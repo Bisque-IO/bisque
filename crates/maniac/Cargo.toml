@@ -1,0 +1,109 @@
+[package]
+name = "maniac"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "maniac"
+path = "src/lib.rs"
+
+[[bin]]
+name = "signal_tree_benchmark"
+path = "src/bin/signal_tree_benchmark.rs"
+
+[[bin]]
+name = "work_contract_benchmark"
+path = "src/bin/work_contract_benchmark.rs"
+
+[[bin]]
+name = "simd_benchmark"
+path = "src/bin/simd_benchmark.rs"
+
+[[bin]]
+name = "future_contract_benchmark"
+path = "src/bin/future_contract_benchmark.rs"
+required-features = ["tokio-bench"]
+
+[[bin]]
+name = "hybrid_selection_test"
+path = "src/bin/hybrid_selection_test.rs"
+
+[[example]]
+name = "io_pool_example"
+required-features = ["io-driver"]
+
+[[example]]
+name = "benchmark_striped_arc"
+
+[dependencies]
+arrayvec = "0.7"
+atomic-waker = { version = "1.1", optional = true }
+cfg-if = "1"
+flume = { version = "0.12", optional = true }
+futures-lite = "2.6"
+getrandom = "0.4"
+# IO driver dependencies
+io-uring = { version = "0.7", optional = true }
+log = "0.4"
+mio = { version = "1.1", features = [
+  "net",
+  "os-poll",
+  "os-ext",
+], optional = true }
+polling = { version = "3.11", optional = true }
+parking_lot = "0.12"
+paste = "1.0"
+pin-project-lite = "0.2"
+snmalloc-rs = "0.3"
+socket2 = { version = "0.6", optional = true }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "sync",
+  "time",
+], optional = true }
+wide = { version = "1.1", optional = true }
+
+[dev-dependencies]
+comfy-table = "7.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+os_pipe = "1.2"
+
+[target.'cfg(windows)'.dependencies]
+widestring = "1.1"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Pipes",
+] }
+
+[features]
+default = ["io-driver"]
+arrayvec = []
+io-driver = [
+  "arrayvec",
+  "atomic-waker",
+  "flume",
+  "io-uring",
+  "mio",
+  "polling",
+  "socket2",
+]
+simd = ["wide"]
+tokio-bench = ["tokio"]
+# Nightly/optional features for buf module
+allocator_api = []
+read_buf = []
+try_trait_v2 = []
+bumpalo = []
+bytes = []
+smallvec = []
+
+[profile.profiling]
+inherits = "release"
+debug = true

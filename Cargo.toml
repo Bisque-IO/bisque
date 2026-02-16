@@ -1,0 +1,174 @@
+[workspace]
+members = [
+    #    "crates/bop-aof",
+    #    "crates/bop-proto",
+    #    "crates/bop-protoc",
+    # "crates/maniac-mdbx",
+    # "crates/bop-mpmc",
+    # "crates/vertx-cluster",
+    # "crates/maniac-allocator",
+    # "crates/maniac-storage",
+    # "crates/maniac-sys",
+    # "crates/maniac-usockets",
+    # "crates/macros",
+    # "crates/maniac",
+    # "crates/raft",           # maniac-raft: OpenRaft adapter for Maniac runtime
+    # "moon/rapp",
+    # "crates/rusqlite",
+    # "crates/libsql-ffi",
+    # "crates/libsql-sys",
+    # "crates/sqlite3-parser",
+    # "crates/nuraft",
+    # "crates/libsql",
+    # "crates/wasmtime",
+    #    "crates/sanakirja-core",
+    #    "crates/sanakirja",
+    "crates/bisque-runtime",
+]
+resolver = "2"
+edition = "2024"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["Bisque Team"]
+description = "Bisque Open Platform"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bisque-io/bop"
+homepage = "https://github.com/bisque-io/bop"
+documentation = "https://docs.rs/bop"
+keywords = ["async", "runtime", "concurrency"]
+categories = ["asynchronous", "concurrency"]
+
+[workspace.dependencies]
+allocator-api2 = "0.4"
+anyerror = "0.1"
+anyhow = "1"
+arc-swap = "1.7"
+async-entry = "0.3"
+auto-const-array = "0.2"
+aws-lc-rs = "1.15"
+base64 = "0.22"
+bindgen = "0.72"
+bitflags = "2"
+bumpalo = { version = "3.17.0", features = ["collections", "boxed"] }
+bytes = { version = "1" }
+byte-unit = "5"
+byteorder = "1.5"
+cc = "1.2"
+chrono = "0.4"
+clap = { version = "4.1", features = ["derive", "env"] }
+cfg-if = "1"
+congee = "0.4.1"
+core_affinity = "0.8"
+crc32fast = "1.4"
+crc64fast-nvme = "1.2"
+criterion = { version = "0.8", features = ["html_reports"] }
+crossbeam = "0.8"
+crossbeam-epoch = "0.9"
+crossbeam-utils = "0.8"
+dashmap = "6.1"
+derive_more = { version = "2", features = [
+    "std",
+    "from",
+    "try_into",
+    "display",
+] }
+flume = "0.12"
+futures = "0.3"
+futures-io = "0.3"
+futures-lite = "2.6"
+futures-util = "0.3"
+# ghost-cell = "0.2.6"
+hdrhistogram = "7.5"
+hyper = { version = "1.8" }
+libc = "0.2"
+log = "0.4"
+loom = "0.7"
+maplit = "1"
+memchr = "2.7"
+memmap2 = "0.9"
+minio = "0.3"
+mio = { version = "1.1", features = ["os-poll", "net", "os-ext"] }
+multimap = "0.10"
+native-tls = "0.2"
+nix = { version = "0.30", features = ["sched"] }
+once_cell = "1.21"
+parking_lot = "0.12"
+pin-project-lite = "0.2"
+pollster = "0.4"
+pretty_assertions = "1"
+proc-macro2 = "1.0.60"
+proptest = "1.0"
+quote = "1"
+rand = "0.9"
+reusable-box-future = { version = "0.2" }
+rlsf = "0.2"
+rustc-hash = "2.0"
+rustls = { version = "0.23", default-features = false }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2.0"
+rustls-webpki = "0.103"
+semver = "1"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+snmalloc-rs = "0.3"
+socket2 = { version = "0.6", features = ["all"] }
+syn = "2"
+tempfile = "3.8"
+thiserror = "2.0"
+tokio = { version = "1", default-features = false }
+tokio-test = "0.4"
+tokio-util = "0.7"
+tracing = { version = "0.1", default-features = false, features = [
+    "attributes",
+] }
+tracing-futures = "0.2"
+tracing-subscriber = "0.3"
+validit = "0.2"
+#vertx-cluster = { path = "crates/vertx-cluster", version = "0.1.0" }
+webpki-roots = "1.0.4"
+zstd = "0.13"
+
+# bop-aof = { path = "crates/bop-aof", version = "0.1.0" }
+#bop-protoc = { path = "crates/bop-protoc", version = "0.1.0" }
+# maniac-mdbx = { path = "crates/maniac-mdbx", version = "0.1.0" }
+# bop-mpmc = { path = "crates/bop-mpmc", version = "0.1.0" }
+#bop-proto = { path = "crates/bop-proto", version = "0.1.0" }
+# nuraft = { path = "crates/nuraft", version = "0.1.0" }
+# maniac-storage = { path = "crates/maniac-storage", version = "0.1.0" }
+# maniac-allocator = { path = "crates/maniac-allocator", version = "0.1.0", default-features = false }
+# maniac-sys = { path = "crates/maniac-sys", version = "0.1.0" }
+# maniac-usockets = { path = "crates/maniac-usockets", version = "0.1.0", default-features = false }
+maniac = { path = "crates/bisque-runtime", version = "0.1.0" }
+# maniac = { path = "crates/maniac", version = "0.1.0" }
+# maniac-macros = { path = "crates/macros", version = "0.1.0" }
+# maniac-raft = { path = "crates/raft", version = "0.1.0" }
+# Upstream openraft from git
+openraft = { git = "https://github.com/databendlabs/openraft", branch = "main", default-features = false, features = [
+    "serde",
+    "tokio-rt",
+] }
+openraft-macros = { git = "https://github.com/databendlabs/openraft", branch = "main" }
+# maniac-rusqlite = { path = "crates/rusqlite", version = "0.9.29" }
+# maniac-libsql-ffi = { path = "crates/libsql-ffi", version = "3.45.1" }
+# maniac-libsql-sys = { path = "crates/libsql-sys", version = "3.45.1" }
+# maniac-sqlite3-parser = { path = "crates/sqlite3-parser", version = "0.13.0" }
+# maniac-wasmtime = { path = "crates/wasmtime", version = "0.1.0" }
+#sanakirja-core = { path = "crates/sanakirja-core", version = "1.4.1" }
+#sanakirja = { path = "crates/sanakirja", version = "1.4.1" }
+
+# [profile.dev]
+# opt-level = 0
+# debug = true
+
+# [profile.release]
+# opt-level = "z"   # Optimize for size
+# lto = true
+# codegen-units = 1
+# panic = "abort"   # Smaller binary size (no unwinding)
+# # strip = "symbols" # Strip debug symbols (more aggressive than `true`)
+# debug = true
+
+# Patches for incompatible dependencies
+[patch.crates-io]
