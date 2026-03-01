@@ -48,7 +48,7 @@ impl RecordTypeFlags {
         self.has_vote || self.has_truncate || self.has_purge
     }
 
-    fn to_u8(&self) -> u8 {
+    pub(crate) fn to_u8(&self) -> u8 {
         let mut flags = 0u8;
         if self.has_vote {
             flags |= 1 << 0;
@@ -65,12 +65,22 @@ impl RecordTypeFlags {
         flags
     }
 
-    fn from_u8(flags: u8) -> Self {
+    pub(crate) fn from_u8(flags: u8) -> Self {
         Self {
             has_vote: (flags & (1 << 0)) != 0,
             has_entry: (flags & (1 << 1)) != 0,
             has_truncate: (flags & (1 << 2)) != 0,
             has_purge: (flags & (1 << 3)) != 0,
+        }
+    }
+
+    /// Merge two flags — union of all record types.
+    pub(crate) fn merge(self, other: Self) -> Self {
+        Self {
+            has_vote: self.has_vote || other.has_vote,
+            has_entry: self.has_entry || other.has_entry,
+            has_truncate: self.has_truncate || other.has_truncate,
+            has_purge: self.has_purge || other.has_purge,
         }
     }
 }

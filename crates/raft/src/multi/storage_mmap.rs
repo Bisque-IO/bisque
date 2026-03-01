@@ -5,7 +5,7 @@
 //! - Dynamic shard creation on first access
 //! - Same on-disk record format as SegLog: `[len:u32][type:u8][group_id:u24][payload...][crc64:u64]`
 //! - Zero-copy reads via mmap slices
-//! - Near-zero-latency writes (memcpy into MmapMut)
+//! - Near-zero-latency writes (memcpy into mmap)
 //! - Background fsync with callback queuing (writer never blocks on fsync)
 //! - LogIndex (congee) for entry index → segment location mapping
 //!
@@ -21,28 +21,26 @@
 //! Plus shared manifest MDBX in `{base_dir}/.raft_manifest/` for fast recovery.
 
 use crate::multi::codec::{
-    BorrowPayload, Decode, Encode, Entry as CodecEntry, LogId as CodecLogId, RawBytes, ToCodec,
-    Vote as CodecVote, FromCodec,
+    BorrowPayload, Decode, Encode, Entry as CodecEntry, FromCodec, LogId as CodecLogId, RawBytes,
+    ToCodec, Vote as CodecVote,
 };
 use crate::multi::manifest_mdbx::{ManifestManager, SegmentMeta};
-use crate::multi::segment_footer::{
-    SegmentFooter, SegmentFooterTracker,
-    FOOTER_HEADER_SIZE, FOOTER_MAGIC, FOOTER_TRAILER_SIZE,
-};
+use crate::multi::segment_footer::RecordTypeFlags;
 use crate::multi::storage_impl::{
-    AtomicLogId, AtomicVote, LogIndex, LogLocation, MAX_GROUPS, MultiplexedStorage,
-    RecordType, append_record_into, validate_record,
-    LENGTH_SIZE, CRC64_SIZE, GROUP_ID_SIZE,
+    AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, LENGTH_SIZE, LogIndex, LogLocation,
+    MAX_GROUPS, MultiplexedStorage, RecordType, append_record_into, validate_record,
 };
+use arc_swap::ArcSwap;
 use crossfire::{MAsyncTx, mpsc::Array};
-use dashmap::DashMap;
-use memmap2::{Mmap, MmapMut};
+use lru::LruCache;
+use memmap2::{Mmap, MmapRaw};
 use openraft::{
     LogId, LogState, RaftTypeConfig,
     storage::{IOFlushed, RaftLogReader, RaftLogStorage},
 };
 use parking_lot::Mutex;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
@@ -71,10 +69,10 @@ pub struct MmapStorageConfig {
     pub manifest_dir: Option<Arc<PathBuf>>,
     /// Maximum segment size in bytes. When exceeded, a new segment is created.
     pub segment_size: u64,
-    /// Maximum entries to keep in memory cache per group
-    pub max_cache_entries_per_group: usize,
     /// Maximum record size
     pub max_record_size: u64,
+    /// Delay before triggering fsync after the first write. Allows write coalescing.
+    pub fsync_delay: std::time::Duration,
 }
 
 impl Default for MmapStorageConfig {
@@ -83,8 +81,8 @@ impl Default for MmapStorageConfig {
             base_dir: Arc::new(PathBuf::from("./raft-data")),
             manifest_dir: None,
             segment_size: DEFAULT_SEGMENT_SIZE,
-            max_cache_entries_per_group: 10000,
             max_record_size: DEFAULT_MAX_RECORD_SIZE,
+            fsync_delay: std::time::Duration::from_millis(1),
         }
     }
 }
@@ -104,9 +102,9 @@ impl MmapStorageConfig {
         self
     }
 
-    /// Set the maximum cache entries per group
-    pub fn with_max_cache_entries(mut self, max_entries: usize) -> Self {
-        self.max_cache_entries_per_group = max_entries;
+    /// Set the fsync delay (time to coalesce writes before fsyncing)
+    pub fn with_fsync_delay(mut self, delay: std::time::Duration) -> Self {
+        self.fsync_delay = delay;
         self
     }
 }
@@ -114,6 +112,14 @@ impl MmapStorageConfig {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Current time as nanos since UNIX_EPOCH.
+fn nanos_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
 
 /// Segment file path: {group_dir}/seg_{segment_id:06}.log
 fn segment_path(group_dir: &Path, segment_id: u64) -> PathBuf {
@@ -148,121 +154,237 @@ fn scan_segment_ids(group_dir: &Path) -> io::Result<Vec<u64>> {
 }
 
 // ---------------------------------------------------------------------------
+// Segment — a single mmap'd segment file with atomic size tracking
+// ---------------------------------------------------------------------------
+
+/// Default maximum number of sealed segments to cache in the LRU.
+const DEFAULT_SEALED_CACHE_CAP: usize = 64;
+
+/// A single mmap'd segment file. ONE mmap per segment, used for both reading and writing.
+/// Size tracking is done via atomics — no locks on the read path.
+struct Segment {
+    segment_id: u64,
+    mmap: MmapRaw,
+    /// Logical size: the write tail. Updated atomically after every append.
+    logical_size: AtomicU64,
+    /// Flushed size: the last fsync'd offset. Updated by the fsync thread.
+    flushed_size: AtomicU64,
+    /// File handle for fsync. Present for active segments, None for
+    /// sealed segments loaded read-only during recovery.
+    file: Option<std::fs::File>,
+    path: PathBuf,
+    /// Max bytes written since last fsync. Updated atomically by writers,
+    /// reset by the fsync thread after draining.
+    pending_max_bytes: AtomicU64,
+    /// Nanos since UNIX_EPOCH when the first callback was enqueued for this
+    /// fsync batch. 0 means no pending callbacks. Set by first writer via CAS,
+    /// cleared by fsync thread after draining. Each segment's delay is
+    /// measured from its own first_enqueue_nanos.
+    first_enqueue_nanos: AtomicU64,
+}
+
+impl Segment {
+    fn new(
+        segment_id: u64,
+        mmap: MmapRaw,
+        valid_bytes: u64,
+        file: Option<std::fs::File>,
+        path: PathBuf,
+    ) -> Self {
+        Self {
+            segment_id,
+            mmap,
+            logical_size: AtomicU64::new(valid_bytes),
+            flushed_size: AtomicU64::new(valid_bytes),
+            file,
+            path,
+            pending_max_bytes: AtomicU64::new(0),
+            first_enqueue_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// Atomically set `first_enqueue_nanos` if not already set (CAS from 0).
+    fn mark_first_enqueue(&self) {
+        if self.first_enqueue_nanos.load(Ordering::Acquire) == 0 {
+            let now = nanos_now();
+            let _ = self.first_enqueue_nanos.compare_exchange(
+                0,
+                now,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Take the pending max_bytes and reset tracking. Called by fsync thread.
+    fn take_pending(&self) -> u64 {
+        let max_bytes = self.pending_max_bytes.swap(0, Ordering::AcqRel);
+        self.first_enqueue_nanos.store(0, Ordering::Release);
+        max_bytes
+    }
+
+    /// Read a byte slice from the segment. Caller must ensure offset+len is within bounds.
+    #[inline]
+    fn read_slice(&self, offset: usize, len: usize) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.mmap.as_ptr().add(offset), len) }
+    }
+
+    /// Get the full readable slice up to `len` bytes.
+    #[inline]
+    fn as_slice(&self, len: usize) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.mmap.as_ptr(), len) }
+    }
+
+    /// Write data at the given offset. Only called by the writer under mutex.
+    /// Caller must ensure offset+data.len() is within capacity.
+    #[inline]
+    unsafe fn write_at(&self, offset: usize, data: &[u8]) {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.mmap.as_mut_ptr().add(offset),
+                data.len(),
+            );
+        }
+    }
+
+    /// Zero-fill a range. Only called by the writer under mutex.
+    #[inline]
+    unsafe fn zero_range(&self, offset: usize, len: usize) {
+        unsafe {
+            ptr::write_bytes(self.mmap.as_mut_ptr().add(offset), 0, len);
+        }
+    }
+
+    /// The total capacity of the underlying mmap.
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.mmap.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MmapSegmentMap — in-memory segment tracking shared between writer and readers
 // ---------------------------------------------------------------------------
 
-struct SealedSegment {
-    segment_id: u64,
-    mmap: Arc<Mmap>,
-    valid_bytes: u64,
-    path: PathBuf,
-}
-
-struct ActiveReadView {
-    segment_id: u64,
-    mmap: Arc<Mmap>,
-    valid_bytes: u64,
-}
-
 struct MmapSegmentMap {
-    sealed: parking_lot::RwLock<Vec<SealedSegment>>,
-    active: parking_lot::RwLock<Option<ActiveReadView>>,
+    /// Sealed segments: LRU cache indexed by segment_id. O(1) lookup, bounded memory.
+    sealed: Mutex<LruCache<u64, Arc<Segment>>>,
+    /// Active segment: atomically swapped on rotation. No lock on read path.
+    active: ArcSwap<Segment>,
+}
+
+/// Sentinel segment used as initial placeholder before the first real segment is set.
+fn sentinel_segment() -> Arc<Segment> {
+    // Create a sentinel with an anonymous mmap. segment_id=0.
+    // This is never read from — callers check segment_id match first.
+    let anon = memmap2::MmapOptions::new().map_anon().unwrap();
+    // Convert MmapMut → MmapRaw (same underlying mapping)
+    let raw = MmapRaw::from(anon);
+    Arc::new(Segment {
+        segment_id: 0,
+        mmap: raw,
+        logical_size: AtomicU64::new(0),
+        flushed_size: AtomicU64::new(0),
+        file: None,
+        path: PathBuf::new(),
+        pending_max_bytes: AtomicU64::new(0),
+        first_enqueue_nanos: AtomicU64::new(0),
+    })
 }
 
 impl MmapSegmentMap {
     fn new() -> Self {
         Self {
-            sealed: parking_lot::RwLock::new(Vec::new()),
-            active: parking_lot::RwLock::new(None),
+            sealed: Mutex::new(LruCache::new(
+                NonZeroUsize::new(DEFAULT_SEALED_CACHE_CAP).unwrap(),
+            )),
+            active: ArcSwap::new(sentinel_segment()),
         }
     }
 
-    /// Find the segment for a given log index using LogLocation info
-    fn find_mmap(&self, segment_id: u64) -> Option<(Arc<Mmap>, u64)> {
-        // Check active first (most recent writes)
-        {
-            let active = self.active.read();
-            if let Some(ref av) = *active {
-                if av.segment_id == segment_id {
-                    return Some((av.mmap.clone(), av.valid_bytes));
-                }
-            }
+    /// Find the segment for a given segment_id. Lock-free for active, O(1) for sealed.
+    fn find_segment(&self, segment_id: u64) -> Option<Arc<Segment>> {
+        // Check active first (most recent writes) — no lock
+        let active = self.active.load();
+        if active.segment_id == segment_id {
+            return Some(Arc::clone(&active));
         }
-        // Check sealed segments
+        // Check sealed LRU — O(1) hash lookup, brief mutex
         {
-            let sealed = self.sealed.read();
-            for seg in sealed.iter().rev() {
-                if seg.segment_id == segment_id {
-                    return Some((seg.mmap.clone(), seg.valid_bytes));
-                }
+            let mut sealed = self.sealed.lock();
+            if let Some(seg) = sealed.get(&segment_id) {
+                return Some(Arc::clone(seg));
             }
         }
         None
     }
 
-    /// Add a sealed segment
-    fn add_sealed(&self, entry: SealedSegment) {
-        let mut guard = self.sealed.write();
-        let pos = guard.partition_point(|s| s.segment_id < entry.segment_id);
-        guard.insert(pos, entry);
+    /// Add a sealed segment to the LRU cache.
+    fn add_sealed(&self, segment: Arc<Segment>) {
+        let mut sealed = self.sealed.lock();
+        sealed.put(segment.segment_id, segment);
     }
 
-    /// Update the active read view
-    fn update_active(&self, view: ActiveReadView) {
-        let mut guard = self.active.write();
-        *guard = Some(view);
+    /// Atomically swap the active segment. Returns the previous active segment.
+    fn swap_active(&self, new_active: Arc<Segment>) -> Arc<Segment> {
+        self.active.swap(new_active)
+    }
+
+    /// Set the active segment (used during initialization).
+    fn set_active(&self, segment: Arc<Segment>) {
+        self.active.store(segment);
     }
 
     /// Remove sealed segments where their entire range is purged.
     /// Returns paths of removed segments for file deletion.
     fn remove_purged_segments(&self, purge_index: u64, log_index: &LogIndex) -> Vec<PathBuf> {
-        let mut guard = self.sealed.write();
+        let mut sealed = self.sealed.lock();
         let mut removed = Vec::new();
-        guard.retain(|seg| {
-            // Check if any entries in this segment are still needed
-            // A segment can be removed if all its entries have indices <= purge_index
-            // We check by seeing if the segment has entries beyond purge_index
-            // by looking up the last entry's index via the segment's valid_bytes range
-            // Simple approach: scan the segment mmap for the last entry index
-            let last_idx = scan_last_entry_index(&seg.mmap, seg.valid_bytes as usize);
-            if let Some(last) = last_idx {
-                if last <= purge_index {
-                    removed.push(seg.path.clone());
-                    return false;
+        let ids_to_check: Vec<u64> = sealed.iter().map(|(&id, _)| id).collect();
+        for seg_id in ids_to_check {
+            if let Some(seg) = sealed.peek(&seg_id) {
+                let valid = seg.logical_size.load(Ordering::Acquire) as usize;
+                let last_idx = scan_last_entry_index(seg.as_slice(valid), valid);
+                if let Some(last) = last_idx {
+                    if last <= purge_index {
+                        removed.push(seg.path.clone());
+                        sealed.pop(&seg_id);
+                    }
                 }
             }
-            true
-        });
-        let _ = log_index; // LogIndex cleanup done separately
+        }
+        let _ = log_index;
         removed
     }
 
     /// Remove sealed segments with first_index > after_index for truncation
     fn remove_after(&self, after_index: u64) -> Vec<PathBuf> {
-        let mut guard = self.sealed.write();
+        let mut sealed = self.sealed.lock();
         let mut removed = Vec::new();
-        guard.retain(|seg| {
-            let first_idx = scan_first_entry_index(&seg.mmap, seg.valid_bytes as usize);
-            if let Some(first) = first_idx {
-                if first > after_index {
-                    removed.push(seg.path.clone());
-                    return false;
+        let ids_to_check: Vec<u64> = sealed.iter().map(|(&id, _)| id).collect();
+        for seg_id in ids_to_check {
+            if let Some(seg) = sealed.peek(&seg_id) {
+                let valid = seg.logical_size.load(Ordering::Acquire) as usize;
+                let first_idx = scan_first_entry_index(seg.as_slice(valid), valid);
+                if let Some(first) = first_idx {
+                    if first > after_index {
+                        removed.push(seg.path.clone());
+                        sealed.pop(&seg_id);
+                    }
                 }
             }
-            true
-        });
+        }
         removed
     }
-
 }
 
 /// Scan a segment mmap for the first entry index
 fn scan_first_entry_index(mmap: &[u8], valid_bytes: usize) -> Option<u64> {
     let mut offset = 0;
     while offset + LENGTH_SIZE <= valid_bytes {
-        let record_len = u32::from_le_bytes(
-            mmap[offset..offset + LENGTH_SIZE].try_into().unwrap(),
-        ) as usize;
+        let record_len =
+            u32::from_le_bytes(mmap[offset..offset + LENGTH_SIZE].try_into().unwrap()) as usize;
         if record_len == 0 || offset + LENGTH_SIZE + record_len > valid_bytes {
             break;
         }
@@ -289,9 +411,8 @@ fn scan_last_entry_index(mmap: &[u8], valid_bytes: usize) -> Option<u64> {
     let mut offset = 0;
     let mut last_entry_index = None;
     while offset + LENGTH_SIZE <= valid_bytes {
-        let record_len = u32::from_le_bytes(
-            mmap[offset..offset + LENGTH_SIZE].try_into().unwrap(),
-        ) as usize;
+        let record_len =
+            u32::from_le_bytes(mmap[offset..offset + LENGTH_SIZE].try_into().unwrap()) as usize;
         if record_len == 0 || offset + LENGTH_SIZE + record_len > valid_bytes {
             break;
         }
@@ -315,19 +436,25 @@ fn scan_last_entry_index(mmap: &[u8], valid_bytes: usize) -> Option<u64> {
 
 /// Request to seal a segment in the background (after rotation)
 struct SealRequest {
-    file: std::fs::File,
+    segment: Arc<Segment>,
     valid_bytes: u64,
-    footer_data: Vec<u8>,
-    segment_id: u64,
     group_id: u64,
     min_index: Option<u64>,
     max_index: Option<u64>,
+    record_type_flags: RecordTypeFlags,
     manifest_tx: MAsyncTx<Array<SegmentMeta>>,
 }
 
+/// Pending fsync entry: segment + callbacks. Callbacks are grouped by segment
+/// so each file is synced exactly once per batch.
+struct FsyncEntry<C: RaftTypeConfig> {
+    segment: Arc<Segment>,
+    callbacks: Vec<IOFlushed<C>>,
+}
+
 struct FsyncInner<C: RaftTypeConfig> {
-    /// Pending (file, callback) pairs from all groups
-    entries: Vec<(Arc<std::fs::File>, IOFlushed<C>)>,
+    /// Pending callbacks grouped by segment pointer.
+    pending: std::collections::HashMap<usize, FsyncEntry<C>>,
     /// Pending segment seal requests
     seal_queue: Vec<SealRequest>,
     shutdown: bool,
@@ -336,24 +463,36 @@ struct FsyncInner<C: RaftTypeConfig> {
 struct FsyncState<C: RaftTypeConfig> {
     mu: std::sync::Mutex<FsyncInner<C>>,
     cv: std::sync::Condvar,
+    /// Delay before triggering fsync after first enqueue.
+    fsync_delay: std::time::Duration,
 }
 
 impl<C: RaftTypeConfig> FsyncState<C> {
-    fn new() -> Self {
+    fn new(fsync_delay: std::time::Duration) -> Self {
         Self {
             mu: std::sync::Mutex::new(FsyncInner {
-                entries: Vec::new(),
+                pending: std::collections::HashMap::new(),
                 seal_queue: Vec::new(),
                 shutdown: false,
             }),
             cv: std::sync::Condvar::new(),
+            fsync_delay,
         }
     }
 
-    /// Push a callback with its associated file handle
-    fn push(&self, file: Arc<std::fs::File>, callback: IOFlushed<C>) {
+    /// Push a callback for the given segment. Tracks `max_bytes` and
+    /// `first_enqueue_nanos` on the Segment atomically (no allocation).
+    fn push(&self, segment: &Arc<Segment>, bytes_written: u64, callback: IOFlushed<C>) {
+        segment.pending_max_bytes.fetch_max(bytes_written, Ordering::Release);
+        segment.mark_first_enqueue();
+
         let mut inner = self.mu.lock().unwrap();
-        inner.entries.push((file, callback));
+        let key = Arc::as_ptr(segment) as usize;
+        let entry = inner.pending.entry(key).or_insert_with(|| FsyncEntry {
+            segment: segment.clone(),
+            callbacks: Vec::new(),
+        });
+        entry.callbacks.push(callback);
         drop(inner);
         self.cv.notify_one();
     }
@@ -369,65 +508,114 @@ impl<C: RaftTypeConfig> FsyncState<C> {
 
 /// Background fsync thread loop — shared across all groups.
 /// Handles both fsync callbacks and segment sealing.
+/// Implements delay-based write coalescing: waits `fsync_delay` from the
+/// first enqueued callback before syncing, allowing multiple writes to batch.
 fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
+    let delay_nanos = state.fsync_delay.as_nanos() as u64;
+
     loop {
-        let (entries, seal_requests, shutdown) = {
+        let (ready, seal_requests, shutdown) = {
             let mut inner = state.mu.lock().unwrap();
-            while inner.entries.is_empty() && inner.seal_queue.is_empty() && !inner.shutdown {
+
+            // Block until there's work or shutdown
+            while inner.pending.is_empty() && inner.seal_queue.is_empty() && !inner.shutdown {
                 inner = state.cv.wait(inner).unwrap();
             }
 
-            if inner.shutdown && inner.entries.is_empty() && inner.seal_queue.is_empty() {
+            if inner.shutdown && inner.pending.is_empty() && inner.seal_queue.is_empty() {
                 return;
             }
 
-            let entries = std::mem::take(&mut inner.entries);
+            // Wait for per-segment delays. Each segment's deadline is
+            // first_enqueue_nanos + delay_nanos. We wait until the earliest
+            // deadline, then drain only segments that are ready.
+            loop {
+                // Seal requests and shutdown are always processed immediately
+                if !inner.seal_queue.is_empty() || inner.shutdown {
+                    break;
+                }
+
+                let now = nanos_now();
+                let earliest_deadline = inner
+                    .pending
+                    .values()
+                    .filter_map(|e| {
+                        let t = e.segment.first_enqueue_nanos.load(Ordering::Acquire);
+                        if t > 0 { Some(t + delay_nanos) } else { None }
+                    })
+                    .min();
+
+                match earliest_deadline {
+                    Some(deadline) if deadline > now => {
+                        let remaining = std::time::Duration::from_nanos(deadline - now);
+                        let (new_inner, _) =
+                            state.cv.wait_timeout(inner, remaining).unwrap();
+                        inner = new_inner;
+                    }
+                    _ => break, // At least one segment is ready (or no timestamps)
+                }
+            }
+
+            if inner.shutdown && inner.pending.is_empty() && inner.seal_queue.is_empty() {
+                return;
+            }
+
+            // Extract segments whose delay has expired, leave the rest
+            let now = nanos_now();
+            let mut ready_entries = Vec::new();
+            let keys: Vec<usize> = inner.pending.keys().copied().collect();
+            for key in keys {
+                let t = inner.pending[&key]
+                    .segment
+                    .first_enqueue_nanos
+                    .load(Ordering::Acquire);
+                if t == 0 || t + delay_nanos <= now {
+                    if let Some(entry) = inner.pending.remove(&key) {
+                        ready_entries.push(entry);
+                    }
+                }
+            }
+
             let seal_requests = std::mem::take(&mut inner.seal_queue);
-            (entries, seal_requests, inner.shutdown)
+            (ready_entries, seal_requests, inner.shutdown)
         };
 
-        // Sync each unique callback file once (deduplicate by Arc pointer)
-        let mut synced = std::collections::HashSet::new();
-        for (file, _) in &entries {
-            let ptr = Arc::as_ptr(file) as usize;
-            if synced.insert(ptr) {
+        // Sync each segment's file once, drain callbacks, update flushed_size
+        for entry in ready {
+            let max_bytes = entry.segment.take_pending();
+
+            if let Some(ref file) = entry.segment.file {
                 let _ = file.sync_data();
             }
+
+            entry
+                .segment
+                .flushed_size
+                .fetch_max(max_bytes, Ordering::Release);
+
+            for cb in entry.callbacks {
+                cb.io_completed(Ok(()));
+            }
         }
 
-        // Fire all callbacks
-        for (_, cb) in entries {
-            cb.io_completed(Ok(()));
-        }
-
-        // Process seal requests: fsync + write footer + truncate + manifest update
+        // Process seal requests: fsync + truncate + manifest update (no footer on file)
         for req in seal_requests {
-            // fsync the segment data
-            let _ = req.file.sync_data();
-
-            // Write footer at the end of valid data, then truncate
-            let final_size = req.valid_bytes + req.footer_data.len() as u64;
-
-            // Use pwrite to write footer at valid_bytes offset
-            {
-                use std::os::unix::fs::FileExt;
-                let _ = req.file.write_at(&req.footer_data, req.valid_bytes);
+            if let Some(ref file) = req.segment.file {
+                let _ = file.sync_data();
+                let _ = file.set_len(req.valid_bytes);
             }
 
-            // Truncate to valid_bytes + footer
-            let _ = req.file.set_len(final_size);
-            let _ = req.file.sync_data();
-
-            // Update manifest
+            // Update manifest with all metadata (replaces on-file footer)
             let _ = req.manifest_tx.try_send(SegmentMeta {
                 group_id: req.group_id,
-                segment_id: req.segment_id,
+                segment_id: req.segment.segment_id,
                 valid_bytes: req.valid_bytes,
                 min_index: req.min_index,
                 max_index: req.max_index,
                 min_ts: None,
                 max_ts: None,
                 sealed: true,
+                record_type_flags: req.record_type_flags,
             });
         }
 
@@ -441,19 +629,20 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
 // ActiveMmapSegment — writer's current segment state
 // ---------------------------------------------------------------------------
 
+/// Writer-side state for the active (tail) segment. The mmap and file handle
+/// live in the shared `Segment` — ONE mmap per segment, ONE file handle.
 struct ActiveMmapSegment {
     segment_id: u64,
-    mmap: MmapMut,
-    file: std::fs::File,
+    /// The shared Segment holding the single MmapRaw and file handle.
+    segment: Arc<Segment>,
     current_size: u64,
     segment_capacity: u64,
-    path: PathBuf,
     min_entry_index: Option<u64>,
     max_entry_index: Option<u64>,
 }
 
 impl ActiveMmapSegment {
-    /// Create a new segment file with mmap
+    /// Create a new segment file with a single mmap.
     fn create(group_dir: &Path, segment_id: u64, segment_size: u64) -> io::Result<Self> {
         let path = segment_path(group_dir, segment_id);
         let file = std::fs::OpenOptions::new()
@@ -464,21 +653,20 @@ impl ActiveMmapSegment {
             .open(&path)?;
         file.set_len(segment_size)?;
 
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        let mmap = memmap2::MmapOptions::new().map_raw(&file)?;
+        let segment = Arc::new(Segment::new(segment_id, mmap, 0, Some(file), path));
 
         Ok(Self {
             segment_id,
-            mmap,
-            file,
+            segment,
             current_size: 0,
             segment_capacity: segment_size,
-            path,
             min_entry_index: None,
             max_entry_index: None,
         })
     }
 
-    /// Open an existing segment file for writing (recovery)
+    /// Open an existing segment file for writing (recovery).
     fn open_existing(path: &Path, segment_id: u64) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -486,24 +674,23 @@ impl ActiveMmapSegment {
             .open(path)?;
 
         let file_len = file.metadata()?.len();
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        let mmap = memmap2::MmapOptions::new().map_raw(&file)?;
+        let segment = Arc::new(Segment::new(
+            segment_id,
+            mmap,
+            0,
+            Some(file),
+            path.to_path_buf(),
+        ));
 
         Ok(Self {
             segment_id,
-            mmap,
-            file,
+            segment,
             current_size: 0, // Will be set during recovery
             segment_capacity: file_len,
-            path: path.to_path_buf(),
             min_entry_index: None,
             max_entry_index: None,
         })
-    }
-
-    /// Create a read-only Mmap from the same file
-    fn create_reader_mmap(&self) -> io::Result<Arc<Mmap>> {
-        let mmap = unsafe { Mmap::map(&self.file)? };
-        Ok(Arc::new(mmap))
     }
 }
 
@@ -515,12 +702,10 @@ struct WriterState {
     active: ActiveMmapSegment,
     /// Pre-allocated next segment — used on rotation to avoid blocking
     next_segment: Option<ActiveMmapSegment>,
-    /// Tracks record types and entry ranges for the active segment's footer
-    footer_tracker: SegmentFooterTracker,
+    /// Tracks record types present in the active segment (for manifest metadata).
+    record_type_flags: RecordTypeFlags,
     group_dir: PathBuf,
     group_id: u64,
-    /// Dup'd file handle for the active segment — shared with fsync thread via Arc
-    fsync_file: Arc<std::fs::File>,
     /// Buffer for encoding vote records (reused to avoid allocation)
     vote_buf: Vec<u8>,
 }
@@ -536,7 +721,7 @@ impl WriterState {
         manifest_tx: &MAsyncTx<Array<SegmentMeta>>,
         fsync_state: &FsyncState<impl RaftTypeConfig>,
     ) -> io::Result<usize> {
-        // Check if we need rotation before this write
+        // Check if we need rotation before this write.
         if self.active.current_size + data.len() as u64 > self.active.segment_capacity {
             self.rotate_segment(config, segment_map, manifest_tx, fsync_state)?;
         }
@@ -544,16 +729,15 @@ impl WriterState {
         let offset = self.active.current_size as usize;
         let end = offset + data.len();
 
-        // Extend file if needed (shouldn't normally happen with pre-allocated segments)
-        if end > self.active.mmap.len() {
-            let new_size = (end as u64).max(self.active.segment_capacity * 2);
-            self.active.file.set_len(new_size)?;
-            self.active.segment_capacity = new_size;
-            self.active.mmap = unsafe { MmapMut::map_mut(&self.active.file)? };
-        }
+        debug_assert!(
+            end <= self.active.segment.capacity(),
+            "write exceeds pre-allocated segment capacity: {} > {}",
+            end,
+            self.active.segment.capacity(),
+        );
 
         // memcpy into mmap — this is the whole point: no syscall, just a copy
-        self.active.mmap[offset..end].copy_from_slice(data);
+        unsafe { self.active.segment.write_at(offset, data) };
         self.active.current_size = end as u64;
 
         // Pre-allocate next segment when active is 75% full
@@ -561,26 +745,27 @@ impl WriterState {
             && self.active.current_size > self.active.segment_capacity * 3 / 4
         {
             let next_id = self.active.segment_id + 1;
-            self.next_segment =
-                Some(ActiveMmapSegment::create(&self.group_dir, next_id, config.segment_size)?);
+            self.next_segment = Some(ActiveMmapSegment::create(
+                &self.group_dir,
+                next_id,
+                config.segment_size,
+            )?);
         }
 
         Ok(offset)
     }
 
-    /// Update the reader-visible active read view after writes
-    fn update_read_view(&self, segment_map: &MmapSegmentMap) {
-        if let Ok(reader_mmap) = self.active.create_reader_mmap() {
-            segment_map.update_active(ActiveReadView {
-                segment_id: self.active.segment_id,
-                mmap: reader_mmap,
-                valid_bytes: self.active.current_size,
-            });
-        }
+    /// Update the reader-visible logical size of the active segment after writes.
+    /// Just an atomic store — no locks.
+    fn update_read_view(&self) {
+        self.active
+            .segment
+            .logical_size
+            .store(self.active.current_size, Ordering::Release);
     }
 
-    /// Rotate: immediately make old segment available as sealed, enqueue background
-    /// sealing (fsync + truncate + footer write + manifest update), swap to pre-allocated segment.
+    /// Rotate: seal old segment into the LRU, atomically swap in the new one,
+    /// and enqueue background sealing (fsync + truncate + footer write + manifest update).
     fn rotate_segment(
         &mut self,
         config: &MmapStorageConfig,
@@ -590,36 +775,8 @@ impl WriterState {
     ) -> io::Result<()> {
         let valid_bytes = self.active.current_size;
 
-        // Create sealed mmap immediately (shares pages with MmapMut, no I/O)
-        let sealed_mmap = unsafe { Mmap::map(&self.active.file)? };
-
-        // Add to sealed list right away — readers can find it immediately
-        segment_map.add_sealed(SealedSegment {
-            segment_id: self.active.segment_id,
-            mmap: Arc::new(sealed_mmap),
-            valid_bytes,
-            path: self.active.path.clone(),
-        });
-
-        // Build footer from tracker
-        let old_tracker = std::mem::replace(
-            &mut self.footer_tracker,
-            SegmentFooterTracker::new(self.group_id, self.active.segment_id + 1),
-        );
-        let footer = old_tracker.build(valid_bytes);
-        let footer_data = footer.encode();
-
-        // Enqueue background sealing: fsync + truncate + footer write + manifest update
-        fsync_state.enqueue_seal(SealRequest {
-            file: self.active.file.try_clone()?,
-            valid_bytes,
-            footer_data,
-            segment_id: self.active.segment_id,
-            group_id: self.group_id,
-            min_index: self.active.min_entry_index,
-            max_index: self.active.max_entry_index,
-            manifest_tx: manifest_tx.clone(),
-        });
+        // Capture record type flags for manifest, reset for new segment
+        let flags = std::mem::take(&mut self.record_type_flags);
 
         // Use pre-allocated segment if available, otherwise create synchronously
         let new_id = self.active.segment_id + 1;
@@ -628,17 +785,26 @@ impl WriterState {
             _ => ActiveMmapSegment::create(&self.group_dir, new_id, config.segment_size)?,
         };
 
-        // Update fsync file handle to new segment
-        self.fsync_file = Arc::new(new_seg.file.try_clone()?);
+        // Atomically swap active → the old active becomes the sealed segment
+        let old_active = segment_map.swap_active(new_seg.segment.clone());
+        // Update old segment's logical_size to final valid_bytes before sealing
+        old_active
+            .logical_size
+            .store(valid_bytes, Ordering::Release);
 
-        // Update active read view
-        if let Ok(reader_mmap) = new_seg.create_reader_mmap() {
-            segment_map.update_active(ActiveReadView {
-                segment_id: new_seg.segment_id,
-                mmap: reader_mmap,
-                valid_bytes: 0,
-            });
-        }
+        // Enqueue background sealing: fsync + truncate + manifest update
+        fsync_state.enqueue_seal(SealRequest {
+            segment: old_active.clone(),
+            valid_bytes,
+            group_id: self.group_id,
+            min_index: self.active.min_entry_index,
+            max_index: self.active.max_entry_index,
+            record_type_flags: flags,
+            manifest_tx: manifest_tx.clone(),
+        });
+
+        // Move old segment into the sealed LRU
+        segment_map.add_sealed(old_active);
 
         self.active = new_seg;
         Ok(())
@@ -651,9 +817,8 @@ fn scan_valid_bytes_up_to_index(data: &[u8], target_index: u64) -> usize {
     let mut offset = 0;
     let mut last_valid_end = 0;
     while offset + LENGTH_SIZE <= data.len() {
-        let record_len = u32::from_le_bytes(
-            data[offset..offset + LENGTH_SIZE].try_into().unwrap(),
-        ) as usize;
+        let record_len =
+            u32::from_le_bytes(data[offset..offset + LENGTH_SIZE].try_into().unwrap()) as usize;
         if record_len == 0 || offset + LENGTH_SIZE + record_len > data.len() {
             break;
         }
@@ -788,11 +953,9 @@ impl<C: RaftTypeConfig> Drop for MmapGroupIndex<C> {
 // ---------------------------------------------------------------------------
 
 struct MmapGroupState<C: RaftTypeConfig> {
-    cache: DashMap<u64, Arc<C::Entry>>,
     vote: AtomicVote,
     first_index: AtomicU64,
     last_index: AtomicU64,
-    cache_low: AtomicU64,
     last_log_id: AtomicLogId,
     last_purged_log_id: AtomicLogId,
     log_index: Arc<LogIndex>,
@@ -858,20 +1021,28 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
 
             let path = segment_path(group_dir, seg_id);
             let file = std::fs::File::open(&path)?;
-            let mmap = unsafe { Mmap::map(&file)? };
+            let mmap_ro = unsafe { Mmap::map(&file)? };
 
-            // Try to read footer from sealed segment for fast recovery
-            let footer = Self::read_footer_from_mmap(&mmap);
+            // Determine valid_bytes from manifest (trusted for sealed) or CRC scan
+            let meta = manifest_segments.get(&seg_id);
+            let valid = if let Some(m) = meta {
+                if m.sealed {
+                    m.valid_bytes as usize
+                } else {
+                    Self::scan_valid_bytes(&mmap_ro)
+                }
+            } else {
+                Self::scan_valid_bytes(&mmap_ro)
+            };
 
-            if let Some(ref ft) = footer {
-                if ft.record_type_flags.has_only_entries() {
-                    // FAST PATH: entry-only segment with footer — walk length prefixes only
-                    let valid = ft.valid_bytes as usize;
+            // FAST PATH: entry-only segment — walk length prefixes only (skip CRC decode)
+            if let Some(m) = meta {
+                if m.sealed && m.record_type_flags.has_only_entries() {
                     let mut offset = 0usize;
-                    let mut entry_index = ft.min_entry_index.unwrap_or(0);
+                    let mut entry_index = m.min_index.unwrap_or(0);
                     while offset + LENGTH_SIZE <= valid {
                         let record_len = u32::from_le_bytes(
-                            mmap[offset..offset + LENGTH_SIZE].try_into().unwrap(),
+                            mmap_ro[offset..offset + LENGTH_SIZE].try_into().unwrap(),
                         ) as usize;
                         if record_len == 0 || offset + LENGTH_SIZE + record_len > valid {
                             break;
@@ -889,28 +1060,33 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                         offset += total;
                     }
 
-                    if let Some(min) = ft.min_entry_index {
-                        overall_first_index = Some(
-                            overall_first_index.map_or(min, |v: u64| v.min(min)),
-                        );
+                    if let Some(min) = m.min_index {
+                        overall_first_index =
+                            Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
                     }
-                    if let Some(max) = ft.max_entry_index {
-                        overall_last_index = Some(
-                            overall_last_index.map_or(max, |v: u64| v.max(max)),
-                        );
-                        // Update last_log_id — we need to decode the last entry for its log_id
-                        // Walk to last record and decode just that one
+                    if let Some(max) = m.max_index {
+                        overall_last_index =
+                            Some(overall_last_index.map_or(max, |v: u64| v.max(max)));
                         if let Some(loc) = log_index.get(max) {
                             let start = loc.offset as usize;
                             let end = start + loc.len as usize;
-                            if end <= mmap.len() {
-                                let buf = &mmap[start..end];
+                            if end <= mmap_ro.len() {
+                                let buf = &mmap_ro[start..end];
                                 if buf.len() > LENGTH_SIZE {
-                                    if let Ok(parsed) = validate_record(&buf[LENGTH_SIZE..], max_record_size) {
-                                        if let Ok(codec_entry) = CodecEntry::<RawBytes>::decode_from_slice(parsed.payload) {
+                                    if let Ok(parsed) =
+                                        validate_record(&buf[LENGTH_SIZE..], max_record_size)
+                                    {
+                                        if let Ok(codec_entry) =
+                                            CodecEntry::<RawBytes>::decode_from_slice(
+                                                parsed.payload,
+                                            )
+                                        {
                                             let entry: openraft::impls::Entry<C> =
-                                                openraft::impls::Entry::<C>::from_codec(codec_entry);
-                                            last_log_id = Some(openraft::entry::RaftEntry::log_id(&entry));
+                                                openraft::impls::Entry::<C>::from_codec(
+                                                    codec_entry,
+                                                );
+                                            last_log_id =
+                                                Some(openraft::entry::RaftEntry::log_id(&entry));
                                         }
                                     }
                                 }
@@ -918,32 +1094,21 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                         }
                     }
 
-                    segment_map.add_sealed(SealedSegment {
-                        segment_id: seg_id,
-                        mmap: Arc::new(mmap),
-                        valid_bytes: ft.valid_bytes,
+                    let mmap_raw = memmap2::MmapOptions::new().map_raw_read_only(&file)?;
+                    segment_map.add_sealed(Arc::new(Segment::new(
+                        seg_id,
+                        mmap_raw,
+                        valid as u64,
+                        None,
                         path,
-                    });
+                    )));
                     continue;
                 }
             }
 
             // SLOW PATH: full record decode
-            // Use footer.valid_bytes if available, manifest if available, else CRC scan
-            let valid = if let Some(ref ft) = footer {
-                ft.valid_bytes as usize
-            } else if let Some(meta) = manifest_segments.get(&seg_id) {
-                if meta.sealed {
-                    meta.valid_bytes as usize
-                } else {
-                    Self::scan_valid_bytes(&mmap)
-                }
-            } else {
-                Self::scan_valid_bytes(&mmap)
-            };
-
             Self::scan_records_into_index(
-                &mmap[..valid],
+                &mmap_ro[..valid],
                 seg_id,
                 group_id,
                 max_record_size,
@@ -953,29 +1118,20 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 &mut last_purged_log_id,
             );
 
-            // Track min/max from manifest or footer
-            if let Some(ref ft) = footer {
-                if let Some(min) = ft.min_entry_index {
-                    overall_first_index = Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
+            // Track min/max from manifest
+            if let Some(m) = meta {
+                if let Some(min) = m.min_index {
+                    overall_first_index =
+                        Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
                 }
-                if let Some(max) = ft.max_entry_index {
-                    overall_last_index = Some(overall_last_index.map_or(max, |v: u64| v.max(max)));
-                }
-            } else if let Some(meta) = manifest_segments.get(&seg_id) {
-                if let Some(min) = meta.min_index {
-                    overall_first_index = Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
-                }
-                if let Some(max) = meta.max_index {
+                if let Some(max) = m.max_index {
                     overall_last_index = Some(overall_last_index.map_or(max, |v: u64| v.max(max)));
                 }
             }
 
-            segment_map.add_sealed(SealedSegment {
-                segment_id: seg_id,
-                mmap: Arc::new(mmap),
-                valid_bytes: valid as u64,
-                path,
-            });
+            let mmap_raw = memmap2::MmapOptions::new().map_raw_read_only(&file)?;
+            segment_map
+                .add_sealed(Arc::new(Segment::new(seg_id, mmap_raw, valid as u64, None, path)));
         }
 
         // Open or create active (tail) segment
@@ -984,20 +1140,19 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             let mut active = ActiveMmapSegment::open_existing(&path, seg_id)?;
 
             // CRC-validate tail segment to find end of valid data
-            let valid = Self::scan_valid_bytes(&active.mmap);
+            let cap = active.segment.capacity();
+            let valid = Self::scan_valid_bytes(active.segment.as_slice(cap));
             active.current_size = valid as u64;
 
             // Zero-pad beyond valid_bytes for partial write protection
-            if valid < active.mmap.len() {
-                let zero_end = active.mmap.len().min(valid + 4096);
-                for byte in &mut active.mmap[valid..zero_end] {
-                    *byte = 0;
-                }
+            if valid < cap {
+                let zero_len = cap.min(valid + 4096) - valid;
+                unsafe { active.segment.zero_range(valid, zero_len) };
             }
 
             // Full record scan for tail (must decode everything)
             Self::scan_records_into_index(
-                &active.mmap[..valid],
+                active.segment.as_slice(valid),
                 seg_id,
                 group_id,
                 max_record_size,
@@ -1008,8 +1163,9 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             );
 
             // Update active's entry index range
-            active.min_entry_index = scan_first_entry_index(&active.mmap, valid);
-            active.max_entry_index = scan_last_entry_index(&active.mmap, valid);
+            let seg_slice = active.segment.as_slice(valid);
+            active.min_entry_index = scan_first_entry_index(seg_slice, valid);
+            active.max_entry_index = scan_last_entry_index(seg_slice, valid);
 
             if let Some(min) = active.min_entry_index {
                 overall_first_index = Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
@@ -1018,26 +1174,18 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 overall_last_index = Some(overall_last_index.map_or(max, |v: u64| v.max(max)));
             }
 
-            // Set active read view
-            if let Ok(reader_mmap) = active.create_reader_mmap() {
-                segment_map.update_active(ActiveReadView {
-                    segment_id: active.segment_id,
-                    mmap: reader_mmap,
-                    valid_bytes: active.current_size,
-                });
-            }
+            // Set active segment for readers — shares the same Segment (same mmap)
+            active
+                .segment
+                .logical_size
+                .store(active.current_size, Ordering::Release);
+            segment_map.set_active(active.segment.clone());
 
             active
         } else {
             // No segments exist — create first one
             let active = ActiveMmapSegment::create(group_dir, 1, config.segment_size)?;
-            if let Ok(reader_mmap) = active.create_reader_mmap() {
-                segment_map.update_active(ActiveReadView {
-                    segment_id: active.segment_id,
-                    mmap: reader_mmap,
-                    valid_bytes: 0,
-                });
-            }
+            segment_map.set_active(active.segment.clone());
             active
         };
 
@@ -1048,40 +1196,6 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             overall_first_index.unwrap_or(0)
         };
         let last_index = overall_last_index.unwrap_or(0);
-
-        // Populate cache from recent entries
-        let cache: DashMap<u64, Arc<C::Entry>> = DashMap::new();
-        let max_cache = config.max_cache_entries_per_group as u64;
-        if max_cache > 0 && last_index > 0 {
-            let cache_start = last_index
-                .saturating_sub(max_cache.saturating_sub(1))
-                .max(first_index);
-            for idx in cache_start..=last_index {
-                if let Some(loc) = log_index.get(idx) {
-                    if let Some((mmap, valid_bytes)) = segment_map.find_mmap(loc.segment_id) {
-                        let start = loc.offset as usize;
-                        let end = start + loc.len as usize;
-                        if end <= valid_bytes as usize && end <= mmap.len() {
-                            let buf = &mmap[start..end];
-                            if buf.len() >= LENGTH_SIZE {
-                                let record_data = &buf[LENGTH_SIZE..];
-                                if let Ok(parsed) = validate_record(record_data, max_record_size) {
-                                    if parsed.record_type == RecordType::Entry {
-                                        if let Ok(codec_entry) =
-                                            CodecEntry::<RawBytes>::decode_from_slice(parsed.payload)
-                                        {
-                                            let entry: openraft::impls::Entry<C> =
-                                                openraft::impls::Entry::<C>::from_codec(codec_entry);
-                                            cache.insert(idx, Arc::new(entry));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // Initialize atomic state
         let atomic_vote = AtomicVote::new();
@@ -1098,26 +1212,22 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         }
 
         // Initialize writer state — no writer thread, callers write directly
-        let fsync_file = Arc::new(active.file.try_clone()?);
         let active_seg_id = active.segment_id;
         let writer = WriterState {
             active,
             next_segment: None,
-            footer_tracker: SegmentFooterTracker::new(group_id, active_seg_id),
+            record_type_flags: RecordTypeFlags::default(),
             group_dir: group_dir.to_path_buf(),
             group_id,
-            fsync_file,
             vote_buf: Vec::new(),
         };
 
         let manifest_tx = manifest.sender();
 
         Ok(Self {
-            cache,
             vote: atomic_vote,
             first_index: AtomicU64::new(first_index),
             last_index: AtomicU64::new(last_index),
-            cache_low: AtomicU64::new(0),
             last_log_id: atomic_last_log_id,
             last_purged_log_id: atomic_last_purged,
             log_index,
@@ -1133,9 +1243,8 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
     fn scan_valid_bytes(data: &[u8]) -> usize {
         let mut offset = 0;
         while offset + LENGTH_SIZE <= data.len() {
-            let record_len = u32::from_le_bytes(
-                data[offset..offset + LENGTH_SIZE].try_into().unwrap(),
-            ) as usize;
+            let record_len =
+                u32::from_le_bytes(data[offset..offset + LENGTH_SIZE].try_into().unwrap()) as usize;
             if record_len == 0 {
                 break;
             }
@@ -1150,8 +1259,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             }
             // Quick CRC check
             let payload_end = record_data.len() - CRC64_SIZE;
-            let stored_crc =
-                u64::from_le_bytes(record_data[payload_end..].try_into().unwrap());
+            let stored_crc = u64::from_le_bytes(record_data[payload_end..].try_into().unwrap());
             let mut digest = crc64fast_nvme::Digest::new();
             digest.write(&record_data[..payload_end]);
             if digest.sum64() != stored_crc {
@@ -1187,9 +1295,8 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
 
         let mut offset = 0;
         while offset + LENGTH_SIZE <= data.len() {
-            let record_len = u32::from_le_bytes(
-                data[offset..offset + LENGTH_SIZE].try_into().unwrap(),
-            ) as usize;
+            let record_len =
+                u32::from_le_bytes(data[offset..offset + LENGTH_SIZE].try_into().unwrap()) as usize;
             if record_len == 0 || offset + LENGTH_SIZE + record_len > data.len() {
                 break;
             }
@@ -1223,9 +1330,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                         }
                     }
                     RecordType::Vote => {
-                        if let Ok(codec_vote) =
-                            CodecVote::decode_from_slice(parsed.payload)
-                        {
+                        if let Ok(codec_vote) = CodecVote::decode_from_slice(parsed.payload) {
                             *vote = Some(openraft::impls::Vote::<C> {
                                 leader_id: openraft::impls::leader_id_adv::LeaderId {
                                     term: codec_vote.leader_id.term,
@@ -1265,26 +1370,6 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         }
     }
 
-    /// Read a SegmentFooter from the end of an mmap'd segment file.
-    /// Returns None if no valid footer is found.
-    fn read_footer_from_mmap(mmap: &[u8]) -> Option<SegmentFooter> {
-        let footer_total = FOOTER_HEADER_SIZE + FOOTER_TRAILER_SIZE;
-        if mmap.len() < footer_total {
-            return None;
-        }
-        let footer_start = mmap.len() - footer_total;
-        let magic_offset = footer_start + FOOTER_HEADER_SIZE;
-        if magic_offset + 4 > mmap.len() {
-            return None;
-        }
-        let magic = u32::from_le_bytes(
-            mmap[magic_offset..magic_offset + 4].try_into().ok()?,
-        );
-        if magic != FOOTER_MAGIC {
-            return None;
-        }
-        SegmentFooter::decode(&mmap[footer_start..]).ok()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,20 +1401,21 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
             .as_ref()
             .map(|p| (**p).clone())
             .unwrap_or(base);
-        let manifest = tokio::task::spawn_blocking(move || {
-            match ManifestManager::open(&manifest_dir) {
+        let manifest =
+            tokio::task::spawn_blocking(move || match ManifestManager::open(&manifest_dir) {
                 Ok(manifest) => Ok(manifest),
-                Err(e) if e.raw_os_error() == Some(22) || e.kind() == io::ErrorKind::InvalidInput => {
+                Err(e)
+                    if e.raw_os_error() == Some(22) || e.kind() == io::ErrorKind::InvalidInput =>
+                {
                     Ok(ManifestManager::open_in_memory())
                 }
                 Err(e) => Err(e),
-            }
-        })
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+            })
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
 
         // Spawn single shared fsync thread for all groups
-        let fsync_state = Arc::new(FsyncState::new());
+        let fsync_state = Arc::new(FsyncState::new(config.fsync_delay));
         let fsync_clone = fsync_state.clone();
         std::thread::Builder::new()
             .name("mmap-raft-fsync".into())
@@ -1391,12 +1477,10 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
         let state = Arc::new(state);
         match self.groups.insert(group_id, state.clone()) {
             Ok(()) => Ok(state),
-            Err(_) => {
-                Ok(self
-                    .groups
-                    .get(group_id)
-                    .expect("group must exist after failed insert"))
-            }
+            Err(_) => Ok(self
+                .groups
+                .get(group_id)
+                .expect("group must exist after failed insert")),
         }
     }
 
@@ -1473,31 +1557,7 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
         self.group_id
     }
 
-    fn cache_window_start(&self) -> u64 {
-        let max = self.config.max_cache_entries_per_group;
-        if max == 0 {
-            return self
-                .state
-                .last_index
-                .load(Ordering::Relaxed)
-                .saturating_add(1);
-        }
-        let last = self.state.last_index.load(Ordering::Relaxed);
-        let first = self.state.first_index.load(Ordering::Relaxed);
-        let keep = max as u64;
-        last.saturating_sub(keep.saturating_sub(1)).max(first)
-    }
-
-    fn enforce_cache_window(&self) {
-        let start = self.cache_window_start();
-        let prev_low = self.state.cache_low.load(Ordering::Relaxed);
-        if prev_low < start {
-            self.state.cache.retain(|k, _| *k >= start);
-        }
-        self.state.cache_low.store(start, Ordering::Relaxed);
-    }
-
-    /// Read an entry from mmap by index (cache miss path)
+    /// Read an entry from mmap by index
     fn read_entry_from_mmap(&self, index: u64) -> io::Result<Option<C::Entry>>
     where
         C: RaftTypeConfig<
@@ -1515,18 +1575,19 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
             None => return Ok(None),
         };
 
-        let (mmap, valid_bytes) = match self.state.segment_map.find_mmap(loc.segment_id) {
-            Some(pair) => pair,
+        let segment = match self.state.segment_map.find_segment(loc.segment_id) {
+            Some(seg) => seg,
             None => return Ok(None),
         };
 
+        let valid_bytes = segment.logical_size.load(Ordering::Acquire) as usize;
         let start = loc.offset as usize;
         let end = start + loc.len as usize;
-        if end > valid_bytes as usize || end > mmap.len() {
+        if end > valid_bytes || end > segment.capacity() {
             return Ok(None);
         }
 
-        let buf = &mmap[start..end];
+        let buf = segment.read_slice(start, end - start);
         if buf.len() < LENGTH_SIZE {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short record"));
         }
@@ -1556,11 +1617,9 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
 
         let codec_entry = CodecEntry::<RawBytes>::decode_from_slice(parsed.payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let entry: openraft::impls::Entry<C> =
-            openraft::impls::Entry::<C>::from_codec(codec_entry);
+        let entry: openraft::impls::Entry<C> = openraft::impls::Entry::<C>::from_codec(codec_entry);
         Ok(Some(entry))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,18 +1662,7 @@ where
         let mut entries = Vec::with_capacity(expected_len);
 
         for idx in start..end {
-            // Fast path: cache hit
-            if let Some(entry) = self.state.cache.get(&idx) {
-                entries.push(entry.value().as_ref().clone());
-                continue;
-            }
-
-            // Slow path: mmap read
             if let Some(entry) = self.read_entry_from_mmap(idx)? {
-                if idx >= self.cache_window_start() {
-                    self.state.cache.insert(idx, Arc::new(entry.clone()));
-                    self.enforce_cache_window();
-                }
                 entries.push(entry);
             } else {
                 break;
@@ -1683,7 +1731,7 @@ where
             &self.payload_buf,
         );
         let data = writer.vote_buf.clone();
-        writer.footer_tracker.record_vote();
+        writer.record_type_flags.has_vote = true;
         writer.write_bytes(
             &data,
             &self.state.config,
@@ -1691,7 +1739,7 @@ where
             &self.state.manifest_tx,
             &self.state.fsync_state,
         )?;
-        writer.update_read_view(&self.state.segment_map);
+        writer.update_read_view();
         Ok(())
     }
 
@@ -1741,9 +1789,9 @@ where
                 openraft::EntryPayload::Membership(_) => {
                     // Rare: fall back to codec path for membership entries
                     let codec_entry: CodecEntry<RawBytes> = entry.to_codec();
-                    codec_entry.encode_into(&mut self.payload_buf).map_err(
-                        |e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
-                    )?;
+                    codec_entry
+                        .encode_into(&mut self.payload_buf)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 }
             }
 
@@ -1757,7 +1805,6 @@ where
             self.record_offsets
                 .push((index, record_start, record_len as u32));
 
-            self.state.cache.insert(index, Arc::new(entry));
             self.state.last_index.fetch_max(index, Ordering::Relaxed);
             last_log_id = Some(log_id);
         }
@@ -1768,7 +1815,7 @@ where
         }
 
         // Write directly into mmap — just a memcpy, no syscall
-        let fsync_file = {
+        let (segment, bytes_written) = {
             let mut writer = self.state.writer.lock();
             let file_offset = writer.write_bytes(
                 &self.encode_buf,
@@ -1793,10 +1840,10 @@ where
                     writer.active.min_entry_index = Some(entry_index);
                 }
                 writer.active.max_entry_index = Some(entry_index);
-                writer.footer_tracker.record_entry(entry_index);
+                writer.record_type_flags.has_entry = true;
             }
 
-            writer.update_read_view(&self.state.segment_map);
+            writer.update_read_view();
 
             // Check rotation after write
             if writer.active.current_size > self.state.config.segment_size {
@@ -1808,14 +1855,14 @@ where
                 )?;
             }
 
-            // Clone the fsync file handle before dropping the lock
-            writer.fsync_file.clone()
+            (writer.active.segment.clone(), writer.active.current_size)
         };
 
-        // Push callback with its file to the shared fsync thread
-        self.state.fsync_state.push(fsync_file, callback);
+        // Push callback onto the segment's queue, register for fsync
+        self.state
+            .fsync_state
+            .push(&segment, bytes_written, callback);
 
-        self.enforce_cache_window();
         Ok(())
     }
 
@@ -1824,12 +1871,6 @@ where
             Some(ref log_id) => log_id.index,
             None => 0,
         };
-
-        // Remove entries after truncation point from cache
-        let last = self.state.last_index.load(Ordering::Relaxed);
-        for idx in (index + 1)..=last {
-            self.state.cache.remove(&idx);
-        }
 
         // Update last index
         self.state.last_index.store(index, Ordering::Relaxed);
@@ -1853,37 +1894,38 @@ where
             }
 
             // If active segment has entries beyond truncation point, scan for new end
-            if writer.active.max_entry_index.map_or(false, |max| max > index) {
+            if writer
+                .active
+                .max_entry_index
+                .map_or(false, |max| max > index)
+            {
                 let new_size = scan_valid_bytes_up_to_index(
-                    &writer.active.mmap[..writer.active.current_size as usize],
+                    writer
+                        .active
+                        .segment
+                        .as_slice(writer.active.current_size as usize),
                     index,
                 );
                 writer.active.current_size = new_size as u64;
-                writer.active.max_entry_index = if index >= writer.active.min_entry_index.unwrap_or(0) {
-                    Some(index)
-                } else {
-                    None
-                };
+                writer.active.max_entry_index =
+                    if index >= writer.active.min_entry_index.unwrap_or(0) {
+                        Some(index)
+                    } else {
+                        None
+                    };
                 if writer.active.max_entry_index.is_none() {
                     writer.active.min_entry_index = None;
                 }
             }
 
-            writer.update_read_view(&self.state.segment_map);
+            writer.update_read_view();
         }
 
-        self.enforce_cache_window();
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<C>) -> Result<(), io::Error> {
         let index = log_id.index;
-
-        // Remove entries up to and including purge point from cache
-        let first = self.state.first_index.load(Ordering::Relaxed);
-        for idx in first..=index {
-            self.state.cache.remove(&idx);
-        }
 
         // Update first index and last_purged_log_id
         self.state.first_index.store(index + 1, Ordering::Relaxed);
@@ -1891,12 +1933,14 @@ where
 
         // Purge from LogIndex and remove old segments
         self.state.log_index.purge_to(index);
-        let removed = self.state.segment_map.remove_purged_segments(index, &self.state.log_index);
+        let removed = self
+            .state
+            .segment_map
+            .remove_purged_segments(index, &self.state.log_index);
         for path in &removed {
             let _ = std::fs::remove_file(path);
         }
 
-        self.enforce_cache_window();
         Ok(())
     }
 }
@@ -1976,8 +2020,8 @@ mod tests {
     use super::*;
     use openraft::type_config::async_runtime::{AsyncRuntime, oneshot::Oneshot};
     use serde::{Deserialize, Serialize};
-    use tempfile::TempDir;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct TestData(Vec<u8>);
@@ -2364,8 +2408,7 @@ mod tests {
     fn test_mmap_large_entries() {
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            let config = MmapStorageConfig::new(tmp.path())
-                .with_segment_size(1024 * 1024); // 1MB segments
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(1024 * 1024); // 1MB segments
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
 
             let mut log = storage.get_log_storage(0).await.unwrap();
@@ -2548,7 +2591,10 @@ mod tests {
                 })
                 .count();
             // Should have at least 2 segments (active + rotated, possibly pre-allocated next)
-            assert!(seg_count >= 2, "Expected at least 2 segments, got {seg_count}");
+            assert!(
+                seg_count >= 2,
+                "Expected at least 2 segments, got {seg_count}"
+            );
 
             // All entries should be readable across segments
             let result = log.try_get_log_entries(1..11).await.unwrap();
@@ -2606,7 +2652,8 @@ mod tests {
                 if file_len > 100 {
                     use std::io::Seek;
                     file.seek(std::io::SeekFrom::End(-50)).unwrap();
-                    file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04]).unwrap();
+                    file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04])
+                        .unwrap();
                 }
             }
         });
@@ -2628,11 +2675,11 @@ mod tests {
     }
 
     #[test]
-    fn test_mmap_footer_roundtrip_via_seal() {
+    fn test_mmap_seal_metadata_in_manifest() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().to_path_buf();
 
-        // Phase 1: Write entries and force rotation to create sealed segments with footers
+        // Phase 1: Write entries and force rotation to create sealed segments
         let path2 = path.clone();
         run_async(async move {
             let config = MmapStorageConfig::new(&path).with_segment_size(256);
@@ -2653,46 +2700,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
         });
 
-        // Phase 2: Verify sealed segments have footers
+        // Phase 2: Verify sealed segment metadata is in manifest
         run_async(async move {
-            let group_dir = path2.join("group_0");
-            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
-                .unwrap()
-                .filter_map(|e| {
-                    let e = e.ok()?;
-                    if e.file_name().to_string_lossy().ends_with(".log") {
-                        Some(e.path())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            seg_files.sort();
+            let manifest = ManifestManager::open(&path2).unwrap();
+            let segments = manifest.read_group_segments(0).unwrap();
 
-            let mut footers_found = 0;
-            // Check all sealed segments (all except last)
-            for seg_path in &seg_files[..seg_files.len().saturating_sub(1)] {
-                let data = std::fs::read(seg_path).unwrap();
-                let footer_total = FOOTER_HEADER_SIZE + FOOTER_TRAILER_SIZE;
-                if data.len() >= footer_total {
-                    let footer_start = data.len() - footer_total;
-                    let magic_offset = footer_start + FOOTER_HEADER_SIZE;
-                    if magic_offset + 4 <= data.len() {
-                        let magic = u32::from_le_bytes(
-                            data[magic_offset..magic_offset + 4].try_into().unwrap(),
-                        );
-                        if magic == FOOTER_MAGIC {
-                            let footer = SegmentFooter::decode(&data[footer_start..]).unwrap();
-                            assert!(footer.record_type_flags.has_entry);
-                            assert!(footer.valid_bytes > 0);
-                            assert!(footer.record_count > 0);
-                            footers_found += 1;
-                        }
-                    }
+            let mut sealed_count = 0;
+            for (_seg_id, meta) in &segments {
+                if meta.sealed {
+                    assert!(meta.record_type_flags.has_entry);
+                    assert!(meta.valid_bytes > 0);
+                    sealed_count += 1;
                 }
             }
 
-            assert!(footers_found > 0, "Expected at least one sealed segment with footer");
+            assert!(
+                sealed_count > 0,
+                "Expected at least one sealed segment in manifest"
+            );
         });
     }
 }

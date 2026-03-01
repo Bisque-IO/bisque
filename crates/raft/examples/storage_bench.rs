@@ -228,13 +228,15 @@ impl BenchStorage for MmapStorage {
     fn create(
         dir: PathBuf,
         segment_size: u64,
-        _fsync_interval: Option<Duration>,
-        max_cache: usize,
+        fsync_interval: Option<Duration>,
+        _max_cache: usize,
     ) -> impl Future<Output = io::Result<Self>> + Send {
         async move {
-            let cfg = MmapStorageConfig::new(dir)
-                .with_segment_size(segment_size)
-                .with_max_cache_entries(max_cache);
+            let mut cfg = MmapStorageConfig::new(dir)
+                .with_segment_size(segment_size);
+            if let Some(interval) = fsync_interval {
+                cfg = cfg.with_fsync_delay(interval);
+            }
             Ok(Self(MmapPerGroupLogStorage::<C>::new(cfg).await?))
         }
     }
@@ -344,6 +346,7 @@ async fn bench_write<S: BenchStorage>(
 
     let start = Instant::now();
     let mut index = 1u64;
+    let mut pending = Vec::new();
 
     while index <= total {
         let end = (index + batch).min(total + 1);
@@ -352,12 +355,17 @@ async fn bench_write<S: BenchStorage>(
 
         let (tx, rx) = oneshot();
         group.append(entries, IOFlushed::<C>::signal(tx)).await?;
+        pending.push(rx);
+
+        index += count as u64;
+    }
+
+    // Wait for all writes to be durable
+    for rx in pending {
         let result: Result<(), io::Error> = rx
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("callback recv: {}", e)))?;
         result?;
-
-        index += count as u64;
     }
 
     let elapsed = start.elapsed();
@@ -387,6 +395,7 @@ async fn bench_read_seq<S: BenchStorage>(
     let batch = cfg.batch_size as u64;
 
     let mut index = 1u64;
+    let mut pending = Vec::new();
     while index <= total {
         let end = (index + batch).min(total + 1);
         let entries: Vec<_> = (index..end).map(|i| make_entry(i, &payload)).collect();
@@ -394,8 +403,11 @@ async fn bench_read_seq<S: BenchStorage>(
 
         let (tx, rx) = oneshot();
         group.append(entries, IOFlushed::<C>::signal(tx)).await?;
-        let _ = rx.await;
+        pending.push(rx);
         index += count as u64;
+    }
+    for rx in pending {
+        let _ = rx.await;
     }
 
     // Drop all handles and re-open with minimal cache (cold reads)
@@ -451,6 +463,7 @@ async fn bench_read_random<S: BenchStorage>(
     let batch = cfg.batch_size as u64;
 
     let mut index = 1u64;
+    let mut pending = Vec::new();
     while index <= total {
         let end = (index + batch).min(total + 1);
         let entries: Vec<_> = (index..end).map(|i| make_entry(i, &payload)).collect();
@@ -458,8 +471,11 @@ async fn bench_read_random<S: BenchStorage>(
 
         let (tx, rx) = oneshot();
         group.append(entries, IOFlushed::<C>::signal(tx)).await?;
-        let _ = rx.await;
+        pending.push(rx);
         index += count as u64;
+    }
+    for rx in pending {
+        let _ = rx.await;
     }
 
     // Drop all handles and re-open cold
@@ -521,9 +537,10 @@ async fn bench_multi_group_write<S: BenchStorage>(
     }
 
     let start = Instant::now();
+    let mut pending = Vec::new();
 
     for round in 0..(entries_per_group / batch_size) {
-        for (g, group) in groups.iter_mut().enumerate() {
+        for (_g, group) in groups.iter_mut().enumerate() {
             let base = round * batch_size + 1;
             let entries: Vec<_> = (0..batch_size)
                 .map(|i| make_entry(base + i, &payload))
@@ -531,14 +548,15 @@ async fn bench_multi_group_write<S: BenchStorage>(
 
             let (tx, rx) = oneshot();
             group.append(entries, IOFlushed::<C>::signal(tx)).await?;
-            let result: Result<(), io::Error> = rx.await.map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("group {} callback recv: {}", g, e),
-                )
-            })?;
-            result?;
+            pending.push(rx);
         }
+    }
+
+    for rx in pending {
+        let result: Result<(), io::Error> = rx
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("callback recv: {}", e)))?;
+        result?;
     }
 
     let elapsed = start.elapsed();

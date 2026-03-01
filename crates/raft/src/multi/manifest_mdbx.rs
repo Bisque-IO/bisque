@@ -3,6 +3,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use super::segment_footer::RecordTypeFlags;
 use crossfire::{MAsyncTx, Rx, TryRecvError, mpsc::Array};
 use libmdbx::{
     Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, Table, TableFlags, WriteFlags,
@@ -24,6 +25,9 @@ pub(crate) struct SegmentMeta {
     pub(crate) max_ts: Option<u64>,
     /// True if this segment is sealed (not the current head).
     pub(crate) sealed: bool,
+    /// Record types present in this segment (entries, votes, truncates, purges).
+    /// Used for fast-path recovery: entry-only segments skip full CRC decode.
+    pub(crate) record_type_flags: RecordTypeFlags,
 }
 
 impl SegmentMeta {
@@ -33,6 +37,7 @@ impl SegmentMeta {
 
         self.valid_bytes = self.valid_bytes.max(other.valid_bytes);
         self.sealed |= other.sealed;
+        self.record_type_flags = self.record_type_flags.merge(other.record_type_flags);
 
         match (self.min_index, other.min_index) {
             (None, x) => self.min_index = x,
@@ -64,7 +69,7 @@ impl SegmentMeta {
     }
 
     fn encode_value(&self) -> [u8; 48] {
-        // [flags:1][pad:7][valid:8][min_i:8][max_i:8][min_ts:8][max_ts:8]
+        // [flags:1][record_type_flags:1][pad:6][valid:8][min_i:8][max_i:8][min_ts:8][max_ts:8]
         let mut v = [0u8; 48];
         let mut flags = 0u8;
         if self.min_index.is_some() && self.max_index.is_some() {
@@ -77,6 +82,7 @@ impl SegmentMeta {
             flags |= 1 << 2;
         }
         v[0] = flags;
+        v[1] = self.record_type_flags.to_u8();
         v[8..16].copy_from_slice(&self.valid_bytes.to_be_bytes());
         let min_i = self.min_index.unwrap_or(0);
         let max_i = self.max_index.unwrap_or(0);
@@ -94,6 +100,7 @@ impl SegmentMeta {
             return None;
         }
         let flags = bytes[0];
+        let record_type_flags = RecordTypeFlags::from_u8(bytes[1]);
         let valid_bytes = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
         let min_i = u64::from_be_bytes(bytes[16..24].try_into().ok()?);
         let max_i = u64::from_be_bytes(bytes[24..32].try_into().ok()?);
@@ -113,6 +120,7 @@ impl SegmentMeta {
             min_ts: if has_ts { Some(min_ts) } else { None },
             max_ts: if has_ts { Some(max_ts) } else { None },
             sealed,
+            record_type_flags,
         })
     }
 }
@@ -380,6 +388,7 @@ mod tests {
             min_ts: None,
             max_ts: None,
             sealed: false,
+            record_type_flags: RecordTypeFlags::default(),
         }
     }
 
@@ -394,6 +403,7 @@ mod tests {
             min_ts: None,
             max_ts: None,
             sealed: false,
+            record_type_flags: RecordTypeFlags::default(),
         };
 
         let key = meta.key_bytes();
@@ -420,6 +430,7 @@ mod tests {
             min_ts: None,
             max_ts: None,
             sealed: false,
+            record_type_flags: RecordTypeFlags::default(),
         };
 
         let encoded = meta.encode_value();
@@ -446,6 +457,7 @@ mod tests {
             min_ts: Some(1234567890),
             max_ts: Some(9876543210),
             sealed: true,
+            record_type_flags: RecordTypeFlags::default(),
         };
 
         let encoded = meta.encode_value();
@@ -473,6 +485,7 @@ mod tests {
             min_ts: None,
             max_ts: None,
             sealed: false,
+            record_type_flags: RecordTypeFlags::default(),
         };
 
         let encoded = meta.encode_value();
@@ -496,6 +509,7 @@ mod tests {
             min_ts: Some(1000),
             max_ts: Some(2000),
             sealed: true,
+            record_type_flags: RecordTypeFlags::default(),
         };
 
         let encoded = meta.encode_value();
@@ -528,6 +542,7 @@ mod tests {
             min_ts: Some(u64::MAX),
             max_ts: Some(u64::MAX),
             sealed: true,
+            record_type_flags: RecordTypeFlags::default(),
         };
 
         let encoded = meta.encode_value();
@@ -722,6 +737,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             };
             manifest
                 .apply_segment_updates(std::iter::once(meta))
@@ -754,6 +770,7 @@ mod tests {
             min_ts: Some(1234567890),
             max_ts: Some(9876543210),
             sealed: true,
+            record_type_flags: RecordTypeFlags::default(),
         };
 
         manifest
@@ -789,6 +806,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: true,
+                record_type_flags: RecordTypeFlags::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -799,6 +817,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: true,
+                record_type_flags: RecordTypeFlags::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -809,6 +828,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
         ];
 
@@ -842,6 +862,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
             SegmentMeta {
                 group_id: 2,
@@ -852,6 +873,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
             SegmentMeta {
                 group_id: 3,
@@ -862,6 +884,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
         ];
 
@@ -900,6 +923,7 @@ mod tests {
             min_ts: None,
             max_ts: None,
             sealed: false,
+            record_type_flags: RecordTypeFlags::default(),
         };
         manifest
             .apply_segment_updates(std::iter::once(meta1))
@@ -915,6 +939,7 @@ mod tests {
             min_ts: None,
             max_ts: None,
             sealed: true,
+            record_type_flags: RecordTypeFlags::default(),
         };
         manifest
             .apply_segment_updates(std::iter::once(meta2))
@@ -944,6 +969,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -954,6 +980,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -964,6 +991,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
         ];
 
@@ -992,6 +1020,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -1002,6 +1031,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -1012,6 +1042,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             },
         ];
 
@@ -1058,6 +1089,7 @@ mod tests {
             min_ts: None,
             max_ts: None,
             sealed: false,
+            record_type_flags: RecordTypeFlags::default(),
         };
 
         // Send async (try_send for test since send() is async)
@@ -1088,6 +1120,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: i == 10,
+                record_type_flags: RecordTypeFlags::default(),
             };
             sender.try_send(meta).unwrap();
         }
@@ -1124,6 +1157,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             };
             sender.try_send(meta).unwrap();
         }
@@ -1154,6 +1188,7 @@ mod tests {
             min_ts: None,
             max_ts: None,
             sealed: false,
+            record_type_flags: RecordTypeFlags::default(),
         };
         sender1.try_send(meta).unwrap();
 
@@ -1187,6 +1222,7 @@ mod tests {
                 min_ts: None,
                 max_ts: None,
                 sealed: false,
+                record_type_flags: RecordTypeFlags::default(),
             };
             sender.try_send(meta).unwrap();
         }

@@ -1618,6 +1618,7 @@ impl SegmentedLog {
             min_ts: self.min_ts,
             max_ts: self.max_ts,
             sealed: true,
+            record_type_flags: self.footer_tracker.record_type_flags,
         });
 
         self.current_segment_id += 1;
@@ -1653,6 +1654,7 @@ impl SegmentedLog {
             min_ts: self.min_ts,
             max_ts: self.max_ts,
             sealed: false,
+            record_type_flags: self.footer_tracker.record_type_flags,
         };
         let _ = self.manifest_tx.try_send(current);
     }

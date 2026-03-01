@@ -22,7 +22,9 @@ openraft = { workspace = true, features = ["tokio-rt"] }
 crc64fast-nvme = { workspace = true }
 congee = { workspace = true }
 dashmap = { workspace = true }
+arc-swap = { workspace = true }
 crossfire = "3.1"
+lru = { workspace = true }
 flume = "0.12"
 libmdbx = "0.6"
 memmap2 = { workspace = true }
