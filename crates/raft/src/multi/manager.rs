@@ -1,0 +1,530 @@
+use crate::multi::config::MultiRaftConfig;
+use crate::multi::network::GroupNetworkFactory;
+use crate::multi::network::MultiRaftNetworkFactory;
+use crate::multi::network::MultiplexedTransport;
+use crate::multi::storage::MultiRaftLogStorage;
+use dashmap::DashMap;
+use tokio::io::{AsyncRead, AsyncWrite};
+use openraft::Config;
+use openraft::Raft;
+use openraft::RaftTypeConfig;
+use openraft::storage::RaftStateMachine;
+use std::marker::Unpin;
+use std::sync::Arc;
+
+/// Manager for multiple Raft groups.
+///
+/// The manager handles:
+/// - Group lifecycle (add/remove groups)
+/// - Shared transport layer for all groups
+/// - Log storage (multiplexed across groups)
+///
+/// State machines are provided externally when adding groups since
+/// different groups may have completely different state machine types.
+pub struct MultiRaftManager<
+    C: RaftTypeConfig,
+    T: MultiplexedTransport<C>,
+    S: MultiRaftLogStorage<C>,
+> {
+    groups: DashMap<u64, Raft<C>>,
+    network_factory: Arc<MultiRaftNetworkFactory<C, T>>,
+    storage: Arc<S>,
+    config: MultiRaftConfig,
+}
+
+impl<C, T, S> MultiRaftManager<C, T, S>
+where
+    C: RaftTypeConfig,
+    T: MultiplexedTransport<C>,
+    S: MultiRaftLogStorage<C>,
+{
+    pub fn new(transport: T, storage: S, config: MultiRaftConfig) -> Self
+    where
+        C::SnapshotData: AsyncRead + AsyncWrite + Unpin,
+        C::Entry: Clone,
+    {
+        Self {
+            groups: DashMap::new(),
+            network_factory: Arc::new(MultiRaftNetworkFactory::new(
+                Arc::new(transport),
+                config.clone(),
+            )),
+            storage: Arc::new(storage),
+            config,
+        }
+    }
+
+    /// Add a new Raft group with the provided state machine.
+    ///
+    /// Each group can have its own state machine type/implementation.
+    /// The log storage is obtained from the shared multiplexed storage.
+    pub async fn add_group<SM>(
+        &self,
+        group_id: u64,
+        node_id: C::NodeId,
+        raft_config: Arc<Config>,
+        state_machine: SM,
+    ) -> Result<Raft<C>, openraft::error::Fatal<C>>
+    where
+        C::SnapshotData: AsyncRead + AsyncWrite + Unpin,
+        C::Entry: Clone,
+        SM: RaftStateMachine<C>,
+    {
+        let group_factory = GroupNetworkFactory::new(self.network_factory.clone(), group_id);
+        let log_store = self.storage.get_log_storage(group_id).await;
+
+        let raft = Raft::new(
+            node_id,
+            raft_config,
+            group_factory,
+            log_store,
+            state_machine,
+        )
+        .await?;
+
+        self.groups.insert(group_id, raft.clone());
+        Ok(raft)
+    }
+
+    /// Get a handle to an existing group
+    pub fn get_group(&self, group_id: u64) -> Option<Raft<C>> {
+        self.groups.get(&group_id).map(|r| r.clone())
+    }
+
+    /// Remove a group, shutting down its Raft instance
+    pub async fn remove_group(&self, group_id: u64) {
+        if let Some((_, raft)) = self.groups.remove(&group_id) {
+            let _ = raft.shutdown().await;
+        }
+        // Also remove from storage
+        self.storage.remove_group(group_id);
+    }
+
+    /// Get all active group IDs
+    pub fn group_ids(&self) -> Vec<u64> {
+        self.groups.iter().map(|e| *e.key()).collect()
+    }
+
+    /// Get the number of active groups
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multi::test_support::run_async;
+    use crate::multi::type_config::ManiacRaftTypeConfig;
+    use dashmap::DashMap;
+    use openraft::error::{InstallSnapshotError, RPCError, RaftError};
+    use openraft::raft::{
+        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+        InstallSnapshotResponse, VoteRequest, VoteResponse,
+    };
+    use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine};
+    use openraft::{LogId, OptionalSend};
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Test data type that implements AppData
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct TestData(Vec<u8>);
+
+    impl fmt::Display for TestData {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "TestData({} bytes)", self.0.len())
+        }
+    }
+
+    impl From<Vec<u8>> for TestData {
+        fn from(v: Vec<u8>) -> Self {
+            TestData(v)
+        }
+    }
+
+    impl From<TestData> for Vec<u8> {
+        fn from(t: TestData) -> Self {
+            t.0
+        }
+    }
+
+    type TestConfig = ManiacRaftTypeConfig<TestData, ()>;
+
+    // In-memory log storage for testing
+    #[derive(Clone)]
+    struct InMemoryLogStorage {
+        log: Arc<DashMap<u64, openraft::impls::Entry<TestConfig>>>,
+        vote: Arc<parking_lot::RwLock<Option<openraft::impls::Vote<TestConfig>>>>,
+        last_purged: Arc<AtomicU64>,
+    }
+
+    impl InMemoryLogStorage {
+        fn new() -> Self {
+            Self {
+                log: Arc::new(DashMap::new()),
+                vote: Arc::new(parking_lot::RwLock::new(None)),
+                last_purged: Arc::new(AtomicU64::new(0)),
+            }
+        }
+    }
+
+    impl RaftLogStorage<TestConfig> for InMemoryLogStorage {
+        type LogReader = Self;
+
+        async fn get_log_state(&mut self) -> Result<LogState<TestConfig>, std::io::Error> {
+            let last_log_id = self
+                .log
+                .iter()
+                .max_by_key(|e| *e.key())
+                .map(|e| e.value().log_id);
+            let last_purged_index = self.last_purged.load(Ordering::Relaxed);
+            let last_purged_log_id = if last_purged_index > 0 {
+                self.log.get(&last_purged_index).map(|e| e.value().log_id)
+            } else {
+                None
+            };
+
+            Ok(LogState {
+                last_purged_log_id,
+                last_log_id,
+            })
+        }
+
+        async fn get_log_reader(&mut self) -> Self::LogReader {
+            self.clone()
+        }
+
+        async fn save_vote(
+            &mut self,
+            vote: &openraft::impls::Vote<TestConfig>,
+        ) -> Result<(), std::io::Error> {
+            *self.vote.write() = Some(vote.clone());
+            Ok(())
+        }
+
+        async fn append<I>(
+            &mut self,
+            entries: I,
+            callback: IOFlushed<TestConfig>,
+        ) -> Result<(), std::io::Error>
+        where
+            I: IntoIterator<Item = openraft::impls::Entry<TestConfig>> + Send,
+        {
+            for entry in entries {
+                self.log.insert(entry.log_id.index, entry);
+            }
+            callback.io_completed(Ok(()));
+            Ok(())
+        }
+
+        async fn truncate_after(&mut self, after: Option<LogId<TestConfig>>) -> Result<(), std::io::Error> {
+            match after {
+                Some(log_id) => {
+                    let keys: Vec<u64> = self
+                        .log
+                        .iter()
+                        .filter(|e| e.key() > &log_id.index)
+                        .map(|e| *e.key())
+                        .collect();
+                    for key in keys {
+                        self.log.remove(&key);
+                    }
+                }
+                None => {
+                    self.log.clear();
+                }
+            }
+            Ok(())
+        }
+
+        async fn purge(&mut self, log_id: LogId<TestConfig>) -> Result<(), std::io::Error> {
+            let keys: Vec<u64> = self
+                .log
+                .iter()
+                .filter(|e| e.key() <= &log_id.index)
+                .map(|e| *e.key())
+                .collect();
+            for key in keys {
+                self.log.remove(&key);
+            }
+            self.last_purged.store(log_id.index, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    impl RaftLogReader<TestConfig> for InMemoryLogStorage {
+        async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Send>(
+            &mut self,
+            range: RB,
+        ) -> Result<Vec<openraft::impls::Entry<TestConfig>>, std::io::Error> {
+            let entries: Vec<_> = self
+                .log
+                .iter()
+                .filter(|e| range.contains(e.key()))
+                .map(|e| e.value().clone())
+                .collect();
+            Ok(entries)
+        }
+
+        async fn read_vote(
+            &mut self,
+        ) -> Result<Option<openraft::impls::Vote<TestConfig>>, std::io::Error> {
+            Ok(self.vote.read().clone())
+        }
+    }
+
+    // In-memory multi-raft storage
+    struct InMemoryMultiStorage {
+        storages: Arc<DashMap<u64, InMemoryLogStorage>>,
+    }
+
+    impl InMemoryMultiStorage {
+        fn new() -> Self {
+            Self {
+                storages: Arc::new(DashMap::new()),
+            }
+        }
+    }
+
+    impl MultiRaftLogStorage<TestConfig> for InMemoryMultiStorage {
+        type GroupLogStorage = InMemoryLogStorage;
+
+        async fn get_log_storage(&self, group_id: u64) -> Self::GroupLogStorage {
+            self.storages
+                .entry(group_id)
+                .or_insert_with(InMemoryLogStorage::new)
+                .clone()
+        }
+
+        fn remove_group(&self, group_id: u64) {
+            self.storages.remove(&group_id);
+        }
+
+        fn group_ids(&self) -> Vec<u64> {
+            self.storages.iter().map(|e| *e.key()).collect()
+        }
+    }
+
+    // Simple state machine for testing
+    #[derive(Clone)]
+    struct TestStateMachine {
+        data: Arc<parking_lot::RwLock<BTreeMap<String, Vec<u8>>>>,
+    }
+
+    impl TestStateMachine {
+        fn new() -> Self {
+            Self {
+                data: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+            }
+        }
+    }
+
+    impl RaftStateMachine<TestConfig> for TestStateMachine {
+        type SnapshotBuilder = Self;
+
+        async fn applied_state(
+            &mut self,
+        ) -> Result<
+            (
+                Option<LogId<TestConfig>>,
+                openraft::StoredMembership<TestConfig>,
+            ),
+            std::io::Error,
+        > {
+            Ok((None, openraft::StoredMembership::default()))
+        }
+
+        async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), std::io::Error>
+        where
+            Strm: futures::Stream<
+                    Item = Result<openraft::storage::EntryResponder<TestConfig>, std::io::Error>,
+                > + Unpin
+                + OptionalSend,
+        {
+            use futures::StreamExt;
+            while let Some(Ok((entry, responder))) = entries.next().await {
+                if let openraft::EntryPayload::Normal(data) = &entry.payload {
+                    let key = format!("key_{}", entry.log_id.index);
+                    self.data.write().insert(key, data.clone().into());
+                }
+                if let Some(r) = responder {
+                    r.send(());
+                }
+            }
+            Ok(())
+        }
+
+        async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+            self.clone()
+        }
+
+        async fn begin_receiving_snapshot(
+            &mut self,
+        ) -> Result<std::io::Cursor<Vec<u8>>, std::io::Error> {
+            Ok(std::io::Cursor::new(Vec::new()))
+        }
+
+        async fn install_snapshot(
+            &mut self,
+            _meta: &openraft::storage::SnapshotMeta<TestConfig>,
+            snapshot: std::io::Cursor<Vec<u8>>,
+        ) -> Result<(), std::io::Error> {
+            let _ = snapshot.into_inner();
+            Ok(())
+        }
+
+        async fn get_current_snapshot(
+            &mut self,
+        ) -> Result<Option<openraft::storage::Snapshot<TestConfig>>, std::io::Error> {
+            Ok(None)
+        }
+    }
+
+    impl openraft::RaftSnapshotBuilder<TestConfig> for TestStateMachine {
+        async fn build_snapshot(
+            &mut self,
+        ) -> Result<openraft::storage::Snapshot<TestConfig>, std::io::Error> {
+            let data = self.data.read();
+            let content = bincode::serde::encode_to_vec(&*data, bincode::config::standard())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let meta = openraft::storage::SnapshotMeta {
+                last_log_id: None,
+                last_membership: openraft::StoredMembership::default(),
+                snapshot_id: "test-snapshot".to_string(),
+            };
+            Ok(openraft::storage::Snapshot {
+                meta,
+                snapshot: std::io::Cursor::new(content),
+            })
+        }
+    }
+
+    // Fake transport for manager tests
+    struct FakeTransport;
+
+    impl MultiplexedTransport<TestConfig> for FakeTransport {
+        async fn send_append_entries(
+            &self,
+            _target: u64,
+            _group_id: u64,
+            _rpc: AppendEntriesRequest<TestConfig>,
+        ) -> Result<AppendEntriesResponse<TestConfig>, RPCError<TestConfig, RaftError<TestConfig>>>
+        {
+            Ok(AppendEntriesResponse::Success)
+        }
+
+        async fn send_vote(
+            &self,
+            _target: u64,
+            _group_id: u64,
+            _rpc: VoteRequest<TestConfig>,
+        ) -> Result<VoteResponse<TestConfig>, RPCError<TestConfig, RaftError<TestConfig>>> {
+            Ok(VoteResponse {
+                vote: openraft::impls::Vote::new(1, 1),
+                vote_granted: true,
+                last_log_id: None,
+            })
+        }
+
+        async fn send_install_snapshot(
+            &self,
+            _target: u64,
+            _group_id: u64,
+            _rpc: InstallSnapshotRequest<TestConfig>,
+        ) -> Result<
+            InstallSnapshotResponse<TestConfig>,
+            RPCError<TestConfig, RaftError<TestConfig, InstallSnapshotError>>,
+        > {
+            Ok(InstallSnapshotResponse {
+                vote: openraft::impls::Vote::new(1, 1),
+            })
+        }
+
+        async fn send_heartbeat_batch(
+            &self,
+            _target: u64,
+            _batch: &[(u64, AppendEntriesRequest<TestConfig>)],
+        ) -> Result<
+            Vec<(u64, AppendEntriesResponse<TestConfig>)>,
+            RPCError<TestConfig, RaftError<TestConfig>>,
+        > {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn test_add_and_get_group() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let config = MultiRaftConfig::default();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage, config));
+
+            let raft_config = Arc::new(openraft::Config::default());
+            let state_machine = TestStateMachine::new();
+
+            let _raft = manager
+                .add_group(1, 1, raft_config, state_machine)
+                .await
+                .expect("Failed to add group");
+
+            assert!(manager.get_group(1).is_some());
+            assert_eq!(manager.group_count(), 1);
+            assert_eq!(manager.group_ids(), vec![1]);
+        });
+    }
+
+    #[test]
+    fn test_multiple_groups_isolation() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let config = MultiRaftConfig::default();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage, config));
+
+            let raft_config = Arc::new(openraft::Config::default());
+
+            let _raft1 = manager
+                .add_group(1, 1, raft_config.clone(), TestStateMachine::new())
+                .await
+                .expect("Failed to add group 1");
+
+            let _raft2 = manager
+                .add_group(2, 1, raft_config.clone(), TestStateMachine::new())
+                .await
+                .expect("Failed to add group 2");
+
+            assert_eq!(manager.group_count(), 2);
+            let mut group_ids = manager.group_ids();
+            group_ids.sort();
+            assert_eq!(group_ids, vec![1, 2]);
+        });
+    }
+
+    #[test]
+    fn test_remove_group() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let config = MultiRaftConfig::default();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage, config));
+
+            let raft_config = Arc::new(openraft::Config::default());
+
+            let _raft = manager
+                .add_group(1, 1, raft_config, TestStateMachine::new())
+                .await
+                .expect("Failed to add group");
+
+            assert_eq!(manager.group_count(), 1);
+
+            manager.remove_group(1).await;
+
+            assert_eq!(manager.group_count(), 0);
+            assert!(manager.get_group(1).is_none());
+        });
+    }
+}

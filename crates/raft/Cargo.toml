@@ -1,0 +1,57 @@
+[package]
+name = "bisque-raft"
+version = "0.1.0"
+edition = "2024"
+authors = ["Bisque Team"]
+description = "Tokio runtime adapter for OpenRaft consensus"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bisque-io/bisque"
+keywords = ["raft", "consensus", "distributed", "async"]
+categories = ["asynchronous", "network-programming"]
+
+[features]
+default = ["multi"]
+multi = []
+
+[dependencies]
+futures = { workspace = true }
+# Upstream openraft
+openraft = { workspace = true, features = ["tokio-rt"] }
+
+# Other dependencies
+crc64fast-nvme = { workspace = true }
+congee = { workspace = true }
+dashmap = { workspace = true }
+crossfire = "3.1"
+flume = "0.12"
+libmdbx = "0.6"
+memmap2 = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+bincode = { version = "2.0.1", features = ["serde"] }
+chrono = { workspace = true }
+futures-lite = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3.10"
+
+[[example]]
+name = "multi_raft_cluster"
+path = "examples/multi_raft_cluster.rs"
+
+[[example]]
+name = "network_stress_test"
+path = "examples/network_stress_test.rs"
+
+[[example]]
+name = "storage_bench"
+path = "examples/storage_bench.rs"
+
+[profile.release]
+debug = true

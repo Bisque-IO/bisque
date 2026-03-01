@@ -11,8 +11,8 @@ members = [
     # "crates/maniac-sys",
     # "crates/maniac-usockets",
     # "crates/macros",
-    # "crates/maniac",
-    # "crates/raft",           # maniac-raft: OpenRaft adapter for Maniac runtime
+    "crates/maniac",
+    "crates/raft",           # maniac-raft: OpenRaft adapter for Maniac runtime
     # "moon/rapp",
     # "crates/rusqlite",
     # "crates/libsql-ffi",
@@ -23,7 +23,7 @@ members = [
     # "crates/wasmtime",
     #    "crates/sanakirja-core",
     #    "crates/sanakirja",
-    "crates/bisque-runtime",
+    # "crates/bisque-runtime",
 ]
 resolver = "2"
 edition = "2024"
@@ -102,6 +102,7 @@ proc-macro2 = "1.0.60"
 proptest = "1.0"
 quote = "1"
 rand = "0.9"
+rcgen = "0.13"
 reusable-box-future = { version = "0.2" }
 rlsf = "0.2"
 rustc-hash = "2.0"

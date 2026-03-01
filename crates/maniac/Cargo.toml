@@ -33,6 +33,18 @@ name = "io_pool_example"
 required-features = ["io-driver"]
 
 [[example]]
+name = "tcp_echo_tokio"
+required-features = ["io-driver", "tokio-bench"]
+
+[[example]]
+name = "tcp_benchmark"
+required-features = ["io-driver", "tokio-bench"]
+
+[[example]]
+name = "tcp_echo_tls"
+required-features = ["tls"]
+
+[[example]]
 name = "benchmark_striped_arc"
 
 [dependencies]
@@ -45,11 +57,11 @@ getrandom = "0.4"
 # IO driver dependencies
 io-uring = { version = "0.7", optional = true }
 log = "0.4"
-mio = { version = "1.1", features = [
-  "net",
-  "os-poll",
-  "os-ext",
-], optional = true }
+# mio = { version = "1.1", features = [
+#   "net",
+#   "os-poll",
+#   "os-ext",
+# ], optional = true }
 polling = { version = "3.11", optional = true }
 parking_lot = "0.12"
 paste = "1.0"
@@ -58,13 +70,18 @@ snmalloc-rs = "0.3"
 socket2 = { version = "0.6", optional = true }
 tokio = { version = "1", features = [
   "rt-multi-thread",
+  "macros",
   "sync",
   "time",
 ], optional = true }
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"], optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
 wide = { version = "1.1", optional = true }
 
 [dev-dependencies]
 comfy-table = "7.1"
+rcgen = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
@@ -89,12 +106,14 @@ io-driver = [
   "arrayvec",
   "atomic-waker",
   "flume",
-  "io-uring",
-  "mio",
+  "iouring",
+  # "mio",
   "polling",
   "socket2",
 ]
+iouring = ["io-uring"]
 simd = ["wide"]
+tls = ["rustls", "webpki-roots", "rustls-pemfile", "io-driver"]
 tokio-bench = ["tokio"]
 # Nightly/optional features for buf module
 allocator_api = []
