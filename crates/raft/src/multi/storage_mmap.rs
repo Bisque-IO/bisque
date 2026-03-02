@@ -27,8 +27,9 @@ use crate::multi::codec::{
 use crate::multi::manifest_mdbx::{ManifestManager, SegmentMeta};
 use crate::multi::segment_footer::RecordTypeFlags;
 use crate::multi::storage_impl::{
-    AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, LENGTH_SIZE, LogIndex, LogLocation,
-    MAX_GROUPS, MultiplexedStorage, RecordType, append_record_into, validate_record,
+    AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, HEADER_SIZE, LENGTH_SIZE, LogIndex,
+    LogLocation, MAX_GROUPS, MultiplexedStorage, RecordType, append_record_into, validate_record,
+    write_u24_le,
 };
 use arc_swap::ArcSwap;
 use crossfire::{MAsyncTx, mpsc::Array};
@@ -107,6 +108,13 @@ impl MmapStorageConfig {
         self.fsync_delay = delay;
         self
     }
+}
+
+/// Metadata extracted during a full record scan.
+struct ScanMeta {
+    record_type_flags: RecordTypeFlags,
+    min_entry_index: Option<u64>,
+    max_entry_index: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +453,25 @@ struct SealRequest {
     manifest_tx: MAsyncTx<Array<SegmentMeta>>,
 }
 
+/// Result of a background pre-allocation: pending, completed, or failed.
+enum PreallocResult {
+    /// Background thread hasn't finished yet
+    Pending,
+    /// Segment created successfully
+    Ready(ActiveMmapSegment),
+    /// Creation failed — caller should fall back to synchronous create
+    Failed,
+}
+
+/// Request to pre-allocate a segment file in the background
+struct PreallocRequest {
+    group_dir: PathBuf,
+    segment_id: u64,
+    segment_size: u64,
+    /// Delivery slot: background thread stores the result here
+    result: Arc<std::sync::Mutex<PreallocResult>>,
+}
+
 /// Pending fsync entry: segment + callbacks. Callbacks are grouped by segment
 /// so each file is synced exactly once per batch.
 struct FsyncEntry<C: RaftTypeConfig> {
@@ -457,6 +484,8 @@ struct FsyncInner<C: RaftTypeConfig> {
     pending: std::collections::HashMap<usize, FsyncEntry<C>>,
     /// Pending segment seal requests
     seal_queue: Vec<SealRequest>,
+    /// Pending segment pre-allocation requests
+    prealloc_queue: Vec<PreallocRequest>,
     shutdown: bool,
 }
 
@@ -473,6 +502,7 @@ impl<C: RaftTypeConfig> FsyncState<C> {
             mu: std::sync::Mutex::new(FsyncInner {
                 pending: std::collections::HashMap::new(),
                 seal_queue: Vec::new(),
+                prealloc_queue: Vec::new(),
                 shutdown: false,
             }),
             cv: std::sync::Condvar::new(),
@@ -504,6 +534,14 @@ impl<C: RaftTypeConfig> FsyncState<C> {
         drop(inner);
         self.cv.notify_one();
     }
+
+    /// Enqueue a segment pre-allocation request for background processing
+    fn enqueue_prealloc(&self, req: PreallocRequest) {
+        let mut inner = self.mu.lock().unwrap();
+        inner.prealloc_queue.push(req);
+        drop(inner);
+        self.cv.notify_one();
+    }
 }
 
 /// Background fsync thread loop — shared across all groups.
@@ -514,15 +552,23 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
     let delay_nanos = state.fsync_delay.as_nanos() as u64;
 
     loop {
-        let (ready, seal_requests, shutdown) = {
+        let (ready, seal_requests, prealloc_requests, shutdown) = {
             let mut inner = state.mu.lock().unwrap();
 
             // Block until there's work or shutdown
-            while inner.pending.is_empty() && inner.seal_queue.is_empty() && !inner.shutdown {
+            while inner.pending.is_empty()
+                && inner.seal_queue.is_empty()
+                && inner.prealloc_queue.is_empty()
+                && !inner.shutdown
+            {
                 inner = state.cv.wait(inner).unwrap();
             }
 
-            if inner.shutdown && inner.pending.is_empty() && inner.seal_queue.is_empty() {
+            if inner.shutdown
+                && inner.pending.is_empty()
+                && inner.seal_queue.is_empty()
+                && inner.prealloc_queue.is_empty()
+            {
                 return;
             }
 
@@ -530,8 +576,11 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
             // first_enqueue_nanos + delay_nanos. We wait until the earliest
             // deadline, then drain only segments that are ready.
             loop {
-                // Seal requests and shutdown are always processed immediately
-                if !inner.seal_queue.is_empty() || inner.shutdown {
+                // Seal/prealloc requests and shutdown are always processed immediately
+                if !inner.seal_queue.is_empty()
+                    || !inner.prealloc_queue.is_empty()
+                    || inner.shutdown
+                {
                     break;
                 }
 
@@ -556,7 +605,11 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
                 }
             }
 
-            if inner.shutdown && inner.pending.is_empty() && inner.seal_queue.is_empty() {
+            if inner.shutdown
+                && inner.pending.is_empty()
+                && inner.seal_queue.is_empty()
+                && inner.prealloc_queue.is_empty()
+            {
                 return;
             }
 
@@ -577,7 +630,8 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
             }
 
             let seal_requests = std::mem::take(&mut inner.seal_queue);
-            (ready_entries, seal_requests, inner.shutdown)
+            let prealloc_requests = std::mem::take(&mut inner.prealloc_queue);
+            (ready_entries, seal_requests, prealloc_requests, inner.shutdown)
         };
 
         // Sync each segment's file once, drain callbacks, update flushed_size
@@ -617,6 +671,19 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
                 sealed: true,
                 record_type_flags: req.record_type_flags,
             });
+        }
+
+        // Process pre-allocation requests: create segment files off the hot path
+        for req in prealloc_requests {
+            let result = match ActiveMmapSegment::create(
+                &req.group_dir,
+                req.segment_id,
+                req.segment_size,
+            ) {
+                Ok(seg) => PreallocResult::Ready(seg),
+                Err(_) => PreallocResult::Failed,
+            };
+            *req.result.lock().unwrap() = result;
         }
 
         if shutdown {
@@ -700,14 +767,13 @@ impl ActiveMmapSegment {
 
 struct WriterState {
     active: ActiveMmapSegment,
-    /// Pre-allocated next segment — used on rotation to avoid blocking
-    next_segment: Option<ActiveMmapSegment>,
+    /// Background pre-allocation result slot. The fsync thread creates the segment
+    /// and stores it here; rotation checks if it's ready.
+    pending_prealloc: Option<Arc<std::sync::Mutex<PreallocResult>>>,
     /// Tracks record types present in the active segment (for manifest metadata).
     record_type_flags: RecordTypeFlags,
     group_dir: PathBuf,
     group_id: u64,
-    /// Buffer for encoding vote records (reused to avoid allocation)
-    vote_buf: Vec<u8>,
 }
 
 impl WriterState {
@@ -740,16 +806,19 @@ impl WriterState {
         unsafe { self.active.segment.write_at(offset, data) };
         self.active.current_size = end as u64;
 
-        // Pre-allocate next segment when active is 75% full
-        if self.next_segment.is_none()
+        // Request background pre-allocation when active is 75% full
+        if self.pending_prealloc.is_none()
             && self.active.current_size > self.active.segment_capacity * 3 / 4
         {
             let next_id = self.active.segment_id + 1;
-            self.next_segment = Some(ActiveMmapSegment::create(
-                &self.group_dir,
-                next_id,
-                config.segment_size,
-            )?);
+            let result = Arc::new(std::sync::Mutex::new(PreallocResult::Pending));
+            fsync_state.enqueue_prealloc(PreallocRequest {
+                group_dir: self.group_dir.clone(),
+                segment_id: next_id,
+                segment_size: config.segment_size,
+                result: result.clone(),
+            });
+            self.pending_prealloc = Some(result);
         }
 
         Ok(offset)
@@ -778,11 +847,40 @@ impl WriterState {
         // Capture record type flags for manifest, reset for new segment
         let flags = std::mem::take(&mut self.record_type_flags);
 
-        // Use pre-allocated segment if available, otherwise create synchronously
+        // Try to use background pre-allocated segment.
+        // If a prealloc is in-flight, wait for it — the background thread will
+        // finish in microseconds (just open+ftruncate+mmap). Waiting avoids
+        // creating the segment twice and orphaning a file.
         let new_id = self.active.segment_id + 1;
-        let new_seg = match self.next_segment.take() {
-            Some(seg) if seg.segment_id == new_id => seg,
-            _ => ActiveMmapSegment::create(&self.group_dir, new_id, config.segment_size)?,
+        let new_seg = if let Some(slot) = self.pending_prealloc.take() {
+            loop {
+                let mut guard = slot.lock().unwrap();
+                match std::mem::replace(&mut *guard, PreallocResult::Pending) {
+                    PreallocResult::Ready(seg) if seg.segment_id == new_id => break seg,
+                    PreallocResult::Ready(_) => {
+                        // Wrong ID (shouldn't happen), fall back
+                        break ActiveMmapSegment::create(
+                            &self.group_dir,
+                            new_id,
+                            config.segment_size,
+                        )?;
+                    }
+                    PreallocResult::Failed => {
+                        break ActiveMmapSegment::create(
+                            &self.group_dir,
+                            new_id,
+                            config.segment_size,
+                        )?;
+                    }
+                    PreallocResult::Pending => {
+                        // Not ready yet — release lock, yield, retry
+                        drop(guard);
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        } else {
+            ActiveMmapSegment::create(&self.group_dir, new_id, config.segment_size)?
         };
 
         // Atomically swap active → the old active becomes the sealed segment
@@ -1107,7 +1205,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             }
 
             // SLOW PATH: full record decode
-            Self::scan_records_into_index(
+            let scan = Self::scan_records_into_index(
                 &mmap_ro[..valid],
                 seg_id,
                 group_id,
@@ -1118,15 +1216,28 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 &mut last_purged_log_id,
             );
 
-            // Track min/max from manifest
-            if let Some(m) = meta {
-                if let Some(min) = m.min_index {
-                    overall_first_index =
-                        Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
-                }
-                if let Some(max) = m.max_index {
-                    overall_last_index = Some(overall_last_index.map_or(max, |v: u64| v.max(max)));
-                }
+            // Track min/max from scan results
+            if let Some(min) = scan.min_entry_index {
+                overall_first_index =
+                    Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
+            }
+            if let Some(max) = scan.max_entry_index {
+                overall_last_index = Some(overall_last_index.map_or(max, |v: u64| v.max(max)));
+            }
+
+            // Repair manifest: emit entry for segments missing or not yet sealed
+            if meta.is_none() || !meta.unwrap().sealed {
+                let _ = manifest.sender().try_send(SegmentMeta {
+                    group_id,
+                    segment_id: seg_id,
+                    valid_bytes: valid as u64,
+                    min_index: scan.min_entry_index,
+                    max_index: scan.max_entry_index,
+                    min_ts: None,
+                    max_ts: None,
+                    sealed: true,
+                    record_type_flags: scan.record_type_flags,
+                });
             }
 
             let mmap_raw = memmap2::MmapOptions::new().map_raw_read_only(&file)?;
@@ -1151,7 +1262,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             }
 
             // Full record scan for tail (must decode everything)
-            Self::scan_records_into_index(
+            let scan = Self::scan_records_into_index(
                 active.segment.as_slice(valid),
                 seg_id,
                 group_id,
@@ -1162,15 +1273,14 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 &mut last_purged_log_id,
             );
 
-            // Update active's entry index range
-            let seg_slice = active.segment.as_slice(valid);
-            active.min_entry_index = scan_first_entry_index(seg_slice, valid);
-            active.max_entry_index = scan_last_entry_index(seg_slice, valid);
+            // Update active's entry index range from scan results
+            active.min_entry_index = scan.min_entry_index;
+            active.max_entry_index = scan.max_entry_index;
 
-            if let Some(min) = active.min_entry_index {
+            if let Some(min) = scan.min_entry_index {
                 overall_first_index = Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
             }
-            if let Some(max) = active.max_entry_index {
+            if let Some(max) = scan.max_entry_index {
                 overall_last_index = Some(overall_last_index.map_or(max, |v: u64| v.max(max)));
             }
 
@@ -1215,11 +1325,10 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         let active_seg_id = active.segment_id;
         let writer = WriterState {
             active,
-            next_segment: None,
+            pending_prealloc: None,
             record_type_flags: RecordTypeFlags::default(),
             group_dir: group_dir.to_path_buf(),
             group_id,
-            vote_buf: Vec::new(),
         };
 
         let manifest_tx = manifest.sender();
@@ -1270,7 +1379,6 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         offset
     }
 
-    /// Scan records in mmap data and populate LogIndex + extract state
     fn scan_records_into_index(
         data: &[u8],
         segment_id: u64,
@@ -1280,7 +1388,8 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         vote: &mut Option<openraft::impls::Vote<C>>,
         last_log_id: &mut Option<LogId<C>>,
         last_purged_log_id: &mut Option<LogId<C>>,
-    ) where
+    ) -> ScanMeta
+    where
         C: RaftTypeConfig<
                 NodeId = u64,
                 Term = u64,
@@ -1292,6 +1401,10 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         C::D: FromCodec<RawBytes>,
     {
         use crate::multi::codec::Vote as CodecVote;
+
+        let mut flags = RecordTypeFlags::default();
+        let mut min_entry_index: Option<u64> = None;
+        let mut max_entry_index: Option<u64> = None;
 
         let mut offset = 0;
         while offset + LENGTH_SIZE <= data.len() {
@@ -1310,6 +1423,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 }
                 match parsed.record_type {
                     RecordType::Entry => {
+                        flags.has_entry = true;
                         // Decode just enough to get the log_id
                         if let Ok(codec_entry) =
                             CodecEntry::<RawBytes>::decode_from_slice(parsed.payload)
@@ -1326,10 +1440,13 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                                     len: total as u32,
                                 },
                             );
+                            min_entry_index = Some(min_entry_index.map_or(index, |v: u64| v.min(index)));
+                            max_entry_index = Some(max_entry_index.map_or(index, |v: u64| v.max(index)));
                             *last_log_id = Some(lid);
                         }
                     }
                     RecordType::Vote => {
+                        flags.has_vote = true;
                         if let Ok(codec_vote) = CodecVote::decode_from_slice(parsed.payload) {
                             *vote = Some(openraft::impls::Vote::<C> {
                                 leader_id: openraft::impls::leader_id_adv::LeaderId {
@@ -1341,6 +1458,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                         }
                     }
                     RecordType::Truncate => {
+                        flags.has_truncate = true;
                         if let Ok(codec_lid) = CodecLogId::decode_from_slice(parsed.payload) {
                             *last_log_id = Some(LogId {
                                 leader_id: openraft::impls::leader_id_adv::LeaderId {
@@ -1352,6 +1470,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                         }
                     }
                     RecordType::Purge => {
+                        flags.has_purge = true;
                         if let Ok(codec_lid) = CodecLogId::decode_from_slice(parsed.payload) {
                             *last_purged_log_id = Some(LogId {
                                 leader_id: openraft::impls::leader_id_adv::LeaderId {
@@ -1367,6 +1486,12 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 break; // Corrupt record, stop scanning
             }
             offset += total;
+        }
+
+        ScanMeta {
+            record_type_flags: flags,
+            min_entry_index,
+            max_entry_index,
         }
     }
 
@@ -1387,6 +1512,8 @@ pub struct MmapPerGroupLogStorage<C: RaftTypeConfig> {
     creation_lock: tokio::sync::Mutex<()>,
     /// Single shared fsync thread for all groups
     fsync_state: Arc<FsyncState<C>>,
+    /// Fsync thread handle — joined on stop() for deterministic shutdown
+    fsync_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
@@ -1417,7 +1544,7 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
         // Spawn single shared fsync thread for all groups
         let fsync_state = Arc::new(FsyncState::new(config.fsync_delay));
         let fsync_clone = fsync_state.clone();
-        std::thread::Builder::new()
+        let fsync_handle = std::thread::Builder::new()
             .name("mmap-raft-fsync".into())
             .spawn(move || {
                 fsync_thread_loop::<C>(fsync_clone);
@@ -1430,14 +1557,23 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
             groups: MmapGroupIndex::new(),
             creation_lock: tokio::sync::Mutex::new(()),
             fsync_state,
+            fsync_thread: std::sync::Mutex::new(Some(fsync_handle)),
         })
     }
 
-    /// Stop all groups and the shared fsync thread
+    /// Stop the shared fsync thread and wait for it to exit.
     pub fn stop(&self) {
-        let mut inner = self.fsync_state.mu.lock().unwrap();
-        inner.shutdown = true;
-        self.fsync_state.cv.notify_one();
+        {
+            let mut inner = self.fsync_state.mu.lock().unwrap();
+            inner.shutdown = true;
+            self.fsync_state.cv.notify_one();
+        }
+        // Join the fsync thread to ensure deterministic shutdown
+        if let Some(handle) = self.fsync_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        // Stop the manifest worker thread
+        self.manifest.stop();
     }
 
     async fn get_or_create_group(&self, group_id: u64) -> io::Result<Arc<MmapGroupState<C>>>
@@ -1615,9 +1751,55 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
             ));
         }
 
-        let codec_entry = CodecEntry::<RawBytes>::decode_from_slice(parsed.payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let entry: openraft::impls::Entry<C> = openraft::impls::Entry::<C>::from_codec(codec_entry);
+        // Direct binary parse from mmap slice — avoids Cursor + RawBytes::decode copy.
+        // Entry payload layout: [term:8][node_id:8][index:8][tag:1][data...]
+        let p = parsed.payload;
+        if p.len() < 25 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "entry payload too short"));
+        }
+        let term = u64::from_le_bytes(p[0..8].try_into().unwrap());
+        let node_id = u64::from_le_bytes(p[8..16].try_into().unwrap());
+        let log_index = u64::from_le_bytes(p[16..24].try_into().unwrap());
+        let tag = p[24];
+
+        let log_id = openraft::LogId::<C> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> {
+                term,
+                node_id,
+            },
+            index: log_index,
+        };
+
+        let payload = match tag {
+            0 => openraft::EntryPayload::Blank,
+            1 => {
+                // Normal: [len:4][payload_bytes...]
+                if p.len() < 29 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "normal entry too short"));
+                }
+                let data_len = u32::from_le_bytes(p[25..29].try_into().unwrap()) as usize;
+                if p.len() < 29 + data_len {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "normal entry data truncated"));
+                }
+                let data = C::D::from_codec(RawBytes(p[29..29 + data_len].to_vec()));
+                openraft::EntryPayload::Normal(data)
+            }
+            2 => {
+                // Membership: rare, fall back to codec decode
+                let codec_entry = CodecEntry::<RawBytes>::decode_from_slice(p)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                return Ok(Some(openraft::impls::Entry::<C>::from_codec(codec_entry)));
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown entry tag: {}", tag),
+                ));
+            }
+        };
+
+        use openraft::entry::RaftEntry;
+        let entry = openraft::impls::Entry::<C>::new(log_id, payload);
         Ok(Some(entry))
     }
 }
@@ -1714,26 +1896,26 @@ where
         // Store atomically in memory
         self.state.vote.store(Some(vote));
 
-        // Encode vote payload
-        let codec_vote = vote.to_codec();
+        // Inline vote encoding — 17 bytes: [term:8][node_id:8][committed:1]
         self.payload_buf.clear();
-        codec_vote
-            .encode_into(&mut self.payload_buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        self.payload_buf.extend_from_slice(&vote.leader_id.term.to_le_bytes());
+        self.payload_buf.extend_from_slice(&vote.leader_id.node_id.to_le_bytes());
+        self.payload_buf.push(vote.committed as u8);
 
-        // Write directly into mmap under lock
-        let mut writer = self.state.writer.lock();
-        writer.vote_buf.clear();
+        // Build full record (header + payload + CRC) outside the lock
+        self.encode_buf.clear();
         append_record_into(
-            &mut writer.vote_buf,
+            &mut self.encode_buf,
             RecordType::Vote,
             self.group_id,
             &self.payload_buf,
         );
-        let data = writer.vote_buf.clone();
+
+        // Write into mmap under lock — no clone needed
+        let mut writer = self.state.writer.lock();
         writer.record_type_flags.has_vote = true;
         writer.write_bytes(
-            &data,
+            &self.encode_buf,
             &self.state.config,
             &self.state.segment_map,
             &self.state.manifest_tx,
@@ -1751,57 +1933,108 @@ where
 
         let mut last_log_id = None;
 
-        // Encode all entries into encode_buf, tracking record offsets
+        // Encode all entries into encode_buf, tracking record offsets.
+        // Blank/Normal entries write header + payload + CRC directly into encode_buf,
+        // skipping the intermediate payload_buf. Membership falls back to payload_buf + append_record_into.
         self.encode_buf.clear();
         self.record_offsets.clear();
         for entry in entries {
             let log_id = entry.log_id();
             let index = log_id.index;
 
-            // Encode entry directly into payload_buf, avoiding to_codec() clone
-            // for Blank/Normal entries. Only Membership falls back to codec path.
-            self.payload_buf.clear();
-            match &entry.payload {
+            let record_start = self.encode_buf.len() as u64;
+            let record_len = match &entry.payload {
                 openraft::EntryPayload::Blank => {
-                    self.payload_buf.reserve(25);
-                    self.payload_buf
-                        .extend_from_slice(&entry.log_id.leader_id.term.to_le_bytes());
-                    self.payload_buf
-                        .extend_from_slice(&entry.log_id.leader_id.node_id.to_le_bytes());
-                    self.payload_buf
-                        .extend_from_slice(&entry.log_id.index.to_le_bytes());
-                    self.payload_buf.push(0); // Blank
+                    // Entry: [term:8][node_id:8][index:8][tag:1] = 25 bytes payload
+                    // Record: [len:4][type:1][group_id:3][payload:25][crc:8] = 41 bytes
+                    let payload_len = 25;
+                    let record_body_len = 1 + GROUP_ID_SIZE + payload_len + CRC64_SIZE;
+                    let total = LENGTH_SIZE + record_body_len;
+                    self.encode_buf.reserve(total);
+
+                    // Record header: [len:4][type:1][group_id:3]
+                    let mut header = [0u8; HEADER_SIZE];
+                    header[0..4].copy_from_slice(&(record_body_len as u32).to_le_bytes());
+                    header[4] = RecordType::Entry as u8;
+                    write_u24_le(&mut header, 5, self.group_id);
+
+                    // Entry fields (written inline as the payload)
+                    let term_bytes = entry.log_id.leader_id.term.to_le_bytes();
+                    let node_bytes = entry.log_id.leader_id.node_id.to_le_bytes();
+                    let idx_bytes = entry.log_id.index.to_le_bytes();
+
+                    // CRC over [type + group_id + payload]
+                    let mut digest = crc64fast_nvme::Digest::new();
+                    digest.write(&header[LENGTH_SIZE..]);
+                    digest.write(&term_bytes);
+                    digest.write(&node_bytes);
+                    digest.write(&idx_bytes);
+                    digest.write(&[0u8]); // Blank tag
+                    let crc = digest.sum64();
+
+                    self.encode_buf.extend_from_slice(&header);
+                    self.encode_buf.extend_from_slice(&term_bytes);
+                    self.encode_buf.extend_from_slice(&node_bytes);
+                    self.encode_buf.extend_from_slice(&idx_bytes);
+                    self.encode_buf.push(0); // Blank tag
+                    self.encode_buf.extend_from_slice(&crc.to_le_bytes());
+                    total
                 }
                 openraft::EntryPayload::Normal(data) => {
-                    let bytes = data.payload_bytes();
-                    self.payload_buf.reserve(29 + bytes.len());
-                    self.payload_buf
-                        .extend_from_slice(&entry.log_id.leader_id.term.to_le_bytes());
-                    self.payload_buf
-                        .extend_from_slice(&entry.log_id.leader_id.node_id.to_le_bytes());
-                    self.payload_buf
-                        .extend_from_slice(&entry.log_id.index.to_le_bytes());
-                    self.payload_buf.push(1); // Normal
-                    self.payload_buf
-                        .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                    self.payload_buf.extend_from_slice(bytes);
+                    // Entry: [term:8][node_id:8][index:8][tag:1][dlen:4][data...] = 29 + data_len
+                    let data_bytes = data.payload_bytes();
+                    let payload_len = 29 + data_bytes.len();
+                    let record_body_len = 1 + GROUP_ID_SIZE + payload_len + CRC64_SIZE;
+                    let total = LENGTH_SIZE + record_body_len;
+                    self.encode_buf.reserve(total);
+
+                    // Record header
+                    let mut header = [0u8; HEADER_SIZE];
+                    header[0..4].copy_from_slice(&(record_body_len as u32).to_le_bytes());
+                    header[4] = RecordType::Entry as u8;
+                    write_u24_le(&mut header, 5, self.group_id);
+
+                    let term_bytes = entry.log_id.leader_id.term.to_le_bytes();
+                    let node_bytes = entry.log_id.leader_id.node_id.to_le_bytes();
+                    let idx_bytes = entry.log_id.index.to_le_bytes();
+                    let dlen_bytes = (data_bytes.len() as u32).to_le_bytes();
+
+                    // CRC over [type + group_id + entry_header + data]
+                    let mut digest = crc64fast_nvme::Digest::new();
+                    digest.write(&header[LENGTH_SIZE..]);
+                    digest.write(&term_bytes);
+                    digest.write(&node_bytes);
+                    digest.write(&idx_bytes);
+                    digest.write(&[1u8]); // Normal tag
+                    digest.write(&dlen_bytes);
+                    digest.write(data_bytes);
+                    let crc = digest.sum64();
+
+                    self.encode_buf.extend_from_slice(&header);
+                    self.encode_buf.extend_from_slice(&term_bytes);
+                    self.encode_buf.extend_from_slice(&node_bytes);
+                    self.encode_buf.extend_from_slice(&idx_bytes);
+                    self.encode_buf.push(1); // Normal tag
+                    self.encode_buf.extend_from_slice(&dlen_bytes);
+                    self.encode_buf.extend_from_slice(data_bytes);
+                    self.encode_buf.extend_from_slice(&crc.to_le_bytes());
+                    total
                 }
                 openraft::EntryPayload::Membership(_) => {
-                    // Rare: fall back to codec path for membership entries
+                    // Rare: fall back to codec + payload_buf path
+                    self.payload_buf.clear();
                     let codec_entry: CodecEntry<RawBytes> = entry.to_codec();
                     codec_entry
                         .encode_into(&mut self.payload_buf)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    append_record_into(
+                        &mut self.encode_buf,
+                        RecordType::Entry,
+                        self.group_id,
+                        &self.payload_buf,
+                    )
                 }
-            }
-
-            let record_start = self.encode_buf.len() as u64;
-            let record_len = append_record_into(
-                &mut self.encode_buf,
-                RecordType::Entry,
-                self.group_id,
-                &self.payload_buf,
-            );
+            };
             self.record_offsets
                 .push((index, record_start, record_len as u32));
 
@@ -2206,7 +2439,6 @@ mod tests {
             log.truncate_after(Some(after)).await.unwrap();
 
             // Give writer thread time to process
-            tokio::time::sleep(Duration::from_millis(50)).await;
 
             // Read entries - should only have 1..=3
             let result = log.try_get_log_entries(1..6).await.unwrap();
@@ -2252,7 +2484,6 @@ mod tests {
             log.purge(purge_id).await.unwrap();
 
             // Give writer time to process
-            tokio::time::sleep(Duration::from_millis(50)).await;
 
             let state = log.get_log_state().await.unwrap();
             assert_eq!(state.last_purged_log_id.unwrap().index, 3);
@@ -2374,7 +2605,6 @@ mod tests {
 
             storage.stop();
             drop(storage);
-            tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
         // Phase 2: Re-open and verify recovery
@@ -2481,7 +2711,6 @@ mod tests {
             storage.stop();
             drop(storage);
             // Wait for background sealing to write footers
-            tokio::time::sleep(Duration::from_millis(500)).await;
         });
 
         // Phase 2: Re-open and verify recovery uses fast path (footer-based)
@@ -2539,7 +2768,6 @@ mod tests {
 
             storage.stop();
             drop(storage);
-            tokio::time::sleep(Duration::from_millis(500)).await;
         });
 
         // Phase 2: Recovery should still work (mix of fast + slow paths)
@@ -2624,7 +2852,6 @@ mod tests {
 
             storage.stop();
             drop(storage);
-            tokio::time::sleep(Duration::from_millis(200)).await;
 
             // Corrupt the tail by writing garbage after valid data
             let group_dir = path.join("group_0");
@@ -2697,7 +2924,6 @@ mod tests {
             storage.stop();
             drop(storage);
             // Wait for background sealing
-            tokio::time::sleep(Duration::from_millis(500)).await;
         });
 
         // Phase 2: Verify sealed segment metadata is in manifest
@@ -2719,5 +2945,1840 @@ mod tests {
                 "Expected at least one sealed segment in manifest"
             );
         });
+    }
+
+    // ===================================================================
+    // Helper functions for comprehensive tests
+    // ===================================================================
+
+    fn make_blank_entry(index: u64, term: u64) -> openraft::impls::Entry<C> {
+        openraft::impls::Entry::<C> {
+            log_id: LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term, node_id: 1 },
+                index,
+            },
+            payload: openraft::entry::EntryPayload::Blank,
+        }
+    }
+
+    fn make_large_entry(index: u64, term: u64, size: usize) -> openraft::impls::Entry<C> {
+        openraft::impls::Entry::<C> {
+            log_id: LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term, node_id: 1 },
+                index,
+            },
+            payload: openraft::entry::EntryPayload::Normal(TestData(vec![0xAB; size])),
+        }
+    }
+
+    fn make_vote(term: u64, node_id: u64, committed: bool) -> openraft::impls::Vote<C> {
+        openraft::impls::Vote::<C> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId { term, node_id },
+            committed,
+        }
+    }
+
+    fn count_segment_files(dir: &std::path::Path) -> usize {
+        let group_dir = dir.join("group_0");
+        if !group_dir.exists() {
+            return 0;
+        }
+        std::fs::read_dir(&group_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".log")
+            })
+            .count()
+    }
+
+    // ===================================================================
+    // Pre-allocation edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_prealloc_ready_before_rotation() {
+        // Pre-allocation should complete before rotation is needed,
+        // so rotation uses the pre-allocated segment (no sync create).
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(512);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write past 75% to trigger prealloc request
+            for i in 1..=8 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Give background thread time to complete prealloc
+
+            // Now write more to trigger rotation — should use prealloc'd segment
+            for i in 9..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // All entries readable across segments
+            let result = log.try_get_log_entries(1..21).await.unwrap();
+            assert_eq!(result.len(), 20);
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(entry.log_id.index, (i + 1) as u64);
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_prealloc_not_ready_at_rotation() {
+        // If prealloc hasn't completed by rotation time, rotate_segment
+        // should wait for it (spin-yield loop) rather than creating a duplicate.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // Very small segments to force rapid rotation
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write rapidly — prealloc and rotation may overlap
+            for i in 1..=50 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // All entries should be readable
+            let result = log.try_get_log_entries(1..51).await.unwrap();
+            assert_eq!(result.len(), 50);
+
+            // Verify no orphaned files (each segment ID should appear at most once)
+            let group_dir = tmp.path().join("group_0");
+            let seg_files: Vec<String> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let name = e.ok()?.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".log") { Some(name) } else { None }
+                })
+                .collect();
+            let unique_count = seg_files.len();
+            let mut deduped = seg_files.clone();
+            deduped.sort();
+            deduped.dedup();
+            assert_eq!(unique_count, deduped.len(), "No duplicate segment files");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_prealloc_multiple_rapid_rotations() {
+        // Multiple rotations in quick succession — each rotation should either
+        // use a prealloc'd segment or fall back to sync create without deadlock.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(128);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Batch writes to fill segments rapidly
+            let mut pending = Vec::new();
+            for i in 1..=100 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+
+            // Drain all callbacks
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            // All entries should be readable
+            let result = log.try_get_log_entries(1..101).await.unwrap();
+            assert_eq!(result.len(), 100);
+
+            // Should have many segments
+            let seg_count = count_segment_files(tmp.path());
+            assert!(seg_count >= 3, "Expected many rotations, got {seg_count}");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_prealloc_not_triggered_below_threshold() {
+        // Writing less than 75% should not trigger preallocation
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // Large segment, small writes — should stay well under 75%
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(1024 * 1024);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries = vec![make_entry(1, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            // Only 1 segment file should exist (active, no prealloc)
+            assert_eq!(count_segment_files(tmp.path()), 1);
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Crash simulation — partial writes and incomplete sealing
+    // ===================================================================
+
+    #[test]
+    fn test_crash_mid_entry_write_truncated_record() {
+        // Simulate crash during entry write: valid entries followed by
+        // a truncated record (incomplete length prefix or payload).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries = vec![make_entry(1, 1), make_entry(2, 1), make_entry(3, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            storage.stop();
+            drop(storage);
+
+            // Append a truncated record: valid length prefix but incomplete payload
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+
+            if let Some(seg_path) = seg_files.last() {
+                use std::io::{Seek, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                // Find end of valid data by scanning for first zero run
+                let meta = file.metadata().unwrap();
+                let mut data = vec![0u8; meta.len() as usize];
+                use std::io::Read;
+                file.seek(std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+                // Find end of valid records
+                let mut valid_end = 0;
+                let mut offset = 0;
+                while offset + 4 <= data.len() {
+                    let rlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+                        as usize;
+                    if rlen == 0 || offset + 4 + rlen > data.len() {
+                        break;
+                    }
+                    offset += 4 + rlen;
+                    valid_end = offset;
+                }
+                // Write a partial record: length says 100 but only write 10 bytes
+                file.seek(std::io::SeekFrom::Start(valid_end as u64))
+                    .unwrap();
+                file.write_all(&100u32.to_le_bytes()).unwrap(); // length = 100
+                file.write_all(&[0xFF; 10]).unwrap(); // only 10 bytes of payload
+                file.sync_all().unwrap();
+            }
+        });
+
+        // Recovery should stop at the truncated record, recovering entries 1-3
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..4).await.unwrap();
+            assert_eq!(result.len(), 3, "Should recover all 3 valid entries");
+            assert_eq!(result[0].log_id.index, 1);
+            assert_eq!(result[1].log_id.index, 2);
+            assert_eq!(result[2].log_id.index, 3);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_crash_corrupted_crc_mid_segment() {
+        // Corrupt CRC of the second record — recovery should stop there,
+        // only recovering the first record.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries = vec![make_entry(1, 1), make_entry(2, 1), make_entry(3, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            storage.stop();
+            drop(storage);
+
+            // Corrupt CRC of the second record
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+
+            if let Some(seg_path) = seg_files.last() {
+                use std::io::{Read, Seek, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                let mut data = vec![0u8; file.metadata().unwrap().len() as usize];
+                file.seek(std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+
+                // Find second record
+                let rlen1 =
+                    u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                let second_start = 4 + rlen1;
+                let rlen2 = u32::from_le_bytes(
+                    data[second_start..second_start + 4].try_into().unwrap(),
+                ) as usize;
+                // CRC is the last 8 bytes of the record
+                let crc_offset = second_start + 4 + rlen2 - 8;
+                // Flip CRC bytes
+                file.seek(std::io::SeekFrom::Start(crc_offset as u64))
+                    .unwrap();
+                file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+                    .unwrap();
+                file.sync_all().unwrap();
+            }
+        });
+
+        // Recovery: only first entry should survive
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..4).await.unwrap();
+            assert_eq!(result.len(), 1, "Only first entry should survive CRC corruption");
+            assert_eq!(result[0].log_id.index, 1);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_crash_after_rotation_before_seal() {
+        // Simulate crash after rotation but before the background seal completes.
+        // The sealed segment won't have a manifest entry. Recovery should use
+        // CRC scan (slow path) and repair the manifest.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write entries across multiple segments
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Stop WITHOUT waiting for background sealing
+            storage.stop();
+            drop(storage);
+
+            // Delete the manifest to simulate missing seal metadata
+            let manifest_dir = path.clone();
+            for entry in std::fs::read_dir(&manifest_dir).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("manifest") || name.ends_with(".mdbx") || name.ends_with("-lock") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+            // Also remove any mdbx files that might be inside subdirs
+            let _ = std::fs::remove_dir_all(path.join("manifest.mdbx"));
+        });
+
+        // Recovery should use slow path and repair manifest
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..21).await.unwrap();
+            assert_eq!(result.len(), 20, "All entries should be recovered via CRC scan");
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(entry.log_id.index, (i + 1) as u64);
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_crash_zero_length_record_stops_scan() {
+        // A zero-length record in the middle of a segment should stop the scan
+        // cleanly without panic.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries = vec![make_entry(1, 1), make_entry(2, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            storage.stop();
+            drop(storage);
+
+            // Overwrite bytes after valid data with zeros (this is actually
+            // the default state of mmap, but let's be explicit)
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+
+            if let Some(seg_path) = seg_files.last() {
+                use std::io::{Read, Seek, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                let mut data = vec![0u8; file.metadata().unwrap().len() as usize];
+                file.seek(std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+
+                // Find end of records
+                let mut offset = 0;
+                while offset + 4 <= data.len() {
+                    let rlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+                        as usize;
+                    if rlen == 0 || offset + 4 + rlen > data.len() {
+                        break;
+                    }
+                    offset += 4 + rlen;
+                }
+                // Write explicit zero length at end of valid data
+                if offset + 4 <= data.len() {
+                    file.seek(std::io::SeekFrom::Start(offset as u64)).unwrap();
+                    file.write_all(&0u32.to_le_bytes()).unwrap();
+                    file.sync_all().unwrap();
+                }
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..3).await.unwrap();
+            assert_eq!(result.len(), 2, "Both entries before zero record should be recovered");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_crash_vote_only_segment_recovery() {
+        // Segment with only votes (no entries) — recovery should restore the vote
+        // but log should be empty.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Only save votes, no entries
+            log.save_vote(&make_vote(1, 5, false)).await.unwrap();
+            log.save_vote(&make_vote(2, 7, true)).await.unwrap();
+
+            storage.stop();
+            drop(storage);
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Last vote should be recovered
+            let vote = log.read_vote().await.unwrap().unwrap();
+            assert_eq!(vote.leader_id.term, 2);
+            assert_eq!(vote.leader_id.node_id, 7);
+            assert!(vote.committed);
+
+            // Log should be empty
+            let state = log.get_log_state().await.unwrap();
+            assert!(state.last_log_id.is_none());
+            assert!(state.last_purged_log_id.is_none());
+
+            let result = log.try_get_log_entries(0..10).await.unwrap();
+            assert_eq!(result.len(), 0);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_crash_recovery_with_truncate_then_new_writes() {
+        // Write entries, truncate some, write more, crash, recover.
+        // Recovery should see the truncation and new entries.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write 5 entries
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Truncate after index 3
+            let trunc_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                index: 3,
+            };
+            log.truncate_after(Some(trunc_lid)).await.unwrap();
+
+            // Write new entries at index 4-6 with term 2
+            for i in 4..=6 {
+                let entries = vec![make_entry(i, 2)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            storage.stop();
+            drop(storage);
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..7).await.unwrap();
+            assert_eq!(result.len(), 6);
+
+            // Entries 1-3 should have term 1
+            for i in 0..3 {
+                assert_eq!(result[i].log_id.leader_id.term, 1);
+            }
+            // Entries 4-6 should have term 2 (post-truncation writes)
+            for i in 3..6 {
+                assert_eq!(result[i].log_id.leader_id.term, 2);
+            }
+
+            let state = log.get_log_state().await.unwrap();
+            assert_eq!(state.last_log_id.unwrap().index, 6);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_crash_recovery_with_purge() {
+        // Write entries, purge some, crash, recover.
+        // Purge is an in-memory-only operation (no purge record written to log),
+        // but it deletes sealed segment files. On recovery, only surviving
+        // segment files are scanned.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=10 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Purge entries 1-5 — only affects in-memory state and log_index
+            // (no purge record written to active segment in current impl)
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                index: 5,
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            // Verify purge worked in-memory
+            let state = log.get_log_state().await.unwrap();
+            assert_eq!(state.last_purged_log_id.unwrap().index, 5);
+
+            // Purged entries are no longer readable
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 0);
+
+            // Remaining entries still readable
+            let result = log.try_get_log_entries(6..11).await.unwrap();
+            assert_eq!(result.len(), 5);
+
+            storage.stop();
+            drop(storage);
+        });
+
+        // On recovery: since purge doesn't write a record and all entries
+        // are in a single segment (default 1MB), all entries 1-10 will be
+        // recovered. The purge state is lost.
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let state = log.get_log_state().await.unwrap();
+            assert_eq!(state.last_log_id.unwrap().index, 10);
+            // Purge state not persisted — last_purged_log_id is None on recovery
+            assert!(state.last_purged_log_id.is_none());
+
+            // All entries recovered since segment file was not removed
+            let result = log.try_get_log_entries(1..11).await.unwrap();
+            assert_eq!(result.len(), 10);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_crash_recovery_sealed_missing_manifest_repairs() {
+        // Create sealed segments, then wipe manifest. Recovery should
+        // CRC-scan the sealed segments and repair the manifest entries.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        let path3 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=30 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            storage.stop();
+            drop(storage);
+        });
+
+        // Wipe manifest
+        run_async(async move {
+            let _ = std::fs::remove_dir_all(path2.join("manifest.mdbx"));
+        });
+
+        // Recovery should repair everything
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path3);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..31).await.unwrap();
+            assert_eq!(result.len(), 30);
+
+            // Subsequent re-open should use fast path (manifest now repaired)
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Concurrent access and race conditions
+    // ===================================================================
+
+    #[test]
+    fn test_concurrent_readers_during_writes() {
+        // Multiple readers reading while a writer is appending entries.
+        // No data corruption or panics should occur.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(512);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut writer = storage.get_log_storage(0).await.unwrap();
+
+            // Write initial entries
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                writer.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Spawn reader tasks
+            let mut reader_handles = Vec::new();
+            for _ in 0..4 {
+                let mut reader = storage.get_log_storage(0).await.unwrap();
+                let handle = tokio::spawn(async move {
+                    for _ in 0..20 {
+                        let result = reader.try_get_log_entries(1..6).await.unwrap();
+                        assert!(result.len() <= 5);
+                        if !result.is_empty() {
+                            assert_eq!(result[0].log_id.index, 1);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                });
+                reader_handles.push(handle);
+            }
+
+            // Continue writing while readers are active
+            for i in 6..=30 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                writer.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Wait for readers
+            for handle in reader_handles {
+                handle.await.unwrap();
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_concurrent_vote_and_append() {
+        // Interleave vote writes with entry appends — both should succeed.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=20 {
+                // Alternate between vote and entry
+                if i % 3 == 0 {
+                    log.save_vote(&make_vote(i, i * 10, i % 2 == 0))
+                        .await
+                        .unwrap();
+                }
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // All entries readable
+            let result = log.try_get_log_entries(1..21).await.unwrap();
+            assert_eq!(result.len(), 20);
+
+            // Last vote should be the one from i=18
+            let vote = log.read_vote().await.unwrap().unwrap();
+            assert_eq!(vote.leader_id.term, 18);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_concurrent_multi_group_writes() {
+        // Multiple groups writing simultaneously — no interference between groups.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(512);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            let mut handles = Vec::new();
+            for group_id in 0..4u64 {
+                let mut log = storage.get_log_storage(group_id).await.unwrap();
+                let handle = tokio::spawn(async move {
+                    for i in 1..=25 {
+                        let entries = vec![make_entry(i, group_id + 1)];
+                        let (cb, rx) = make_callback();
+                        log.append(entries, cb).await.unwrap();
+                        rx.await.unwrap().unwrap();
+                    }
+                    // Verify own entries
+                    let result = log.try_get_log_entries(1..26).await.unwrap();
+                    assert_eq!(result.len(), 25);
+                    for entry in &result {
+                        assert_eq!(entry.log_id.leader_id.term, group_id + 1);
+                    }
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            assert_eq!(storage.num_groups(), 4);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_shutdown_with_pending_writes() {
+        // Shutdown while writes are in-flight — should not deadlock.
+        // With a short fsync delay, callbacks should fire before or during shutdown.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_fsync_delay(Duration::from_millis(10));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let mut pending = Vec::new();
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+
+            // Wait for callbacks to complete before shutdown
+            for rx in pending {
+                let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
+                assert!(result.is_ok(), "Callback should fire within timeout");
+                result.unwrap().unwrap().unwrap();
+            }
+
+            // Data should be readable
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 5);
+
+            // Shutdown should complete cleanly
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_shutdown_no_deadlock_immediate() {
+        // Immediate shutdown with pending work — must not deadlock.
+        // Callbacks may be dropped (channel closed), that's OK.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_fsync_delay(Duration::from_secs(60)); // Very long delay
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=3 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, _rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                // Don't wait for callbacks — just fire and forget
+            }
+
+            // Stop immediately — fsync thread should exit without deadlock
+            storage.stop();
+            // If we get here, no deadlock
+        });
+    }
+
+    // ===================================================================
+    // Blank entry handling
+    // ===================================================================
+
+    #[test]
+    fn test_blank_entry_roundtrip() {
+        // Blank entries should encode/decode correctly through the direct binary path.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries = vec![
+                make_blank_entry(1, 1),
+                make_entry(2, 1), // Normal
+                make_blank_entry(3, 2),
+            ];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..4).await.unwrap();
+            assert_eq!(result.len(), 3);
+
+            // Entry 1: Blank
+            assert_eq!(result[0].log_id.index, 1);
+            assert_eq!(result[0].log_id.leader_id.term, 1);
+            assert!(matches!(result[0].payload, openraft::EntryPayload::Blank));
+
+            // Entry 2: Normal
+            assert_eq!(result[1].log_id.index, 2);
+            assert!(matches!(result[1].payload, openraft::EntryPayload::Normal(_)));
+
+            // Entry 3: Blank
+            assert_eq!(result[2].log_id.index, 3);
+            assert_eq!(result[2].log_id.leader_id.term, 2);
+            assert!(matches!(result[2].payload, openraft::EntryPayload::Blank));
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_blank_entry_recovery() {
+        // Blank entries survive recovery (direct binary parse path).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries = vec![
+                make_blank_entry(1, 1),
+                make_entry(2, 1),
+                make_blank_entry(3, 2),
+            ];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            storage.stop();
+            drop(storage);
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..4).await.unwrap();
+            assert_eq!(result.len(), 3);
+            assert!(matches!(result[0].payload, openraft::EntryPayload::Blank));
+            assert!(matches!(result[1].payload, openraft::EntryPayload::Normal(_)));
+            assert!(matches!(result[2].payload, openraft::EntryPayload::Blank));
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Edge cases in read path
+    // ===================================================================
+
+    #[test]
+    fn test_read_nonexistent_index() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries = vec![make_entry(1, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            // Read non-existent index
+            let result = log.try_get_log_entries(100..200).await.unwrap();
+            assert_eq!(result.len(), 0);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_read_empty_range() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries = vec![make_entry(1, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            // Empty range
+            let result = log.try_get_log_entries(5..5).await.unwrap();
+            assert_eq!(result.len(), 0);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_read_after_truncate_all() {
+        // Truncate all entries (after=None), then read — should be empty.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Truncate all
+            log.truncate_after(None).await.unwrap();
+
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 0);
+
+            let state = log.get_log_state().await.unwrap();
+            assert!(state.last_log_id.is_none());
+
+            // Can write new entries starting from index 1
+            let entries = vec![make_entry(1, 2)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..2).await.unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].log_id.leader_id.term, 2);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_read_across_many_segments() {
+        // Entries spread across many segments — sequential read should collect all.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(128);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let mut pending = Vec::new();
+            for i in 1..=50 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            let result = log.try_get_log_entries(1..51).await.unwrap();
+            assert_eq!(result.len(), 50);
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(entry.log_id.index, (i + 1) as u64);
+            }
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Entry at segment boundaries
+    // ===================================================================
+
+    #[test]
+    fn test_entry_exactly_fills_segment() {
+        // Entry that exactly fills the segment capacity should trigger rotation.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // Use a small segment size. Each entry is ~50 bytes with overhead.
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(100);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write entries that will fill and overflow the segment
+            for i in 1..=10 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let result = log.try_get_log_entries(1..11).await.unwrap();
+            assert_eq!(result.len(), 10);
+
+            // Should have multiple segments
+            let seg_count = count_segment_files(tmp.path());
+            assert!(seg_count >= 2);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_large_entry_exceeding_half_segment() {
+        // A single large entry that takes more than half the segment.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(1024);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Small entries first
+            let entries = vec![make_entry(1, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            // Large entry (600 bytes payload, > half of 1024)
+            let entries = vec![make_large_entry(2, 1, 600)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            // Should trigger rotation. Both entries readable.
+            let result = log.try_get_log_entries(1..3).await.unwrap();
+            assert_eq!(result.len(), 2);
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Truncate edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_truncate_across_segment_boundary() {
+        // Truncate that spans across sealed+active segments.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write enough entries to span multiple segments
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Truncate back to index 5 — should remove sealed segments too
+            let trunc_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                index: 5,
+            };
+            log.truncate_after(Some(trunc_lid)).await.unwrap();
+
+            let result = log.try_get_log_entries(1..21).await.unwrap();
+            assert_eq!(result.len(), 5);
+            assert_eq!(result[4].log_id.index, 5);
+
+            let state = log.get_log_state().await.unwrap();
+            assert_eq!(state.last_log_id.unwrap().index, 5);
+
+            // Can write new entries after truncation
+            for i in 6..=10 {
+                let entries = vec![make_entry(i, 2)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let result = log.try_get_log_entries(1..11).await.unwrap();
+            assert_eq!(result.len(), 10);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_truncate_idempotent() {
+        // Truncating to current last index should be a no-op.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Truncate at current last — no-op
+            let trunc_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                index: 5,
+            };
+            log.truncate_after(Some(trunc_lid)).await.unwrap();
+
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 5);
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Purge edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_purge_all_entries() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Purge all entries
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                index: 5,
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 0);
+
+            let state = log.get_log_state().await.unwrap();
+            assert_eq!(state.last_purged_log_id.unwrap().index, 5);
+
+            // Can still write new entries
+            let entries = vec![make_entry(6, 2)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(6..7).await.unwrap();
+            assert_eq!(result.len(), 1);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_purge_removes_sealed_segments() {
+        // Purge should remove sealed segment files that are fully purged.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write enough to create multiple segments
+            for i in 1..=30 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let seg_count_before = count_segment_files(tmp.path());
+            assert!(seg_count_before >= 3, "Need multiple segments");
+
+            // Purge most entries
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                index: 25,
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            // Some segment files should have been removed
+            let seg_count_after = count_segment_files(tmp.path());
+            assert!(
+                seg_count_after < seg_count_before,
+                "Purge should remove old segment files: before={seg_count_before}, after={seg_count_after}"
+            );
+
+            // Remaining entries still readable
+            let result = log.try_get_log_entries(26..31).await.unwrap();
+            assert_eq!(result.len(), 5);
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Vote edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_vote_overwrite_recovery() {
+        // Multiple vote writes — only the last should survive recovery.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write many votes
+            for i in 1..=10 {
+                log.save_vote(&make_vote(i, i * 100, i % 2 == 0))
+                    .await
+                    .unwrap();
+            }
+
+            storage.stop();
+            drop(storage);
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let vote = log.read_vote().await.unwrap().unwrap();
+            assert_eq!(vote.leader_id.term, 10);
+            assert_eq!(vote.leader_id.node_id, 1000);
+            assert!(vote.committed); // 10 % 2 == 0
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_vote_committed_flag_preserved() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            log.save_vote(&make_vote(5, 42, true)).await.unwrap();
+            let vote = log.read_vote().await.unwrap().unwrap();
+            assert!(vote.committed);
+            assert_eq!(vote.leader_id.term, 5);
+            assert_eq!(vote.leader_id.node_id, 42);
+
+            log.save_vote(&make_vote(6, 99, false)).await.unwrap();
+            let vote = log.read_vote().await.unwrap().unwrap();
+            assert!(!vote.committed);
+            assert_eq!(vote.leader_id.term, 6);
+            assert_eq!(vote.leader_id.node_id, 99);
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Fsync and callback edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_fsync_delay_coalescing() {
+        // With a non-zero fsync delay, multiple writes should be coalesced
+        // into a single fsync.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_fsync_delay(Duration::from_millis(50));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write many entries rapidly
+            let mut pending = Vec::new();
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+
+            // All callbacks should eventually fire
+            for rx in pending {
+                let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
+                assert!(result.is_ok(), "Callback should fire within timeout");
+                result.unwrap().unwrap().unwrap();
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_zero_fsync_delay() {
+        // With zero delay, callbacks should fire as quickly as possible.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=10 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(2), rx).await;
+                assert!(result.is_ok(), "Callback should fire quickly with zero delay");
+                result.unwrap().unwrap().unwrap();
+            }
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Empty / minimal state
+    // ===================================================================
+
+    #[test]
+    fn test_empty_storage_operations() {
+        // Operations on a fresh storage with no data.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Read vote — should be None
+            let vote = log.read_vote().await.unwrap();
+            assert!(vote.is_none());
+
+            // Get log state — should be empty
+            let state = log.get_log_state().await.unwrap();
+            assert!(state.last_log_id.is_none());
+            assert!(state.last_purged_log_id.is_none());
+
+            // Read entries — should be empty
+            let result = log.try_get_log_entries(0..100).await.unwrap();
+            assert_eq!(result.len(), 0);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_empty_storage_recovery() {
+        // Recover from a storage that was created but never written to.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let _log = storage.get_log_storage(0).await.unwrap();
+            storage.stop();
+            drop(storage);
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let vote = log.read_vote().await.unwrap();
+            assert!(vote.is_none());
+
+            let state = log.get_log_state().await.unwrap();
+            assert!(state.last_log_id.is_none());
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Batch append edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_large_batch_append() {
+        // Append many entries in a single batch.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries: Vec<_> = (1..=100).map(|i| make_entry(i, 1)).collect();
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..101).await.unwrap();
+            assert_eq!(result.len(), 100);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_batch_append_triggers_rotation() {
+        // Multiple individual appends that collectively exceed segment size
+        // should trigger rotation between batches.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let mut pending = Vec::new();
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            // All entries readable
+            let result = log.try_get_log_entries(1..21).await.unwrap();
+            assert_eq!(result.len(), 20);
+
+            // Should have multiple segments
+            let seg_count = count_segment_files(tmp.path());
+            assert!(seg_count >= 2);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_mixed_blank_and_normal_batch() {
+        // Batch with alternating blank and normal entries.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let entries: Vec<_> = (1..=10)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        make_blank_entry(i, 1)
+                    } else {
+                        make_entry(i, 1)
+                    }
+                })
+                .collect();
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..11).await.unwrap();
+            assert_eq!(result.len(), 10);
+            for (i, entry) in result.iter().enumerate() {
+                let idx = (i + 1) as u64;
+                assert_eq!(entry.log_id.index, idx);
+                if idx % 2 == 0 {
+                    assert!(matches!(entry.payload, openraft::EntryPayload::Blank));
+                } else {
+                    assert!(matches!(entry.payload, openraft::EntryPayload::Normal(_)));
+                }
+            }
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Multiple recovery cycles
+    // ===================================================================
+
+    #[test]
+    fn test_multiple_recovery_cycles() {
+        // Write, close, recover, write more, close, recover — state should accumulate.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Cycle 1: write entries 1-5
+        let p = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&p);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            storage.stop();
+            drop(storage);
+        });
+
+        // Cycle 2: recover, write entries 6-10
+        let p = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&p);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Verify cycle 1 data
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 5);
+
+            for i in 6..=10 {
+                let entries = vec![make_entry(i, 2)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            storage.stop();
+            drop(storage);
+        });
+
+        // Cycle 3: recover and verify all data
+        let p = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&p);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..11).await.unwrap();
+            assert_eq!(result.len(), 10);
+
+            // Entries from cycle 1
+            for i in 0..5 {
+                assert_eq!(result[i].log_id.leader_id.term, 1);
+            }
+            // Entries from cycle 2
+            for i in 5..10 {
+                assert_eq!(result[i].log_id.leader_id.term, 2);
+            }
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Group lifecycle
+    // ===================================================================
+
+    #[test]
+    fn test_remove_group() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            // Create multiple groups
+            let _log0 = storage.get_log_storage(0).await.unwrap();
+            let _log1 = storage.get_log_storage(1).await.unwrap();
+            let _log2 = storage.get_log_storage(2).await.unwrap();
+
+            assert_eq!(storage.num_groups(), 3);
+
+            // Remove a group
+            storage.remove_group(1);
+            assert_eq!(storage.num_groups(), 2);
+
+            // Remaining groups should still work
+            let ids = storage.group_ids();
+            assert!(ids.contains(&0));
+            assert!(ids.contains(&2));
+            assert!(!ids.contains(&1));
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_recreate_group_after_remove() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+            let entries = vec![make_entry(1, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            storage.remove_group(0);
+
+            // Re-create the group — it should recover existing data from disk
+            let mut log = storage.get_log_storage(0).await.unwrap();
+            let result = log.try_get_log_entries(1..2).await.unwrap();
+            assert_eq!(result.len(), 1);
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Stress test: no deadlocks under load
+    // ===================================================================
+
+    #[test]
+    fn test_no_deadlock_under_concurrent_load() {
+        // Hammer multiple groups with concurrent reads, writes, votes, truncates,
+        // and purges. Must complete within timeout (no deadlock).
+        let result = std::panic::catch_unwind(|| {
+            run_async(async {
+                let tmp = TempDir::new().unwrap();
+                let config = MmapStorageConfig::new(tmp.path())
+                    .with_segment_size(256)
+                    .with_fsync_delay(Duration::from_millis(1));
+                let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+                let mut handles = Vec::new();
+
+                for group_id in 0..3u64 {
+                    let mut log = storage.get_log_storage(group_id).await.unwrap();
+                    let handle = tokio::spawn(async move {
+                        let mut pending = Vec::new();
+
+                        // Phase 1: Rapid writes
+                        for i in 1..=50 {
+                            let entries = vec![make_entry(i, group_id + 1)];
+                            let (cb, rx) = make_callback();
+                            log.append(entries, cb).await.unwrap();
+                            pending.push(rx);
+
+                            // Intersperse with votes
+                            if i % 10 == 0 {
+                                log.save_vote(&make_vote(i, group_id, i % 2 == 0))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+
+                        // Phase 2: Drain callbacks
+                        for rx in pending {
+                            rx.await.unwrap().unwrap();
+                        }
+
+                        // Phase 3: Read all entries
+                        let result = log.try_get_log_entries(1..51).await.unwrap();
+                        assert_eq!(result.len(), 50);
+
+                        // Phase 4: Truncate some
+                        let trunc_lid = LogId {
+                            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                                term: group_id + 1,
+                                node_id: 1,
+                            },
+                            index: 30,
+                        };
+                        log.truncate_after(Some(trunc_lid)).await.unwrap();
+
+                        // Phase 5: Write more after truncation
+                        let mut pending = Vec::new();
+                        for i in 31..=40 {
+                            let entries = vec![make_entry(i, group_id + 10)];
+                            let (cb, rx) = make_callback();
+                            log.append(entries, cb).await.unwrap();
+                            pending.push(rx);
+                        }
+                        for rx in pending {
+                            rx.await.unwrap().unwrap();
+                        }
+
+                        // Phase 6: Purge early entries
+                        let purge_lid = LogId {
+                            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                                term: group_id + 1,
+                                node_id: 1,
+                            },
+                            index: 10,
+                        };
+                        log.purge(purge_lid).await.unwrap();
+
+                        // Phase 7: Verify final state
+                        let result = log.try_get_log_entries(11..41).await.unwrap();
+                        assert_eq!(result.len(), 30);
+                    });
+                    handles.push(handle);
+                }
+
+                // Timeout: must complete within 30 seconds or it's a deadlock
+                let timeout = tokio::time::timeout(Duration::from_secs(30), async {
+                    for handle in handles {
+                        handle.await.unwrap();
+                    }
+                });
+                assert!(timeout.await.is_ok(), "Deadlock detected: test timed out");
+
+                storage.stop();
+            });
+        });
+        assert!(result.is_ok(), "Test panicked unexpectedly");
     }
 }

@@ -10,8 +10,9 @@ keywords = ["raft", "consensus", "distributed", "async"]
 categories = ["asynchronous", "network-programming"]
 
 [features]
-default = ["multi"]
+default = ["multi", "tls"]
 multi = []
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
 
 [dependencies]
 futures = { workspace = true }
@@ -19,29 +20,36 @@ futures = { workspace = true }
 openraft = { workspace = true, features = ["tokio-rt"] }
 
 # Other dependencies
+bytes = { workspace = true }
 crc64fast-nvme = { workspace = true }
 congee = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
-crossfire = "3.1"
+crossfire = { workspace = true }
 lru = { workspace = true }
-flume = "0.12"
-libmdbx = "0.6"
+libmdbx = { workspace = true }
 memmap2 = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-bincode = { version = "2.0.1", features = ["serde"] }
+bincode = { workspace = true, features = ["serde"] }
 chrono = { workspace = true }
 futures-lite = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tempfile = "3.10"
+tempfile = { workspace = true }
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [[example]]
 name = "multi_raft_cluster"

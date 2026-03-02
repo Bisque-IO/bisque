@@ -14,10 +14,8 @@
 
 use crate::multi::codec::{Decode, Encode, ResponseMessage, RpcMessage};
 use crate::multi::network::MultiplexedTransport;
+use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 use openraft::RaftTypeConfig;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError};
 use openraft::raft::{
@@ -33,6 +31,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::oneshot;
+
+/// Boxed async reader half — either OwnedReadHalf (TCP) or ReadHalf<TlsStream>
+pub type BoxedReader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+/// Boxed async writer half
+pub type BoxedWriter = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 
 // Thread-local buffer pool for encoding to avoid repeated allocations.
 // The pool maintains a single buffer per thread that grows to accommodate the largest message.
@@ -56,7 +62,7 @@ pub fn return_encode_buffer(mut buffer: Vec<u8>) {
 
 /// Network error types for transport
 #[derive(Debug, thiserror::Error)]
-pub enum ManiacTransportError {
+pub enum BisqueTransportError {
     #[error("Connection failed: {0}")]
     ConnectionError(Cow<'static, str>),
 
@@ -91,29 +97,29 @@ pub enum ManiacTransportError {
     CodecError(Cow<'static, str>),
 }
 
-impl<C: RaftTypeConfig> From<ManiacTransportError> for RPCError<C> {
-    fn from(error: ManiacTransportError) -> Self {
+impl<C: RaftTypeConfig> From<BisqueTransportError> for RPCError<C> {
+    fn from(error: BisqueTransportError) -> Self {
         RPCError::Network(openraft::error::NetworkError::new(&error))
     }
 }
 
-impl<C: RaftTypeConfig> From<ManiacTransportError>
+impl<C: RaftTypeConfig> From<BisqueTransportError>
     for RPCError<C, RaftError<C, InstallSnapshotError>>
 {
-    fn from(error: ManiacTransportError) -> Self {
+    fn from(error: BisqueTransportError) -> Self {
         RPCError::Network(openraft::error::NetworkError::new(&error))
     }
 }
 
-impl<C: RaftTypeConfig> From<ManiacTransportError> for RPCError<C, RaftError<C>> {
-    fn from(error: ManiacTransportError) -> Self {
+impl<C: RaftTypeConfig> From<BisqueTransportError> for RPCError<C, RaftError<C>> {
+    fn from(error: BisqueTransportError) -> Self {
         RPCError::Network(openraft::error::NetworkError::new(&error))
     }
 }
 
 /// Configuration for ManiacTcpTransport
 #[derive(Debug, Clone)]
-pub struct ManiacTcpTransportConfig {
+pub struct BisqueTcpTransportConfig {
     /// Connection timeout for establishing new connections
     pub connect_timeout: Duration,
     /// Request timeout for individual RPC calls
@@ -131,9 +137,16 @@ pub struct ManiacTcpTransportConfig {
     pub connection_ttl: Duration,
     /// TCP nodelay (disable Nagle's algorithm)
     pub tcp_nodelay: bool,
+    /// TLS client configuration for outgoing connections.
+    /// When set, all outgoing connections use TLS.
+    #[cfg(feature = "tls")]
+    pub tls_client_config: Option<Arc<rustls::ClientConfig>>,
+    /// Server name for TLS SNI verification on outgoing connections.
+    #[cfg(feature = "tls")]
+    pub tls_server_name: Option<rustls::pki_types::ServerName<'static>>,
 }
 
-impl Default for ManiacTcpTransportConfig {
+impl Default for BisqueTcpTransportConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(10),
@@ -142,23 +155,27 @@ impl Default for ManiacTcpTransportConfig {
             max_concurrent_requests_per_conn: 256,
             connection_ttl: Duration::from_secs(300), // 5 minutes
             tcp_nodelay: true,
+            #[cfg(feature = "tls")]
+            tls_client_config: None,
+            #[cfg(feature = "tls")]
+            tls_server_name: None,
         }
     }
 }
 
 /// Frame format: length (u32) + payload
-const FRAME_PREFIX_LEN: usize = 4;
+pub(crate) const FRAME_PREFIX_LEN: usize = 4;
 
 /// Helper to read a frame from any AsyncRead stream
 pub async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
-) -> Result<Vec<u8>, ManiacTransportError> {
+) -> Result<Vec<u8>, BisqueTransportError> {
     // Read length prefix
     let mut len_buf = [0u8; FRAME_PREFIX_LEN];
     stream
         .read_exact(&mut len_buf)
         .await
-        .map_err(ManiacTransportError::IoError)?;
+        .map_err(BisqueTransportError::IoError)?;
 
     let len = u32::from_le_bytes(len_buf) as usize;
 
@@ -171,7 +188,7 @@ pub async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     stream
         .read_exact(&mut payload)
         .await
-        .map_err(ManiacTransportError::IoError)?;
+        .map_err(BisqueTransportError::IoError)?;
 
     Ok(payload)
 }
@@ -182,7 +199,7 @@ pub async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
 pub async fn write_frame_vectored<W: tokio::io::AsyncWrite + Unpin>(
     stream: &mut W,
     data: Vec<u8>,
-) -> Result<Vec<u8>, ManiacTransportError> {
+) -> Result<Vec<u8>, BisqueTransportError> {
     let len = data.len() as u32;
     let len_buf = len.to_le_bytes();
 
@@ -190,11 +207,11 @@ pub async fn write_frame_vectored<W: tokio::io::AsyncWrite + Unpin>(
     stream
         .write_all(&len_buf)
         .await
-        .map_err(ManiacTransportError::IoError)?;
+        .map_err(BisqueTransportError::IoError)?;
     stream
         .write_all(&data)
         .await
-        .map_err(ManiacTransportError::IoError)?;
+        .map_err(BisqueTransportError::IoError)?;
 
     // Return the payload buffer for potential reuse
     let mut payload_buf = data;
@@ -202,26 +219,94 @@ pub async fn write_frame_vectored<W: tokio::io::AsyncWrite + Unpin>(
     Ok(payload_buf)
 }
 
-/// Helper to write a frame to any AsyncWrite stream (legacy version for borrowed data)
+/// Helper to write a frame to any AsyncWrite stream (for borrowed data).
+/// Uses two write_all calls to avoid allocating a combined buffer.
 pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     stream: &mut W,
     data: &[u8],
-) -> Result<(), ManiacTransportError> {
+) -> Result<(), BisqueTransportError> {
     let len = data.len() as u32;
-    let mut frame = Vec::with_capacity(4 + data.len());
-    frame.extend_from_slice(&len.to_le_bytes());
-    frame.extend_from_slice(data);
-
+    let len_buf = len.to_le_bytes();
     stream
-        .write_all(&frame)
+        .write_all(&len_buf)
         .await
-        .map_err(ManiacTransportError::IoError)?;
-
+        .map_err(BisqueTransportError::IoError)?;
+    stream
+        .write_all(data)
+        .await
+        .map_err(BisqueTransportError::IoError)?;
     Ok(())
 }
 
+/// Read a frame into a reusable buffer, avoiding per-frame allocation.
+/// Returns the number of payload bytes read. The buffer is resized to fit
+/// the payload; if capacity is already sufficient, no allocation occurs.
+pub async fn read_frame_into<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<usize, BisqueTransportError> {
+    let mut len_buf = [0u8; FRAME_PREFIX_LEN];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(BisqueTransportError::IoError)?;
+
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len == 0 {
+        buf.clear();
+        return Ok(0);
+    }
+
+    // Grow the buffer if needed. If capacity >= len this is just a length update.
+    // The zero-fill from resize is overwritten by read_exact immediately.
+    buf.resize(len, 0);
+    stream
+        .read_exact(&mut buf[..len])
+        .await
+        .map_err(BisqueTransportError::IoError)?;
+
+    Ok(len)
+}
+
+/// Write a buffer that already contains the frame header prepended to the payload.
+/// This is a single write_all call — no header/payload split, no extra syscall.
+/// Returns the cleared buffer for pool reuse.
+pub async fn write_preframed<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
+    data: Vec<u8>,
+) -> Result<Vec<u8>, BisqueTransportError> {
+    stream
+        .write_all(&data)
+        .await
+        .map_err(BisqueTransportError::IoError)?;
+    let mut buf = data;
+    buf.clear();
+    Ok(buf)
+}
+
+/// Encode a message into the thread-local buffer with a frame length header prepended.
+/// Uses `mem::take` to move the buffer out of TLS without copying.
+/// Returns an owned buffer containing `[4-byte LE length | payload]`.
+/// Caller should pass the buffer to `write_preframed` and then `return_encode_buffer`.
+pub fn encode_framed<E: Encode>(msg: &E) -> Result<Vec<u8>, BisqueTransportError> {
+    ENCODE_BUFFER.with(|buf| {
+        let mut borrowed = buf.borrow_mut();
+        borrowed.clear();
+        // Reserve space for the 4-byte frame length prefix
+        borrowed.extend_from_slice(&[0u8; FRAME_PREFIX_LEN]);
+        // Encode the message after the prefix
+        msg.encode(&mut *borrowed)
+            .map_err(|e| BisqueTransportError::CodecError(e.to_string().into()))?;
+        // Patch the length prefix (payload length = total - header)
+        let payload_len = (borrowed.len() - FRAME_PREFIX_LEN) as u32;
+        borrowed[..FRAME_PREFIX_LEN].copy_from_slice(&payload_len.to_le_bytes());
+        // Move the buffer out of TLS (zero-copy). TLS gets an empty Vec.
+        Ok(std::mem::take(&mut *borrowed))
+    })
+}
+
 /// Type alias for pending request channel
-type PendingResponseSender = oneshot::Sender<Result<Vec<u8>, ManiacTransportError>>;
+type PendingResponseSender = oneshot::Sender<Result<Bytes, BisqueTransportError>>;
 
 /// Message sent to the connection task for writing
 struct WriteRequest {
@@ -251,8 +336,8 @@ impl<'a> Drop for InFlightGuard<'a> {
 
 /// A single multiplexed connection with its own IO task
 struct MultiplexedConnection {
-    /// Channel to send write requests to the IO task (using flume for reliability)
-    write_tx: flume::Sender<WriteRequest>,
+    /// Channel to send write requests to the IO task
+    write_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<WriteRequest>>,
     /// Connection creation time for TTL tracking
     created_at: Instant,
     /// Number of in-flight requests
@@ -265,9 +350,9 @@ struct MultiplexedConnection {
 
 impl MultiplexedConnection {
     /// Create a new multiplexed connection and spawn the IO task
-    fn new(stream: TcpStream, conn_id: u64) -> Arc<Self> {
-        // Channel for write requests - buffer up to 256 pending writes (using flume for reliability)
-        let (write_tx, write_rx) = flume::bounded::<WriteRequest>(256);
+    fn new(reader: BoxedReader, writer: BoxedWriter, conn_id: u64) -> Arc<Self> {
+        // Channel for write requests - buffer up to 256 pending writes
+        let (write_tx, write_rx) = crossfire::mpsc::bounded_async::<WriteRequest>(256);
 
         let conn = Arc::new(Self {
             write_tx,
@@ -280,7 +365,7 @@ impl MultiplexedConnection {
         // Spawn IO task that handles both reading and writing
         let conn_clone = conn.clone();
         tokio::spawn(async move {
-            conn_clone.io_loop(stream, write_rx).await;
+            conn_clone.io_loop(reader, writer, write_rx).await;
         });
 
         conn
@@ -288,25 +373,27 @@ impl MultiplexedConnection {
 
     /// IO loop that handles both reading responses and writing requests
     /// Uses split stream with separate reader and writer tasks for true concurrency
-    async fn io_loop(self: Arc<Self>, stream: TcpStream, write_rx: flume::Receiver<WriteRequest>) {
+    async fn io_loop(
+        self: Arc<Self>,
+        reader: BoxedReader,
+        writer: BoxedWriter,
+        write_rx: crossfire::AsyncRx<crossfire::mpsc::Array<WriteRequest>>,
+    ) {
         // Map of pending requests awaiting responses
         let pending: Arc<DashMap<u64, PendingResponseSender>> = Arc::new(DashMap::new());
-
-        // Split the stream into read and write halves
-        let (read_half, write_half) = stream.into_split();
 
         // Spawn the writer task
         let conn_self = self.clone();
         let pending_clone = pending.clone();
         let _writer_handle = tokio::spawn(async move {
             conn_self
-                .writer_loop(write_half, write_rx, pending_clone)
+                .writer_loop(writer, write_rx, pending_clone)
                 .await;
         });
 
         // Run the reader in the current task
         let reader_self = self.clone();
-        reader_self.reader_loop(read_half, pending.clone()).await;
+        reader_self.reader_loop(reader, pending.clone()).await;
 
         // When reader exits, mark connection as dead (writer will notice via channel closure)
         self.alive.store(false, Ordering::Release);
@@ -316,8 +403,8 @@ impl MultiplexedConnection {
     /// Writer loop - processes write requests from the channel
     async fn writer_loop(
         self: Arc<Self>,
-        mut write_half: tokio::net::tcp::OwnedWriteHalf,
-        write_rx: flume::Receiver<WriteRequest>,
+        mut write_half: BoxedWriter,
+        write_rx: crossfire::AsyncRx<crossfire::mpsc::Array<WriteRequest>>,
         pending: Arc<DashMap<u64, PendingResponseSender>>,
     ) {
         loop {
@@ -327,19 +414,19 @@ impl MultiplexedConnection {
             }
 
             // Wait for a write request (this blocks properly without busy-wait)
-            match write_rx.recv_async().await {
+            match write_rx.recv().await {
                 Ok(write_req) => {
                     // Register the pending request before writing
                     pending.insert(write_req.request_id, write_req.response_tx);
 
-                    // Write the request using sequential writes
-                    match write_frame_vectored(&mut write_half, write_req.data).await {
+                    // Write the pre-framed buffer (header + payload) in a single syscall
+                    match write_preframed(&mut write_half, write_req.data).await {
                         Ok(returned_buf) => {
                             // Return the buffer to the thread-local pool for reuse
                             return_encode_buffer(returned_buf);
                         }
                         Err(e) => {
-                            tracing::debug!("Connection {} write error: {}", self.conn_id, e);
+                            tracing::trace!("Connection {} write error: {}", self.conn_id, e);
                             // Remove and notify this request
                             if let Some((_, tx)) = pending.remove(&write_req.request_id) {
                                 let _ = tx.send(Err(e));
@@ -357,50 +444,80 @@ impl MultiplexedConnection {
         }
     }
 
-    /// Reader loop - reads responses and dispatches to pending requests
+    /// Reader loop - reads responses and dispatches to pending requests.
+    /// Uses a BytesMut rolling buffer for zero-copy frame extraction:
+    /// - Reads chunks from the socket into a contiguous buffer
+    /// - Extracts complete frames via `split_to().freeze()` (pointer arithmetic, no copy)
+    /// - Multiple frames per read syscall when data arrives in bursts
     async fn reader_loop(
         self: Arc<Self>,
-        mut read_half: tokio::net::tcp::OwnedReadHalf,
+        mut read_half: BoxedReader,
         pending: Arc<DashMap<u64, PendingResponseSender>>,
     ) {
+        let mut buf = BytesMut::with_capacity(64 * 1024);
+
         loop {
-            // Check if connection is still alive
             if !self.alive.load(Ordering::Acquire) {
                 return;
             }
 
-            // Read a response (blocks properly without busy-wait)
-            match read_frame(&mut read_half).await {
-                Ok(data) => {
-                    // Parse request_id from response
-                    // Parse request_id from response
-                    if data.len() < 9 {
-                        tracing::error!("Response too short: {} bytes", data.len());
-                        // Close connection on invalid data to prevent busy loop
-                        return;
-                    }
-
-                    let request_id = u64::from_le_bytes(data[1..9].try_into().unwrap());
-
-                    if let Some((_, sender)) = pending.remove(&request_id) {
-                        let _ = sender.send(Ok(data));
-                    } else {
-                        tracing::warn!(
-                            "Received response for unknown request ID: {} (len={}, disc={})",
-                            request_id,
-                            data.len(),
-                            data[0]
-                        );
-                    }
+            // Process all complete frames already in the buffer
+            loop {
+                if buf.len() < FRAME_PREFIX_LEN {
+                    break;
                 }
+                let payload_len =
+                    u32::from_le_bytes(buf[..FRAME_PREFIX_LEN].try_into().unwrap()) as usize;
+
+                if payload_len == 0 {
+                    buf.advance(FRAME_PREFIX_LEN);
+                    continue;
+                }
+
+                if buf.len() < FRAME_PREFIX_LEN + payload_len {
+                    break; // Incomplete frame, need more data
+                }
+
+                // Complete frame available — extract zero-copy
+                buf.advance(FRAME_PREFIX_LEN);
+                let frame: Bytes = buf.split_to(payload_len).freeze();
+
+                if frame.len() < 9 {
+                    tracing::error!("Response too short: {} bytes", frame.len());
+                    return;
+                }
+
+                let request_id = u64::from_le_bytes(frame[1..9].try_into().unwrap());
+
+                if let Some((_, sender)) = pending.remove(&request_id) {
+                    let _ = sender.send(Ok(frame));
+                } else {
+                    tracing::warn!(
+                        "Response for unknown request ID: {} (len={}, disc={})",
+                        request_id,
+                        payload_len,
+                        frame[0]
+                    );
+                }
+            }
+
+            // Compact/reserve if running low on space
+            if buf.capacity() - buf.len() < 4096 {
+                buf.reserve(64 * 1024);
+            }
+
+            // Read more data from the socket
+            match read_half.read_buf(&mut buf).await {
+                Ok(0) => {
+                    tracing::trace!("Connection {} closed by peer", self.conn_id);
+                    return;
+                }
+                Ok(_) => {} // Data read, loop back to parse frames
                 Err(e) => {
-                    // Check if it's an EOF (connection closed gracefully)
-                    if let ManiacTransportError::IoError(ref io_err) = e {
-                        if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
-                            tracing::debug!("Connection {} closed by peer", self.conn_id);
-                        } else {
-                            tracing::debug!("Connection {} read error: {}", self.conn_id, e);
-                        }
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        tracing::trace!("Connection {} closed by peer", self.conn_id);
+                    } else {
+                        tracing::trace!("Connection {} read error: {}", self.conn_id, e);
                     }
                     return;
                 }
@@ -408,13 +525,14 @@ impl MultiplexedConnection {
         }
     }
 
-    /// Notify all pending requests of connection error
+    /// Notify all pending requests of connection error.
+    /// Collects keys in one read-lock pass, then removes each (N+1 lock acquisitions
+    /// instead of 2N with the previous iter-next-remove pattern).
     fn notify_all_pending_error(&self, pending: &DashMap<u64, PendingResponseSender>) {
-        // Drain all entries one by one - avoids collecting all keys into a Vec upfront
-        // which could be large under high load
-        while let Some(entry) = pending.iter().next().map(|e| *e.key()) {
-            if let Some((_, sender)) = pending.remove(&entry) {
-                let _ = sender.send(Err(ManiacTransportError::ConnectionClosed));
+        let keys: Vec<u64> = pending.iter().map(|e| *e.key()).collect();
+        for key in keys {
+            if let Some((_, sender)) = pending.remove(&key) {
+                let _ = sender.send(Err(BisqueTransportError::ConnectionClosed));
             }
         }
     }
@@ -435,9 +553,9 @@ impl MultiplexedConnection {
         request_id: u64,
         request_data: Vec<u8>,
         timeout: Duration,
-    ) -> Result<Vec<u8>, ManiacTransportError> {
+    ) -> Result<Bytes, BisqueTransportError> {
         if !self.alive.load(Ordering::Acquire) {
-            return Err(ManiacTransportError::ConnectionClosed);
+            return Err(BisqueTransportError::ConnectionClosed);
         }
 
         // Create response channel
@@ -454,9 +572,9 @@ impl MultiplexedConnection {
             response_tx,
         };
 
-        if self.write_tx.send_async(write_req).await.is_err() {
+        if self.write_tx.send(write_req).await.is_err() {
             self.alive.store(false, Ordering::Release);
-            return Err(ManiacTransportError::ConnectionClosed);
+            return Err(BisqueTransportError::ConnectionClosed);
         }
 
         // Wait for response with timeout
@@ -465,7 +583,7 @@ impl MultiplexedConnection {
             Ok(Err(_recv_err)) => {
                 // Sender dropped - connection likely closed
                 self.alive.store(false, Ordering::Release);
-                Err(ManiacTransportError::ConnectionClosed)
+                Err(BisqueTransportError::ConnectionClosed)
             }
             Err(_timeout) => {
                 // Request timed out - mark connection as dead to prevent reuse of stalled connection
@@ -475,7 +593,7 @@ impl MultiplexedConnection {
                     self.conn_id
                 );
                 self.alive.store(false, Ordering::Release);
-                Err(ManiacTransportError::RequestTimeout)
+                Err(BisqueTransportError::RequestTimeout)
             }
         }
     }
@@ -516,37 +634,39 @@ impl MultiplexedConnectionPool {
         &self,
         addr: SocketAddr,
         factory: F,
-    ) -> Result<Arc<MultiplexedConnection>, ManiacTransportError>
+    ) -> Result<Arc<MultiplexedConnection>, BisqueTransportError>
     where
         F: Fn() -> Fut,
-        Fut: Future<Output = Result<TcpStream, io::Error>>,
+        Fut: Future<Output = Result<(BoxedReader, BoxedWriter), io::Error>>,
     {
         let ttl = self.connection_ttl;
         let max_per_conn = self.max_per_conn as u64;
 
-        // First pass: try to find an existing usable connection
-        // We scope this block to ensure the DashMap lock is dropped before any await
+        // First pass: try to find an existing usable connection.
+        // We scope this block to ensure the DashMap lock is dropped before any await.
+        // Dead/expired connections are skipped during selection and only cleaned up
+        // when the pool is at capacity and needs room for a new connection.
         {
             let mut pool = self.pools.entry(addr).or_insert_with(Vec::new);
 
-            // Remove dead or expired connections
-            pool.retain(|conn| conn.is_usable(ttl));
-
-            // Find connection with lowest in-flight count in a single pass
-            // Track indices to avoid cloning Arc until we know which one we need
+            // Find connection with lowest in-flight count in a single pass,
+            // skipping dead/expired connections without eagerly removing them.
             let mut best_idx: Option<usize> = None;
             let mut best_count = u64::MAX;
             let mut fallback_idx: Option<usize> = None;
             let mut fallback_count = u64::MAX;
+            let mut usable_count = 0usize;
 
             for (idx, conn) in pool.iter().enumerate() {
+                if !conn.is_usable(ttl) {
+                    continue;
+                }
+                usable_count += 1;
                 let count = conn.in_flight_count();
-                // Track best connection with capacity
                 if count < best_count && count < max_per_conn {
                     best_count = count;
                     best_idx = Some(idx);
                 }
-                // Also track overall best for fallback
                 if count < fallback_count {
                     fallback_count = count;
                     fallback_idx = Some(idx);
@@ -557,24 +677,27 @@ impl MultiplexedConnectionPool {
                 return Ok(pool[idx].clone());
             }
 
-            // If we are at capacity, reuse the one with lowest load even if full
-            if pool.len() >= self.connections_per_addr {
+            // If all usable connections are at capacity, reuse the least loaded one
+            if usable_count >= self.connections_per_addr {
                 if let Some(idx) = fallback_idx {
                     return Ok(pool[idx].clone());
                 }
             }
+
+            // Clean up dead/expired connections only when we need to create a new one
+            pool.retain(|conn| conn.is_usable(ttl));
         } // Lock dropped here
 
         // No usable connection and we have capacity to create one.
         // Create new connection without holding the lock
-        let stream = factory().await.map_err(|e| {
-            ManiacTransportError::ConnectionError(
+        let (reader, writer) = factory().await.map_err(|e| {
+            BisqueTransportError::ConnectionError(
                 format!("Failed to connect to {}: {}", addr, e).into(),
             )
         })?;
 
         let conn_id = self.next_conn_id();
-        let conn = MultiplexedConnection::new(stream, conn_id);
+        let conn = MultiplexedConnection::new(reader, writer, conn_id);
 
         // Re-acquire lock to insert
         // Note: another task might have inserted a connection in the meantime,
@@ -672,8 +795,8 @@ impl<NodeId: Eq + std::hash::Hash + Clone + Send + Sync + 'static> NodeAddressRe
 }
 
 /// TCP transport implementation for Multi-Raft with true connection multiplexing
-pub struct ManiacTcpTransport<C: RaftTypeConfig> {
-    config: ManiacTcpTransportConfig,
+pub struct BisqueTcpTransport<C: RaftTypeConfig> {
+    config: BisqueTcpTransportConfig,
     connection_pool: Arc<MultiplexedConnectionPool>,
     /// Node address resolver
     node_registry: Arc<dyn NodeAddressResolver<C::NodeId>>,
@@ -682,14 +805,14 @@ pub struct ManiacTcpTransport<C: RaftTypeConfig> {
     _phantom: PhantomData<C>,
 }
 
-impl<C> ManiacTcpTransport<C>
+impl<C> BisqueTcpTransport<C>
 where
     C: RaftTypeConfig,
     C::NodeId: Eq + std::hash::Hash + Clone,
 {
     /// Create a new ManiacTcpTransport with true multiplexing support
     pub fn new(
-        config: ManiacTcpTransportConfig,
+        config: BisqueTcpTransportConfig,
         node_registry: Arc<dyn NodeAddressResolver<C::NodeId>>,
     ) -> Self {
         Self {
@@ -711,7 +834,7 @@ where
         C::NodeId: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
     {
         Self::new(
-            ManiacTcpTransportConfig::default(),
+            BisqueTcpTransportConfig::default(),
             Arc::new(DefaultNodeRegistry::new()),
         )
     }
@@ -732,53 +855,60 @@ where
         target: &SocketAddr,
         request_id: u64,
         request_msg: &RpcMessage<D>,
-    ) -> Result<Vec<u8>, ManiacTransportError> {
+    ) -> Result<Bytes, BisqueTransportError> {
         let pool = self.connection_pool.clone();
         let addr = *target;
         let tcp_nodelay = self.config.tcp_nodelay;
 
-        tracing::debug!("rpc_call: target={}, request_id={}", addr, request_id);
+        // Encode into TLS buffer with frame header prepended. Zero-copy move via mem::take.
+        let request_data = encode_framed(request_msg)?;
 
-        // Serialize request using thread-local buffer pool to reduce allocations.
-        // We encode into the pooled buffer, clone the data (fast memcpy), then return the buffer.
-        // The buffer keeps its capacity for reuse, avoiding repeated Vec growth.
-        let request_data = ENCODE_BUFFER.with(|buf| {
-            let mut borrowed = buf.borrow_mut();
-            borrowed.clear();
-            request_msg
-                .encode_into(&mut borrowed)
-                .map_err(|e| ManiacTransportError::CodecError(e.to_string().into()))?;
-            // Clone the data - this is a fast memcpy, the buffer keeps its capacity
-            Ok::<_, ManiacTransportError>(borrowed.clone())
-        })?;
+        tracing::trace!(
+            target = %addr,
+            request_id,
+            bytes = request_data.len(),
+            "rpc_call"
+        );
 
-        tracing::debug!("rpc_call: encoded {} bytes", request_data.len());
+        // Capture TLS config for the factory closure (Arc is cheap to clone per-call)
+        #[cfg(feature = "tls")]
+        let tls_client_config = self.config.tls_client_config.clone();
+        #[cfg(feature = "tls")]
+        let tls_server_name = self.config.tls_server_name.clone();
 
         // Get a connection from the pool
-        tracing::debug!("rpc_call: getting connection from pool");
         let conn = pool
-            .get_or_create(addr, || async move {
-                tracing::debug!("rpc_call: creating new TCP connection to {}", addr);
-                let stream = TcpStream::connect(addr).await?;
-                stream.set_nodelay(tcp_nodelay)?;
-                Ok(stream)
+            .get_or_create(addr, || {
+                // Clone per-invocation so the Fn closure can be called multiple times
+                #[cfg(feature = "tls")]
+                let tls_client_config = tls_client_config.clone();
+                #[cfg(feature = "tls")]
+                let tls_server_name = tls_server_name.clone();
+
+                async move {
+                    let stream = TcpStream::connect(addr).await?;
+                    stream.set_nodelay(tcp_nodelay)?;
+
+                    #[cfg(feature = "tls")]
+                    if let Some(tls_config) = tls_client_config {
+                        let connector = tokio_rustls::TlsConnector::from(tls_config);
+                        let server_name = tls_server_name
+                            .unwrap_or_else(|| rustls::pki_types::ServerName::IpAddress(addr.ip().into()));
+                        let tls_stream = connector.connect(server_name, stream).await?;
+                        let (reader, writer) = tokio::io::split(tls_stream);
+                        return Ok((Box::new(reader) as BoxedReader, Box::new(writer) as BoxedWriter));
+                    }
+
+                    let (read_half, write_half) = stream.into_split();
+                    Ok((Box::new(read_half) as BoxedReader, Box::new(write_half) as BoxedWriter))
+                }
             })
             .await?;
-
-        tracing::debug!("rpc_call: got connection conn_id={}", conn.conn_id);
 
         // Send request and wait for response
         let result = conn
             .send_request(request_id, request_data, self.config.request_timeout)
             .await;
-
-        tracing::debug!(
-            "rpc_call: send_request result={:?}",
-            result
-                .as_ref()
-                .map(|v| v.len())
-                .map_err(|e| format!("{}", e))
-        );
 
         // If the connection failed, remove it from the pool
         if result.is_err() && !conn.alive.load(Ordering::Acquire) {
@@ -789,7 +919,7 @@ where
     }
 }
 
-impl<C> MultiplexedTransport<C> for ManiacTcpTransport<C>
+impl<C> MultiplexedTransport<C> for BisqueTcpTransport<C>
 where
     C: RaftTypeConfig<
             NodeId = u64,
@@ -818,7 +948,7 @@ where
         let addr = self
             .node_registry
             .resolve(&target)
-            .ok_or_else(|| ManiacTransportError::UnknownNode(target))?;
+            .ok_or_else(|| BisqueTransportError::UnknownNode(target))?;
         let request_id = self.next_request_id();
 
         // Convert entries using ToCodec trait - pre-allocate capacity
@@ -847,7 +977,7 @@ where
 
         // Deserialize response
         let response: RpcMessage<RawBytes> = RpcMessage::decode_from_slice(&response_data)
-            .map_err(|e| ManiacTransportError::CodecError(e.to_string().into()))
+            .map_err(|e| BisqueTransportError::CodecError(e.to_string().into()))
             .map_err(RPCError::<C, RaftError<C>>::from)?;
 
         match response {
@@ -870,9 +1000,9 @@ where
                 }
             }
             RpcMessage::Error { error, .. } => {
-                Err(ManiacTransportError::RemoteError(error.into()).into())
+                Err(BisqueTransportError::RemoteError(error.into()).into())
             }
-            _ => Err(ManiacTransportError::InvalidResponse.into()),
+            _ => Err(BisqueTransportError::InvalidResponse.into()),
         }
     }
 
@@ -884,14 +1014,10 @@ where
     ) -> Result<VoteResponse<C>, RPCError<C, RaftError<C>>> {
         use crate::multi::codec::{FromCodec, RawBytes, ToCodec, VoteRequest as CodecVoteRequest};
 
-        tracing::debug!("send_vote: target={}, group_id={}", target, group_id);
-
-        let addr = self.node_registry.resolve(&target).ok_or_else(|| {
-            tracing::error!("send_vote: Unknown node: {}", target);
-            ManiacTransportError::UnknownNode(target)
-        })?;
-
-        tracing::debug!("send_vote: resolved addr={}", addr);
+        let addr = self
+            .node_registry
+            .resolve(&target)
+            .ok_or_else(|| BisqueTransportError::UnknownNode(target))?;
         let request_id = self.next_request_id();
 
         let codec_rpc = CodecVoteRequest {
@@ -912,7 +1038,7 @@ where
 
         // Deserialize response
         let response: RpcMessage<RawBytes> = RpcMessage::decode_from_slice(&response_data)
-            .map_err(|e| ManiacTransportError::CodecError(e.to_string().into()))
+            .map_err(|e| BisqueTransportError::CodecError(e.to_string().into()))
             .map_err(RPCError::<C, RaftError<C>>::from)?;
 
         match response {
@@ -927,9 +1053,9 @@ where
                     .map(|l| openraft::LogId::<C>::from_codec(l)),
             }),
             RpcMessage::Error { error, .. } => {
-                Err(ManiacTransportError::RemoteError(error.into()).into())
+                Err(BisqueTransportError::RemoteError(error.into()).into())
             }
-            _ => Err(ManiacTransportError::InvalidResponse.into()),
+            _ => Err(BisqueTransportError::InvalidResponse.into()),
         }
     }
 
@@ -946,7 +1072,7 @@ where
         let addr = self
             .node_registry
             .resolve(&target)
-            .ok_or_else(|| ManiacTransportError::UnknownNode(target))?;
+            .ok_or_else(|| BisqueTransportError::UnknownNode(target))?;
         let request_id = self.next_request_id();
 
         let codec_rpc = CodecInstallSnapshotRequest {
@@ -970,7 +1096,7 @@ where
 
         // Deserialize response
         let response: RpcMessage<RawBytes> = RpcMessage::decode_from_slice(&response_data)
-            .map_err(|e| ManiacTransportError::CodecError(e.to_string().into()))
+            .map_err(|e| BisqueTransportError::CodecError(e.to_string().into()))
             .map_err(RPCError::<C, RaftError<C, InstallSnapshotError>>::from)?;
 
         match response {
@@ -981,9 +1107,9 @@ where
                 vote: openraft::impls::Vote::<C>::from_codec(resp.vote),
             }),
             RpcMessage::Error { error, .. } => {
-                Err(ManiacTransportError::RemoteError(error.into()).into())
+                Err(BisqueTransportError::RemoteError(error.into()).into())
             }
-            _ => Err(ManiacTransportError::InvalidResponse.into()),
+            _ => Err(BisqueTransportError::InvalidResponse.into()),
         }
     }
 
@@ -1000,7 +1126,7 @@ where
         let addr = self
             .node_registry
             .resolve(&target)
-            .ok_or_else(|| ManiacTransportError::UnknownNode(target))?;
+            .ok_or_else(|| BisqueTransportError::UnknownNode(target))?;
 
         let request_id = self.next_request_id();
 
@@ -1037,7 +1163,7 @@ where
             .map_err(RPCError::<C, RaftError<C>>::from)?;
 
         let response: RpcMessage<RawBytes> = RpcMessage::decode_from_slice(&response_data)
-            .map_err(|e| ManiacTransportError::CodecError(e.to_string().into()))
+            .map_err(|e| BisqueTransportError::CodecError(e.to_string().into()))
             .map_err(RPCError::<C, RaftError<C>>::from)?;
 
         let convert_resp = |resp: CodecResp| -> AppendEntriesResponse<C> {
@@ -1061,9 +1187,9 @@ where
                 .map(|(gid, resp)| (gid, convert_resp(resp)))
                 .collect()),
             RpcMessage::Error { error, .. } => {
-                Err(ManiacTransportError::RemoteError(error.into()).into())
+                Err(BisqueTransportError::RemoteError(error.into()).into())
             }
-            _ => Err(ManiacTransportError::InvalidResponse.into()),
+            _ => Err(BisqueTransportError::InvalidResponse.into()),
         }
     }
 }
@@ -1075,7 +1201,7 @@ mod tests {
 
     #[test]
     fn test_transport_config_default() {
-        let config = ManiacTcpTransportConfig::default();
+        let config = BisqueTcpTransportConfig::default();
         assert_eq!(config.connections_per_addr, 4);
         assert_eq!(config.max_concurrent_requests_per_conn, 256);
         assert_eq!(config.connection_ttl, Duration::from_secs(300));

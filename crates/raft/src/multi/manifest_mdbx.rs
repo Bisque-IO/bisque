@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::segment_footer::RecordTypeFlags;
-use crossfire::{MAsyncTx, Rx, TryRecvError, mpsc::Array};
+use crossfire::{MAsyncTx, RecvTimeoutError, Rx, TryRecvError, mpsc::Array};
 use libmdbx::{
     Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, Table, TableFlags, WriteFlags,
 };
@@ -283,6 +283,8 @@ impl MdbxManifest {
 pub(crate) struct ManifestManager {
     tx: MAsyncTx<Array<SegmentMeta>>,
     manifest: Arc<MdbxManifest>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    worker_thread: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl ManifestManager {
@@ -290,15 +292,22 @@ impl ManifestManager {
         let path = base_dir.join(".raft_manifest");
         let manifest = Arc::new(MdbxManifest::open(&path)?);
         let (tx, rx) = crossfire::mpsc::bounded_async_blocking::<SegmentMeta>(4096);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let manifest_clone = manifest.clone();
-        std::thread::Builder::new()
+        let shutdown_clone = shutdown.clone();
+        let handle = std::thread::Builder::new()
             .name("raft-manifest-mdbx".to_string())
             .spawn(move || {
-                Self::worker_loop(manifest_clone, rx);
+                Self::worker_loop(manifest_clone, rx, shutdown_clone);
             })
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-        Ok(Self { tx, manifest })
+        Ok(Self {
+            tx,
+            manifest,
+            shutdown,
+            worker_thread: Arc::new(std::sync::Mutex::new(Some(handle))),
+        })
     }
 
     /// Open an in-memory manifest for filesystems that don't support MDBX (e.g., tmpfs)
@@ -306,19 +315,35 @@ impl ManifestManager {
     pub(crate) fn open_in_memory() -> Self {
         let manifest = Arc::new(MdbxManifest::new_in_memory());
         let (tx, rx) = crossfire::mpsc::bounded_async_blocking::<SegmentMeta>(4096);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let manifest_clone = manifest.clone();
-        std::thread::Builder::new()
+        let shutdown_clone = shutdown.clone();
+        let handle = std::thread::Builder::new()
             .name("raft-manifest-memory".to_string())
             .spawn(move || {
-                Self::worker_loop(manifest_clone, rx);
+                Self::worker_loop(manifest_clone, rx, shutdown_clone);
             })
             .expect("Failed to spawn manifest worker thread");
 
-        Self { tx, manifest }
+        Self {
+            tx,
+            manifest,
+            shutdown,
+            worker_thread: Arc::new(std::sync::Mutex::new(Some(handle))),
+        }
     }
 
     pub(crate) fn sender(&self) -> MAsyncTx<Array<SegmentMeta>> {
         self.tx.clone()
+    }
+
+    /// Signal the manifest worker thread to shut down and wait for it to exit.
+    pub(crate) fn stop(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.worker_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
     }
 
     pub(crate) fn read_group_segments(
@@ -328,19 +353,38 @@ impl ManifestManager {
         self.manifest.read_group_segments(group_id)
     }
 
-    fn worker_loop(manifest: Arc<MdbxManifest>, rx: Rx<Array<SegmentMeta>>) {
+    fn worker_loop(
+        manifest: Arc<MdbxManifest>,
+        rx: Rx<Array<SegmentMeta>>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::time::Duration;
+
         // Coalesce updates by (group_id, segment_id) and commit in batches.
         let mut pending: HashMap<(u64, u64), SegmentMeta> = HashMap::new();
         loop {
-            let first = match rx.recv() {
-                Ok(v) => v,
-                Err(_) => return,
+            // Use recv_timeout so we can periodically check the shutdown flag
+            // even when no messages arrive.
+            let first = match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(v) => Some(v),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    // All senders dropped — flush remaining and exit.
+                    if !pending.is_empty() {
+                        let drained = pending.drain().map(|(_, v)| v).collect::<Vec<_>>();
+                        let _ = manifest.apply_segment_updates(drained.into_iter());
+                    }
+                    return;
+                }
             };
-            let key = (first.group_id, first.segment_id);
-            pending
-                .entry(key)
-                .and_modify(|m| m.merge_from(first))
-                .or_insert(first);
+
+            if let Some(v) = first {
+                let key = (v.group_id, v.segment_id);
+                pending
+                    .entry(key)
+                    .and_modify(|m| m.merge_from(v))
+                    .or_insert(v);
+            }
 
             // Drain without blocking to batch.
             for _ in 0..4096 {
@@ -357,13 +401,15 @@ impl ManifestManager {
                 }
             }
 
-            if pending.is_empty() {
-                continue;
+            if !pending.is_empty() {
+                let drained = pending.drain().map(|(_, v)| v).collect::<Vec<_>>();
+                // Best-effort: if manifest commit fails, we just lose acceleration.
+                let _ = manifest.apply_segment_updates(drained.into_iter());
             }
 
-            let drained = pending.drain().map(|(_, v)| v).collect::<Vec<_>>();
-            // Best-effort: if manifest commit fails, we just lose acceleration.
-            let _ = manifest.apply_segment_updates(drained.into_iter());
+            if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
         }
     }
 }

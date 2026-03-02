@@ -187,37 +187,6 @@ impl BenchStorage for SegLogStorage {
     }
 }
 
-// --- Segmented MDBX backend ---
-
-struct MdbxStorage(MdbxPerGroupLogStorage<C>);
-
-impl BenchStorage for MdbxStorage {
-    type Group = MdbxGroupLogStorage<C>;
-
-    fn create(
-        dir: PathBuf,
-        segment_size: u64,
-        fsync_interval: Option<Duration>,
-        max_cache: usize,
-    ) -> impl Future<Output = io::Result<Self>> + Send {
-        async move {
-            let cfg = MdbxStorageConfig::new(dir)
-                .with_segment_size(segment_size)
-                .with_fsync_interval(fsync_interval)
-                .with_max_cache_entries(max_cache);
-            Ok(Self(MdbxPerGroupLogStorage::<C>::new(cfg).await?))
-        }
-    }
-
-    fn get_group(&self, group_id: u64) -> impl Future<Output = io::Result<Self::Group>> + Send {
-        self.0.get_log_storage(group_id)
-    }
-
-    fn stop(&self) {
-        self.0.stop();
-    }
-}
-
 // --- Segmented Mmap backend ---
 
 struct MmapStorage(MmapPerGroupLogStorage<C>);
@@ -232,8 +201,7 @@ impl BenchStorage for MmapStorage {
         _max_cache: usize,
     ) -> impl Future<Output = io::Result<Self>> + Send {
         async move {
-            let mut cfg = MmapStorageConfig::new(dir)
-                .with_segment_size(segment_size);
+            let mut cfg = MmapStorageConfig::new(dir).with_segment_size(segment_size);
             if let Some(interval) = fsync_interval {
                 cfg = cfg.with_fsync_delay(interval);
             }
@@ -583,7 +551,6 @@ async fn main() -> io::Result<()> {
         println!("  --read-only      Run only read benchmarks");
         println!("  --multi-only     Run only multi-group benchmarks");
         println!("  --seglog-only    Only benchmark Segmented Log backend");
-        println!("  --mdbx-only      Only benchmark Segmented MDBX backend");
         println!("  --mmap-only      Only benchmark Segmented Mmap backend");
         println!("  --quick          Run with reduced entry counts");
         println!("  --fsync-none     Fsync after every write (no batching)");
@@ -596,7 +563,6 @@ async fn main() -> io::Result<()> {
     let read_only = args.iter().any(|a| a == "--read-only");
     let multi_only = args.iter().any(|a| a == "--multi-only");
     let seglog_only = args.iter().any(|a| a == "--seglog-only");
-    let mdbx_only = args.iter().any(|a| a == "--mdbx-only");
     let mmap_only = args.iter().any(|a| a == "--mmap-only");
     let quick = args.iter().any(|a| a == "--quick");
     let fsync_none = args.iter().any(|a| a == "--fsync-none");
@@ -610,9 +576,8 @@ async fn main() -> io::Result<()> {
     let run_write = !read_only && !multi_only;
     let run_read = !write_only && !multi_only;
     let run_multi = !write_only && !read_only;
-    let run_seglog = !mdbx_only && !mmap_only;
-    let run_mdbx = !seglog_only && !mmap_only;
-    let run_mmap = !seglog_only && !mdbx_only;
+    let run_seglog = !mmap_only;
+    let run_mmap = !seglog_only;
 
     let segment_size_bytes = segment_size_mb * 1024 * 1024;
 
@@ -626,9 +591,6 @@ async fn main() -> io::Result<()> {
         let mut names = Vec::new();
         if run_seglog {
             names.push("SegLog");
-        }
-        if run_mdbx {
-            names.push("MDBX");
         }
         if run_mmap {
             names.push("Mmap");
@@ -687,20 +649,6 @@ async fn main() -> io::Result<()> {
                 {
                     Ok(elapsed) => print_result("SegLog", cfg.total_entries, total_bytes, elapsed),
                     Err(e) => println!("    {:<16} ERROR: {}", "SegLog", e),
-                }
-            }
-            if run_mdbx {
-                let dir = tempfile::tempdir()?;
-                match bench_write::<MdbxStorage>(
-                    cfg,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("MDBX", cfg.total_entries, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "MDBX", e),
                 }
             }
             if run_mmap {

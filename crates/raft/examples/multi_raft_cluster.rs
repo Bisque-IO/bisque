@@ -39,8 +39,8 @@
 use bisque_raft::BisqueRaftTypeConfig;
 use bisque_raft::multi::codec::{FromCodec, RawBytes, ToCodec};
 use bisque_raft::multi::{
-    DefaultNodeRegistry, ManiacRpcServer, ManiacRpcServerConfig, ManiacTcpTransport,
-    ManiacTcpTransportConfig, MultiRaftConfig, MultiRaftManager, MultiplexedLogStorage,
+    BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
+    DefaultNodeRegistry, MultiRaftConfig, MultiRaftManager, MultiplexedLogStorage,
     MultiplexedStorageConfig, NodeAddressResolver,
 };
 use futures::StreamExt;
@@ -292,7 +292,7 @@ struct NodeConfig {
 type NodeRegistry = DefaultNodeRegistry<u64>;
 
 /// Type alias for our transport
-type Transport = ManiacTcpTransport<KvTypeConfig>;
+type Transport = BisqueTcpTransport<KvTypeConfig>;
 
 /// Type alias for our storage
 type Storage = MultiplexedLogStorage<KvTypeConfig>;
@@ -301,7 +301,7 @@ type Storage = MultiplexedLogStorage<KvTypeConfig>;
 type Manager = MultiRaftManager<KvTypeConfig, Transport, Storage>;
 
 /// Type alias for our RPC server
-type RpcServer = ManiacRpcServer<KvTypeConfig, Transport, Storage>;
+type RpcServer = BisqueRpcServer<KvTypeConfig, Transport, Storage>;
 
 /// Create a node's infrastructure (storage, transport, manager)
 async fn create_node(
@@ -332,7 +332,7 @@ async fn create_node(
     println!("  Node {}: Created storage at {:?}", node_id, node_dir);
 
     // Create TCP transport
-    let transport_config = ManiacTcpTransportConfig {
+    let transport_config = BisqueTcpTransportConfig {
         connect_timeout: Duration::from_secs(5),
         // Set slightly lower than election timeout (4000ms) to ensure transport
         // fails fast and rotates connections before Raft gives up.
@@ -448,7 +448,7 @@ async fn main() {
     let mut managers = Vec::new();
     for (node_id, addr, manager) in node_results {
         // Create and start RPC server for this node
-        let rpc_config = ManiacRpcServerConfig {
+        let rpc_config = BisqueRpcServerConfig {
             bind_addr: addr,
             ..Default::default()
         };

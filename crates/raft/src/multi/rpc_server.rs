@@ -12,22 +12,26 @@
 //! - Request IDs correlate responses to their original requests
 
 use crate::multi::codec::{
-    Decode, Encode, ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage,
+    Decode, ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage,
     SnapshotMeta as CodecSnapshotMeta, Vote as CodecVote,
 };
 use crate::multi::manager::MultiRaftManager;
 use crate::multi::network::MultiplexedTransport;
 use crate::multi::storage::MultiRaftLogStorage;
-use crate::multi::tcp_transport::{read_frame, return_encode_buffer, write_frame_vectored};
+use crate::multi::tcp_transport::{
+    BoxedReader, BoxedWriter, FRAME_PREFIX_LEN, encode_framed, return_encode_buffer,
+    write_preframed,
+};
+use bytes::{Buf, BytesMut};
 use dashmap::DashMap;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
 use openraft::RaftTypeConfig;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
+use tokio::time::timeout;
 
 pub use protocol::{ResponseMessage, RpcMessage};
 
@@ -140,7 +144,7 @@ impl SnapshotTransferManager {
 
 /// RPC server configuration
 #[derive(Debug, Clone)]
-pub struct ManiacRpcServerConfig {
+pub struct BisqueRpcServerConfig {
     /// Address to bind to
     pub bind_addr: SocketAddr,
     /// Max number of concurrent connections
@@ -153,9 +157,13 @@ pub struct ManiacRpcServerConfig {
     /// Timeout for incomplete snapshot transfers.
     /// Default: 5 minutes
     pub snapshot_transfer_timeout: Duration,
+    /// TLS server configuration for incoming connections.
+    /// When set, all incoming connections require TLS.
+    #[cfg(feature = "tls")]
+    pub tls_server_config: Option<Arc<rustls::ServerConfig>>,
 }
 
-impl Default for ManiacRpcServerConfig {
+impl Default for BisqueRpcServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: "0.0.0.0:5000".parse().unwrap(),
@@ -163,18 +171,20 @@ impl Default for ManiacRpcServerConfig {
             connection_timeout: std::time::Duration::from_secs(60),
             max_concurrent_requests: 256,
             snapshot_transfer_timeout: Duration::from_secs(300), // 5 minutes
+            #[cfg(feature = "tls")]
+            tls_server_config: None,
         }
     }
 }
 
 /// RPC server for handling incoming Raft requests with true multiplexing
-pub struct ManiacRpcServer<C, T, S>
+pub struct BisqueRpcServer<C, T, S>
 where
     C: RaftTypeConfig,
     T: MultiplexedTransport<C>,
     S: MultiRaftLogStorage<C>,
 {
-    config: ManiacRpcServerConfig,
+    config: BisqueRpcServerConfig,
     manager: Arc<MultiRaftManager<C, T, S>>,
     /// Active connection count
     active_connections: AtomicU64,
@@ -183,7 +193,7 @@ where
     _phantom: PhantomData<(C, T, S)>,
 }
 
-impl<C, T, S> ManiacRpcServer<C, T, S>
+impl<C, T, S> BisqueRpcServer<C, T, S>
 where
     C: RaftTypeConfig<
             NodeId = u64,
@@ -201,7 +211,7 @@ where
     S: MultiRaftLogStorage<C>,
 {
     /// Create a new RPC server
-    pub fn new(config: ManiacRpcServerConfig, manager: Arc<MultiRaftManager<C, T, S>>) -> Self {
+    pub fn new(config: BisqueRpcServerConfig, manager: Arc<MultiRaftManager<C, T, S>>) -> Self {
         let snapshot_transfers = Arc::new(SnapshotTransferManager::new(
             config.snapshot_transfer_timeout,
         ));
@@ -218,6 +228,13 @@ where
     pub async fn serve(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         let actual_addr = listener.local_addr()?;
+
+        #[cfg(feature = "tls")]
+        let tls_acceptor = self
+            .config
+            .tls_server_config
+            .as_ref()
+            .map(|cfg| tokio_rustls::TlsAcceptor::from(cfg.clone()));
 
         tracing::info!(
             "Raft RPC server listening on: {} (max_concurrent={})",
@@ -241,10 +258,46 @@ where
 
             let server = self.clone();
 
+            #[cfg(feature = "tls")]
+            let tls_acceptor = tls_acceptor.clone();
+
             // Spawn connection handler
             tokio::spawn(async move {
+                // Split the stream into read/write halves, optionally wrapping with TLS
+                let (reader, writer): (BoxedReader, BoxedWriter) = {
+                    #[cfg(feature = "tls")]
+                    if let Some(ref acceptor) = tls_acceptor {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                let (r, w) = tokio::io::split(tls_stream);
+                                (Box::new(r), Box::new(w))
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "TLS handshake failed from {}: {}",
+                                    peer_addr,
+                                    e
+                                );
+                                server
+                                    .active_connections
+                                    .fetch_sub(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    } else {
+                        let (r, w) = stream.into_split();
+                        (Box::new(r) as BoxedReader, Box::new(w) as BoxedWriter)
+                    }
+
+                    #[cfg(not(feature = "tls"))]
+                    {
+                        let (r, w) = stream.into_split();
+                        (Box::new(r) as BoxedReader, Box::new(w) as BoxedWriter)
+                    }
+                };
+
                 match server
-                    .handle_multiplexed_connection(stream, peer_addr)
+                    .handle_multiplexed_connection(reader, writer, peer_addr)
                     .await
                 {
                     Ok(_) => {
@@ -264,7 +317,8 @@ where
     /// Uses separate tasks for reading and writing to avoid busy-waiting
     async fn handle_multiplexed_connection(
         &self,
-        stream: TcpStream,
+        read_half: BoxedReader,
+        write_half: BoxedWriter,
         peer_addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -278,11 +332,8 @@ where
         // Shared connection alive flag
         let alive = Arc::new(AtomicBool::new(true));
 
-        // Channel for responses from handler tasks - use flume for reliability
-        let (response_tx, response_rx) = flume::bounded::<Vec<u8>>(256);
-
-        // Split the stream using tokio's into_split()
-        let (read_half, write_half) = stream.into_split();
+        // Channel for responses from handler tasks
+        let (response_tx, response_rx) = crossfire::mpsc::bounded_async::<Vec<u8>>(256);
 
         // Spawn writer task
         let alive_clone = alive.clone();
@@ -303,30 +354,24 @@ where
 
     /// Writer loop - sends responses back to client
     async fn response_writer_loop(
-        mut write_half: tokio::net::tcp::OwnedWriteHalf,
-        response_rx: flume::Receiver<Vec<u8>>,
+        mut write_half: BoxedWriter,
+        response_rx: crossfire::AsyncRx<crossfire::mpsc::Array<Vec<u8>>>,
         alive: Arc<std::sync::atomic::AtomicBool>,
     ) {
         use std::sync::atomic::Ordering;
 
         loop {
             if !alive.load(Ordering::Acquire) {
-                tracing::debug!("RPC writer: connection no longer alive, exiting");
+                tracing::trace!("RPC writer: connection no longer alive, exiting");
                 return;
             }
 
-            match response_rx.recv_async().await {
+            match response_rx.recv().await {
                 Ok(response_data) => {
-                    tracing::debug!(
-                        "RPC writer: sending response ({} bytes)",
-                        response_data.len()
-                    );
-                    // Use vectored I/O to avoid copying the payload
-                    match write_frame_vectored(&mut write_half, response_data).await {
+                    // Write the pre-framed buffer in a single syscall
+                    match write_preframed(&mut write_half, response_data).await {
                         Ok(returned_buf) => {
-                            // Return the buffer to the thread-local pool for reuse
                             return_encode_buffer(returned_buf);
-                            tracing::debug!("RPC writer: response sent successfully");
                         }
                         Err(e) => {
                             tracing::error!("RPC writer: failed to write response: {}", e);
@@ -337,118 +382,138 @@ where
                 }
                 Err(_) => {
                     // Channel closed
-                    tracing::debug!("RPC writer: channel closed, exiting");
+                    tracing::trace!("RPC writer: channel closed, exiting");
                     return;
                 }
             }
         }
     }
 
-    /// Reader loop - reads requests from client
+    /// Reader loop - reads requests from client.
+    /// Uses a BytesMut rolling buffer for batch frame parsing:
+    /// - Single read syscall captures multiple frames when data arrives in bursts
+    /// - Parses all complete frames from buffer before issuing next read
+    /// - No per-frame allocation or resize; buffer grows to high-water mark
     async fn request_reader_loop(
         &self,
-        mut read_half: tokio::net::tcp::OwnedReadHalf,
+        mut read_half: BoxedReader,
         peer_addr: SocketAddr,
-        response_tx: flume::Sender<Vec<u8>>,
+        response_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<Vec<u8>>>,
         alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = BytesMut::with_capacity(64 * 1024);
 
         loop {
             if !alive.load(Ordering::Acquire) {
                 return Ok(());
             }
 
-            // Wait for request from socket
-            match timeout(self.config.connection_timeout, read_frame(&mut read_half)).await {
-                Ok(Ok(request_data)) => {
-                    // Decode request using zero-copy codec
-                    let request: CodecRpcMessage<crate::multi::codec::RawBytes> =
-                        match CodecRpcMessage::decode_from_slice(&request_data) {
-                            Ok(req) => req,
-                            Err(e) => {
-                                tracing::error!(
-                                    "RPC reader: failed to decode request from {}: {}",
-                                    peer_addr,
-                                    e
-                                );
-                                // Return error to close connection, preventing busy loop on garbage data
-                                return Err(Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    e,
-                                )));
-                            }
-                        };
-
-                    let request_id = request.request_id();
-                    tracing::debug!(
-                        "RPC reader: received request {} from {}",
-                        request_id,
-                        peer_addr
-                    );
-                    let manager = self.manager.clone();
-                    let snapshot_transfers = self.snapshot_transfers.clone();
-                    let tx = response_tx.clone();
-                    let max_concurrent_requests = self.config.max_concurrent_requests;
-
-                    // Spawn handler for this request
-                    tokio::spawn(async move {
-                        tracing::debug!("RPC handler: processing request {}", request_id);
-                        let response = Self::process_codec_request(
-                            &manager,
-                            &snapshot_transfers,
-                            request,
-                            max_concurrent_requests,
-                        )
-                        .await;
-                        tracing::debug!(
-                            "RPC handler: request {} processed, encoding response",
-                            request_id
-                        );
-
-                        // Serialize and send response to writer
-                        match response.encode_to_vec() {
-                            Ok(response_data) => {
-                                tracing::debug!(
-                                    "RPC handler: sending response for request {} ({} bytes)",
-                                    request_id,
-                                    response_data.len()
-                                );
-                                if tx.send_async(response_data).await.is_err() {
-                                    tracing::debug!(
-                                        "RPC handler: response channel closed for request {}",
-                                        request_id
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        "RPC handler: response for request {} sent to writer",
-                                        request_id
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "RPC handler: failed to encode response for request {}: {}",
-                                    request_id,
-                                    e
-                                );
-                            }
-                        }
-                    });
+            // Parse all complete frames already in the buffer
+            loop {
+                if buf.len() < FRAME_PREFIX_LEN {
+                    break;
                 }
-                Ok(Err(e)) => {
-                    if let crate::multi::tcp_transport::ManiacTransportError::IoError(ref io_err) =
-                        e
-                    {
-                        if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
-                            tracing::debug!("RPC reader: connection closed by peer: {}", peer_addr);
-                            return Ok(());
+                let payload_len =
+                    u32::from_le_bytes(buf[..FRAME_PREFIX_LEN].try_into().unwrap()) as usize;
+
+                if payload_len == 0 {
+                    buf.advance(FRAME_PREFIX_LEN);
+                    continue;
+                }
+
+                if buf.len() < FRAME_PREFIX_LEN + payload_len {
+                    break; // Incomplete frame, need more data
+                }
+
+                // Complete frame — decode directly from buffer (borrows slice;
+                // decoded CodecRpcMessage owns its data via Decode copy)
+                let frame_start = FRAME_PREFIX_LEN;
+                let frame_end = FRAME_PREFIX_LEN + payload_len;
+                let request: CodecRpcMessage<crate::multi::codec::RawBytes> =
+                    match CodecRpcMessage::decode_from_slice(&buf[frame_start..frame_end]) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            tracing::error!(
+                                "RPC reader: failed to decode request from {}: {}",
+                                peer_addr,
+                                e
+                            );
+                            return Err(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                e,
+                            )));
                         }
+                    };
+
+                // Advance past the frame header + payload
+                buf.advance(FRAME_PREFIX_LEN + payload_len);
+
+                let request_id = request.request_id();
+                tracing::trace!(
+                    "RPC reader: received request {} from {}",
+                    request_id,
+                    peer_addr
+                );
+                let manager = self.manager.clone();
+                let snapshot_transfers = self.snapshot_transfers.clone();
+                let tx = response_tx.clone();
+                let max_concurrent_requests = self.config.max_concurrent_requests;
+
+                // Spawn handler for this request
+                tokio::spawn(async move {
+                    let response = Self::process_codec_request(
+                        &manager,
+                        &snapshot_transfers,
+                        request,
+                        max_concurrent_requests,
+                    )
+                    .await;
+
+                    // Encode with frame header prepended — zero-copy move from TLS buffer
+                    match encode_framed(&response) {
+                        Ok(response_data) => {
+                            if tx.send(response_data).await.is_err() {
+                                tracing::trace!(
+                                    "RPC handler: response channel closed for request {}",
+                                    request_id
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "RPC handler: failed to encode response for request {}: {}",
+                                request_id,
+                                e
+                            );
+                        }
+                    }
+                });
+            }
+
+            // Reserve space if running low on capacity
+            if buf.capacity() - buf.len() < 4096 {
+                buf.reserve(64 * 1024);
+            }
+
+            // Read more data from socket with idle timeout
+            match timeout(self.config.connection_timeout, read_half.read_buf(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    tracing::trace!("RPC reader: connection closed by peer: {}", peer_addr);
+                    return Ok(());
+                }
+                Ok(Ok(_)) => {} // Data read, loop back to parse frames
+                Ok(Err(e)) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        tracing::trace!("RPC reader: connection closed by peer: {}", peer_addr);
+                        return Ok(());
                     }
                     return Err(Box::new(e));
                 }
                 Err(_) => {
-                    tracing::debug!("RPC reader: connection timeout from: {}", peer_addr);
+                    tracing::trace!("RPC reader: connection timeout from: {}", peer_addr);
                     return Ok(());
                 }
             }
@@ -1155,7 +1220,7 @@ mod tests {
 
     #[test]
     fn test_rpc_server_config_default() {
-        let config = ManiacRpcServerConfig::default();
+        let config = BisqueRpcServerConfig::default();
         assert_eq!(config.max_connections, 1000);
         assert_eq!(config.max_concurrent_requests, 256);
         assert_eq!(config.snapshot_transfer_timeout, Duration::from_secs(300));

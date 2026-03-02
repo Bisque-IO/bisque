@@ -201,12 +201,12 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bincode",
+ "bytes",
  "chrono",
  "congee",
  "crc64fast-nvme",
  "crossfire",
  "dashmap",
- "flume",
  "futures",
  "futures-lite",
  "libmdbx",
@@ -215,10 +215,14 @@ dependencies = [
  "openraft",
  "parking_lot",
  "rand 0.9.2",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1991,6 +1995,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]
