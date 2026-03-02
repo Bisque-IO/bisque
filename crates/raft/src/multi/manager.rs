@@ -1,4 +1,3 @@
-use crate::multi::config::MultiRaftConfig;
 use crate::multi::network::GroupNetworkFactory;
 use crate::multi::network::MultiRaftNetworkFactory;
 use crate::multi::network::MultiplexedTransport;
@@ -29,7 +28,6 @@ pub struct MultiRaftManager<
     groups: DashMap<u64, Raft<C>>,
     network_factory: Arc<MultiRaftNetworkFactory<C, T>>,
     storage: Arc<S>,
-    config: MultiRaftConfig,
 }
 
 impl<C, T, S> MultiRaftManager<C, T, S>
@@ -38,19 +36,15 @@ where
     T: MultiplexedTransport<C>,
     S: MultiRaftLogStorage<C>,
 {
-    pub fn new(transport: T, storage: S, config: MultiRaftConfig) -> Self
+    pub fn new(transport: T, storage: S) -> Self
     where
         C::SnapshotData: AsyncRead + AsyncWrite + Unpin,
         C::Entry: Clone,
     {
         Self {
             groups: DashMap::new(),
-            network_factory: Arc::new(MultiRaftNetworkFactory::new(
-                Arc::new(transport),
-                config.clone(),
-            )),
+            network_factory: Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport))),
             storage: Arc::new(storage),
-            config,
         }
     }
 
@@ -442,17 +436,6 @@ mod tests {
                 vote: openraft::impls::Vote::new(1, 1),
             })
         }
-
-        async fn send_heartbeat_batch(
-            &self,
-            _target: u64,
-            _batch: &[(u64, AppendEntriesRequest<TestConfig>)],
-        ) -> Result<
-            Vec<(u64, AppendEntriesResponse<TestConfig>)>,
-            RPCError<TestConfig, RaftError<TestConfig>>,
-        > {
-            Ok(vec![])
-        }
     }
 
     #[test]
@@ -460,8 +443,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let config = MultiRaftConfig::default();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage, config));
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
             let state_machine = TestStateMachine::new();
@@ -482,8 +464,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let config = MultiRaftConfig::default();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage, config));
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 
@@ -509,8 +490,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let config = MultiRaftConfig::default();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage, config));
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 

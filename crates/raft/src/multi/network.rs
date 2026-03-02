@@ -1,14 +1,7 @@
-use crate::multi::config::MultiRaftConfig;
-use dashmap::DashMap;
-use openraft::Instant;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc as tokio_mpsc;
-use tokio::sync::oneshot;
 use openraft::OptionalSend;
 use openraft::OptionalSync;
 use openraft::RaftTypeConfig;
 use openraft::StorageError;
-use openraft::async_runtime::AsyncRuntime;
 use openraft::error::InstallSnapshotError;
 use openraft::error::RPCError;
 use openraft::error::RaftError;
@@ -31,6 +24,7 @@ use std::future::Future;
 use std::marker::Unpin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub trait MultiplexedTransport<C: RaftTypeConfig>: OptionalSend + OptionalSync + 'static {
     fn send_append_entries(
@@ -58,36 +52,11 @@ pub trait MultiplexedTransport<C: RaftTypeConfig>: OptionalSend + OptionalSync +
             RPCError<C, RaftError<C, InstallSnapshotError>>,
         >,
     > + OptionalSend;
-
-    fn send_heartbeat_batch(
-        &self,
-        target: C::NodeId,
-        batch: &[(u64, AppendEntriesRequest<C>)],
-    ) -> impl Future<
-        Output = Result<Vec<(u64, AppendEntriesResponse<C>)>, RPCError<C, RaftError<C>>>,
-    > + OptionalSend;
-}
-
-type HeartbeatTx<C> = oneshot::Sender<Result<AppendEntriesResponse<C>, RPCError<C, RaftError<C>>>>;
-
-type HeartbeatMsg<C> = (u64, AppendEntriesRequest<C>, HeartbeatTx<C>);
-
-struct HeartbeatBuffer<C: RaftTypeConfig> {
-    tx: tokio_mpsc::Sender<HeartbeatMsg<C>>,
-}
-
-impl<C: RaftTypeConfig> Clone for HeartbeatBuffer<C> {
-    fn clone(&self) -> Self {
-        Self {
-            tx: self.tx.clone(),
-        }
-    }
 }
 
 pub struct MultiRaftNetworkFactory<C: RaftTypeConfig, T: MultiplexedTransport<C>> {
     transport: Arc<T>,
-    config: MultiRaftConfig,
-    buffers: Arc<DashMap<C::NodeId, HeartbeatBuffer<C>>>,
+    _phantom: std::marker::PhantomData<C>,
 }
 
 /// Error type for batch operations using Cow to avoid allocations for static messages
@@ -116,171 +85,11 @@ where
     C::SnapshotData: AsyncRead + AsyncWrite + Unpin,
     C::Entry: Clone,
 {
-    pub fn new(transport: Arc<T>, config: MultiRaftConfig) -> Self {
+    pub fn new(transport: Arc<T>) -> Self {
         Self {
             transport,
-            config,
-            buffers: Arc::new(DashMap::new()),
+            _phantom: std::marker::PhantomData,
         }
-    }
-
-    fn get_buffer(&self, target: C::NodeId) -> HeartbeatBuffer<C> {
-        if let Some(buffer) = self.buffers.get(&target) {
-            return buffer.clone();
-        }
-
-        let (tx, mut rx) = tokio_mpsc::channel(256);
-        let buffer = HeartbeatBuffer { tx };
-        self.buffers.insert(target.clone(), buffer.clone());
-
-        // Spawn flush task
-        let flush_transport = self.transport.clone();
-        let flush_target = target.clone();
-        let flush_interval = self.config.heartbeat_interval;
-
-        // Maximum number of distinct group heartbeats to coalesce into a single on-wire batch.
-        // This is a safety valve to avoid unbounded batching under extreme load.
-        const MAX_COALESCED_HEARTBEATS: usize = 256;
-
-        // Use C::AsyncRuntime to spawn
-        let _ = C::AsyncRuntime::spawn(async move {
-            // Deduplicate by group_id within the batching window, but preserve all waiters:
-            // group_id -> (latest rpc, waiters)
-            let mut pending: std::collections::HashMap<
-                u64,
-                (AppendEntriesRequest<C>, Vec<HeartbeatTx<C>>),
-            > = std::collections::HashMap::new();
-
-            let mut batch_req: Vec<(u64, AppendEntriesRequest<C>)> = Vec::new();
-            let mut resp_map: std::collections::HashMap<u64, AppendEntriesResponse<C>> =
-                std::collections::HashMap::new();
-
-            loop {
-                // Wait for the first message
-                let first = match rx.recv().await {
-                    Some(msg) => msg,
-                    None => return, // Channel closed
-                };
-
-                pending.clear();
-
-                // Start batching window from the first message.
-                let start = <C::AsyncRuntime as AsyncRuntime>::Instant::now();
-                let deadline = start + flush_interval;
-
-                // Add first message (avoid closure move issues)
-                match pending.entry(first.0) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        let (rpc, waiters) = e.get_mut();
-                        *rpc = first.1;
-                        waiters.push(first.2);
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert((first.1, vec![first.2]));
-                    }
-                }
-
-                // Collect until deadline or max batch size.
-                loop {
-                    // Drain any immediately available messages first.
-                    while pending.len() < MAX_COALESCED_HEARTBEATS {
-                        match rx.try_recv() {
-                            Ok((gid, rpc, tx)) => match pending.entry(gid) {
-                                std::collections::hash_map::Entry::Occupied(mut e) => {
-                                    let (existing_rpc, waiters) = e.get_mut();
-                                    *existing_rpc = rpc;
-                                    waiters.push(tx);
-                                }
-                                std::collections::hash_map::Entry::Vacant(e) => {
-                                    e.insert((rpc, vec![tx]));
-                                }
-                            },
-                            Err(_) => break,
-                        }
-                    }
-
-                    if pending.len() >= MAX_COALESCED_HEARTBEATS {
-                        break;
-                    }
-
-                    // If the window elapsed, flush.
-                    if <C::AsyncRuntime as AsyncRuntime>::Instant::now() >= deadline {
-                        break;
-                    }
-
-                    // Wait for the next message, but only until the deadline.
-                    match C::AsyncRuntime::timeout_at(deadline, rx.recv()).await {
-                        Ok(Some((gid, rpc, tx))) => match pending.entry(gid) {
-                            std::collections::hash_map::Entry::Occupied(mut e) => {
-                                let (existing_rpc, waiters) = e.get_mut();
-                                *existing_rpc = rpc;
-                                waiters.push(tx);
-                            }
-                            std::collections::hash_map::Entry::Vacant(e) => {
-                                e.insert((rpc, vec![tx]));
-                            }
-                        },
-                        Ok(None) => return, // Channel closed
-                        Err(_) => break,    // Deadline elapsed
-                    }
-                }
-
-                // Build the batch request from the deduped map by draining to avoid clones.
-                // We'll rebuild the waiter map as we go.
-                batch_req.clear();
-                batch_req.reserve(pending.len());
-
-                // Temporary storage for waiters while we build the batch
-                let mut waiter_map: std::collections::HashMap<u64, Vec<HeartbeatTx<C>>> =
-                    std::collections::HashMap::with_capacity(pending.len());
-
-                for (gid, (rpc, waiters)) in pending.drain() {
-                    batch_req.push((gid, rpc));
-                    waiter_map.insert(gid, waiters);
-                }
-
-                let result = flush_transport
-                    .send_heartbeat_batch(flush_target.clone(), &batch_req)
-                    .await;
-
-                match result {
-                    Ok(responses) => {
-                        resp_map.clear();
-                        for (gid, resp) in responses {
-                            resp_map.insert(gid, resp);
-                        }
-
-                        for (gid, mut waiters) in waiter_map.drain() {
-                            if let Some(resp) = resp_map.remove(&gid) {
-                                // Give ownership to the last waiter, clone for others
-                                if let Some(last_sender) = waiters.pop() {
-                                    for sender in waiters {
-                                        let _ = sender.send(Ok(resp.clone()));
-                                    }
-                                    let _ = last_sender.send(Ok(resp));
-                                }
-                            } else {
-                                let err = BatchError::new_static("Missing response in batch");
-                                let rpc_err =
-                                    RPCError::Network(openraft::error::NetworkError::new(&err));
-                                for sender in waiters {
-                                    let _ = sender.send(Err(rpc_err.clone()));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        for (_gid, waiters) in waiter_map.drain() {
-                            for sender in waiters {
-                                let _ = sender.send(Err(e.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        buffer
     }
 }
 
@@ -323,10 +132,8 @@ where
     type Network = MultiRaftNetwork<C, T>;
 
     async fn new_client(&mut self, target: C::NodeId, _node: &C::Node) -> Self::Network {
-        let buffer = self.parent.get_buffer(target.clone());
         MultiRaftNetwork {
             transport: self.parent.transport.clone(),
-            buffer,
             target,
             group_id: self.group_id,
         }
@@ -335,7 +142,6 @@ where
 
 pub struct MultiRaftNetwork<C: RaftTypeConfig, T: MultiplexedTransport<C>> {
     transport: Arc<T>,
-    buffer: HeartbeatBuffer<C>,
     target: C::NodeId,
     group_id: u64,
 }
@@ -352,29 +158,10 @@ where
         rpc: AppendEntriesRequest<C>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<C>, RPCError<C>> {
-        // Check if heartbeat (empty entries)
-        if rpc.entries.is_empty() {
-            let (tx, rx) = oneshot::channel();
-
-            if let Err(_) = self.buffer.tx.send((self.group_id, rpc, tx)).await {
-                let err = BatchError::new_static("Heartbeat buffer closed");
-                return Err(RPCError::Network(openraft::error::NetworkError::new(&err)));
-            }
-
-            // Wait for response
-            match rx.await {
-                Ok(res) => res.decompose_infallible(),
-                Err(_) => {
-                    let err = BatchError::new_static("Heartbeat channel closed");
-                    Err(RPCError::Network(openraft::error::NetworkError::new(&err)))
-                }
-            }
-        } else {
-            self.transport
-                .send_append_entries(self.target.clone(), self.group_id, rpc)
-                .await
-                .decompose_infallible()
-        }
+        self.transport
+            .send_append_entries(self.target.clone(), self.group_id, rpc)
+            .await
+            .decompose_infallible()
     }
 
     async fn vote(
@@ -468,7 +255,11 @@ where
     }
 
     fn backoff(&self) -> openraft::network::Backoff {
-        openraft::network::Backoff::new(std::iter::repeat(Duration::from_millis(500)))
+        // Exponential backoff: 500ms, 1s, 2s, 4s, 8s, 16s, then cap at 30s.
+        let iter = (0u32..6)
+            .map(|i| Duration::from_millis(500 * 2u64.pow(i)))
+            .chain(std::iter::repeat(Duration::from_secs(30)));
+        openraft::network::Backoff::new(iter)
     }
 }
 
@@ -504,14 +295,11 @@ mod tests {
 
     type TestConfig = ManiacRaftTypeConfig<TestData, ()>;
 
-    /// Fake transport that records calls and allows test control
+    /// Fake transport that records calls
     #[derive(Clone)]
     struct FakeTransport {
         append_entries_calls: Arc<DashMap<(u64, u64), Vec<AppendEntriesRequest<TestConfig>>>>,
         vote_calls: Arc<DashMap<(u64, u64), Vec<VoteRequest<TestConfig>>>>,
-        heartbeat_batch_calls: Arc<DashMap<u64, Vec<Vec<(u64, AppendEntriesRequest<TestConfig>)>>>>,
-        batch_responses: Arc<DashMap<u64, Vec<(u64, AppendEntriesResponse<TestConfig>)>>>,
-        batch_errors: Arc<DashMap<u64, RPCError<TestConfig, RaftError<TestConfig>>>>,
         call_count: Arc<AtomicU64>,
     }
 
@@ -520,44 +308,8 @@ mod tests {
             Self {
                 append_entries_calls: Arc::new(DashMap::new()),
                 vote_calls: Arc::new(DashMap::new()),
-                heartbeat_batch_calls: Arc::new(DashMap::new()),
-                batch_responses: Arc::new(DashMap::new()),
-                batch_errors: Arc::new(DashMap::new()),
                 call_count: Arc::new(AtomicU64::new(0)),
             }
-        }
-
-        fn set_batch_response(
-            &self,
-            target: u64,
-            responses: Vec<(u64, AppendEntriesResponse<TestConfig>)>,
-        ) {
-            self.batch_responses.insert(target, responses);
-        }
-
-        fn set_batch_error(&self, target: u64, error: RPCError<TestConfig, RaftError<TestConfig>>) {
-            self.batch_errors.insert(target, error);
-        }
-
-        fn get_heartbeat_batch_count(&self, target: u64) -> usize {
-            self.heartbeat_batch_calls
-                .get(&target)
-                .map(|v| v.len())
-                .unwrap_or(0)
-        }
-
-        fn get_heartbeat_batch(
-            &self,
-            target: u64,
-            idx: usize,
-        ) -> Option<Vec<(u64, AppendEntriesRequest<TestConfig>)>> {
-            self.heartbeat_batch_calls.get(&target).and_then(|v| {
-                if idx < v.len() {
-                    Some(v[idx].clone())
-                } else {
-                    None
-                }
-            })
         }
     }
 
@@ -571,7 +323,6 @@ mod tests {
         {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let key = (target, group_id);
-            // Clone manually since AppendEntriesRequest may not implement Clone
             let rpc_clone = AppendEntriesRequest {
                 vote: rpc.vote.clone(),
                 prev_log_id: rpc.prev_log_id.clone(),
@@ -618,38 +369,6 @@ mod tests {
                 vote: openraft::impls::Vote::new(1, 1),
             })
         }
-
-        async fn send_heartbeat_batch(
-            &self,
-            target: u64,
-            batch: &[(u64, AppendEntriesRequest<TestConfig>)],
-        ) -> Result<
-            Vec<(u64, AppendEntriesResponse<TestConfig>)>,
-            RPCError<TestConfig, RaftError<TestConfig>>,
-        > {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
-            let batch_vec = batch.to_vec();
-            self.heartbeat_batch_calls
-                .entry(target)
-                .or_insert_with(Vec::new)
-                .push(batch_vec);
-
-            // Check for error first
-            if let Some(err) = self.batch_errors.get(&target) {
-                return Err(err.clone());
-            }
-
-            // Return configured responses or defaults
-            if let Some(responses) = self.batch_responses.get(&target) {
-                Ok(responses.clone())
-            } else {
-                // Default: success for all groups
-                Ok(batch
-                    .iter()
-                    .map(|(gid, _)| (*gid, AppendEntriesResponse::Success))
-                    .collect())
-            }
-        }
     }
 
     fn make_heartbeat_request(term: u64, node_id: u64) -> AppendEntriesRequest<TestConfig> {
@@ -681,58 +400,21 @@ mod tests {
     }
 
     #[test]
-    fn test_heartbeat_detection() {
+    fn test_heartbeat_direct_transport() {
         run_async(async {
             let transport = FakeTransport::new();
-            let transport_arc = Arc::new(transport.clone());
-            let config = MultiRaftConfig {
-                heartbeat_interval: Duration::from_millis(50),
-            };
-            let factory = Arc::new(MultiRaftNetworkFactory::new(transport_arc.clone(), config));
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
             let mut group_factory = GroupNetworkFactory::new(factory.clone(), 1);
 
             let node = openraft::impls::BasicNode {
                 addr: "127.0.0.1:5000".to_string(),
             };
-            let mut group_factory_mut = group_factory;
-            let mut network = group_factory_mut.new_client(1, &node).await;
+            let mut network = group_factory.new_client(1, &node).await;
 
-            // Empty entries = heartbeat, should go through buffer
+            // Empty entries (heartbeat) should go directly through transport
             let heartbeat = make_heartbeat_request(1, 1);
             let result = network
                 .append_entries(heartbeat, RPCOption::new(Duration::from_secs(30)))
-                .await;
-            assert!(result.is_ok());
-
-            // Wait for flush
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Should have been batched
-            assert!(transport.clone().get_heartbeat_batch_count(1) > 0);
-        });
-    }
-
-    #[test]
-    fn test_non_heartbeat_bypass() {
-        run_async(async {
-            let transport = FakeTransport::new();
-            let transport_arc = Arc::new(transport.clone());
-            let config = MultiRaftConfig {
-                heartbeat_interval: Duration::from_millis(50),
-            };
-            let factory = Arc::new(MultiRaftNetworkFactory::new(transport_arc.clone(), config));
-            let mut group_factory = GroupNetworkFactory::new(factory.clone(), 1);
-
-            let node = openraft::impls::BasicNode {
-                addr: "127.0.0.1:5000".to_string(),
-            };
-            let mut group_factory_mut = group_factory;
-            let mut network = group_factory_mut.new_client(1, &node).await;
-
-            // Non-empty entries = not heartbeat, should bypass buffer
-            let append = make_append_request(1, 1, "test data".to_string());
-            let result = network
-                .append_entries(append.clone(), RPCOption::new(Duration::from_secs(30)))
                 .await;
             assert!(result.is_ok());
 
@@ -741,168 +423,339 @@ mod tests {
             assert!(transport.append_entries_calls.get(&key).is_some());
             let calls = transport.append_entries_calls.get(&key).unwrap();
             assert_eq!(calls.len(), 1);
+            assert!(calls[0].entries.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_append_entries_direct_transport() {
+        run_async(async {
+            let transport = FakeTransport::new();
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
+            let mut group_factory = GroupNetworkFactory::new(factory.clone(), 1);
+
+            let node = openraft::impls::BasicNode {
+                addr: "127.0.0.1:5000".to_string(),
+            };
+            let mut network = group_factory.new_client(1, &node).await;
+
+            let append = make_append_request(1, 1, "test data".to_string());
+            let result = network
+                .append_entries(append, RPCOption::new(Duration::from_secs(30)))
+                .await;
+            assert!(result.is_ok());
+
+            let key = (1, 1);
+            let calls = transport.append_entries_calls.get(&key).unwrap();
+            assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].entries.len(), 1);
         });
     }
 
     #[test]
-    fn test_heartbeat_dedup() {
+    fn test_vote_request_direct_transport() {
         run_async(async {
             let transport = FakeTransport::new();
-            let config = MultiRaftConfig {
-                heartbeat_interval: Duration::from_millis(50),
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
+            let mut group_factory = GroupNetworkFactory::new(factory.clone(), 1);
+
+            let node = openraft::impls::BasicNode {
+                addr: "127.0.0.1:5000".to_string(),
             };
-            let factory = Arc::new(MultiRaftNetworkFactory::new(
-                Arc::new(transport.clone()),
-                config,
-            ));
+            let mut network = group_factory.new_client(1, &node).await;
 
-            // Send multiple heartbeats for same group
-            let hb1 = make_heartbeat_request(1, 1);
-            let hb2 = make_heartbeat_request(2, 1); // Different term
-            let hb3 = make_heartbeat_request(3, 1); // Different term
+            let vote_req = VoteRequest {
+                vote: openraft::impls::Vote::new(1, 1),
+                last_log_id: None,
+            };
+            let result = network
+                .vote(vote_req, RPCOption::new(Duration::from_secs(30)))
+                .await;
+            assert!(result.is_ok());
+            assert!(result.unwrap().vote_granted);
 
-            // Use the buffer directly so we can deterministically control arrival order without
-            // having to concurrently borrow a `&mut MultiRaftNetwork`.
-            let mut buffer = factory.get_buffer(1);
-            let (tx1, rx1) = oneshot::channel();
-            let (tx2, rx2) = oneshot::channel();
-            let (tx3, rx3) = oneshot::channel();
-
-            // Enqueue in order: hb1 -> hb2 -> hb3. The buffer should keep only the latest RPC per
-            // group within the batching window, while still resolving all waiters.
-            buffer.tx.send((1, hb1, tx1)).await.unwrap();
-            buffer.tx.send((1, hb2, tx2)).await.unwrap();
-            buffer.tx.send((1, hb3, tx3)).await.unwrap();
-
-            let (r1, r2, r3) = futures::future::join3(rx1, rx2, rx3).await;
-            assert!(r1.unwrap().is_ok());
-            assert!(r2.unwrap().is_ok());
-            assert!(r3.unwrap().is_ok());
-
-            // Should have only one batch with the latest heartbeat
-            assert_eq!(transport.clone().get_heartbeat_batch_count(1), 1);
-            if let Some(batch) = transport.clone().get_heartbeat_batch(1, 0) {
-                assert_eq!(batch.len(), 1); // Only one group
-                assert_eq!(batch[0].0, 1); // group_id
-                // Should have the latest term (3)
-                assert_eq!(batch[0].1.vote.leader_id.term, 3);
-            }
+            let key = (1, 1);
+            let calls = transport.vote_calls.get(&key).unwrap();
+            assert_eq!(calls.len(), 1);
         });
     }
 
     #[test]
-    fn test_batch_size_cap() {
+    fn test_multiple_targets_isolation() {
         run_async(async {
             let transport = FakeTransport::new();
-            let config = MultiRaftConfig {
-                // Keep the batching window long enough that many heartbeats can accumulate,
-                // but short enough for the test to complete quickly.
-                heartbeat_interval: Duration::from_millis(100),
-            };
-            let factory = Arc::new(MultiRaftNetworkFactory::new(
-                Arc::new(transport.clone()),
-                config,
-            ));
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
 
-            // Exceed MAX_COALESCED_HEARTBEATS (256) by creating many distinct groups and issuing
-            // heartbeats concurrently. This avoids a slow "sleep per heartbeat interval" loop.
             let node = openraft::impls::BasicNode {
                 addr: "127.0.0.1:5000".to_string(),
             };
-            let mut futs = Vec::new();
-            for group_id in 1..=260 {
-                let mut group_factory = GroupNetworkFactory::new(factory.clone(), group_id);
-                let mut network = group_factory.new_client(1, &node).await;
-                let hb = make_heartbeat_request(1, 1);
-                futs.push(async move {
-                    network
-                        .append_entries(hb, RPCOption::new(Duration::from_secs(30)))
+
+            let mut gf1 = GroupNetworkFactory::new(factory.clone(), 1);
+            let mut net1 = gf1.new_client(1, &node).await;
+
+            let mut gf2 = GroupNetworkFactory::new(factory.clone(), 1);
+            let mut net2 = gf2.new_client(2, &node).await;
+
+            let hb1 = make_heartbeat_request(1, 1);
+            let hb2 = make_heartbeat_request(1, 1);
+
+            let (r1, r2) = futures::future::join(
+                net1.append_entries(hb1, RPCOption::new(Duration::from_secs(30))),
+                net2.append_entries(hb2, RPCOption::new(Duration::from_secs(30))),
+            )
+            .await;
+
+            assert!(r1.is_ok());
+            assert!(r2.is_ok());
+
+            // Each target should have its own call
+            assert!(transport.append_entries_calls.get(&(1, 1)).is_some());
+            assert!(transport.append_entries_calls.get(&(2, 1)).is_some());
+        });
+    }
+
+    #[test]
+    fn test_concurrent_groups_same_target() {
+        run_async(async {
+            let transport = FakeTransport::new();
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
+
+            let node = openraft::impls::BasicNode {
+                addr: "127.0.0.1:5000".to_string(),
+            };
+
+            let mut handles = Vec::new();
+            for group_id in 1..=10 {
+                let factory = factory.clone();
+                let node = node.clone();
+                let handle = tokio::spawn(async move {
+                    let mut gf = GroupNetworkFactory::new(factory, group_id);
+                    let mut net = gf.new_client(1, &node).await;
+                    let hb = make_heartbeat_request(1, 1);
+                    net.append_entries(hb, RPCOption::new(Duration::from_secs(30)))
                         .await
                 });
+                handles.push(handle);
             }
-            let results = futures::future::join_all(futs).await;
-            assert!(results.iter().all(|r| r.is_ok()));
 
-            // Should have at least one batch (may have multiple if cap was hit)
-            assert!(transport.get_heartbeat_batch_count(1) > 0);
+            for handle in handles {
+                let result = handle.await.unwrap();
+                assert!(result.is_ok());
+            }
+
+            // Each group should have its own call to the transport
+            assert_eq!(transport.call_count.load(Ordering::Relaxed), 10);
         });
     }
 
     #[test]
-    fn test_error_propagation() {
+    fn test_install_snapshot_success() {
         run_async(async {
             let transport = FakeTransport::new();
-            let error = RPCError::Network(openraft::error::NetworkError::new(
-                &std::io::Error::new(std::io::ErrorKind::Other, "test error"),
-            ));
-            transport.set_batch_error(1, error.clone());
-
-            let config = MultiRaftConfig {
-                heartbeat_interval: Duration::from_millis(50),
-            };
-            let factory = Arc::new(MultiRaftNetworkFactory::new(
-                Arc::new(transport.clone()),
-                config,
-            ));
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
             let mut group_factory = GroupNetworkFactory::new(factory.clone(), 1);
 
             let node = openraft::impls::BasicNode {
                 addr: "127.0.0.1:5000".to_string(),
             };
-            let mut group_factory_mut = group_factory;
-            let mut network = group_factory_mut.new_client(1, &node).await;
+            let mut network = group_factory.new_client(1, &node).await;
 
-            let hb = make_heartbeat_request(1, 1);
+            let snapshot_data: Vec<u8> = vec![1, 2, 3, 4, 5];
+            let cursor = std::io::Cursor::new(snapshot_data);
+            let snapshot_meta = openraft::storage::SnapshotMeta::<TestConfig> {
+                last_log_id: None,
+                last_membership: openraft::StoredMembership::default(),
+                snapshot_id: "test-snapshot".to_string(),
+            };
+
+            let snapshot = openraft::storage::Snapshot::<TestConfig> {
+                meta: snapshot_meta,
+                snapshot: cursor,
+            };
+
+            let vote = openraft::impls::Vote::new(1, 1);
+            let cancel_fut =
+                async { std::future::pending::<openraft::error::ReplicationClosed>().await };
+
             let result = network
-                .append_entries(hb, RPCOption::new(Duration::from_secs(30)))
+                .full_snapshot(
+                    vote,
+                    snapshot,
+                    cancel_fut,
+                    RPCOption::new(Duration::from_secs(30)),
+                )
                 .await;
 
-            // Wait for flush
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Should have received error
-            assert!(result.is_err());
+            assert!(result.is_ok());
         });
     }
 
     #[test]
-    fn test_missing_response_in_batch() {
+    fn test_install_snapshot_rejection() {
         run_async(async {
-            let transport = FakeTransport::new();
-            // Return batch with missing group
-            transport.set_batch_response(
-                1,
-                vec![
-                    (2, AppendEntriesResponse::Success), // Missing group 1
-                ],
-            );
+            struct RejectingTransport {
+                call_count: Arc<AtomicU64>,
+            }
 
-            let config = MultiRaftConfig {
-                heartbeat_interval: Duration::from_millis(50),
+            impl Clone for RejectingTransport {
+                fn clone(&self) -> Self {
+                    Self {
+                        call_count: self.call_count.clone(),
+                    }
+                }
+            }
+
+            impl MultiplexedTransport<TestConfig> for RejectingTransport {
+                async fn send_append_entries(
+                    &self,
+                    _target: u64,
+                    _group_id: u64,
+                    _rpc: AppendEntriesRequest<TestConfig>,
+                ) -> Result<
+                    AppendEntriesResponse<TestConfig>,
+                    RPCError<TestConfig, RaftError<TestConfig>>,
+                > {
+                    Ok(AppendEntriesResponse::Success)
+                }
+
+                async fn send_vote(
+                    &self,
+                    _target: u64,
+                    _group_id: u64,
+                    _rpc: VoteRequest<TestConfig>,
+                ) -> Result<VoteResponse<TestConfig>, RPCError<TestConfig, RaftError<TestConfig>>>
+                {
+                    Ok(VoteResponse {
+                        vote: openraft::impls::Vote::new(1, 1),
+                        vote_granted: true,
+                        last_log_id: None,
+                    })
+                }
+
+                async fn send_install_snapshot(
+                    &self,
+                    _target: u64,
+                    _group_id: u64,
+                    _rpc: InstallSnapshotRequest<TestConfig>,
+                ) -> Result<
+                    InstallSnapshotResponse<TestConfig>,
+                    RPCError<TestConfig, RaftError<TestConfig, InstallSnapshotError>>,
+                > {
+                    self.call_count.fetch_add(1, Ordering::Relaxed);
+                    Err(RPCError::Network(openraft::error::NetworkError::new(
+                        &std::io::Error::new(std::io::ErrorKind::Other, "snapshot rejected"),
+                    )))
+                }
+            }
+
+            let transport = RejectingTransport {
+                call_count: Arc::new(AtomicU64::new(0)),
             };
-            let factory = Arc::new(MultiRaftNetworkFactory::new(
-                Arc::new(transport.clone()),
-                config,
-            ));
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
             let mut group_factory = GroupNetworkFactory::new(factory.clone(), 1);
 
             let node = openraft::impls::BasicNode {
                 addr: "127.0.0.1:5000".to_string(),
             };
-            let mut group_factory_mut = group_factory;
-            let mut network = group_factory_mut.new_client(1, &node).await;
+            let mut network = group_factory.new_client(1, &node).await;
 
-            let hb = make_heartbeat_request(1, 1);
+            let snapshot_data: Vec<u8> = vec![1, 2, 3, 4, 5];
+            let cursor = std::io::Cursor::new(snapshot_data);
+            let snapshot_meta = openraft::storage::SnapshotMeta::<TestConfig> {
+                last_log_id: None,
+                last_membership: openraft::StoredMembership::default(),
+                snapshot_id: "test-snapshot".to_string(),
+            };
+
+            let snapshot = openraft::storage::Snapshot {
+                meta: snapshot_meta,
+                snapshot: cursor,
+            };
+
+            let vote = openraft::impls::Vote::new(1, 1);
+            let cancel_fut =
+                async { std::future::pending::<openraft::error::ReplicationClosed>().await };
+
             let result = network
-                .append_entries(hb, RPCOption::new(Duration::from_secs(30)))
+                .full_snapshot(
+                    vote,
+                    snapshot,
+                    cancel_fut,
+                    RPCOption::new(Duration::from_secs(30)),
+                )
                 .await;
-
-            // Wait for flush
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Should have received error about missing response
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_backoff_configuration() {
+        let transport = FakeTransport::new();
+        let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport)));
+
+        let node = openraft::impls::BasicNode {
+            addr: "127.0.0.1:5000".to_string(),
+        };
+
+        run_async(async move {
+            let mut group_factory = GroupNetworkFactory::new(factory.clone(), 1);
+            let network = group_factory.new_client(1, &node).await;
+            let _backoff = network.backoff();
+        });
+    }
+
+    #[test]
+    fn test_factory_construction() {
+        let transport = FakeTransport::new();
+        let _factory = MultiRaftNetworkFactory::new(Arc::new(transport));
+    }
+
+    #[test]
+    fn test_group_network_factory_new() {
+        let transport = FakeTransport::new();
+        let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport)));
+        let group_factory = GroupNetworkFactory::new(factory, 42);
+        assert_eq!(group_factory.group_id, 42);
+    }
+
+    #[test]
+    fn test_concurrent_targets_stress() {
+        run_async(async {
+            let transport = FakeTransport::new();
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
+
+            let node = openraft::impls::BasicNode {
+                addr: "127.0.0.1:5000".to_string(),
+            };
+
+            let mut handles = Vec::new();
+            for target_id in 1..=5 {
+                for group_id in 1..=10 {
+                    let factory = factory.clone();
+                    let node = node.clone();
+                    let handle = tokio::spawn(async move {
+                        let mut gf = GroupNetworkFactory::new(factory, group_id);
+                        let mut net = gf.new_client(target_id, &node).await;
+                        let hb = make_heartbeat_request(1, 1);
+                        net.append_entries(hb, RPCOption::new(Duration::from_secs(30)))
+                            .await
+                    });
+                    handles.push((target_id, group_id, handle));
+                }
+            }
+
+            for (target_id, group_id, handle) in handles {
+                let result = handle.await.unwrap();
+                assert!(
+                    result.is_ok(),
+                    "Target {} Group {} failed",
+                    target_id,
+                    group_id
+                );
+            }
+
+            // All 50 calls should have gone through
+            assert_eq!(transport.call_count.load(Ordering::Relaxed), 50);
         });
     }
 }

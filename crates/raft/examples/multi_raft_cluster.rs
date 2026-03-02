@@ -40,7 +40,7 @@ use bisque_raft::BisqueRaftTypeConfig;
 use bisque_raft::multi::codec::{FromCodec, RawBytes, ToCodec};
 use bisque_raft::multi::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
-    DefaultNodeRegistry, MultiRaftConfig, MultiRaftManager, MultiplexedLogStorage,
+    DefaultNodeRegistry, MultiRaftManager, MultiplexedLogStorage,
     MultiplexedStorageConfig, NodeAddressResolver,
 };
 use futures::StreamExt;
@@ -337,24 +337,17 @@ async fn create_node(
         // Set slightly lower than election timeout (4000ms) to ensure transport
         // fails fast and rotates connections before Raft gives up.
         request_timeout: Duration::from_millis(3000),
-        // Increased to allow more concurrent streams per pair
-        connections_per_addr: 8,
-        max_concurrent_requests_per_conn: 128,
         connection_ttl: Duration::from_secs(300),
         tcp_nodelay: true,
+        ..Default::default()
     };
 
     let transport = Transport::new(transport_config, node_registry);
 
     println!("  Node {}: Created TCP transport at {}", node_id, node_addr);
 
-    // Create multi-raft configuration
-    let multi_config = MultiRaftConfig {
-        heartbeat_interval: Duration::from_millis(100),
-    };
-
     // Create and return the manager wrapped in Arc
-    Arc::new(MultiRaftManager::new(transport, storage, multi_config))
+    Arc::new(MultiRaftManager::new(transport, storage))
 }
 
 const NUM_GROUPS: u64 = 3;

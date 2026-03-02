@@ -19,7 +19,6 @@ mod network_tests;
 
 // storage_tests module removed - tests integrated into storage_impl.rs
 
-pub use config::MultiRaftConfig;
 pub use manager::MultiRaftManager;
 pub use network::{MultiRaftNetwork, MultiRaftNetworkFactory, MultiplexedTransport};
 pub use storage::MultiRaftLogStorage;

@@ -8,8 +8,8 @@
 //! - Mid-stream disconnects (reader/writer side)
 //! - Malformed/corrupted frames
 //! - Request timeout handling
-//! - Connection pool: TTL expiry, dead connection cleanup, capacity
-//! - InFlightGuard RAII correctness
+//! - Transport config: TTL, batch settings
+//! - Atomic counter RAII correctness
 //! - notify_all_pending_error behavior
 //! - Concurrent multiplexed requests
 //! - Server connection limit enforcement
@@ -729,22 +729,22 @@ async fn test_rolling_buffer_read_timeout() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_connection_pool_basic() {
+async fn test_transport_config_basic() {
     use crate::multi::tcp_transport::BisqueTcpTransportConfig;
 
     let config = BisqueTcpTransportConfig {
-        connections_per_addr: 2,
-        max_concurrent_requests_per_conn: 10,
+        write_channel_capacity: 128,
+        max_batch_bytes: 32 * 1024,
         connection_ttl: Duration::from_secs(300),
         ..Default::default()
     };
 
-    assert_eq!(config.connections_per_addr, 2);
-    assert_eq!(config.max_concurrent_requests_per_conn, 10);
+    assert_eq!(config.write_channel_capacity, 128);
+    assert_eq!(config.max_batch_bytes, 32 * 1024);
 }
 
 #[tokio::test]
-async fn test_connection_pool_ttl_config() {
+async fn test_transport_config_ttl() {
     use crate::multi::tcp_transport::BisqueTcpTransportConfig;
 
     let config = BisqueTcpTransportConfig {
@@ -756,11 +756,11 @@ async fn test_connection_pool_ttl_config() {
 }
 
 // ============================================================================
-// InFlightGuard RAII correctness
+// Atomic counter RAII correctness
 // ============================================================================
 
 #[test]
-fn test_inflight_guard_increments_and_decrements() {
+fn test_atomic_counter_increments_and_decrements() {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     let counter = AtomicU64::new(0);
@@ -785,7 +785,7 @@ fn test_inflight_guard_increments_and_decrements() {
 }
 
 #[test]
-fn test_inflight_guard_panic_safety() {
+fn test_atomic_counter_panic_safety() {
     use std::panic;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1588,8 +1588,8 @@ fn test_transport_config_all_fields() {
     use crate::multi::tcp_transport::BisqueTcpTransportConfig;
 
     let config = BisqueTcpTransportConfig::default();
-    assert_eq!(config.connections_per_addr, 4);
-    assert_eq!(config.max_concurrent_requests_per_conn, 256);
+    assert_eq!(config.write_channel_capacity, 256);
+    assert_eq!(config.max_batch_bytes, 64 * 1024);
     assert_eq!(config.connection_ttl, Duration::from_secs(300));
     assert_eq!(config.connect_timeout, Duration::from_secs(10));
     assert_eq!(config.request_timeout, Duration::from_secs(30));

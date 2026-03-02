@@ -16,8 +16,7 @@ use bisque_raft::multi::codec::{Decode, Encode};
 use bisque_raft::multi::network::GroupNetworkFactory;
 use bisque_raft::multi::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
-    DefaultNodeRegistry, MultiRaftConfig, MultiRaftManager, MultiRaftNetworkFactory,
-    MultiplexedLogStorage, MultiplexedStorageConfig,
+    DefaultNodeRegistry, MultiRaftManager, MultiplexedLogStorage, MultiplexedStorageConfig,
 };
 use bisque_raft::{BisqueRaftTypeConfig, multi::codec};
 use futures::FutureExt;
@@ -166,12 +165,6 @@ impl openraft::RaftSnapshotBuilder<TestConfig> for TestStateMachine {
 }
 
 #[test]
-fn test_multi_raft_config_default() {
-    let config = MultiRaftConfig::default();
-    assert_eq!(config.heartbeat_interval.as_millis(), 100);
-}
-
-#[test]
 fn test_rpc_server_config_default() {
     let config = BisqueRpcServerConfig::default();
     assert_eq!(config.max_connections, 1000);
@@ -181,8 +174,8 @@ fn test_rpc_server_config_default() {
 #[test]
 fn test_transport_config_default() {
     let config = BisqueTcpTransportConfig::default();
-    assert_eq!(config.connections_per_addr, 4);
-    assert_eq!(config.max_concurrent_requests_per_conn, 256);
+    assert_eq!(config.write_channel_capacity, 256);
+    assert_eq!(config.max_batch_bytes, 64 * 1024);
     assert_eq!(config.connection_ttl.as_secs(), 300);
 }
 
@@ -234,10 +227,9 @@ fn test_two_node_two_group_cluster() {
         let transport_cfg = BisqueTcpTransportConfig {
             connect_timeout: Duration::from_secs(2),
             request_timeout: Duration::from_secs(2),
-            connections_per_addr: 2,
-            max_concurrent_requests_per_conn: 64,
             connection_ttl: Duration::from_secs(30),
             tcp_nodelay: true,
+            ..Default::default()
         };
 
         let transport1 =
@@ -245,19 +237,13 @@ fn test_two_node_two_group_cluster() {
         let transport2 =
             BisqueTcpTransport::<TestConfig>::new(transport_cfg.clone(), node_registry.clone());
 
-        let multi_cfg = MultiRaftConfig {
-            heartbeat_interval: Duration::from_millis(50),
-        };
-
         let manager1 = Arc::new(MultiRaftManager::<TestConfig, _, _>::new(
             transport1,
             storage1,
-            multi_cfg.clone(),
         ));
         let manager2 = Arc::new(MultiRaftManager::<TestConfig, _, _>::new(
             transport2,
             storage2,
-            multi_cfg.clone(),
         ));
 
         // Start RPC servers
@@ -383,151 +369,5 @@ fn test_two_node_two_group_cluster() {
     });
 }
 
-#[test]
-fn test_heartbeat_coalescing_verification() {
-    run_async(async {
-        use tokio::net::TcpListener as TokioTcpListener;
-
-        // Fake server that just counts HeartbeatBatchMulti messages and replies with success.
-        let server_addr = pick_unused_local_addr();
-        let batches_seen = Arc::new(AtomicU64::new(0));
-
-        let server_handle = {
-            let batches_seen = batches_seen.clone();
-            tokio::spawn(async move {
-                let listener = TokioTcpListener::bind(server_addr)
-                    .await
-                    .expect("bind fake server");
-                loop {
-                    let (mut stream, _peer) = match listener.accept().await {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let batches_seen = batches_seen.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            let frame =
-                                match bisque_raft::multi::tcp_transport::read_frame(&mut stream)
-                                    .await
-                                {
-                                    Ok(v) => v,
-                                    Err(_) => return,
-                                };
-                            let msg: codec::RpcMessage<codec::RawBytes> =
-                                match codec::RpcMessage::decode_from_slice(&frame) {
-                                    Ok(m) => m,
-                                    Err(_) => return,
-                                };
-
-                            match msg {
-                                codec::RpcMessage::HeartbeatBatchMulti {
-                                    request_id,
-                                    heartbeats,
-                                } => {
-                                    batches_seen.fetch_add(1, Ordering::SeqCst);
-                                    let responses = heartbeats
-                                        .into_iter()
-                                        .map(|(gid, _)| {
-                                            (gid, codec::AppendEntriesResponse::Success)
-                                        })
-                                        .collect::<Vec<_>>();
-                                    let resp = codec::RpcMessage::<codec::RawBytes>::HeartbeatBatchMultiResponse {
-                                        request_id,
-                                        responses,
-                                    };
-                                    let out = resp.encode_to_vec().expect("encode response");
-                                    let _ = bisque_raft::multi::tcp_transport::write_frame(
-                                        &mut stream,
-                                        &out,
-                                    )
-                                    .await;
-                                }
-                                other => {
-                                    // Best-effort error response.
-                                    let resp = codec::RpcMessage::<codec::RawBytes>::Error {
-                                        request_id: other.request_id(),
-                                        error: "unsupported".to_string(),
-                                    };
-                                    let out = resp.encode_to_vec().expect("encode error");
-                                    let _ = bisque_raft::multi::tcp_transport::write_frame(
-                                        &mut stream,
-                                        &out,
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                    });
-                }
-            })
-        };
-
-        // Client-side setup: real ManiacTcpTransport + MultiRaftNetworkFactory coalescing.
-        let node_registry = Arc::new(DefaultNodeRegistry::<u64>::new());
-        node_registry.register(2, server_addr);
-
-        let transport = BisqueTcpTransport::<TestConfig>::new(
-            BisqueTcpTransportConfig {
-                connect_timeout: Duration::from_secs(2),
-                request_timeout: Duration::from_secs(2),
-                connections_per_addr: 1,
-                max_concurrent_requests_per_conn: 128,
-                connection_ttl: Duration::from_secs(30),
-                tcp_nodelay: true,
-            },
-            node_registry.clone(),
-        );
-
-        let factory = Arc::new(MultiRaftNetworkFactory::<TestConfig, _>::new(
-            Arc::new(transport),
-            MultiRaftConfig {
-                heartbeat_interval: Duration::from_millis(10),
-            },
-        ));
-
-        let node = openraft::impls::BasicNode {
-            addr: server_addr.to_string(),
-        };
-
-        // Fire heartbeats for many groups concurrently to the same target.
-        let groups: u64 = 100;
-        let mut futs = Vec::new();
-        for gid in 1..=groups {
-            let mut gf = GroupNetworkFactory::new(factory.clone(), gid);
-            let mut net = gf.new_client(2, &node).await;
-            let hb = openraft::raft::AppendEntriesRequest::<TestConfig> {
-                vote: openraft::impls::Vote::new(1, 1),
-                prev_log_id: None,
-                entries: vec![],
-                leader_commit: None,
-            };
-            futs.push(async move {
-                net.append_entries(
-                    hb,
-                    openraft::network::RPCOption::new(Duration::from_secs(3)),
-                )
-                .await
-            });
-        }
-
-        let results = futures::future::join_all(futs).await;
-        assert!(
-            results.iter().all(|r| r.is_ok()),
-            "all heartbeats should succeed"
-        );
-
-        // Coalescing expectation: should be much closer to "per peer" than "per group".
-        // With groups=100 and MAX_COALESCED_HEARTBEATS=256, we expect ~1 batch (maybe a couple due to timing).
-        let seen = batches_seen.load(Ordering::SeqCst);
-        assert!(seen > 0, "should have sent at least one batch");
-        assert!(
-            seen <= 5,
-            "expected strong coalescing, got {} HeartbeatBatchMulti messages for {} groups",
-            seen,
-            groups
-        );
-
-        // Keep server_handle alive until here.
-        drop(server_handle);
-    });
-}
+// (heartbeat coalescing verification test was removed — heartbeats now go
+// directly through BisqueTcpTransport which batches writes naturally)

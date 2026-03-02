@@ -8,9 +8,6 @@
 
 use bisque_raft::multi::codec::{BorrowPayload, FromCodec, RawBytes, ToCodec};
 use bisque_raft::multi::storage_impl::{GroupLogStorage, PerGroupLogStorage, StorageConfig};
-use bisque_raft::multi::storage_mdbx::{
-    MdbxGroupLogStorage, MdbxPerGroupLogStorage, MdbxStorageConfig,
-};
 use bisque_raft::multi::storage_mmap::{
     MmapGroupLogStorage, MmapPerGroupLogStorage, MmapStorageConfig,
 };
@@ -694,20 +691,6 @@ async fn main() -> io::Result<()> {
                     Err(e) => println!("    {:<16} ERROR: {}", "SegLog", e),
                 }
             }
-            if run_mdbx {
-                let dir = tempfile::tempdir()?;
-                match bench_read_seq::<MdbxStorage>(
-                    cfg,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("MDBX", cfg.total_entries, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "MDBX", e),
-                }
-            }
             if run_mmap {
                 let dir = tempfile::tempdir()?;
                 match bench_read_seq::<MmapStorage>(
@@ -750,20 +733,6 @@ async fn main() -> io::Result<()> {
                 {
                     Ok(elapsed) => print_result("SegLog", num_reads, total_bytes, elapsed),
                     Err(e) => println!("    {:<16} ERROR: {}", "SegLog", e),
-                }
-            }
-            if run_mdbx {
-                let dir = tempfile::tempdir()?;
-                match bench_read_random::<MdbxStorage>(
-                    cfg,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("MDBX", num_reads, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "MDBX", e),
                 }
             }
             if run_mmap {
@@ -826,23 +795,6 @@ async fn main() -> io::Result<()> {
                 {
                     Ok(elapsed) => print_result("SegLog", total_entries, total_bytes, elapsed),
                     Err(e) => println!("    {:<16} ERROR: {}", "SegLog", e),
-                }
-            }
-            if run_mdbx {
-                let dir = tempfile::tempdir()?;
-                match bench_multi_group_write::<MdbxStorage>(
-                    *num_groups,
-                    *payload_size,
-                    *entries_per_group,
-                    *batch_size,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("MDBX", total_entries, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "MDBX", e),
                 }
             }
             if run_mmap {
