@@ -13,6 +13,7 @@ members = [
     # "crates/macros",
     "crates/maniac",
     "crates/raft",           # maniac-raft: OpenRaft adapter for Maniac runtime
+    "crates/lance",          # bisque-lance: Distributed search & analytics storage engine
     # "moon/rapp",
     # "crates/rusqlite",
     # "crates/libsql-ffi",
@@ -44,6 +45,10 @@ categories = ["asynchronous", "concurrency"]
 allocator-api2 = "0.4"
 anyerror = "0.1"
 anyhow = "1"
+arrow = { version = "57", default-features = false }
+arrow-array = { version = "57", default-features = false }
+arrow-ipc = { version = "57", default-features = false }
+arrow-schema = { version = "57", default-features = false }
 arc-swap = "1.7"
 lru = "0.14"
 async-entry = "0.3"
@@ -86,6 +91,16 @@ futures-util = "0.3"
 hdrhistogram = "7.5"
 hyper = { version = "1.8" }
 libc = "0.2"
+datafusion = { version = "52.1.0", default-features = false }
+datafusion-expr = { version = "52.1.0", default-features = false }
+datafusion-physical-plan = { version = "52.1.0", default-features = false }
+datafusion-common = { version = "52.1.0", default-features = false }
+lance = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
+lance-index = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
+lance-linalg = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
+lance-io = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
+lance-table = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
+lance-core = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
 libmdbx = "0.6"
 log = "0.4"
 loom = "0.7"
@@ -131,6 +146,7 @@ tracing = { version = "0.1", default-features = false, features = [
 ] }
 tracing-futures = "0.2"
 tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4"] }
 validit = "0.2"
 #vertx-cluster = { path = "crates/vertx-cluster", version = "0.1.0" }
 webpki-roots = "1.0.4"
@@ -146,6 +162,7 @@ zstd = "0.13"
 # maniac-allocator = { path = "crates/maniac-allocator", version = "0.1.0", default-features = false }
 # maniac-sys = { path = "crates/maniac-sys", version = "0.1.0" }
 # maniac-usockets = { path = "crates/maniac-usockets", version = "0.1.0", default-features = false }
+bisque-raft = { path = "crates/raft", version = "0.1.0" }
 maniac = { path = "crates/bisque-runtime", version = "0.1.0" }
 # maniac = { path = "crates/maniac", version = "0.1.0" }
 # maniac-macros = { path = "crates/macros", version = "0.1.0" }
