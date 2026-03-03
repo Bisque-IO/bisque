@@ -2,16 +2,17 @@
 //!
 //! A Raft-replicated "Hot-Cold" LSM storage pipeline built on the Lance columnar format.
 //! Manages the full lifecycle of data from ingestion through local NVMe segments
-//! to deep S3 archival.
+//! to deep S3 archival, with support for multiple independent tables.
 //!
 //! # Architecture
 //!
-//! Data flows through three tiers:
+//! Each table's data flows through three tiers:
 //! - **Active Segment**: Local NVMe, accepting writes via Raft-replicated AppendRecords
 //! - **Sealed Segment**: Local NVMe, read-only, awaiting flush to deep storage
 //! - **Deep Storage**: S3 Lance dataset, the long-term archive
 //!
-//! The Raft state machine tracks segment metadata and drives transitions between tiers.
+//! The Raft state machine tracks segment metadata per table and drives transitions
+//! between tiers.
 
 pub mod codec;
 pub mod config;
@@ -21,17 +22,19 @@ pub mod ipc;
 pub mod query;
 pub mod raft;
 pub mod state_machine;
+pub mod table_engine;
 pub mod types;
 
-pub use config::{BisqueLanceConfig, IndexSpec};
+pub use config::{BisqueLanceConfig, IndexSpec, TableOpenConfig};
 pub use engine::BisqueLance;
 pub use error::{Error, Result};
 pub use query::BisqueLanceTableProvider;
 pub use raft::{LanceRaftNode, WriteError};
 pub use state_machine::LanceStateMachine;
+pub use table_engine::TableEngine;
 pub use types::{
     CleanupStats, CompactionStats, FlushHandle, FlushState, LanceCommand, LanceResponse,
-    SealReason, SegmentCatalog, SegmentId, SnapshotData,
+    SchemaVersion, SealReason, SegmentCatalog, SegmentId, SnapshotData, TableSnapshot,
 };
 
 /// Raft type configuration for bisque-lance.

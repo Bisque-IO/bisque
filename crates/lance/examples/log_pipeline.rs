@@ -50,10 +50,8 @@ fn log_schema() -> Arc<Schema> {
 }
 
 /// Generate a batch of fake log entries.
-///
-/// `batch_id` offsets the timestamps so each batch represents a different time window.
 fn generate_log_batch(schema: &Arc<Schema>, batch_id: i64, num_rows: usize) -> RecordBatch {
-    let base_ts = 1_700_000_000_000i64 + batch_id * 60_000; // offset by 60s per batch
+    let base_ts = 1_700_000_000_000i64 + batch_id * 60_000;
     let levels = ["INFO", "WARN", "ERROR", "DEBUG"];
     let services = ["api-gateway", "auth-service", "user-service", "payment-service"];
     let messages = [
@@ -68,7 +66,7 @@ fn generate_log_batch(schema: &Arc<Schema>, batch_id: i64, num_rows: usize) -> R
     ];
 
     let timestamps: Vec<i64> = (0..num_rows)
-        .map(|i| base_ts + (i as i64) * 100) // 100ms apart
+        .map(|i| base_ts + (i as i64) * 100)
         .collect();
 
     let level_values: Vec<&str> = (0..num_rows).map(|i| levels[i % levels.len()]).collect();
@@ -126,27 +124,25 @@ async fn main() -> anyhow::Result<()> {
     let schema = log_schema();
 
     // =========================================================================
-    // Step 1: Configure and open the engine
+    // Step 1: Configure and open the multi-table engine, then create "logs" table
     // =========================================================================
-    println!("--- Step 1: Configure and Open Engine ---\n");
+    println!("--- Step 1: Configure and Open Engine + Create 'logs' Table ---\n");
 
     let config = BisqueLanceConfig::new(&data_dir)
-        .with_schema(schema.clone())
-        .with_seal_max_age(Duration::from_secs(3600)) // won't auto-seal in this example
-        .with_seal_max_size(u64::MAX) // won't auto-seal by size
-        // Use a local path as "deep storage" (normally this would be an S3 URI)
+        .with_seal_max_age(Duration::from_secs(3600))
+        .with_seal_max_size(u64::MAX)
         .with_s3_uri(deep_storage_dir.to_str().unwrap())
-        // Build FTS index on `message` column when a segment is sealed
         .with_seal_index(IndexSpec::fts("message"));
 
-    let engine = Arc::new(BisqueLance::open(config, None).await?);
+    let engine = Arc::new(BisqueLance::open(config).await?);
+
+    // Create the "logs" table with our schema
+    let table_config = engine.config().build_table_config("logs", schema.clone());
+    let logs = engine.create_table(table_config, None).await?;
 
     println!("  Engine opened at: {}", data_dir.display());
     println!("  Deep storage at:  {}", deep_storage_dir.display());
-    println!(
-        "  Active segment:   {}",
-        engine.catalog().active_segment
-    );
+    println!("  Table 'logs' active segment: {}", logs.catalog().active_segment);
     println!();
 
     // =========================================================================
@@ -157,9 +153,9 @@ async fn main() -> anyhow::Result<()> {
     let batch1 = generate_log_batch(&schema, 0, 100);
     println!("  Generated {} log entries for batch 1", batch1.num_rows());
 
-    engine.apply_append(vec![batch1]).await?;
+    logs.apply_append(vec![batch1]).await?;
 
-    let active_rows = engine
+    let active_rows = logs
         .active_dataset_snapshot()
         .await
         .unwrap()
@@ -173,19 +169,17 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     println!("--- Step 3: Seal Active Segment (Hot → Warm) ---\n");
 
-    let sealed_id = engine.catalog().active_segment;
-    let new_active_id = engine.next_segment_id();
+    let sealed_id = logs.catalog().active_segment;
+    let new_active_id = logs.next_segment_id();
 
-    engine
-        .apply_seal(sealed_id, new_active_id, SealReason::MaxAge)
-        .await?;
+    logs.apply_seal(sealed_id, new_active_id, SealReason::MaxAge).await?;
 
     println!("  Sealed segment {} (now read-only)", sealed_id);
     println!("  New active segment: {}", new_active_id);
     println!(
         "  Catalog: active={}, sealed={:?}",
-        engine.catalog().active_segment,
-        engine.catalog().sealed_segment
+        logs.catalog().active_segment,
+        logs.catalog().sealed_segment
     );
     println!();
 
@@ -194,11 +188,11 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     println!("--- Step 3b: Build FTS Index on Sealed Segment ---\n");
 
-    engine.create_seal_indices().await?;
+    logs.create_seal_indices().await?;
     println!("  FTS index created on 'message' column of sealed segment");
 
     // Run FTS search on the sealed segment using Lance Scanner API
-    let sealed_ds = engine.sealed_dataset_snapshot().await.unwrap();
+    let sealed_ds = logs.sealed_dataset_snapshot().await.unwrap();
 
     println!("\n  >> FTS search: \"timeout\" (match any log mentioning timeout)\n");
     let fts_query = FullTextSearchQuery::new("timeout".to_owned()).limit(Some(10));
@@ -264,15 +258,15 @@ async fn main() -> anyhow::Result<()> {
     let batch2 = generate_log_batch(&schema, 1, 50);
     println!("  Generated {} log entries for batch 2", batch2.num_rows());
 
-    engine.apply_append(vec![batch2]).await?;
+    logs.apply_append(vec![batch2]).await?;
 
-    let active_rows = engine
+    let active_rows = logs
         .active_dataset_snapshot()
         .await
         .unwrap()
         .count_rows(None)
         .await?;
-    let sealed_rows = engine
+    let sealed_rows = logs
         .sealed_dataset_snapshot()
         .await
         .unwrap()
@@ -287,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     println!("--- Step 5: Query Across Hot + Warm Tiers ---\n");
 
-    let provider = Arc::new(BisqueLanceTableProvider::new(engine.clone(), schema.clone()));
+    let provider = Arc::new(BisqueLanceTableProvider::new(logs.clone(), schema.clone()));
     let ctx = SessionContext::new();
     ctx.register_table("logs", provider.clone())?;
 
@@ -319,30 +313,28 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     println!("\n--- Step 6: Flush Sealed → Deep Storage (Cold) ---\n");
 
-    let flush_handle = engine.begin_flush()?;
+    let flush_handle = logs.begin_flush()?;
     println!(
         "  Flush handle: segment_id={}",
         flush_handle.segment_id
     );
 
-    engine.apply_begin_flush(flush_handle.segment_id);
+    logs.apply_begin_flush(flush_handle.segment_id);
 
-    let s3_version = engine.execute_flush(&flush_handle).await?;
+    let s3_version = logs.execute_flush(&flush_handle).await?;
     println!(
         "  Deep storage write complete: version={}",
         s3_version
     );
 
-    engine
-        .apply_promote(flush_handle.segment_id, s3_version)
-        .await?;
+    logs.apply_promote(flush_handle.segment_id, s3_version).await?;
 
     println!("  Promoted segment {} to deep storage", flush_handle.segment_id);
     println!(
         "  Catalog: active={}, sealed={:?}, deep_storage_version={}",
-        engine.catalog().active_segment,
-        engine.catalog().sealed_segment,
-        engine.catalog().s3_manifest_version,
+        logs.catalog().active_segment,
+        logs.catalog().sealed_segment,
+        logs.catalog().s3_manifest_version,
     );
     println!();
 
@@ -354,9 +346,9 @@ async fn main() -> anyhow::Result<()> {
     let batch3 = generate_log_batch(&schema, 2, 25);
     println!("  Generated {} log entries for batch 3", batch3.num_rows());
 
-    engine.apply_append(vec![batch3]).await?;
+    logs.apply_append(vec![batch3]).await?;
 
-    let active_rows = engine
+    let active_rows = logs
         .active_dataset_snapshot()
         .await
         .unwrap()
@@ -365,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  Active segment: {} rows (hot)", active_rows);
     println!(
         "  Deep storage:   version {} (cold)",
-        engine.catalog().s3_manifest_version
+        logs.catalog().s3_manifest_version
     );
     println!();
 
@@ -374,8 +366,7 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     println!("--- Step 8: Query Across Hot + Cold Tiers ---\n");
 
-    // Re-register with fresh provider to pick up the promoted deep storage
-    let provider = Arc::new(BisqueLanceTableProvider::new(engine.clone(), schema.clone()));
+    let provider = Arc::new(BisqueLanceTableProvider::new(logs.clone(), schema.clone()));
     let ctx = SessionContext::new();
     ctx.register_table("logs", provider)?;
 
@@ -408,6 +399,69 @@ async fn main() -> anyhow::Result<()> {
     .await?
     .show()
     .await?;
+
+    // =========================================================================
+    // Step 9: Demonstrate multi-table — create a "metrics" table
+    // =========================================================================
+    println!("\n--- Step 9: Multi-Table — Create 'metrics' Table ---\n");
+
+    let metrics_schema = Arc::new(Schema::new(vec![
+        Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+        Field::new("host", DataType::Utf8, false),
+        Field::new("cpu_percent", DataType::Float64, false),
+        Field::new("mem_mb", DataType::Int32, false),
+    ]));
+
+    let metrics_config = engine.config().build_table_config("metrics", metrics_schema.clone());
+    let metrics = engine.create_table(metrics_config, None).await?;
+
+    println!("  Created 'metrics' table");
+    println!("  Tables: {:?}", engine.list_tables());
+
+    // Write some metrics data
+    let metrics_batch = RecordBatch::try_new(
+        metrics_schema.clone(),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(vec![
+                1_700_000_000_000i64,
+                1_700_000_001_000,
+                1_700_000_002_000,
+            ])),
+            Arc::new(StringArray::from(vec!["host-1", "host-2", "host-1"])),
+            Arc::new(arrow_array::Float64Array::from(vec![45.2, 78.1, 52.3])),
+            Arc::new(Int32Array::from(vec![4096, 8192, 4096])),
+        ],
+    )?;
+
+    metrics.apply_append(vec![metrics_batch]).await?;
+    let metrics_rows = metrics
+        .active_dataset_snapshot()
+        .await
+        .unwrap()
+        .count_rows(None)
+        .await?;
+    println!("  Metrics table: {} rows", metrics_rows);
+
+    // Query the metrics table
+    let metrics_provider = Arc::new(BisqueLanceTableProvider::new(metrics.clone(), metrics_schema));
+    let ctx = SessionContext::new();
+    ctx.register_table("metrics", metrics_provider)?;
+
+    println!("\n  >> SELECT host, AVG(cpu_percent) as avg_cpu FROM metrics GROUP BY host\n");
+    ctx.sql("SELECT host, AVG(cpu_percent) as avg_cpu FROM metrics GROUP BY host")
+        .await?
+        .show()
+        .await?;
+
+    // Show schema history
+    println!("\n  Schema history for 'logs':");
+    for sv in logs.schema_history() {
+        println!("    version={}, created_at={}", sv.version, sv.created_at_millis);
+    }
+    println!("  Schema history for 'metrics':");
+    for sv in metrics.schema_history() {
+        println!("    version={}, created_at={}", sv.version, sv.created_at_millis);
+    }
 
     // =========================================================================
     // Cleanup

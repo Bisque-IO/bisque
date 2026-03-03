@@ -29,6 +29,12 @@ pub enum Error {
 
     #[error("No sealed segment to flush")]
     NoSealedSegment,
+
+    #[error("Table not found: {0}")]
+    TableNotFound(String),
+
+    #[error("Table already exists: {0}")]
+    TableAlreadyExists(String),
 }
 
 impl From<Error> for io::Error {

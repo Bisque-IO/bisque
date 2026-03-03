@@ -46,57 +46,62 @@ impl IndexSpec {
             index_type: IndexType::BTree,
         }
     }
+
+    /// Create a RTree scalar index spec on a column.
+    pub fn rtree(column: impl Into<String>) -> Self {
+        let col = column.into();
+        Self {
+            name: Some(format!("{}_rtree", col)),
+            columns: vec![col],
+            index_type: IndexType::RTree,
+        }
+    }
 }
 
-/// Configuration for the BisqueLance storage engine.
+/// Node-level configuration for the BisqueLance multi-table storage engine.
+///
+/// Contains defaults that apply to all tables. Per-table overrides are
+/// specified via [`TableOpenConfig`] when creating individual tables.
 pub struct BisqueLanceConfig {
-    /// Local NVMe path for segment storage.
+    /// Local NVMe path for data storage. Tables are stored under `{local_data_dir}/tables/{name}/`.
     pub local_data_dir: PathBuf,
 
-    /// Max age before sealing active segment.
+    /// Default max age before sealing active segment.
     pub seal_max_age: Duration,
 
-    /// Max size in bytes before sealing active segment.
+    /// Default max size in bytes before sealing active segment.
     pub seal_max_size: u64,
 
-    /// Arrow schema for the dataset.
+    /// Default Arrow schema for tables (used when not specified per-table).
     /// If None, the schema is inferred from the first write.
     pub schema: Option<arrow_schema::SchemaRef>,
 
-    /// S3 URI for deep storage dataset (e.g., "s3://bucket/deep-storage.lance").
+    /// Default S3 URI prefix for deep storage (tables append their name).
     /// If None, S3 deep storage is disabled.
     pub s3_uri: Option<String>,
 
     /// S3 storage options (credentials, region, endpoint).
-    /// Keys follow the object_store S3ConfigKey conventions:
-    /// `access_key_id`, `secret_access_key`, `region`, `endpoint`, etc.
     pub s3_storage_options: HashMap<String, String>,
 
-    /// Max rows per file for S3 deep storage writes (larger = more efficient on S3).
+    /// Default max rows per file for S3 deep storage writes.
     pub s3_max_rows_per_file: usize,
 
-    /// Max rows per row group for S3 deep storage writes.
+    /// Default max rows per row group for S3 deep storage writes.
     pub s3_max_rows_per_group: usize,
 
-    /// Indices to create on sealed segments.
-    ///
-    /// When a segment is sealed, these indices are built on the sealed
-    /// dataset before it becomes available for queries. This enables
-    /// FTS and vector search on sealed data.
+    /// Default indices to create on sealed segments.
     pub seal_indices: Vec<IndexSpec>,
 
-    /// Target number of rows per fragment for compaction. Defaults to 1M.
+    /// Default target number of rows per fragment for compaction.
     pub compaction_target_rows_per_fragment: usize,
 
-    /// Whether to materialize deletions during compaction. Defaults to true.
+    /// Default whether to materialize deletions during compaction.
     pub compaction_materialize_deletions: bool,
 
-    /// Fraction of deleted rows that triggers deletion materialization (0.0–1.0).
-    /// Defaults to 0.1 (10%).
+    /// Default deletion threshold for compaction.
     pub compaction_deletion_threshold: f32,
 
-    /// Minimum number of fragments before compaction is considered worthwhile.
-    /// Defaults to 4.
+    /// Default minimum fragments before compaction.
     pub compaction_min_fragments: usize,
 }
 
@@ -195,7 +200,7 @@ impl BisqueLanceConfig {
         self
     }
 
-    /// Build Lance `CompactionOptions` from this config.
+    /// Build Lance `CompactionOptions` from default config.
     pub fn compaction_options(&self) -> CompactionOptions {
         CompactionOptions {
             target_rows_per_fragment: self.compaction_target_rows_per_fragment,
@@ -205,18 +210,112 @@ impl BisqueLanceConfig {
         }
     }
 
-    /// Path to the segments directory.
-    pub fn segments_dir(&self) -> PathBuf {
-        self.local_data_dir.join("segments")
+    /// Whether S3 deep storage is configured.
+    pub fn has_s3(&self) -> bool {
+        self.s3_uri.is_some()
     }
 
-    /// Path to a specific segment's Lance dataset.
+    // =========================================================================
+    // Table path helpers
+    // =========================================================================
+
+    /// Path to a table's data directory.
+    pub fn table_data_dir(&self, table_name: &str) -> PathBuf {
+        self.local_data_dir.join("tables").join(table_name)
+    }
+
+    /// Build a [`TableOpenConfig`] for a table using this engine's defaults.
+    pub fn build_table_config(
+        &self,
+        name: &str,
+        schema: arrow_schema::SchemaRef,
+    ) -> TableOpenConfig {
+        TableOpenConfig {
+            name: name.to_string(),
+            table_data_dir: self.table_data_dir(name),
+            schema: Some(schema),
+            seal_indices: self.seal_indices.clone(),
+            s3_uri: self.s3_uri.clone(),
+            s3_storage_options: self.s3_storage_options.clone(),
+            s3_max_rows_per_file: self.s3_max_rows_per_file,
+            s3_max_rows_per_group: self.s3_max_rows_per_group,
+            seal_max_age: self.seal_max_age,
+            seal_max_size: self.seal_max_size,
+            compaction_target_rows_per_fragment: self.compaction_target_rows_per_fragment,
+            compaction_materialize_deletions: self.compaction_materialize_deletions,
+            compaction_deletion_threshold: self.compaction_deletion_threshold,
+            compaction_min_fragments: self.compaction_min_fragments,
+        }
+    }
+
+    /// Build a [`TableOpenConfig`] for a table with custom S3 URI.
+    pub fn build_table_config_with_s3(
+        &self,
+        name: &str,
+        schema: arrow_schema::SchemaRef,
+        s3_uri: impl Into<String>,
+    ) -> TableOpenConfig {
+        let mut config = self.build_table_config(name, schema);
+        config.s3_uri = Some(s3_uri.into());
+        config
+    }
+}
+
+/// Per-table configuration for opening a table within a BisqueLance engine.
+pub struct TableOpenConfig {
+    /// Table name.
+    pub name: String,
+    /// Resolved path to this table's data directory (e.g., `{data_dir}/tables/{name}`).
+    pub table_data_dir: PathBuf,
+    /// Arrow schema for this table. If None, inferred from first write.
+    pub schema: Option<arrow_schema::SchemaRef>,
+    /// Indices to create on sealed segments for this table.
+    pub seal_indices: Vec<IndexSpec>,
+    /// S3 URI for deep storage of this table. If None, S3 disabled for this table.
+    pub s3_uri: Option<String>,
+    /// S3 storage options (credentials, region, endpoint).
+    pub s3_storage_options: HashMap<String, String>,
+    /// Max rows per file for S3 writes.
+    pub s3_max_rows_per_file: usize,
+    /// Max rows per row group for S3 writes.
+    pub s3_max_rows_per_group: usize,
+    /// Max age before sealing active segment.
+    pub seal_max_age: Duration,
+    /// Max size in bytes before sealing active segment.
+    pub seal_max_size: u64,
+    /// Target rows per fragment for compaction.
+    pub compaction_target_rows_per_fragment: usize,
+    /// Whether to materialize deletions during compaction.
+    pub compaction_materialize_deletions: bool,
+    /// Deletion threshold for compaction.
+    pub compaction_deletion_threshold: f32,
+    /// Minimum fragments before compaction runs.
+    pub compaction_min_fragments: usize,
+}
+
+impl TableOpenConfig {
+    /// Path to this table's segments directory.
+    pub fn segments_dir(&self) -> PathBuf {
+        self.table_data_dir.join("segments")
+    }
+
+    /// Path to a specific segment's Lance dataset within this table.
     pub fn segment_path(&self, segment_id: u64) -> PathBuf {
         self.segments_dir().join(format!("{}.lance", segment_id))
     }
 
-    /// Whether S3 deep storage is configured.
+    /// Whether S3 deep storage is configured for this table.
     pub fn has_s3(&self) -> bool {
         self.s3_uri.is_some()
+    }
+
+    /// Build Lance `CompactionOptions` from this table's config.
+    pub fn compaction_options(&self) -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: self.compaction_target_rows_per_fragment,
+            materialize_deletions: self.compaction_materialize_deletions,
+            materialize_deletions_threshold: self.compaction_deletion_threshold,
+            ..Default::default()
+        }
     }
 }

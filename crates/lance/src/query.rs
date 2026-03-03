@@ -1,7 +1,7 @@
 //! DataFusion table provider for bisque-lance.
 //!
 //! `BisqueLanceTableProvider` implements DataFusion's `TableProvider` trait,
-//! presenting a unified query view across all three storage tiers:
+//! presenting a unified query view across all three storage tiers of a single table:
 //!
 //! ```text
 //! UNION ALL(active_segment, sealed_segment, s3_deep_storage)
@@ -24,42 +24,37 @@ use datafusion_physical_plan::union::UnionExec;
 use lance::dataset::scanner::Scanner;
 use lance::Dataset;
 
-use crate::engine::BisqueLance;
+use crate::table_engine::TableEngine;
 
-/// DataFusion table provider that presents a unified view across all storage tiers.
+/// DataFusion table provider for a single bisque-lance table.
 ///
-/// Query planning always produces a `UnionExec` over whichever tiers are present:
+/// Wraps a [`TableEngine`] and produces a `UnionExec` over whichever tiers are present:
 /// - Active segment (local NVMe, read-write)
 /// - Sealed segment (local NVMe, read-only)
 /// - S3 deep storage (remote)
-///
-/// Filter pushdown, projection pushdown, and limit pushdown are all delegated
-/// to Lance's native `Scanner::create_plan()`.
 pub struct BisqueLanceTableProvider {
-    engine: Arc<BisqueLance>,
+    table: Arc<TableEngine>,
     schema: SchemaRef,
 }
 
 impl std::fmt::Debug for BisqueLanceTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BisqueLanceTableProvider")
+            .field("table", &self.table.name())
             .field("schema", &self.schema)
             .finish()
     }
 }
 
 impl BisqueLanceTableProvider {
-    /// Create a table provider from a BisqueLance engine.
-    ///
-    /// The schema must be provided (typically from the engine's config or the
-    /// active dataset's schema).
-    pub fn new(engine: Arc<BisqueLance>, schema: SchemaRef) -> Self {
-        Self { engine, schema }
+    /// Create a table provider for a single table.
+    pub fn new(table: Arc<TableEngine>, schema: SchemaRef) -> Self {
+        Self { table, schema }
     }
 
-    /// Get the underlying engine.
-    pub fn engine(&self) -> &Arc<BisqueLance> {
-        &self.engine
+    /// Get the underlying table engine.
+    pub fn table(&self) -> &Arc<TableEngine> {
+        &self.table
     }
 }
 
@@ -87,26 +82,26 @@ impl TableProvider for BisqueLanceTableProvider {
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(3);
 
         // 1. Active segment
-        if let Some(ds) = self.engine.active_dataset_snapshot().await {
+        if let Some(ds) = self.table.active_dataset_snapshot().await {
             let plan = build_scan_plan(&ds, &self.schema, projection, filters, limit).await?;
             plans.push(plan);
         }
 
         // 2. Sealed segment
-        if let Some(ds) = self.engine.sealed_dataset_snapshot().await {
+        if let Some(ds) = self.table.sealed_dataset_snapshot().await {
             let plan = build_scan_plan(&ds, &self.schema, projection, filters, limit).await?;
             plans.push(plan);
         }
 
         // 3. S3 deep storage
-        if let Some(ds) = self.engine.s3_dataset_snapshot().await {
+        if let Some(ds) = self.table.s3_dataset_snapshot().await {
             let plan = build_scan_plan(&ds, &self.schema, projection, filters, limit).await?;
             plans.push(plan);
         }
 
         if plans.is_empty() {
             // No datasets available — return an empty plan
-            let empty_ds = self.engine.active_dataset_snapshot().await;
+            let empty_ds = self.table.active_dataset_snapshot().await;
             match empty_ds {
                 Some(ds) => {
                     let mut scan = ds.scan();
@@ -129,7 +124,6 @@ impl TableProvider for BisqueLanceTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
-        // Lance handles filter pushdown natively (FTS, scalar, vector).
         Ok(filters
             .iter()
             .map(|_| TableProviderFilterPushDown::Inexact)
@@ -138,8 +132,6 @@ impl TableProvider for BisqueLanceTableProvider {
 }
 
 /// Build a DataFusion `ExecutionPlan` for a single Lance dataset.
-///
-/// Applies projection, filter, and limit pushdown via Lance's `Scanner`.
 async fn build_scan_plan(
     dataset: &Dataset,
     schema: &SchemaRef,

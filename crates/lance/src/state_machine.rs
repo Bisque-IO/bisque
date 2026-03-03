@@ -1,7 +1,8 @@
 //! Raft state machine implementation for bisque-lance.
 //!
 //! `LanceStateMachine` implements openraft's `RaftStateMachine` trait,
-//! dispatching applied log entries to the `BisqueLance` storage engine.
+//! dispatching applied log entries to the appropriate `TableEngine` within
+//! the multi-table `BisqueLance` engine.
 
 use std::io::{self, Cursor};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use crate::ipc;
 use crate::types::{LanceCommand, LanceResponse, SnapshotData};
 use crate::LanceTypeConfig;
 
-/// Raft state machine that drives the BisqueLance storage engine.
+/// Raft state machine that drives the BisqueLance multi-table storage engine.
 pub struct LanceStateMachine {
     engine: Arc<BisqueLance>,
     last_applied: Option<LogId<LanceTypeConfig>>,
@@ -87,8 +88,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         LanceSnapshotBuilder {
-            catalog: self.engine.catalog(),
-            flush_state: self.engine.flush_state(),
+            table_snapshots: self.engine.table_snapshots(),
             last_applied: self.last_applied.clone(),
             last_membership: self.last_membership.clone(),
         }
@@ -109,16 +109,44 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
 
         info!(
             ?meta.last_log_id,
-            active_segment = data.catalog.active_segment,
-            sealed_segment = ?data.catalog.sealed_segment,
+            tables = data.tables.len(),
             "Installing snapshot"
         );
 
-        // Rebuild engine state from snapshot catalog.
-        // The actual Lance datasets will be rebuilt from Raft log replay
-        // starting from the snapshot point.
-        // For now we just update the metadata — a full implementation would
-        // re-open datasets from the snapshot catalog state.
+        // Shut down existing tables, then restore from snapshot.
+        if let Err(e) = self.engine.shutdown().await {
+            warn!("Error shutting down engine during snapshot install: {}", e);
+        }
+
+        for (table_name, table_snapshot) in &data.tables {
+            let schema = if let Some(latest) = table_snapshot.schema_history.last() {
+                match ipc::schema_from_ipc(&latest.schema_ipc) {
+                    Ok(s) => Some(Arc::new(s)),
+                    Err(e) => {
+                        warn!(table = %table_name, "Failed to decode schema from snapshot: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mut config = self.engine.config().build_table_config(
+                table_name,
+                schema.unwrap_or_else(|| {
+                    use arrow_schema::{DataType, Field, Schema};
+                    Arc::new(Schema::new(vec![Field::new("_placeholder", DataType::Null, true)]))
+                }),
+            );
+
+            if !table_snapshot.catalog.s3_dataset_uri.is_empty() {
+                config.s3_uri = Some(table_snapshot.catalog.s3_dataset_uri.clone());
+            }
+
+            if let Err(e) = self.engine.restore_table(config, table_snapshot).await {
+                error!(table = %table_name, "Failed to restore table from snapshot: {}", e);
+            }
+        }
 
         self.last_applied = meta.last_log_id.clone();
         self.last_membership = meta.last_membership.clone();
@@ -129,7 +157,6 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<LanceTypeConfig>>, io::Error> {
-        // Build a snapshot on-demand from current state
         let mut builder = self.get_snapshot_builder().await;
         match builder.build_snapshot().await {
             Ok(snap) => Ok(Some(snap)),
@@ -146,73 +173,133 @@ impl LanceStateMachine {
         debug!(%cmd, "Applying command");
 
         match cmd {
-            LanceCommand::AppendRecords { data } => {
+            LanceCommand::CreateTable { table_name, schema_ipc } => {
+                match ipc::schema_from_ipc(&schema_ipc) {
+                    Ok(schema) => {
+                        let config = self.engine.config().build_table_config(
+                            &table_name,
+                            Arc::new(schema),
+                        );
+                        match self.engine.create_table(config, None).await {
+                            Ok(_) => LanceResponse::Ok,
+                            Err(e) => {
+                                error!(table = %table_name, "create_table failed: {}", e);
+                                LanceResponse::Error(e.to_string())
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(table = %table_name, "Failed to decode schema IPC: {}", e);
+                        LanceResponse::Error(e.to_string())
+                    }
+                }
+            }
+
+            LanceCommand::DropTable { table_name } => {
+                match self.engine.drop_table(&table_name).await {
+                    Ok(()) => LanceResponse::Ok,
+                    Err(e) => {
+                        error!(table = %table_name, "drop_table failed: {}", e);
+                        LanceResponse::Error(e.to_string())
+                    }
+                }
+            }
+
+            LanceCommand::AppendRecords { table_name, data } => {
+                let table = match self.engine.require_table(&table_name) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(table = %table_name, "Table not found: {}", e);
+                        return LanceResponse::Error(e.to_string());
+                    }
+                };
                 match ipc::decode_record_batches(&data) {
-                    Ok(batches) => match self.engine.apply_append(batches).await {
+                    Ok(batches) => match table.apply_append(batches).await {
                         Ok(()) => LanceResponse::Ok,
                         Err(e) => {
-                            error!("apply_append failed: {}", e);
+                            error!(table = %table_name, "apply_append failed: {}", e);
                             LanceResponse::Error(e.to_string())
                         }
                     },
                     Err(e) => {
-                        error!("Failed to decode IPC data: {}", e);
+                        error!(table = %table_name, "Failed to decode IPC data: {}", e);
                         LanceResponse::Error(e.to_string())
                     }
                 }
             }
+
             LanceCommand::SealActiveSegment {
+                table_name,
                 sealed_segment_id,
                 new_active_segment_id,
                 reason,
             } => {
-                match self
-                    .engine
+                let table = match self.engine.require_table(&table_name) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(table = %table_name, "Table not found: {}", e);
+                        return LanceResponse::Error(e.to_string());
+                    }
+                };
+                match table
                     .apply_seal(sealed_segment_id, new_active_segment_id, reason)
                     .await
                 {
                     Ok(()) => {
-                        // Compact the sealed segment first — merge small fragments
-                        if let Err(e) = self.engine.compact_sealed().await {
-                            warn!("Sealed segment compaction failed: {}", e);
-                            // Non-fatal: compaction is an optimization
+                        if let Err(e) = table.compact_sealed().await {
+                            warn!(table = %table_name, "Sealed segment compaction failed: {}", e);
                         }
-
-                        // Build indices on the compacted sealed segment
-                        if let Err(e) = self.engine.create_seal_indices().await {
-                            warn!("Index creation on sealed segment failed: {}", e);
-                            // Non-fatal: indices are an optimization
+                        if let Err(e) = table.create_seal_indices().await {
+                            warn!(table = %table_name, "Index creation on sealed segment failed: {}", e);
                         }
                         LanceResponse::Ok
                     }
                     Err(e) => {
-                        error!("apply_seal failed: {}", e);
+                        error!(table = %table_name, "apply_seal failed: {}", e);
                         LanceResponse::Error(e.to_string())
                     }
                 }
             }
-            LanceCommand::BeginFlush { segment_id } => {
-                self.engine.apply_begin_flush(segment_id);
+
+            LanceCommand::BeginFlush { table_name, segment_id } => {
+                let table = match self.engine.require_table(&table_name) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(table = %table_name, "Table not found: {}", e);
+                        return LanceResponse::Error(e.to_string());
+                    }
+                };
+                table.apply_begin_flush(segment_id);
                 LanceResponse::Ok
             }
+
             LanceCommand::PromoteToDeepStorage {
+                table_name,
                 segment_id,
                 s3_manifest_version,
-            } => match self.engine.apply_promote(segment_id, s3_manifest_version).await {
-                Ok(()) => LanceResponse::Ok,
-                Err(e) => {
-                    error!("apply_promote failed: {}", e);
-                    LanceResponse::Error(e.to_string())
+            } => {
+                let table = match self.engine.require_table(&table_name) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(table = %table_name, "Table not found: {}", e);
+                        return LanceResponse::Error(e.to_string());
+                    }
+                };
+                match table.apply_promote(segment_id, s3_manifest_version).await {
+                    Ok(()) => LanceResponse::Ok,
+                    Err(e) => {
+                        error!(table = %table_name, "apply_promote failed: {}", e);
+                        LanceResponse::Error(e.to_string())
+                    }
                 }
-            },
+            }
         }
     }
 }
 
-/// Builds snapshots from the current engine state.
+/// Builds snapshots from the current multi-table engine state.
 pub struct LanceSnapshotBuilder {
-    catalog: crate::types::SegmentCatalog,
-    flush_state: crate::types::FlushState,
+    table_snapshots: std::collections::HashMap<String, crate::types::TableSnapshot>,
     last_applied: Option<LogId<LanceTypeConfig>>,
     last_membership: StoredMembership<LanceTypeConfig>,
 }
@@ -220,8 +307,7 @@ pub struct LanceSnapshotBuilder {
 impl RaftSnapshotBuilder<LanceTypeConfig> for LanceSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<LanceTypeConfig>, io::Error> {
         let data = SnapshotData {
-            catalog: self.catalog.clone(),
-            flush_state: self.flush_state.clone(),
+            tables: self.table_snapshots.clone(),
         };
 
         let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard())

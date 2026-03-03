@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 /// Unique identifier for a segment. Monotonically increasing.
@@ -22,7 +23,7 @@ impl fmt::Display for SealReason {
     }
 }
 
-/// Tracks which segments are active, sealed, and the S3 deep storage version.
+/// Tracks which segments are active, sealed, and the S3 deep storage version for a single table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentCatalog {
     /// Currently active segment accepting writes.
@@ -71,27 +72,44 @@ impl Default for FlushState {
 /// Raft log entry command type for bisque-lance.
 ///
 /// Each variant is replicated via Raft and applied to all nodes' state machines.
-/// `AppendRecords` carries Arrow IPC-encoded bytes to avoid custom Arrow serde.
+/// All variants include a `table_name` for multi-table routing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LanceCommand {
+    /// Create a new table with the given schema (Arrow IPC-encoded).
+    CreateTable {
+        table_name: String,
+        schema_ipc: Vec<u8>,
+    },
+
+    /// Drop a table and remove all its data.
+    DropTable { table_name: String },
+
     /// Replicate raw data to all nodes.
     /// Every node appends this data to its local active Lance dataset.
     /// `data` contains Arrow IPC-encoded RecordBatches.
-    AppendRecords { data: Vec<u8> },
+    AppendRecords {
+        table_name: String,
+        data: Vec<u8>,
+    },
 
     /// Seal the current active segment and create a new one.
     SealActiveSegment {
+        table_name: String,
         sealed_segment_id: SegmentId,
         new_active_segment_id: SegmentId,
         reason: SealReason,
     },
 
     /// Mark the start of a flush operation (leader only writes to S3).
-    BeginFlush { segment_id: SegmentId },
+    BeginFlush {
+        table_name: String,
+        segment_id: SegmentId,
+    },
 
     /// Promote sealed segment data to S3 deep storage.
     /// Applied after successful S3 manifest commit.
     PromoteToDeepStorage {
+        table_name: String,
         segment_id: SegmentId,
         s3_manifest_version: u64,
     },
@@ -100,28 +118,36 @@ pub enum LanceCommand {
 impl fmt::Display for LanceCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LanceCommand::AppendRecords { data } => {
-                write!(f, "AppendRecords({} bytes)", data.len())
+            LanceCommand::CreateTable { table_name, schema_ipc } => {
+                write!(f, "CreateTable(table={}, schema={} bytes)", table_name, schema_ipc.len())
+            }
+            LanceCommand::DropTable { table_name } => {
+                write!(f, "DropTable(table={})", table_name)
+            }
+            LanceCommand::AppendRecords { table_name, data } => {
+                write!(f, "AppendRecords(table={}, {} bytes)", table_name, data.len())
             }
             LanceCommand::SealActiveSegment {
+                table_name,
                 sealed_segment_id,
                 new_active_segment_id,
                 reason,
             } => write!(
                 f,
-                "SealActiveSegment(sealed={}, new={}, reason={})",
-                sealed_segment_id, new_active_segment_id, reason
+                "SealActiveSegment(table={}, sealed={}, new={}, reason={})",
+                table_name, sealed_segment_id, new_active_segment_id, reason
             ),
-            LanceCommand::BeginFlush { segment_id } => {
-                write!(f, "BeginFlush(segment={})", segment_id)
+            LanceCommand::BeginFlush { table_name, segment_id } => {
+                write!(f, "BeginFlush(table={}, segment={})", table_name, segment_id)
             }
             LanceCommand::PromoteToDeepStorage {
+                table_name,
                 segment_id,
                 s3_manifest_version,
             } => write!(
                 f,
-                "PromoteToDeepStorage(segment={}, version={})",
-                segment_id, s3_manifest_version
+                "PromoteToDeepStorage(table={}, segment={}, version={})",
+                table_name, segment_id, s3_manifest_version
             ),
         }
     }
@@ -151,6 +177,8 @@ impl fmt::Display for LanceResponse {
 /// a `PromoteToDeepStorage` Raft entry on success.
 #[derive(Debug, Clone)]
 pub struct FlushHandle {
+    /// The table this flush belongs to.
+    pub table_name: String,
     /// The segment being flushed.
     pub segment_id: SegmentId,
     /// Timestamp when flush began (millis since epoch).
@@ -181,10 +209,28 @@ pub struct CompactionStats {
     pub files_added: u64,
 }
 
-/// Snapshot payload for the state machine.
-/// Contains only metadata — actual data lives in Lance datasets.
+/// A recorded schema version for schema evolution tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotData {
+pub struct SchemaVersion {
+    /// Monotonically increasing version number (1-based).
+    pub version: u64,
+    /// Arrow IPC-encoded schema bytes.
+    pub schema_ipc: Vec<u8>,
+    /// When this schema version was recorded (millis since epoch).
+    pub created_at_millis: i64,
+}
+
+/// Per-table snapshot data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableSnapshot {
     pub catalog: SegmentCatalog,
     pub flush_state: FlushState,
+    pub schema_history: Vec<SchemaVersion>,
+}
+
+/// Snapshot payload for the state machine.
+/// Contains metadata for all tables — actual data lives in Lance datasets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotData {
+    pub tables: HashMap<String, TableSnapshot>,
 }

@@ -140,11 +140,14 @@ async fn run_bench(
     let data_dir = temp_dir.path().join("bench-data");
 
     let config = BisqueLanceConfig::new(&data_dir)
-        .with_schema(schema.clone())
         .with_seal_max_age(Duration::from_secs(86400))
         .with_seal_max_size(u64::MAX);
 
-    let engine = Arc::new(BisqueLance::open(config, None).await?);
+    let engine = Arc::new(BisqueLance::open(config).await?);
+
+    // Create bench table
+    let table_config = engine.config().build_table_config("bench", schema.clone());
+    let table = engine.create_table(table_config, None).await?;
 
     let num_appends = total_rows / batch_size;
     let actual_total = num_appends * batch_size;
@@ -157,20 +160,22 @@ async fn run_bench(
     // Warmup: 3 appends (or fewer if num_appends is small)
     let warmup_count = num_appends.min(3);
     for batch in batches.iter().take(warmup_count) {
-        engine.apply_append(vec![batch.clone()]).await?;
+        table.apply_append(vec![batch.clone()]).await?;
     }
 
     // Re-open with a fresh engine so warmup fragments don't affect measurement
     engine.shutdown().await?;
     drop(engine);
+    drop(table);
     tokio::fs::remove_dir_all(&data_dir).await?;
 
     let config = BisqueLanceConfig::new(&data_dir)
-        .with_schema(schema.clone())
         .with_seal_max_age(Duration::from_secs(86400))
         .with_seal_max_size(u64::MAX);
 
-    let engine = Arc::new(BisqueLance::open(config, None).await?);
+    let engine = Arc::new(BisqueLance::open(config).await?);
+    let table_config = engine.config().build_table_config("bench", schema.clone());
+    let table = engine.create_table(table_config, None).await?;
 
     // Timed run
     let mut latencies = Vec::with_capacity(num_appends);
@@ -178,7 +183,7 @@ async fn run_bench(
 
     for batch in &batches {
         let lap = Instant::now();
-        engine.apply_append(vec![batch.clone()]).await?;
+        table.apply_append(vec![batch.clone()]).await?;
         latencies.push(lap.elapsed());
     }
 
