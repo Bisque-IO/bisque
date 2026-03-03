@@ -47,6 +47,7 @@ anyerror = "0.1"
 anyhow = "1"
 arrow = { version = "57", default-features = false }
 arrow-array = { version = "57", default-features = false }
+arrow-flight = { version = "57", default-features = false, features = ["flight-sql-experimental"] }
 arrow-ipc = { version = "57", default-features = false }
 arrow-schema = { version = "57", default-features = false }
 arc-swap = "1.7"
@@ -138,6 +139,8 @@ syn = "2"
 tempfile = "3.10"
 thiserror = "2.0"
 tokio = { version = "1", default-features = false }
+tokio-stream = "0.1"
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "router"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
 tokio-test = "0.4"
 tokio-util = "0.7"

@@ -30,12 +30,17 @@ datafusion-common = { workspace = true }
 # Arrow in-memory format
 arrow = { workspace = true, features = ["ipc"] }
 arrow-array = { workspace = true }
+arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true }
 futures = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

@@ -15,7 +15,7 @@ use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicyBuilder, RemovalStats};
 use lance::dataset::optimize::{
-    commit_compaction, plan_compaction, CompactionMetrics, IgnoreRemap, RewriteResult,
+    CompactionMetrics, IgnoreRemap, RewriteResult, commit_compaction, plan_compaction,
 };
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
@@ -28,7 +28,7 @@ use crate::config::TableOpenConfig;
 use crate::error::{Error, Result};
 use crate::ipc;
 use crate::types::{
-    CleanupStats, CompactionStats, FlushHandle, FlushState, SealReason, SchemaVersion,
+    CleanupStats, CompactionStats, FlushHandle, FlushState, SchemaVersion, SealReason,
     SegmentCatalog, SegmentId,
 };
 
@@ -114,10 +114,7 @@ impl TableEngine {
             None
         };
 
-        let active_rows = active_dataset
-            .count_rows(None)
-            .await
-            .unwrap_or(0) as u64;
+        let active_rows = active_dataset.count_rows(None).await.unwrap_or(0) as u64;
 
         // Initialize schema history
         let schema_history = schema_history.unwrap_or_else(|| {
@@ -195,14 +192,14 @@ impl TableEngine {
         self.maybe_record_schema_change(&batches[0].schema());
 
         let schema = batches[0].schema();
-        let reader = arrow::record_batch::RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            schema,
-        );
+        let reader =
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
 
         // Serialize writers; clone dataset under brief read lock, then I/O with no lock.
         let _guard = self.active_write.lock().await;
-        let mut ds = self.active_dataset.read()
+        let mut ds = self
+            .active_dataset
+            .read()
             .clone()
             .ok_or_else(|| Error::InvalidState("no active dataset".into()))?;
 
@@ -239,7 +236,9 @@ impl TableEngine {
         let _sealed_guard = self.sealed_write.lock().await;
 
         // Clone the current active dataset (readers still see it)
-        let old_active = self.active_dataset.read()
+        let old_active = self
+            .active_dataset
+            .read()
             .clone()
             .ok_or_else(|| Error::InvalidState("no active dataset to seal".into()))?;
 
@@ -409,11 +408,7 @@ impl TableEngine {
     ///
     /// Returns the new S3 manifest version on success.
     pub async fn execute_flush(&self, handle: &FlushHandle) -> Result<u64> {
-        let s3_uri = self
-            .config
-            .s3_uri
-            .as_ref()
-            .ok_or(Error::S3NotConfigured)?;
+        let s3_uri = self.config.s3_uri.as_ref().ok_or(Error::S3NotConfigured)?;
 
         info!(
             table = %self.name,
@@ -424,7 +419,9 @@ impl TableEngine {
 
         // Read all data from the sealed segment
         let batches = {
-            let ds = self.sealed_dataset.read()
+            let ds = self
+                .sealed_dataset
+                .read()
                 .clone()
                 .ok_or_else(|| Error::InvalidState("no sealed dataset for flush".into()))?;
 
@@ -461,10 +458,8 @@ impl TableEngine {
         };
 
         let schema = batches[0].schema();
-        let reader = arrow::record_batch::RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            schema,
-        );
+        let reader =
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
 
         // Serialize S3 writes; clone dataset, do I/O, swap back
         let _guard = self.s3_write.lock().await;
@@ -647,17 +642,13 @@ impl TableEngine {
         }
 
         let _guard = self.active_write.lock().await;
-        let mut ds = self.active_dataset.read()
-            .clone()
-            .ok_or_else(|| Error::InvalidState("no active dataset for compaction commit".into()))?;
+        let mut ds =
+            self.active_dataset.read().clone().ok_or_else(|| {
+                Error::InvalidState("no active dataset for compaction commit".into())
+            })?;
 
-        let metrics = commit_compaction(
-            &mut ds,
-            results,
-            Arc::new(IgnoreRemap::default()),
-            &options,
-        )
-        .await?;
+        let metrics =
+            commit_compaction(&mut ds, results, Arc::new(IgnoreRemap::default()), &options).await?;
 
         *self.active_dataset.write() = Some(ds);
 
@@ -704,17 +695,13 @@ impl TableEngine {
         }
 
         let _guard = self.sealed_write.lock().await;
-        let mut ds = self.sealed_dataset.read()
-            .clone()
-            .ok_or_else(|| Error::InvalidState("no sealed dataset for compaction commit".into()))?;
+        let mut ds =
+            self.sealed_dataset.read().clone().ok_or_else(|| {
+                Error::InvalidState("no sealed dataset for compaction commit".into())
+            })?;
 
-        let metrics = commit_compaction(
-            &mut ds,
-            results,
-            Arc::new(IgnoreRemap::default()),
-            &options,
-        )
-        .await?;
+        let metrics =
+            commit_compaction(&mut ds, results, Arc::new(IgnoreRemap::default()), &options).await?;
 
         *self.sealed_dataset.write() = Some(ds);
 
@@ -770,17 +757,14 @@ impl TableEngine {
         }
 
         let _guard = self.s3_write.lock().await;
-        let mut ds = self.s3_dataset.read()
+        let mut ds = self
+            .s3_dataset
+            .read()
             .clone()
             .ok_or_else(|| Error::InvalidState("no S3 dataset for compaction commit".into()))?;
 
-        let metrics = commit_compaction(
-            &mut ds,
-            results,
-            Arc::new(IgnoreRemap::default()),
-            &options,
-        )
-        .await?;
+        let metrics =
+            commit_compaction(&mut ds, results, Arc::new(IgnoreRemap::default()), &options).await?;
 
         // Update catalog with new S3 version
         let new_version = ds.version().version;
@@ -841,9 +825,7 @@ impl TableEngine {
     /// Get the next segment ID (one past the highest known segment).
     pub fn next_segment_id(&self) -> SegmentId {
         let cat = self.catalog.read();
-        let max = cat
-            .active_segment
-            .max(cat.sealed_segment.unwrap_or(0));
+        let max = cat.active_segment.max(cat.sealed_segment.unwrap_or(0));
         max + 1
     }
 
@@ -870,9 +852,9 @@ impl TableEngine {
     /// Get the schema from the active dataset.
     pub async fn schema(&self) -> Option<arrow_schema::SchemaRef> {
         let guard = self.active_dataset.read();
-        guard.as_ref().map(|ds| {
-            Arc::new(arrow_schema::Schema::from(ds.schema()))
-        })
+        guard
+            .as_ref()
+            .map(|ds| Arc::new(arrow_schema::Schema::from(ds.schema())))
     }
 
     // =========================================================================
@@ -944,17 +926,14 @@ async fn open_or_create_segment(path: &Path, config: &TableOpenConfig) -> Result
     } else {
         debug!(?path, "Creating new empty segment");
 
-        let schema = config
-            .schema
-            .clone()
-            .unwrap_or_else(|| {
-                use arrow_schema::{DataType, Field, Schema};
-                std::sync::Arc::new(Schema::new(vec![Field::new(
-                    "_placeholder",
-                    DataType::Null,
-                    true,
-                )]))
-            });
+        let schema = config.schema.clone().unwrap_or_else(|| {
+            use arrow_schema::{DataType, Field, Schema};
+            std::sync::Arc::new(Schema::new(vec![Field::new(
+                "_placeholder",
+                DataType::Null,
+                true,
+            )]))
+        });
 
         let reader = arrow::record_batch::RecordBatchIterator::new(
             std::iter::empty::<std::result::Result<RecordBatch, arrow::error::ArrowError>>(),
@@ -969,12 +948,12 @@ async fn open_or_create_segment(path: &Path, config: &TableOpenConfig) -> Result
 /// Return default index params for a given `IndexType`.
 fn index_params_for_type(index_type: IndexType) -> Box<dyn IndexParams> {
     match index_type {
-        IndexType::Inverted | IndexType::NGram => {
-            Box::new(InvertedIndexParams::default())
-        }
-        IndexType::BTree | IndexType::Scalar | IndexType::Bitmap | IndexType::LabelList => {
-            Box::new(ScalarIndexParams::default())
-        }
+        IndexType::Inverted | IndexType::NGram => Box::new(InvertedIndexParams::default()),
+        IndexType::BTree
+        | IndexType::RTree
+        | IndexType::Scalar
+        | IndexType::Bitmap
+        | IndexType::LabelList => Box::new(ScalarIndexParams::default()),
         IndexType::IvfFlat
         | IndexType::IvfSq
         | IndexType::IvfPq
@@ -994,9 +973,7 @@ fn index_params_for_type(index_type: IndexType) -> Box<dyn IndexParams> {
                 sq,
             ))
         }
-        _ => {
-            Box::new(ScalarIndexParams::default())
-        }
+        _ => Box::new(ScalarIndexParams::default()),
     }
 }
 
@@ -1032,10 +1009,7 @@ impl CompactionStats {
 
 /// Open an S3 dataset using the configured URI and storage options.
 async fn open_s3_dataset(config: &TableOpenConfig) -> Result<Dataset> {
-    let s3_uri = config
-        .s3_uri
-        .as_ref()
-        .ok_or(Error::S3NotConfigured)?;
+    let s3_uri = config.s3_uri.as_ref().ok_or(Error::S3NotConfigured)?;
 
     let ds = if !config.s3_storage_options.is_empty() {
         DatasetBuilder::from_uri(s3_uri)
