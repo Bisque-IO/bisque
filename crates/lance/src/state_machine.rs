@@ -172,7 +172,13 @@ impl LanceStateMachine {
                     .await
                 {
                     Ok(()) => {
-                        // Build indices on the newly sealed segment (non-blocking for Raft)
+                        // Compact the sealed segment first — merge small fragments
+                        if let Err(e) = self.engine.compact_sealed().await {
+                            warn!("Sealed segment compaction failed: {}", e);
+                            // Non-fatal: compaction is an optimization
+                        }
+
+                        // Build indices on the compacted sealed segment
                         if let Err(e) = self.engine.create_seal_indices().await {
                             warn!("Index creation on sealed segment failed: {}", e);
                             // Non-fatal: indices are an optimization

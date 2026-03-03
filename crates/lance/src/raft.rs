@@ -36,6 +36,8 @@ pub struct LanceRaftNode {
     seal_check_interval: Duration,
     /// Interval between flush attempts when a sealed segment is pending.
     flush_check_interval: Duration,
+    /// Interval between compaction checks for active and S3 tiers.
+    compaction_check_interval: Duration,
     /// Notify handle to trigger shutdown of background tasks.
     shutdown: Arc<Notify>,
     /// Background task handles.
@@ -57,6 +59,7 @@ impl LanceRaftNode {
             node_id,
             seal_check_interval: Duration::from_secs(5),
             flush_check_interval: Duration::from_secs(10),
+            compaction_check_interval: Duration::from_secs(60),
             shutdown: Arc::new(Notify::new()),
             task_handles: parking_lot::Mutex::new(Vec::new()),
         }
@@ -71,6 +74,12 @@ impl LanceRaftNode {
     /// Set the interval for flush checks.
     pub fn with_flush_check_interval(mut self, interval: Duration) -> Self {
         self.flush_check_interval = interval;
+        self
+    }
+
+    /// Set the interval for compaction checks.
+    pub fn with_compaction_check_interval(mut self, interval: Duration) -> Self {
+        self.compaction_check_interval = interval;
         self
     }
 
@@ -101,6 +110,15 @@ impl LanceRaftNode {
             self.engine.clone(),
             self.node_id,
             self.flush_check_interval,
+            self.shutdown.clone(),
+        )));
+
+        // 4. Compaction loop
+        handles.push(tokio::spawn(compaction_loop(
+            self.raft.clone(),
+            self.engine.clone(),
+            self.node_id,
+            self.compaction_check_interval,
             self.shutdown.clone(),
         )));
 
@@ -407,6 +425,68 @@ async fn flush_orchestrator(
                 s3_version,
                 "Flush pipeline completed successfully"
             );
+        }
+    }
+}
+
+/// Periodic compaction of active and S3 tiers.
+///
+/// **Leader only.** Merges small fragments for better read performance:
+/// - Active segment: merges append fragments accumulated since last compaction
+/// - S3 deep storage: merges fragments from multiple flushes, cleans old versions
+async fn compaction_loop(
+    raft: Raft<LanceTypeConfig>,
+    engine: Arc<BisqueLance>,
+    node_id: u64,
+    interval: Duration,
+    shutdown: Arc<Notify>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.notified() => {
+                debug!("Compaction loop shutting down");
+                return;
+            }
+        }
+
+        if !is_leader(&raft, node_id) {
+            continue;
+        }
+
+        // Active tier compaction
+        match engine.compact_active().await {
+            Ok(stats) if stats.fragments_removed > 0 => {
+                info!(
+                    fragments_removed = stats.fragments_removed,
+                    fragments_added = stats.fragments_added,
+                    "Active segment compaction completed"
+                );
+            }
+            Err(e) => {
+                warn!("Active segment compaction failed: {}", e);
+            }
+            _ => {} // No compaction needed
+        }
+
+        // S3 tier compaction
+        if engine.config().has_s3() && !engine.is_flush_in_progress() {
+            match engine.compact_s3().await {
+                Ok(stats) if stats.fragments_removed > 0 => {
+                    info!(
+                        fragments_removed = stats.fragments_removed,
+                        fragments_added = stats.fragments_added,
+                        "S3 compaction completed"
+                    );
+                }
+                Err(e) => {
+                    warn!("S3 compaction failed: {}", e);
+                }
+                _ => {} // No compaction needed
+            }
         }
     }
 }

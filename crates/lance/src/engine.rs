@@ -10,28 +10,40 @@ use arrow_array::RecordBatch;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicyBuilder, RemovalStats};
+use lance::dataset::optimize::{
+    commit_compaction, plan_compaction, CompactionMetrics, IgnoreRemap, RewriteResult,
+};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance_index::{DatasetIndexExt, IndexParams, IndexType};
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use parking_lot::RwLock;
-use tokio::sync::RwLock as AsyncRwLock;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
 use crate::config::BisqueLanceConfig;
 use crate::error::{Error, Result};
-use crate::types::{CleanupStats, FlushHandle, FlushState, SealReason, SegmentCatalog, SegmentId};
+use crate::types::{CleanupStats, CompactionStats, FlushHandle, FlushState, SealReason, SegmentCatalog, SegmentId};
 
 /// The core storage engine. Manages local Lance datasets and tracks segment state.
 ///
 /// Intended to be wrapped by `LanceStateMachine` which drives it via Raft log application.
+///
+/// # Concurrency
+///
+/// Datasets use `parking_lot::RwLock` for fast, non-blocking reads (clone is cheap
+/// — just Arc refcount bumps) and `tokio::sync::Mutex` to serialize writers per tier.
+/// Writers clone the dataset under a brief read lock, perform I/O on the clone
+/// (no lock held), then briefly acquire a write lock to swap in the updated handle.
+/// This means reads are never blocked by ongoing writes.
 pub struct BisqueLance {
     config: BisqueLanceConfig,
     catalog: RwLock<SegmentCatalog>,
-    /// Uses tokio async RwLock because Lance Dataset operations are async.
-    active_dataset: AsyncRwLock<Option<Dataset>>,
-    sealed_dataset: AsyncRwLock<Option<Dataset>>,
-    /// S3 deep storage dataset (opened lazily on first flush or when catalog has S3 data).
-    s3_dataset: AsyncRwLock<Option<Dataset>>,
+    active_dataset: RwLock<Option<Dataset>>,
+    active_write: AsyncMutex<()>,
+    sealed_dataset: RwLock<Option<Dataset>>,
+    sealed_write: AsyncMutex<()>,
+    s3_dataset: RwLock<Option<Dataset>>,
+    s3_write: AsyncMutex<()>,
     flush_state: RwLock<FlushState>,
     /// Tracks byte size of the active segment for seal-by-size checks.
     active_bytes: AtomicU64,
@@ -101,9 +113,12 @@ impl BisqueLance {
         Ok(Self {
             config,
             catalog: RwLock::new(catalog),
-            active_dataset: AsyncRwLock::new(Some(active_dataset)),
-            sealed_dataset: AsyncRwLock::new(sealed_dataset),
-            s3_dataset: AsyncRwLock::new(s3_dataset),
+            active_dataset: RwLock::new(Some(active_dataset)),
+            active_write: AsyncMutex::new(()),
+            sealed_dataset: RwLock::new(sealed_dataset),
+            sealed_write: AsyncMutex::new(()),
+            s3_dataset: RwLock::new(s3_dataset),
+            s3_write: AsyncMutex::new(()),
             flush_state: RwLock::new(FlushState::Idle),
             active_bytes: AtomicU64::new(0),
             active_created_at: RwLock::new(Instant::now()),
@@ -133,13 +148,17 @@ impl BisqueLance {
             schema,
         );
 
-        let mut ds_guard = self.active_dataset.write().await;
-        let ds = ds_guard
-            .as_mut()
+        // Serialize writers; clone dataset under brief read lock, then I/O with no lock.
+        let _guard = self.active_write.lock().await;
+        let mut ds = self.active_dataset.read()
+            .clone()
             .ok_or_else(|| Error::InvalidState("no active dataset".into()))?;
 
         ds.append(reader, Some(WriteParams::default())).await?;
-        drop(ds_guard);
+
+        // Brief write lock to swap in the updated handle
+        *self.active_dataset.write() = Some(ds);
+        drop(_guard);
 
         self.active_bytes.fetch_add(append_bytes, Ordering::Relaxed);
         debug!(bytes = append_bytes, "Appended to active segment");
@@ -162,19 +181,26 @@ impl BisqueLance {
             "Sealing active segment"
         );
 
-        // Take the current active dataset
-        let old_active = self.active_dataset.write().await.take();
+        // Lock order: active → sealed (always this order to prevent deadlocks)
+        let _active_guard = self.active_write.lock().await;
+        let _sealed_guard = self.sealed_write.lock().await;
 
-        // Move it to the sealed slot (dropping any previous sealed dataset)
-        *self.sealed_dataset.write().await = Some(
-            old_active
-                .ok_or_else(|| Error::InvalidState("no active dataset to seal".into()))?,
-        );
+        // Clone the current active dataset (readers still see it)
+        let old_active = self.active_dataset.read()
+            .clone()
+            .ok_or_else(|| Error::InvalidState("no active dataset to seal".into()))?;
 
         // Create new active segment
         let new_path = self.config.segment_path(new_active_segment_id);
         let new_dataset = open_or_create_segment(&new_path, &self.config).await?;
-        *self.active_dataset.write().await = Some(new_dataset);
+
+        // Atomically swap both datasets (brief write locks held simultaneously)
+        {
+            let mut active = self.active_dataset.write();
+            let mut sealed = self.sealed_dataset.write();
+            *sealed = Some(old_active);
+            *active = Some(new_dataset);
+        }
 
         // Update catalog
         {
@@ -200,8 +226,8 @@ impl BisqueLance {
             return Ok(());
         }
 
-        let mut ds_guard = self.sealed_dataset.write().await;
-        let ds = match ds_guard.as_mut() {
+        let _guard = self.sealed_write.lock().await;
+        let mut ds = match self.sealed_dataset.read().clone() {
             Some(ds) => ds,
             None => {
                 warn!("No sealed dataset to index");
@@ -249,6 +275,7 @@ impl BisqueLance {
             }
         }
 
+        *self.sealed_dataset.write() = Some(ds);
         Ok(())
     }
 
@@ -283,7 +310,10 @@ impl BisqueLance {
         }
 
         // Drop the sealed dataset handle
-        *self.sealed_dataset.write().await = None;
+        {
+            let _guard = self.sealed_write.lock().await;
+            *self.sealed_dataset.write() = None;
+        }
 
         // Clean up local sealed segment files
         let segment_path = self.config.segment_path(segment_id);
@@ -349,11 +379,10 @@ impl BisqueLance {
             "Executing S3 flush"
         );
 
-        // Read all data from the sealed segment
+        // Read all data from the sealed segment (brief read lock to clone, then scan with no lock)
         let batches = {
-            let ds_guard = self.sealed_dataset.read().await;
-            let ds = ds_guard
-                .as_ref()
+            let ds = self.sealed_dataset.read()
+                .clone()
                 .ok_or_else(|| Error::InvalidState("no sealed dataset for flush".into()))?;
 
             let stream = ds
@@ -395,13 +424,15 @@ impl BisqueLance {
             schema,
         );
 
-        // Open or create the S3 dataset and append
-        let mut s3_guard = self.s3_dataset.write().await;
+        // Serialize S3 writes; clone dataset, do I/O, swap back
+        let _guard = self.s3_write.lock().await;
+        let current_s3 = self.s3_dataset.read().clone();
 
-        let new_version = if let Some(ref mut s3_ds) = *s3_guard {
+        let (new_s3, new_version) = if let Some(mut s3_ds) = current_s3 {
             // Append to existing S3 dataset
             s3_ds.append(reader, Some(write_params)).await?;
-            s3_ds.version().version
+            let version = s3_ds.version().version;
+            (s3_ds, version)
         } else {
             // First flush — create the S3 dataset
             let s3_ds = if !self.config.s3_storage_options.is_empty() {
@@ -436,9 +467,10 @@ impl BisqueLance {
             };
 
             let version = s3_ds.version().version;
-            *s3_guard = Some(s3_ds);
-            version
+            (s3_ds, version)
         };
+
+        *self.s3_dataset.write() = Some(new_s3);
 
         info!(
             segment_id = handle.segment_id,
@@ -522,8 +554,7 @@ impl BisqueLance {
     /// `delete_unverified`: if true, removes orphaned files not referenced by any manifest.
     /// Safe when no concurrent writes are happening (no flush in progress).
     async fn cleanup_s3_internal(&self, delete_unverified: bool) -> Result<CleanupStats> {
-        let s3_guard = self.s3_dataset.read().await;
-        let ds = match s3_guard.as_ref() {
+        let ds = match self.s3_dataset.read().clone() {
             Some(ds) => ds,
             None => {
                 debug!("No S3 dataset open, skipping cleanup");
@@ -536,7 +567,7 @@ impl BisqueLance {
             .build();
 
         let removal_stats: RemovalStats =
-            lance::dataset::cleanup::cleanup_old_versions(ds, policy).await?;
+            lance::dataset::cleanup::cleanup_old_versions(&ds, policy).await?;
 
         let stats = CleanupStats {
             versions_removed: removal_stats.old_versions as u64,
@@ -550,6 +581,216 @@ impl BisqueLance {
             bytes_freed = stats.bytes_freed,
             "S3 cleanup completed"
         );
+
+        Ok(stats)
+    }
+
+    // =========================================================================
+    // Compaction
+    // =========================================================================
+
+    /// Compact the active segment to merge small append fragments.
+    ///
+    /// Uses a three-step approach so reads and writes can continue during
+    /// the expensive plan/execute phases. Only the final commit step holds
+    /// a brief write lock.
+    pub async fn compact_active(&self) -> Result<CompactionStats> {
+        // 1. Snapshot dataset under brief read lock
+        let (snapshot, options) = {
+            let guard = self.active_dataset.read();
+            let ds = match guard.as_ref() {
+                Some(ds) => ds,
+                None => {
+                    debug!("No active dataset, skipping compaction");
+                    return Ok(CompactionStats::default());
+                }
+            };
+
+            let fragment_count = ds.get_fragments().len();
+            if fragment_count < self.config.compaction_min_fragments {
+                debug!(
+                    fragment_count,
+                    threshold = self.config.compaction_min_fragments,
+                    "Active segment below compaction threshold, skipping"
+                );
+                return Ok(CompactionStats::default());
+            }
+
+            info!(fragment_count, "Compacting active segment");
+            (ds.clone(), self.config.compaction_options())
+        };
+        // read lock released
+
+        // 2. Plan and execute compaction (no lock held — reads/writes continue)
+        let results = plan_and_execute(&snapshot, &options).await?;
+        if results.is_empty() {
+            return Ok(CompactionStats::default());
+        }
+
+        // 3. Commit results (write mutex for serialization, clone + commit + swap)
+        let _guard = self.active_write.lock().await;
+        let mut ds = self.active_dataset.read()
+            .clone()
+            .ok_or_else(|| Error::InvalidState("no active dataset for compaction commit".into()))?;
+
+        let metrics = commit_compaction(
+            &mut ds,
+            results,
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await?;
+
+        *self.active_dataset.write() = Some(ds);
+
+        let stats = CompactionStats::from_metrics(&metrics);
+        info!(
+            fragments_removed = stats.fragments_removed,
+            fragments_added = stats.fragments_added,
+            "Active segment compaction complete"
+        );
+
+        Ok(stats)
+    }
+
+    /// Compact the sealed segment to merge fragments before index creation and flush.
+    ///
+    /// Called after sealing, before `create_seal_indices()`. Uses three-step
+    /// compaction so queries on the sealed segment can continue during the
+    /// plan/execute phases.
+    pub async fn compact_sealed(&self) -> Result<CompactionStats> {
+        let (snapshot, options) = {
+            let guard = self.sealed_dataset.read();
+            let ds = match guard.as_ref() {
+                Some(ds) => ds,
+                None => {
+                    debug!("No sealed dataset, skipping compaction");
+                    return Ok(CompactionStats::default());
+                }
+            };
+
+            let fragment_count = ds.get_fragments().len();
+            if fragment_count < 2 {
+                debug!(
+                    fragment_count,
+                    "Sealed segment has too few fragments to compact"
+                );
+                return Ok(CompactionStats::default());
+            }
+
+            info!(fragment_count, "Compacting sealed segment");
+            (ds.clone(), self.config.compaction_options())
+        };
+
+        let results = plan_and_execute(&snapshot, &options).await?;
+        if results.is_empty() {
+            return Ok(CompactionStats::default());
+        }
+
+        let _guard = self.sealed_write.lock().await;
+        let mut ds = self.sealed_dataset.read()
+            .clone()
+            .ok_or_else(|| Error::InvalidState("no sealed dataset for compaction commit".into()))?;
+
+        let metrics = commit_compaction(
+            &mut ds,
+            results,
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await?;
+
+        *self.sealed_dataset.write() = Some(ds);
+
+        let stats = CompactionStats::from_metrics(&metrics);
+        info!(
+            fragments_removed = stats.fragments_removed,
+            fragments_added = stats.fragments_added,
+            "Sealed segment compaction complete"
+        );
+
+        Ok(stats)
+    }
+
+    /// Compact S3 deep storage to merge fragments from multiple flushes.
+    ///
+    /// **Leader only.** Must not run during a flush. Uses three-step
+    /// compaction so queries on S3 data can continue during plan/execute.
+    /// Also cleans up old versions after compaction.
+    pub async fn compact_s3(&self) -> Result<CompactionStats> {
+        if !self.config.has_s3() {
+            return Err(Error::S3NotConfigured);
+        }
+
+        if let FlushState::InProgress { segment_id, .. } = &*self.flush_state.read() {
+            return Err(Error::FlushInProgress(*segment_id));
+        }
+
+        let (snapshot, options) = {
+            let guard = self.s3_dataset.read();
+            let ds = match guard.as_ref() {
+                Some(ds) => ds,
+                None => {
+                    debug!("No S3 dataset open, skipping compaction");
+                    return Ok(CompactionStats::default());
+                }
+            };
+
+            let fragment_count = ds.get_fragments().len();
+            if fragment_count < self.config.compaction_min_fragments {
+                debug!(
+                    fragment_count,
+                    threshold = self.config.compaction_min_fragments,
+                    "S3 dataset below compaction threshold, skipping"
+                );
+                return Ok(CompactionStats::default());
+            }
+
+            info!(fragment_count, "Compacting S3 deep storage");
+            (ds.clone(), self.config.compaction_options())
+        };
+
+        let results = plan_and_execute(&snapshot, &options).await?;
+        if results.is_empty() {
+            return Ok(CompactionStats::default());
+        }
+
+        let _guard = self.s3_write.lock().await;
+        let mut ds = self.s3_dataset.read()
+            .clone()
+            .ok_or_else(|| Error::InvalidState("no S3 dataset for compaction commit".into()))?;
+
+        let metrics = commit_compaction(
+            &mut ds,
+            results,
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await?;
+
+        // Update catalog with new S3 version
+        let new_version = ds.version().version;
+        {
+            let mut cat = self.catalog.write();
+            cat.s3_manifest_version = new_version;
+        }
+
+        *self.s3_dataset.write() = Some(ds);
+
+        let stats = CompactionStats::from_metrics(&metrics);
+        info!(
+            fragments_removed = stats.fragments_removed,
+            fragments_added = stats.fragments_added,
+            new_s3_version = new_version,
+            "S3 compaction complete"
+        );
+
+        // Write lock released, cleanup only needs a read snapshot
+        drop(_guard);
+
+        if let Err(e) = self.cleanup_s3_internal(true).await {
+            warn!("S3 version cleanup after compaction failed: {}", e);
+        }
 
         Ok(stats)
     }
@@ -598,23 +839,26 @@ impl BisqueLance {
     }
 
     /// Get a snapshot (clone) of the active dataset for querying.
+    ///
+    /// The clone is a lightweight handle (just Arc refcount bumps) that
+    /// points to the same underlying data. Never blocked by writes.
     pub async fn active_dataset_snapshot(&self) -> Option<Dataset> {
-        self.active_dataset.read().await.clone()
+        self.active_dataset.read().clone()
     }
 
     /// Get a snapshot (clone) of the sealed dataset for querying.
     pub async fn sealed_dataset_snapshot(&self) -> Option<Dataset> {
-        self.sealed_dataset.read().await.clone()
+        self.sealed_dataset.read().clone()
     }
 
     /// Get a snapshot (clone) of the S3 dataset for querying.
     pub async fn s3_dataset_snapshot(&self) -> Option<Dataset> {
-        self.s3_dataset.read().await.clone()
+        self.s3_dataset.read().clone()
     }
 
     /// Get the schema from the active dataset.
     pub async fn schema(&self) -> Option<arrow_schema::SchemaRef> {
-        let guard = self.active_dataset.read().await;
+        let guard = self.active_dataset.read();
         guard.as_ref().map(|ds| {
             Arc::new(arrow_schema::Schema::from(ds.schema()))
         })
@@ -628,9 +872,9 @@ impl BisqueLance {
     /// Gracefully shutdown the engine.
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down BisqueLance engine");
-        *self.active_dataset.write().await = None;
-        *self.sealed_dataset.write().await = None;
-        *self.s3_dataset.write().await = None;
+        *self.active_dataset.write() = None;
+        *self.sealed_dataset.write() = None;
+        *self.s3_dataset.write() = None;
         Ok(())
     }
 }
@@ -707,6 +951,40 @@ fn index_params_for_type(index_type: IndexType) -> Box<dyn IndexParams> {
         _ => {
             // Fallback to scalar params for unknown types
             Box::new(ScalarIndexParams::default())
+        }
+    }
+}
+
+/// Plan and execute compaction tasks without holding any dataset locks.
+///
+/// This is the slow part of compaction — it reads fragments, merges them, and
+/// writes new fragment files. The results are returned to be committed in a
+/// separate step (which requires a brief write lock).
+async fn plan_and_execute(
+    dataset: &Dataset,
+    options: &lance::dataset::optimize::CompactionOptions,
+) -> Result<Vec<RewriteResult>> {
+    let plan = plan_compaction(dataset, options).await?;
+    if plan.num_tasks() == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::with_capacity(plan.num_tasks());
+    for task in plan.compaction_tasks() {
+        let result = task.execute(dataset).await?;
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
+impl CompactionStats {
+    fn from_metrics(m: &CompactionMetrics) -> Self {
+        Self {
+            fragments_removed: m.fragments_removed as u64,
+            fragments_added: m.fragments_added as u64,
+            files_removed: m.files_removed as u64,
+            files_added: m.files_added as u64,
         }
     }
 }

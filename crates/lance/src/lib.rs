@@ -30,8 +30,8 @@ pub use query::BisqueLanceTableProvider;
 pub use raft::{LanceRaftNode, WriteError};
 pub use state_machine::LanceStateMachine;
 pub use types::{
-    CleanupStats, FlushHandle, FlushState, LanceCommand, LanceResponse, SealReason,
-    SegmentCatalog, SegmentId, SnapshotData,
+    CleanupStats, CompactionStats, FlushHandle, FlushState, LanceCommand, LanceResponse,
+    SealReason, SegmentCatalog, SegmentId, SnapshotData,
 };
 
 /// Raft type configuration for bisque-lance.

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use lance::dataset::optimize::CompactionOptions;
 use lance_index::IndexType;
 
 /// Specifies an index to create on sealed segments.
@@ -83,6 +84,20 @@ pub struct BisqueLanceConfig {
     /// dataset before it becomes available for queries. This enables
     /// FTS and vector search on sealed data.
     pub seal_indices: Vec<IndexSpec>,
+
+    /// Target number of rows per fragment for compaction. Defaults to 1M.
+    pub compaction_target_rows_per_fragment: usize,
+
+    /// Whether to materialize deletions during compaction. Defaults to true.
+    pub compaction_materialize_deletions: bool,
+
+    /// Fraction of deleted rows that triggers deletion materialization (0.0–1.0).
+    /// Defaults to 0.1 (10%).
+    pub compaction_deletion_threshold: f32,
+
+    /// Minimum number of fragments before compaction is considered worthwhile.
+    /// Defaults to 4.
+    pub compaction_min_fragments: usize,
 }
 
 impl BisqueLanceConfig {
@@ -97,6 +112,10 @@ impl BisqueLanceConfig {
             s3_max_rows_per_file: 5_000_000,
             s3_max_rows_per_group: 50_000,
             seal_indices: Vec::new(),
+            compaction_target_rows_per_fragment: 1_048_576, // 1M rows
+            compaction_materialize_deletions: true,
+            compaction_deletion_threshold: 0.1,
+            compaction_min_fragments: 4,
         }
     }
 
@@ -154,6 +173,36 @@ impl BisqueLanceConfig {
     pub fn with_seal_indices(mut self, specs: Vec<IndexSpec>) -> Self {
         self.seal_indices.extend(specs);
         self
+    }
+
+    pub fn with_compaction_target_rows_per_fragment(mut self, n: usize) -> Self {
+        self.compaction_target_rows_per_fragment = n;
+        self
+    }
+
+    pub fn with_compaction_materialize_deletions(mut self, v: bool) -> Self {
+        self.compaction_materialize_deletions = v;
+        self
+    }
+
+    pub fn with_compaction_deletion_threshold(mut self, t: f32) -> Self {
+        self.compaction_deletion_threshold = t;
+        self
+    }
+
+    pub fn with_compaction_min_fragments(mut self, n: usize) -> Self {
+        self.compaction_min_fragments = n;
+        self
+    }
+
+    /// Build Lance `CompactionOptions` from this config.
+    pub fn compaction_options(&self) -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: self.compaction_target_rows_per_fragment,
+            materialize_deletions: self.compaction_materialize_deletions,
+            materialize_deletions_threshold: self.compaction_deletion_threshold,
+            ..Default::default()
+        }
     }
 
     /// Path to the segments directory.

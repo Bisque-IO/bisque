@@ -168,6 +168,19 @@ pub struct CleanupStats {
     pub bytes_freed: u64,
 }
 
+/// Statistics from a compaction operation.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionStats {
+    /// Number of fragments removed by compaction.
+    pub fragments_removed: u64,
+    /// Number of new fragments created by compaction.
+    pub fragments_added: u64,
+    /// Number of individual files removed.
+    pub files_removed: u64,
+    /// Number of individual files added.
+    pub files_added: u64,
+}
+
 /// Snapshot payload for the state machine.
 /// Contains only metadata — actual data lives in Lance datasets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
