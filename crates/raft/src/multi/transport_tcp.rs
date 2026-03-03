@@ -3,12 +3,13 @@
 //! Each raft group is pinned to a single logical TCP connection per target host.
 //! A crossfire queue per connection enables natural write batching: the writer task
 //! blocks for the first message, then drains all immediately available messages
-//! into a single `write_all` syscall (up to a configurable batch size).
+//! into a single `write_vectored` (writev) syscall (up to a configurable batch size).
 //!
-//! Connections have a TTL and are transparently refreshed without dropping
-//! in-flight requests — old and new readers share the same pending-response map.
+//! Connections have a TTL and are transparently refreshed. Response dispatch
+//! uses a lock-free FIFO channel: the writer pushes oneshot senders in request
+//! order, the reader pops them to match responses — no mutex on the hot path.
 
-use crate::multi::codec::{Decode, Encode, ResponseMessage, RpcMessage};
+use crate::multi::codec::{Decode, Encode, RpcMessage};
 use crate::multi::network::MultiplexedTransport;
 use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
@@ -20,7 +21,6 @@ use openraft::raft::{
 };
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -325,7 +325,6 @@ type PendingResponseSender = oneshot::Sender<Result<Bytes, BisqueTransportError>
 
 /// Message sent to the writer task for batched writing
 struct WriteRequest {
-    request_id: u64,
     /// Pre-encoded frame: [4-byte LE length | payload]
     data: Vec<u8>,
     response_tx: PendingResponseSender,
@@ -340,13 +339,12 @@ struct GroupConnectionKey {
 
 /// A single logical connection for a (target, group_id) pair.
 ///
-/// The `pending` map is shared across connection refreshes so that in-flight
-/// requests on the old connection still receive their responses.
+/// Response dispatch uses a FIFO channel instead of a HashMap+mutex:
+/// the writer pushes oneshot senders in request order, the reader pops
+/// them in the same order to dispatch responses. No locks on the hot path.
 struct GroupConnection {
     /// Channel to send write requests to the writer task
     write_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<WriteRequest>>,
-    /// Shared pending-response map (survives connection refresh)
-    pending: Arc<std::sync::Mutex<HashMap<u64, PendingResponseSender>>>,
     /// Whether this connection is alive
     alive: Arc<AtomicBool>,
     /// When this connection was created
@@ -360,7 +358,6 @@ impl GroupConnection {
     fn new(
         reader: BoxedReader,
         writer: BoxedWriter,
-        pending: Arc<std::sync::Mutex<HashMap<u64, PendingResponseSender>>>,
         generation: u64,
         max_batch_bytes: usize,
         channel_capacity: usize,
@@ -369,41 +366,47 @@ impl GroupConnection {
             crossfire::mpsc::bounded_async::<WriteRequest>(channel_capacity);
         let alive = Arc::new(AtomicBool::new(true));
 
+        // Unbounded FIFO for response dispatch: writer pushes oneshot senders,
+        // reader pops them in the same order to match responses. Unbounded
+        // because the writer can push faster than the reader pops (TCP RTT).
+        let (resp_tx, resp_rx) =
+            crossfire::mpsc::unbounded_async::<PendingResponseSender>();
+
         // Spawn writer task
         let writer_alive = alive.clone();
-        let writer_pending = pending.clone();
         tokio::spawn(async move {
-            Self::writer_loop(writer, write_rx, writer_pending, writer_alive, max_batch_bytes)
+            Self::writer_loop(writer, write_rx, resp_tx, writer_alive, max_batch_bytes)
                 .await;
         });
 
         // Spawn reader task
         let reader_alive = alive.clone();
-        let reader_pending = pending.clone();
         tokio::spawn(async move {
-            Self::reader_loop(reader, reader_pending, reader_alive).await;
+            Self::reader_loop(reader, resp_rx, reader_alive).await;
         });
 
         Self {
             write_tx,
-            pending,
             alive,
             created_at: Instant::now(),
             generation,
         }
     }
 
-    /// Writer loop: block on first message, drain queue, batch write.
+    /// Writer loop: block on first message, drain queue, vectored write.
+    /// Pushes oneshot senders to the unbounded FIFO in request order so the
+    /// reader can pop them to dispatch responses — no mutex, no backpressure.
+    /// Uses `write_vectored` (writev syscall) to avoid copying pre-encoded
+    /// frames into a contiguous buffer.
     async fn writer_loop(
         mut write_half: BoxedWriter,
         write_rx: crossfire::AsyncRx<crossfire::mpsc::Array<WriteRequest>>,
-        pending: Arc<std::sync::Mutex<HashMap<u64, PendingResponseSender>>>,
+        resp_tx: crossfire::MTx<crossfire::mpsc::List<PendingResponseSender>>,
         alive: Arc<AtomicBool>,
         max_batch_bytes: usize,
     ) {
         use crossfire::TryRecvError;
-
-        let mut encode_buf: Vec<u8> = Vec::with_capacity(max_batch_bytes);
+        use std::io::IoSlice;
 
         loop {
             if !alive.load(Ordering::Acquire) {
@@ -416,60 +419,81 @@ impl GroupConnection {
                 Err(_) => return, // channel closed
             };
 
-            // 2. Register pending and copy pre-encoded frame into batch buffer
-            {
-                let mut map = pending.lock().unwrap();
-                map.insert(first.request_id, first.response_tx);
+            // 2. Push response sender to FIFO and collect pre-encoded frame (no copy)
+            if resp_tx.send(first.response_tx).is_err() {
+                alive.store(false, Ordering::Release);
+                return;
             }
-            encode_buf.clear();
-            encode_buf.extend_from_slice(&first.data);
-            return_encode_buffer(first.data);
+            let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(32);
+            let mut total_bytes = first.data.len();
+            data_bufs.push(first.data);
 
             // 3. Drain immediately available requests up to max_batch_bytes
             loop {
-                if encode_buf.len() >= max_batch_bytes {
+                if total_bytes >= max_batch_bytes {
                     break;
                 }
                 match write_rx.try_recv() {
                     Ok(req) => {
-                        {
-                            let mut map = pending.lock().unwrap();
-                            map.insert(req.request_id, req.response_tx);
-                        }
-                        encode_buf.extend_from_slice(&req.data);
-                        return_encode_buffer(req.data);
+                        let _ = resp_tx.send(req.response_tx);
+                        total_bytes += req.data.len();
+                        data_bufs.push(req.data);
                     }
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                 }
             }
 
-            // 4. Single write_all + flush
-            if let Err(e) = write_half.write_all(&encode_buf).await {
-                tracing::error!("writer: write error: {}", e);
+            // 4. Vectored write — writev() syscall, zero-copy batching
+            let write_err = {
+                let mut slices: Vec<IoSlice<'_>> =
+                    data_bufs.iter().map(|b| IoSlice::new(b)).collect();
+                let mut remaining: &mut [IoSlice<'_>] = &mut slices;
+                loop {
+                    if remaining.is_empty() {
+                        break None;
+                    }
+                    match write_half.write_vectored(remaining).await {
+                        Ok(0) => {
+                            break Some("write_vectored returned 0 bytes".into());
+                        }
+                        Ok(n) => {
+                            IoSlice::advance_slices(&mut remaining, n);
+                        }
+                        Err(e) => {
+                            break Some(format!("write error: {e}"));
+                        }
+                    }
+                }
+            };
+            // Borrow on data_bufs released — return buffers to the pool
+            for buf in data_bufs {
+                return_encode_buffer(buf);
+            }
+            if let Some(err_msg) = write_err {
+                tracing::error!("writer: {}", err_msg);
                 alive.store(false, Ordering::Release);
-                Self::notify_all_pending_error(&pending);
                 return;
             }
             if let Err(e) = write_half.flush().await {
                 tracing::error!("writer: flush error: {}", e);
                 alive.store(false, Ordering::Release);
-                Self::notify_all_pending_error(&pending);
                 return;
             }
         }
     }
 
-    /// Reader loop: BytesMut rolling buffer, zero-copy frame extraction,
-    /// dispatch by request_id to the shared pending map.
+    /// Reader loop: BytesMut rolling buffer, zero-copy frame extraction.
+    /// Pops oneshot senders from the unbounded FIFO in order to dispatch responses.
     async fn reader_loop(
         mut read_half: BoxedReader,
-        pending: Arc<std::sync::Mutex<HashMap<u64, PendingResponseSender>>>,
+        resp_rx: crossfire::AsyncRx<crossfire::mpsc::List<PendingResponseSender>>,
         alive: Arc<AtomicBool>,
     ) {
         let mut buf = BytesMut::with_capacity(64 * 1024);
 
         loop {
             if !alive.load(Ordering::Acquire) {
+                Self::drain_and_error(&resp_rx);
                 return;
             }
 
@@ -497,25 +521,25 @@ impl GroupConnection {
                 if frame.len() < 9 {
                     tracing::error!("reader: response too short: {} bytes", frame.len());
                     alive.store(false, Ordering::Release);
-                    Self::notify_all_pending_error(&pending);
+                    Self::drain_and_error(&resp_rx);
                     return;
                 }
 
-                let request_id = u64::from_le_bytes(frame[1..9].try_into().unwrap());
-
-                let sender = {
-                    let mut map = pending.lock().unwrap();
-                    map.remove(&request_id)
-                };
-                if let Some(sender) = sender {
-                    let _ = sender.send(Ok(frame));
-                } else {
-                    tracing::warn!(
-                        "reader: response for unknown request_id: {} (len={}, disc={})",
-                        request_id,
-                        payload_len,
-                        frame[0]
-                    );
+                // Pop next response sender from FIFO (always available — writer
+                // pushes before writing to TCP, and responses arrive in order).
+                match resp_rx.try_recv() {
+                    Ok(sender) => {
+                        let _ = sender.send(Ok(frame));
+                    }
+                    Err(crossfire::TryRecvError::Empty) => {
+                        tracing::error!("reader: FIFO empty — response/request ordering mismatch");
+                        alive.store(false, Ordering::Release);
+                        return;
+                    }
+                    Err(crossfire::TryRecvError::Disconnected) => {
+                        alive.store(false, Ordering::Release);
+                        return;
+                    }
                 }
             }
 
@@ -529,7 +553,7 @@ impl GroupConnection {
                 Ok(0) => {
                     tracing::trace!("reader: connection closed by peer");
                     alive.store(false, Ordering::Release);
-                    Self::notify_all_pending_error(&pending);
+                    Self::drain_and_error(&resp_rx);
                     return;
                 }
                 Ok(_) => {} // loop back to parse
@@ -540,22 +564,18 @@ impl GroupConnection {
                         tracing::error!("reader: read error: {}", e);
                     }
                     alive.store(false, Ordering::Release);
-                    Self::notify_all_pending_error(&pending);
+                    Self::drain_and_error(&resp_rx);
                     return;
                 }
             }
         }
     }
 
-    /// Notify all pending requests of connection error.
-    fn notify_all_pending_error(
-        pending: &std::sync::Mutex<HashMap<u64, PendingResponseSender>>,
+    /// Drain remaining response senders from the FIFO and notify them of connection error.
+    fn drain_and_error(
+        resp_rx: &crossfire::AsyncRx<crossfire::mpsc::List<PendingResponseSender>>,
     ) {
-        let drained: Vec<(u64, PendingResponseSender)> = {
-            let mut map = pending.lock().unwrap();
-            map.drain().collect()
-        };
-        for (_, sender) in drained {
+        while let Ok(sender) = resp_rx.try_recv() {
             let _ = sender.send(Err(BisqueTransportError::ConnectionClosed));
         }
     }
@@ -568,7 +588,6 @@ impl GroupConnection {
     /// Send a pre-encoded request and await the response
     async fn send_request(
         &self,
-        request_id: u64,
         request_data: Vec<u8>,
         timeout: Duration,
     ) -> Result<Bytes, BisqueTransportError> {
@@ -579,7 +598,6 @@ impl GroupConnection {
         let (response_tx, response_rx) = oneshot::channel();
 
         let write_req = WriteRequest {
-            request_id,
             data: request_data,
             response_tx,
         };
@@ -596,7 +614,7 @@ impl GroupConnection {
                 Err(BisqueTransportError::ConnectionClosed)
             }
             Err(_) => {
-                tracing::warn!("request {} timed out", request_id);
+                tracing::warn!("request timed out");
                 self.alive.store(false, Ordering::Release);
                 Err(BisqueTransportError::RequestTimeout)
             }
@@ -761,17 +779,9 @@ where
 
         let generation = self.next_generation();
 
-        // Share pending map from old connection if one exists (for refresh)
-        let pending = if let Some(old_conn) = self.connections.get(&key) {
-            old_conn.pending.clone()
-        } else {
-            Arc::new(std::sync::Mutex::new(HashMap::new()))
-        };
-
         let conn = Arc::new(GroupConnection::new(
             reader,
             writer,
-            pending,
             generation,
             self.config.max_batch_bytes,
             self.config.write_channel_capacity,
@@ -833,13 +843,16 @@ where
     }
 
     /// Internal RPC call: encode, get connection, send, await response
-    async fn rpc_call<D: Encode + Send + 'static>(
+    async fn rpc_call(
         &self,
         addr: &SocketAddr,
         group_id: u64,
         request_id: u64,
-        request_msg: &RpcMessage<D>,
-    ) -> Result<Bytes, BisqueTransportError> {
+        request_msg: &RpcMessage<C>,
+    ) -> Result<Bytes, BisqueTransportError>
+    where
+        RpcMessage<C>: Encode,
+    {
         let request_data = encode_framed(request_msg)?;
 
         tracing::trace!(
@@ -853,7 +866,7 @@ where
         let conn = self.get_or_create_connection(*addr, group_id).await?;
 
         let result = conn
-            .send_request(request_id, request_data, self.config.request_timeout)
+            .send_request(request_data, self.config.request_timeout)
             .await;
 
         // If connection died, remove it so next call creates a fresh one
@@ -884,8 +897,7 @@ where
     >,
     C::SnapshotData: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
     C::Entry: Clone,
-    C::D: crate::multi::codec::ToCodec<crate::multi::codec::RawBytes>
-        + crate::multi::codec::FromCodec<crate::multi::codec::RawBytes>,
+    C::D: Encode + Decode,
 {
     async fn send_append_entries(
         &self,
@@ -893,33 +905,16 @@ where
         group_id: u64,
         rpc: AppendEntriesRequest<C>,
     ) -> Result<AppendEntriesResponse<C>, RPCError<C, RaftError<C>>> {
-        use crate::multi::codec::{
-            AppendEntriesRequest as CodecAppendEntriesRequest, Entry as CodecEntry, FromCodec,
-            RawBytes, ToCodec,
-        };
-
         let addr = self
             .node_registry
             .resolve(&target)
             .ok_or_else(|| BisqueTransportError::UnknownNode(target))?;
         let request_id = self.next_request_id();
 
-        let mut codec_entries: Vec<CodecEntry<RawBytes>> = Vec::with_capacity(rpc.entries.len());
-        for entry in rpc.entries.iter() {
-            codec_entries.push(entry.to_codec());
-        }
-
-        let codec_rpc = CodecAppendEntriesRequest {
-            vote: rpc.vote.to_codec(),
-            prev_log_id: rpc.prev_log_id.as_ref().map(|lid| lid.to_codec()),
-            entries: codec_entries,
-            leader_commit: rpc.leader_commit.as_ref().map(|lid| lid.to_codec()),
-        };
-
-        let request = RpcMessage::AppendEntries {
+        let request = RpcMessage::<C>::AppendEntries {
             request_id,
             group_id,
-            rpc: codec_rpc,
+            rpc,
         };
 
         let response_data = self
@@ -927,29 +922,15 @@ where
             .await
             .map_err(RPCError::<C, RaftError<C>>::from)?;
 
-        let response: RpcMessage<RawBytes> = RpcMessage::decode_from_slice(&response_data)
+        let response: RpcMessage<C> = RpcMessage::decode_from_slice(&response_data)
             .map_err(|e| BisqueTransportError::CodecError(e.to_string().into()))
             .map_err(RPCError::<C, RaftError<C>>::from)?;
 
         match response {
             RpcMessage::Response {
-                message: ResponseMessage::AppendEntries(resp),
+                message: crate::multi::codec::ResponseMessage::AppendEntries(resp),
                 ..
-            } => {
-                use crate::multi::codec::AppendEntriesResponse as CodecResp;
-                match resp {
-                    CodecResp::Success => Ok(AppendEntriesResponse::Success),
-                    CodecResp::PartialSuccess(log_id) => {
-                        let lid = log_id.map(|l| openraft::LogId::<C>::from_codec(l));
-                        Ok(AppendEntriesResponse::PartialSuccess(lid))
-                    }
-                    CodecResp::Conflict => Ok(AppendEntriesResponse::Conflict),
-                    CodecResp::HigherVote(v) => {
-                        let vote = openraft::impls::Vote::<C>::from_codec(v);
-                        Ok(AppendEntriesResponse::HigherVote(vote))
-                    }
-                }
-            }
+            } => Ok(resp),
             RpcMessage::Error { error, .. } => {
                 Err(BisqueTransportError::RemoteError(error.into()).into())
             }
@@ -963,23 +944,16 @@ where
         group_id: u64,
         rpc: VoteRequest<C>,
     ) -> Result<VoteResponse<C>, RPCError<C, RaftError<C>>> {
-        use crate::multi::codec::{FromCodec, RawBytes, ToCodec, VoteRequest as CodecVoteRequest};
-
         let addr = self
             .node_registry
             .resolve(&target)
             .ok_or_else(|| BisqueTransportError::UnknownNode(target))?;
         let request_id = self.next_request_id();
 
-        let codec_rpc = CodecVoteRequest {
-            vote: rpc.vote.to_codec(),
-            last_log_id: rpc.last_log_id.as_ref().map(|lid| lid.to_codec()),
-        };
-
-        let request: RpcMessage<RawBytes> = RpcMessage::Vote {
+        let request = RpcMessage::<C>::Vote {
             request_id,
             group_id,
-            rpc: codec_rpc,
+            rpc,
         };
 
         let response_data = self
@@ -987,21 +961,15 @@ where
             .await
             .map_err(RPCError::<C, RaftError<C>>::from)?;
 
-        let response: RpcMessage<RawBytes> = RpcMessage::decode_from_slice(&response_data)
+        let response: RpcMessage<C> = RpcMessage::decode_from_slice(&response_data)
             .map_err(|e| BisqueTransportError::CodecError(e.to_string().into()))
             .map_err(RPCError::<C, RaftError<C>>::from)?;
 
         match response {
             RpcMessage::Response {
-                message: ResponseMessage::Vote(resp),
+                message: crate::multi::codec::ResponseMessage::Vote(resp),
                 ..
-            } => Ok(VoteResponse {
-                vote: openraft::impls::Vote::<C>::from_codec(resp.vote),
-                vote_granted: resp.vote_granted,
-                last_log_id: resp
-                    .last_log_id
-                    .map(|l| openraft::LogId::<C>::from_codec(l)),
-            }),
+            } => Ok(resp),
             RpcMessage::Error { error, .. } => {
                 Err(BisqueTransportError::RemoteError(error.into()).into())
             }
@@ -1015,28 +983,16 @@ where
         group_id: u64,
         rpc: InstallSnapshotRequest<C>,
     ) -> Result<InstallSnapshotResponse<C>, RPCError<C, RaftError<C, InstallSnapshotError>>> {
-        use crate::multi::codec::{
-            FromCodec, InstallSnapshotRequest as CodecInstallSnapshotRequest, RawBytes, ToCodec,
-        };
-
         let addr = self
             .node_registry
             .resolve(&target)
             .ok_or_else(|| BisqueTransportError::UnknownNode(target))?;
         let request_id = self.next_request_id();
 
-        let codec_rpc = CodecInstallSnapshotRequest {
-            vote: rpc.vote.to_codec(),
-            meta: rpc.meta.to_codec(),
-            offset: rpc.offset,
-            data: RawBytes(rpc.data),
-            done: rpc.done,
-        };
-
-        let request: RpcMessage<RawBytes> = RpcMessage::InstallSnapshot {
+        let request = RpcMessage::<C>::InstallSnapshot {
             request_id,
             group_id,
-            rpc: codec_rpc,
+            rpc,
         };
 
         let response_data = self
@@ -1044,17 +1000,15 @@ where
             .await
             .map_err(RPCError::<C, RaftError<C, InstallSnapshotError>>::from)?;
 
-        let response: RpcMessage<RawBytes> = RpcMessage::decode_from_slice(&response_data)
+        let response: RpcMessage<C> = RpcMessage::decode_from_slice(&response_data)
             .map_err(|e| BisqueTransportError::CodecError(e.to_string().into()))
             .map_err(RPCError::<C, RaftError<C, InstallSnapshotError>>::from)?;
 
         match response {
             RpcMessage::Response {
-                message: ResponseMessage::InstallSnapshot(resp),
+                message: crate::multi::codec::ResponseMessage::InstallSnapshot(resp),
                 ..
-            } => Ok(InstallSnapshotResponse {
-                vote: openraft::impls::Vote::<C>::from_codec(resp.vote),
-            }),
+            } => Ok(resp),
             RpcMessage::Error { error, .. } => {
                 Err(BisqueTransportError::RemoteError(error.into()).into())
             }

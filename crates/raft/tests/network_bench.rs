@@ -16,18 +16,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use bisque_raft::BisqueRaftTypeConfig;
 use bisque_raft::multi::codec;
 use bisque_raft::multi::network::MultiplexedTransport;
 use bisque_raft::multi::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
-    DefaultNodeRegistry, MultiRaftManager, MultiplexedLogStorage, MultiplexedStorageConfig,
+    DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
     NodeAddressResolver,
 };
-use bisque_raft::BisqueRaftTypeConfig;
 use futures::FutureExt;
 use openraft::async_runtime::watch::WatchReceiver;
-use openraft::storage::RaftStateMachine;
 use openraft::entry::RaftEntry;
+use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
 use openraft::{LogId, OptionalSend};
 
@@ -66,15 +66,29 @@ impl fmt::Display for TestData {
     }
 }
 
-impl codec::ToCodec<codec::RawBytes> for TestData {
-    fn to_codec(&self) -> codec::RawBytes {
-        codec::RawBytes(self.0.clone())
+impl codec::Encode for TestData {
+    fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), codec::CodecError> {
+        (self.0.len() as u32).encode(writer)?;
+        writer.write_all(&self.0)?;
+        Ok(())
+    }
+    fn encoded_size(&self) -> usize {
+        4 + self.0.len()
     }
 }
 
-impl codec::FromCodec<codec::RawBytes> for TestData {
-    fn from_codec(codec: codec::RawBytes) -> Self {
-        TestData(codec.0)
+impl codec::Decode for TestData {
+    fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, codec::CodecError> {
+        let len = u32::decode(reader)? as usize;
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf)?;
+        Ok(Self(buf))
+    }
+}
+
+impl codec::BorrowPayload for TestData {
+    fn payload_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -252,25 +266,26 @@ struct SingleNodeHarness {
 
 impl SingleNodeHarness {
     async fn new() -> Self {
+        Self::with_transport_config(BisqueTcpTransportConfig::default()).await
+    }
+
+    async fn with_transport_config(transport_config: BisqueTcpTransportConfig) -> Self {
         let addr = pick_unused_local_addr();
         let node_registry = Arc::new(DefaultNodeRegistry::<u64>::new());
         node_registry.register(1, addr);
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let storage = MultiplexedLogStorage::<TestConfig>::new(MultiplexedStorageConfig {
-            base_dir: dir.path().to_path_buf(),
-            num_shards: 1,
-            segment_size: 64 * 1024 * 1024,
-            fsync_interval: None,
-            max_cache_entries_per_group: 10_000,
-            max_record_size: Some(1024 * 1024),
-        })
+        let storage = MultiplexedLogStorage::<TestConfig>::new(
+            MmapStorageConfig::new(dir.path())
+                .with_segment_size(64 * 1024 * 1024)
+                .with_fsync_delay(Duration::ZERO),
+        )
         .await
         .expect("storage");
 
         // Client-side transport (sends RPCs over TCP)
         let transport = Arc::new(BisqueTcpTransport::<TestConfig>::new(
-            BisqueTcpTransportConfig::default(),
+            transport_config,
             node_registry.clone(),
         ));
 
@@ -295,7 +310,9 @@ impl SingleNodeHarness {
 
         tokio::spawn({
             let s = server.clone();
-            async move { let _ = s.serve().await; }
+            async move {
+                let _ = s.serve().await;
+            }
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -429,15 +446,24 @@ fn bench_heartbeat_throughput() {
             let transport = harness.transport.clone();
             let completed = completed.clone();
             let errors = errors.clone();
-            let n = per_worker + if (w as u64) < total % CONCURRENCY as u64 { 1 } else { 0 };
+            let n = per_worker
+                + if (w as u64) < total % CONCURRENCY as u64 {
+                    1
+                } else {
+                    0
+                };
             handles.push(tokio::spawn(async move {
                 for _ in 0..n {
                     match transport
                         .send_append_entries(1, 1, make_empty_append_request())
                         .await
                     {
-                        Ok(_) => { completed.fetch_add(1, Ordering::Relaxed); }
-                        Err(_) => { errors.fetch_add(1, Ordering::Relaxed); }
+                        Ok(_) => {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }));
@@ -450,13 +476,17 @@ fn bench_heartbeat_throughput() {
 
         println!(
             "[heartbeat] {} ok, {} errors out of {} in {:?} ({:.0} req/s)",
-            done, errs, total, elapsed,
+            done,
+            errs,
+            total,
+            elapsed,
             done as f64 / elapsed.as_secs_f64(),
         );
         assert!(
             done >= total * 95 / 100,
             "too many failures: {} ok, {} errors",
-            done, errs,
+            done,
+            errs,
         );
 
         harness.shutdown();
@@ -475,6 +505,7 @@ fn bench_append_entries_payload_sizes() {
             (128, 100_000),
             (1024, 50_000),
             (16384, 10_000),
+            (65536, 10_000),
         ] {
             let per_worker = count / CONCURRENCY as u64;
             let completed = Arc::new(AtomicU64::new(0));
@@ -485,7 +516,12 @@ fn bench_append_entries_payload_sizes() {
             for w in 0..CONCURRENCY {
                 let transport = harness.transport.clone();
                 let completed = completed.clone();
-                let n = per_worker + if (w as u64) < count % CONCURRENCY as u64 { 1 } else { 0 };
+                let n = per_worker
+                    + if (w as u64) < count % CONCURRENCY as u64 {
+                        1
+                    } else {
+                        0
+                    };
                 handles.push(tokio::spawn(async move {
                     for _ in 0..n {
                         let req = make_append_request(1, payload_size);
@@ -556,13 +592,18 @@ fn bench_multi_group_fanout() {
 
         println!(
             "[multi_group] {} groups x {} req = {} total, {} ok in {:?} ({:.0} req/s)",
-            num_groups, requests_per_group, total, done, elapsed,
+            num_groups,
+            requests_per_group,
+            total,
+            done,
+            elapsed,
             done as f64 / elapsed.as_secs_f64(),
         );
         assert!(
             done >= total * 95 / 100,
             "too many failures: {}/{}",
-            done, total,
+            done,
+            total,
         );
 
         harness.shutdown();
@@ -586,7 +627,12 @@ fn bench_vote_throughput() {
         for w in 0..CONCURRENCY {
             let transport = harness.transport.clone();
             let completed = completed.clone();
-            let n = per_worker + if (w as u64) < total % CONCURRENCY as u64 { 1 } else { 0 };
+            let n = per_worker
+                + if (w as u64) < total % CONCURRENCY as u64 {
+                    1
+                } else {
+                    0
+                };
             let base = w as u64 * per_worker + (w as u64).min(total % CONCURRENCY as u64);
             handles.push(tokio::spawn(async move {
                 for i in 0..n {
@@ -607,13 +653,16 @@ fn bench_vote_throughput() {
 
         println!(
             "[vote] {} ok / {} in {:?} ({:.0} req/s)",
-            done, total, elapsed,
+            done,
+            total,
+            elapsed,
             done as f64 / elapsed.as_secs_f64(),
         );
         assert!(
             done >= total * 95 / 100,
             "too many failures: {}/{}",
-            done, total,
+            done,
+            total,
         );
 
         harness.shutdown();
@@ -642,7 +691,12 @@ fn bench_append_latency() {
 
         for w in 0..CONCURRENCY {
             let transport = harness.transport.clone();
-            let n = per_worker + if (w as u64) < total % CONCURRENCY as u64 { 1 } else { 0 };
+            let n = per_worker
+                + if (w as u64) < total % CONCURRENCY as u64 {
+                    1
+                } else {
+                    0
+                };
             handles.push(tokio::spawn(async move {
                 let mut local_samples = Vec::with_capacity(n as usize);
                 for _ in 0..n {
@@ -660,12 +714,11 @@ fn bench_append_latency() {
         }
 
         let results = futures::future::join_all(handles).await;
-        let all_samples: Vec<Duration> = results
-            .into_iter()
-            .flat_map(|r| r.unwrap())
-            .collect();
+        let all_samples: Vec<Duration> = results.into_iter().flat_map(|r| r.unwrap()).collect();
 
-        let mut stats = LatencyStats { samples: all_samples };
+        let mut stats = LatencyStats {
+            samples: all_samples,
+        };
         let summary = stats.compute();
 
         println!("[append_latency] concurrency={}", CONCURRENCY);
@@ -673,4 +726,133 @@ fn bench_append_latency() {
 
         harness.shutdown();
     });
+}
+
+/// Connection refresh throughput — verifies that TTL-based connection refresh
+/// does not drop requests or significantly degrade throughput.
+///
+/// Runs the same workload twice:
+///   1. Baseline: long TTL (no refreshes during the test)
+///   2. Refresh: short TTL (many refreshes during the test)
+///
+/// Asserts zero errors in both runs and that refresh throughput is >= 70%
+/// of baseline (generous margin for CI variability).
+#[test]
+fn bench_connection_refresh_throughput() {
+    run_async(async {
+        let total: u64 = 50_000;
+
+        // ---- Baseline run: long TTL, no refreshes ----
+        let baseline_harness = SingleNodeHarness::with_transport_config(
+            BisqueTcpTransportConfig {
+                connection_ttl: Duration::from_secs(300),
+                ..Default::default()
+            },
+        )
+        .await;
+        baseline_harness.add_groups(&[1]).await;
+
+        let (baseline_done, baseline_errs, baseline_elapsed) =
+            run_throughput_workload(&baseline_harness.transport, total, 1).await;
+        baseline_harness.shutdown();
+
+        let baseline_rps = baseline_done as f64 / baseline_elapsed.as_secs_f64();
+        println!(
+            "[conn_refresh baseline] {} ok, {} errors in {:?} ({:.0} req/s)",
+            baseline_done, baseline_errs, baseline_elapsed, baseline_rps,
+        );
+        assert_eq!(
+            baseline_errs, 0,
+            "baseline should have zero errors, got {}",
+            baseline_errs,
+        );
+
+        // ---- Refresh run: 50ms TTL, forces ~60+ refreshes over a ~3s test ----
+        let refresh_harness = SingleNodeHarness::with_transport_config(
+            BisqueTcpTransportConfig {
+                connection_ttl: Duration::from_millis(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        refresh_harness.add_groups(&[1]).await;
+
+        let (refresh_done, refresh_errs, refresh_elapsed) =
+            run_throughput_workload(&refresh_harness.transport, total, 1).await;
+        refresh_harness.shutdown();
+
+        let refresh_rps = refresh_done as f64 / refresh_elapsed.as_secs_f64();
+        println!(
+            "[conn_refresh refresh] {} ok, {} errors in {:?} ({:.0} req/s)",
+            refresh_done, refresh_errs, refresh_elapsed, refresh_rps,
+        );
+        assert_eq!(
+            refresh_errs, 0,
+            "refresh run should have zero errors, got {}",
+            refresh_errs,
+        );
+
+        let ratio = refresh_rps / baseline_rps;
+        println!(
+            "[conn_refresh] ratio={:.2} (refresh/baseline: {:.0}/{:.0})",
+            ratio, refresh_rps, baseline_rps,
+        );
+        assert!(
+            ratio >= 0.70,
+            "throughput with refresh ({:.0} req/s) dropped to {:.0}% of baseline ({:.0} req/s)",
+            refresh_rps,
+            ratio * 100.0,
+            baseline_rps,
+        );
+    });
+}
+
+/// Shared workload runner: 32 workers, each looping sequentially.
+/// Returns (completed, errors, elapsed).
+async fn run_throughput_workload(
+    transport: &Arc<BisqueTcpTransport<TestConfig>>,
+    total: u64,
+    group_id: u64,
+) -> (u64, u64, Duration) {
+    let per_worker = total / CONCURRENCY as u64;
+    let completed = Arc::new(AtomicU64::new(0));
+    let errors = Arc::new(AtomicU64::new(0));
+
+    let start = Instant::now();
+    let mut handles = Vec::new();
+
+    for w in 0..CONCURRENCY {
+        let transport = transport.clone();
+        let completed = completed.clone();
+        let errors = errors.clone();
+        let n = per_worker
+            + if (w as u64) < total % CONCURRENCY as u64 {
+                1
+            } else {
+                0
+            };
+        handles.push(tokio::spawn(async move {
+            for _ in 0..n {
+                match transport
+                    .send_append_entries(1, group_id, make_empty_append_request())
+                    .await
+                {
+                    Ok(_) => {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+
+    futures::future::join_all(handles).await;
+    let elapsed = start.elapsed();
+    (
+        completed.load(Ordering::Relaxed),
+        errors.load(Ordering::Relaxed),
+        elapsed,
+    )
 }

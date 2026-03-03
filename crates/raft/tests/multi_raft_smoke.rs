@@ -16,7 +16,7 @@ use bisque_raft::multi::codec::{Decode, Encode};
 use bisque_raft::multi::network::GroupNetworkFactory;
 use bisque_raft::multi::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
-    DefaultNodeRegistry, MultiRaftManager, MultiplexedLogStorage, MultiplexedStorageConfig,
+    DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
 };
 use bisque_raft::{BisqueRaftTypeConfig, multi::codec};
 use futures::FutureExt;
@@ -57,15 +57,29 @@ impl fmt::Display for TestData {
     }
 }
 
-impl codec::ToCodec<codec::RawBytes> for TestData {
-    fn to_codec(&self) -> codec::RawBytes {
-        codec::RawBytes(self.0.clone())
+impl codec::Encode for TestData {
+    fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), codec::CodecError> {
+        (self.0.len() as u32).encode(writer)?;
+        writer.write_all(&self.0)?;
+        Ok(())
+    }
+    fn encoded_size(&self) -> usize {
+        4 + self.0.len()
     }
 }
 
-impl codec::FromCodec<codec::RawBytes> for TestData {
-    fn from_codec(codec: codec::RawBytes) -> Self {
-        TestData(codec.0)
+impl codec::Decode for TestData {
+    fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, codec::CodecError> {
+        let len = u32::decode(reader)? as usize;
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf)?;
+        Ok(Self(buf))
+    }
+}
+
+impl codec::BorrowPayload for TestData {
+    fn payload_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -202,24 +216,18 @@ fn test_two_node_two_group_cluster() {
         let dir1 = tempfile::tempdir().expect("tempdir node1");
         let dir2 = tempfile::tempdir().expect("tempdir node2");
 
-        let storage1 = MultiplexedLogStorage::<TestConfig>::new(MultiplexedStorageConfig {
-            base_dir: dir1.path().to_path_buf(),
-            num_shards: 1,
-            segment_size: 4 * 1024 * 1024,
-            fsync_interval: None,
-            max_cache_entries_per_group: 1024,
-            max_record_size: Some(1024 * 1024),
-        })
+        let storage1 = MultiplexedLogStorage::<TestConfig>::new(
+            MmapStorageConfig::new(dir1.path())
+                .with_segment_size(4 * 1024 * 1024)
+                .with_fsync_delay(Duration::ZERO),
+        )
         .await
         .expect("storage1");
-        let storage2 = MultiplexedLogStorage::<TestConfig>::new(MultiplexedStorageConfig {
-            base_dir: dir2.path().to_path_buf(),
-            num_shards: 1,
-            segment_size: 4 * 1024 * 1024,
-            fsync_interval: None,
-            max_cache_entries_per_group: 1024,
-            max_record_size: Some(1024 * 1024),
-        })
+        let storage2 = MultiplexedLogStorage::<TestConfig>::new(
+            MmapStorageConfig::new(dir2.path())
+                .with_segment_size(4 * 1024 * 1024)
+                .with_fsync_delay(Duration::ZERO),
+        )
         .await
         .expect("storage2");
 

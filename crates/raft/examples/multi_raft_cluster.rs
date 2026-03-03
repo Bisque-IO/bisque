@@ -37,11 +37,11 @@
 //! in all groups, demonstrating how multi-raft enables horizontal scaling.
 
 use bisque_raft::BisqueRaftTypeConfig;
-use bisque_raft::multi::codec::{FromCodec, RawBytes, ToCodec};
+use bisque_raft::multi::codec::{BorrowPayload, CodecError, Decode, Encode};
 use bisque_raft::multi::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
-    DefaultNodeRegistry, MultiRaftManager, MultiplexedLogStorage,
-    MultiplexedStorageConfig, NodeAddressResolver,
+    DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
+    NodeAddressResolver,
 };
 use futures::StreamExt;
 use openraft::impls::BasicNode;
@@ -100,21 +100,38 @@ impl fmt::Display for KvResponse {
 }
 
 // Implement codec traits for KvCommand to work with multi-raft
-impl ToCodec<RawBytes> for KvCommand {
-    fn to_codec(&self) -> RawBytes {
-        // Use bincode for serialization
+impl Encode for KvCommand {
+    fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         let bytes = bincode::serde::encode_to_vec(self, bincode::config::standard())
             .expect("serialization should not fail");
-        RawBytes(bytes)
+        (bytes.len() as u32).encode(writer)?;
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+    fn encoded_size(&self) -> usize {
+        let bytes = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .expect("serialization should not fail");
+        4 + bytes.len()
     }
 }
 
-impl FromCodec<RawBytes> for KvCommand {
-    fn from_codec(raw: RawBytes) -> Self {
+impl Decode for KvCommand {
+    fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, CodecError> {
+        let len = u32::decode(reader)? as usize;
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf)?;
         let (cmd, _): (KvCommand, _) =
-            bincode::serde::decode_from_slice(&raw.0, bincode::config::standard())
-                .expect("deserialization should not fail");
-        cmd
+            bincode::serde::decode_from_slice(&buf, bincode::config::standard())
+                .map_err(|e| CodecError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+        Ok(cmd)
+    }
+}
+
+impl BorrowPayload for KvCommand {
+    fn payload_bytes(&self) -> &[u8] {
+        // KvCommand doesn't own a contiguous byte buffer, so we return an empty slice.
+        // The mmap storage uses this for size hints; actual encoding goes through Encode.
+        &[]
     }
 }
 
@@ -314,17 +331,11 @@ async fn create_node(
     let node_dir = base_dir.join(format!("node-{}", node_id));
     std::fs::create_dir_all(&node_dir).expect("Failed to create node dir");
 
-    // Create storage configuration with 4 shards
-    let storage_config = MultiplexedStorageConfig {
-        base_dir: node_dir.clone(),
-        num_shards: 4,
-        segment_size: 64 * 1024 * 1024, // 64MB segment files
-        fsync_interval: None,
-        max_cache_entries_per_group: 10000,
-        max_record_size: Some(1024 * 1024),
-    };
+    // Create storage configuration
+    let storage_config = MmapStorageConfig::new(&node_dir)
+        .with_segment_size(64 * 1024 * 1024); // 64MB segment files
 
-    // Create the sharded log storage
+    // Create the mmap log storage
     let storage = MultiplexedLogStorage::<KvTypeConfig>::new(storage_config)
         .await
         .expect("Failed to create storage");

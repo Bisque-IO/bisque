@@ -12,17 +12,18 @@
 //! - Request IDs correlate responses to their original requests
 
 use crate::multi::codec::{
-    Decode, RawBytes, ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage,
-    SnapshotMeta as CodecSnapshotMeta, Vote as CodecVote,
+    Decode, Encode, ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage,
 };
 use crate::multi::manager::MultiRaftManager;
 use crate::multi::network::MultiplexedTransport;
 use crate::multi::storage::MultiRaftLogStorage;
-use crate::multi::tcp_transport::{BoxedReader, BoxedWriter, FRAME_PREFIX_LEN, encode_framed_append};
+use crate::multi::transport_tcp::{
+    BoxedReader, BoxedWriter, FRAME_PREFIX_LEN, encode_framed,
+};
 use bytes::{Buf, BytesMut};
 use dashmap::DashMap;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use openraft::RaftTypeConfig;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -44,11 +45,11 @@ struct SnapshotTransferKey {
 }
 
 /// State for an in-progress chunked snapshot transfer
-struct SnapshotAccumulator {
+struct SnapshotAccumulator<C: RaftTypeConfig> {
     /// Vote from the leader sending the snapshot
-    vote: CodecVote,
+    vote: C::Vote,
     /// Snapshot metadata
-    meta: CodecSnapshotMeta,
+    meta: openraft::storage::SnapshotMeta<C>,
     /// Accumulated data chunks
     data: Vec<u8>,
     /// Expected next offset
@@ -57,8 +58,8 @@ struct SnapshotAccumulator {
     last_activity: Instant,
 }
 
-impl SnapshotAccumulator {
-    fn new(vote: CodecVote, meta: CodecSnapshotMeta) -> Self {
+impl<C: RaftTypeConfig> SnapshotAccumulator<C> {
+    fn new(vote: C::Vote, meta: openraft::storage::SnapshotMeta<C>) -> Self {
         Self {
             vote,
             meta,
@@ -92,16 +93,16 @@ impl SnapshotAccumulator {
 }
 
 /// Manages in-progress snapshot transfers across all groups
-struct SnapshotTransferManager {
+struct SnapshotTransferManager<C: RaftTypeConfig> {
     /// In-progress transfers keyed by (group_id, snapshot_id)
-    transfers: DashMap<SnapshotTransferKey, SnapshotAccumulator>,
+    transfers: DashMap<SnapshotTransferKey, SnapshotAccumulator<C>>,
     /// Timeout for incomplete transfers (default 5 minutes)
     transfer_timeout: Duration,
     /// Counter for periodic cleanup (every N calls)
     cleanup_counter: AtomicU64,
 }
 
-impl SnapshotTransferManager {
+impl<C: RaftTypeConfig> SnapshotTransferManager<C> {
     fn new(transfer_timeout: Duration) -> Self {
         Self {
             transfers: DashMap::new(),
@@ -123,9 +124,9 @@ impl SnapshotTransferManager {
         &self,
         group_id: u64,
         snapshot_id: String,
-        vote: CodecVote,
-        meta: CodecSnapshotMeta,
-    ) -> dashmap::mapref::one::RefMut<'_, SnapshotTransferKey, SnapshotAccumulator> {
+        vote: C::Vote,
+        meta: openraft::storage::SnapshotMeta<C>,
+    ) -> dashmap::mapref::one::RefMut<'_, SnapshotTransferKey, SnapshotAccumulator<C>> {
         let key = SnapshotTransferKey {
             group_id,
             snapshot_id: snapshot_id.clone(),
@@ -137,7 +138,7 @@ impl SnapshotTransferManager {
     }
 
     /// Remove a completed or aborted transfer
-    fn remove(&self, group_id: u64, snapshot_id: &str) -> Option<SnapshotAccumulator> {
+    fn remove(&self, group_id: u64, snapshot_id: &str) -> Option<SnapshotAccumulator<C>> {
         let key = SnapshotTransferKey {
             group_id,
             snapshot_id: snapshot_id.to_string(),
@@ -199,7 +200,7 @@ where
     /// Active connection count
     active_connections: AtomicU64,
     /// Manages in-progress chunked snapshot transfers
-    snapshot_transfers: Arc<SnapshotTransferManager>,
+    snapshot_transfers: Arc<SnapshotTransferManager<C>>,
     /// Shutdown signal sender
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Shutdown signal receiver (cloneable)
@@ -219,8 +220,7 @@ where
             SnapshotData = std::io::Cursor<Vec<u8>>,
         >,
     C::Entry: Clone,
-    C::D: crate::multi::codec::ToCodec<crate::multi::codec::RawBytes>
-        + crate::multi::codec::FromCodec<crate::multi::codec::RawBytes>,
+    C::D: Encode + Decode,
     T: MultiplexedTransport<C>,
     S: MultiRaftLogStorage<C>,
 {
@@ -388,9 +388,8 @@ where
         // Shared connection alive flag
         let alive = Arc::new(AtomicBool::new(true));
 
-        // Channel for response messages (structured data, encoding deferred to writer)
-        let (response_tx, response_rx) =
-            crossfire::mpsc::bounded_async::<CodecRpcMessage<RawBytes>>(256);
+        // Channel for pre-encoded response frames (encoding done on producer side)
+        let (response_tx, response_rx) = crossfire::mpsc::bounded_async::<Vec<u8>>(256);
 
         // Spawn writer task (long-lived: one per connection)
         let alive_writer = alive.clone();
@@ -410,24 +409,20 @@ where
         result
     }
 
-    /// Writer loop — receives structured response messages and encodes into a
-    /// single reusable buffer. Zero allocation after warmup.
-    ///
-    /// Encoding is deferred to the writer instead of the reader, so:
-    /// - No per-response `Vec<u8>` allocation from `encode_framed` / TLS pool
-    /// - Single reusable `encode_buf` grows to steady-state and stays there
-    /// - Batch: multiple responses are appended into the same buffer, one `write_all`
+    /// Writer loop — receives pre-encoded response frames and flushes them
+    /// with `write_vectored` (writev syscall). Zero encoding, zero allocation.
     async fn response_writer_loop(
         mut write_half: BoxedWriter,
-        response_rx: crossfire::AsyncRx<crossfire::mpsc::Array<CodecRpcMessage<RawBytes>>>,
+        response_rx: crossfire::AsyncRx<crossfire::mpsc::Array<Vec<u8>>>,
         alive: Arc<std::sync::atomic::AtomicBool>,
     ) {
         use crossfire::TryRecvError;
+        use std::io::IoSlice;
         use std::sync::atomic::Ordering;
         use tokio::io::AsyncWriteExt;
 
-        // Single reusable buffer — grows to max response size, zero alloc after warmup
-        let mut encode_buf: Vec<u8> = Vec::with_capacity(4096);
+        // Reusable vec for collecting pre-encoded frames each iteration
+        let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(32);
 
         loop {
             if !alive.load(Ordering::Acquire) {
@@ -435,44 +430,68 @@ where
                 return;
             }
 
-            // Block for the first response message
+            // Block for the first pre-encoded response frame
             let first = match response_rx.recv().await {
-                Ok(msg) => msg,
+                Ok(buf) => buf,
                 Err(_) => {
                     tracing::trace!("RPC writer: channel closed, exiting");
                     return;
                 }
             };
+            let mut batch_bytes = first.len();
+            data_bufs.push(first);
 
-            // Encode first response into reusable buffer
-            encode_buf.clear();
-            if let Err(e) = encode_framed_append(&first, &mut encode_buf) {
-                tracing::error!("RPC writer: failed to encode response: {}", e);
-                continue;
-            }
-
-            // Drain all immediately ready responses into the same buffer (batch)
+            // Drain immediately ready responses up to a byte budget so we
+            // write in bounded batches instead of accumulating unbounded data.
+            const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
             loop {
                 match response_rx.try_recv() {
-                    Ok(msg) => {
-                        if let Err(e) = encode_framed_append(&msg, &mut encode_buf) {
-                            tracing::error!("RPC writer: failed to encode batched response: {}", e);
+                    Ok(buf) => {
+                        batch_bytes += buf.len();
+                        data_bufs.push(buf);
+                        if batch_bytes >= MAX_BATCH_BYTES {
+                            break;
                         }
                     }
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                 }
             }
 
-            // Single write_all for all batched responses
-            if let Err(e) = write_half.write_all(&encode_buf).await {
-                tracing::error!("RPC writer: failed to write response batch: {}", e);
+            // Vectored write — writev() syscall, stack-allocated IoSlice, zero alloc
+            let write_err: Option<std::io::Error> = 'write: {
+                let mut pos = 0;
+                while pos < data_bufs.len() {
+                    let chunk = &data_bufs[pos..];
+                    let n = chunk.len().min(64);
+                    let mut slices = [IoSlice::new(&[]); 64];
+                    for (s, b) in slices[..n].iter_mut().zip(chunk.iter()) {
+                        *s = IoSlice::new(b);
+                    }
+                    let mut remaining: &mut [IoSlice<'_>] = &mut slices[..n];
+                    while !remaining.is_empty() {
+                        match write_half.write_vectored(remaining).await {
+                            Ok(0) => break 'write Some(
+                                std::io::ErrorKind::WriteZero.into(),
+                            ),
+                            Ok(w) => IoSlice::advance_slices(&mut remaining, w),
+                            Err(e) => break 'write Some(e),
+                        }
+                    }
+                    pos += n;
+                }
+                None
+            };
+
+            data_bufs.clear();
+
+            if let Some(e) = write_err {
+                tracing::error!("RPC writer: {e}");
                 alive.store(false, Ordering::Release);
                 return;
             }
 
-            // Flush to ensure data is sent, especially important for TLS
             if let Err(e) = write_half.flush().await {
-                tracing::error!("RPC writer: failed to flush: {}", e);
+                tracing::error!("RPC writer: failed to flush: {e}");
                 alive.store(false, Ordering::Release);
                 return;
             }
@@ -488,7 +507,7 @@ where
         &self,
         mut read_half: BoxedReader,
         peer_addr: SocketAddr,
-        response_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<CodecRpcMessage<RawBytes>>>,
+        response_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<Vec<u8>>>,
         alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use std::sync::atomic::Ordering;
@@ -520,7 +539,7 @@ where
                 // Complete frame — decode directly from buffer
                 let frame_start = FRAME_PREFIX_LEN;
                 let frame_end = FRAME_PREFIX_LEN + payload_len;
-                let request: CodecRpcMessage<RawBytes> =
+                let request: CodecRpcMessage<C> =
                     match CodecRpcMessage::decode_from_slice(&buf[frame_start..frame_end]) {
                         Ok(req) => req,
                         Err(e) => {
@@ -549,11 +568,12 @@ where
                 let snapshot_transfers = self.snapshot_transfers.clone();
                 let mcr = max_concurrent;
 
-                // Process in FuturesUnordered — no tokio::spawn, no Box::pin, no encoding
-                // Response message is sent as structured data; encoding deferred to writer
+                // Process + encode in FuturesUnordered — yields pre-framed Vec<u8>
                 in_flight.push(async move {
-                    Self::process_codec_request(&manager, &snapshot_transfers, request, mcr)
-                        .await
+                    let msg =
+                        Self::process_codec_request(&manager, &snapshot_transfers, request, mcr)
+                            .await;
+                    encode_framed(&msg).expect("encode to Vec cannot fail")
                 });
             }
 
@@ -590,10 +610,7 @@ where
                     Ok(Ok(_)) => {} // Data read, loop back to parse frames
                     Ok(Err(e)) => {
                         if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                            tracing::trace!(
-                                "RPC reader: connection closed by peer: {}",
-                                peer_addr
-                            );
+                            tracing::trace!("RPC reader: connection closed by peer: {}", peer_addr);
                             eof = true;
                         } else {
                             return Err(Box::new(e));
@@ -653,16 +670,10 @@ where
     /// Process a codec request and return a codec response
     async fn process_codec_request(
         manager: &Arc<MultiRaftManager<C, T, S>>,
-        snapshot_transfers: &Arc<SnapshotTransferManager>,
-        request: CodecRpcMessage<RawBytes>,
-        max_concurrent_requests: usize,
-    ) -> CodecRpcMessage<RawBytes> {
-        use crate::multi::codec::{
-            AppendEntriesResponse as CodecAppendEntriesResponse, FromCodec,
-            InstallSnapshotResponse as CodecInstallSnapshotResponse, ToCodec,
-            VoteResponse as CodecVoteResponse,
-        };
-
+        snapshot_transfers: &Arc<SnapshotTransferManager<C>>,
+        request: CodecRpcMessage<C>,
+        _max_concurrent_requests: usize,
+    ) -> CodecRpcMessage<C> {
         match request {
             CodecRpcMessage::AppendEntries {
                 request_id,
@@ -677,56 +688,20 @@ where
                 );
 
                 if let Some(raft) = manager.get_group(group_id) {
-                    // Convert codec types to raft types using FromCodec
-                    let vote = openraft::impls::Vote::<C>::from_codec(rpc.vote);
-                    let prev_log_id = rpc.prev_log_id.map(|l| openraft::LogId::<C>::from_codec(l));
-                    let leader_commit = rpc
-                        .leader_commit
-                        .map(|l| openraft::LogId::<C>::from_codec(l));
-
-                    // Convert entries using FromCodec trait - pre-allocate capacity
-                    let entry_count = rpc.entries.len();
-                    let mut entries: Vec<C::Entry> = Vec::with_capacity(entry_count);
-                    for e in rpc.entries {
-                        entries.push(openraft::impls::Entry::<C>::from_codec(e));
-                    }
-                    let raft_rpc = openraft::raft::AppendEntriesRequest {
-                        vote,
-                        prev_log_id,
-                        entries,
-                        leader_commit,
-                    };
-
                     tracing::trace!(
                         "AppendEntries handler: calling raft.append_entries (req_id={}, entries={})",
                         request_id,
-                        entry_count
+                        rpc.entries.len()
                     );
-                    match raft.append_entries(raft_rpc).await {
+                    match raft.append_entries(rpc).await {
                         Ok(response) => {
                             tracing::trace!(
                                 "AppendEntries handler: got Ok response (req_id={})",
                                 request_id
                             );
-                            let codec_response = match response {
-                                openraft::raft::AppendEntriesResponse::Success => {
-                                    CodecAppendEntriesResponse::Success
-                                }
-                                openraft::raft::AppendEntriesResponse::PartialSuccess(lid) => {
-                                    CodecAppendEntriesResponse::PartialSuccess(
-                                        lid.map(|l| l.to_codec()),
-                                    )
-                                }
-                                openraft::raft::AppendEntriesResponse::Conflict => {
-                                    CodecAppendEntriesResponse::Conflict
-                                }
-                                openraft::raft::AppendEntriesResponse::HigherVote(v) => {
-                                    CodecAppendEntriesResponse::HigherVote(v.to_codec())
-                                }
-                            };
                             CodecRpcMessage::Response {
                                 request_id,
-                                message: CodecResponseMessage::AppendEntries(codec_response),
+                                message: CodecResponseMessage::AppendEntries(response),
                             }
                         }
                         Err(e) => {
@@ -761,20 +736,11 @@ where
                 );
 
                 if let Some(raft) = manager.get_group(group_id) {
-                    let vote = openraft::impls::Vote::<C>::from_codec(rpc.vote);
-                    let last_log_id = rpc.last_log_id.map(|l| openraft::LogId::<C>::from_codec(l));
-                    let raft_rpc = openraft::raft::VoteRequest { vote, last_log_id };
-
-                    match raft.vote(raft_rpc).await {
+                    match raft.vote(rpc).await {
                         Ok(response) => {
-                            let codec_response = CodecVoteResponse {
-                                vote: response.vote.to_codec(),
-                                vote_granted: response.vote_granted,
-                                last_log_id: response.last_log_id.map(|l| l.to_codec()),
-                            };
                             CodecRpcMessage::Response {
                                 request_id,
-                                message: CodecResponseMessage::Vote(codec_response),
+                                message: CodecResponseMessage::Vote(response),
                             }
                         }
                         Err(e) => CodecRpcMessage::Error {
@@ -803,7 +769,7 @@ where
                     snapshot_id,
                     rpc.offset,
                     rpc.done,
-                    rpc.data.0.len()
+                    rpc.data.len()
                 );
 
                 if let Some(raft) = manager.get_group(group_id) {
@@ -812,21 +778,20 @@ where
 
                     if rpc.offset == 0 && rpc.done {
                         // Full snapshot in one piece - no accumulation needed
-                        let vote = openraft::impls::Vote::<C>::from_codec(rpc.vote);
-                        let meta = openraft::storage::SnapshotMeta::<C>::from_codec(rpc.meta);
                         let snapshot = openraft::storage::Snapshot {
-                            meta,
-                            snapshot: std::io::Cursor::new(rpc.data.0),
+                            meta: rpc.meta,
+                            snapshot: std::io::Cursor::new(rpc.data),
                         };
 
-                        match raft.install_full_snapshot(vote, snapshot).await {
+                        match raft.install_full_snapshot(rpc.vote, snapshot).await {
                             Ok(response) => {
-                                let codec_response = CodecInstallSnapshotResponse {
-                                    vote: response.vote.to_codec(),
-                                };
                                 CodecRpcMessage::Response {
                                     request_id,
-                                    message: CodecResponseMessage::InstallSnapshot(codec_response),
+                                    message: CodecResponseMessage::InstallSnapshot(
+                                        openraft::raft::InstallSnapshotResponse {
+                                            vote: response.vote,
+                                        },
+                                    ),
                                 }
                             }
                             Err(e) => CodecRpcMessage::Error {
@@ -840,7 +805,7 @@ where
                             "Starting chunked snapshot transfer for group {} (snapshot_id={}, first_chunk_len={})",
                             group_id,
                             snapshot_id,
-                            rpc.data.0.len()
+                            rpc.data.len()
                         );
 
                         let mut acc = snapshot_transfers.get_or_create(
@@ -851,7 +816,7 @@ where
                         );
 
                         // Append the first chunk
-                        if !acc.append_chunk(rpc.offset, &rpc.data.0) {
+                        if !acc.append_chunk(rpc.offset, &rpc.data) {
                             drop(acc);
                             snapshot_transfers.remove(group_id, &snapshot_id);
                             return CodecRpcMessage::Error {
@@ -861,10 +826,11 @@ where
                         }
 
                         // Return success to continue receiving chunks
-                        let codec_response = CodecInstallSnapshotResponse { vote: rpc.vote };
                         CodecRpcMessage::Response {
                             request_id,
-                            message: CodecResponseMessage::InstallSnapshot(codec_response),
+                            message: CodecResponseMessage::InstallSnapshot(
+                                openraft::raft::InstallSnapshotResponse { vote: rpc.vote },
+                            ),
                         }
                     } else {
                         // Subsequent chunk - append to existing accumulator
@@ -875,7 +841,7 @@ where
 
                         if let Some(mut acc) = snapshot_transfers.transfers.get_mut(&key) {
                             let expected_offset = acc.next_offset;
-                            if !acc.append_chunk(rpc.offset, &rpc.data.0) {
+                            if !acc.append_chunk(rpc.offset, &rpc.data) {
                                 drop(acc);
                                 snapshot_transfers.remove(group_id, &snapshot_id);
                                 return CodecRpcMessage::Error {
@@ -889,10 +855,8 @@ where
 
                             if rpc.done {
                                 // Final chunk - install the complete snapshot
-                                let vote = openraft::impls::Vote::<C>::from_codec(acc.vote.clone());
-                                let meta = openraft::storage::SnapshotMeta::<C>::from_codec(
-                                    acc.meta.clone(),
-                                );
+                                let vote = acc.vote.clone();
+                                let meta = acc.meta.clone();
                                 let data = std::mem::take(&mut acc.data);
                                 drop(acc);
 
@@ -913,13 +877,12 @@ where
 
                                 match raft.install_full_snapshot(vote, snapshot).await {
                                     Ok(response) => {
-                                        let codec_response = CodecInstallSnapshotResponse {
-                                            vote: response.vote.to_codec(),
-                                        };
                                         CodecRpcMessage::Response {
                                             request_id,
                                             message: CodecResponseMessage::InstallSnapshot(
-                                                codec_response,
+                                                openraft::raft::InstallSnapshotResponse {
+                                                    vote: response.vote,
+                                                },
                                             ),
                                         }
                                     }
@@ -938,11 +901,11 @@ where
                                     acc.next_offset
                                 );
 
-                                let codec_response =
-                                    CodecInstallSnapshotResponse { vote: rpc.vote };
                                 CodecRpcMessage::Response {
                                     request_id,
-                                    message: CodecResponseMessage::InstallSnapshot(codec_response),
+                                    message: CodecResponseMessage::InstallSnapshot(
+                                        openraft::raft::InstallSnapshotResponse { vote: rpc.vote },
+                                    ),
                                 }
                             }
                         } else {
@@ -1058,24 +1021,34 @@ pub mod protocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi::codec::{RawBytes, SnapshotMeta as CodecSnapshotMeta, Vote as CodecVote};
     use std::time::{Duration, Instant};
 
-    #[test]
-    fn test_snapshot_accumulator_append_chunk() {
-        let vote = CodecVote {
-            leader_id: crate::multi::codec::LeaderId {
+    type C = crate::multi::test_support::TestConfig;
+
+    fn test_vote() -> openraft::impls::Vote<C> {
+        openraft::impls::Vote {
+            leader_id: openraft::impls::leader_id_adv::LeaderId {
                 term: 1,
                 node_id: 1,
             },
             committed: true,
-        };
-        let meta = CodecSnapshotMeta {
+        }
+    }
+
+    fn test_snapshot_meta() -> openraft::storage::SnapshotMeta<C> {
+        openraft::storage::SnapshotMeta {
             last_log_id: None,
-            last_membership: crate::multi::codec::StoredMembership::default(),
+            last_membership: openraft::StoredMembership::new(
+                None,
+                openraft::Membership::new_with_defaults(vec![vec![1u64].into_iter().collect()], Vec::<u64>::new()),
+            ),
             snapshot_id: "test-snap".to_string(),
-        };
-        let mut acc = SnapshotAccumulator::new(vote.clone(), meta.clone());
+        }
+    }
+
+    #[test]
+    fn test_snapshot_accumulator_append_chunk() {
+        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta());
 
         // Append first chunk
         assert!(acc.append_chunk(0, b"chunk1"));
@@ -1094,19 +1067,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_accumulator_expiry() {
-        let vote = CodecVote {
-            leader_id: crate::multi::codec::LeaderId {
-                term: 1,
-                node_id: 1,
-            },
-            committed: true,
-        };
-        let meta = CodecSnapshotMeta {
-            last_log_id: None,
-            last_membership: crate::multi::codec::StoredMembership::default(),
-            snapshot_id: "test-snap".to_string(),
-        };
-        let mut acc = SnapshotAccumulator::new(vote, meta);
+        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta());
 
         // Should not be expired immediately
         assert!(!acc.is_expired(Duration::from_secs(60)));
@@ -1118,20 +1079,11 @@ mod tests {
 
     #[test]
     fn test_snapshot_transfer_manager() {
-        let manager = SnapshotTransferManager::new(Duration::from_secs(60));
+        let manager = SnapshotTransferManager::<C>::new(Duration::from_secs(60));
 
-        let vote = CodecVote {
-            leader_id: crate::multi::codec::LeaderId {
-                term: 1,
-                node_id: 1,
-            },
-            committed: true,
-        };
-        let meta = CodecSnapshotMeta {
-            last_log_id: None,
-            last_membership: crate::multi::codec::StoredMembership::default(),
-            snapshot_id: "snap-1".to_string(),
-        };
+        let vote = test_vote();
+        let mut meta = test_snapshot_meta();
+        meta.snapshot_id = "snap-1".to_string();
 
         // Get or create accumulator
         let mut acc = manager.get_or_create(1, "snap-1".to_string(), vote.clone(), meta.clone());
@@ -1158,20 +1110,11 @@ mod tests {
 
     #[test]
     fn test_snapshot_transfer_manager_cleanup_expired() {
-        let manager = SnapshotTransferManager::new(Duration::from_secs(1));
+        let manager = SnapshotTransferManager::<C>::new(Duration::from_secs(1));
 
-        let vote = CodecVote {
-            leader_id: crate::multi::codec::LeaderId {
-                term: 1,
-                node_id: 1,
-            },
-            committed: true,
-        };
-        let meta = CodecSnapshotMeta {
-            last_log_id: None,
-            last_membership: crate::multi::codec::StoredMembership::default(),
-            snapshot_id: "snap-1".to_string(),
-        };
+        let vote = test_vote();
+        let mut meta = test_snapshot_meta();
+        meta.snapshot_id = "snap-1".to_string();
 
         // Create an accumulator
         let mut acc = manager.get_or_create(1, "snap-1".to_string(), vote, meta);

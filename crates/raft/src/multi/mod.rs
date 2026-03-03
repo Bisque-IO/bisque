@@ -3,12 +3,11 @@ pub mod config;
 pub mod manager;
 pub(crate) mod manifest_mdbx;
 pub mod network;
+pub mod record_format;
 pub mod rpc_server;
-pub(crate) mod segment_footer;
 pub mod storage;
-pub mod storage_impl;
 pub mod storage_mmap;
-pub mod tcp_transport;
+pub mod transport_tcp;
 pub mod type_config;
 
 #[cfg(test)]
@@ -16,8 +15,6 @@ mod test_support;
 
 #[cfg(test)]
 mod network_tests;
-
-// storage_tests module removed - tests integrated into storage_impl.rs
 
 pub use manager::MultiRaftManager;
 pub use network::{MultiRaftNetwork, MultiRaftNetworkFactory, MultiplexedTransport};
@@ -27,9 +24,13 @@ pub use rpc_server::{
     BisqueRpcServer, BisqueRpcServerConfig,
     protocol::{ResponseMessage, RpcMessage},
 };
-pub use storage_impl::{GroupLogStorage, MultiplexedLogStorage, MultiplexedStorageConfig};
-pub use storage_mmap::{MmapGroupLogStorage, MmapPerGroupLogStorage, MmapStorageConfig};
-pub use tcp_transport::{
+pub use storage_mmap::MmapGroupLogStorage as GroupLogStorage;
+pub use storage_mmap::MmapGroupLogStorage;
+pub use storage_mmap::MmapPerGroupLogStorage;
+pub use storage_mmap::MmapPerGroupLogStorage as MultiplexedLogStorage;
+pub use storage_mmap::MmapStorageConfig;
+pub use storage_mmap::MmapStorageConfig as MultiplexedStorageConfig;
+pub use transport_tcp::{
     BisqueTcpTransport, BisqueTcpTransportConfig, BisqueTransportError, BoxedReader, BoxedWriter,
     DefaultNodeRegistry, NodeAddressResolver,
 };

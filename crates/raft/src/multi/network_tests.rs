@@ -17,11 +17,10 @@
 //! - End-to-end client↔server RPC roundtrips
 
 use crate::multi::codec::{
-    AppendEntriesRequest as CodecAppendEntriesRequest,
-    AppendEntriesResponse as CodecAppendEntriesResponse, Decode, Encode, LeaderId, RawBytes,
-    ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage, Vote as CodecVote,
+    Decode, Encode,
+    ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage,
 };
-use crate::multi::tcp_transport::{
+use crate::multi::transport_tcp::{
     BisqueTransportError, FRAME_PREFIX_LEN, encode_framed, read_frame, read_frame_into,
     return_encode_buffer, write_frame, write_preframed,
 };
@@ -29,6 +28,8 @@ use bytes::{Buf, BytesMut};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+type C = crate::multi::test_support::TestConfig;
 
 // ============================================================================
 // Helpers
@@ -41,19 +42,20 @@ async fn ephemeral_listener() -> (TcpListener, std::net::SocketAddr) {
     (listener, addr)
 }
 
+fn test_vote() -> openraft::impls::Vote<C> {
+    openraft::impls::Vote {
+        leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+        committed: true,
+    }
+}
+
 /// Build a minimal codec AppendEntries request for testing.
-fn make_append_request(request_id: u64, group_id: u64) -> CodecRpcMessage<RawBytes> {
+fn make_append_request(request_id: u64, group_id: u64) -> CodecRpcMessage<C> {
     CodecRpcMessage::AppendEntries {
         request_id,
         group_id,
-        rpc: CodecAppendEntriesRequest {
-            vote: CodecVote {
-                leader_id: LeaderId {
-                    term: 1,
-                    node_id: 1,
-                },
-                committed: true,
-            },
+        rpc: openraft::raft::AppendEntriesRequest {
+            vote: test_vote(),
             prev_log_id: None,
             entries: vec![],
             leader_commit: None,
@@ -62,10 +64,12 @@ fn make_append_request(request_id: u64, group_id: u64) -> CodecRpcMessage<RawByt
 }
 
 /// Build a minimal codec Response for testing.
-fn make_response(request_id: u64) -> CodecRpcMessage<RawBytes> {
+fn make_response(request_id: u64) -> CodecRpcMessage<C> {
     CodecRpcMessage::Response {
         request_id,
-        message: CodecResponseMessage::AppendEntries(CodecAppendEntriesResponse::Success),
+        message: CodecResponseMessage::AppendEntries(
+            openraft::raft::AppendEntriesResponse::Success,
+        ),
     }
 }
 
@@ -84,7 +88,7 @@ async fn test_encode_framed_roundtrip() {
     assert_eq!(payload_len, framed.len() - FRAME_PREFIX_LEN);
 
     // Decode from the payload slice
-    let decoded: CodecRpcMessage<RawBytes> =
+    let decoded: CodecRpcMessage<C> =
         CodecRpcMessage::decode_from_slice(&framed[FRAME_PREFIX_LEN..]).unwrap();
     assert_eq!(decoded.request_id(), 42);
 
@@ -111,7 +115,7 @@ async fn test_write_preframed_roundtrip() {
 
     let (mut server_stream, _) = listener.accept().await.unwrap();
     let data = read_frame(&mut server_stream).await.unwrap();
-    let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(&data).unwrap();
+    let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(&data).unwrap();
     assert_eq!(decoded.request_id(), 7);
 
     writer.await.unwrap();
@@ -136,7 +140,7 @@ async fn test_read_frame_into_roundtrip() {
         .await
         .unwrap();
     assert!(n > 0);
-    let decoded: CodecRpcMessage<RawBytes> =
+    let decoded: CodecRpcMessage<C> =
         CodecRpcMessage::decode_from_slice(&reuse_buf[..n]).unwrap();
     assert_eq!(decoded.request_id(), 99);
 
@@ -154,27 +158,18 @@ async fn test_read_frame_into_reuses_buffer_capacity() {
         let framed1 = encode_framed(&small).unwrap();
         let _ = write_preframed(&mut stream, framed1).await.unwrap();
 
-        let large = CodecRpcMessage::<RawBytes>::AppendEntries {
+        let large = CodecRpcMessage::<C>::AppendEntries {
             request_id: 2,
             group_id: 1,
-            rpc: CodecAppendEntriesRequest {
-                vote: CodecVote {
-                    leader_id: LeaderId {
-                        term: 1,
-                        node_id: 1,
-                    },
-                    committed: true,
-                },
+            rpc: openraft::raft::AppendEntriesRequest {
+                vote: test_vote(),
                 prev_log_id: None,
-                entries: vec![crate::multi::codec::Entry {
-                    log_id: crate::multi::codec::LogId {
-                        leader_id: LeaderId {
-                            term: 1,
-                            node_id: 1,
-                        },
+                entries: vec![openraft::impls::Entry::<C> {
+                    log_id: openraft::LogId {
+                        leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
                         index: 1,
                     },
-                    payload: crate::multi::codec::EntryPayload::Normal(RawBytes(vec![0xAB; 4096])),
+                    payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(vec![0xAB; 4096].into())),
                 }],
                 leader_commit: None,
             },
@@ -250,7 +245,7 @@ async fn test_rolling_buffer_multiple_frames_in_single_read() {
             if buf.len() < FRAME_PREFIX_LEN + payload_len {
                 break;
             }
-            let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(
+            let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(
                 &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
             )
             .unwrap();
@@ -311,7 +306,7 @@ async fn test_rolling_buffer_partial_frame_across_reads() {
             let payload_len =
                 u32::from_le_bytes(buf[..FRAME_PREFIX_LEN].try_into().unwrap()) as usize;
             if buf.len() >= FRAME_PREFIX_LEN + payload_len {
-                let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(
+                let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(
                     &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
                 )
                 .unwrap();
@@ -374,7 +369,7 @@ async fn test_rolling_buffer_zero_length_frames() {
             if buf.len() < FRAME_PREFIX_LEN + payload_len {
                 break;
             }
-            let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(
+            let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(
                 &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
             )
             .unwrap();
@@ -400,28 +395,18 @@ async fn test_rolling_buffer_zero_length_frames() {
 #[tokio::test]
 async fn test_rolling_buffer_large_frame() {
     // Test a frame larger than the initial buffer capacity
-    let large_payload = RawBytes(vec![0xDE; 128 * 1024]); // 128KB
-    let msg = CodecRpcMessage::<RawBytes>::AppendEntries {
+    let msg = CodecRpcMessage::<C>::AppendEntries {
         request_id: 1,
         group_id: 1,
-        rpc: CodecAppendEntriesRequest {
-            vote: CodecVote {
-                leader_id: LeaderId {
-                    term: 1,
-                    node_id: 1,
-                },
-                committed: true,
-            },
+        rpc: openraft::raft::AppendEntriesRequest {
+            vote: test_vote(),
             prev_log_id: None,
-            entries: vec![crate::multi::codec::Entry {
-                log_id: crate::multi::codec::LogId {
-                    leader_id: LeaderId {
-                        term: 1,
-                        node_id: 1,
-                    },
+            entries: vec![openraft::impls::Entry::<C> {
+                log_id: openraft::LogId {
+                    leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
                     index: 1,
                 },
-                payload: crate::multi::codec::EntryPayload::Normal(large_payload),
+                payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(vec![0xDE; 128 * 1024].into())),
             }],
             leader_commit: None,
         },
@@ -447,7 +432,7 @@ async fn test_rolling_buffer_large_frame() {
                 u32::from_le_bytes(buf[..FRAME_PREFIX_LEN].try_into().unwrap()) as usize;
             assert_eq!(payload_len, expected_payload_len);
             if buf.len() >= FRAME_PREFIX_LEN + payload_len {
-                let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(
+                let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(
                     &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
                 )
                 .unwrap();
@@ -606,7 +591,7 @@ async fn test_corrupted_payload_decode_fails() {
     let (mut server_stream, _) = listener.accept().await.unwrap();
     let data = read_frame(&mut server_stream).await.unwrap();
     // The frame reads fine, but decoding the codec message should fail
-    let result = CodecRpcMessage::<RawBytes>::decode_from_slice(&data);
+    let result = CodecRpcMessage::<C>::decode_from_slice(&data);
     assert!(result.is_err(), "Garbage payload should fail to decode");
 
     writer.await.unwrap();
@@ -635,7 +620,7 @@ async fn test_truncated_codec_payload() {
     let (mut server_stream, _) = listener.accept().await.unwrap();
     let data = read_frame(&mut server_stream).await.unwrap();
     // Framing is fine (we sent exactly the bytes promised), but decode should fail
-    let result = CodecRpcMessage::<RawBytes>::decode_from_slice(&data);
+    let result = CodecRpcMessage::<C>::decode_from_slice(&data);
     assert!(
         result.is_err(),
         "Truncated codec payload should fail to decode"
@@ -730,7 +715,7 @@ async fn test_rolling_buffer_read_timeout() {
 
 #[tokio::test]
 async fn test_transport_config_basic() {
-    use crate::multi::tcp_transport::BisqueTcpTransportConfig;
+    use crate::multi::transport_tcp::BisqueTcpTransportConfig;
 
     let config = BisqueTcpTransportConfig {
         write_channel_capacity: 128,
@@ -745,7 +730,7 @@ async fn test_transport_config_basic() {
 
 #[tokio::test]
 async fn test_transport_config_ttl() {
-    use crate::multi::tcp_transport::BisqueTcpTransportConfig;
+    use crate::multi::transport_tcp::BisqueTcpTransportConfig;
 
     let config = BisqueTcpTransportConfig {
         connection_ttl: Duration::from_secs(1),
@@ -934,7 +919,7 @@ async fn test_concurrent_frame_writes_and_reads() {
             if buf.len() < FRAME_PREFIX_LEN + payload_len {
                 break;
             }
-            let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(
+            let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(
                 &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
             )
             .unwrap();
@@ -987,14 +972,14 @@ async fn test_bidirectional_frame_exchange() {
 
         // Read response
         let response_data = read_frame(&mut stream).await.unwrap();
-        let response: CodecRpcMessage<RawBytes> =
+        let response: CodecRpcMessage<C> =
             CodecRpcMessage::decode_from_slice(&response_data).unwrap();
         assert_eq!(response.request_id(), 1);
         match &response {
             CodecRpcMessage::Response { message, .. } => {
                 assert!(matches!(
                     message,
-                    CodecResponseMessage::AppendEntries(CodecAppendEntriesResponse::Success)
+                    CodecResponseMessage::AppendEntries(openraft::raft::AppendEntriesResponse::Success)
                 ));
             }
             _ => panic!("Expected Response"),
@@ -1006,7 +991,7 @@ async fn test_bidirectional_frame_exchange() {
 
     // Read request
     let request_data = read_frame(&mut server_stream).await.unwrap();
-    let request: CodecRpcMessage<RawBytes> =
+    let request: CodecRpcMessage<C> =
         CodecRpcMessage::decode_from_slice(&request_data).unwrap();
     assert_eq!(request.request_id(), 1);
 
@@ -1037,7 +1022,7 @@ async fn test_multiple_bidirectional_exchanges() {
 
             // Read response
             let response_data = read_frame(&mut stream).await.unwrap();
-            let response: CodecRpcMessage<RawBytes> =
+            let response: CodecRpcMessage<C> =
                 CodecRpcMessage::decode_from_slice(&response_data).unwrap();
             assert_eq!(response.request_id(), i);
         }
@@ -1049,7 +1034,7 @@ async fn test_multiple_bidirectional_exchanges() {
     for _ in 0..num_exchanges {
         // Read request
         let request_data = read_frame(&mut server_stream).await.unwrap();
-        let request: CodecRpcMessage<RawBytes> =
+        let request: CodecRpcMessage<C> =
             CodecRpcMessage::decode_from_slice(&request_data).unwrap();
 
         // Send response
@@ -1175,7 +1160,7 @@ fn test_encode_framed_reuse_reduces_allocations() {
 
 #[test]
 fn test_default_node_registry() {
-    use crate::multi::tcp_transport::{DefaultNodeRegistry, NodeAddressResolver};
+    use crate::multi::transport_tcp::{DefaultNodeRegistry, NodeAddressResolver};
 
     let registry = DefaultNodeRegistry::<u64>::new();
 
@@ -1201,7 +1186,7 @@ fn test_default_node_registry() {
 
 #[test]
 fn test_node_registry_overwrite() {
-    use crate::multi::tcp_transport::{DefaultNodeRegistry, NodeAddressResolver};
+    use crate::multi::transport_tcp::{DefaultNodeRegistry, NodeAddressResolver};
 
     let registry = DefaultNodeRegistry::<u64>::new();
     let addr1: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
@@ -1282,7 +1267,7 @@ async fn test_byte_by_byte_frame_delivery() {
             let payload_len =
                 u32::from_le_bytes(buf[..FRAME_PREFIX_LEN].try_into().unwrap()) as usize;
             if payload_len > 0 && buf.len() >= FRAME_PREFIX_LEN + payload_len {
-                let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(
+                let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(
                     &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
                 )
                 .unwrap();
@@ -1349,7 +1334,7 @@ async fn test_split_stream_concurrent_read_write() {
                 if buf.len() < FRAME_PREFIX_LEN + payload_len {
                     break;
                 }
-                let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(
+                let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(
                     &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
                 )
                 .unwrap();
@@ -1394,7 +1379,7 @@ async fn test_split_stream_concurrent_read_write() {
                 if buf.len() < FRAME_PREFIX_LEN + payload_len {
                     break;
                 }
-                let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(
+                let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(
                     &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
                 )
                 .unwrap();
@@ -1512,7 +1497,7 @@ async fn test_multiple_connections_to_same_server() {
                         if buf.len() < FRAME_PREFIX_LEN + payload_len {
                             break;
                         }
-                        let decoded: CodecRpcMessage<RawBytes> =
+                        let decoded: CodecRpcMessage<C> =
                             CodecRpcMessage::decode_from_slice(
                                 &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
                             )
@@ -1552,7 +1537,7 @@ async fn test_multiple_connections_to_same_server() {
             return_encode_buffer(returned);
 
             let response_data = read_frame(&mut stream).await.unwrap();
-            let response: CodecRpcMessage<RawBytes> =
+            let response: CodecRpcMessage<C> =
                 CodecRpcMessage::decode_from_slice(&response_data).unwrap();
             assert_eq!(response.request_id(), request_id);
         }));
@@ -1585,7 +1570,7 @@ fn test_rpc_server_config_all_fields() {
 
 #[test]
 fn test_transport_config_all_fields() {
-    use crate::multi::tcp_transport::BisqueTcpTransportConfig;
+    use crate::multi::transport_tcp::BisqueTcpTransportConfig;
 
     let config = BisqueTcpTransportConfig::default();
     assert_eq!(config.write_channel_capacity, 256);
@@ -1602,34 +1587,27 @@ fn test_transport_config_all_fields() {
 
 #[test]
 fn test_install_snapshot_request_codec_roundtrip() {
-    use crate::multi::codec::{
-        InstallSnapshotRequest, SnapshotMeta as CodecSnapshotMeta, StoredMembership,
-    };
-
-    let request = CodecRpcMessage::<RawBytes>::InstallSnapshot {
+    let request = CodecRpcMessage::<C>::InstallSnapshot {
         request_id: 42,
         group_id: 7,
-        rpc: InstallSnapshotRequest {
-            vote: CodecVote {
-                leader_id: LeaderId {
-                    term: 1,
-                    node_id: 1,
-                },
-                committed: true,
-            },
-            meta: CodecSnapshotMeta {
+        rpc: openraft::raft::InstallSnapshotRequest {
+            vote: test_vote(),
+            meta: openraft::storage::SnapshotMeta {
                 last_log_id: None,
-                last_membership: StoredMembership::default(),
+                last_membership: openraft::StoredMembership::new(
+                    None,
+                    openraft::Membership::new_with_defaults(vec![vec![1u64].into_iter().collect()], Vec::<u64>::new()),
+                ),
                 snapshot_id: "snap-1".to_string(),
             },
             offset: 0,
-            data: RawBytes(vec![0xAB; 256]),
+            data: vec![0xAB; 256],
             done: false,
         },
     };
 
     let encoded = request.encode_to_vec().unwrap();
-    let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(&encoded).unwrap();
+    let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(&encoded).unwrap();
     assert_eq!(decoded.request_id(), 42);
 
     match decoded {
@@ -1637,7 +1615,7 @@ fn test_install_snapshot_request_codec_roundtrip() {
             assert_eq!(group_id, 7);
             assert_eq!(rpc.offset, 0);
             assert!(!rpc.done);
-            assert_eq!(rpc.data.0.len(), 256);
+            assert_eq!(rpc.data.len(), 256);
             assert_eq!(rpc.meta.snapshot_id, "snap-1");
         }
         _ => panic!("Expected InstallSnapshot"),
@@ -1646,40 +1624,33 @@ fn test_install_snapshot_request_codec_roundtrip() {
 
 #[test]
 fn test_install_snapshot_final_chunk_codec() {
-    use crate::multi::codec::{
-        InstallSnapshotRequest, SnapshotMeta as CodecSnapshotMeta, StoredMembership,
-    };
-
-    let request = CodecRpcMessage::<RawBytes>::InstallSnapshot {
+    let request = CodecRpcMessage::<C>::InstallSnapshot {
         request_id: 99,
         group_id: 3,
-        rpc: InstallSnapshotRequest {
-            vote: CodecVote {
-                leader_id: LeaderId {
-                    term: 2,
-                    node_id: 5,
-                },
+        rpc: openraft::raft::InstallSnapshotRequest {
+            vote: openraft::impls::Vote {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 2, node_id: 5 },
                 committed: true,
             },
-            meta: CodecSnapshotMeta {
-                last_log_id: Some(crate::multi::codec::LogId {
-                    leader_id: LeaderId {
-                        term: 2,
-                        node_id: 5,
-                    },
+            meta: openraft::storage::SnapshotMeta {
+                last_log_id: Some(openraft::LogId {
+                    leader_id: openraft::impls::leader_id_adv::LeaderId { term: 2, node_id: 5 },
                     index: 100,
                 }),
-                last_membership: StoredMembership::default(),
+                last_membership: openraft::StoredMembership::new(
+                    None,
+                    openraft::Membership::new_with_defaults(vec![vec![1u64].into_iter().collect()], Vec::<u64>::new()),
+                ),
                 snapshot_id: "snap-final".to_string(),
             },
             offset: 512,
-            data: RawBytes(vec![0xCD; 128]),
+            data: vec![0xCD; 128],
             done: true,
         },
     };
 
     let encoded = request.encode_to_vec().unwrap();
-    let decoded: CodecRpcMessage<RawBytes> = CodecRpcMessage::decode_from_slice(&encoded).unwrap();
+    let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(&encoded).unwrap();
 
     match decoded {
         CodecRpcMessage::InstallSnapshot { rpc, .. } => {
@@ -1888,7 +1859,7 @@ async fn test_tls_frame_roundtrip() {
 /// TLS client ↔ server multi-frame exchange using BoxedReader/BoxedWriter
 #[tokio::test]
 async fn test_tls_boxed_stream_split() {
-    use crate::multi::tcp_transport::{BoxedReader, BoxedWriter};
+    use crate::multi::transport_tcp::{BoxedReader, BoxedWriter};
 
     let (server_cert, server_key, ca_cert) = generate_test_certs();
     let server_config = build_server_config(server_cert, server_key);
@@ -1944,7 +1915,10 @@ async fn test_plain_tcp_to_tls_server_fails() {
     let server = tokio::spawn(async move {
         let (tcp_stream, _) = listener.accept().await.unwrap();
         let result = acceptor.accept(tcp_stream).await;
-        assert!(result.is_err(), "TLS handshake should fail with plain TCP client");
+        assert!(
+            result.is_err(),
+            "TLS handshake should fail with plain TCP client"
+        );
     });
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -1973,7 +1947,10 @@ async fn test_tls_client_to_plain_server_fails() {
     let tcp_stream = TcpStream::connect(addr).await.unwrap();
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let result = connector.connect(server_name, tcp_stream).await;
-    assert!(result.is_err(), "TLS handshake should fail against plain TCP server");
+    assert!(
+        result.is_err(),
+        "TLS handshake should fail against plain TCP server"
+    );
 
     server.await.unwrap();
 }
@@ -1998,7 +1975,9 @@ async fn test_tls_rolling_buffer_burst() {
         let mut tls_stream = acceptor.accept(tcp_stream).await.unwrap();
         for i in 0..num_frames {
             let payload = format!("burst-{:04}", i);
-            write_frame(&mut tls_stream, payload.as_bytes()).await.unwrap();
+            write_frame(&mut tls_stream, payload.as_bytes())
+                .await
+                .unwrap();
         }
     });
 
@@ -2061,8 +2040,7 @@ async fn test_tls_encode_framed_write_preframed() {
         let (tcp_stream, _) = listener.accept().await.unwrap();
         let mut tls_stream = acceptor.accept(tcp_stream).await.unwrap();
         let data = read_frame(&mut tls_stream).await.unwrap();
-        let decoded: CodecRpcMessage<RawBytes> =
-            CodecRpcMessage::decode_from_slice(&data).unwrap();
+        let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(&data).unwrap();
         match decoded {
             CodecRpcMessage::AppendEntries { request_id, .. } => {
                 assert_eq!(request_id, 42);

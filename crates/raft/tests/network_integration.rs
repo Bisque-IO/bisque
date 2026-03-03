@@ -17,8 +17,8 @@ use bisque_raft::multi::codec::{self, Decode, Encode};
 use bisque_raft::multi::network::GroupNetworkFactory;
 use bisque_raft::multi::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
-    DefaultNodeRegistry, MultiRaftManager, MultiRaftNetworkFactory, MultiplexedLogStorage,
-    MultiplexedStorageConfig,
+    DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiRaftNetworkFactory,
+    MultiplexedLogStorage,
 };
 use bisque_raft::BisqueRaftTypeConfig;
 use bytes::{Buf, BytesMut};
@@ -65,15 +65,29 @@ impl fmt::Display for TestData {
     }
 }
 
-impl codec::ToCodec<codec::RawBytes> for TestData {
-    fn to_codec(&self) -> codec::RawBytes {
-        codec::RawBytes(self.0.clone())
+impl codec::Encode for TestData {
+    fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), codec::CodecError> {
+        (self.0.len() as u32).encode(writer)?;
+        writer.write_all(&self.0)?;
+        Ok(())
+    }
+    fn encoded_size(&self) -> usize {
+        4 + self.0.len()
     }
 }
 
-impl codec::FromCodec<codec::RawBytes> for TestData {
-    fn from_codec(codec: codec::RawBytes) -> Self {
-        TestData(codec.0)
+impl codec::Decode for TestData {
+    fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, codec::CodecError> {
+        let len = u32::decode(reader)? as usize;
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf)?;
+        Ok(Self(buf))
+    }
+}
+
+impl codec::BorrowPayload for TestData {
+    fn payload_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -229,7 +243,7 @@ fn spawn_pipelined_rpc_server(
                         buf.advance(FRAME_PREFIX_LEN);
                         let frame = buf.split_to(payload_len);
 
-                        let msg: codec::RpcMessage<codec::RawBytes> =
+                        let msg: codec::RpcMessage<TestConfig> =
                             match codec::RpcMessage::decode_from_slice(&frame) {
                                 Ok(m) => m,
                                 Err(_) => break 'outer,
@@ -266,23 +280,23 @@ fn spawn_pipelined_rpc_server(
 
 /// Build a success response for any incoming RPC message.
 fn build_rpc_response(
-    msg: codec::RpcMessage<codec::RawBytes>,
-) -> codec::RpcMessage<codec::RawBytes> {
+    msg: codec::RpcMessage<TestConfig>,
+) -> codec::RpcMessage<TestConfig> {
     match msg {
         codec::RpcMessage::AppendEntries { request_id, .. } => {
             codec::RpcMessage::Response {
                 request_id,
                 message: codec::ResponseMessage::AppendEntries(
-                    codec::AppendEntriesResponse::Success,
+                    openraft::raft::AppendEntriesResponse::Success,
                 ),
             }
         }
         codec::RpcMessage::Vote { request_id, .. } => {
             codec::RpcMessage::Response {
                 request_id,
-                message: codec::ResponseMessage::Vote(codec::VoteResponse {
-                    vote: codec::Vote {
-                        leader_id: codec::LeaderId {
+                message: codec::ResponseMessage::Vote(openraft::raft::VoteResponse {
+                    vote: openraft::impls::Vote {
+                        leader_id: openraft::impls::leader_id_adv::LeaderId {
                             term: 1,
                             node_id: 1,
                         },
@@ -344,14 +358,11 @@ impl TestCluster {
             node_registry.register(node_id, addr);
 
             let dir = tempfile::tempdir().expect("tempdir");
-            let storage = MultiplexedLogStorage::<TestConfig>::new(MultiplexedStorageConfig {
-                base_dir: dir.path().to_path_buf(),
-                num_shards: 1,
-                segment_size: 4 * 1024 * 1024,
-                fsync_interval: None,
-                max_cache_entries_per_group: 1024,
-                max_record_size: Some(1024 * 1024),
-            })
+            let storage = MultiplexedLogStorage::<TestConfig>::new(
+                MmapStorageConfig::new(dir.path())
+                    .with_segment_size(4 * 1024 * 1024)
+                    .with_fsync_delay(Duration::ZERO),
+            )
             .await
             .expect("storage");
 
@@ -543,42 +554,42 @@ fn test_codec_roundtrip_stress() {
 
     for i in 0..iterations {
         let data = vec![(i % 256) as u8; 64 + (i % 512)];
-        let rpc = codec::AppendEntriesRequest::<codec::RawBytes> {
-            vote: codec::Vote {
-                leader_id: codec::LeaderId {
+        let rpc = openraft::raft::AppendEntriesRequest::<TestConfig> {
+            vote: openraft::impls::Vote {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
                     term: i as u64,
                     node_id: 1,
                 },
                 committed: true,
             },
-            prev_log_id: Some(codec::LogId {
-                leader_id: codec::LeaderId {
+            prev_log_id: Some(openraft::LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
                     term: i as u64,
                     node_id: 1,
                 },
                 index: i as u64,
             }),
-            entries: vec![codec::Entry {
-                log_id: codec::LogId {
-                    leader_id: codec::LeaderId {
+            entries: vec![openraft::impls::Entry::<TestConfig> {
+                log_id: openraft::LogId {
+                    leader_id: openraft::impls::leader_id_adv::LeaderId {
                         term: i as u64,
                         node_id: 1,
                     },
                     index: i as u64 + 1,
                 },
-                payload: codec::EntryPayload::Normal(codec::RawBytes(data.clone())),
+                payload: openraft::EntryPayload::Normal(TestData(data.clone())),
             }],
             leader_commit: None,
         };
 
-        let msg = codec::RpcMessage::AppendEntries {
+        let msg = codec::RpcMessage::<TestConfig>::AppendEntries {
             request_id: i as u64,
             group_id: 42,
             rpc,
         };
 
         let encoded = msg.encode_to_vec().expect("encode");
-        let decoded: codec::RpcMessage<codec::RawBytes> =
+        let decoded: codec::RpcMessage<TestConfig> =
             codec::RpcMessage::decode_from_slice(&encoded).expect("decode");
 
         match decoded {
@@ -590,8 +601,8 @@ fn test_codec_roundtrip_stress() {
                 assert_eq!(request_id, i as u64);
                 assert_eq!(group_id, 42);
                 assert_eq!(rpc.entries.len(), 1);
-                if let codec::EntryPayload::Normal(raw) = &rpc.entries[0].payload {
-                    assert_eq!(raw.0, data);
+                if let openraft::EntryPayload::Normal(td) = &rpc.entries[0].payload {
+                    assert_eq!(td.0, data);
                 } else {
                     panic!("expected Normal entry");
                 }

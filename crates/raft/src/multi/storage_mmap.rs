@@ -21,14 +21,12 @@
 //! Plus shared manifest MDBX in `{base_dir}/.raft_manifest/` for fast recovery.
 
 use crate::multi::codec::{
-    BorrowPayload, Decode, Encode, Entry as CodecEntry, FromCodec, LogId as CodecLogId, RawBytes,
-    ToCodec, Vote as CodecVote,
+    BorrowPayload, Decode, Encode,
 };
 use crate::multi::manifest_mdbx::{ManifestManager, SegmentMeta};
-use crate::multi::segment_footer::RecordTypeFlags;
-use crate::multi::storage_impl::{
+use crate::multi::record_format::{
     AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, HEADER_SIZE, LENGTH_SIZE, LogIndex,
-    LogLocation, MAX_GROUPS, MultiplexedStorage, RecordType, append_record_into, validate_record,
+    LogLocation, MAX_GROUPS, RecordType, RecordTypeFlags, append_record_into, validate_record,
     write_u24_le,
 };
 use arc_swap::ArcSwap;
@@ -113,6 +111,7 @@ impl MmapStorageConfig {
 /// Metadata extracted during a full record scan.
 struct ScanMeta {
     record_type_flags: RecordTypeFlags,
+    record_count: u64,
     min_entry_index: Option<u64>,
     max_entry_index: Option<u64>,
 }
@@ -271,6 +270,39 @@ impl Segment {
     }
 }
 
+/// Create a `Bytes` view into an mmap segment's memory.
+/// The returned `Bytes` holds an `Arc<Segment>` ref, preventing the mmap
+/// from being unmapped while the `Bytes` (or any slice of it) is alive.
+fn bytes_from_segment(segment: &Arc<Segment>, offset: usize, len: usize) -> bytes::Bytes {
+    /// Wrapper that keeps the segment Arc alive and provides [`AsRef<[u8]>`]
+    /// into the mmap memory. The pointer is stable because it points into
+    /// the mmap region, which doesn't move.
+    struct SegmentSlice {
+        segment: Arc<Segment>,
+        offset: usize,
+        len: usize,
+    }
+
+    impl AsRef<[u8]> for SegmentSlice {
+        fn as_ref(&self) -> &[u8] {
+            self.segment.read_slice(self.offset, self.len)
+        }
+    }
+
+    // SAFETY: SegmentSlice only holds Arc<Segment> + usize + usize.
+    // Arc<Segment> is Send+Sync, and the mmap memory is safely readable
+    // from any thread. The raw pointer inside read_slice is derived from
+    // a stable mmap mapping that doesn't move.
+    unsafe impl Send for SegmentSlice {}
+    unsafe impl Sync for SegmentSlice {}
+
+    bytes::Bytes::from_owner(SegmentSlice {
+        segment: Arc::clone(segment),
+        offset,
+        len,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // MmapSegmentMap — in-memory segment tracking shared between writer and readers
 // ---------------------------------------------------------------------------
@@ -387,6 +419,16 @@ impl MmapSegmentMap {
     }
 }
 
+/// Extract the entry index from an entry record payload by reading the log_id.index
+/// directly from the binary layout: [term:8][node_id:8][index:8][...]
+fn extract_entry_index(payload: &[u8]) -> Option<u64> {
+    if payload.len() >= 24 {
+        Some(u64::from_le_bytes(payload[16..24].try_into().unwrap()))
+    } else {
+        None
+    }
+}
+
 /// Scan a segment mmap for the first entry index
 fn scan_first_entry_index(mmap: &[u8], valid_bytes: usize) -> Option<u64> {
     let mut offset = 0;
@@ -399,13 +441,10 @@ fn scan_first_entry_index(mmap: &[u8], valid_bytes: usize) -> Option<u64> {
         let data = &mmap[offset + LENGTH_SIZE..offset + LENGTH_SIZE + record_len];
         if data.len() >= 1 + GROUP_ID_SIZE + CRC64_SIZE {
             if let Ok(RecordType::Entry) = RecordType::try_from(data[0]) {
-                // This is an entry record — extract the index from the codec payload
                 let payload = &data[1 + GROUP_ID_SIZE..data.len() - CRC64_SIZE];
-                if let Ok(codec_entry) = CodecLogId::decode_from_slice(payload) {
-                    return Some(codec_entry.index);
+                if let Some(index) = extract_entry_index(payload) {
+                    return Some(index);
                 }
-                // Alternatively, the log index stores the index, but we don't have it here
-                // For now, return None and use LogIndex for this purpose
                 return None;
             }
         }
@@ -428,8 +467,8 @@ fn scan_last_entry_index(mmap: &[u8], valid_bytes: usize) -> Option<u64> {
         if data.len() >= 1 + GROUP_ID_SIZE + CRC64_SIZE {
             if let Ok(RecordType::Entry) = RecordType::try_from(data[0]) {
                 let payload = &data[1 + GROUP_ID_SIZE..data.len() - CRC64_SIZE];
-                if let Ok(codec_entry) = CodecLogId::decode_from_slice(payload) {
-                    last_entry_index = Some(codec_entry.index);
+                if let Some(index) = extract_entry_index(payload) {
+                    last_entry_index = Some(index);
                 }
             }
         }
@@ -449,6 +488,7 @@ struct SealRequest {
     group_id: u64,
     min_index: Option<u64>,
     max_index: Option<u64>,
+    record_count: u64,
     record_type_flags: RecordTypeFlags,
     manifest_tx: MAsyncTx<Array<SegmentMeta>>,
 }
@@ -669,6 +709,7 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
                 min_ts: None,
                 max_ts: None,
                 sealed: true,
+                record_count: req.record_count,
                 record_type_flags: req.record_type_flags,
             });
         }
@@ -772,6 +813,8 @@ struct WriterState {
     pending_prealloc: Option<Arc<std::sync::Mutex<PreallocResult>>>,
     /// Tracks record types present in the active segment (for manifest metadata).
     record_type_flags: RecordTypeFlags,
+    /// Number of records written to the active segment.
+    record_count: u64,
     group_dir: PathBuf,
     group_id: u64,
 }
@@ -844,8 +887,9 @@ impl WriterState {
     ) -> io::Result<()> {
         let valid_bytes = self.active.current_size;
 
-        // Capture record type flags for manifest, reset for new segment
+        // Capture record type flags and record count for manifest, reset for new segment
         let flags = std::mem::take(&mut self.record_type_flags);
+        let record_count = std::mem::take(&mut self.record_count);
 
         // Try to use background pre-allocated segment.
         // If a prealloc is in-flight, wait for it — the background thread will
@@ -897,6 +941,7 @@ impl WriterState {
             group_id: self.group_id,
             min_index: self.active.min_entry_index,
             max_index: self.active.max_entry_index,
+            record_count,
             record_type_flags: flags,
             manifest_tx: manifest_tx.clone(),
         });
@@ -925,8 +970,8 @@ fn scan_valid_bytes_up_to_index(data: &[u8], target_index: u64) -> usize {
             if let Ok(RecordType::Entry) = RecordType::try_from(record_data[0]) {
                 // Parse just enough to get the entry index from the codec payload
                 let payload = &record_data[1 + GROUP_ID_SIZE..record_data.len() - CRC64_SIZE];
-                if let Ok(log_id) = CodecLogId::decode_from_slice(payload) {
-                    if log_id.index > target_index {
+                if let Some(index) = extract_entry_index(payload) {
+                    if index > target_index {
                         break;
                     }
                 }
@@ -1086,7 +1131,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 Node = openraft::impls::BasicNode,
                 Entry = openraft::impls::Entry<C>,
             >,
-        C::D: FromCodec<RawBytes>,
+        C::D: Decode,
     {
         std::fs::create_dir_all(group_dir)?;
 
@@ -1174,15 +1219,11 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                                     if let Ok(parsed) =
                                         validate_record(&buf[LENGTH_SIZE..], max_record_size)
                                     {
-                                        if let Ok(codec_entry) =
-                                            CodecEntry::<RawBytes>::decode_from_slice(
+                                        if let Ok(entry) =
+                                            openraft::impls::Entry::<C>::decode_from_slice(
                                                 parsed.payload,
                                             )
                                         {
-                                            let entry: openraft::impls::Entry<C> =
-                                                openraft::impls::Entry::<C>::from_codec(
-                                                    codec_entry,
-                                                );
                                             last_log_id =
                                                 Some(openraft::entry::RaftEntry::log_id(&entry));
                                         }
@@ -1236,6 +1277,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                     min_ts: None,
                     max_ts: None,
                     sealed: true,
+                    record_count: scan.record_count,
                     record_type_flags: scan.record_type_flags,
                 });
             }
@@ -1327,6 +1369,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             active,
             pending_prealloc: None,
             record_type_flags: RecordTypeFlags::default(),
+            record_count: 0,
             group_dir: group_dir.to_path_buf(),
             group_id,
         };
@@ -1398,11 +1441,10 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 Node = openraft::impls::BasicNode,
                 Entry = openraft::impls::Entry<C>,
             >,
-        C::D: FromCodec<RawBytes>,
+        C::D: Decode,
     {
-        use crate::multi::codec::Vote as CodecVote;
-
         let mut flags = RecordTypeFlags::default();
+        let mut record_count: u64 = 0;
         let mut min_entry_index: Option<u64> = None;
         let mut max_entry_index: Option<u64> = None;
 
@@ -1424,12 +1466,9 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 match parsed.record_type {
                     RecordType::Entry => {
                         flags.has_entry = true;
-                        // Decode just enough to get the log_id
-                        if let Ok(codec_entry) =
-                            CodecEntry::<RawBytes>::decode_from_slice(parsed.payload)
+                        if let Ok(entry) =
+                            openraft::impls::Entry::<C>::decode_from_slice(parsed.payload)
                         {
-                            let entry: openraft::impls::Entry<C> =
-                                openraft::impls::Entry::<C>::from_codec(codec_entry);
                             let lid = openraft::entry::RaftEntry::log_id(&entry);
                             let index = lid.index;
                             let _ = log_index.insert(
@@ -1447,41 +1486,24 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                     }
                     RecordType::Vote => {
                         flags.has_vote = true;
-                        if let Ok(codec_vote) = CodecVote::decode_from_slice(parsed.payload) {
-                            *vote = Some(openraft::impls::Vote::<C> {
-                                leader_id: openraft::impls::leader_id_adv::LeaderId {
-                                    term: codec_vote.leader_id.term,
-                                    node_id: codec_vote.leader_id.node_id,
-                                },
-                                committed: codec_vote.committed,
-                            });
+                        if let Ok(decoded_vote) = openraft::impls::Vote::<C>::decode_from_slice(parsed.payload) {
+                            *vote = Some(decoded_vote);
                         }
                     }
                     RecordType::Truncate => {
                         flags.has_truncate = true;
-                        if let Ok(codec_lid) = CodecLogId::decode_from_slice(parsed.payload) {
-                            *last_log_id = Some(LogId {
-                                leader_id: openraft::impls::leader_id_adv::LeaderId {
-                                    term: codec_lid.leader_id.term,
-                                    node_id: codec_lid.leader_id.node_id,
-                                },
-                                index: codec_lid.index,
-                            });
+                        if let Ok(decoded_lid) = openraft::LogId::<C>::decode_from_slice(parsed.payload) {
+                            *last_log_id = Some(decoded_lid);
                         }
                     }
                     RecordType::Purge => {
                         flags.has_purge = true;
-                        if let Ok(codec_lid) = CodecLogId::decode_from_slice(parsed.payload) {
-                            *last_purged_log_id = Some(LogId {
-                                leader_id: openraft::impls::leader_id_adv::LeaderId {
-                                    term: codec_lid.leader_id.term,
-                                    node_id: codec_lid.leader_id.node_id,
-                                },
-                                index: codec_lid.index,
-                            });
+                        if let Ok(decoded_lid) = openraft::LogId::<C>::decode_from_slice(parsed.payload) {
+                            *last_purged_log_id = Some(decoded_lid);
                         }
                     }
                 }
+                record_count += 1;
             } else {
                 break; // Corrupt record, stop scanning
             }
@@ -1490,6 +1512,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
 
         ScanMeta {
             record_type_flags: flags,
+            record_count,
             min_entry_index,
             max_entry_index,
         }
@@ -1586,7 +1609,7 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
                 Node = openraft::impls::BasicNode,
                 Entry = openraft::impls::Entry<C>,
             >,
-        C::D: FromCodec<RawBytes>,
+        C::D: Decode,
     {
         // Fast path
         if let Some(state) = self.groups.get(group_id) {
@@ -1631,7 +1654,7 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
                 Node = openraft::impls::BasicNode,
                 Entry = openraft::impls::Entry<C>,
             >,
-        C::D: FromCodec<RawBytes>,
+        C::D: Decode,
     {
         let group_state = self.get_or_create_group(group_id).await?;
         Ok(MmapGroupLogStorage {
@@ -1704,7 +1727,7 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
                 Node = openraft::impls::BasicNode,
                 Entry = openraft::impls::Entry<C>,
             >,
-        C::D: FromCodec<RawBytes>,
+        C::D: Decode,
     {
         let loc = match self.state.log_index.get(index) {
             Some(loc) => loc,
@@ -1781,14 +1804,21 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
                 if p.len() < 29 + data_len {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "normal entry data truncated"));
                 }
-                let data = C::D::from_codec(RawBytes(p[29..29 + data_len].to_vec()));
+                // Zero-copy: construct a Bytes view into the mmap segment for the
+                // data portion [len:4][payload_bytes]. The Bytes keeps the
+                // Arc<Segment> alive, preventing mmap unmapping.
+                let data_offset_in_segment = start + HEADER_SIZE + 25;
+                let data_total_len = 4 + data_len;
+                let data_bytes = bytes_from_segment(&segment, data_offset_in_segment, data_total_len);
+                let data = C::D::decode_from_bytes(data_bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 openraft::EntryPayload::Normal(data)
             }
             2 => {
-                // Membership: rare, fall back to codec decode
-                let codec_entry = CodecEntry::<RawBytes>::decode_from_slice(p)
+                // Membership: rare, fall back to full decode
+                let entry = openraft::impls::Entry::<C>::decode_from_slice(p)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                return Ok(Some(openraft::impls::Entry::<C>::from_codec(codec_entry)));
+                return Ok(Some(entry));
             }
             _ => {
                 return Err(io::Error::new(
@@ -1819,7 +1849,7 @@ where
             Entry = openraft::impls::Entry<C>,
         >,
     C::Entry: Clone + 'static,
-    C::D: FromCodec<RawBytes>,
+    C::D: Decode,
 {
     async fn try_get_log_entries<
         RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + Send,
@@ -1874,8 +1904,7 @@ where
             Entry = openraft::impls::Entry<C>,
         >,
     C::Entry: Send + Sync + Clone + 'static,
-    C::Vote: ToCodec<CodecVote>,
-    C::D: ToCodec<RawBytes> + FromCodec<RawBytes> + BorrowPayload,
+    C::D: Encode + Decode + BorrowPayload,
 {
     type LogReader = Self;
 
@@ -1914,6 +1943,7 @@ where
         // Write into mmap under lock — no clone needed
         let mut writer = self.state.writer.lock();
         writer.record_type_flags.has_vote = true;
+        writer.record_count += 1;
         writer.write_bytes(
             &self.encode_buf,
             &self.state.config,
@@ -2023,8 +2053,7 @@ where
                 openraft::EntryPayload::Membership(_) => {
                     // Rare: fall back to codec + payload_buf path
                     self.payload_buf.clear();
-                    let codec_entry: CodecEntry<RawBytes> = entry.to_codec();
-                    codec_entry
+                    entry
                         .encode_into(&mut self.payload_buf)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     append_record_into(
@@ -2074,6 +2103,7 @@ where
                 }
                 writer.active.max_entry_index = Some(entry_index);
                 writer.record_type_flags.has_entry = true;
+                writer.record_count += 1;
             }
 
             writer.update_read_view();
@@ -2179,39 +2209,8 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// MultiplexedStorage + MultiRaftLogStorage implementations
+// MultiRaftLogStorage implementation
 // ---------------------------------------------------------------------------
-
-impl<C> MultiplexedStorage<C> for MmapPerGroupLogStorage<C>
-where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-            Vote = openraft::impls::Vote<C>,
-            Node = openraft::impls::BasicNode,
-            Entry = openraft::impls::Entry<C>,
-        > + 'static,
-    C::Entry: Send + Sync + Clone + 'static,
-    C::Vote: ToCodec<CodecVote>,
-    C::D: ToCodec<RawBytes> + FromCodec<RawBytes> + BorrowPayload,
-{
-    type GroupLogStorage = MmapGroupLogStorage<C>;
-
-    async fn get_log_storage(&self, group_id: u64) -> Self::GroupLogStorage {
-        MmapPerGroupLogStorage::get_log_storage(self, group_id)
-            .await
-            .expect("Failed to create mmap group storage")
-    }
-
-    fn remove_group(&self, group_id: u64) {
-        MmapPerGroupLogStorage::remove_group(self, group_id)
-    }
-
-    fn group_ids(&self) -> Vec<u64> {
-        MmapPerGroupLogStorage::group_ids(self)
-    }
-}
 
 impl<C> crate::multi::storage::MultiRaftLogStorage<C> for MmapPerGroupLogStorage<C>
 where
@@ -2224,8 +2223,7 @@ where
             Entry = openraft::impls::Entry<C>,
         > + 'static,
     C::Entry: Send + Sync + Clone + 'static,
-    C::Vote: ToCodec<CodecVote>,
-    C::D: ToCodec<RawBytes> + FromCodec<RawBytes> + BorrowPayload,
+    C::D: Encode + Decode + BorrowPayload,
 {
     type GroupLogStorage = MmapGroupLogStorage<C>;
 
@@ -2265,15 +2263,23 @@ mod tests {
         }
     }
 
-    impl ToCodec<RawBytes> for TestData {
-        fn to_codec(&self) -> RawBytes {
-            RawBytes(self.0.clone())
+    impl Encode for TestData {
+        fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), crate::multi::codec::CodecError> {
+            (self.0.len() as u32).encode(writer)?;
+            writer.write_all(&self.0)?;
+            Ok(())
+        }
+        fn encoded_size(&self) -> usize {
+            4 + self.0.len()
         }
     }
 
-    impl FromCodec<RawBytes> for TestData {
-        fn from_codec(raw: RawBytes) -> Self {
-            Self(raw.0)
+    impl Decode for TestData {
+        fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, crate::multi::codec::CodecError> {
+            let len = u32::decode(reader)? as usize;
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf)?;
+            Ok(Self(buf))
         }
     }
 

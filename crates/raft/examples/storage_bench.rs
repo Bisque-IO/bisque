@@ -1,13 +1,12 @@
-//! Storage throughput benchmark comparing Segmented Log vs Segmented MDBX
+//! Storage throughput benchmark for mmap-based raft log storage.
 //!
 //! Measures raw write and read throughput with configurable payload sizes,
-//! batch sizes, and number of groups for both storage backends.
+//! batch sizes, and number of groups.
 //!
 //! Run with: cargo run --release --example storage_bench
 //! Options:  cargo run --release --example storage_bench -- --help
 
-use bisque_raft::multi::codec::{BorrowPayload, FromCodec, RawBytes, ToCodec};
-use bisque_raft::multi::storage_impl::{GroupLogStorage, PerGroupLogStorage, StorageConfig};
+use bisque_raft::multi::codec::{BorrowPayload, CodecError, Decode, Encode};
 use bisque_raft::multi::storage_mmap::{
     MmapGroupLogStorage, MmapPerGroupLogStorage, MmapStorageConfig,
 };
@@ -16,7 +15,6 @@ use openraft::storage::{IOFlushed, RaftLogReader, RaftLogStorage};
 use openraft::type_config::async_runtime::{AsyncRuntime, Oneshot};
 use openraft::{LogId, RaftTypeConfig};
 use serde::{Deserialize, Serialize};
-use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -34,15 +32,23 @@ impl std::fmt::Display for BenchData {
     }
 }
 
-impl ToCodec<RawBytes> for BenchData {
-    fn to_codec(&self) -> RawBytes {
-        RawBytes(self.0.clone())
+impl Encode for BenchData {
+    fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), CodecError> {
+        (self.0.len() as u32).encode(writer)?;
+        writer.write_all(&self.0)?;
+        Ok(())
+    }
+    fn encoded_size(&self) -> usize {
+        4 + self.0.len()
     }
 }
 
-impl FromCodec<RawBytes> for BenchData {
-    fn from_codec(codec: RawBytes) -> Self {
-        Self(codec.0)
+impl Decode for BenchData {
+    fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, CodecError> {
+        let len = u32::decode(reader)? as usize;
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf)?;
+        Ok(Self(buf))
     }
 }
 
@@ -134,80 +140,25 @@ fn format_ops(ops: f64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Storage abstraction for benchmarking
+// Storage wrapper
 // ---------------------------------------------------------------------------
-
-trait BenchStorage: Sized + Send + 'static {
-    type Group: RaftLogStorage<C> + RaftLogReader<C> + Send;
-
-    fn create(
-        dir: PathBuf,
-        segment_size: u64,
-        fsync_interval: Option<Duration>,
-        max_cache: usize,
-    ) -> impl Future<Output = io::Result<Self>> + Send;
-
-    fn get_group(&self, group_id: u64) -> impl Future<Output = io::Result<Self::Group>> + Send;
-
-    fn stop(&self);
-}
-
-// --- Segmented Log backend ---
-
-struct SegLogStorage(PerGroupLogStorage<C>);
-
-impl BenchStorage for SegLogStorage {
-    type Group = GroupLogStorage<C>;
-
-    fn create(
-        dir: PathBuf,
-        segment_size: u64,
-        fsync_interval: Option<Duration>,
-        max_cache: usize,
-    ) -> impl Future<Output = io::Result<Self>> + Send {
-        async move {
-            let cfg = StorageConfig::new(&dir)
-                .with_segment_size(segment_size)
-                .with_max_record_size(segment_size)
-                .with_fsync_interval(fsync_interval)
-                .with_max_cache_entries(max_cache);
-            Ok(Self(PerGroupLogStorage::<C>::new(cfg).await?))
-        }
-    }
-
-    fn get_group(&self, group_id: u64) -> impl Future<Output = io::Result<Self::Group>> + Send {
-        self.0.get_log_storage(group_id)
-    }
-
-    fn stop(&self) {
-        self.0.stop();
-    }
-}
-
-// --- Segmented Mmap backend ---
 
 struct MmapStorage(MmapPerGroupLogStorage<C>);
 
-impl BenchStorage for MmapStorage {
-    type Group = MmapGroupLogStorage<C>;
-
-    fn create(
+impl MmapStorage {
+    async fn create(
         dir: PathBuf,
         segment_size: u64,
-        fsync_interval: Option<Duration>,
-        _max_cache: usize,
-    ) -> impl Future<Output = io::Result<Self>> + Send {
-        async move {
-            let mut cfg = MmapStorageConfig::new(dir).with_segment_size(segment_size);
-            if let Some(interval) = fsync_interval {
-                cfg = cfg.with_fsync_delay(interval);
-            }
-            Ok(Self(MmapPerGroupLogStorage::<C>::new(cfg).await?))
-        }
+        fsync_delay: Duration,
+    ) -> io::Result<Self> {
+        let cfg = MmapStorageConfig::new(dir)
+            .with_segment_size(segment_size)
+            .with_fsync_delay(fsync_delay);
+        Ok(Self(MmapPerGroupLogStorage::<C>::new(cfg).await?))
     }
 
-    fn get_group(&self, group_id: u64) -> impl Future<Output = io::Result<Self::Group>> + Send {
-        self.0.get_log_storage(group_id)
+    async fn get_group(&self, group_id: u64) -> io::Result<MmapGroupLogStorage<C>> {
+        self.0.get_log_storage(group_id).await
     }
 
     fn stop(&self) {
@@ -286,13 +237,13 @@ fn bench_configs() -> Vec<BenchConfig> {
 // Write benchmark
 // ---------------------------------------------------------------------------
 
-async fn bench_write<S: BenchStorage>(
+async fn bench_write(
     cfg: &BenchConfig,
     dir: PathBuf,
     segment_size: u64,
-    fsync_interval: Option<Duration>,
+    fsync_delay: Duration,
 ) -> io::Result<Duration> {
-    let storage = S::create(dir, segment_size, fsync_interval, 50_000).await?;
+    let storage = MmapStorage::create(dir, segment_size, fsync_delay).await?;
     let mut group = storage.get_group(1).await?;
 
     let payload = vec![0x42u8; cfg.payload_size];
@@ -345,14 +296,14 @@ async fn bench_write<S: BenchStorage>(
 // Read benchmark (sequential scan)
 // ---------------------------------------------------------------------------
 
-async fn bench_read_seq<S: BenchStorage>(
+async fn bench_read_seq(
     cfg: &BenchConfig,
     dir: PathBuf,
     segment_size: u64,
-    fsync_interval: Option<Duration>,
+    fsync_delay: Duration,
 ) -> io::Result<Duration> {
-    // Populate with generous cache
-    let storage = S::create(dir.clone(), segment_size, fsync_interval, 50_000).await?;
+    // Populate
+    let storage = MmapStorage::create(dir.clone(), segment_size, fsync_delay).await?;
     let mut group = storage.get_group(1).await?;
 
     let payload = vec![0x42u8; cfg.payload_size];
@@ -375,13 +326,13 @@ async fn bench_read_seq<S: BenchStorage>(
         let _ = rx.await;
     }
 
-    // Drop all handles and re-open with minimal cache (cold reads)
+    // Drop all handles and re-open
     drop(group);
     storage.stop();
     drop(storage);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let storage = S::create(dir, segment_size, fsync_interval, 1).await?;
+    let storage = MmapStorage::create(dir, segment_size, fsync_delay).await?;
     let mut group = storage.get_group(1).await?;
 
     let read_batch = batch.max(100);
@@ -413,14 +364,14 @@ async fn bench_read_seq<S: BenchStorage>(
 // Read benchmark (random access)
 // ---------------------------------------------------------------------------
 
-async fn bench_read_random<S: BenchStorage>(
+async fn bench_read_random(
     cfg: &BenchConfig,
     dir: PathBuf,
     segment_size: u64,
-    fsync_interval: Option<Duration>,
+    fsync_delay: Duration,
 ) -> io::Result<Duration> {
     // Populate
-    let storage = S::create(dir.clone(), segment_size, fsync_interval, 50_000).await?;
+    let storage = MmapStorage::create(dir.clone(), segment_size, fsync_delay).await?;
     let mut group = storage.get_group(1).await?;
 
     let payload = vec![0x42u8; cfg.payload_size];
@@ -443,13 +394,13 @@ async fn bench_read_random<S: BenchStorage>(
         let _ = rx.await;
     }
 
-    // Drop all handles and re-open cold
+    // Drop all handles and re-open
     drop(group);
     storage.stop();
     drop(storage);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let storage = S::create(dir, segment_size, fsync_interval, 1).await?;
+    let storage = MmapStorage::create(dir, segment_size, fsync_delay).await?;
     let mut group = storage.get_group(1).await?;
 
     // Build a pseudo-random index sequence (deterministic for reproducibility)
@@ -483,16 +434,16 @@ async fn bench_read_random<S: BenchStorage>(
 // Multi-group write benchmark
 // ---------------------------------------------------------------------------
 
-async fn bench_multi_group_write<S: BenchStorage>(
+async fn bench_multi_group_write(
     num_groups: u64,
     payload_size: usize,
     entries_per_group: u64,
     batch_size: u64,
     dir: PathBuf,
     segment_size: u64,
-    fsync_interval: Option<Duration>,
+    fsync_delay: Duration,
 ) -> io::Result<Duration> {
-    let storage = S::create(dir, segment_size, fsync_interval, 10_000).await?;
+    let storage = MmapStorage::create(dir, segment_size, fsync_delay).await?;
 
     let payload = vec![0x42u8; payload_size];
 
@@ -547,8 +498,6 @@ async fn main() -> io::Result<()> {
         println!("  --write-only     Run only write benchmarks");
         println!("  --read-only      Run only read benchmarks");
         println!("  --multi-only     Run only multi-group benchmarks");
-        println!("  --seglog-only    Only benchmark Segmented Log backend");
-        println!("  --mmap-only      Only benchmark Segmented Mmap backend");
         println!("  --quick          Run with reduced entry counts");
         println!("  --fsync-none     Fsync after every write (no batching)");
         println!("  --segment-size N Segment size in MB (default: 64)");
@@ -559,8 +508,6 @@ async fn main() -> io::Result<()> {
     let write_only = args.iter().any(|a| a == "--write-only");
     let read_only = args.iter().any(|a| a == "--read-only");
     let multi_only = args.iter().any(|a| a == "--multi-only");
-    let seglog_only = args.iter().any(|a| a == "--seglog-only");
-    let mmap_only = args.iter().any(|a| a == "--mmap-only");
     let quick = args.iter().any(|a| a == "--quick");
     let fsync_none = args.iter().any(|a| a == "--fsync-none");
 
@@ -573,42 +520,25 @@ async fn main() -> io::Result<()> {
     let run_write = !read_only && !multi_only;
     let run_read = !write_only && !multi_only;
     let run_multi = !write_only && !read_only;
-    let run_seglog = !mmap_only;
-    let run_mmap = !seglog_only;
 
     let segment_size_bytes = segment_size_mb * 1024 * 1024;
 
-    let fsync_interval = if fsync_none {
-        None
+    let fsync_delay = if fsync_none {
+        Duration::ZERO
     } else {
-        Some(Duration::from_millis(10))
-    };
-
-    let backends = {
-        let mut names = Vec::new();
-        if run_seglog {
-            names.push("SegLog");
-        }
-        if run_mmap {
-            names.push("Mmap");
-        }
-        if names.is_empty() {
-            println!("No backends selected");
-            return Ok(());
-        }
-        names.join(" + ")
+        Duration::from_millis(10)
     };
 
     println!("==========================================================");
-    println!("  Bisque Raft Storage Throughput Benchmark");
+    println!("  Bisque Raft Storage Throughput Benchmark (Mmap)");
     println!("==========================================================");
-    println!("  backends:       {}", backends);
     println!("  segment_size:   {} MB", segment_size_mb);
     println!(
-        "  fsync_interval: {}",
-        match fsync_interval {
-            Some(d) => format!("{}ms (batched)", d.as_millis()),
-            None => "every write".to_string(),
+        "  fsync_delay:    {}",
+        if fsync_delay.is_zero() {
+            "every write".to_string()
+        } else {
+            format!("{}ms (batched)", fsync_delay.as_millis())
         }
     );
     if quick {
@@ -634,33 +564,17 @@ async fn main() -> io::Result<()> {
             let total_bytes = cfg.total_entries * cfg.payload_size as u64;
             println!("  {}", cfg.label);
 
-            if run_seglog {
-                let dir = tempfile::tempdir()?;
-                match bench_write::<SegLogStorage>(
-                    cfg,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("SegLog", cfg.total_entries, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "SegLog", e),
-                }
-            }
-            if run_mmap {
-                let dir = tempfile::tempdir()?;
-                match bench_write::<MmapStorage>(
-                    cfg,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("Mmap", cfg.total_entries, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "Mmap", e),
-                }
+            let dir = tempfile::tempdir()?;
+            match bench_write(
+                cfg,
+                dir.path().to_path_buf(),
+                segment_size_bytes,
+                fsync_delay,
+            )
+            .await
+            {
+                Ok(elapsed) => print_result("Mmap", cfg.total_entries, total_bytes, elapsed),
+                Err(e) => println!("    {:<16} ERROR: {}", "Mmap", e),
             }
         }
         println!();
@@ -677,33 +591,17 @@ async fn main() -> io::Result<()> {
             let total_bytes = cfg.total_entries * cfg.payload_size as u64;
             println!("  {}", cfg.label);
 
-            if run_seglog {
-                let dir = tempfile::tempdir()?;
-                match bench_read_seq::<SegLogStorage>(
-                    cfg,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("SegLog", cfg.total_entries, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "SegLog", e),
-                }
-            }
-            if run_mmap {
-                let dir = tempfile::tempdir()?;
-                match bench_read_seq::<MmapStorage>(
-                    cfg,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("Mmap", cfg.total_entries, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "Mmap", e),
-                }
+            let dir = tempfile::tempdir()?;
+            match bench_read_seq(
+                cfg,
+                dir.path().to_path_buf(),
+                segment_size_bytes,
+                fsync_delay,
+            )
+            .await
+            {
+                Ok(elapsed) => print_result("Mmap", cfg.total_entries, total_bytes, elapsed),
+                Err(e) => println!("    {:<16} ERROR: {}", "Mmap", e),
             }
         }
         println!();
@@ -721,33 +619,17 @@ async fn main() -> io::Result<()> {
             let total_bytes = num_reads * cfg.payload_size as u64;
             println!("  {}", cfg.label);
 
-            if run_seglog {
-                let dir = tempfile::tempdir()?;
-                match bench_read_random::<SegLogStorage>(
-                    cfg,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("SegLog", num_reads, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "SegLog", e),
-                }
-            }
-            if run_mmap {
-                let dir = tempfile::tempdir()?;
-                match bench_read_random::<MmapStorage>(
-                    cfg,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("Mmap", num_reads, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "Mmap", e),
-                }
+            let dir = tempfile::tempdir()?;
+            match bench_read_random(
+                cfg,
+                dir.path().to_path_buf(),
+                segment_size_bytes,
+                fsync_delay,
+            )
+            .await
+            {
+                Ok(elapsed) => print_result("Mmap", num_reads, total_bytes, elapsed),
+                Err(e) => println!("    {:<16} ERROR: {}", "Mmap", e),
             }
         }
         println!();
@@ -780,39 +662,20 @@ async fn main() -> io::Result<()> {
             let total_bytes = total_entries * *payload_size as u64;
             println!("  {}", label);
 
-            if run_seglog {
-                let dir = tempfile::tempdir()?;
-                match bench_multi_group_write::<SegLogStorage>(
-                    *num_groups,
-                    *payload_size,
-                    *entries_per_group,
-                    *batch_size,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("SegLog", total_entries, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "SegLog", e),
-                }
-            }
-            if run_mmap {
-                let dir = tempfile::tempdir()?;
-                match bench_multi_group_write::<MmapStorage>(
-                    *num_groups,
-                    *payload_size,
-                    *entries_per_group,
-                    *batch_size,
-                    dir.path().to_path_buf(),
-                    segment_size_bytes,
-                    fsync_interval,
-                )
-                .await
-                {
-                    Ok(elapsed) => print_result("Mmap", total_entries, total_bytes, elapsed),
-                    Err(e) => println!("    {:<16} ERROR: {}", "Mmap", e),
-                }
+            let dir = tempfile::tempdir()?;
+            match bench_multi_group_write(
+                *num_groups,
+                *payload_size,
+                *entries_per_group,
+                *batch_size,
+                dir.path().to_path_buf(),
+                segment_size_bytes,
+                fsync_delay,
+            )
+            .await
+            {
+                Ok(elapsed) => print_result("Mmap", total_entries, total_bytes, elapsed),
+                Err(e) => println!("    {:<16} ERROR: {}", "Mmap", e),
             }
         }
         println!();
