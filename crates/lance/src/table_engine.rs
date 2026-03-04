@@ -32,6 +32,21 @@ use crate::types::{
     SegmentCatalog, SegmentId,
 };
 
+/// Sentinel value for "no log index" in `AtomicU64` fields.
+const NO_LOG_INDEX: u64 = u64::MAX;
+
+/// Convert atomic log index value to `Option<u64>`.
+#[inline]
+fn atomic_to_opt(v: u64) -> Option<u64> {
+    if v == NO_LOG_INDEX { None } else { Some(v) }
+}
+
+/// Convert `Option<u64>` to atomic log index value.
+#[inline]
+fn opt_to_atomic(v: Option<u64>) -> u64 {
+    v.unwrap_or(NO_LOG_INDEX)
+}
+
 /// Storage engine for a single table. Manages local Lance datasets and tracks
 /// segment state through the active → sealed → deep storage lifecycle.
 ///
@@ -61,6 +76,10 @@ pub struct TableEngine {
     active_created_at: RwLock<Instant>,
     /// Schema evolution history.
     schema_history: RwLock<Vec<SchemaVersion>>,
+    /// First raft log index written to the active segment (`u64::MAX` = None).
+    active_first_log_index: AtomicU64,
+    /// First raft log index written to the sealed segment (`u64::MAX` = None).
+    sealed_first_log_index: AtomicU64,
 }
 
 impl TableEngine {
@@ -147,6 +166,8 @@ impl TableEngine {
         Ok(Self {
             name,
             config,
+            active_first_log_index: AtomicU64::new(opt_to_atomic(catalog.active_first_log_index)),
+            sealed_first_log_index: AtomicU64::new(opt_to_atomic(catalog.sealed_first_log_index)),
             catalog: RwLock::new(catalog),
             active_dataset: RwLock::new(Some(active_dataset)),
             active_write: AsyncMutex::new(()),
@@ -169,6 +190,32 @@ impl TableEngine {
     /// Get the table config.
     pub fn config(&self) -> &TableOpenConfig {
         &self.config
+    }
+
+    // =========================================================================
+    // Log Index Tracking (for purge floor)
+    // =========================================================================
+
+    /// Record the raft log index for an append to the active segment.
+    /// Only updates if this is the first write to the current active segment.
+    /// Returns `true` if the value was set (first write), `false` if already set.
+    pub fn record_log_index(&self, log_index: u64) -> bool {
+        self.active_first_log_index
+            .compare_exchange(NO_LOG_INDEX, log_index, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Get the minimum log index that constrains purging for this table.
+    /// Returns `None` if no hot/warm data needs protection.
+    pub fn min_safe_log_index(&self) -> Option<u64> {
+        let active = atomic_to_opt(self.active_first_log_index.load(Ordering::Acquire));
+        let sealed = atomic_to_opt(self.sealed_first_log_index.load(Ordering::Acquire));
+        match (active, sealed) {
+            (Some(a), Some(s)) => Some(a.min(s)),
+            (Some(a), None) => Some(a),
+            (None, Some(s)) => Some(s),
+            (None, None) => None,
+        }
     }
 
     // =========================================================================
@@ -252,6 +299,12 @@ impl TableEngine {
             let mut sealed = self.sealed_dataset.write();
             *sealed = Some(old_active);
             *active = Some(new_dataset);
+        }
+
+        // Rotate first_log_index: sealed inherits active's, active resets
+        {
+            let active_first = self.active_first_log_index.swap(NO_LOG_INDEX, Ordering::AcqRel);
+            self.sealed_first_log_index.store(active_first, Ordering::Release);
         }
 
         // Update catalog
@@ -355,6 +408,9 @@ impl TableEngine {
                 cat.sealed_segment = None;
             }
         }
+
+        // Data is now in S3 — sealed segment no longer constrains log purging
+        self.sealed_first_log_index.store(NO_LOG_INDEX, Ordering::Release);
 
         // Drop the sealed dataset handle
         {
@@ -819,7 +875,10 @@ impl TableEngine {
 
     /// Get a snapshot of the current catalog state.
     pub fn catalog(&self) -> SegmentCatalog {
-        self.catalog.read().clone()
+        let mut cat = self.catalog.read().clone();
+        cat.active_first_log_index = atomic_to_opt(self.active_first_log_index.load(Ordering::Acquire));
+        cat.sealed_first_log_index = atomic_to_opt(self.sealed_first_log_index.load(Ordering::Acquire));
+        cat
     }
 
     /// Get the current flush state.

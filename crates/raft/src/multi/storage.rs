@@ -10,6 +10,8 @@ use openraft::OptionalSync;
 use openraft::RaftTypeConfig;
 use openraft::storage::RaftLogStorage;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 /// Trait for a storage backend that provides log storage for multiple Raft groups.
 ///
@@ -42,4 +44,11 @@ where
 
     /// Get list of all group IDs currently in this storage.
     fn group_ids(&self) -> Vec<u64>;
+
+    /// Get the purge floor handle for a specific group.
+    ///
+    /// The state machine layer can hold this `Arc<AtomicU64>` and update it
+    /// to prevent log purging below a certain index. Returns `None` if the
+    /// group has not been initialized yet.
+    fn get_purge_floor(&self, group_id: u64) -> Option<Arc<AtomicU64>>;
 }

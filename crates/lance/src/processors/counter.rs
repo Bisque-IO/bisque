@@ -29,6 +29,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
+use crate::types::{ProcessorDescriptor, time_unit_to_string};
 use crate::write_processor::{ProcessorOutput, WriteProcessor};
 
 /// Accumulated value for a counter group.
@@ -245,6 +246,16 @@ impl WriteProcessor for CounterAggregator {
         }
         let aggregated = self.aggregate(&batches);
         ProcessorOutput::primary_only(vec![aggregated])
+    }
+
+    fn descriptor(&self) -> Option<ProcessorDescriptor> {
+        Some(ProcessorDescriptor::Counter {
+            key_columns: self.key_columns.clone(),
+            value_column: self.value_column.clone(),
+            timestamp_column: self.timestamp_column.clone(),
+            timestamp_resolution_ms: self.timestamp_resolution_ms,
+            timestamp_unit: time_unit_to_string(self.timestamp_unit),
+        })
     }
 }
 

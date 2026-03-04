@@ -58,6 +58,9 @@ bytes = { workspace = true }
 # Async
 async-trait = "0.1"
 
+# Embedded KV store for crash-consistent manifest
+libmdbx = { workspace = true }
+
 # Utilities
 tracing = { workspace = true }
 thiserror = { workspace = true }

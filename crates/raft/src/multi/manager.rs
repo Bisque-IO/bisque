@@ -103,6 +103,14 @@ where
     pub fn group_count(&self) -> usize {
         self.groups.len()
     }
+
+    /// Get the purge floor handle for a specific group.
+    ///
+    /// Returns `None` if the group's log storage has not been initialized yet.
+    /// Call after `add_group` or after manually initializing the group's storage.
+    pub fn get_purge_floor(&self, group_id: u64) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        self.storage.get_purge_floor(group_id)
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +307,10 @@ mod tests {
 
         fn group_ids(&self) -> Vec<u64> {
             self.storages.iter().map(|e| *e.key()).collect()
+        }
+
+        fn get_purge_floor(&self, _group_id: u64) -> Option<Arc<AtomicU64>> {
+            None
         }
     }
 

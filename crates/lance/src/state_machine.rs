@@ -5,6 +5,7 @@
 //! the multi-table `BisqueLance` engine.
 
 use std::io::{self, Cursor};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -15,7 +16,8 @@ use tracing::{debug, error, info, warn};
 use crate::async_apply::{AppliedWatermark, AsyncApplyBuffer, AsyncApplyConfig};
 use crate::engine::BisqueLance;
 use crate::ipc;
-use crate::types::{LanceCommand, LanceResponse, SnapshotData};
+use crate::manifest::{GroupMeta, LanceManifestManager, ManifestUpdate, TableUpdate};
+use crate::types::{LanceCommand, LanceResponse, PersistedTableEntry, SnapshotData};
 use crate::LanceTypeConfig;
 
 /// Raft state machine that drives the BisqueLance multi-table storage engine.
@@ -25,6 +27,13 @@ pub struct LanceStateMachine {
     last_membership: StoredMembership<LanceTypeConfig>,
     /// Optional async apply buffer for decoupling Lance I/O from apply.
     async_buffer: Option<AsyncApplyBuffer>,
+    /// Shared purge floor with the log storage. When set, the state machine
+    /// updates this to prevent log purging below the min safe log index.
+    purge_floor: Option<Arc<AtomicU64>>,
+    /// Optional MDBX manifest for crash-consistent metadata persistence.
+    manifest: Option<Arc<LanceManifestManager>>,
+    /// Raft group ID for manifest key scoping.
+    group_id: u64,
 }
 
 impl LanceStateMachine {
@@ -34,7 +43,27 @@ impl LanceStateMachine {
             last_applied: None,
             last_membership: StoredMembership::default(),
             async_buffer: None,
+            purge_floor: None,
+            manifest: None,
+            group_id: 0,
         }
+    }
+
+    /// Set the purge floor handle shared with the log storage.
+    /// Must be called before the Raft node starts processing.
+    pub fn with_purge_floor(mut self, floor: Arc<AtomicU64>) -> Self {
+        self.purge_floor = Some(floor);
+        self
+    }
+
+    /// Set the MDBX manifest for crash-consistent metadata persistence.
+    ///
+    /// When set, `applied_state()` reads from MDBX on startup, and
+    /// `apply()` sends metadata updates to the manifest worker thread.
+    pub fn with_manifest(mut self, manifest: Arc<LanceManifestManager>, group_id: u64) -> Self {
+        self.manifest = Some(manifest);
+        self.group_id = group_id;
+        self
     }
 
     /// Create a new state machine with async apply enabled.
@@ -51,6 +80,9 @@ impl LanceStateMachine {
             last_applied: None,
             last_membership: StoredMembership::default(),
             async_buffer: Some(async_buffer),
+            purge_floor: None,
+            manifest: None,
+            group_id: 0,
         };
         (sm, watermark)
     }
@@ -73,6 +105,29 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
         ),
         io::Error,
     > {
+        // On startup, try reading crash-consistent state from MDBX manifest.
+        if let Some(manifest) = &self.manifest {
+            if let Ok(Some((last_applied, membership))) =
+                manifest.read_group_meta(self.group_id)
+            {
+                self.last_applied = last_applied.clone();
+                self.last_membership = membership.clone();
+
+                // Restore all tables from persisted entries (full config + state).
+                if let Ok(entries) = manifest.read_all_tables(self.group_id) {
+                    if !entries.is_empty() {
+                        if let Err(e) = self.engine.restore_from_persisted_entries(entries).await {
+                            error!("Failed to restore tables from MDBX manifest: {}", e);
+                        }
+                    }
+                }
+
+                info!(?last_applied, "Recovered applied_state from MDBX manifest");
+                return Ok((last_applied, membership));
+            }
+        }
+
+        // Fallback: in-memory state (first boot or no manifest).
         let last_applied = if let Some(buf) = &self.async_buffer {
             // Conservative watermark: only report what Lance has fully written.
             buf.lance_applied_log_id()
@@ -96,29 +151,133 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
             let (entry, responder) = entry_result?;
             self.last_applied = Some(entry.log_id.clone());
 
+            // Track what table update to send to the manifest (if any).
+            let mut manifest_table_update: Option<TableUpdate> = None;
+
             let response = match entry.payload {
                 EntryPayload::Blank => LanceResponse::Ok,
                 EntryPayload::Normal(cmd) => {
                     match cmd {
                         LanceCommand::AppendRecords { table_name, data } => {
-                            if let Some(buf) = &self.async_buffer {
-                                // Async path: enqueue for background processing.
-                                buf.enqueue(entry.log_id.clone(), table_name, data).await;
+                            // Skip entries whose data has already been promoted to
+                            // deep storage. During recovery replay, per-table
+                            // min_safe_log_index tells us the earliest log entry
+                            // still in hot/warm storage — anything before it is
+                            // already in S3 and must not be re-applied.
+                            let skip = self
+                                .engine
+                                .require_table(&table_name)
+                                .ok()
+                                .and_then(|t| {
+                                    t.min_safe_log_index()
+                                        .map(|min_idx| entry.log_id.index < min_idx)
+                                })
+                                .unwrap_or(false);
+
+                            if skip {
+                                debug!(
+                                    table = %table_name,
+                                    log_index = entry.log_id.index,
+                                    "Skipping AppendRecords: data already in deep storage"
+                                );
                                 LanceResponse::Ok
                             } else {
-                                // Sync path (original behavior).
-                                self.apply_command(LanceCommand::AppendRecords { table_name, data }).await
+                                // Track the first log index written to the active segment.
+                                // Only update manifest when the value changes (first write).
+                                let changed = self
+                                    .engine
+                                    .require_table(&table_name)
+                                    .ok()
+                                    .map(|t| t.record_log_index(entry.log_id.index))
+                                    .unwrap_or(false);
+
+                                if changed {
+                                    if let Ok(table) = self.engine.require_table(&table_name) {
+                                        manifest_table_update = Some(TableUpdate::Set {
+                                            table_name: table_name.clone(),
+                                            entry: LanceManifestManager::build_table_entry(&table),
+                                        });
+                                    }
+                                }
+
+                                if let Some(buf) = &self.async_buffer {
+                                    // Async path: enqueue for background processing.
+                                    buf.enqueue(entry.log_id.clone(), table_name, data).await;
+                                    LanceResponse::Ok
+                                } else {
+                                    // Sync path (original behavior).
+                                    self.apply_command(LanceCommand::AppendRecords { table_name, data }).await
+                                }
                             }
                         }
                         LanceCommand::SealActiveSegment { ref table_name, .. }
                         | LanceCommand::DropTable { ref table_name, .. } => {
+                            let tname = table_name.clone();
                             // Barrier: drain pending writes for this table before proceeding.
                             if let Some(buf) = &self.async_buffer {
-                                buf.drain_table(table_name).await;
+                                buf.drain_table(&tname).await;
                             }
-                            self.apply_command(cmd).await
+                            let response = self.apply_command(cmd).await;
+
+                            // Build manifest update based on the command type.
+                            if let Ok(table) = self.engine.require_table(&tname) {
+                                manifest_table_update = Some(TableUpdate::Set {
+                                    table_name: tname.clone(),
+                                    entry: LanceManifestManager::build_table_entry(&table),
+                                });
+                            } else {
+                                // Table was dropped — record removal.
+                                manifest_table_update = Some(TableUpdate::Remove {
+                                    table_name: tname,
+                                });
+                            }
+
+                            response
                         }
-                        other => self.apply_command(other).await,
+                        cmd @ LanceCommand::PromoteToDeepStorage { .. } => {
+                            let table_name = match &cmd {
+                                LanceCommand::PromoteToDeepStorage { table_name, .. } => {
+                                    table_name.clone()
+                                }
+                                _ => unreachable!(),
+                            };
+                            let response = self.apply_command(cmd).await;
+                            // Eagerly update purge floor since promote relaxes the constraint.
+                            self.update_purge_floor();
+
+                            if let Ok(table) = self.engine.require_table(&table_name) {
+                                manifest_table_update = Some(TableUpdate::Set {
+                                    table_name,
+                                    entry: LanceManifestManager::build_table_entry(&table),
+                                });
+                            }
+
+                            response
+                        }
+                        other => {
+                            // Extract table_name before moving the command.
+                            let tname = match &other {
+                                LanceCommand::CreateTable { table_name, .. }
+                                | LanceCommand::BeginFlush { table_name, .. } => {
+                                    Some(table_name.clone())
+                                }
+                                _ => None,
+                            };
+
+                            let response = self.apply_command(other).await;
+
+                            // Update manifest with table state after CreateTable / BeginFlush.
+                            if let Some(tname) = tname {
+                                if let Ok(table) = self.engine.require_table(&tname) {
+                                    manifest_table_update = Some(TableUpdate::Set {
+                                        table_name: tname,
+                                        entry: LanceManifestManager::build_table_entry(&table),
+                                    });
+                                }
+                            }
+
+                            response
+                        }
                     }
                 }
                 EntryPayload::Membership(m) => {
@@ -127,6 +286,17 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                     LanceResponse::Ok
                 }
             };
+
+            // Send manifest update (fire-and-forget).
+            if let Some(manifest) = &self.manifest {
+                let update = LanceManifestManager::build_apply_update(
+                    self.group_id,
+                    &self.last_applied,
+                    &self.last_membership,
+                    manifest_table_update,
+                );
+                manifest.send_update(update).await;
+            }
 
             if let Some(r) = responder {
                 r.send(response);
@@ -141,10 +311,29 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
         if let Some(buf) = &self.async_buffer {
             buf.drain_all().await;
         }
+
+        // Flush manifest durably before building snapshot so MDBX is consistent.
+        if let Some(manifest) = &self.manifest {
+            let update = LanceManifestManager::build_apply_update(
+                self.group_id,
+                &self.last_applied,
+                &self.last_membership,
+                None,
+            );
+            if let Err(e) = manifest.send_update_durable(update).await {
+                warn!("Failed to flush manifest before snapshot build: {}", e);
+            }
+        }
+
+        // Compute and update the purge floor before building the snapshot.
+        let min_safe = self.compute_min_safe_log_index();
+        self.update_purge_floor_with(min_safe);
+
         LanceSnapshotBuilder {
-            table_snapshots: self.engine.table_snapshots(),
+            table_entries: self.engine.table_entries(),
             last_applied: self.last_applied.clone(),
             last_membership: self.last_membership.clone(),
+            min_safe_log_index: min_safe,
         }
     }
 
@@ -172,8 +361,9 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
             warn!("Error shutting down engine during snapshot install: {}", e);
         }
 
-        for (table_name, table_snapshot) in &data.tables {
-            let schema = if let Some(latest) = table_snapshot.schema_history.last() {
+        for (table_name, table_entry) in &data.tables {
+            let snapshot = table_entry.to_snapshot();
+            let schema = if let Some(latest) = table_entry.schema_history.last() {
                 match ipc::schema_from_ipc(&latest.schema_ipc) {
                     Ok(s) => Some(Arc::new(s)),
                     Err(e) => {
@@ -185,25 +375,36 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                 None
             };
 
-            let mut config = self.engine.config().build_table_config(
+            let config = crate::config::TableOpenConfig::from_persisted(
                 table_name,
-                schema.unwrap_or_else(|| {
-                    use arrow_schema::{DataType, Field, Schema};
-                    Arc::new(Schema::new(vec![Field::new("_placeholder", DataType::Null, true)]))
-                }),
+                &table_entry.config,
+                schema,
+                self.engine.config(),
             );
 
-            if !table_snapshot.catalog.s3_dataset_uri.is_empty() {
-                config.s3_uri = Some(table_snapshot.catalog.s3_dataset_uri.clone());
-            }
-
-            if let Err(e) = self.engine.restore_table(config, table_snapshot).await {
+            if let Err(e) = self.engine.restore_table(config, &snapshot).await {
                 error!(table = %table_name, "Failed to restore table from snapshot: {}", e);
             }
         }
 
         self.last_applied = meta.last_log_id.clone();
         self.last_membership = meta.last_membership.clone();
+
+        // Bulk-write snapshot state to MDBX manifest for crash consistency.
+        if let Some(manifest) = &self.manifest {
+            let update = ManifestUpdate::InstallSnapshot {
+                group_id: self.group_id,
+                meta: GroupMeta::from_raft(
+                    &self.last_applied,
+                    &self.last_membership,
+                ),
+                tables: data.tables,
+                done: None,
+            };
+            if let Err(e) = manifest.send_update_durable(update).await {
+                error!("Failed to write snapshot state to MDBX manifest: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -229,6 +430,39 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
 }
 
 impl LanceStateMachine {
+    /// Compute the minimum log index across all tables' hot/warm segments.
+    fn compute_min_safe_log_index(&self) -> Option<u64> {
+        let mut min_index: Option<u64> = None;
+        for table_name in self.engine.list_tables() {
+            if let Some(table) = self.engine.get_table(&table_name) {
+                if let Some(table_min) = table.min_safe_log_index() {
+                    min_index = Some(match min_index {
+                        Some(current) => current.min(table_min),
+                        None => table_min,
+                    });
+                }
+            }
+        }
+        min_index
+    }
+
+    /// Update the purge floor by recomputing from current state.
+    fn update_purge_floor(&self) {
+        let min_safe = self.compute_min_safe_log_index();
+        self.update_purge_floor_with(min_safe);
+    }
+
+    /// Update the purge floor with a precomputed value.
+    fn update_purge_floor_with(&self, min_safe: Option<u64>) {
+        if let Some(floor) = &self.purge_floor {
+            let value = min_safe.unwrap_or(0);
+            floor.store(value, Ordering::Release);
+            if value > 0 {
+                info!(min_safe_log_index = value, "Updated purge floor");
+            }
+        }
+    }
+
     async fn apply_command(&self, cmd: LanceCommand) -> LanceResponse {
         debug!(%cmd, "Applying command");
 
@@ -359,15 +593,17 @@ impl LanceStateMachine {
 
 /// Builds snapshots from the current multi-table engine state.
 pub struct LanceSnapshotBuilder {
-    table_snapshots: std::collections::HashMap<String, crate::types::TableSnapshot>,
+    table_entries: std::collections::HashMap<String, PersistedTableEntry>,
     last_applied: Option<LogId<LanceTypeConfig>>,
     last_membership: StoredMembership<LanceTypeConfig>,
+    min_safe_log_index: Option<u64>,
 }
 
 impl RaftSnapshotBuilder<LanceTypeConfig> for LanceSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<LanceTypeConfig>, io::Error> {
         let data = SnapshotData {
-            tables: self.table_snapshots.clone(),
+            tables: self.table_entries.clone(),
+            min_safe_log_index: self.min_safe_log_index,
         };
 
         let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard())

@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use lance::dataset::optimize::CompactionOptions;
 use lance_index::IndexType;
+
+use crate::types::{duration_to_ms, PersistedIndexSpec, PersistedTableConfig};
 
 /// Specifies an index to create on sealed segments.
 #[derive(Debug, Clone)]
@@ -55,6 +58,33 @@ impl IndexSpec {
             columns: vec![col],
             index_type: IndexType::RTree,
         }
+    }
+
+    /// Convert to a serializable representation.
+    pub fn to_persisted(&self) -> PersistedIndexSpec {
+        PersistedIndexSpec {
+            columns: self.columns.clone(),
+            index_type: format!("{:?}", self.index_type),
+            name: self.name.clone(),
+        }
+    }
+
+    /// Reconstruct from a serializable representation.
+    pub fn from_persisted(p: &PersistedIndexSpec) -> Result<Self, String> {
+        let index_type = match p.index_type.as_str() {
+            "Scalar" => IndexType::Scalar,
+            "BTree" => IndexType::BTree,
+            "Bitmap" => IndexType::Bitmap,
+            "Inverted" => IndexType::Inverted,
+            "RTree" => IndexType::RTree,
+            "IvfHnswSq" => IndexType::IvfHnswSq,
+            other => return Err(format!("unknown IndexType: {}", other)),
+        };
+        Ok(Self {
+            columns: p.columns.clone(),
+            index_type,
+            name: p.name.clone(),
+        })
     }
 }
 
@@ -316,6 +346,68 @@ impl TableOpenConfig {
             materialize_deletions: self.compaction_materialize_deletions,
             materialize_deletions_threshold: self.compaction_deletion_threshold,
             ..Default::default()
+        }
+    }
+
+    /// Convert to a serializable representation.
+    ///
+    /// Does NOT include `s3_storage_options` (credentials), `table_data_dir`
+    /// (derived at runtime), or `schema` (stored in schema_history).
+    pub fn to_persisted(&self) -> PersistedTableConfig {
+        PersistedTableConfig {
+            seal_indices: self.seal_indices.iter().map(|s| s.to_persisted()).collect(),
+            s3_uri: self.s3_uri.clone(),
+            s3_max_rows_per_file: self.s3_max_rows_per_file,
+            s3_max_rows_per_group: self.s3_max_rows_per_group,
+            seal_max_age_ms: duration_to_ms(self.seal_max_age),
+            seal_max_size: self.seal_max_size,
+            compaction_target_rows_per_fragment: self.compaction_target_rows_per_fragment,
+            compaction_materialize_deletions: self.compaction_materialize_deletions,
+            compaction_deletion_threshold: self.compaction_deletion_threshold,
+            compaction_min_fragments: self.compaction_min_fragments,
+            batcher: None,
+            processor: None,
+        }
+    }
+
+    /// Reconstruct from persisted config, merging with engine-level settings
+    /// for fields not stored in MDBX (credentials, data dir, schema).
+    pub fn from_persisted(
+        name: &str,
+        persisted: &PersistedTableConfig,
+        schema: Option<arrow_schema::SchemaRef>,
+        engine_config: &BisqueLanceConfig,
+    ) -> Self {
+        let seal_indices = persisted
+            .seal_indices
+            .iter()
+            .filter_map(|p| IndexSpec::from_persisted(p).ok())
+            .collect();
+
+        let schema = schema.unwrap_or_else(|| {
+            use arrow_schema::{DataType, Field, Schema};
+            Arc::new(Schema::new(vec![Field::new(
+                "_placeholder",
+                DataType::Null,
+                true,
+            )]))
+        });
+
+        Self {
+            name: name.to_string(),
+            table_data_dir: engine_config.table_data_dir(name),
+            schema: Some(schema),
+            seal_indices,
+            s3_uri: persisted.s3_uri.clone(),
+            s3_storage_options: engine_config.s3_storage_options.clone(),
+            s3_max_rows_per_file: persisted.s3_max_rows_per_file,
+            s3_max_rows_per_group: persisted.s3_max_rows_per_group,
+            seal_max_age: Duration::from_millis(persisted.seal_max_age_ms),
+            seal_max_size: persisted.seal_max_size,
+            compaction_target_rows_per_fragment: persisted.compaction_target_rows_per_fragment,
+            compaction_materialize_deletions: persisted.compaction_materialize_deletions,
+            compaction_deletion_threshold: persisted.compaction_deletion_threshold,
+            compaction_min_fragments: persisted.compaction_min_fragments,
         }
     }
 }

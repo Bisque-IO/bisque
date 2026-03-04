@@ -61,7 +61,7 @@ bincode = { version = "2.0.1", features = ["serde"] }
 bindgen = "0.72"
 bitflags = "2"
 bumpalo = { version = "3.17.0", features = ["collections", "boxed"] }
-bytes = { version = "1" }
+bytes = { version = "1", features = ["serde"] }
 byte-unit = "5"
 byteorder = "1.5"
 cc = "1.2"

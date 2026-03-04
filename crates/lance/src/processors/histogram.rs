@@ -21,6 +21,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
 use super::counter::{build_timestamp_array, extract_timestamp_array};
+use crate::types::{ProcessorDescriptor, time_unit_to_string};
 use crate::write_processor::{ProcessorOutput, WriteProcessor};
 
 /// Accumulated histogram state for a single group key.
@@ -355,6 +356,18 @@ impl WriteProcessor for HistogramAggregator {
         }
         let aggregated = self.aggregate(&batches);
         ProcessorOutput::primary_only(vec![aggregated])
+    }
+
+    fn descriptor(&self) -> Option<ProcessorDescriptor> {
+        Some(ProcessorDescriptor::Histogram {
+            key_columns: self.key_columns.clone(),
+            boundaries_column: self.boundaries_column.clone(),
+            bucket_counts_column: self.bucket_counts_column.clone(),
+            sum_column: self.sum_column.clone(),
+            count_column: self.count_column.clone(),
+            timestamp_column: self.timestamp_column.clone(),
+            timestamp_unit: time_unit_to_string(self.timestamp_unit),
+        })
     }
 }
 

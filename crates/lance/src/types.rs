@@ -1,6 +1,11 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+
+use arrow_schema::TimeUnit;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a segment. Monotonically increasing.
 pub type SegmentId = u64;
@@ -34,6 +39,14 @@ pub struct SegmentCatalog {
     pub s3_manifest_version: u64,
     /// S3 dataset URI.
     pub s3_dataset_uri: String,
+    /// First raft log index written to the active segment.
+    /// `None` if no data has been written to the active segment yet.
+    #[serde(default)]
+    pub active_first_log_index: Option<u64>,
+    /// First raft log index written to the sealed segment.
+    /// `None` if no sealed segment or it has no data.
+    #[serde(default)]
+    pub sealed_first_log_index: Option<u64>,
 }
 
 impl Default for SegmentCatalog {
@@ -43,6 +56,8 @@ impl Default for SegmentCatalog {
             sealed_segment: None,
             s3_manifest_version: 0,
             s3_dataset_uri: String::new(),
+            active_first_log_index: None,
+            sealed_first_log_index: None,
         }
     }
 }
@@ -78,7 +93,7 @@ pub enum LanceCommand {
     /// Create a new table with the given schema (Arrow IPC-encoded).
     CreateTable {
         table_name: String,
-        schema_ipc: Vec<u8>,
+        schema_ipc: Bytes,
     },
 
     /// Drop a table and remove all its data.
@@ -89,7 +104,7 @@ pub enum LanceCommand {
     /// `data` contains Arrow IPC-encoded RecordBatches.
     AppendRecords {
         table_name: String,
-        data: Vec<u8>,
+        data: Bytes,
     },
 
     /// Seal the current active segment and create a new one.
@@ -244,5 +259,233 @@ pub struct TableSnapshot {
 /// Contains metadata for all tables — actual data lives in Lance datasets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotData {
-    pub tables: HashMap<String, TableSnapshot>,
+    pub tables: HashMap<String, PersistedTableEntry>,
+    /// Minimum raft log index that must be retained.
+    /// Computed as the minimum `first_log_index` across all tables' active and
+    /// sealed segments. `None` means all data is in S3 (or no tables exist).
+    #[serde(default)]
+    pub min_safe_log_index: Option<u64>,
+}
+
+// =============================================================================
+// Persisted Configuration Types
+// =============================================================================
+
+/// Serializable mirror of [`IndexSpec`](crate::config::IndexSpec).
+///
+/// `IndexType` from lance_index does not implement `Serialize`, so we store it
+/// as a string (e.g. `"Inverted"`, `"BTree"`, `"IvfHnswSq"`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedIndexSpec {
+    pub columns: Vec<String>,
+    /// String representation of the `IndexType` variant.
+    pub index_type: String,
+    pub name: Option<String>,
+}
+
+/// Serializable descriptor for reconstructing a [`WriteProcessor`](crate::WriteProcessor).
+///
+/// Each variant captures the constructor arguments needed to rebuild the
+/// concrete processor at recovery time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ProcessorDescriptor {
+    Counter {
+        key_columns: Vec<String>,
+        value_column: String,
+        timestamp_column: Option<String>,
+        timestamp_resolution_ms: i64,
+        timestamp_unit: String,
+    },
+    Gauge {
+        key_columns: Vec<String>,
+        value_column: String,
+        timestamp_column: Option<String>,
+        timestamp_unit: String,
+    },
+    Histogram {
+        key_columns: Vec<String>,
+        boundaries_column: String,
+        bucket_counts_column: String,
+        sum_column: String,
+        count_column: String,
+        timestamp_column: Option<String>,
+        timestamp_unit: String,
+    },
+}
+
+impl ProcessorDescriptor {
+    /// Reconstruct the concrete [`WriteProcessor`](crate::WriteProcessor) from
+    /// this descriptor.
+    pub fn into_processor(&self) -> Arc<dyn crate::write_processor::WriteProcessor> {
+        match self {
+            ProcessorDescriptor::Counter {
+                key_columns,
+                value_column,
+                timestamp_column,
+                timestamp_resolution_ms,
+                timestamp_unit,
+            } => {
+                let mut agg = crate::processors::CounterAggregator::new(
+                    key_columns.clone(),
+                    value_column.clone(),
+                );
+                if let Some(ts_col) = timestamp_column {
+                    agg = agg.with_timestamp(ts_col.clone(), *timestamp_resolution_ms);
+                }
+                agg = agg.with_timestamp_unit(parse_time_unit(timestamp_unit));
+                Arc::new(agg)
+            }
+            ProcessorDescriptor::Gauge {
+                key_columns,
+                value_column,
+                timestamp_column,
+                timestamp_unit,
+            } => {
+                let mut agg = crate::processors::GaugeAggregator::new(
+                    key_columns.clone(),
+                    value_column.clone(),
+                );
+                if let Some(ts_col) = timestamp_column {
+                    agg = agg.with_timestamp(ts_col.clone());
+                }
+                agg = agg.with_timestamp_unit(parse_time_unit(timestamp_unit));
+                Arc::new(agg)
+            }
+            ProcessorDescriptor::Histogram {
+                key_columns,
+                boundaries_column,
+                bucket_counts_column,
+                sum_column,
+                count_column,
+                timestamp_column,
+                timestamp_unit,
+            } => {
+                let mut agg =
+                    crate::processors::HistogramAggregator::new(key_columns.clone())
+                        .with_column_names(
+                            boundaries_column.clone(),
+                            bucket_counts_column.clone(),
+                            sum_column.clone(),
+                            count_column.clone(),
+                        );
+                if let Some(ts_col) = timestamp_column {
+                    agg = agg.with_timestamp(ts_col.clone());
+                }
+                agg = agg.with_timestamp_unit(parse_time_unit(timestamp_unit));
+                Arc::new(agg)
+            }
+        }
+    }
+}
+
+/// Serializable batcher configuration (without `dyn WriteProcessor`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedBatcherConfig {
+    pub linger_ms: u64,
+    pub max_batch_bytes: usize,
+    pub channel_capacity: usize,
+}
+
+/// Full per-table configuration that can be persisted to MDBX.
+///
+/// Does NOT include:
+/// - `s3_storage_options` — contains credentials, supplied from environment
+/// - `table_data_dir` — derived from engine config at runtime
+/// - `schema` — stored separately in `schema_history`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedTableConfig {
+    pub seal_indices: Vec<PersistedIndexSpec>,
+    pub s3_uri: Option<String>,
+    pub s3_max_rows_per_file: usize,
+    pub s3_max_rows_per_group: usize,
+    pub seal_max_age_ms: u64,
+    pub seal_max_size: u64,
+    pub compaction_target_rows_per_fragment: usize,
+    pub compaction_materialize_deletions: bool,
+    pub compaction_deletion_threshold: f32,
+    pub compaction_min_fragments: usize,
+    pub batcher: Option<PersistedBatcherConfig>,
+    pub processor: Option<ProcessorDescriptor>,
+}
+
+/// Combined configuration + state per table — what's stored in MDBX.
+///
+/// Replaces `TableSnapshot` as the system of record. Contains everything
+/// needed to fully recover a `TableEngine` instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedTableEntry {
+    pub config: PersistedTableConfig,
+    pub catalog: SegmentCatalog,
+    pub flush_state: FlushState,
+    pub schema_history: Vec<SchemaVersion>,
+}
+
+impl PersistedTableEntry {
+    /// Extract a `TableSnapshot` view (for backward compatibility).
+    pub fn to_snapshot(&self) -> TableSnapshot {
+        TableSnapshot {
+            catalog: self.catalog.clone(),
+            flush_state: self.flush_state.clone(),
+            schema_history: self.schema_history.clone(),
+        }
+    }
+
+    /// Create from a `TableSnapshot` with default config (for migration).
+    pub fn from_snapshot_with_defaults(snapshot: TableSnapshot) -> Self {
+        Self {
+            config: PersistedTableConfig::default(),
+            catalog: snapshot.catalog,
+            flush_state: snapshot.flush_state,
+            schema_history: snapshot.schema_history,
+        }
+    }
+}
+
+impl Default for PersistedTableConfig {
+    fn default() -> Self {
+        Self {
+            seal_indices: Vec::new(),
+            s3_uri: None,
+            s3_max_rows_per_file: 5_000_000,
+            s3_max_rows_per_group: 50_000,
+            seal_max_age_ms: 60_000,
+            seal_max_size: 1024 * 1024 * 1024,
+            compaction_target_rows_per_fragment: 1_048_576,
+            compaction_materialize_deletions: true,
+            compaction_deletion_threshold: 0.1,
+            compaction_min_fragments: 4,
+            batcher: None,
+            processor: None,
+        }
+    }
+}
+
+// =============================================================================
+// TimeUnit Helpers
+// =============================================================================
+
+/// Parse an Arrow `TimeUnit` from its string representation.
+pub fn parse_time_unit(s: &str) -> TimeUnit {
+    match s {
+        "Second" => TimeUnit::Second,
+        "Millisecond" => TimeUnit::Millisecond,
+        "Microsecond" => TimeUnit::Microsecond,
+        "Nanosecond" => TimeUnit::Nanosecond,
+        _ => TimeUnit::Millisecond, // safe default
+    }
+}
+
+/// Convert an Arrow `TimeUnit` to its string representation.
+pub fn time_unit_to_string(unit: TimeUnit) -> String {
+    match unit {
+        TimeUnit::Second => "Second".to_string(),
+        TimeUnit::Millisecond => "Millisecond".to_string(),
+        TimeUnit::Microsecond => "Microsecond".to_string(),
+        TimeUnit::Nanosecond => "Nanosecond".to_string(),
+    }
+}
+
+/// Convert a `Duration` to milliseconds (saturating at u64::MAX).
+pub fn duration_to_ms(d: Duration) -> u64 {
+    d.as_millis().min(u64::MAX as u128) as u64
 }

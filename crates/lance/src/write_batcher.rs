@@ -26,7 +26,10 @@ use tracing::{debug, warn};
 
 use crate::ipc;
 use crate::raft::WriteError;
-use crate::types::{LanceCommand, LanceResponse, WriteResult};
+use crate::types::{
+    duration_to_ms, LanceCommand, LanceResponse, PersistedBatcherConfig, ProcessorDescriptor,
+    WriteResult,
+};
 use crate::write_processor::{MaterializedWrite, WriteProcessor};
 use crate::LanceTypeConfig;
 
@@ -104,6 +107,33 @@ impl WriteBatcherConfig {
     pub fn with_processor(mut self, processor: Arc<dyn WriteProcessor>) -> Self {
         self.processor = Some(processor);
         self
+    }
+
+    /// Convert the batcher-only settings to a serializable form.
+    pub fn to_persisted_batcher(&self) -> PersistedBatcherConfig {
+        PersistedBatcherConfig {
+            linger_ms: duration_to_ms(self.linger),
+            max_batch_bytes: self.max_batch_bytes,
+            channel_capacity: self.channel_capacity,
+        }
+    }
+
+    /// Get the processor descriptor, if a processor is configured.
+    pub fn processor_descriptor(&self) -> Option<ProcessorDescriptor> {
+        self.processor.as_ref().and_then(|p| p.descriptor())
+    }
+
+    /// Reconstruct from persisted batcher config and optional processor descriptor.
+    pub fn from_persisted(
+        batcher: &PersistedBatcherConfig,
+        processor: Option<&ProcessorDescriptor>,
+    ) -> Self {
+        Self {
+            linger: Duration::from_millis(batcher.linger_ms),
+            max_batch_bytes: batcher.max_batch_bytes,
+            channel_capacity: batcher.channel_capacity,
+            processor: processor.map(|d| d.into_processor()),
+        }
     }
 }
 
@@ -344,7 +374,7 @@ async fn batcher_loop(
                 Ok(data) => {
                     let cmd = LanceCommand::AppendRecords {
                         table_name: table_name.clone(),
-                        data,
+                        data: data.into(),
                     };
                     match raft.client_write(cmd).await {
                         Ok(resp) => {
@@ -397,7 +427,7 @@ async fn propose_materialized_writes(
             Ok(data) => {
                 let cmd = LanceCommand::AppendRecords {
                     table_name: mw.table_name.clone(),
-                    data,
+                    data: data.into(),
                 };
                 if let Err(e) = raft.client_write(cmd).await {
                     warn!(

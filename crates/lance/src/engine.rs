@@ -9,8 +9,9 @@ use tracing::{info, warn};
 
 use crate::config::{BisqueLanceConfig, TableOpenConfig};
 use crate::error::{Error, Result};
+use crate::ipc;
 use crate::table_engine::TableEngine;
-use crate::types::{SegmentCatalog, TableSnapshot};
+use crate::types::{PersistedTableEntry, SegmentCatalog, TableSnapshot};
 
 /// Multi-table storage engine. Holds a registry of [`TableEngine`] instances
 /// keyed by table name.
@@ -135,20 +136,63 @@ impl BisqueLance {
         &self.config
     }
 
-    /// Collect snapshots of all tables for Raft snapshotting.
-    pub fn table_snapshots(&self) -> HashMap<String, TableSnapshot> {
+    /// Collect full persisted entries for all tables (config + state).
+    ///
+    /// Used by the snapshot builder — this is the system-of-record data
+    /// that gets serialized into Raft snapshots.
+    pub fn table_entries(&self) -> HashMap<String, PersistedTableEntry> {
         let tables = self.tables.read();
         tables
             .iter()
             .map(|(name, engine)| {
-                let snapshot = TableSnapshot {
+                let entry = PersistedTableEntry {
+                    config: engine.config().to_persisted(),
                     catalog: engine.catalog(),
                     flush_state: engine.flush_state(),
                     schema_history: engine.schema_history(),
                 };
-                (name.clone(), snapshot)
+                (name.clone(), entry)
             })
             .collect()
+    }
+
+    /// Restore tables from MDBX manifest data (full persisted entries).
+    ///
+    /// Called during crash recovery — reads per-table entries from the
+    /// manifest and recreates each `TableEngine` with the persisted config,
+    /// catalog, flush state, and schema history.
+    pub async fn restore_from_persisted_entries(
+        &self,
+        entries: HashMap<String, PersistedTableEntry>,
+    ) -> Result<()> {
+        for (table_name, entry) in &entries {
+            let schema = if let Some(latest) = entry.schema_history.last() {
+                match ipc::schema_from_ipc(&latest.schema_ipc) {
+                    Ok(s) => Some(Arc::new(s)),
+                    Err(e) => {
+                        warn!(table = %table_name, "Failed to decode schema from manifest: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let config = TableOpenConfig::from_persisted(
+                table_name,
+                &entry.config,
+                schema,
+                &self.config,
+            );
+
+            let snapshot = entry.to_snapshot();
+            if let Err(e) = self.restore_table(config, &snapshot).await {
+                warn!(table = %table_name, "Failed to restore table from manifest: {}", e);
+            }
+        }
+
+        info!(tables = entries.len(), "Restored tables from MDBX manifest");
+        Ok(())
     }
 
     /// Gracefully shutdown all tables.

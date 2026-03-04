@@ -21,6 +21,7 @@ pub mod engine;
 pub mod error;
 pub mod flight;
 pub mod ipc;
+pub mod manifest;
 pub mod otel;
 pub mod postgres;
 pub mod processors;
@@ -37,6 +38,7 @@ pub use config::{BisqueLanceConfig, IndexSpec, TableOpenConfig};
 pub use engine::BisqueLance;
 pub use error::{Error, Result};
 pub use flight::BisqueFlightService;
+pub use manifest::LanceManifestManager;
 pub use otel::{OtlpReceiver, serve_otlp};
 pub use postgres::{PostgresServerConfig, serve_postgres};
 pub use processors::{CounterAggregator, GaugeAggregator, HistogramAggregator};
@@ -46,8 +48,9 @@ pub use state_machine::LanceStateMachine;
 pub use table_engine::TableEngine;
 pub use types::{
     CleanupStats, CompactionStats, FlushHandle, FlushState, LanceCommand, LanceResponse,
-    SchemaVersion, SealReason, SegmentCatalog, SegmentId, SnapshotData, TableSnapshot,
-    WriteResult,
+    PersistedBatcherConfig, PersistedIndexSpec, PersistedTableConfig, PersistedTableEntry,
+    ProcessorDescriptor, SchemaVersion, SealReason, SegmentCatalog, SegmentId, SnapshotData,
+    TableSnapshot, WriteResult,
 };
 pub use write_batcher::WriteBatcherConfig;
 pub use write_processor::{MaterializedWrite, ProcessorOutput, WriteProcessor};

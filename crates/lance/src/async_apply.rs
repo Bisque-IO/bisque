@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bisque_raft::multi::record_format::AtomicLogId;
+use bytes::Bytes;
 use openraft::LogId;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -94,7 +95,7 @@ enum ApplyWork {
     Append {
         log_id: LogId<LanceTypeConfig>,
         table_name: String,
-        data: Vec<u8>,
+        data: Bytes,
         data_len: usize,
     },
     /// Drain all pending writes for a specific table, then signal completion.
@@ -109,7 +110,7 @@ enum ApplyWork {
 /// Accumulated pending work for a single table.
 struct TableWork {
     /// IPC-encoded data chunks in log order.
-    entries: Vec<(LogId<LanceTypeConfig>, Vec<u8>)>,
+    entries: Vec<(LogId<LanceTypeConfig>, Bytes)>,
     /// Total bytes across all entries (for backpressure accounting).
     total_bytes: usize,
 }
@@ -183,7 +184,7 @@ impl AsyncApplyBuffer {
         &self,
         log_id: LogId<LanceTypeConfig>,
         table_name: String,
-        data: Vec<u8>,
+        data: Bytes,
     ) {
         let data_len = data.len();
 
@@ -339,7 +340,7 @@ fn accumulate(
     per_table: &mut HashMap<String, TableWork>,
     log_id: LogId<LanceTypeConfig>,
     table_name: String,
-    data: Vec<u8>,
+    data: Bytes,
     data_len: usize,
 ) {
     let work = per_table.entry(table_name).or_insert_with(TableWork::new);
@@ -513,13 +514,13 @@ mod tests {
 
         // Enqueue some work.
         let batch = make_batch(&["a", "b"], &[1.0, 2.0]);
-        let data = ipc::encode_record_batches(&[batch]).unwrap();
+        let data: Bytes = ipc::encode_record_batches(&[batch]).unwrap().into();
         buffer
             .enqueue(make_log_id(1), "test_table".to_string(), data)
             .await;
 
         let batch2 = make_batch(&["c"], &[3.0]);
-        let data2 = ipc::encode_record_batches(&[batch2]).unwrap();
+        let data2: Bytes = ipc::encode_record_batches(&[batch2]).unwrap().into();
         buffer
             .enqueue(make_log_id(2), "test_table".to_string(), data2)
             .await;
@@ -552,13 +553,13 @@ mod tests {
         let (buffer, _watermark) = AsyncApplyBuffer::new(engine.clone(), AsyncApplyConfig::default());
 
         let batch_a = make_batch(&["a"], &[1.0]);
-        let data_a = ipc::encode_record_batches(&[batch_a]).unwrap();
+        let data_a: Bytes = ipc::encode_record_batches(&[batch_a]).unwrap().into();
         buffer
             .enqueue(make_log_id(1), "table_a".to_string(), data_a)
             .await;
 
         let batch_b = make_batch(&["b"], &[2.0]);
-        let data_b = ipc::encode_record_batches(&[batch_b]).unwrap();
+        let data_b: Bytes = ipc::encode_record_batches(&[batch_b]).unwrap().into();
         buffer
             .enqueue(make_log_id(2), "table_b".to_string(), data_b)
             .await;
@@ -612,7 +613,7 @@ mod tests {
 
         // Enqueue enough data to exceed the limit.
         let batch = make_batch(&["x"], &[1.0]);
-        let data = ipc::encode_record_batches(&[batch]).unwrap();
+        let data: Bytes = ipc::encode_record_batches(&[batch]).unwrap().into();
 
         // First enqueue should succeed.
         buffer
@@ -651,7 +652,7 @@ mod tests {
 
         // Enqueue and drain.
         let batch = make_batch(&["a"], &[1.0]);
-        let data = ipc::encode_record_batches(&[batch]).unwrap();
+        let data: Bytes = ipc::encode_record_batches(&[batch]).unwrap().into();
         buffer
             .enqueue(make_log_id(5), "wm_table".to_string(), data)
             .await;

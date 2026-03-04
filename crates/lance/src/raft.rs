@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::async_apply::AppliedWatermark;
 use crate::engine::BisqueLance;
 use crate::ipc;
+use crate::manifest::{LanceManifestManager, TableUpdate};
 use crate::types::{LanceCommand, LanceResponse, WriteResult};
 use crate::write_batcher::{WriteBatcher, WriteBatcherConfig};
 use crate::LanceTypeConfig;
@@ -36,6 +37,8 @@ pub struct LanceRaftNode {
     engine: Arc<BisqueLance>,
     /// This node's ID.
     node_id: u64,
+    /// The Raft group ID (used for per-group MDBX manifest).
+    group_id: u64,
     /// Interval between seal threshold checks.
     seal_check_interval: Duration,
     /// Interval between flush attempts when a sealed segment is pending.
@@ -46,6 +49,8 @@ pub struct LanceRaftNode {
     write_batcher: Option<Arc<WriteBatcher>>,
     /// Optional watermark for read-after-write fencing (set when async apply is enabled).
     applied_watermark: Option<AppliedWatermark>,
+    /// Optional MDBX manifest manager for crash-consistent metadata.
+    manifest: Option<Arc<LanceManifestManager>>,
     /// Notify handle to trigger shutdown of background tasks.
     shutdown: Arc<Notify>,
     /// Background task handles.
@@ -65,11 +70,13 @@ impl LanceRaftNode {
             raft,
             engine,
             node_id,
+            group_id: 0,
             seal_check_interval: Duration::from_secs(5),
             flush_check_interval: Duration::from_secs(10),
             compaction_check_interval: Duration::from_secs(60),
             write_batcher: None,
             applied_watermark: None,
+            manifest: None,
             shutdown: Arc::new(Notify::new()),
             task_handles: parking_lot::Mutex::new(Vec::new()),
         }
@@ -93,6 +100,14 @@ impl LanceRaftNode {
         self
     }
 
+    /// Set the Raft group ID (default: 0).
+    ///
+    /// Used for per-group MDBX manifest storage and batcher config persistence.
+    pub fn with_group_id(mut self, group_id: u64) -> Self {
+        self.group_id = group_id;
+        self
+    }
+
     /// Enable write batching with the given default configuration.
     ///
     /// When enabled, `write_records()` routes through a per-table batcher
@@ -113,6 +128,14 @@ impl LanceRaftNode {
         self
     }
 
+    /// Set the MDBX manifest manager for crash-consistent metadata.
+    ///
+    /// The manifest will be stopped when [`shutdown`] is called.
+    pub fn with_manifest(mut self, manifest: Arc<LanceManifestManager>) -> Self {
+        self.manifest = Some(manifest);
+        self
+    }
+
     /// Get a reference to the applied watermark, if async apply is enabled.
     pub fn applied_watermark(&self) -> Option<&AppliedWatermark> {
         self.applied_watermark.as_ref()
@@ -122,14 +145,77 @@ impl LanceRaftNode {
     ///
     /// Requires that write batching was enabled via [`with_write_batcher`].
     /// Has no effect if batching is not enabled.
+    ///
+    /// When an MDBX manifest is configured, the batcher/processor config is
+    /// persisted so it survives restarts (restored automatically in [`start`]).
     pub fn configure_table_batcher(&self, table_name: impl Into<String>, config: WriteBatcherConfig) {
+        let table_name = table_name.into();
         if let Some(batcher) = &self.write_batcher {
-            batcher.configure_table(table_name, config);
+            batcher.configure_table(&table_name, config.clone());
+        }
+
+        // Persist batcher config to MDBX (fire-and-forget).
+        if let Some(manifest) = &self.manifest {
+            let group_id = self.group_id;
+            let batcher_config = config.to_persisted_batcher();
+            let processor_desc = config.processor_descriptor();
+            let manifest = manifest.clone();
+            let tname = table_name;
+            tokio::spawn(async move {
+                if let Ok(Some(mut entry)) = manifest.read_table(group_id, &tname) {
+                    entry.config.batcher = Some(batcher_config);
+                    entry.config.processor = processor_desc;
+                    let update = LanceManifestManager::build_table_only_update(
+                        group_id,
+                        TableUpdate::Set {
+                            table_name: tname,
+                            entry,
+                        },
+                    );
+                    manifest.send_update(update).await;
+                }
+            });
         }
     }
 
     /// Start background tasks (leader watcher, seal checker, flush orchestrator, compaction).
+    ///
+    /// Also restores persisted per-table batcher/processor configs from MDBX
+    /// if both a manifest and write batcher are configured.
     pub fn start(&self) {
+        // Restore persisted batcher configs from MDBX.
+        if let (Some(manifest), Some(batcher)) = (&self.manifest, &self.write_batcher) {
+            match manifest.read_all_tables(self.group_id) {
+                Ok(entries) => {
+                    for (table_name, entry) in entries {
+                        if entry.config.batcher.is_some() || entry.config.processor.is_some() {
+                            let batcher_cfg = entry.config.batcher.as_ref();
+                            let processor_desc = entry.config.processor.as_ref();
+                            let restored = WriteBatcherConfig::from_persisted(
+                                batcher_cfg.unwrap_or(
+                                    &crate::types::PersistedBatcherConfig {
+                                        linger_ms: 5,
+                                        max_batch_bytes: 8 * 1024 * 1024,
+                                        channel_capacity: 1024,
+                                    },
+                                ),
+                                processor_desc,
+                            );
+                            debug!(
+                                table = %table_name,
+                                has_processor = processor_desc.is_some(),
+                                "Restored persisted batcher config"
+                            );
+                            batcher.configure_table(&table_name, restored);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to read persisted batcher configs: {}", e);
+                }
+            }
+        }
+
         let mut handles = self.task_handles.lock();
 
         // 1. Leader election watcher
@@ -181,7 +267,7 @@ impl LanceRaftNode {
 
         let cmd = LanceCommand::CreateTable {
             table_name: table_name.to_string(),
-            schema_ipc,
+            schema_ipc: schema_ipc.into(),
         };
         self.propose(cmd).await
     }
@@ -224,7 +310,7 @@ impl LanceRaftNode {
 
         let cmd = LanceCommand::AppendRecords {
             table_name: table_name.to_string(),
-            data,
+            data: data.into(),
         };
         self.propose(cmd).await
     }
@@ -296,6 +382,11 @@ impl LanceRaftNode {
 
         if let Err(e) = self.engine.shutdown().await {
             error!("Engine shutdown error: {}", e);
+        }
+
+        // Stop the manifest worker thread last, after all engine work is done.
+        if let Some(manifest) = &self.manifest {
+            manifest.stop();
         }
     }
 }

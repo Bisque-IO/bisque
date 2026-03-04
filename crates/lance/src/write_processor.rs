@@ -15,6 +15,8 @@
 
 use arrow_array::RecordBatch;
 
+use crate::types::ProcessorDescriptor;
+
 /// A write to a materialized (derived) table.
 ///
 /// Produced by [`WriteProcessor::process`] when the processor emits additional
@@ -81,5 +83,13 @@ pub trait WriteProcessor: Send + Sync + 'static {
     /// any incomplete window aggregations.
     fn drain(&self) -> Vec<MaterializedWrite> {
         Vec::new()
+    }
+
+    /// Return a serializable descriptor for this processor, if available.
+    ///
+    /// Built-in processors (Counter, Gauge, Histogram) return `Some(...)`.
+    /// Custom or third-party processors return `None` (the default).
+    fn descriptor(&self) -> Option<ProcessorDescriptor> {
+        None
     }
 }

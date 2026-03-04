@@ -1111,6 +1111,9 @@ struct MmapGroupState<C: RaftTypeConfig> {
     manifest_tx: MAsyncTx<Array<SegmentMeta>>,
     /// Shared fsync state (one thread for all groups, owned by MmapPerGroupLogStorage)
     fsync_state: Arc<FsyncState<C>>,
+    /// Floor below which purge() will not remove log entries.
+    /// Set externally by the state machine layer. 0 = no constraint.
+    purge_floor: Arc<AtomicU64>,
 }
 
 impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
@@ -1388,6 +1391,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             config: config.clone(),
             manifest_tx,
             fsync_state,
+            purge_floor: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1681,6 +1685,12 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
     pub fn num_groups(&self) -> usize {
         self.groups.len()
     }
+
+    /// Get the purge floor handle for a specific group.
+    /// Returns `None` if the group has not been initialized yet.
+    pub fn get_purge_floor(&self, group_id: u64) -> Option<Arc<AtomicU64>> {
+        self.groups.get(group_id).map(|state| state.purge_floor.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1714,6 +1724,13 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
     /// Get the group ID
     pub fn group_id(&self) -> u64 {
         self.group_id
+    }
+
+    /// Get the purge floor handle.
+    /// The state machine layer can hold this Arc and update the floor
+    /// to prevent log purging below a certain index.
+    pub fn purge_floor(&self) -> Arc<AtomicU64> {
+        self.state.purge_floor.clone()
     }
 
     /// Read an entry from mmap by index
@@ -2131,11 +2148,25 @@ where
     }
 
     async fn purge(&mut self, log_id: LogId<C>) -> Result<(), io::Error> {
-        let index = log_id.index;
+        let floor = self.state.purge_floor.load(Ordering::Acquire);
+        let index = if floor > 0 && log_id.index >= floor {
+            // Cap the purge at floor - 1 to retain the entry at floor.
+            if floor <= 1 {
+                return Ok(());
+            }
+            floor - 1
+        } else {
+            log_id.index
+        };
 
         // Update first index and last_purged_log_id
         self.state.first_index.store(index + 1, Ordering::Relaxed);
-        self.state.last_purged_log_id.store(Some(&log_id));
+        // Use the original leader_id with the capped index.
+        let effective_log_id: LogId<C> = LogId {
+            leader_id: log_id.leader_id,
+            index,
+        };
+        self.state.last_purged_log_id.store(Some(&effective_log_id));
 
         // Purge from LogIndex and remove old segments
         self.state.log_index.purge_to(index);
@@ -2182,6 +2213,10 @@ where
 
     fn group_ids(&self) -> Vec<u64> {
         MmapPerGroupLogStorage::group_ids(self)
+    }
+
+    fn get_purge_floor(&self, group_id: u64) -> Option<Arc<AtomicU64>> {
+        MmapPerGroupLogStorage::get_purge_floor(self, group_id)
     }
 }
 
