@@ -162,6 +162,18 @@ pub enum LanceResponse {
     Error(String),
 }
 
+/// Result of a successful write operation.
+///
+/// Contains the Raft log index at which the write was committed. Clients
+/// can pass this index to query APIs for read-after-write consistency —
+/// the query handler will wait until the Lance materialization watermark
+/// reaches this index before executing.
+#[derive(Debug, Clone)]
+pub struct WriteResult {
+    /// Raft log index at which the write was committed.
+    pub log_index: u64,
+}
+
 impl fmt::Display for LanceResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

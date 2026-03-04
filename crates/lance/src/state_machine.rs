@@ -12,6 +12,7 @@ use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{EntryPayload, LogId, OptionalSend, Snapshot, SnapshotMeta, StoredMembership};
 use tracing::{debug, error, info, warn};
 
+use crate::async_apply::{AppliedWatermark, AsyncApplyBuffer, AsyncApplyConfig};
 use crate::engine::BisqueLance;
 use crate::ipc;
 use crate::types::{LanceCommand, LanceResponse, SnapshotData};
@@ -22,6 +23,8 @@ pub struct LanceStateMachine {
     engine: Arc<BisqueLance>,
     last_applied: Option<LogId<LanceTypeConfig>>,
     last_membership: StoredMembership<LanceTypeConfig>,
+    /// Optional async apply buffer for decoupling Lance I/O from apply.
+    async_buffer: Option<AsyncApplyBuffer>,
 }
 
 impl LanceStateMachine {
@@ -30,7 +33,26 @@ impl LanceStateMachine {
             engine,
             last_applied: None,
             last_membership: StoredMembership::default(),
+            async_buffer: None,
         }
+    }
+
+    /// Create a new state machine with async apply enabled.
+    ///
+    /// Returns the state machine and a clonable [`AppliedWatermark`] handle
+    /// that query layers can use for read-after-write fencing.
+    pub fn with_async_apply(
+        engine: Arc<BisqueLance>,
+        config: AsyncApplyConfig,
+    ) -> (Self, AppliedWatermark) {
+        let (async_buffer, watermark) = AsyncApplyBuffer::new(engine.clone(), config);
+        let sm = Self {
+            engine,
+            last_applied: None,
+            last_membership: StoredMembership::default(),
+            async_buffer: Some(async_buffer),
+        };
+        (sm, watermark)
     }
 
     /// Access the underlying engine.
@@ -51,7 +73,13 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
         ),
         io::Error,
     > {
-        Ok((self.last_applied.clone(), self.last_membership.clone()))
+        let last_applied = if let Some(buf) = &self.async_buffer {
+            // Conservative watermark: only report what Lance has fully written.
+            buf.lance_applied_log_id()
+        } else {
+            self.last_applied.clone()
+        };
+        Ok((last_applied, self.last_membership.clone()))
     }
 
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
@@ -70,7 +98,29 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
 
             let response = match entry.payload {
                 EntryPayload::Blank => LanceResponse::Ok,
-                EntryPayload::Normal(cmd) => self.apply_command(cmd).await,
+                EntryPayload::Normal(cmd) => {
+                    match cmd {
+                        LanceCommand::AppendRecords { table_name, data } => {
+                            if let Some(buf) = &self.async_buffer {
+                                // Async path: enqueue for background processing.
+                                buf.enqueue(entry.log_id.clone(), table_name, data).await;
+                                LanceResponse::Ok
+                            } else {
+                                // Sync path (original behavior).
+                                self.apply_command(LanceCommand::AppendRecords { table_name, data }).await
+                            }
+                        }
+                        LanceCommand::SealActiveSegment { ref table_name, .. }
+                        | LanceCommand::DropTable { ref table_name, .. } => {
+                            // Barrier: drain pending writes for this table before proceeding.
+                            if let Some(buf) = &self.async_buffer {
+                                buf.drain_table(table_name).await;
+                            }
+                            self.apply_command(cmd).await
+                        }
+                        other => self.apply_command(other).await,
+                    }
+                }
                 EntryPayload::Membership(m) => {
                     self.last_membership =
                         StoredMembership::new(Some(entry.log_id.clone()), m);
@@ -87,6 +137,10 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        // Drain async buffer to ensure Lance state is caught up before snapshot.
+        if let Some(buf) = &self.async_buffer {
+            buf.drain_all().await;
+        }
         LanceSnapshotBuilder {
             table_snapshots: self.engine.table_snapshots(),
             last_applied: self.last_applied.clone(),

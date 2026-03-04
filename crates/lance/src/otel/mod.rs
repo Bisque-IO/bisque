@@ -100,6 +100,14 @@ impl OtlpReceiver {
             )),
         );
 
+        // Traces and logs are append-only (no processor), but still benefit
+        // from batching — coalesces many small Export() calls into fewer Raft
+        // proposals per linger window.
+        self.raft_node
+            .configure_table_batcher(schema::SPANS_TABLE, WriteBatcherConfig::default());
+        self.raft_node
+            .configure_table_batcher(schema::LOGS_TABLE, WriteBatcherConfig::default());
+
         Ok(())
     }
 

@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 
 use crate::ipc;
 use crate::raft::WriteError;
-use crate::types::{LanceCommand, LanceResponse};
+use crate::types::{LanceCommand, LanceResponse, WriteResult};
 use crate::write_processor::{MaterializedWrite, WriteProcessor};
 use crate::LanceTypeConfig;
 
@@ -115,7 +115,7 @@ impl WriteBatcherConfig {
 struct BatchWriteRequest {
     batches: Vec<RecordBatch>,
     estimated_bytes: usize,
-    response_tx: oneshot::Sender<Result<LanceResponse, WriteError>>,
+    response_tx: oneshot::Sender<Result<WriteResult, WriteError>>,
 }
 
 /// Handle to a per-table batcher task.
@@ -177,7 +177,7 @@ impl WriteBatcher {
         &self,
         table_name: &str,
         batches: Vec<RecordBatch>,
-    ) -> Result<LanceResponse, WriteError> {
+    ) -> Result<WriteResult, WriteError> {
         let estimated_bytes: usize = batches
             .iter()
             .map(|b| b.get_array_memory_size())
@@ -337,8 +337,8 @@ async fn batcher_loop(
         };
 
         // Step 3b: IPC-encode and propose primary batches.
-        let result = if primary_batches.is_empty() {
-            Ok(LanceResponse::Ok)
+        let result: Result<WriteResult, WriteError> = if primary_batches.is_empty() {
+            Ok(WriteResult { log_index: 0 })
         } else {
             match ipc::encode_record_batches(&primary_batches) {
                 Ok(data) => {
@@ -347,7 +347,15 @@ async fn batcher_loop(
                         data,
                     };
                     match raft.client_write(cmd).await {
-                        Ok(resp) => Ok(resp.response().clone()),
+                        Ok(resp) => {
+                            if let LanceResponse::Error(e) = resp.response() {
+                                Err(WriteError::Raft(e.clone()))
+                            } else {
+                                Ok(WriteResult {
+                                    log_index: resp.log_id().index,
+                                })
+                            }
+                        }
                         Err(e) => Err(WriteError::Raft(e.to_string())),
                     }
                 }

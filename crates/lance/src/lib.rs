@@ -14,6 +14,7 @@
 //! The Raft state machine tracks segment metadata per table and drives transitions
 //! between tiers.
 
+pub mod async_apply;
 pub mod codec;
 pub mod config;
 pub mod engine;
@@ -31,6 +32,7 @@ pub mod types;
 pub mod write_batcher;
 pub mod write_processor;
 
+pub use async_apply::{AppliedWatermark, AsyncApplyConfig};
 pub use config::{BisqueLanceConfig, IndexSpec, TableOpenConfig};
 pub use engine::BisqueLance;
 pub use error::{Error, Result};
@@ -45,6 +47,7 @@ pub use table_engine::TableEngine;
 pub use types::{
     CleanupStats, CompactionStats, FlushHandle, FlushState, LanceCommand, LanceResponse,
     SchemaVersion, SealReason, SegmentCatalog, SegmentId, SnapshotData, TableSnapshot,
+    WriteResult,
 };
 pub use write_batcher::WriteBatcherConfig;
 pub use write_processor::{MaterializedWrite, ProcessorOutput, WriteProcessor};

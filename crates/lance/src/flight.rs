@@ -56,11 +56,21 @@ use futures::{StreamExt, TryStreamExt};
 use prost::Message as _;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::ipc;
 use crate::postgres::BisqueLanceCatalogProvider;
 use crate::raft::{LanceRaftNode, WriteError};
+
+/// Default timeout for waiting on the read fence.
+const READ_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// gRPC metadata key for read-after-write fencing.
+///
+/// Clients pass the `log_index` from their [`WriteResult`] in this header.
+/// The query handler waits until Lance has materialized at least this far
+/// before executing the query.
+const READ_FENCE_HEADER: &str = "x-bisque-min-log-id";
 
 /// Arrow Flight SQL service backed by a bisque-lance Raft node.
 ///
@@ -105,6 +115,45 @@ impl BisqueFlightService {
     /// Build a [`FlightServiceServer`] from this service, ready to be added to a tonic router.
     pub fn into_server(self) -> FlightServiceServer<Self> {
         FlightServiceServer::new(self)
+    }
+
+    /// Wait for the Lance materialization watermark to reach the specified
+    /// log index (read-after-write fence). No-op if async apply is not enabled
+    /// or if no fence header is present.
+    async fn wait_for_read_fence<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let min_log_id = match request.metadata().get(READ_FENCE_HEADER) {
+            Some(val) => {
+                let s = val
+                    .to_str()
+                    .map_err(|_| Status::invalid_argument("x-bisque-min-log-id must be ASCII"))?;
+                s.parse::<u64>().map_err(|_| {
+                    Status::invalid_argument("x-bisque-min-log-id must be a u64")
+                })?
+            }
+            None => return Ok(()),
+        };
+
+        if min_log_id == 0 {
+            return Ok(());
+        }
+
+        if let Some(watermark) = self.raft_node.applied_watermark() {
+            if !watermark.wait_for(min_log_id, READ_FENCE_TIMEOUT).await {
+                warn!(
+                    min_log_id,
+                    current = watermark.current_index(),
+                    "read fence timeout waiting for Lance materialization"
+                );
+                return Err(Status::deadline_exceeded(format!(
+                    "timed out waiting for log index {} to be materialized (current: {})",
+                    min_log_id,
+                    watermark.current_index()
+                )));
+            }
+            debug!(min_log_id, "read fence satisfied");
+        }
+        // If no watermark (sync mode), data is immediately visible.
+        Ok(())
     }
 
     /// Execute a SQL query and return the result schema + batches.
@@ -206,10 +255,11 @@ impl FlightSqlService for BisqueFlightService {
     async fn get_flight_info_statement(
         &self,
         query: CommandStatementQuery,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         debug!(sql = %query.query, "get_flight_info_statement");
 
+        self.wait_for_read_fence(&request).await?;
         let (schema, _batches) = self.execute_sql(&query.query).await?;
 
         // Create a ticket that embeds the SQL query for do_get_statement.
@@ -231,12 +281,14 @@ impl FlightSqlService for BisqueFlightService {
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let sql = std::str::from_utf8(&ticket.statement_handle)
             .map_err(|_| Status::invalid_argument("statement handle is not valid UTF-8 SQL"))?;
 
         debug!(sql = %sql, "do_get_statement");
+
+        self.wait_for_read_fence(&request).await?;
 
         let df = self.ctx
             .sql(sql)

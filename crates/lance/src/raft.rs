@@ -17,9 +17,10 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::async_apply::AppliedWatermark;
 use crate::engine::BisqueLance;
 use crate::ipc;
-use crate::types::{LanceCommand, LanceResponse};
+use crate::types::{LanceCommand, LanceResponse, WriteResult};
 use crate::write_batcher::{WriteBatcher, WriteBatcherConfig};
 use crate::LanceTypeConfig;
 
@@ -43,6 +44,8 @@ pub struct LanceRaftNode {
     compaction_check_interval: Duration,
     /// Optional write batcher for coalescing per-table writes.
     write_batcher: Option<Arc<WriteBatcher>>,
+    /// Optional watermark for read-after-write fencing (set when async apply is enabled).
+    applied_watermark: Option<AppliedWatermark>,
     /// Notify handle to trigger shutdown of background tasks.
     shutdown: Arc<Notify>,
     /// Background task handles.
@@ -66,6 +69,7 @@ impl LanceRaftNode {
             flush_check_interval: Duration::from_secs(10),
             compaction_check_interval: Duration::from_secs(60),
             write_batcher: None,
+            applied_watermark: None,
             shutdown: Arc::new(Notify::new()),
             task_handles: parking_lot::Mutex::new(Vec::new()),
         }
@@ -98,6 +102,20 @@ impl LanceRaftNode {
     pub fn with_write_batcher(mut self, config: WriteBatcherConfig) -> Self {
         self.write_batcher = Some(Arc::new(WriteBatcher::new(config, self.raft.clone())));
         self
+    }
+
+    /// Set the applied watermark for read-after-write fencing.
+    ///
+    /// Should be set when async apply is enabled. The watermark is obtained
+    /// from [`LanceStateMachine::with_async_apply`].
+    pub fn with_applied_watermark(mut self, watermark: AppliedWatermark) -> Self {
+        self.applied_watermark = Some(watermark);
+        self
+    }
+
+    /// Get a reference to the applied watermark, if async apply is enabled.
+    pub fn applied_watermark(&self) -> Option<&AppliedWatermark> {
+        self.applied_watermark.as_ref()
     }
 
     /// Set a per-table batcher configuration, overriding the default.
@@ -157,7 +175,7 @@ impl LanceRaftNode {
         &self,
         table_name: &str,
         schema: &arrow_schema::Schema,
-    ) -> Result<LanceResponse, WriteError> {
+    ) -> Result<WriteResult, WriteError> {
         let schema_ipc = ipc::schema_to_ipc(schema)
             .map_err(|e| WriteError::Encode(e.to_string()))?;
 
@@ -172,7 +190,7 @@ impl LanceRaftNode {
     pub async fn drop_table(
         &self,
         table_name: &str,
-    ) -> Result<LanceResponse, WriteError> {
+    ) -> Result<WriteResult, WriteError> {
         let cmd = LanceCommand::DropTable {
             table_name: table_name.to_string(),
         };
@@ -184,13 +202,16 @@ impl LanceRaftNode {
     /// When a [`WriteBatcher`] is configured, writes are coalesced over the
     /// linger window before being proposed as a single Raft entry. Otherwise
     /// each call produces an individual Raft proposal.
+    ///
+    /// Returns a [`WriteResult`] containing the committed log index, which
+    /// can be used for read-after-write fencing.
     pub async fn write_records(
         &self,
         table_name: &str,
         batches: &[arrow_array::RecordBatch],
-    ) -> Result<LanceResponse, WriteError> {
+    ) -> Result<WriteResult, WriteError> {
         if batches.is_empty() {
-            return Ok(LanceResponse::Ok);
+            return Ok(WriteResult { log_index: 0 });
         }
 
         // Route through batcher if configured.
@@ -209,10 +230,18 @@ impl LanceRaftNode {
     }
 
     /// Propose a command through Raft consensus.
-    pub async fn propose(&self, cmd: LanceCommand) -> Result<LanceResponse, WriteError> {
+    ///
+    /// Returns a [`WriteResult`] containing the committed log index.
+    pub async fn propose(&self, cmd: LanceCommand) -> Result<WriteResult, WriteError> {
         let result = self.raft.client_write(cmd).await;
         match result {
-            Ok(resp) => Ok(resp.response().clone()),
+            Ok(resp) => {
+                if let LanceResponse::Error(e) = resp.response() {
+                    return Err(WriteError::Raft(e.clone()));
+                }
+                let log_index = resp.log_id().index;
+                Ok(WriteResult { log_index })
+            }
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
                 Err(WriteError::NotLeader {
                     leader_id: fwd.leader_id,

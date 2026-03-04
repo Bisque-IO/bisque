@@ -232,8 +232,10 @@ async fn metrics_sum_to_counters() {
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    assert_eq!(values.value(0), 42.0);
-    assert_eq!(values.value(1), 10.0); // i64 cast to f64
+    // Row order is non-deterministic (HashMap iteration), so collect and sort.
+    let mut vals: Vec<f64> = (0..batch.num_rows()).map(|i| values.value(i)).collect();
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(vals, vec![10.0, 42.0]);
 
     node.shutdown().await;
 }
