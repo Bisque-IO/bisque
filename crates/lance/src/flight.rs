@@ -51,6 +51,7 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::context::SessionContext;
+use datafusion::prelude::SessionConfig;
 use futures::{StreamExt, TryStreamExt};
 use prost::Message as _;
 use tonic::transport::Server;
@@ -58,7 +59,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::debug;
 
 use crate::ipc;
-use crate::query::BisqueLanceTableProvider;
+use crate::postgres::BisqueLanceCatalogProvider;
 use crate::raft::{LanceRaftNode, WriteError};
 
 /// Arrow Flight SQL service backed by a bisque-lance Raft node.
@@ -72,12 +73,28 @@ use crate::raft::{LanceRaftNode, WriteError};
 /// Read operations are served directly from the local engine.
 pub struct BisqueFlightService {
     raft_node: Arc<LanceRaftNode>,
+    /// Cached session context with a dynamic catalog that resolves tables
+    /// from the live engine — no per-query rebuild needed.
+    ctx: Arc<SessionContext>,
 }
 
 impl BisqueFlightService {
     /// Create a new Flight SQL service wrapping the given Raft node.
     pub fn new(raft_node: Arc<LanceRaftNode>) -> Self {
-        Self { raft_node }
+        let engine = raft_node.engine().clone();
+
+        let session_config = SessionConfig::new()
+            .with_default_catalog_and_schema("bisque", "public")
+            .with_create_default_catalog_and_schema(false);
+        let ctx = SessionContext::new_with_config(session_config);
+
+        let catalog = Arc::new(BisqueLanceCatalogProvider::new(engine));
+        ctx.register_catalog("bisque", catalog);
+
+        Self {
+            raft_node,
+            ctx: Arc::new(ctx),
+        }
     }
 
     /// Get a reference to the underlying Raft node.
@@ -90,35 +107,10 @@ impl BisqueFlightService {
         FlightServiceServer::new(self)
     }
 
-    /// Build a DataFusion `SessionContext` with all current tables registered.
-    async fn build_session_context(&self) -> Result<SessionContext, Status> {
-        let engine = self.raft_node.engine();
-        let ctx = SessionContext::new();
-
-        for table_name in engine.list_tables() {
-            let table = match engine.get_table(&table_name) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            let schema = match table.schema().await {
-                Some(s) => s,
-                None => continue,
-            };
-
-            let provider = BisqueLanceTableProvider::new(table, schema);
-            ctx.register_table(&table_name, Arc::new(provider))
-                .map_err(|e| Status::internal(format!("failed to register table: {e}")))?;
-        }
-
-        Ok(ctx)
-    }
-
     /// Execute a SQL query and return the result schema + batches.
     async fn execute_sql(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
-        let ctx = self.build_session_context().await?;
-
-        let df = ctx
+        let df = self
+            .ctx
             .sql(sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("SQL error: {e}")))?;
@@ -246,9 +238,7 @@ impl FlightSqlService for BisqueFlightService {
 
         debug!(sql = %sql, "do_get_statement");
 
-        let ctx = self.build_session_context().await?;
-
-        let df = ctx
+        let df = self.ctx
             .sql(sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("SQL error: {e}")))?;
@@ -687,8 +677,7 @@ impl FlightSqlService for BisqueFlightService {
 
         debug!(sql = %sql, "do_get_prepared_statement");
 
-        let ctx = self.build_session_context().await?;
-        let df = ctx
+        let df = self.ctx
             .sql(sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("SQL error: {e}")))?;

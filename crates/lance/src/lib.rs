@@ -20,18 +20,24 @@ pub mod engine;
 pub mod error;
 pub mod flight;
 pub mod ipc;
+pub mod otel;
 pub mod postgres;
+pub mod processors;
 pub mod query;
 pub mod raft;
 pub mod state_machine;
 pub mod table_engine;
 pub mod types;
+pub mod write_batcher;
+pub mod write_processor;
 
 pub use config::{BisqueLanceConfig, IndexSpec, TableOpenConfig};
 pub use engine::BisqueLance;
 pub use error::{Error, Result};
 pub use flight::BisqueFlightService;
+pub use otel::{OtlpReceiver, serve_otlp};
 pub use postgres::{PostgresServerConfig, serve_postgres};
+pub use processors::{CounterAggregator, GaugeAggregator, HistogramAggregator};
 pub use query::BisqueLanceTableProvider;
 pub use raft::{LanceRaftNode, WriteError};
 pub use state_machine::LanceStateMachine;
@@ -40,6 +46,8 @@ pub use types::{
     CleanupStats, CompactionStats, FlushHandle, FlushState, LanceCommand, LanceResponse,
     SchemaVersion, SealReason, SegmentCatalog, SegmentId, SnapshotData, TableSnapshot,
 };
+pub use write_batcher::WriteBatcherConfig;
+pub use write_processor::{MaterializedWrite, ProcessorOutput, WriteProcessor};
 
 /// Raft type configuration for bisque-lance.
 ///

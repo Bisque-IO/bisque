@@ -46,12 +46,12 @@ use crate::raft::LanceRaftNode;
 /// Every call to [`table_names`], [`table_exist`], or [`table`] reads the
 /// current engine state, so newly created or dropped tables are reflected
 /// immediately without any cache refresh.
-struct BisqueLanceSchemaProvider {
+pub(crate) struct BisqueLanceSchemaProvider {
     engine: Arc<BisqueLance>,
 }
 
 impl BisqueLanceSchemaProvider {
-    fn new(engine: Arc<BisqueLance>) -> Self {
+    pub(crate) fn new(engine: Arc<BisqueLance>) -> Self {
         Self { engine }
     }
 }
@@ -103,13 +103,13 @@ impl SchemaProvider for BisqueLanceSchemaProvider {
 /// A DataFusion [`CatalogProvider`] that exposes a `"public"` schema backed
 /// by the live [`BisqueLance`] engine, plus any additional schemas registered
 /// at runtime (e.g. `pg_catalog` for PostgreSQL compatibility).
-struct BisqueLanceCatalogProvider {
+pub(crate) struct BisqueLanceCatalogProvider {
     public: Arc<BisqueLanceSchemaProvider>,
     extra: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
 }
 
 impl BisqueLanceCatalogProvider {
-    fn new(engine: Arc<BisqueLance>) -> Self {
+    pub(crate) fn new(engine: Arc<BisqueLance>) -> Self {
         Self {
             public: Arc::new(BisqueLanceSchemaProvider::new(engine)),
             extra: RwLock::new(HashMap::new()),

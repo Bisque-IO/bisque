@@ -799,12 +799,17 @@ impl TableEngine {
 
     /// Check if the active segment should be sealed.
     pub fn should_seal(&self) -> Option<SealReason> {
+        // Never seal an empty segment — no point rotating if nothing was written.
+        let size = self.active_bytes.load(Ordering::Relaxed);
+        if size == 0 {
+            return None;
+        }
+
         let age = self.active_created_at.read().elapsed();
         if age >= self.config.seal_max_age {
             return Some(SealReason::MaxAge);
         }
 
-        let size = self.active_bytes.load(Ordering::Relaxed);
         if size >= self.config.seal_max_size {
             return Some(SealReason::MaxSize);
         }

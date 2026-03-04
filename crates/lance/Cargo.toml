@@ -46,8 +46,12 @@ prost = { workspace = true }
 # PostgreSQL wire protocol
 datafusion-postgres = { workspace = true }
 
+# OpenTelemetry
+opentelemetry-proto = { workspace = true }
+
 # Serialization
 serde = { workspace = true }
+serde_json = { workspace = true }
 bincode = { workspace = true, features = ["serde"] }
 bytes = { workspace = true }
 
@@ -59,6 +63,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
+crossfire = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

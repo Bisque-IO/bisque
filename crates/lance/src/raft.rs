@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::engine::BisqueLance;
 use crate::ipc;
 use crate::types::{LanceCommand, LanceResponse};
+use crate::write_batcher::{WriteBatcher, WriteBatcherConfig};
 use crate::LanceTypeConfig;
 
 /// Raft-integrated node for bisque-lance.
@@ -40,6 +41,8 @@ pub struct LanceRaftNode {
     flush_check_interval: Duration,
     /// Interval between compaction checks for active and S3 tiers.
     compaction_check_interval: Duration,
+    /// Optional write batcher for coalescing per-table writes.
+    write_batcher: Option<Arc<WriteBatcher>>,
     /// Notify handle to trigger shutdown of background tasks.
     shutdown: Arc<Notify>,
     /// Background task handles.
@@ -62,6 +65,7 @@ impl LanceRaftNode {
             seal_check_interval: Duration::from_secs(5),
             flush_check_interval: Duration::from_secs(10),
             compaction_check_interval: Duration::from_secs(60),
+            write_batcher: None,
             shutdown: Arc::new(Notify::new()),
             task_handles: parking_lot::Mutex::new(Vec::new()),
         }
@@ -83,6 +87,27 @@ impl LanceRaftNode {
     pub fn with_compaction_check_interval(mut self, interval: Duration) -> Self {
         self.compaction_check_interval = interval;
         self
+    }
+
+    /// Enable write batching with the given default configuration.
+    ///
+    /// When enabled, `write_records()` routes through a per-table batcher
+    /// that coalesces writes over a short linger window before submitting
+    /// a single Raft proposal. Individual tables can be configured with
+    /// [`configure_table_batcher`].
+    pub fn with_write_batcher(mut self, config: WriteBatcherConfig) -> Self {
+        self.write_batcher = Some(Arc::new(WriteBatcher::new(config, self.raft.clone())));
+        self
+    }
+
+    /// Set a per-table batcher configuration, overriding the default.
+    ///
+    /// Requires that write batching was enabled via [`with_write_batcher`].
+    /// Has no effect if batching is not enabled.
+    pub fn configure_table_batcher(&self, table_name: impl Into<String>, config: WriteBatcherConfig) {
+        if let Some(batcher) = &self.write_batcher {
+            batcher.configure_table(table_name, config);
+        }
     }
 
     /// Start background tasks (leader watcher, seal checker, flush orchestrator, compaction).
@@ -155,6 +180,10 @@ impl LanceRaftNode {
     }
 
     /// Write record batches to a specific table through Raft consensus.
+    ///
+    /// When a [`WriteBatcher`] is configured, writes are coalesced over the
+    /// linger window before being proposed as a single Raft entry. Otherwise
+    /// each call produces an individual Raft proposal.
     pub async fn write_records(
         &self,
         table_name: &str,
@@ -162,6 +191,11 @@ impl LanceRaftNode {
     ) -> Result<LanceResponse, WriteError> {
         if batches.is_empty() {
             return Ok(LanceResponse::Ok);
+        }
+
+        // Route through batcher if configured.
+        if let Some(batcher) = &self.write_batcher {
+            return batcher.submit(table_name, batches.to_vec()).await;
         }
 
         let data = ipc::encode_record_batches(batches)
@@ -215,6 +249,12 @@ impl LanceRaftNode {
     /// Shutdown background tasks and the engine.
     pub async fn shutdown(&self) {
         info!(node_id = self.node_id, "Shutting down LanceRaftNode");
+
+        // Drain the write batcher first so any pending writes complete.
+        if let Some(batcher) = &self.write_batcher {
+            batcher.shutdown().await;
+        }
+
         self.shutdown.notify_waiters();
 
         let handles: Vec<_> = {
@@ -236,7 +276,7 @@ impl LanceRaftNode {
 // =============================================================================
 
 /// Errors from [`LanceRaftNode::write_records`] and [`LanceRaftNode::propose`].
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum WriteError {
     /// This node is not the leader; the request should be forwarded.
     #[error("not leader (leader: {leader_id:?})")]
