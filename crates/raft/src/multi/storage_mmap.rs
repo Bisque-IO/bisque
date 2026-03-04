@@ -1795,27 +1795,8 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
 
         let payload = match tag {
             0 => openraft::EntryPayload::Blank,
-            1 => {
-                // Normal: [len:4][payload_bytes...]
-                if p.len() < 29 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "normal entry too short"));
-                }
-                let data_len = u32::from_le_bytes(p[25..29].try_into().unwrap()) as usize;
-                if p.len() < 29 + data_len {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "normal entry data truncated"));
-                }
-                // Zero-copy: construct a Bytes view into the mmap segment for the
-                // data portion [len:4][payload_bytes]. The Bytes keeps the
-                // Arc<Segment> alive, preventing mmap unmapping.
-                let data_offset_in_segment = start + HEADER_SIZE + 25;
-                let data_total_len = 4 + data_len;
-                let data_bytes = bytes_from_segment(&segment, data_offset_in_segment, data_total_len);
-                let data = C::D::decode_from_bytes(data_bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                openraft::EntryPayload::Normal(data)
-            }
-            2 => {
-                // Membership: rare, fall back to full decode
+            1 | 2 => {
+                // Normal or Membership: full entry decode via the codec.
                 let entry = openraft::impls::Entry::<C>::decode_from_slice(p)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 return Ok(Some(entry));
@@ -2010,48 +1991,10 @@ where
                     self.encode_buf.extend_from_slice(&crc.to_le_bytes());
                     total
                 }
-                openraft::EntryPayload::Normal(data) => {
-                    // Entry: [term:8][node_id:8][index:8][tag:1][dlen:4][data...] = 29 + data_len
-                    let data_bytes = data.payload_bytes();
-                    let payload_len = 29 + data_bytes.len();
-                    let record_body_len = 1 + GROUP_ID_SIZE + payload_len + CRC64_SIZE;
-                    let total = LENGTH_SIZE + record_body_len;
-                    self.encode_buf.reserve(total);
-
-                    // Record header
-                    let mut header = [0u8; HEADER_SIZE];
-                    header[0..4].copy_from_slice(&(record_body_len as u32).to_le_bytes());
-                    header[4] = RecordType::Entry as u8;
-                    write_u24_le(&mut header, 5, self.group_id);
-
-                    let term_bytes = entry.log_id.leader_id.term.to_le_bytes();
-                    let node_bytes = entry.log_id.leader_id.node_id.to_le_bytes();
-                    let idx_bytes = entry.log_id.index.to_le_bytes();
-                    let dlen_bytes = (data_bytes.len() as u32).to_le_bytes();
-
-                    // CRC over [type + group_id + entry_header + data]
-                    let mut digest = crc64fast_nvme::Digest::new();
-                    digest.write(&header[LENGTH_SIZE..]);
-                    digest.write(&term_bytes);
-                    digest.write(&node_bytes);
-                    digest.write(&idx_bytes);
-                    digest.write(&[1u8]); // Normal tag
-                    digest.write(&dlen_bytes);
-                    digest.write(data_bytes);
-                    let crc = digest.sum64();
-
-                    self.encode_buf.extend_from_slice(&header);
-                    self.encode_buf.extend_from_slice(&term_bytes);
-                    self.encode_buf.extend_from_slice(&node_bytes);
-                    self.encode_buf.extend_from_slice(&idx_bytes);
-                    self.encode_buf.push(1); // Normal tag
-                    self.encode_buf.extend_from_slice(&dlen_bytes);
-                    self.encode_buf.extend_from_slice(data_bytes);
-                    self.encode_buf.extend_from_slice(&crc.to_le_bytes());
-                    total
-                }
-                openraft::EntryPayload::Membership(_) => {
-                    // Rare: fall back to codec + payload_buf path
+                openraft::EntryPayload::Normal(_) | openraft::EntryPayload::Membership(_) => {
+                    // Full entry encoding via the codec. This ensures multi-variant
+                    // command types (e.g. CreateTable, DropTable, AppendRecords) are
+                    // all stored correctly and can be decoded via Entry::decode.
                     self.payload_buf.clear();
                     entry
                         .encode_into(&mut self.payload_buf)

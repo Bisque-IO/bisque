@@ -41,6 +41,10 @@ futures = { workspace = true }
 
 # gRPC
 tonic = { workspace = true }
+prost = { workspace = true }
+
+# PostgreSQL wire protocol
+datafusion-postgres = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -61,5 +65,6 @@ tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = { workspace = true }
+arrow-cast = { workspace = true }
 lance = { workspace = true }
 lance-index = { workspace = true }

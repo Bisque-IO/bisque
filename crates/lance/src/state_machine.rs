@@ -157,6 +157,12 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<LanceTypeConfig>>, io::Error> {
+        // No snapshot if nothing has been applied yet — returning a synthetic
+        // snapshot with a fake LogId would trick openraft into thinking the node
+        // is already initialized, preventing single-node bootstrap.
+        if self.last_applied.is_none() {
+            return Ok(None);
+        }
         let mut builder = self.get_snapshot_builder().await;
         match builder.build_snapshot().await {
             Ok(snap) => Ok(Some(snap)),
