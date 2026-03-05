@@ -14,9 +14,10 @@ use openraft::{EntryPayload, LogId, OptionalSend, Snapshot, SnapshotMeta, Stored
 use tracing::{debug, error, info, warn};
 
 use crate::async_apply::{AppliedWatermark, AsyncApplyBuffer, AsyncApplyConfig};
+use crate::catalog_events::{CatalogEventBus, CatalogEventKind};
 use crate::engine::BisqueLance;
 use crate::ipc;
-use crate::manifest::{GroupMeta, LanceManifestManager, ManifestUpdate, TableUpdate};
+use crate::manifest::{GroupMeta, LanceManifestManager, ManifestCommand, ManifestUpdate, TableUpdate};
 use crate::types::{LanceCommand, LanceResponse, PersistedTableEntry, SnapshotData};
 use crate::LanceTypeConfig;
 
@@ -34,6 +35,8 @@ pub struct LanceStateMachine {
     manifest: Option<Arc<LanceManifestManager>>,
     /// Raft group ID for manifest key scoping.
     group_id: u64,
+    /// Optional catalog event bus for real-time push notifications.
+    catalog_events: Option<Arc<CatalogEventBus>>,
 }
 
 impl LanceStateMachine {
@@ -46,7 +49,14 @@ impl LanceStateMachine {
             purge_floor: None,
             manifest: None,
             group_id: 0,
+            catalog_events: None,
         }
+    }
+
+    /// Set the catalog event bus for real-time push notifications.
+    pub fn with_catalog_events(mut self, bus: Arc<CatalogEventBus>) -> Self {
+        self.catalog_events = Some(bus);
+        self
     }
 
     /// Set the purge floor handle shared with the log storage.
@@ -83,6 +93,7 @@ impl LanceStateMachine {
             purge_floor: None,
             manifest: None,
             group_id: 0,
+            catalog_events: None,
         };
         (sm, watermark)
     }
@@ -90,6 +101,11 @@ impl LanceStateMachine {
     /// Access the underlying engine.
     pub fn engine(&self) -> &Arc<BisqueLance> {
         &self.engine
+    }
+
+    /// Access the catalog event bus (if configured).
+    pub fn catalog_events(&self) -> Option<&Arc<CatalogEventBus>> {
+        self.catalog_events.as_ref()
     }
 }
 
@@ -153,6 +169,8 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
 
             // Track what table update to send to the manifest (if any).
             let mut manifest_table_update: Option<TableUpdate> = None;
+            // Catalog events to emit after successful apply.
+            let mut catalog_event: Option<CatalogEventKind> = None;
 
             let response = match entry.payload {
                 EntryPayload::Blank => LanceResponse::Ok,
@@ -197,6 +215,10 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                                             table_name: table_name.clone(),
                                             entry: LanceManifestManager::build_table_entry(&table),
                                         });
+                                        catalog_event = Some(CatalogEventKind::ActiveVersionBumped {
+                                            table: table_name.clone(),
+                                            version: table.catalog().active_segment,
+                                        });
                                     }
                                 }
 
@@ -210,58 +232,82 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                                 }
                             }
                         }
-                        LanceCommand::SealActiveSegment { ref table_name, .. }
-                        | LanceCommand::DropTable { ref table_name, .. } => {
+                        LanceCommand::SealActiveSegment { ref table_name, ref sealed_segment_id, ref new_active_segment_id, .. } => {
                             let tname = table_name.clone();
+                            let sealed_id = *sealed_segment_id;
+                            let new_active_id = *new_active_segment_id;
                             // Barrier: drain pending writes for this table before proceeding.
                             if let Some(buf) = &self.async_buffer {
                                 buf.drain_table(&tname).await;
                             }
                             let response = self.apply_command(cmd).await;
 
-                            // Build manifest update based on the command type.
                             if let Ok(table) = self.engine.require_table(&tname) {
                                 manifest_table_update = Some(TableUpdate::Set {
                                     table_name: tname.clone(),
                                     entry: LanceManifestManager::build_table_entry(&table),
                                 });
-                            } else {
-                                // Table was dropped — record removal.
-                                manifest_table_update = Some(TableUpdate::Remove {
-                                    table_name: tname,
+                                if matches!(response, LanceResponse::Ok) {
+                                    catalog_event = Some(CatalogEventKind::SegmentSealed {
+                                        table: tname,
+                                        active_version: new_active_id,
+                                        sealed_version: sealed_id,
+                                    });
+                                }
+                            }
+
+                            response
+                        }
+                        LanceCommand::DropTable { ref table_name } => {
+                            let tname = table_name.clone();
+                            if let Some(buf) = &self.async_buffer {
+                                buf.drain_table(&tname).await;
+                            }
+                            let response = self.apply_command(cmd).await;
+
+                            manifest_table_update = Some(TableUpdate::Remove {
+                                table_name: tname.clone(),
+                            });
+                            if matches!(response, LanceResponse::Ok) {
+                                catalog_event = Some(CatalogEventKind::TableDropped {
+                                    table: tname,
                                 });
                             }
 
                             response
                         }
-                        cmd @ LanceCommand::PromoteToDeepStorage { .. } => {
-                            let table_name = match &cmd {
-                                LanceCommand::PromoteToDeepStorage { table_name, .. } => {
-                                    table_name.clone()
-                                }
-                                _ => unreachable!(),
-                            };
+                        LanceCommand::PromoteToDeepStorage { ref table_name, ref s3_manifest_version, .. } => {
+                            let tname = table_name.clone();
+                            let s3_ver = *s3_manifest_version;
                             let response = self.apply_command(cmd).await;
                             // Eagerly update purge floor since promote relaxes the constraint.
                             self.update_purge_floor();
 
-                            if let Ok(table) = self.engine.require_table(&table_name) {
+                            if let Ok(table) = self.engine.require_table(&tname) {
                                 manifest_table_update = Some(TableUpdate::Set {
-                                    table_name,
+                                    table_name: tname.clone(),
                                     entry: LanceManifestManager::build_table_entry(&table),
                                 });
+                                if matches!(response, LanceResponse::Ok) {
+                                    catalog_event = Some(CatalogEventKind::SegmentPromoted {
+                                        table: tname,
+                                        s3_manifest_version: s3_ver,
+                                    });
+                                }
                             }
 
                             response
                         }
                         other => {
-                            // Extract table_name before moving the command.
-                            let tname = match &other {
-                                LanceCommand::CreateTable { table_name, .. }
-                                | LanceCommand::BeginFlush { table_name, .. } => {
-                                    Some(table_name.clone())
+                            // Extract table_name + schema_ipc before moving the command.
+                            let (tname, schema_ipc) = match &other {
+                                LanceCommand::CreateTable { table_name, schema_ipc } => {
+                                    (Some(table_name.clone()), Some(schema_ipc.clone()))
                                 }
-                                _ => None,
+                                LanceCommand::BeginFlush { table_name, .. } => {
+                                    (Some(table_name.clone()), None)
+                                }
+                                _ => (None, None),
                             };
 
                             let response = self.apply_command(other).await;
@@ -270,9 +316,18 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                             if let Some(tname) = tname {
                                 if let Ok(table) = self.engine.require_table(&tname) {
                                     manifest_table_update = Some(TableUpdate::Set {
-                                        table_name: tname,
+                                        table_name: tname.clone(),
                                         entry: LanceManifestManager::build_table_entry(&table),
                                     });
+                                    // Emit TableCreated event for CreateTable commands.
+                                    if let Some(schema_ipc) = schema_ipc {
+                                        if matches!(response, LanceResponse::Ok) {
+                                            catalog_event = Some(CatalogEventKind::TableCreated {
+                                                table: tname,
+                                                schema_ipc: schema_ipc.to_vec(),
+                                            });
+                                        }
+                                    }
                                 }
                             }
 
@@ -286,6 +341,20 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                     LanceResponse::Ok
                 }
             };
+
+            // Emit catalog event + persist to WAL.
+            if let Some(event_kind) = catalog_event {
+                if let Some(bus) = &self.catalog_events {
+                    let event = bus.publish(event_kind);
+                    // Persist to MDBX WAL (fire-and-forget).
+                    if let Some(manifest) = &self.manifest {
+                        manifest.send_update(ManifestCommand::AppendWalEvents {
+                            group_id: self.group_id,
+                            events: vec![event],
+                        }).await;
+                    }
+                }
+            }
 
             // Send manifest update (fire-and-forget).
             if let Some(manifest) = &self.manifest {

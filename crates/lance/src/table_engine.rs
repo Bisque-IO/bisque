@@ -31,6 +31,7 @@ use crate::types::{
     CleanupStats, CompactionStats, FlushHandle, FlushState, SchemaVersion, SealReason,
     SegmentCatalog, SegmentId,
 };
+use crate::version_pins::{PinTier, VersionPinTracker};
 
 /// Sentinel value for "no log index" in `AtomicU64` fields.
 const NO_LOG_INDEX: u64 = u64::MAX;
@@ -80,6 +81,8 @@ pub struct TableEngine {
     active_first_log_index: AtomicU64,
     /// First raft log index written to the sealed segment (`u64::MAX` = None).
     sealed_first_log_index: AtomicU64,
+    /// Optional version pin tracker for compaction safety with remote clients.
+    version_pins: RwLock<Option<Arc<VersionPinTracker>>>,
 }
 
 impl TableEngine {
@@ -96,7 +99,13 @@ impl TableEngine {
         let segments_dir = config.segments_dir();
         tokio::fs::create_dir_all(&segments_dir).await?;
 
-        let catalog = catalog.unwrap_or_default();
+        let mut catalog = catalog.unwrap_or_default();
+        // Ensure s3_dataset_uri is populated from config.
+        if let Some(s3_uri) = &config.s3_uri {
+            if catalog.s3_dataset_uri.is_empty() {
+                catalog.s3_dataset_uri = s3_uri.clone();
+            }
+        }
         let name = config.name.clone();
 
         // Open or create the active segment dataset
@@ -179,6 +188,7 @@ impl TableEngine {
             active_bytes: AtomicU64::new(0),
             active_created_at: RwLock::new(Instant::now()),
             schema_history: RwLock::new(schema_history),
+            version_pins: RwLock::new(None),
         })
     }
 
@@ -190,6 +200,14 @@ impl TableEngine {
     /// Get the table config.
     pub fn config(&self) -> &TableOpenConfig {
         &self.config
+    }
+
+    /// Set the version pin tracker for compaction safety with remote clients.
+    ///
+    /// When set, `cleanup_s3()` will refuse to delete old versions if any
+    /// remote client has them pinned.
+    pub fn set_version_pins(&self, pins: Arc<VersionPinTracker>) {
+        *self.version_pins.write() = Some(pins);
     }
 
     // =========================================================================
@@ -629,6 +647,22 @@ impl TableEngine {
     }
 
     async fn cleanup_s3_internal(&self, delete_unverified: bool) -> Result<CleanupStats> {
+        // Check if any remote client has pinned versions for this table.
+        // If so, skip cleanup to avoid deleting files they're still reading.
+        if let Some(pins) = self.version_pins.read().as_ref() {
+            let has_active_pins = pins.min_pinned_version(&self.name, PinTier::Active).is_some();
+            let has_sealed_pins = pins.min_pinned_version(&self.name, PinTier::Sealed).is_some();
+            if has_active_pins || has_sealed_pins {
+                debug!(
+                    table = %self.name,
+                    has_active_pins,
+                    has_sealed_pins,
+                    "Skipping S3 cleanup: remote clients have pinned versions"
+                );
+                return Ok(CleanupStats::default());
+            }
+        }
+
         let ds = match self.s3_dataset.read().clone() {
             Some(ds) => ds,
             None => {

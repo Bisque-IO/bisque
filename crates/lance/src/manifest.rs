@@ -27,13 +27,17 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
+use crate::catalog_events::CatalogEvent;
 use crate::types::PersistedTableEntry;
 use crate::LanceTypeConfig;
 
 const META_TABLE: &str = "lance_meta";
 const TABLES_TABLE: &str = "lance_tables";
+const WAL_TABLE: &str = "catalog_wal";
 /// Key for the group meta record within the per-group MDBX.
 const META_KEY: &[u8] = b"raft";
+/// Maximum WAL size in bytes before compaction trims oldest entries.
+const WAL_MAX_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 
 // =============================================================================
 // Types
@@ -127,6 +131,11 @@ pub(crate) enum ManifestCommand {
         tables: HashMap<String, PersistedTableEntry>,
         done: Option<tokio::sync::oneshot::Sender<()>>,
     },
+    /// Append catalog WAL events for client sync.
+    AppendWalEvents {
+        group_id: u64,
+        events: Vec<CatalogEvent>,
+    },
 }
 
 // Keep the old name as a public alias for backward compat in state_machine.rs.
@@ -144,6 +153,7 @@ pub(crate) struct GroupMdbxEnv {
     db: Arc<Database<NoWriteMap>>,
     meta_dbi: u32,
     tables_dbi: u32,
+    wal_dbi: u32,
 }
 
 impl GroupMdbxEnv {
@@ -180,6 +190,12 @@ impl GroupMdbxEnv {
         let tables_dbi = tables_table.dbi();
         drop(tables_table);
 
+        let wal_table = txn
+            .create_table(Some(WAL_TABLE), TableFlags::default())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let wal_dbi = wal_table.dbi();
+        drop(wal_table);
+
         txn.commit()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -187,6 +203,7 @@ impl GroupMdbxEnv {
             db,
             meta_dbi,
             tables_dbi,
+            wal_dbi,
         })
     }
 
@@ -251,6 +268,38 @@ impl GroupMdbxEnv {
         }
         let raw = RawTable {
             dbi: self.tables_dbi,
+            _marker: std::marker::PhantomData,
+        };
+        unsafe { std::mem::transmute(raw) }
+    }
+
+    unsafe fn wal_table_ro<'txn>(
+        &self,
+        _txn: &libmdbx::Transaction<'txn, libmdbx::RO, NoWriteMap>,
+    ) -> Table<'txn> {
+        #[repr(C)]
+        struct RawTable<'txn> {
+            dbi: u32,
+            _marker: std::marker::PhantomData<&'txn ()>,
+        }
+        let raw = RawTable {
+            dbi: self.wal_dbi,
+            _marker: std::marker::PhantomData,
+        };
+        unsafe { std::mem::transmute(raw) }
+    }
+
+    unsafe fn wal_table_rw<'txn>(
+        &self,
+        _txn: &libmdbx::Transaction<'txn, libmdbx::RW, NoWriteMap>,
+    ) -> Table<'txn> {
+        #[repr(C)]
+        struct RawTable<'txn> {
+            dbi: u32,
+            _marker: std::marker::PhantomData<&'txn ()>,
+        }
+        let raw = RawTable {
+            dbi: self.wal_dbi,
             _marker: std::marker::PhantomData,
         };
         unsafe { std::mem::transmute(raw) }
@@ -326,6 +375,229 @@ impl GroupMdbxEnv {
             Ok(None) => Ok(None),
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
         }
+    }
+
+    // -- WAL operations --
+
+    /// Read all WAL events with sequence number > `since_seq`.
+    fn read_wal_since(&self, since_seq: u64) -> io::Result<Vec<CatalogEvent>> {
+        let txn = self
+            .db
+            .begin_ro_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let table = unsafe { self.wal_table_ro(&txn) };
+
+        let mut events = Vec::new();
+        let mut cursor = txn
+            .cursor(&table)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        // Position cursor at the first key > since_seq.
+        let start_key = (since_seq + 1).to_be_bytes();
+        let iter = cursor.iter_from::<std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>>(&start_key);
+        for result in iter {
+            match result {
+                Ok((_, v)) => {
+                    match bincode::serde::decode_from_slice::<CatalogEvent, _>(
+                        v.as_ref(),
+                        bincode::config::standard(),
+                    ) {
+                        Ok((event, _)) => events.push(event),
+                        Err(e) => {
+                            warn!("Failed to decode WAL event: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("WAL cursor error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
+    /// Get the latest WAL sequence number, or 0 if the WAL is empty.
+    fn latest_wal_seq(&self) -> io::Result<u64> {
+        let txn = self
+            .db
+            .begin_ro_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let table = unsafe { self.wal_table_ro(&txn) };
+
+        let mut cursor = txn
+            .cursor(&table)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        // Seek to last entry
+        match cursor.last::<std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>>() {
+            Ok(Some((k, _))) => {
+                if k.len() == 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&k);
+                    Ok(u64::from_be_bytes(buf))
+                } else {
+                    Ok(0)
+                }
+            }
+            Ok(None) => Ok(0),
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
+        }
+    }
+
+    /// Append a WAL event (called by worker thread in a write transaction).
+    fn append_wal_events(
+        &self,
+        txn: &libmdbx::Transaction<'_, libmdbx::RW, NoWriteMap>,
+        events: &[CatalogEvent],
+    ) -> io::Result<()> {
+        let table = unsafe { self.wal_table_rw(txn) };
+        for event in events {
+            let key = event.seq.to_be_bytes();
+            let value =
+                bincode::serde::encode_to_vec(event, bincode::config::standard())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            txn.put(&table, &key[..], &value, WriteFlags::empty())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Delete WAL entries with sequence number <= `up_to_seq`.
+    fn compact_wal(&self, up_to_seq: u64) -> io::Result<usize> {
+        let txn = self
+            .db
+            .begin_rw_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let table = unsafe { self.wal_table_rw(&txn) };
+
+        let mut cursor = txn
+            .cursor(&table)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let mut deleted = 0usize;
+        let mut to_delete = Vec::new();
+
+        let iter = cursor.iter::<std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>>();
+        for result in iter {
+            match result {
+                Ok((k, _)) => {
+                    if k.len() == 8 {
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&k);
+                        let seq = u64::from_be_bytes(buf);
+                        if seq <= up_to_seq {
+                            to_delete.push(seq);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        drop(cursor);
+
+        for seq in &to_delete {
+            let key = seq.to_be_bytes();
+            match txn.del(&table, &key[..], None) {
+                Ok(_) | Err(libmdbx::Error::NotFound) => {}
+                Err(e) => {
+                    return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                }
+            }
+            deleted += 1;
+        }
+
+        txn.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(deleted)
+    }
+
+    /// Calculate total size of WAL entries in bytes (keys + values).
+    fn wal_size_bytes(&self) -> io::Result<u64> {
+        let txn = self
+            .db
+            .begin_ro_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let table = unsafe { self.wal_table_ro(&txn) };
+
+        let mut cursor = txn
+            .cursor(&table)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let mut total: u64 = 0;
+        let iter = cursor.iter::<std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>>();
+        for result in iter {
+            match result {
+                Ok((k, v)) => {
+                    total += k.len() as u64 + v.len() as u64;
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(total)
+    }
+
+    /// Compact WAL entries to fit within `max_bytes`.
+    ///
+    /// Walks from oldest, accumulates bytes to remove, and deletes entries
+    /// until the remaining WAL fits within the limit.
+    fn compact_wal_to_size(&self, max_bytes: u64) -> io::Result<usize> {
+        let total = self.wal_size_bytes()?;
+        if total <= max_bytes {
+            return Ok(0);
+        }
+
+        let excess = total - max_bytes;
+        let txn = self
+            .db
+            .begin_rw_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let table = unsafe { self.wal_table_rw(&txn) };
+
+        let mut cursor = txn
+            .cursor(&table)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let mut accumulated: u64 = 0;
+        let mut to_delete = Vec::new();
+        let iter = cursor.iter::<std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>>();
+        for result in iter {
+            match result {
+                Ok((k, v)) => {
+                    let entry_size = k.len() as u64 + v.len() as u64;
+                    if k.len() == 8 {
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&k);
+                        to_delete.push(u64::from_be_bytes(buf));
+                    }
+                    accumulated += entry_size;
+                    if accumulated >= excess {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        drop(cursor);
+
+        let deleted = to_delete.len();
+        for seq in &to_delete {
+            let key = seq.to_be_bytes();
+            match txn.del(&table, &key[..], None) {
+                Ok(_) | Err(libmdbx::Error::NotFound) => {}
+                Err(e) => {
+                    return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                }
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(deleted)
     }
 
     // -- Write operations (called by worker thread only) --
@@ -557,6 +829,28 @@ impl LanceManifestManager {
         env.read_all_tables()
     }
 
+    /// Read WAL events with sequence number > `since_seq`.
+    pub fn read_wal_since(
+        &self,
+        group_id: u64,
+        since_seq: u64,
+    ) -> io::Result<Vec<CatalogEvent>> {
+        let env = self.get_env(group_id)?;
+        env.read_wal_since(since_seq)
+    }
+
+    /// Get the latest WAL sequence number for a group.
+    pub fn latest_wal_seq(&self, group_id: u64) -> io::Result<u64> {
+        let env = self.get_env(group_id)?;
+        env.latest_wal_seq()
+    }
+
+    /// Compact WAL entries up to (and including) the given sequence number.
+    pub fn compact_wal(&self, group_id: u64, up_to_seq: u64) -> io::Result<usize> {
+        let env = self.get_env(group_id)?;
+        env.compact_wal(up_to_seq)
+    }
+
     /// Read a single table's persisted entry.
     pub fn read_table(
         &self,
@@ -603,6 +897,11 @@ impl LanceManifestManager {
                 tables,
                 done: Some(done_tx),
             },
+            // WAL events are fire-and-forget only; durable not needed.
+            other @ ManifestCommand::AppendWalEvents { .. } => {
+                let _ = done_tx.send(());
+                other
+            }
         };
 
         self.tx
@@ -712,11 +1011,11 @@ impl LanceManifestManager {
 
     fn commit_batch(envs: &Arc<RwLock<HashMap<u64, Arc<GroupMdbxEnv>>>>, pending: &mut Vec<ManifestCommand>) {
         // Coalesce per group: latest meta wins, latest table entry wins per key.
-        // InstallSnapshot for a group clears all existing data and isn't coalesced
-        // with Apply for the same group — we process them in order.
+        // WAL events are accumulated in order (not coalesced).
         struct GroupBatch {
             meta: Option<GroupMeta>,
             table_updates: HashMap<String, Option<PersistedTableEntry>>,
+            wal_events: Vec<CatalogEvent>,
             is_snapshot: bool,
         }
 
@@ -734,6 +1033,7 @@ impl LanceManifestManager {
                     let batch = per_group.entry(group_id).or_insert_with(|| GroupBatch {
                         meta: None,
                         table_updates: HashMap::new(),
+                        wal_events: Vec::new(),
                         is_snapshot: false,
                     });
                     if let Some(m) = meta {
@@ -759,10 +1059,10 @@ impl LanceManifestManager {
                     tables,
                     done,
                 } => {
-                    // InstallSnapshot replaces everything — start fresh.
                     let batch = per_group.entry(group_id).or_insert_with(|| GroupBatch {
                         meta: None,
                         table_updates: HashMap::new(),
+                        wal_events: Vec::new(),
                         is_snapshot: false,
                     });
                     batch.meta = Some(meta);
@@ -774,6 +1074,18 @@ impl LanceManifestManager {
                     if let Some(d) = done {
                         done_senders.push(d);
                     }
+                }
+                ManifestCommand::AppendWalEvents {
+                    group_id,
+                    events,
+                } => {
+                    let batch = per_group.entry(group_id).or_insert_with(|| GroupBatch {
+                        meta: None,
+                        table_updates: HashMap::new(),
+                        wal_events: Vec::new(),
+                        is_snapshot: false,
+                    });
+                    batch.wal_events.extend(events);
                 }
             }
         }
@@ -807,6 +1119,35 @@ impl LanceManifestManager {
 
             if let Err(e) = result {
                 error!(group_id, "MDBX manifest commit failed: {}", e);
+            }
+
+            // Append WAL events in a separate transaction.
+            if !batch.wal_events.is_empty() {
+                let txn = match env.db.begin_rw_txn() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(group_id, "Failed to open WAL write txn: {}", e);
+                        continue;
+                    }
+                };
+                if let Err(e) = env.append_wal_events(&txn, &batch.wal_events) {
+                    error!(group_id, "Failed to append WAL events: {}", e);
+                    continue;
+                }
+                if let Err(e) = txn.commit() {
+                    error!(group_id, "Failed to commit WAL events: {}", e);
+                }
+
+                // Size-based WAL compaction: keep WAL under 16 MiB.
+                match env.compact_wal_to_size(WAL_MAX_BYTES) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        debug!(group_id, deleted = n, "Compacted WAL entries (size limit)");
+                    }
+                    Err(e) => {
+                        warn!(group_id, "WAL compaction failed: {}", e);
+                    }
+                }
             }
         }
 

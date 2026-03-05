@@ -15,7 +15,11 @@
 //! between tiers.
 
 pub mod async_apply;
+pub mod catalog_events;
+pub mod client;
+pub mod client_store;
 pub mod codec;
+pub mod cold_store;
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -27,13 +31,19 @@ pub mod postgres;
 pub mod processors;
 pub mod query;
 pub mod raft;
+pub mod s3_server;
+pub mod s3_store;
 pub mod state_machine;
 pub mod table_engine;
 pub mod types;
+pub mod version_pins;
 pub mod write_batcher;
 pub mod write_processor;
 
 pub use async_apply::{AppliedWatermark, AsyncApplyConfig};
+pub use catalog_events::{CatalogEvent, CatalogEventBus, CatalogEventKind};
+pub use client::BisqueClient;
+pub use cold_store::CredentialConfig;
 pub use config::{BisqueLanceConfig, IndexSpec, TableOpenConfig};
 pub use engine::BisqueLance;
 pub use error::{Error, Result};
@@ -41,6 +51,8 @@ pub use flight::BisqueFlightService;
 pub use manifest::LanceManifestManager;
 pub use otel::{OtlpReceiver, serve_http, serve_otlp};
 pub use postgres::{PostgresServerConfig, serve_postgres};
+pub use s3_server::serve_s3;
+pub use s3_store::BisqueRoutingStore;
 pub use processors::{CounterAggregator, GaugeAggregator, HistogramAggregator};
 pub use query::BisqueLanceTableProvider;
 pub use raft::{LanceRaftNode, WriteError};
@@ -52,6 +64,7 @@ pub use types::{
     ProcessorDescriptor, SchemaVersion, SealReason, SegmentCatalog, SegmentId, SnapshotData,
     TableSnapshot, WriteResult,
 };
+pub use version_pins::VersionPinTracker;
 pub use write_batcher::WriteBatcherConfig;
 pub use write_processor::{MaterializedWrite, ProcessorOutput, WriteProcessor};
 

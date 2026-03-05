@@ -85,6 +85,7 @@ derive_more = { version = "2", features = [
     "try_into",
     "display",
 ] }
+fastwebsockets = { version = "0.10", features = ["upgrade", "with_axum"] }
 flume = "0.12"
 futures = "0.3"
 futures-io = "0.3"
@@ -93,6 +94,7 @@ futures-util = "0.3"
 # ghost-cell = "0.2.6"
 hdrhistogram = "7.5"
 hex = "0.4"
+http-body-util = "0.1"
 hyper = { version = "1.8" }
 libc = "0.2"
 datafusion = { version = "52.1.0", default-features = false }
@@ -140,6 +142,8 @@ rustls-webpki = "0.103"
 semver = "1"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+object_store = { version = "0.12", features = ["aws"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 snap = "1"
 snmalloc-rs = "0.3"
 socket2 = { version = "0.6", features = ["all"] }
@@ -158,6 +162,7 @@ tracing = { version = "0.1", default-features = false, features = [
 ] }
 tracing-futures = "0.2"
 tracing-subscriber = "0.3"
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 validit = "0.2"
 #vertx-cluster = { path = "crates/vertx-cluster", version = "0.1.0" }
