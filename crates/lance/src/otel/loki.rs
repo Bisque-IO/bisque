@@ -99,11 +99,7 @@ pub async fn loki_query(
                 "result": streams
             })))
         }
-        LogQLExpr::MetricQuery {
-            func,
-            inner,
-            range,
-        } => {
+        LogQLExpr::MetricQuery { func, inner, range } => {
             let (selector, pipeline) = extract_log_query(inner)?;
             let range_ns = range.as_nanos() as i64;
             let start_ns = time_ns - range_ns;
@@ -157,7 +153,8 @@ pub async fn loki_query_range(
 
     let limit = params.limit.unwrap_or(1000);
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let start_ns = parse_loki_timestamp(params.start.as_deref()).unwrap_or(now_ns - 3_600_000_000_000);
+    let start_ns =
+        parse_loki_timestamp(params.start.as_deref()).unwrap_or(now_ns - 3_600_000_000_000);
     let end_ns = parse_loki_timestamp(params.end.as_deref()).unwrap_or(now_ns);
     let step_ms = parse_loki_duration_ms(params.step.as_deref()).unwrap_or(15_000);
 
@@ -182,11 +179,7 @@ pub async fn loki_query_range(
                 "result": streams
             })))
         }
-        LogQLExpr::MetricQuery {
-            func,
-            inner,
-            range,
-        } => {
+        LogQLExpr::MetricQuery { func, inner, range } => {
             let (selector, pipeline) = extract_log_query(inner)?;
             let _range_ns = range.as_nanos() as i64;
 
@@ -214,7 +207,13 @@ pub async fn loki_query_range(
             let (func, selector, pipeline, _range) = extract_metric_query(inner)?;
 
             let samples = eval_metric_query(
-                &state.ctx, func, &selector, &pipeline, start_ns, end_ns, Some(step_ms),
+                &state.ctx,
+                func,
+                &selector,
+                &pipeline,
+                start_ns,
+                end_ns,
+                Some(step_ms),
             )
             .await?;
 
@@ -255,10 +254,16 @@ pub async fn loki_labels(
 
     for batch in &batches {
         for col_idx in 0..batch.num_columns() {
-            if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<arrow_array::StringArray>() {
+            if let Some(arr) = batch
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+            {
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
-                        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(arr.value(i)) {
+                        if let Ok(serde_json::Value::Object(map)) =
+                            serde_json::from_str(arr.value(i))
+                        {
                             for k in map.keys() {
                                 labels.insert(k.clone());
                             }
@@ -369,7 +374,11 @@ pub async fn loki_series(
 ) -> Result<Response, (StatusCode, String)> {
     let df = match state.ctx.table("otel_logs").await {
         Ok(df) => df,
-        Err(_) => return Ok(loki_success_response(json!(Vec::<serde_json::Value>::new()))),
+        Err(_) => {
+            return Ok(loki_success_response(
+                json!(Vec::<serde_json::Value>::new()),
+            ));
+        }
     };
 
     let batches = df
@@ -529,7 +538,9 @@ pub async fn loki_push(
 
             timestamp_builder.append_value(ts_ns);
             observed_ts_builder.append_value(ts_ns);
-            trace_id_builder.append_value(&zero_trace).expect("16 bytes");
+            trace_id_builder
+                .append_value(&zero_trace)
+                .expect("16 bytes");
             span_id_builder.append_value(&zero_span).expect("8 bytes");
             severity_number_builder.append_value(severity_number);
             severity_text_builder.append_value(severity_text);
@@ -620,10 +631,10 @@ async fn query_log_streams(
         .filter(
             col("timestamp")
                 .gt_eq(lit(ScalarValue::TimestampNanosecond(Some(start_ns), None)))
-                .and(col("timestamp").lt_eq(lit(ScalarValue::TimestampNanosecond(
-                    Some(end_ns),
-                    None,
-                )))),
+                .and(
+                    col("timestamp")
+                        .lt_eq(lit(ScalarValue::TimestampNanosecond(Some(end_ns), None))),
+                ),
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
 
@@ -699,7 +710,9 @@ async fn query_log_streams(
             }
 
             let stream_key = format!("{:?}", labels);
-            let entry = streams.entry(stream_key).or_insert_with(|| (labels, Vec::new()));
+            let entry = streams
+                .entry(stream_key)
+                .or_insert_with(|| (labels, Vec::new()));
 
             let ts_ns = timestamps.value(i);
             entry.1.push([ts_ns.to_string(), body.to_string()]);
@@ -738,10 +751,10 @@ async fn eval_metric_query(
         .filter(
             col("timestamp")
                 .gt_eq(lit(ScalarValue::TimestampNanosecond(Some(start_ns), None)))
-                .and(col("timestamp").lt_eq(lit(ScalarValue::TimestampNanosecond(
-                    Some(end_ns),
-                    None,
-                )))),
+                .and(
+                    col("timestamp")
+                        .lt_eq(lit(ScalarValue::TimestampNanosecond(Some(end_ns), None))),
+                ),
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
 
@@ -825,10 +838,7 @@ fn extract_log_query(
     expr: &LogQLExpr,
 ) -> Result<(StreamSelector, Vec<PipelineStage>), (StatusCode, String)> {
     match expr {
-        LogQLExpr::LogQuery {
-            selector,
-            pipeline,
-        } => Ok((selector.clone(), pipeline.clone())),
+        LogQLExpr::LogQuery { selector, pipeline } => Ok((selector.clone(), pipeline.clone())),
         _ => Err((
             StatusCode::BAD_REQUEST,
             "expected log query inside metric function".into(),
@@ -848,11 +858,7 @@ fn extract_metric_query(
     (StatusCode, String),
 > {
     match expr {
-        LogQLExpr::MetricQuery {
-            func,
-            inner,
-            range,
-        } => {
+        LogQLExpr::MetricQuery { func, inner, range } => {
             let (selector, pipeline) = extract_log_query(inner)?;
             Ok((*func, selector, pipeline, *range))
         }
@@ -972,7 +978,10 @@ fn parse_loki_json_push(json: &serde_json::Value) -> Result<PushRequest, (Status
                         let secs = ts_ns / 1_000_000_000;
                         let nanos = (ts_ns % 1_000_000_000) as i32;
                         Some(EntryAdapter {
-                            timestamp: Some(LokiTimestamp { seconds: secs, nanos }),
+                            timestamp: Some(LokiTimestamp {
+                                seconds: secs,
+                                nanos,
+                            }),
                             line,
                             structured_metadata: Vec::new(),
                         })

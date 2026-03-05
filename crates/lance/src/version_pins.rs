@@ -117,7 +117,11 @@ impl VersionPinTracker {
                     }
                 }
             }
-            debug!(session_id, pins_released = pins.len(), "Session removed, pins released");
+            debug!(
+                session_id,
+                pins_released = pins.len(),
+                "Session removed, pins released"
+            );
         }
     }
 
@@ -231,10 +235,16 @@ mod tests {
 
         tracker.pin(s1, key.clone());
         tracker.pin(s2, key.clone());
-        assert_eq!(tracker.min_pinned_version("events", PinTier::Active), Some(5));
+        assert_eq!(
+            tracker.min_pinned_version("events", PinTier::Active),
+            Some(5)
+        );
 
         tracker.unpin(s1, key.clone());
-        assert_eq!(tracker.min_pinned_version("events", PinTier::Active), Some(5));
+        assert_eq!(
+            tracker.min_pinned_version("events", PinTier::Active),
+            Some(5)
+        );
 
         tracker.unpin(s2, key.clone());
         assert_eq!(tracker.min_pinned_version("events", PinTier::Active), None);
@@ -246,18 +256,27 @@ mod tests {
         let s1 = tracker.create_session();
         let s2 = tracker.create_session();
 
-        tracker.pin(s1, PinKey {
-            table: "events".into(),
-            tier: PinTier::Active,
-            version: 10,
-        });
-        tracker.pin(s2, PinKey {
-            table: "events".into(),
-            tier: PinTier::Active,
-            version: 5,
-        });
+        tracker.pin(
+            s1,
+            PinKey {
+                table: "events".into(),
+                tier: PinTier::Active,
+                version: 10,
+            },
+        );
+        tracker.pin(
+            s2,
+            PinKey {
+                table: "events".into(),
+                tier: PinTier::Active,
+                version: 5,
+            },
+        );
 
-        assert_eq!(tracker.min_pinned_version("events", PinTier::Active), Some(5));
+        assert_eq!(
+            tracker.min_pinned_version("events", PinTier::Active),
+            Some(5)
+        );
         assert_eq!(tracker.min_pinned_version("events", PinTier::Sealed), None);
         assert_eq!(tracker.min_pinned_version("other", PinTier::Active), None);
     }
@@ -267,16 +286,22 @@ mod tests {
         let tracker = VersionPinTracker::new(Duration::from_secs(30));
         let s1 = tracker.create_session();
 
-        tracker.pin(s1, PinKey {
-            table: "t".into(),
-            tier: PinTier::Active,
-            version: 1,
-        });
-        tracker.pin(s1, PinKey {
-            table: "t".into(),
-            tier: PinTier::Sealed,
-            version: 2,
-        });
+        tracker.pin(
+            s1,
+            PinKey {
+                table: "t".into(),
+                tier: PinTier::Active,
+                version: 1,
+            },
+        );
+        tracker.pin(
+            s1,
+            PinKey {
+                table: "t".into(),
+                tier: PinTier::Sealed,
+                version: 2,
+            },
+        );
 
         assert_eq!(tracker.pin_count(), 2);
         tracker.remove_session(s1);
@@ -288,11 +313,14 @@ mod tests {
     fn test_reap_expired() {
         let tracker = VersionPinTracker::new(Duration::from_millis(10));
         let s1 = tracker.create_session();
-        tracker.pin(s1, PinKey {
-            table: "t".into(),
-            tier: PinTier::Active,
-            version: 1,
-        });
+        tracker.pin(
+            s1,
+            PinKey {
+                table: "t".into(),
+                tier: PinTier::Active,
+                version: 1,
+            },
+        );
 
         std::thread::sleep(Duration::from_millis(20));
         let reaped = tracker.reap_expired();
@@ -305,11 +333,14 @@ mod tests {
     fn test_heartbeat_prevents_reap() {
         let tracker = VersionPinTracker::new(Duration::from_millis(50));
         let s1 = tracker.create_session();
-        tracker.pin(s1, PinKey {
-            table: "t".into(),
-            tier: PinTier::Active,
-            version: 1,
-        });
+        tracker.pin(
+            s1,
+            PinKey {
+                table: "t".into(),
+                tier: PinTier::Active,
+                version: 1,
+            },
+        );
 
         std::thread::sleep(Duration::from_millis(30));
         tracker.heartbeat(s1);

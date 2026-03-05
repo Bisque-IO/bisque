@@ -5,21 +5,23 @@
 //! the multi-table `BisqueLance` engine.
 
 use std::io::{self, Cursor};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::StreamExt;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{EntryPayload, LogId, OptionalSend, Snapshot, SnapshotMeta, StoredMembership};
 use tracing::{debug, error, info, warn};
 
+use crate::LanceTypeConfig;
 use crate::async_apply::{AppliedWatermark, AsyncApplyBuffer, AsyncApplyConfig};
 use crate::catalog_events::{CatalogEventBus, CatalogEventKind};
 use crate::engine::BisqueLance;
 use crate::ipc;
-use crate::manifest::{GroupMeta, LanceManifestManager, ManifestCommand, ManifestUpdate, TableUpdate};
+use crate::manifest::{
+    GroupMeta, LanceManifestManager, ManifestCommand, ManifestUpdate, TableUpdate,
+};
 use crate::types::{LanceCommand, LanceResponse, PersistedTableEntry, SnapshotData};
-use crate::LanceTypeConfig;
 
 /// Raft state machine that drives the BisqueLance multi-table storage engine.
 pub struct LanceStateMachine {
@@ -123,9 +125,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
     > {
         // On startup, try reading crash-consistent state from MDBX manifest.
         if let Some(manifest) = &self.manifest {
-            if let Ok(Some((last_applied, membership))) =
-                manifest.read_group_meta(self.group_id)
-            {
+            if let Ok(Some((last_applied, membership))) = manifest.read_group_meta(self.group_id) {
                 self.last_applied = last_applied.clone();
                 self.last_membership = membership.clone();
 
@@ -156,10 +156,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
     where
         Strm: futures::Stream<
-                Item = Result<
-                    openraft::storage::EntryResponder<LanceTypeConfig>,
-                    io::Error,
-                >,
+                Item = Result<openraft::storage::EntryResponder<LanceTypeConfig>, io::Error>,
             > + Unpin
             + OptionalSend,
     {
@@ -215,10 +212,11 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                                             table_name: table_name.clone(),
                                             entry: LanceManifestManager::build_table_entry(&table),
                                         });
-                                        catalog_event = Some(CatalogEventKind::ActiveVersionBumped {
-                                            table: table_name.clone(),
-                                            version: table.catalog().active_segment,
-                                        });
+                                        catalog_event =
+                                            Some(CatalogEventKind::ActiveVersionBumped {
+                                                table: table_name.clone(),
+                                                version: table.catalog().active_segment,
+                                            });
                                     }
                                 }
 
@@ -228,11 +226,20 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                                     LanceResponse::Ok
                                 } else {
                                     // Sync path (original behavior).
-                                    self.apply_command(LanceCommand::AppendRecords { table_name, data }).await
+                                    self.apply_command(LanceCommand::AppendRecords {
+                                        table_name,
+                                        data,
+                                    })
+                                    .await
                                 }
                             }
                         }
-                        LanceCommand::SealActiveSegment { ref table_name, ref sealed_segment_id, ref new_active_segment_id, .. } => {
+                        LanceCommand::SealActiveSegment {
+                            ref table_name,
+                            ref sealed_segment_id,
+                            ref new_active_segment_id,
+                            ..
+                        } => {
                             let tname = table_name.clone();
                             let sealed_id = *sealed_segment_id;
                             let new_active_id = *new_active_segment_id;
@@ -269,14 +276,17 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                                 table_name: tname.clone(),
                             });
                             if matches!(response, LanceResponse::Ok) {
-                                catalog_event = Some(CatalogEventKind::TableDropped {
-                                    table: tname,
-                                });
+                                catalog_event =
+                                    Some(CatalogEventKind::TableDropped { table: tname });
                             }
 
                             response
                         }
-                        LanceCommand::PromoteToDeepStorage { ref table_name, ref s3_manifest_version, .. } => {
+                        LanceCommand::PromoteToDeepStorage {
+                            ref table_name,
+                            ref s3_manifest_version,
+                            ..
+                        } => {
                             let tname = table_name.clone();
                             let s3_ver = *s3_manifest_version;
                             let response = self.apply_command(cmd).await;
@@ -301,9 +311,10 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                         other => {
                             // Extract table_name + schema_ipc before moving the command.
                             let (tname, schema_ipc) = match &other {
-                                LanceCommand::CreateTable { table_name, schema_ipc } => {
-                                    (Some(table_name.clone()), Some(schema_ipc.clone()))
-                                }
+                                LanceCommand::CreateTable {
+                                    table_name,
+                                    schema_ipc,
+                                } => (Some(table_name.clone()), Some(schema_ipc.clone())),
                                 LanceCommand::BeginFlush { table_name, .. } => {
                                     (Some(table_name.clone()), None)
                                 }
@@ -336,8 +347,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                     }
                 }
                 EntryPayload::Membership(m) => {
-                    self.last_membership =
-                        StoredMembership::new(Some(entry.log_id.clone()), m);
+                    self.last_membership = StoredMembership::new(Some(entry.log_id.clone()), m);
                     LanceResponse::Ok
                 }
             };
@@ -348,10 +358,12 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                     let event = bus.publish(event_kind);
                     // Persist to MDBX WAL (fire-and-forget).
                     if let Some(manifest) = &self.manifest {
-                        manifest.send_update(ManifestCommand::AppendWalEvents {
-                            group_id: self.group_id,
-                            events: vec![event],
-                        }).await;
+                        manifest
+                            .send_update(ManifestCommand::AppendWalEvents {
+                                group_id: self.group_id,
+                                events: vec![event],
+                            })
+                            .await;
                     }
                 }
             }
@@ -463,10 +475,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
         if let Some(manifest) = &self.manifest {
             let update = ManifestUpdate::InstallSnapshot {
                 group_id: self.group_id,
-                meta: GroupMeta::from_raft(
-                    &self.last_applied,
-                    &self.last_membership,
-                ),
+                meta: GroupMeta::from_raft(&self.last_applied, &self.last_membership),
                 tables: data.tables,
                 done: None,
             };
@@ -536,27 +545,28 @@ impl LanceStateMachine {
         debug!(%cmd, "Applying command");
 
         match cmd {
-            LanceCommand::CreateTable { table_name, schema_ipc } => {
-                match ipc::schema_from_ipc(&schema_ipc) {
-                    Ok(schema) => {
-                        let config = self.engine.config().build_table_config(
-                            &table_name,
-                            Arc::new(schema),
-                        );
-                        match self.engine.create_table(config, None).await {
-                            Ok(_) => LanceResponse::Ok,
-                            Err(e) => {
-                                error!(table = %table_name, "create_table failed: {}", e);
-                                LanceResponse::Error(e.to_string())
-                            }
+            LanceCommand::CreateTable {
+                table_name,
+                schema_ipc,
+            } => match ipc::schema_from_ipc(&schema_ipc) {
+                Ok(schema) => {
+                    let config = self
+                        .engine
+                        .config()
+                        .build_table_config(&table_name, Arc::new(schema));
+                    match self.engine.create_table(config, None).await {
+                        Ok(_) => LanceResponse::Ok,
+                        Err(e) => {
+                            error!(table = %table_name, "create_table failed: {}", e);
+                            LanceResponse::Error(e.to_string())
                         }
                     }
-                    Err(e) => {
-                        error!(table = %table_name, "Failed to decode schema IPC: {}", e);
-                        LanceResponse::Error(e.to_string())
-                    }
                 }
-            }
+                Err(e) => {
+                    error!(table = %table_name, "Failed to decode schema IPC: {}", e);
+                    LanceResponse::Error(e.to_string())
+                }
+            },
 
             LanceCommand::DropTable { table_name } => {
                 match self.engine.drop_table(&table_name).await {
@@ -624,7 +634,10 @@ impl LanceStateMachine {
                 }
             }
 
-            LanceCommand::BeginFlush { table_name, segment_id } => {
+            LanceCommand::BeginFlush {
+                table_name,
+                segment_id,
+            } => {
                 let table = match self.engine.require_table(&table_name) {
                     Ok(t) => t,
                     Err(e) => {

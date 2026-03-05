@@ -126,22 +126,22 @@ impl GaugeAggregator {
                 })
                 .collect();
 
-            let ts_values = self.timestamp_column.as_ref().map(|name| {
-                extract_timestamp_array(batch, name, self.timestamp_unit)
-            });
+            let ts_values = self
+                .timestamp_column
+                .as_ref()
+                .map(|name| extract_timestamp_array(batch, name, self.timestamp_unit));
 
-            let st_values = self.start_time_column.as_ref().map(|name| {
-                extract_timestamp_array(batch, name, self.timestamp_unit)
-            });
+            let st_values = self
+                .start_time_column
+                .as_ref()
+                .map(|name| extract_timestamp_array(batch, name, self.timestamp_unit));
 
             let value_array = batch
                 .column_by_name(&self.value_column)
                 .unwrap_or_else(|| panic!("value column '{}' not found", self.value_column))
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .unwrap_or_else(|| {
-                    panic!("value column '{}' must be Float64", self.value_column)
-                });
+                .unwrap_or_else(|| panic!("value column '{}' must be Float64", self.value_column));
 
             for row in 0..num_rows {
                 // Build composite key: "col0\0col1\0..."
@@ -178,7 +178,11 @@ impl GaugeAggregator {
         self.build_output(&accum, num_key_cols)
     }
 
-    fn build_output(&self, accum: &HashMap<String, GaugeAccum>, num_key_cols: usize) -> RecordBatch {
+    fn build_output(
+        &self,
+        accum: &HashMap<String, GaugeAccum>,
+        num_key_cols: usize,
+    ) -> RecordBatch {
         let num_groups = accum.len();
         let has_ts = self.timestamp_column.is_some();
         let has_st = self.start_time_column.is_some();
@@ -219,11 +223,19 @@ impl GaugeAggregator {
             .collect();
 
         if has_ts {
-            columns.push(build_timestamp_array(&ts_values, self.timestamp_unit, num_groups));
+            columns.push(build_timestamp_array(
+                &ts_values,
+                self.timestamp_unit,
+                num_groups,
+            ));
         }
 
         if has_st {
-            columns.push(build_timestamp_array(&st_values, self.timestamp_unit, num_groups));
+            columns.push(build_timestamp_array(
+                &st_values,
+                self.timestamp_unit,
+                num_groups,
+            ));
         }
 
         columns.push(Arc::new(value_builder.finish()) as ArrayRef);

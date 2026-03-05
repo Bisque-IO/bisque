@@ -15,9 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{Float64Builder, ListBuilder, StringBuilder, UInt64Builder};
-use arrow_array::{
-    ArrayRef, Float64Array, ListArray, RecordBatch, StringArray, UInt64Array,
-};
+use arrow_array::{ArrayRef, Float64Array, ListArray, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
 use super::counter::{build_timestamp_array, extract_timestamp_array};
@@ -252,13 +250,15 @@ impl HistogramAggregator {
                 .downcast_ref::<UInt64Array>()
                 .unwrap_or_else(|| panic!("count column '{}' must be UInt64", self.count_column));
 
-            let ts_values = self.timestamp_column.as_ref().map(|name| {
-                extract_timestamp_array(batch, name, self.timestamp_unit)
-            });
+            let ts_values = self
+                .timestamp_column
+                .as_ref()
+                .map(|name| extract_timestamp_array(batch, name, self.timestamp_unit));
 
-            let st_values = self.start_time_column.as_ref().map(|name| {
-                extract_timestamp_array(batch, name, self.timestamp_unit)
-            });
+            let st_values = self
+                .start_time_column
+                .as_ref()
+                .map(|name| extract_timestamp_array(batch, name, self.timestamp_unit));
 
             let min_array = self.min_column.as_ref().map(|name| {
                 batch
@@ -299,10 +299,7 @@ impl HistogramAggregator {
                 if let Some(existing) = accum.get_mut(key_buf.as_str()) {
                     // Merge bucket counts directly from Arrow array — no intermediate Vec.
                     let bc_values = bucket_counts_list.value(row);
-                    let bc_array = bc_values
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .unwrap();
+                    let bc_array = bc_values.as_any().downcast_ref::<UInt64Array>().unwrap();
                     let merge_len = existing.bucket_counts.len().min(bc_array.len());
                     for i in 0..merge_len {
                         existing.bucket_counts[i] += bc_array.value(i);
@@ -327,13 +324,11 @@ impl HistogramAggregator {
                     }
                     // Aggregate min (take minimum).
                     if let Some(v) = row_min {
-                        existing.min =
-                            Some(existing.min.map_or(v, |old| old.min(v)));
+                        existing.min = Some(existing.min.map_or(v, |old| old.min(v)));
                     }
                     // Aggregate max (take maximum).
                     if let Some(v) = row_max {
-                        existing.max =
-                            Some(existing.max.map_or(v, |old| old.max(v)));
+                        existing.max = Some(existing.max.map_or(v, |old| old.max(v)));
                     }
                 } else {
                     // First occurrence: extract boundaries and bucket counts.
@@ -385,8 +380,7 @@ impl HistogramAggregator {
         // Estimate total inner capacity for list builders.
         let total_buckets: usize = accum.values().map(|h| h.bucket_counts.len()).sum();
 
-        let mut boundaries_builder =
-            ListBuilder::new(Float64Builder::with_capacity(total_buckets));
+        let mut boundaries_builder = ListBuilder::new(Float64Builder::with_capacity(total_buckets));
         let mut bucket_counts_builder =
             ListBuilder::new(UInt64Builder::with_capacity(total_buckets));
         let mut sum_builder = Float64Builder::with_capacity(num_groups);

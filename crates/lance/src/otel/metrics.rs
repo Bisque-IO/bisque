@@ -17,13 +17,13 @@ use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point, Exemplar};
+use opentelemetry_proto::tonic::metrics::v1::{Exemplar, metric, number_data_point};
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
+use super::OtlpReceiver;
 use super::convert::{key_values_to_json, pad_or_truncate};
 use super::schema;
-use super::OtlpReceiver;
 
 // ---------------------------------------------------------------------------
 // Shared resource/scope context extracted once per ResourceMetrics/ScopeMetrics
@@ -131,8 +131,7 @@ impl CounterBuilders {
             Arc::new(self.resource_dropped_attributes_count.finish()),
             Arc::new(self.scope_dropped_attributes_count.finish()),
         ];
-        RecordBatch::try_new(table_schema, columns)
-            .expect("schema mismatch in counter batch")
+        RecordBatch::try_new(table_schema, columns).expect("schema mismatch in counter batch")
     }
 }
 
@@ -218,8 +217,7 @@ impl GaugeBuilders {
             Arc::new(self.resource_dropped_attributes_count.finish()),
             Arc::new(self.scope_dropped_attributes_count.finish()),
         ];
-        RecordBatch::try_new(table_schema, columns)
-            .expect("schema mismatch in gauge batch")
+        RecordBatch::try_new(table_schema, columns).expect("schema mismatch in gauge batch")
     }
 }
 
@@ -246,10 +244,10 @@ struct HistogramBuilders {
     // Histogram data
     boundaries: ListBuilder<Float64Builder>,
     bucket_counts: ListBuilder<UInt64Builder>,
-    sum: Float64Builder,     // nullable
+    sum: Float64Builder, // nullable
     count_col: UInt64Builder,
-    min: Float64Builder,     // nullable
-    max: Float64Builder,     // nullable
+    min: Float64Builder, // nullable
+    max: Float64Builder, // nullable
     // Passthrough
     aggregation_temporality: Int32Builder,
     is_monotonic: BooleanBuilder,
@@ -321,8 +319,7 @@ impl HistogramBuilders {
             Arc::new(self.resource_dropped_attributes_count.finish()),
             Arc::new(self.scope_dropped_attributes_count.finish()),
         ];
-        RecordBatch::try_new(table_schema, columns)
-            .expect("schema mismatch in histogram batch")
+        RecordBatch::try_new(table_schema, columns).expect("schema mismatch in histogram batch")
     }
 }
 
@@ -354,10 +351,10 @@ struct ExpHistogramBuilders {
     positive_bucket_counts: ListBuilder<UInt64Builder>,
     negative_offset: Int32Builder,
     negative_bucket_counts: ListBuilder<UInt64Builder>,
-    sum: Float64Builder,     // nullable
+    sum: Float64Builder, // nullable
     count_col: UInt64Builder,
-    min: Float64Builder,     // nullable
-    max: Float64Builder,     // nullable
+    min: Float64Builder, // nullable
+    max: Float64Builder, // nullable
     // Passthrough
     aggregation_temporality: Int32Builder,
     is_monotonic: BooleanBuilder,
@@ -439,8 +436,7 @@ impl ExpHistogramBuilders {
             Arc::new(self.resource_dropped_attributes_count.finish()),
             Arc::new(self.scope_dropped_attributes_count.finish()),
         ];
-        RecordBatch::try_new(table_schema, columns)
-            .expect("schema mismatch in exp histogram batch")
+        RecordBatch::try_new(table_schema, columns).expect("schema mismatch in exp histogram batch")
     }
 }
 
@@ -486,8 +482,7 @@ impl ExemplarBuilders {
         self.metric_table.append_value(metric_table);
         self.attributes
             .append_value(key_values_to_json(&exemplar.filtered_attributes));
-        self.timestamp
-            .append_value(exemplar.time_unix_nano as i64);
+        self.timestamp.append_value(exemplar.time_unix_nano as i64);
 
         let tid = pad_or_truncate(&exemplar.trace_id, 16);
         self.trace_id
@@ -527,8 +522,7 @@ impl ExemplarBuilders {
             Arc::new(self.value_int.finish()),
             Arc::new(self.value_double.finish()),
         ];
-        RecordBatch::try_new(table_schema, columns)
-            .expect("schema mismatch in exemplar batch")
+        RecordBatch::try_new(table_schema, columns).expect("schema mismatch in exemplar batch")
     }
 }
 
@@ -658,8 +652,7 @@ impl MetricsService for OtlpReceiver {
             }
         }
 
-        let total =
-            num_counter + num_gauge + num_histogram + num_exp_histogram + num_summary;
+        let total = num_counter + num_gauge + num_histogram + num_exp_histogram + num_summary;
         if total == 0 {
             return Ok(Response::new(ExportMetricsServiceResponse {
                 partial_success: None,
@@ -690,16 +683,8 @@ impl MetricsService for OtlpReceiver {
 
             for sm in &rm.scope_metrics {
                 let scope_ctx = ScopeContext {
-                    name: sm
-                        .scope
-                        .as_ref()
-                        .map(|s| s.name.as_str())
-                        .unwrap_or(""),
-                    version: sm
-                        .scope
-                        .as_ref()
-                        .map(|s| s.version.as_str())
-                        .unwrap_or(""),
+                    name: sm.scope.as_ref().map(|s| s.name.as_str()).unwrap_or(""),
+                    version: sm.scope.as_ref().map(|s| s.version.as_str()).unwrap_or(""),
                     attributes_json: sm
                         .scope
                         .as_ref()
@@ -730,29 +715,18 @@ impl MetricsService for OtlpReceiver {
                                     res_ctx,
                                     scope_ctx
                                 );
-                                counters
-                                    .timestamp
-                                    .append_value(dp.time_unix_nano as i64);
+                                counters.timestamp.append_value(dp.time_unix_nano as i64);
                                 counters
                                     .start_time
                                     .append_value(dp.start_time_unix_nano as i64);
                                 append_number_value!(counters, dp.value);
                                 append_counter_passthrough!(
-                                    counters,
-                                    agg_temp,
-                                    is_mono,
-                                    dp.flags,
-                                    res_ctx,
-                                    scope_ctx
+                                    counters, agg_temp, is_mono, dp.flags, res_ctx, scope_ctx
                                 );
                                 counters.count += 1;
 
                                 for ex in &dp.exemplars {
-                                    exemplars.append(
-                                        &metric.name,
-                                        schema::COUNTERS_TABLE,
-                                        ex,
-                                    );
+                                    exemplars.append(&metric.name, schema::COUNTERS_TABLE, ex);
                                 }
                             }
                         }
@@ -767,24 +741,16 @@ impl MetricsService for OtlpReceiver {
                                     res_ctx,
                                     scope_ctx
                                 );
-                                gauges
-                                    .timestamp
-                                    .append_value(dp.time_unix_nano as i64);
+                                gauges.timestamp.append_value(dp.time_unix_nano as i64);
                                 gauges
                                     .start_time
                                     .append_value(dp.start_time_unix_nano as i64);
                                 append_number_value!(gauges, dp.value);
-                                append_gauge_passthrough!(
-                                    gauges, dp.flags, res_ctx, scope_ctx
-                                );
+                                append_gauge_passthrough!(gauges, dp.flags, res_ctx, scope_ctx);
                                 gauges.count += 1;
 
                                 for ex in &dp.exemplars {
-                                    exemplars.append(
-                                        &metric.name,
-                                        schema::GAUGES_TABLE,
-                                        ex,
-                                    );
+                                    exemplars.append(&metric.name, schema::GAUGES_TABLE, ex);
                                 }
                             }
                         }
@@ -800,9 +766,7 @@ impl MetricsService for OtlpReceiver {
                                     res_ctx,
                                     scope_ctx
                                 );
-                                histograms
-                                    .timestamp
-                                    .append_value(dp.time_unix_nano as i64);
+                                histograms.timestamp.append_value(dp.time_unix_nano as i64);
                                 histograms
                                     .start_time
                                     .append_value(dp.start_time_unix_nano as i64);
@@ -825,21 +789,12 @@ impl MetricsService for OtlpReceiver {
                                 histograms.min.append_option(dp.min);
                                 histograms.max.append_option(dp.max);
                                 append_counter_passthrough!(
-                                    histograms,
-                                    agg_temp,
-                                    false,
-                                    dp.flags,
-                                    res_ctx,
-                                    scope_ctx
+                                    histograms, agg_temp, false, dp.flags, res_ctx, scope_ctx
                                 );
                                 histograms.count += 1;
 
                                 for ex in &dp.exemplars {
-                                    exemplars.append(
-                                        &metric.name,
-                                        schema::HISTOGRAMS_TABLE,
-                                        ex,
-                                    );
+                                    exemplars.append(&metric.name, schema::HISTOGRAMS_TABLE, ex);
                                 }
                             }
                         }
@@ -873,8 +828,7 @@ impl MetricsService for OtlpReceiver {
                                     .map(|b| (b.offset, &b.bucket_counts[..]))
                                     .unwrap_or((0, &[]));
                                 exp_histograms.positive_offset.append_value(pos_offset);
-                                let pos_inner =
-                                    exp_histograms.positive_bucket_counts.values();
+                                let pos_inner = exp_histograms.positive_bucket_counts.values();
                                 for &c in pos_counts {
                                     pos_inner.append_value(c);
                                 }
@@ -886,8 +840,7 @@ impl MetricsService for OtlpReceiver {
                                     .map(|b| (b.offset, &b.bucket_counts[..]))
                                     .unwrap_or((0, &[]));
                                 exp_histograms.negative_offset.append_value(neg_offset);
-                                let neg_inner =
-                                    exp_histograms.negative_bucket_counts.values();
+                                let neg_inner = exp_histograms.negative_bucket_counts.values();
                                 for &c in neg_counts {
                                     neg_inner.append_value(c);
                                 }
@@ -919,13 +872,7 @@ impl MetricsService for OtlpReceiver {
                         }
                         Some(metric::Data::Summary(s)) => {
                             for dp in &s.data_points {
-                                summaries.append(
-                                    metric,
-                                    &metadata_json,
-                                    &res_ctx,
-                                    &scope_ctx,
-                                    dp,
-                                );
+                                summaries.append(metric, &metadata_json, &res_ctx, &scope_ctx, dp);
                             }
                         }
                         _ => {}
@@ -958,8 +905,7 @@ impl MetricsService for OtlpReceiver {
         let gauge_fut = async {
             if !gauges.is_empty() {
                 let batch = gauges.finish(schema::gauge_schema_ref().clone());
-                self.write_to_table(schema::GAUGES_TABLE, vec![batch])
-                    .await
+                self.write_to_table(schema::GAUGES_TABLE, vec![batch]).await
             } else {
                 Ok(())
             }
@@ -977,8 +923,7 @@ impl MetricsService for OtlpReceiver {
 
         let exp_hist_fut = async {
             if !exp_histograms.is_empty() {
-                let batch =
-                    exp_histograms.finish(schema::exp_histogram_schema_ref().clone());
+                let batch = exp_histograms.finish(schema::exp_histogram_schema_ref().clone());
                 self.write_to_table(schema::EXP_HISTOGRAMS_TABLE, vec![batch])
                     .await
             } else {
@@ -1006,15 +951,14 @@ impl MetricsService for OtlpReceiver {
             }
         };
 
-        let (counter_res, gauge_res, hist_res, exp_hist_res, summary_res, exemplar_res) =
-            tokio::join!(
-                counter_fut,
-                gauge_fut,
-                hist_fut,
-                exp_hist_fut,
-                summary_fut,
-                exemplar_fut
-            );
+        let (counter_res, gauge_res, hist_res, exp_hist_res, summary_res, exemplar_res) = tokio::join!(
+            counter_fut,
+            gauge_fut,
+            hist_fut,
+            exp_hist_fut,
+            summary_fut,
+            exemplar_fut
+        );
 
         let mut errors = Vec::new();
         if let Err(e) = counter_res {
@@ -1126,21 +1070,18 @@ impl SummaryBuildersSimple {
         self.unit.append_value(&metric.unit);
         self.metadata.append_value(metadata_json);
         self.attributes.append_value(&dp_attrs);
-        self.resource_attributes
-            .append_value(&res.attributes_json);
+        self.resource_attributes.append_value(&res.attributes_json);
         self.resource_dropped_attributes_count
             .append_value(res.dropped_attributes_count);
         self.resource_schema_url.append_value(&res.schema_url);
         self.scope_name.append_value(scope.name);
         self.scope_version.append_value(scope.version);
-        self.scope_attributes
-            .append_value(&scope.attributes_json);
+        self.scope_attributes.append_value(&scope.attributes_json);
         self.scope_dropped_attributes_count
             .append_value(scope.dropped_attributes_count);
         self.scope_schema_url.append_value(scope.schema_url);
         self.timestamp.append_value(dp.time_unix_nano as i64);
-        self.start_time
-            .append_value(dp.start_time_unix_nano as i64);
+        self.start_time.append_value(dp.start_time_unix_nano as i64);
         self.count_col.append_value(dp.count);
         self.sum.append_value(dp.sum);
 
@@ -1184,7 +1125,6 @@ impl SummaryBuildersSimple {
             Arc::new(self.quantile_values.finish()),
             Arc::new(self.flags.finish()),
         ];
-        RecordBatch::try_new(table_schema, columns)
-            .expect("schema mismatch in summary batch")
+        RecordBatch::try_new(table_schema, columns).expect("schema mismatch in summary batch")
     }
 }

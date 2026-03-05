@@ -246,12 +246,10 @@ fn test_two_node_two_group_cluster() {
             BisqueTcpTransport::<TestConfig>::new(transport_cfg.clone(), node_registry.clone());
 
         let manager1 = Arc::new(MultiRaftManager::<TestConfig, _, _>::new(
-            transport1,
-            storage1,
+            transport1, storage1,
         ));
         let manager2 = Arc::new(MultiRaftManager::<TestConfig, _, _>::new(
-            transport2,
-            storage2,
+            transport2, storage2,
         ));
 
         // Start RPC servers

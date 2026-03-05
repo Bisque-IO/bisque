@@ -178,12 +178,8 @@ impl BisqueLance {
                 None
             };
 
-            let config = TableOpenConfig::from_persisted(
-                table_name,
-                &entry.config,
-                schema,
-                &self.config,
-            );
+            let config =
+                TableOpenConfig::from_persisted(table_name, &entry.config, schema, &self.config);
 
             let snapshot = entry.to_snapshot();
             if let Err(e) = self.restore_table(config, &snapshot).await {
@@ -199,7 +195,11 @@ impl BisqueLance {
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down BisqueLance engine (all tables)");
         let tables: Vec<(String, Arc<TableEngine>)> = {
-            self.tables.read().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            self.tables
+                .read()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
         };
 
         for (name, engine) in tables {

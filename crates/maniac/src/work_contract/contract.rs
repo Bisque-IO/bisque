@@ -3,8 +3,8 @@
 //! A work contract represents a task that can be scheduled for execution.
 //! Contracts can be rescheduled, released, and moved but not copied.
 
-use super::group::WorkContractGroupOps;
 use super::WorkContractId;
+use super::group::WorkContractGroupOps;
 use std::sync::{Arc, Weak};
 
 /// Initial state of a work contract

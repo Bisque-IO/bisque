@@ -17,9 +17,7 @@ use crate::multi::codec::{
 use crate::multi::manager::MultiRaftManager;
 use crate::multi::network::MultiplexedTransport;
 use crate::multi::storage::MultiRaftLogStorage;
-use crate::multi::transport_tcp::{
-    BoxedReader, BoxedWriter, FRAME_PREFIX_LEN, encode_framed,
-};
+use crate::multi::transport_tcp::{BoxedReader, BoxedWriter, FRAME_PREFIX_LEN, encode_framed};
 use bytes::{Buf, BytesMut};
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -470,9 +468,7 @@ where
                     let mut remaining: &mut [IoSlice<'_>] = &mut slices[..n];
                     while !remaining.is_empty() {
                         match write_half.write_vectored(remaining).await {
-                            Ok(0) => break 'write Some(
-                                std::io::ErrorKind::WriteZero.into(),
-                            ),
+                            Ok(0) => break 'write Some(std::io::ErrorKind::WriteZero.into()),
                             Ok(w) => IoSlice::advance_slices(&mut remaining, w),
                             Err(e) => break 'write Some(e),
                         }
@@ -737,12 +733,10 @@ where
 
                 if let Some(raft) = manager.get_group(group_id) {
                     match raft.vote(rpc).await {
-                        Ok(response) => {
-                            CodecRpcMessage::Response {
-                                request_id,
-                                message: CodecResponseMessage::Vote(response),
-                            }
-                        }
+                        Ok(response) => CodecRpcMessage::Response {
+                            request_id,
+                            message: CodecResponseMessage::Vote(response),
+                        },
                         Err(e) => CodecRpcMessage::Error {
                             request_id,
                             error: format!("Vote failed: {}", e),
@@ -784,16 +778,14 @@ where
                         };
 
                         match raft.install_full_snapshot(rpc.vote, snapshot).await {
-                            Ok(response) => {
-                                CodecRpcMessage::Response {
-                                    request_id,
-                                    message: CodecResponseMessage::InstallSnapshot(
-                                        openraft::raft::InstallSnapshotResponse {
-                                            vote: response.vote,
-                                        },
-                                    ),
-                                }
-                            }
+                            Ok(response) => CodecRpcMessage::Response {
+                                request_id,
+                                message: CodecResponseMessage::InstallSnapshot(
+                                    openraft::raft::InstallSnapshotResponse {
+                                        vote: response.vote,
+                                    },
+                                ),
+                            },
                             Err(e) => CodecRpcMessage::Error {
                                 request_id,
                                 error: format!("InstallSnapshot failed: {}", e),
@@ -876,16 +868,14 @@ where
                                 };
 
                                 match raft.install_full_snapshot(vote, snapshot).await {
-                                    Ok(response) => {
-                                        CodecRpcMessage::Response {
-                                            request_id,
-                                            message: CodecResponseMessage::InstallSnapshot(
-                                                openraft::raft::InstallSnapshotResponse {
-                                                    vote: response.vote,
-                                                },
-                                            ),
-                                        }
-                                    }
+                                    Ok(response) => CodecRpcMessage::Response {
+                                        request_id,
+                                        message: CodecResponseMessage::InstallSnapshot(
+                                            openraft::raft::InstallSnapshotResponse {
+                                                vote: response.vote,
+                                            },
+                                        ),
+                                    },
                                     Err(e) => CodecRpcMessage::Error {
                                         request_id,
                                         error: format!("InstallSnapshot failed: {}", e),
@@ -1040,7 +1030,10 @@ mod tests {
             last_log_id: None,
             last_membership: openraft::StoredMembership::new(
                 None,
-                openraft::Membership::new_with_defaults(vec![vec![1u64].into_iter().collect()], Vec::<u64>::new()),
+                openraft::Membership::new_with_defaults(
+                    vec![vec![1u64].into_iter().collect()],
+                    Vec::<u64>::new(),
+                ),
             ),
             snapshot_id: "test-snap".to_string(),
         }

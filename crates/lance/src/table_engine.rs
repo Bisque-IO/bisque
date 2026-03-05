@@ -321,8 +321,11 @@ impl TableEngine {
 
         // Rotate first_log_index: sealed inherits active's, active resets
         {
-            let active_first = self.active_first_log_index.swap(NO_LOG_INDEX, Ordering::AcqRel);
-            self.sealed_first_log_index.store(active_first, Ordering::Release);
+            let active_first = self
+                .active_first_log_index
+                .swap(NO_LOG_INDEX, Ordering::AcqRel);
+            self.sealed_first_log_index
+                .store(active_first, Ordering::Release);
         }
 
         // Update catalog
@@ -428,7 +431,8 @@ impl TableEngine {
         }
 
         // Data is now in S3 — sealed segment no longer constrains log purging
-        self.sealed_first_log_index.store(NO_LOG_INDEX, Ordering::Release);
+        self.sealed_first_log_index
+            .store(NO_LOG_INDEX, Ordering::Release);
 
         // Drop the sealed dataset handle
         {
@@ -650,8 +654,12 @@ impl TableEngine {
         // Check if any remote client has pinned versions for this table.
         // If so, skip cleanup to avoid deleting files they're still reading.
         if let Some(pins) = self.version_pins.read().as_ref() {
-            let has_active_pins = pins.min_pinned_version(&self.name, PinTier::Active).is_some();
-            let has_sealed_pins = pins.min_pinned_version(&self.name, PinTier::Sealed).is_some();
+            let has_active_pins = pins
+                .min_pinned_version(&self.name, PinTier::Active)
+                .is_some();
+            let has_sealed_pins = pins
+                .min_pinned_version(&self.name, PinTier::Sealed)
+                .is_some();
             if has_active_pins || has_sealed_pins {
                 debug!(
                     table = %self.name,
@@ -910,8 +918,10 @@ impl TableEngine {
     /// Get a snapshot of the current catalog state.
     pub fn catalog(&self) -> SegmentCatalog {
         let mut cat = self.catalog.read().clone();
-        cat.active_first_log_index = atomic_to_opt(self.active_first_log_index.load(Ordering::Acquire));
-        cat.sealed_first_log_index = atomic_to_opt(self.sealed_first_log_index.load(Ordering::Acquire));
+        cat.active_first_log_index =
+            atomic_to_opt(self.active_first_log_index.load(Ordering::Acquire));
+        cat.sealed_first_log_index =
+            atomic_to_opt(self.sealed_first_log_index.load(Ordering::Acquire));
         cat
     }
 

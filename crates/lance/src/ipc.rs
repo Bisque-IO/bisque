@@ -36,8 +36,8 @@ pub fn decode_record_batches(data: &[u8]) -> Result<Vec<RecordBatch>> {
         return Ok(Vec::new());
     }
 
-    let reader = StreamReader::try_new(std::io::Cursor::new(data), None)
-        .map_err(|e| Error::Arrow(e))?;
+    let reader =
+        StreamReader::try_new(std::io::Cursor::new(data), None).map_err(|e| Error::Arrow(e))?;
 
     let mut batches = Vec::new();
     for batch_result in reader {
@@ -64,8 +64,8 @@ pub fn schema_to_ipc(schema: &Schema) -> Result<Vec<u8>> {
 ///
 /// Reads the schema from the IPC stream header (ignores any batches).
 pub fn schema_from_ipc(data: &[u8]) -> Result<Schema> {
-    let reader = StreamReader::try_new(std::io::Cursor::new(data), None)
-        .map_err(|e| Error::Arrow(e))?;
+    let reader =
+        StreamReader::try_new(std::io::Cursor::new(data), None).map_err(|e| Error::Arrow(e))?;
     Ok((*reader.schema()).clone())
 }
 

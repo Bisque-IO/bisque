@@ -17,8 +17,7 @@
 //! - End-to-end client↔server RPC roundtrips
 
 use crate::multi::codec::{
-    Decode, Encode,
-    ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage,
+    Decode, Encode, ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage,
 };
 use crate::multi::transport_tcp::{
     BisqueTransportError, FRAME_PREFIX_LEN, encode_framed, read_frame, read_frame_into,
@@ -44,7 +43,10 @@ async fn ephemeral_listener() -> (TcpListener, std::net::SocketAddr) {
 
 fn test_vote() -> openraft::impls::Vote<C> {
     openraft::impls::Vote {
-        leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+        leader_id: openraft::impls::leader_id_adv::LeaderId {
+            term: 1,
+            node_id: 1,
+        },
         committed: true,
     }
 }
@@ -140,8 +142,7 @@ async fn test_read_frame_into_roundtrip() {
         .await
         .unwrap();
     assert!(n > 0);
-    let decoded: CodecRpcMessage<C> =
-        CodecRpcMessage::decode_from_slice(&reuse_buf[..n]).unwrap();
+    let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(&reuse_buf[..n]).unwrap();
     assert_eq!(decoded.request_id(), 99);
 
     writer.await.unwrap();
@@ -166,10 +167,15 @@ async fn test_read_frame_into_reuses_buffer_capacity() {
                 prev_log_id: None,
                 entries: vec![openraft::impls::Entry::<C> {
                     log_id: openraft::LogId {
-                        leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                        leader_id: openraft::impls::leader_id_adv::LeaderId {
+                            term: 1,
+                            node_id: 1,
+                        },
                         index: 1,
                     },
-                    payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(vec![0xAB; 4096].into())),
+                    payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(
+                        vec![0xAB; 4096].into(),
+                    )),
                 }],
                 leader_commit: None,
             },
@@ -403,10 +409,15 @@ async fn test_rolling_buffer_large_frame() {
             prev_log_id: None,
             entries: vec![openraft::impls::Entry::<C> {
                 log_id: openraft::LogId {
-                    leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                    leader_id: openraft::impls::leader_id_adv::LeaderId {
+                        term: 1,
+                        node_id: 1,
+                    },
                     index: 1,
                 },
-                payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(vec![0xDE; 128 * 1024].into())),
+                payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(
+                    vec![0xDE; 128 * 1024].into(),
+                )),
             }],
             leader_commit: None,
         },
@@ -979,7 +990,9 @@ async fn test_bidirectional_frame_exchange() {
             CodecRpcMessage::Response { message, .. } => {
                 assert!(matches!(
                     message,
-                    CodecResponseMessage::AppendEntries(openraft::raft::AppendEntriesResponse::Success)
+                    CodecResponseMessage::AppendEntries(
+                        openraft::raft::AppendEntriesResponse::Success
+                    )
                 ));
             }
             _ => panic!("Expected Response"),
@@ -991,8 +1004,7 @@ async fn test_bidirectional_frame_exchange() {
 
     // Read request
     let request_data = read_frame(&mut server_stream).await.unwrap();
-    let request: CodecRpcMessage<C> =
-        CodecRpcMessage::decode_from_slice(&request_data).unwrap();
+    let request: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(&request_data).unwrap();
     assert_eq!(request.request_id(), 1);
 
     // Send response
@@ -1497,11 +1509,10 @@ async fn test_multiple_connections_to_same_server() {
                         if buf.len() < FRAME_PREFIX_LEN + payload_len {
                             break;
                         }
-                        let decoded: CodecRpcMessage<C> =
-                            CodecRpcMessage::decode_from_slice(
-                                &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
-                            )
-                            .unwrap();
+                        let decoded: CodecRpcMessage<C> = CodecRpcMessage::decode_from_slice(
+                            &buf[FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + payload_len],
+                        )
+                        .unwrap();
                         buf.advance(FRAME_PREFIX_LEN + payload_len);
 
                         let response = make_response(decoded.request_id());
@@ -1596,7 +1607,10 @@ fn test_install_snapshot_request_codec_roundtrip() {
                 last_log_id: None,
                 last_membership: openraft::StoredMembership::new(
                     None,
-                    openraft::Membership::new_with_defaults(vec![vec![1u64].into_iter().collect()], Vec::<u64>::new()),
+                    openraft::Membership::new_with_defaults(
+                        vec![vec![1u64].into_iter().collect()],
+                        Vec::<u64>::new(),
+                    ),
                 ),
                 snapshot_id: "snap-1".to_string(),
             },
@@ -1629,17 +1643,26 @@ fn test_install_snapshot_final_chunk_codec() {
         group_id: 3,
         rpc: openraft::raft::InstallSnapshotRequest {
             vote: openraft::impls::Vote {
-                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 2, node_id: 5 },
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 2,
+                    node_id: 5,
+                },
                 committed: true,
             },
             meta: openraft::storage::SnapshotMeta {
                 last_log_id: Some(openraft::LogId {
-                    leader_id: openraft::impls::leader_id_adv::LeaderId { term: 2, node_id: 5 },
+                    leader_id: openraft::impls::leader_id_adv::LeaderId {
+                        term: 2,
+                        node_id: 5,
+                    },
                     index: 100,
                 }),
                 last_membership: openraft::StoredMembership::new(
                     None,
-                    openraft::Membership::new_with_defaults(vec![vec![1u64].into_iter().collect()], Vec::<u64>::new()),
+                    openraft::Membership::new_with_defaults(
+                        vec![vec![1u64].into_iter().collect()],
+                        Vec::<u64>::new(),
+                    ),
                 ),
                 snapshot_id: "snap-final".to_string(),
             },

@@ -24,14 +24,14 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use crate::LanceTypeConfig;
 use crate::ipc;
 use crate::raft::WriteError;
 use crate::types::{
-    duration_to_ms, LanceCommand, LanceResponse, PersistedBatcherConfig, ProcessorDescriptor,
-    WriteResult,
+    LanceCommand, LanceResponse, PersistedBatcherConfig, ProcessorDescriptor, WriteResult,
+    duration_to_ms,
 };
 use crate::write_processor::{MaterializedWrite, WriteProcessor};
-use crate::LanceTypeConfig;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -187,9 +187,7 @@ impl WriteBatcher {
     /// If a batcher loop is already running for this table, the new config
     /// takes effect on the next batcher creation (e.g. after shutdown/restart).
     pub fn configure_table(&self, table_name: impl Into<String>, config: WriteBatcherConfig) {
-        self.table_configs
-            .write()
-            .insert(table_name.into(), config);
+        self.table_configs.write().insert(table_name.into(), config);
     }
 
     /// Resolve the effective config for a table.
@@ -208,10 +206,7 @@ impl WriteBatcher {
         table_name: &str,
         batches: Vec<RecordBatch>,
     ) -> Result<WriteResult, WriteError> {
-        let estimated_bytes: usize = batches
-            .iter()
-            .map(|b| b.get_array_memory_size())
-            .sum();
+        let estimated_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
 
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -256,8 +251,7 @@ impl WriteBatcher {
 
         let config = self.config_for(table_name);
 
-        let (tx, rx) =
-            crossfire::mpsc::bounded_async::<BatchWriteRequest>(config.channel_capacity);
+        let (tx, rx) = crossfire::mpsc::bounded_async::<BatchWriteRequest>(config.channel_capacity);
 
         let task = tokio::spawn(batcher_loop(
             table_name.to_string(),

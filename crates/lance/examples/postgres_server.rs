@@ -25,14 +25,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{Float64Array, Int32Array, RecordBatch, StringArray, TimestampMillisecondArray};
-use arrow_flight::sql::client::FlightSqlServiceClient;
-use arrow_flight::sql::CommandStatementIngest;
 use arrow_flight::Action;
+use arrow_flight::sql::CommandStatementIngest;
+use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use tonic::transport::Channel;
 
 use bisque_lance::flight::serve_flight;
-use bisque_lance::postgres::{serve_postgres, PostgresServerConfig};
+use bisque_lance::postgres::{PostgresServerConfig, serve_postgres};
 use bisque_lance::{
     BisqueLance, BisqueLanceConfig, LanceRaftNode, LanceStateMachine, LanceTypeConfig,
 };
@@ -97,7 +97,13 @@ fn generate_events(schema: &Schema) -> RecordBatch {
                 "alice", "bob", "alice", "carol", "bob", "alice", "dave", "carol",
             ])),
             Arc::new(StringArray::from(vec![
-                "page_view", "click", "page_view", "signup", "page_view", "click", "page_view",
+                "page_view",
+                "click",
+                "page_view",
+                "signup",
+                "page_view",
+                "click",
+                "page_view",
                 "purchase",
             ])),
             Arc::new(StringArray::from(vec![

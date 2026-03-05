@@ -37,7 +37,12 @@ fn log_schema() -> Arc<Schema> {
 /// Pre-generate `count` rows as a single RecordBatch.
 fn generate_batch(schema: &Arc<Schema>, offset: i64, count: usize) -> RecordBatch {
     let levels = ["INFO", "WARN", "ERROR", "DEBUG"];
-    let services = ["api-gateway", "auth-service", "user-service", "payment-service"];
+    let services = [
+        "api-gateway",
+        "auth-service",
+        "user-service",
+        "payment-service",
+    ];
     let messages = [
         "Request processed successfully",
         "Connection pool exhausted, retrying",
@@ -220,11 +225,7 @@ async fn main() -> anyhow::Result<()> {
 
     let batch_sizes: Vec<usize> = std::env::var("BATCH_SIZES")
         .ok()
-        .map(|v| {
-            v.split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect()
-        })
+        .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![1_000, 5_000, 10_000, 50_000, 100_000]);
 
     let schema = log_schema();

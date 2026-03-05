@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use parking_lot::RwLock;
 use tracing::debug;
 
@@ -249,13 +249,19 @@ mod tests {
     fn test_config_builder() {
         let config = CredentialConfig::new()
             .with_credential("aws_region", "us-east-1")
-            .with_table_credentials("audit", HashMap::from([
-                ("aws_region".into(), "eu-west-1".into()),
-            ]));
+            .with_table_credentials(
+                "audit",
+                HashMap::from([("aws_region".into(), "eu-west-1".into())]),
+            );
 
         assert_eq!(config.credentials.get("aws_region").unwrap(), "us-east-1");
         assert_eq!(
-            config.table_overrides.get("audit").unwrap().get("aws_region").unwrap(),
+            config
+                .table_overrides
+                .get("audit")
+                .unwrap()
+                .get("aws_region")
+                .unwrap(),
             "eu-west-1"
         );
     }

@@ -146,11 +146,7 @@ fn format_ops(ops: f64) -> String {
 struct MmapStorage(MmapPerGroupLogStorage<C>);
 
 impl MmapStorage {
-    async fn create(
-        dir: PathBuf,
-        segment_size: u64,
-        fsync_delay: Duration,
-    ) -> io::Result<Self> {
+    async fn create(dir: PathBuf, segment_size: u64, fsync_delay: Duration) -> io::Result<Self> {
         let cfg = MmapStorageConfig::new(dir)
             .with_segment_size(segment_size)
             .with_fsync_delay(fsync_delay);

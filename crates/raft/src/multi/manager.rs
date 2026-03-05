@@ -3,13 +3,13 @@ use crate::multi::network::MultiRaftNetworkFactory;
 use crate::multi::network::MultiplexedTransport;
 use crate::multi::storage::MultiRaftLogStorage;
 use dashmap::DashMap;
-use tokio::io::{AsyncRead, AsyncWrite};
 use openraft::Config;
 use openraft::Raft;
 use openraft::RaftTypeConfig;
 use openraft::storage::RaftStateMachine;
 use std::marker::Unpin;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Manager for multiple Raft groups.
 ///
@@ -108,7 +108,10 @@ where
     ///
     /// Returns `None` if the group's log storage has not been initialized yet.
     /// Call after `add_group` or after manually initializing the group's storage.
-    pub fn get_purge_floor(&self, group_id: u64) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+    pub fn get_purge_floor(
+        &self,
+        group_id: u64,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
         self.storage.get_purge_floor(group_id)
     }
 }
@@ -222,7 +225,10 @@ mod tests {
             Ok(())
         }
 
-        async fn truncate_after(&mut self, after: Option<LogId<TestConfig>>) -> Result<(), std::io::Error> {
+        async fn truncate_after(
+            &mut self,
+            after: Option<LogId<TestConfig>>,
+        ) -> Result<(), std::io::Error> {
             match after {
                 Some(log_id) => {
                     let keys: Vec<u64> = self

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use openraft::impls::BasicNode;
 use openraft::Config;
+use openraft::impls::BasicNode;
 
 use bisque_lance::{
     BisqueLance, BisqueLanceConfig, LanceRaftNode, LanceStateMachine, LanceTypeConfig,
@@ -74,9 +74,8 @@ async fn setup_with_batcher(
     members.insert(node_id, BasicNode::default());
     let _ = raft.initialize(members).await;
 
-    let raft_node = Arc::new(
-        LanceRaftNode::new(raft, engine, node_id).with_write_batcher(batcher_config),
-    );
+    let raft_node =
+        Arc::new(LanceRaftNode::new(raft, engine, node_id).with_write_batcher(batcher_config));
     raft_node.start();
 
     // Wait for leadership.
@@ -298,9 +297,7 @@ async fn per_table_config() {
     node.write_records("fast_table", &[batch.clone()])
         .await
         .unwrap();
-    node.write_records("normal_table", &[batch])
-        .await
-        .unwrap();
+    node.write_records("normal_table", &[batch]).await.unwrap();
 
     assert_eq!(count_rows(&node, "fast_table").await, 5);
     assert_eq!(count_rows(&node, "normal_table").await, 5);

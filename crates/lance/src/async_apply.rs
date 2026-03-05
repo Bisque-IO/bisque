@@ -17,8 +17,8 @@
 //! log order. Different tables may be processed in parallel.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bisque_raft::multi::record_format::AtomicLogId;
@@ -28,9 +28,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error};
 
+use crate::LanceTypeConfig;
 use crate::engine::BisqueLance;
 use crate::ipc;
-use crate::LanceTypeConfig;
 
 /// Configuration for the async apply buffer.
 #[derive(Debug, Clone)]
@@ -180,12 +180,7 @@ impl AsyncApplyBuffer {
     ///
     /// If pending bytes exceed `max_pending_bytes`, this method blocks until
     /// the background writer drains enough work.
-    pub async fn enqueue(
-        &self,
-        log_id: LogId<LanceTypeConfig>,
-        table_name: String,
-        data: Bytes,
-    ) {
+    pub async fn enqueue(&self, log_id: LogId<LanceTypeConfig>, table_name: String, data: Bytes) {
         let data_len = data.len();
 
         // Backpressure: spin-wait if we're over the limit.
@@ -278,7 +273,14 @@ async fn background_writer(
             Some(item) => item,
             None => {
                 // Channel closed — flush remaining work and exit.
-                flush_all(&mut per_table, &engine, &lance_applied_tx, &lance_applied_log_id, &pending_bytes).await;
+                flush_all(
+                    &mut per_table,
+                    &engine,
+                    &lance_applied_tx,
+                    &lance_applied_log_id,
+                    &pending_bytes,
+                )
+                .await;
                 return;
             }
         };
@@ -294,12 +296,27 @@ async fn background_writer(
                 accumulate(&mut per_table, log_id, table_name, data, data_len);
             }
             ApplyWork::DrainTable { table_name, done } => {
-                flush_table(&table_name, &mut per_table, &engine, &lance_applied_tx, &lance_applied_log_id, &pending_bytes).await;
+                flush_table(
+                    &table_name,
+                    &mut per_table,
+                    &engine,
+                    &lance_applied_tx,
+                    &lance_applied_log_id,
+                    &pending_bytes,
+                )
+                .await;
                 let _ = done.send(());
                 continue;
             }
             ApplyWork::DrainAll { done } => {
-                flush_all(&mut per_table, &engine, &lance_applied_tx, &lance_applied_log_id, &pending_bytes).await;
+                flush_all(
+                    &mut per_table,
+                    &engine,
+                    &lance_applied_tx,
+                    &lance_applied_log_id,
+                    &pending_bytes,
+                )
+                .await;
                 let _ = done.send(());
                 continue;
             }
@@ -317,11 +334,26 @@ async fn background_writer(
                     accumulate(&mut per_table, log_id, table_name, data, data_len);
                 }
                 Ok(ApplyWork::DrainTable { table_name, done }) => {
-                    flush_table(&table_name, &mut per_table, &engine, &lance_applied_tx, &lance_applied_log_id, &pending_bytes).await;
+                    flush_table(
+                        &table_name,
+                        &mut per_table,
+                        &engine,
+                        &lance_applied_tx,
+                        &lance_applied_log_id,
+                        &pending_bytes,
+                    )
+                    .await;
                     let _ = done.send(());
                 }
                 Ok(ApplyWork::DrainAll { done }) => {
-                    flush_all(&mut per_table, &engine, &lance_applied_tx, &lance_applied_log_id, &pending_bytes).await;
+                    flush_all(
+                        &mut per_table,
+                        &engine,
+                        &lance_applied_tx,
+                        &lance_applied_log_id,
+                        &pending_bytes,
+                    )
+                    .await;
                     let _ = done.send(());
                 }
                 Err(_) => break,
@@ -330,7 +362,14 @@ async fn background_writer(
 
         // Flush all accumulated work.
         if !per_table.is_empty() {
-            flush_all(&mut per_table, &engine, &lance_applied_tx, &lance_applied_log_id, &pending_bytes).await;
+            flush_all(
+                &mut per_table,
+                &engine,
+                &lance_applied_tx,
+                &lance_applied_log_id,
+                &pending_bytes,
+            )
+            .await;
         }
     }
 }
@@ -358,7 +397,15 @@ async fn flush_table(
     pending_bytes: &AtomicUsize,
 ) {
     if let Some(work) = per_table.remove(table_name) {
-        write_table_work(table_name, work, engine, lance_applied_tx, lance_applied_log_id, pending_bytes).await;
+        write_table_work(
+            table_name,
+            work,
+            engine,
+            lance_applied_tx,
+            lance_applied_log_id,
+            pending_bytes,
+        )
+        .await;
     }
 }
 
@@ -377,7 +424,15 @@ async fn flush_all(
     let table_names: Vec<String> = per_table.keys().cloned().collect();
     for name in table_names {
         if let Some(work) = per_table.remove(&name) {
-            write_table_work(&name, work, engine, lance_applied_tx, lance_applied_log_id, pending_bytes).await;
+            write_table_work(
+                &name,
+                work,
+                engine,
+                lance_applied_tx,
+                lance_applied_log_id,
+                pending_bytes,
+            )
+            .await;
         }
     }
 }
@@ -507,10 +562,13 @@ mod tests {
     async fn enqueue_and_drain_all() {
         let (_dir, engine) = setup_engine().await;
         let schema = test_schema();
-        let table_config = engine.config().build_table_config("test_table", Arc::new(schema));
+        let table_config = engine
+            .config()
+            .build_table_config("test_table", Arc::new(schema));
         engine.create_table(table_config, None).await.unwrap();
 
-        let (buffer, watermark) = AsyncApplyBuffer::new(engine.clone(), AsyncApplyConfig::default());
+        let (buffer, watermark) =
+            AsyncApplyBuffer::new(engine.clone(), AsyncApplyConfig::default());
 
         // Enqueue some work.
         let batch = make_batch(&["a", "b"], &[1.0, 2.0]);
@@ -545,12 +603,17 @@ mod tests {
         let (_dir, engine) = setup_engine().await;
         let schema = test_schema();
 
-        let config_a = engine.config().build_table_config("table_a", Arc::new(schema.clone()));
+        let config_a = engine
+            .config()
+            .build_table_config("table_a", Arc::new(schema.clone()));
         engine.create_table(config_a, None).await.unwrap();
-        let config_b = engine.config().build_table_config("table_b", Arc::new(schema));
+        let config_b = engine
+            .config()
+            .build_table_config("table_b", Arc::new(schema));
         engine.create_table(config_b, None).await.unwrap();
 
-        let (buffer, _watermark) = AsyncApplyBuffer::new(engine.clone(), AsyncApplyConfig::default());
+        let (buffer, _watermark) =
+            AsyncApplyBuffer::new(engine.clone(), AsyncApplyConfig::default());
 
         let batch_a = make_batch(&["a"], &[1.0]);
         let data_a: Bytes = ipc::encode_record_batches(&[batch_a]).unwrap().into();
@@ -601,7 +664,9 @@ mod tests {
     async fn backpressure_blocks_until_drained() {
         let (_dir, engine) = setup_engine().await;
         let schema = test_schema();
-        let table_config = engine.config().build_table_config("bp_table", Arc::new(schema));
+        let table_config = engine
+            .config()
+            .build_table_config("bp_table", Arc::new(schema));
         engine.create_table(table_config, None).await.unwrap();
 
         // Tiny limit to trigger backpressure easily.
@@ -642,10 +707,13 @@ mod tests {
     async fn watermark_wait_for() {
         let (_dir, engine) = setup_engine().await;
         let schema = test_schema();
-        let table_config = engine.config().build_table_config("wm_table", Arc::new(schema));
+        let table_config = engine
+            .config()
+            .build_table_config("wm_table", Arc::new(schema));
         engine.create_table(table_config, None).await.unwrap();
 
-        let (buffer, watermark) = AsyncApplyBuffer::new(engine.clone(), AsyncApplyConfig::default());
+        let (buffer, watermark) =
+            AsyncApplyBuffer::new(engine.clone(), AsyncApplyConfig::default());
 
         // wait_for should timeout when nothing is materialized.
         assert!(!watermark.wait_for(1, Duration::from_millis(10)).await);

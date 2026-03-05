@@ -9,36 +9,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{
-    Array, Float64Array, FixedSizeBinaryArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     UInt32Array, UInt64Array,
 };
 use futures::TryStreamExt;
-use openraft::impls::BasicNode;
 use openraft::Config;
+use openraft::impls::BasicNode;
 use tonic::Request;
 
-use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-use opentelemetry_proto::tonic::metrics::v1::{
-    exemplar, Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
-    HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric,
-    number_data_point,
-};
 use opentelemetry_proto::tonic::metrics::v1::exponential_histogram_data_point::Buckets;
+use opentelemetry_proto::tonic::metrics::v1::{
+    Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
+    HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, exemplar,
+    metric, number_data_point,
+};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{
     ResourceSpans, ScopeSpans, Span, Status as SpanStatus, span,
 };
 
-use bisque_lance::otel::schema;
 use bisque_lance::otel::OtlpReceiver;
+use bisque_lance::otel::schema;
 use bisque_lance::{
     BisqueLance, BisqueLanceConfig, LanceRaftNode, LanceStateMachine, LanceTypeConfig,
     WriteBatcherConfig,
@@ -100,9 +100,8 @@ async fn setup_node(base_dir: &std::path::Path) -> Arc<LanceRaftNode> {
 
     let batcher_config = WriteBatcherConfig::default().with_linger(Duration::from_millis(10));
 
-    let raft_node = Arc::new(
-        LanceRaftNode::new(raft, engine, node_id).with_write_batcher(batcher_config),
-    );
+    let raft_node =
+        Arc::new(LanceRaftNode::new(raft, engine, node_id).with_write_batcher(batcher_config));
     raft_node.start();
 
     // Wait for leadership.
@@ -218,7 +217,9 @@ async fn metrics_sum_to_counters() {
         }],
     };
 
-    MetricsService::export(&receiver, Request::new(request)).await.unwrap();
+    MetricsService::export(&receiver, Request::new(request))
+        .await
+        .unwrap();
 
     let rows = count_rows(&node, schema::COUNTERS_TABLE).await;
     assert_eq!(rows, 2, "expected 2 counter rows, got {rows}");
@@ -315,7 +316,9 @@ async fn metrics_gauge_to_gauges() {
         }],
     };
 
-    MetricsService::export(&receiver, Request::new(request)).await.unwrap();
+    MetricsService::export(&receiver, Request::new(request))
+        .await
+        .unwrap();
 
     let rows = count_rows(&node, schema::GAUGES_TABLE).await;
     assert_eq!(rows, 1);
@@ -370,7 +373,9 @@ async fn metrics_histogram_to_histograms() {
         }],
     };
 
-    <OtlpReceiver as MetricsService>::export(&receiver, Request::new(request)).await.unwrap();
+    <OtlpReceiver as MetricsService>::export(&receiver, Request::new(request))
+        .await
+        .unwrap();
 
     let rows = count_rows(&node, schema::HISTOGRAMS_TABLE).await;
     assert_eq!(rows, 1);
@@ -487,7 +492,9 @@ async fn trace_service_writes_spans_with_events_and_links() {
         }],
     };
 
-    TraceService::export(&receiver, Request::new(request)).await.unwrap();
+    TraceService::export(&receiver, Request::new(request))
+        .await
+        .unwrap();
 
     // Verify spans
     let rows = count_rows(&node, schema::SPANS_TABLE).await;
@@ -606,7 +613,9 @@ async fn logs_service_writes_logs() {
         }],
     };
 
-    LogsService::export(&receiver, Request::new(request)).await.unwrap();
+    LogsService::export(&receiver, Request::new(request))
+        .await
+        .unwrap();
 
     let rows = count_rows(&node, schema::LOGS_TABLE).await;
     assert_eq!(rows, 1);
@@ -738,7 +747,9 @@ async fn mixed_metric_types() {
         }],
     };
 
-    MetricsService::export(&receiver, Request::new(request)).await.unwrap();
+    MetricsService::export(&receiver, Request::new(request))
+        .await
+        .unwrap();
 
     assert_eq!(count_rows(&node, schema::COUNTERS_TABLE).await, 1);
     assert_eq!(count_rows(&node, schema::GAUGES_TABLE).await, 1);
@@ -804,7 +815,9 @@ async fn metrics_exp_histogram() {
         }],
     };
 
-    MetricsService::export(&receiver, Request::new(request)).await.unwrap();
+    MetricsService::export(&receiver, Request::new(request))
+        .await
+        .unwrap();
 
     let rows = count_rows(&node, schema::EXP_HISTOGRAMS_TABLE).await;
     assert_eq!(rows, 1);
@@ -886,7 +899,9 @@ async fn metrics_exemplars() {
         }],
     };
 
-    MetricsService::export(&receiver, Request::new(request)).await.unwrap();
+    MetricsService::export(&receiver, Request::new(request))
+        .await
+        .unwrap();
 
     let rows = count_rows(&node, schema::EXEMPLARS_TABLE).await;
     assert_eq!(rows, 1);

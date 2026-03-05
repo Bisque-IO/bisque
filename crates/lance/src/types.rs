@@ -102,10 +102,7 @@ pub enum LanceCommand {
     /// Replicate raw data to all nodes.
     /// Every node appends this data to its local active Lance dataset.
     /// `data` contains Arrow IPC-encoded RecordBatches.
-    AppendRecords {
-        table_name: String,
-        data: Bytes,
-    },
+    AppendRecords { table_name: String, data: Bytes },
 
     /// Seal the current active segment and create a new one.
     SealActiveSegment {
@@ -133,14 +130,27 @@ pub enum LanceCommand {
 impl fmt::Display for LanceCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LanceCommand::CreateTable { table_name, schema_ipc } => {
-                write!(f, "CreateTable(table={}, schema={} bytes)", table_name, schema_ipc.len())
+            LanceCommand::CreateTable {
+                table_name,
+                schema_ipc,
+            } => {
+                write!(
+                    f,
+                    "CreateTable(table={}, schema={} bytes)",
+                    table_name,
+                    schema_ipc.len()
+                )
             }
             LanceCommand::DropTable { table_name } => {
                 write!(f, "DropTable(table={})", table_name)
             }
             LanceCommand::AppendRecords { table_name, data } => {
-                write!(f, "AppendRecords(table={}, {} bytes)", table_name, data.len())
+                write!(
+                    f,
+                    "AppendRecords(table={}, {} bytes)",
+                    table_name,
+                    data.len()
+                )
             }
             LanceCommand::SealActiveSegment {
                 table_name,
@@ -152,8 +162,15 @@ impl fmt::Display for LanceCommand {
                 "SealActiveSegment(table={}, sealed={}, new={}, reason={})",
                 table_name, sealed_segment_id, new_active_segment_id, reason
             ),
-            LanceCommand::BeginFlush { table_name, segment_id } => {
-                write!(f, "BeginFlush(table={}, segment={})", table_name, segment_id)
+            LanceCommand::BeginFlush {
+                table_name,
+                segment_id,
+            } => {
+                write!(
+                    f,
+                    "BeginFlush(table={}, segment={})",
+                    table_name, segment_id
+                )
             }
             LanceCommand::PromoteToDeepStorage {
                 table_name,
@@ -322,9 +339,7 @@ pub enum ProcessorDescriptor {
         max_column: Option<String>,
     },
     /// Specialized OTEL sum (counter) aggregator (sums values, truncates timestamps).
-    OtelSum {
-        timestamp_resolution_ms: i64,
-    },
+    OtelSum { timestamp_resolution_ms: i64 },
     /// Specialized OTEL gauge processor (last-write-wins).
     OtelGauge,
     /// Specialized OTEL histogram processor (merges buckets).
@@ -391,14 +406,13 @@ impl ProcessorDescriptor {
                 min_column,
                 max_column,
             } => {
-                let mut agg =
-                    crate::processors::HistogramAggregator::new(key_columns.clone())
-                        .with_column_names(
-                            boundaries_column.clone(),
-                            bucket_counts_column.clone(),
-                            sum_column.clone(),
-                            count_column.clone(),
-                        );
+                let mut agg = crate::processors::HistogramAggregator::new(key_columns.clone())
+                    .with_column_names(
+                        boundaries_column.clone(),
+                        bucket_counts_column.clone(),
+                        sum_column.clone(),
+                        count_column.clone(),
+                    );
                 if let Some(ts_col) = timestamp_column {
                     agg = agg.with_timestamp(ts_col.clone());
                 }
@@ -416,9 +430,9 @@ impl ProcessorDescriptor {
             }
             ProcessorDescriptor::OtelSum {
                 timestamp_resolution_ms,
-            } => Arc::new(
-                crate::otel::processors::OtelSumAggregator::new(*timestamp_resolution_ms),
-            ),
+            } => Arc::new(crate::otel::processors::OtelSumAggregator::new(
+                *timestamp_resolution_ms,
+            )),
             ProcessorDescriptor::OtelGauge => {
                 Arc::new(crate::otel::processors::OtelGaugeProcessor::new())
             }

@@ -21,8 +21,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use arrow_schema::SchemaRef;
@@ -53,8 +53,16 @@ use crate::s3_store::BisqueRoutingStore;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WsOutbound {
-    Pin { table: String, tier: String, version: u64 },
-    Unpin { table: String, tier: String, version: u64 },
+    Pin {
+        table: String,
+        tier: String,
+        version: u64,
+    },
+    Unpin {
+        table: String,
+        tier: String,
+        version: u64,
+    },
     Heartbeat,
 }
 
@@ -93,11 +101,7 @@ impl BisqueClient {
         let cluster_url = cluster_url.into().trim_end_matches('/').to_string();
         let bucket = bucket.into();
 
-        let routing_store = Arc::new(BisqueRoutingStore::new(
-            &cluster_url,
-            &bucket,
-            credentials,
-        ));
+        let routing_store = Arc::new(BisqueRoutingStore::new(&cluster_url, &bucket, credentials));
 
         let ctx = SessionContext::new();
         let tables: Arc<RwLock<HashMap<String, Arc<RemoteLanceTableProvider>>>> =
@@ -110,16 +114,16 @@ impl BisqueClient {
         let client_store = persist_path
             .and_then(|p| ClientStore::open(p).ok())
             .map(Arc::new);
-        let restored = client_store.as_ref().and_then(|store| {
-            match store.load_state() {
+        let restored = client_store
+            .as_ref()
+            .and_then(|store| match store.load_state() {
                 Ok(Some((meta, entries)))
                     if meta.cluster_url == cluster_url && meta.bucket == bucket =>
                 {
                     Some((meta, entries))
                 }
                 _ => None,
-            }
-        });
+            });
 
         if let Some((meta, entries)) = restored {
             // Delta sync: restore from persisted catalog, open datasets lazily
@@ -160,12 +164,7 @@ impl BisqueClient {
             let mut persisted_entries = HashMap::new();
 
             for (table_name, info) in &catalog.tables {
-                let provider = open_table_provider(
-                    &routing_store,
-                    table_name,
-                    info,
-                )
-                .await?;
+                let provider = open_table_provider(&routing_store, table_name, info).await?;
                 let provider = Arc::new(provider);
 
                 // Pin initial versions
@@ -279,10 +278,7 @@ impl BisqueClient {
     }
 
     /// Execute a SQL query and collect results.
-    pub async fn sql(
-        &self,
-        query: &str,
-    ) -> DfResult<Vec<arrow::array::RecordBatch>> {
+    pub async fn sql(&self, query: &str) -> DfResult<Vec<arrow::array::RecordBatch>> {
         let df = self.ctx.sql(query).await?;
         df.collect().await
     }
@@ -339,11 +335,7 @@ impl std::fmt::Debug for RemoteLanceTableProvider {
 }
 
 impl RemoteLanceTableProvider {
-    fn new(
-        schema: SchemaRef,
-        active: Option<Dataset>,
-        sealed: Option<Dataset>,
-    ) -> Self {
+    fn new(schema: SchemaRef, active: Option<Dataset>, sealed: Option<Dataset>) -> Self {
         Self {
             schema,
             active: Arc::new(ArcSwap::from_pointee(active)),
@@ -398,9 +390,11 @@ impl RemoteLanceTableProvider {
 
     /// Lazily open datasets that haven't been loaded yet.
     async fn ensure_datasets_open(&self) {
-        if self.needs_active_open.compare_exchange(
-            true, false, Ordering::AcqRel, Ordering::Relaxed,
-        ).is_ok() {
+        if self
+            .needs_active_open
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
             if let Some(store) = &self.routing_store {
                 match open_remote_dataset(store, &self.table_name, "active").await {
                     Ok(ds) => {
@@ -416,9 +410,11 @@ impl RemoteLanceTableProvider {
             }
         }
 
-        if self.needs_sealed_open.compare_exchange(
-            true, false, Ordering::AcqRel, Ordering::Relaxed,
-        ).is_ok() {
+        if self
+            .needs_sealed_open
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
             if let Some(store) = &self.routing_store {
                 match open_remote_dataset(store, &self.table_name, "sealed").await {
                     Ok(ds) => {
@@ -589,29 +585,25 @@ async fn open_table_provider(
 ) -> Result<RemoteLanceTableProvider, Box<dyn std::error::Error + Send + Sync>> {
     // Open active dataset
     let active_ds = match info.active_version {
-        Some(_) => {
-            match open_remote_dataset(routing_store, table_name, "active").await {
-                Ok(ds) => Some(ds),
-                Err(e) => {
-                    warn!(table = %table_name, "Failed to open active dataset: {}", e);
-                    None
-                }
+        Some(_) => match open_remote_dataset(routing_store, table_name, "active").await {
+            Ok(ds) => Some(ds),
+            Err(e) => {
+                warn!(table = %table_name, "Failed to open active dataset: {}", e);
+                None
             }
-        }
+        },
         None => None,
     };
 
     // Open sealed dataset
     let sealed_ds = match info.sealed_segment {
-        Some(_) => {
-            match open_remote_dataset(routing_store, table_name, "sealed").await {
-                Ok(ds) => Some(ds),
-                Err(e) => {
-                    warn!(table = %table_name, "Failed to open sealed dataset: {}", e);
-                    None
-                }
+        Some(_) => match open_remote_dataset(routing_store, table_name, "sealed").await {
+            Ok(ds) => Some(ds),
+            Err(e) => {
+                warn!(table = %table_name, "Failed to open sealed dataset: {}", e);
+                None
             }
-        }
+        },
         None => None,
     };
 
@@ -620,9 +612,7 @@ async fn open_table_provider(
         .as_ref()
         .or(sealed_ds.as_ref())
         .map(|ds| Arc::new(ds.schema().into()) as SchemaRef)
-        .ok_or_else(|| {
-            format!("No datasets available for table '{}'", table_name)
-        })?;
+        .ok_or_else(|| format!("No datasets available for table '{}'", table_name))?;
 
     Ok(RemoteLanceTableProvider::new(schema, active_ds, sealed_ds))
 }
@@ -726,9 +716,9 @@ async fn ws_connect_and_listen(
     // Drain any queued outbound messages (pins from initial connect, heartbeats)
     while let Ok(msg) = ws_rx.try_recv() {
         let json = serde_json::to_string(&msg)?;
-        ws.write_frame(fastwebsockets::Frame::text(
-            fastwebsockets::Payload::Owned(json.into_bytes()),
-        ))
+        ws.write_frame(fastwebsockets::Frame::text(fastwebsockets::Payload::Owned(
+            json.into_bytes(),
+        )))
         .await?;
     }
 
@@ -836,7 +826,11 @@ async fn handle_ws_message(
                 entry.active_version = Some(*version);
             });
         }
-        CatalogEventKind::SegmentSealed { table, active_version, sealed_version } => {
+        CatalogEventKind::SegmentSealed {
+            table,
+            active_version,
+            sealed_version,
+        } => {
             let provider = tables.read().get(table).cloned();
             if let Some(provider) = provider {
                 let old_active_v = provider.active_version();

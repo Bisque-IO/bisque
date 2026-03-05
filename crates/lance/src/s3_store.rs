@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -120,15 +120,15 @@ impl BisqueRoutingStore {
     /// Refresh the segment catalog from the cluster.
     async fn refresh_catalog(&self) -> OsResult<()> {
         let url = format!("{}/_bisque/catalog", self.object_url(""));
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "BisqueRoutingStore",
-                source: Box::new(e),
-            })?;
+        let resp =
+            self.client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "BisqueRoutingStore",
+                    source: Box::new(e),
+                })?;
 
         if !resp.status().is_success() {
             return Err(object_store::Error::Generic {
@@ -138,10 +138,12 @@ impl BisqueRoutingStore {
         }
 
         let catalog_resp: CatalogResponse =
-            resp.json().await.map_err(|e| object_store::Error::Generic {
-                store: "BisqueRoutingStore",
-                source: Box::new(e),
-            })?;
+            resp.json()
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "BisqueRoutingStore",
+                    source: Box::new(e),
+                })?;
 
         let mut cached = self.catalog.write();
         cached.tables = catalog_resp.tables;
@@ -171,7 +173,7 @@ impl BisqueRoutingStore {
         };
 
         match parts.next() {
-            Some("active") | Some("sealed") => {},
+            Some("active") | Some("sealed") => {}
             _ => return false,
         };
 
@@ -197,15 +199,15 @@ impl BisqueRoutingStore {
             url_encode(prefix),
         );
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "BisqueRoutingStore",
-                source: Box::new(e),
-            })?;
+        let resp =
+            self.client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "BisqueRoutingStore",
+                    source: Box::new(e),
+                })?;
 
         if !resp.status().is_success() {
             return Err(object_store::Error::Generic {
@@ -246,13 +248,10 @@ impl BisqueRoutingStore {
             req = req.header("range", &range_header);
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "BisqueRoutingStore",
-                source: Box::new(e),
-            })?;
+        let resp = req.send().await.map_err(|e| object_store::Error::Generic {
+            store: "BisqueRoutingStore",
+            source: Box::new(e),
+        })?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(object_store::Error::NotFound {
@@ -364,21 +363,17 @@ impl ObjectStore for BisqueRoutingStore {
         Err(object_store::Error::NotImplemented)
     }
 
-    async fn get_opts(
-        &self,
-        location: &ObjectPath,
-        options: GetOptions,
-    ) -> OsResult<GetResult> {
+    async fn get_opts(&self, location: &ObjectPath, options: GetOptions) -> OsResult<GetResult> {
         self.ensure_catalog().await?;
         if self.is_cluster_path(location) {
             self.cluster_get(location, options).await
         } else {
-            let store = self.resolve_cold_store(location).ok_or_else(|| {
-                object_store::Error::Generic {
-                    store: "BisqueRoutingStore",
-                    source: format!("no cold store configured for path: {}", location).into(),
-                }
-            })?;
+            let store =
+                self.resolve_cold_store(location)
+                    .ok_or_else(|| object_store::Error::Generic {
+                        store: "BisqueRoutingStore",
+                        source: format!("no cold store configured for path: {}", location).into(),
+                    })?;
             store.get_opts(location, options).await
         }
     }
@@ -412,79 +407,82 @@ impl ObjectStore for BisqueRoutingStore {
 
             Ok((is_cluster, prefix_owned))
         })
-        .flat_map(move |result: OsResult<(bool, Option<ObjectPath>)>| match result {
-            Ok((true, prefix)) => {
-                let prefix_str = prefix.as_ref().map(|p| p.as_ref()).unwrap_or("").to_string();
-                let client = client2.clone();
-                let cluster_url = cluster_url2.clone();
-                let bucket = bucket2.clone();
+        .flat_map(
+            move |result: OsResult<(bool, Option<ObjectPath>)>| match result {
+                Ok((true, prefix)) => {
+                    let prefix_str = prefix
+                        .as_ref()
+                        .map(|p| p.as_ref())
+                        .unwrap_or("")
+                        .to_string();
+                    let client = client2.clone();
+                    let cluster_url = cluster_url2.clone();
+                    let bucket = bucket2.clone();
 
-                futures::stream::once(async move {
-                    let url = format!(
-                        "{}/{}?list-type=2&prefix={}&max-keys=10000",
-                        cluster_url,
-                        bucket,
-                        url_encode(&prefix_str),
-                    );
-                    let resp = client.get(&url).send().await.map_err(|e| {
-                        object_store::Error::Generic {
-                            store: "BisqueRoutingStore",
-                            source: Box::new(e),
-                        }
-                    })?;
-                    let xml = resp.text().await.map_err(|e| {
-                        object_store::Error::Generic {
-                            store: "BisqueRoutingStore",
-                            source: Box::new(e),
-                        }
-                    })?;
-                    Ok(parse_list_xml(&xml))
-                })
-                .flat_map(|result: OsResult<Vec<ObjectMeta>>| match result {
-                    Ok(items) => futures::stream::iter(items.into_iter().map(Ok)).boxed(),
-                    Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
-                })
-                .boxed()
-            }
-            Ok((false, prefix)) => {
-                // Resolve cold store for this path using server options + client credentials
-                let store = prefix.as_ref().and_then(|p| {
-                    let table_name = p.as_ref().split('/').next()?;
-                    let catalog = catalog2.read();
-                    let info = catalog.tables.get(table_name)?;
-                    if info.s3_dataset_uri.is_empty() {
-                        return None;
-                    }
-                    credentials
-                        .resolve(table_name, &info.s3_dataset_uri, &info.s3_storage_options)
-                        .ok()
-                        .map(|(s, _)| s)
-                });
-
-                match store {
-                    Some(s) => s.list(prefix.as_ref()),
-                    None => futures::stream::once(async {
-                        Err(object_store::Error::Generic {
-                            store: "BisqueRoutingStore",
-                            source: "no cold store configured".into(),
-                        })
-                    }).boxed(),
+                    futures::stream::once(async move {
+                        let url = format!(
+                            "{}/{}?list-type=2&prefix={}&max-keys=10000",
+                            cluster_url,
+                            bucket,
+                            url_encode(&prefix_str),
+                        );
+                        let resp = client.get(&url).send().await.map_err(|e| {
+                            object_store::Error::Generic {
+                                store: "BisqueRoutingStore",
+                                source: Box::new(e),
+                            }
+                        })?;
+                        let xml = resp
+                            .text()
+                            .await
+                            .map_err(|e| object_store::Error::Generic {
+                                store: "BisqueRoutingStore",
+                                source: Box::new(e),
+                            })?;
+                        Ok(parse_list_xml(&xml))
+                    })
+                    .flat_map(|result: OsResult<Vec<ObjectMeta>>| match result {
+                        Ok(items) => futures::stream::iter(items.into_iter().map(Ok)).boxed(),
+                        Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
+                    })
+                    .boxed()
                 }
-            }
-            Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
-        })
+                Ok((false, prefix)) => {
+                    // Resolve cold store for this path using server options + client credentials
+                    let store = prefix.as_ref().and_then(|p| {
+                        let table_name = p.as_ref().split('/').next()?;
+                        let catalog = catalog2.read();
+                        let info = catalog.tables.get(table_name)?;
+                        if info.s3_dataset_uri.is_empty() {
+                            return None;
+                        }
+                        credentials
+                            .resolve(table_name, &info.s3_dataset_uri, &info.s3_storage_options)
+                            .ok()
+                            .map(|(s, _)| s)
+                    });
+
+                    match store {
+                        Some(s) => s.list(prefix.as_ref()),
+                        None => futures::stream::once(async {
+                            Err(object_store::Error::Generic {
+                                store: "BisqueRoutingStore",
+                                source: "no cold store configured".into(),
+                            })
+                        })
+                        .boxed(),
+                    }
+                }
+                Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
+            },
+        )
         .boxed()
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> OsResult<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&ObjectPath>) -> OsResult<ListResult> {
         self.ensure_catalog().await?;
 
-        let is_cluster = prefix
-            .map(|p| self.is_cluster_path(p))
-            .unwrap_or(false);
+        let is_cluster = prefix.map(|p| self.is_cluster_path(p)).unwrap_or(false);
 
         if is_cluster {
             let prefix_str = prefix.map(|p| p.as_ref()).unwrap_or("");
@@ -515,7 +513,11 @@ impl ObjectStore for BisqueRoutingStore {
                 if let Some(idx) = rest.find(delimiter) {
                     let cp = format!(
                         "{}{}{}",
-                        if prefix_str.is_empty() { "" } else { prefix_str },
+                        if prefix_str.is_empty() {
+                            ""
+                        } else {
+                            prefix_str
+                        },
                         if prefix_str.is_empty() { "" } else { "/" },
                         &rest[..=idx]
                     );
@@ -547,11 +549,7 @@ impl ObjectStore for BisqueRoutingStore {
         Err(object_store::Error::NotImplemented)
     }
 
-    async fn copy_if_not_exists(
-        &self,
-        _from: &ObjectPath,
-        _to: &ObjectPath,
-    ) -> OsResult<()> {
+    async fn copy_if_not_exists(&self, _from: &ObjectPath, _to: &ObjectPath) -> OsResult<()> {
         Err(object_store::Error::NotImplemented)
     }
 }

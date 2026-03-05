@@ -260,8 +260,7 @@ pub async fn prom_series(
                     "__name__".to_string(),
                     serde_json::Value::String(metric_names.value(i).to_string()),
                 );
-                if let Ok(serde_json::Value::Object(map)) =
-                    serde_json::from_str(attrs_col.value(i))
+                if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(attrs_col.value(i))
                 {
                     for (k, v) in map {
                         labels.insert(k, v);
@@ -414,8 +413,7 @@ pub async fn prom_remote_write(
         }
 
         let attrs_json = serde_json::to_string(&attrs).unwrap_or_else(|_| "{}".to_string());
-        let res_attrs_json =
-            serde_json::to_string(&res_attrs).unwrap_or_else(|_| "{}".to_string());
+        let res_attrs_json = serde_json::to_string(&res_attrs).unwrap_or_else(|_| "{}".to_string());
 
         let is_counter = type_map
             .get(&metric_name)
@@ -491,8 +489,8 @@ fn build_metric_batch(
     schema: &Arc<arrow_schema::Schema>,
     has_temporality: bool,
 ) -> RecordBatch {
-    use arrow_array::builder::*;
     use arrow_array::ArrayRef;
+    use arrow_array::builder::*;
 
     let n = rows.len();
     let mut metric_name = StringBuilder::with_capacity(n, n * 32);
@@ -602,7 +600,10 @@ async fn query_attribute_columns(
         Err(_) => return Ok(Vec::new()),
     };
     // For series endpoint, also select metric_name
-    let has_metric_name = df.schema().field_with_unqualified_name("metric_name").is_ok();
+    let has_metric_name = df
+        .schema()
+        .field_with_unqualified_name("metric_name")
+        .is_ok();
     let cols = if has_metric_name {
         vec!["metric_name", "attributes", "resource_attributes"]
     } else {
@@ -656,7 +657,11 @@ async fn query_metric_metadata(
 
 fn extract_json_keys_from_batch(batch: &RecordBatch, keys: &mut BTreeSet<String>) {
     for col_idx in 0..batch.num_columns() {
-        if let Some(str_arr) = batch.column(col_idx).as_any().downcast_ref::<arrow_array::StringArray>() {
+        if let Some(str_arr) = batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+        {
             for i in 0..str_arr.len() {
                 if !str_arr.is_null(i) {
                     if let Ok(serde_json::Value::Object(map)) =

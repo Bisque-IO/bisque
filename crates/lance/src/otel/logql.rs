@@ -109,9 +109,7 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while self.pos < self.input.len()
-            && self.input.as_bytes()[self.pos].is_ascii_whitespace()
-        {
+        while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
     }
@@ -251,10 +249,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(LogQLExpr::LogQuery {
-            selector,
-            pipeline,
-        })
+        Ok(LogQLExpr::LogQuery { selector, pipeline })
     }
 
     fn parse_stream_selector(&mut self) -> Result<StreamSelector, String> {
@@ -449,12 +444,12 @@ pub fn matches_pipeline(body: &str, pipeline: &[PipelineStage]) -> bool {
     pipeline.iter().all(|stage| match stage {
         PipelineStage::LineContains(s) => body.contains(s.as_str()),
         PipelineStage::LineNotContains(s) => !body.contains(s.as_str()),
-        PipelineStage::LineMatchesRegex(pattern) => {
-            Regex::new(pattern).map(|re| re.is_match(body)).unwrap_or(false)
-        }
-        PipelineStage::LineNotMatchesRegex(pattern) => {
-            Regex::new(pattern).map(|re| !re.is_match(body)).unwrap_or(true)
-        }
+        PipelineStage::LineMatchesRegex(pattern) => Regex::new(pattern)
+            .map(|re| re.is_match(body))
+            .unwrap_or(false),
+        PipelineStage::LineNotMatchesRegex(pattern) => Regex::new(pattern)
+            .map(|re| !re.is_match(body))
+            .unwrap_or(true),
     })
 }
 
@@ -486,10 +481,7 @@ mod tests {
     fn parse_simple_log_query() {
         let expr = parse(r#"{job="app"}"#).unwrap();
         match expr {
-            LogQLExpr::LogQuery {
-                selector,
-                pipeline,
-            } => {
+            LogQLExpr::LogQuery { selector, pipeline } => {
                 assert_eq!(selector.matchers.len(), 1);
                 assert_eq!(selector.matchers[0].name, "job");
                 assert!(matches!(selector.matchers[0].op, MatchOp::Eq));
@@ -504,10 +496,7 @@ mod tests {
     fn parse_log_query_with_pipeline() {
         let expr = parse(r#"{job="app"} |= "error" != "timeout""#).unwrap();
         match expr {
-            LogQLExpr::LogQuery {
-                selector,
-                pipeline,
-            } => {
+            LogQLExpr::LogQuery { selector, pipeline } => {
                 assert_eq!(selector.matchers.len(), 1);
                 assert_eq!(pipeline.len(), 2);
                 assert!(matches!(pipeline[0], PipelineStage::LineContains(_)));

@@ -11,9 +11,9 @@ mod opts;
 mod socket;
 mod split;
 mod tcp;
-mod udp;
 #[cfg(feature = "tls")]
 pub mod tls;
+mod udp;
 #[cfg(unix)]
 mod unix;
 

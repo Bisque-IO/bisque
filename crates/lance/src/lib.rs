@@ -51,11 +51,11 @@ pub use flight::BisqueFlightService;
 pub use manifest::LanceManifestManager;
 pub use otel::{OtlpReceiver, serve_http, serve_otlp};
 pub use postgres::{PostgresServerConfig, serve_postgres};
-pub use s3_server::serve_s3;
-pub use s3_store::BisqueRoutingStore;
 pub use processors::{CounterAggregator, GaugeAggregator, HistogramAggregator};
 pub use query::BisqueLanceTableProvider;
 pub use raft::{LanceRaftNode, WriteError};
+pub use s3_server::serve_s3;
+pub use s3_store::BisqueRoutingStore;
 pub use state_machine::LanceStateMachine;
 pub use table_engine::TableEngine;
 pub use types::{
@@ -72,5 +72,4 @@ pub use write_processor::{MaterializedWrite, ProcessorOutput, WriteProcessor};
 ///
 /// Uses `LanceCommand` as the application request type (D) and
 /// `LanceResponse` as the response type (R).
-pub type LanceTypeConfig =
-    bisque_raft::BisqueRaftTypeConfig<LanceCommand, LanceResponse>;
+pub type LanceTypeConfig = bisque_raft::BisqueRaftTypeConfig<LanceCommand, LanceResponse>;

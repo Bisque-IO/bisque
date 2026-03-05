@@ -21,8 +21,8 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_physical_plan::union::UnionExec;
-use lance::dataset::scanner::Scanner;
 use lance::Dataset;
+use lance::dataset::scanner::Scanner;
 
 use crate::table_engine::TableEngine;
 

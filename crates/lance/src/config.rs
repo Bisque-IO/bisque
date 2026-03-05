@@ -6,7 +6,7 @@ use std::time::Duration;
 use lance::dataset::optimize::CompactionOptions;
 use lance_index::IndexType;
 
-use crate::types::{duration_to_ms, PersistedIndexSpec, PersistedTableConfig};
+use crate::types::{PersistedIndexSpec, PersistedTableConfig, duration_to_ms};
 
 /// Specifies an index to create on sealed segments.
 #[derive(Debug, Clone)]

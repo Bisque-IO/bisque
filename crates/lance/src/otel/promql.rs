@@ -10,9 +10,9 @@
 
 use std::collections::BTreeMap;
 
+use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type, TimestampNanosecondType};
-use arrow_array::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::*;
@@ -33,11 +33,21 @@ pub struct PromSeries {
 /// Post-processing operations applied after SQL data fetch.
 #[derive(Debug, Clone)]
 enum PostOp {
-    Rate { range_secs: f64 },
-    Increase { range_secs: f64 },
+    Rate {
+        range_secs: f64,
+    },
+    Increase {
+        range_secs: f64,
+    },
     Irate,
-    Aggregate { op: AggOp, by_labels: Vec<String>, without: bool },
-    HistogramQuantile { _quantile: f64 },
+    Aggregate {
+        op: AggOp,
+        by_labels: Vec<String>,
+        without: bool,
+    },
+    HistogramQuantile {
+        _quantile: f64,
+    },
     ScalarMultiply(f64),
     ScalarDivide(f64),
     ScalarAdd(f64),
@@ -212,12 +222,14 @@ fn walk_expr(expr: &PromExpr, plan: &mut PromQueryPlan) -> Result<(), String> {
                         walk_expr(inner.as_ref(), plan)?;
                     }
                     plan.tables = vec!["otel_histograms"];
-                    plan.post_ops.push(PostOp::HistogramQuantile { _quantile: quantile });
+                    plan.post_ops.push(PostOp::HistogramQuantile {
+                        _quantile: quantile,
+                    });
                     Ok(())
                 }
-                "abs" | "ceil" | "floor" | "round" | "sqrt" | "ln" | "log2" | "log10"
-                | "exp" | "absent" | "clamp_min" | "clamp_max" | "timestamp"
-                | "label_replace" | "label_join" | "sort" | "sort_desc" => {
+                "abs" | "ceil" | "floor" | "round" | "sqrt" | "ln" | "log2" | "log10" | "exp"
+                | "absent" | "clamp_min" | "clamp_max" | "timestamp" | "label_replace"
+                | "label_join" | "sort" | "sort_desc" => {
                     // Simple pass-through: walk inner, ignore transform
                     if let Some(inner) = call.args.args.first() {
                         walk_expr(inner.as_ref(), plan)?;
@@ -237,12 +249,8 @@ fn walk_expr(expr: &PromExpr, plan: &mut PromQueryPlan) -> Result<(), String> {
             walk_expr(&agg.expr, plan)?;
 
             let (by_labels, without) = match &agg.modifier {
-                Some(LabelModifier::Include(labels)) => {
-                    (labels.labels.clone(), false)
-                }
-                Some(LabelModifier::Exclude(labels)) => {
-                    (labels.labels.clone(), true)
-                }
+                Some(LabelModifier::Include(labels)) => (labels.labels.clone(), false),
+                Some(LabelModifier::Exclude(labels)) => (labels.labels.clone(), true),
                 None => (Vec::new(), false),
             };
 
@@ -257,7 +265,11 @@ fn walk_expr(expr: &PromExpr, plan: &mut PromQueryPlan) -> Result<(), String> {
                 _ => AggOp::Sum, // fallback
             };
 
-            plan.post_ops.push(PostOp::Aggregate { op, by_labels, without });
+            plan.post_ops.push(PostOp::Aggregate {
+                op,
+                by_labels,
+                without,
+            });
             Ok(())
         }
         PromExpr::Binary(bin) => {
@@ -310,11 +322,13 @@ fn extract_matchers(matchers: &Matchers, plan: &mut PromQueryPlan) {
                     plan.metric_name = Some(m.value.clone());
                 }
                 _ => {
-                    plan.label_matchers.push((m.name.clone(), m.op.clone(), m.value.clone()));
+                    plan.label_matchers
+                        .push((m.name.clone(), m.op.clone(), m.value.clone()));
                 }
             }
         } else {
-            plan.label_matchers.push((m.name.clone(), m.op.clone(), m.value.clone()));
+            plan.label_matchers
+                .push((m.name.clone(), m.op.clone(), m.value.clone()));
         }
     }
 }
@@ -339,11 +353,14 @@ async fn fetch_and_filter(
         let df = df
             .filter(
                 col("timestamp")
-                    .gt_eq(lit(ScalarValue::TimestampNanosecond(Some(plan.start_ns), None)))
-                    .and(
-                        col("timestamp")
-                            .lt_eq(lit(ScalarValue::TimestampNanosecond(Some(plan.end_ns), None))),
-                    ),
+                    .gt_eq(lit(ScalarValue::TimestampNanosecond(
+                        Some(plan.start_ns),
+                        None,
+                    )))
+                    .and(col("timestamp").lt_eq(lit(ScalarValue::TimestampNanosecond(
+                        Some(plan.end_ns),
+                        None,
+                    )))),
             )
             .map_err(|e| format!("filter: {e}"))?;
 
@@ -512,15 +529,31 @@ fn apply_post_ops(series: &mut Vec<PromSeries>, plan: &PromQueryPlan) -> Result<
     for op in &plan.post_ops {
         match op {
             PostOp::Rate { range_secs } => {
-                apply_rate(series, *range_secs, plan.step_ns, plan.start_ns / 1_000_000, plan.end_ns / 1_000_000);
+                apply_rate(
+                    series,
+                    *range_secs,
+                    plan.step_ns,
+                    plan.start_ns / 1_000_000,
+                    plan.end_ns / 1_000_000,
+                );
             }
             PostOp::Increase { range_secs } => {
-                apply_increase(series, *range_secs, plan.step_ns, plan.start_ns / 1_000_000, plan.end_ns / 1_000_000);
+                apply_increase(
+                    series,
+                    *range_secs,
+                    plan.step_ns,
+                    plan.start_ns / 1_000_000,
+                    plan.end_ns / 1_000_000,
+                );
             }
             PostOp::Irate => {
                 apply_irate(series);
             }
-            PostOp::Aggregate { op, by_labels, without } => {
+            PostOp::Aggregate {
+                op,
+                by_labels,
+                without,
+            } => {
                 *series = apply_aggregate(series, *op, by_labels, *without);
             }
             PostOp::HistogramQuantile { .. } => {
@@ -562,7 +595,13 @@ fn apply_post_ops(series: &mut Vec<PromSeries>, plan: &PromQueryPlan) -> Result<
 }
 
 /// Compute per-second rate over the range window for each evaluation step.
-fn apply_rate(series: &mut Vec<PromSeries>, range_secs: f64, step_ns: Option<i64>, _start_ms: i64, _end_ms: i64) {
+fn apply_rate(
+    series: &mut Vec<PromSeries>,
+    range_secs: f64,
+    step_ns: Option<i64>,
+    _start_ms: i64,
+    _end_ms: i64,
+) {
     for s in series.iter_mut() {
         if s.samples.len() < 2 {
             s.samples.clear();
@@ -609,7 +648,13 @@ fn apply_rate(series: &mut Vec<PromSeries>, range_secs: f64, step_ns: Option<i64
 }
 
 /// Compute increase (delta over range window).
-fn apply_increase(series: &mut Vec<PromSeries>, range_secs: f64, step_ns: Option<i64>, start_ms: i64, end_ms: i64) {
+fn apply_increase(
+    series: &mut Vec<PromSeries>,
+    range_secs: f64,
+    step_ns: Option<i64>,
+    start_ms: i64,
+    end_ms: i64,
+) {
     // Increase = rate * range_seconds
     apply_rate(series, range_secs, step_ns, start_ms, end_ms);
     for s in series.iter_mut() {

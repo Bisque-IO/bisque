@@ -18,12 +18,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
 
+use super::OtlpReceiver;
 use super::arrow_proto::{
-    ArrowLogsService, ArrowMetricsService, ArrowPayloadType, ArrowTracesService,
-    BatchArrowRecords, BatchStatus, StatusCode,
+    ArrowLogsService, ArrowMetricsService, ArrowPayloadType, ArrowTracesService, BatchArrowRecords,
+    BatchStatus, StatusCode,
 };
 use super::schema;
-use super::OtlpReceiver;
 
 /// Map an `ArrowPayloadType` to the target table name.
 fn payload_type_to_table(payload_type: i32) -> Option<&'static str> {
@@ -66,10 +66,8 @@ impl OtlpReceiver {
     async fn process_arrow_stream(
         &self,
         mut stream: Streaming<BatchArrowRecords>,
-    ) -> Result<
-        Response<Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>>,
-        Status,
-    > {
+    ) -> Result<Response<Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>>, Status>
+    {
         let (tx, rx) = mpsc::channel(64);
         let raft_node = self.raft_node().clone();
 
@@ -116,8 +114,7 @@ impl OtlpReceiver {
                                 "failed to create Arrow IPC reader"
                             );
                             status_code = StatusCode::InvalidArgument as i32;
-                            status_message =
-                                format!("failed to decode Arrow IPC: {e}");
+                            status_message = format!("failed to decode Arrow IPC: {e}");
                             continue;
                         }
                     };
@@ -136,8 +133,7 @@ impl OtlpReceiver {
                                     "failed to read Arrow record batch"
                                 );
                                 status_code = StatusCode::InvalidArgument as i32;
-                                status_message =
-                                    format!("failed to read record batch: {e}");
+                                status_message = format!("failed to read record batch: {e}");
                             }
                         }
                     }
@@ -164,25 +160,17 @@ impl OtlpReceiver {
                             debug!(table = table_name, "auto-created OTAP table");
                         }
 
-                        if let Err(e) =
-                            raft_node.write_records(table_name, &batches).await
-                        {
+                        if let Err(e) = raft_node.write_records(table_name, &batches).await {
                             warn!(
                                 error = %e,
                                 table = table_name,
                                 "failed to write arrow records"
                             );
                             status_code = StatusCode::Internal as i32;
-                            status_message =
-                                format!("failed to write to {table_name}: {e}");
+                            status_message = format!("failed to write to {table_name}: {e}");
                         } else {
-                            let total_rows: usize =
-                                batches.iter().map(|b| b.num_rows()).sum();
-                            debug!(
-                                table = table_name,
-                                rows = total_rows,
-                                "wrote arrow payload"
-                            );
+                            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                            debug!(table = table_name, rows = total_rows, "wrote arrow payload");
                         }
                     }
                 }
@@ -200,17 +188,16 @@ impl OtlpReceiver {
         });
 
         let stream = ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(stream)
-                as Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>,
-        ))
+        Ok(Response::new(Box::pin(stream)
+            as Pin<
+                Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>,
+            >))
     }
 }
 
 #[tonic::async_trait]
 impl ArrowTracesService for OtlpReceiver {
-    type ArrowTracesStream =
-        Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>;
+    type ArrowTracesStream = Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>;
 
     async fn arrow_traces(
         &self,
@@ -223,8 +210,7 @@ impl ArrowTracesService for OtlpReceiver {
 
 #[tonic::async_trait]
 impl ArrowLogsService for OtlpReceiver {
-    type ArrowLogsStream =
-        Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>;
+    type ArrowLogsStream = Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>;
 
     async fn arrow_logs(
         &self,
@@ -237,8 +223,7 @@ impl ArrowLogsService for OtlpReceiver {
 
 #[tonic::async_trait]
 impl ArrowMetricsService for OtlpReceiver {
-    type ArrowMetricsStream =
-        Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>;
+    type ArrowMetricsStream = Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>;
 
     async fn arrow_metrics(
         &self,

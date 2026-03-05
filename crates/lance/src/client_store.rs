@@ -216,9 +216,8 @@ impl ClientStore {
 
         // Write meta
         let meta_table = unsafe { self.meta_table_rw(&txn) };
-        let meta_bytes =
-            bincode::serde::encode_to_vec(meta, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let meta_bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         txn.put(&meta_table, STATE_KEY, &meta_bytes, WriteFlags::empty())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -228,16 +227,10 @@ impl ClientStore {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         for (name, entry) in tables {
-            let value =
-                bincode::serde::encode_to_vec(entry, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            txn.put(
-                &tables_table,
-                name.as_bytes(),
-                &value,
-                WriteFlags::empty(),
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let value = bincode::serde::encode_to_vec(entry, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            txn.put(&tables_table, name.as_bytes(), &value, WriteFlags::empty())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         }
 
         txn.commit()
@@ -253,9 +246,8 @@ impl ClientStore {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         let table = unsafe { self.tables_table_rw(&txn) };
-        let value =
-            bincode::serde::encode_to_vec(entry, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let value = bincode::serde::encode_to_vec(entry, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         txn.put(&table, name.as_bytes(), &value, WriteFlags::empty())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -317,9 +309,8 @@ impl ClientStore {
             .begin_rw_txn()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let meta_table = unsafe { self.meta_table_rw(&txn) };
-        let value =
-            bincode::serde::encode_to_vec(&meta, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let value = bincode::serde::encode_to_vec(&meta, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         txn.put(&meta_table, STATE_KEY, &value, WriteFlags::empty())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         txn.commit()

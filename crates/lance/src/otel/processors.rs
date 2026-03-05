@@ -232,10 +232,7 @@ fn build_key(key_arrays: &[&StringArray; NUM_KEY_COLS], row: usize, buf: &mut St
 }
 
 /// Split composite keys back into NUM_KEY_COLS StringBuilder columns.
-fn build_key_columns(
-    accum_keys: impl Iterator<Item = impl AsRef<str>>,
-    n: usize,
-) -> Vec<ArrayRef> {
+fn build_key_columns(accum_keys: impl Iterator<Item = impl AsRef<str>>, n: usize) -> Vec<ArrayRef> {
     let mut builders: Vec<StringBuilder> = (0..NUM_KEY_COLS)
         .map(|_| StringBuilder::with_capacity(n, n * 32))
         .collect();
@@ -324,11 +321,7 @@ enum NumberValue {
 }
 
 impl NumberValue {
-    fn read(
-        value_int: &Int64Array,
-        value_double: &Float64Array,
-        row: usize,
-    ) -> Self {
+    fn read(value_int: &Int64Array, value_double: &Float64Array, row: usize) -> Self {
         if !value_int.is_null(row) {
             NumberValue::Int(value_int.value(row))
         } else if !value_double.is_null(row) {
@@ -463,11 +456,9 @@ impl OtelSumAggregator {
         columns.push(Arc::new(st_builder.finish()));
 
         // Value — aggregated sum always stored as value_double
-        columns.extend(build_number_value_columns(
-            entries.iter(),
-            n,
-            |(_, e)| NumberValue::Double(e.value),
-        ));
+        columns.extend(build_number_value_columns(entries.iter(), n, |(_, e)| {
+            NumberValue::Double(e.value)
+        }));
 
         // Passthrough
         columns.extend(build_counter_pt_columns(
@@ -476,8 +467,7 @@ impl OtelSumAggregator {
         ));
 
         let table_schema = schema::counter_schema_ref().clone();
-        RecordBatch::try_new(table_schema, columns)
-            .expect("schema mismatch in otel counter output")
+        RecordBatch::try_new(table_schema, columns).expect("schema mismatch in otel counter output")
     }
 }
 
@@ -574,11 +564,9 @@ impl OtelGaugeProcessor {
         columns.push(Arc::new(st_builder.finish()));
 
         // Value — preserve original type (last-write-wins)
-        columns.extend(build_number_value_columns(
-            entries.iter(),
-            n,
-            |(_, e)| e.value,
-        ));
+        columns.extend(build_number_value_columns(entries.iter(), n, |(_, e)| {
+            e.value
+        }));
 
         // Gauge passthrough (no agg_temp/is_monotonic)
         columns.extend(build_gauge_pt_columns(
@@ -587,8 +575,7 @@ impl OtelGaugeProcessor {
         ));
 
         let table_schema = schema::gauge_schema_ref().clone();
-        RecordBatch::try_new(table_schema, columns)
-            .expect("schema mismatch in otel gauge output")
+        RecordBatch::try_new(table_schema, columns).expect("schema mismatch in otel gauge output")
     }
 }
 
@@ -736,8 +723,7 @@ impl OtelHistogramProcessor {
 
         // Histogram data columns
         let total_buckets: usize = entries.iter().map(|(_, h)| h.bucket_counts.len()).sum();
-        let mut boundaries_builder =
-            ListBuilder::new(Float64Builder::with_capacity(total_buckets));
+        let mut boundaries_builder = ListBuilder::new(Float64Builder::with_capacity(total_buckets));
         let mut bucket_counts_builder =
             ListBuilder::new(UInt64Builder::with_capacity(total_buckets));
         let mut sum_builder = Float64Builder::with_capacity(n);
@@ -961,13 +947,17 @@ impl OtelExpHistogramAggregator {
         let mut zero_count_builder = UInt64Builder::with_capacity(n);
         let mut zero_threshold_builder = Float64Builder::with_capacity(n);
         let mut pos_offset_builder = Int32Builder::with_capacity(n);
-        let total_pos_buckets: usize =
-            entries.iter().map(|(_, e)| e.positive_bucket_counts.len()).sum();
+        let total_pos_buckets: usize = entries
+            .iter()
+            .map(|(_, e)| e.positive_bucket_counts.len())
+            .sum();
         let mut pos_counts_builder =
             ListBuilder::new(UInt64Builder::with_capacity(total_pos_buckets));
         let mut neg_offset_builder = Int32Builder::with_capacity(n);
-        let total_neg_buckets: usize =
-            entries.iter().map(|(_, e)| e.negative_bucket_counts.len()).sum();
+        let total_neg_buckets: usize = entries
+            .iter()
+            .map(|(_, e)| e.negative_bucket_counts.len())
+            .sum();
         let mut neg_counts_builder =
             ListBuilder::new(UInt64Builder::with_capacity(total_neg_buckets));
         let mut sum_builder = Float64Builder::with_capacity(n);

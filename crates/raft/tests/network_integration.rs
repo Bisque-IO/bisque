@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use bisque_raft::BisqueRaftTypeConfig;
 use bisque_raft::multi::NodeAddressResolver;
 use bisque_raft::multi::codec::{self, Decode, Encode};
 use bisque_raft::multi::network::GroupNetworkFactory;
@@ -20,7 +21,6 @@ use bisque_raft::multi::{
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiRaftNetworkFactory,
     MultiplexedLogStorage,
 };
-use bisque_raft::BisqueRaftTypeConfig;
 use bytes::{Buf, BytesMut};
 use futures::FutureExt;
 use openraft::async_runtime::watch::WatchReceiver;
@@ -214,8 +214,7 @@ fn spawn_pipelined_rpc_server(
                 let (mut reader, mut writer) = stream.into_split();
                 // Bounded channel decouples reader from writer so reads
                 // aren't stalled by TCP write backpressure.
-                let (tx, mut rx) =
-                    tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
 
                 // Writer task: drain the channel and flush batched writes
                 let writer_handle = tokio::spawn(async move {
@@ -234,9 +233,9 @@ fn spawn_pipelined_rpc_server(
                         if buf.len() < FRAME_PREFIX_LEN {
                             break;
                         }
-                        let payload_len = u32::from_le_bytes(
-                            buf[..FRAME_PREFIX_LEN].try_into().unwrap(),
-                        ) as usize;
+                        let payload_len =
+                            u32::from_le_bytes(buf[..FRAME_PREFIX_LEN].try_into().unwrap())
+                                as usize;
                         if buf.len() < FRAME_PREFIX_LEN + payload_len {
                             break; // incomplete frame
                         }
@@ -279,34 +278,28 @@ fn spawn_pipelined_rpc_server(
 }
 
 /// Build a success response for any incoming RPC message.
-fn build_rpc_response(
-    msg: codec::RpcMessage<TestConfig>,
-) -> codec::RpcMessage<TestConfig> {
+fn build_rpc_response(msg: codec::RpcMessage<TestConfig>) -> codec::RpcMessage<TestConfig> {
     match msg {
-        codec::RpcMessage::AppendEntries { request_id, .. } => {
-            codec::RpcMessage::Response {
-                request_id,
-                message: codec::ResponseMessage::AppendEntries(
-                    openraft::raft::AppendEntriesResponse::Success,
-                ),
-            }
-        }
-        codec::RpcMessage::Vote { request_id, .. } => {
-            codec::RpcMessage::Response {
-                request_id,
-                message: codec::ResponseMessage::Vote(openraft::raft::VoteResponse {
-                    vote: openraft::impls::Vote {
-                        leader_id: openraft::impls::leader_id_adv::LeaderId {
-                            term: 1,
-                            node_id: 1,
-                        },
-                        committed: false,
+        codec::RpcMessage::AppendEntries { request_id, .. } => codec::RpcMessage::Response {
+            request_id,
+            message: codec::ResponseMessage::AppendEntries(
+                openraft::raft::AppendEntriesResponse::Success,
+            ),
+        },
+        codec::RpcMessage::Vote { request_id, .. } => codec::RpcMessage::Response {
+            request_id,
+            message: codec::ResponseMessage::Vote(openraft::raft::VoteResponse {
+                vote: openraft::impls::Vote {
+                    leader_id: openraft::impls::leader_id_adv::LeaderId {
+                        term: 1,
+                        node_id: 1,
                     },
-                    vote_granted: true,
-                    last_log_id: None,
-                }),
-            }
-        }
+                    committed: false,
+                },
+                vote_granted: true,
+                last_log_id: None,
+            }),
+        },
         other => codec::RpcMessage::Error {
             request_id: other.request_id(),
             error: "unsupported".to_string(),
@@ -345,10 +338,7 @@ struct TestCluster {
 }
 
 impl TestCluster {
-    async fn new(
-        num_nodes: usize,
-        transport_cfg: BisqueTcpTransportConfig,
-    ) -> Self {
+    async fn new(num_nodes: usize, transport_cfg: BisqueTcpTransportConfig) -> Self {
         let node_registry = Arc::new(DefaultNodeRegistry::<u64>::new());
         let mut nodes = Vec::with_capacity(num_nodes);
 
@@ -366,14 +356,11 @@ impl TestCluster {
             .await
             .expect("storage");
 
-            let transport = BisqueTcpTransport::<TestConfig>::new(
-                transport_cfg.clone(),
-                node_registry.clone(),
-            );
+            let transport =
+                BisqueTcpTransport::<TestConfig>::new(transport_cfg.clone(), node_registry.clone());
 
             let manager = Arc::new(MultiRaftManager::<TestConfig, _, _>::new(
-                transport,
-                storage,
+                transport, storage,
             ));
 
             let server = Arc::new(BisqueRpcServer::new(
@@ -662,8 +649,7 @@ fn test_tcp_framing_throughput() {
                     if buf.len() < 4 {
                         break;
                     }
-                    let len =
-                        u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+                    let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
                     if buf.len() < 4 + len {
                         break;
                     }
@@ -725,8 +711,7 @@ fn test_tcp_framing_throughput() {
                     if buf.len() < 4 {
                         break;
                     }
-                    let len =
-                        u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+                    let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
                     if buf.len() < 4 + len {
                         break;
                     }
@@ -844,13 +829,18 @@ fn test_multiplexed_transport_concurrent_requests() {
 
         println!(
             "[multiplexed_transport_concurrent] {} ok, {} errors out of {} in {:?} ({:.0} req/s)",
-            done, errs, total_requests, elapsed,
+            done,
+            errs,
+            total_requests,
+            elapsed,
             done as f64 / elapsed.as_secs_f64(),
         );
         assert!(
             done >= total_requests * 95 / 100,
             "too many failures: {} ok, {} errors out of {}",
-            done, errs, total_requests,
+            done,
+            errs,
+            total_requests,
         );
     });
 }
@@ -912,13 +902,16 @@ fn test_vote_rpc_stress() {
 
         println!(
             "[vote_rpc_stress] {} ok out of {} in {:?} ({:.0} req/s)",
-            done, total_votes, elapsed,
+            done,
+            total_votes,
+            elapsed,
             done as f64 / elapsed.as_secs_f64(),
         );
         assert!(
             done >= total_votes * 95 / 100,
             "too many failures: {} out of {}",
-            total_votes - done, total_votes,
+            total_votes - done,
+            total_votes,
         );
     });
 }
@@ -982,13 +975,16 @@ fn test_transport_concurrent_stress() {
 
         println!(
             "[transport_concurrent_stress] {} ok out of {} in {:?} ({:.0} req/s)",
-            done, total_requests, elapsed,
+            done,
+            total_requests,
+            elapsed,
             done as f64 / elapsed.as_secs_f64(),
         );
         assert!(
             done >= total_requests * 95 / 100,
             "too many failures: {} out of {}",
-            total_requests - done, total_requests,
+            total_requests - done,
+            total_requests,
         );
     });
 }
@@ -1052,7 +1048,10 @@ fn test_cluster_write_throughput() {
             "[cluster_write_throughput] {} writes ({} B each) in {:?}",
             num_writes, payload_size, elapsed,
         );
-        println!("  throughput: {:.0} writes/s", num_writes as f64 / elapsed.as_secs_f64());
+        println!(
+            "  throughput: {:.0} writes/s",
+            num_writes as f64 / elapsed.as_secs_f64()
+        );
         println!("  latency: {}", summary);
 
         // Verify replication
@@ -1384,7 +1383,10 @@ fn test_e2e_rpc_latency() {
         }
 
         let summary = latencies.compute();
-        println!("[e2e_rpc_latency] {} writes, latency: {}", num_writes, summary);
+        println!(
+            "[e2e_rpc_latency] {} writes, latency: {}",
+            num_writes, summary
+        );
 
         cluster.shutdown();
     });
@@ -1605,13 +1607,18 @@ fn test_group_pinned_concurrent_throughput() {
 
         println!(
             "[group_pinned_concurrent] {} ok, {} errors out of {} in {:?} ({:.0} req/s)",
-            done, errs, total_requests, elapsed,
+            done,
+            errs,
+            total_requests,
+            elapsed,
             done as f64 / elapsed.as_secs_f64(),
         );
         assert!(
             done >= total_requests * 95 / 100,
             "too many failures: {} ok, {} errors out of {}",
-            done, errs, total_requests,
+            done,
+            errs,
+            total_requests,
         );
     });
 }
@@ -1661,7 +1668,10 @@ fn test_group_pinned_multi_group_isolation() {
         }
 
         let results = futures::future::join_all(handles).await;
-        let ok_count = results.iter().filter(|r| r.as_ref().unwrap().is_ok()).count();
+        let ok_count = results
+            .iter()
+            .filter(|r| r.as_ref().unwrap().is_ok())
+            .count();
         let total = (num_groups * requests_per_group) as usize;
 
         println!(
@@ -1670,7 +1680,9 @@ fn test_group_pinned_multi_group_isolation() {
         );
         assert!(
             ok_count >= total * 95 / 100,
-            "too many failures: {}/{}", ok_count, total,
+            "too many failures: {}/{}",
+            ok_count,
+            total,
         );
     });
 }
@@ -1744,7 +1756,9 @@ fn test_group_pinned_connection_refresh() {
         assert!(
             done >= total * 90 / 100,
             "too many failures during refresh: {} ok, {} errors out of {}",
-            done, errs, total,
+            done,
+            errs,
+            total,
         );
     });
 }
@@ -1817,12 +1831,23 @@ fn test_group_pinned_error_recovery() {
                     },
                 )
                 .await;
-            assert!(resp.is_ok(), "post-recovery request failed: {:?}", resp.err());
+            assert!(
+                resp.is_ok(),
+                "post-recovery request failed: {:?}",
+                resp.err()
+            );
         }
 
         let count = request_count.load(Ordering::Relaxed);
-        println!("[group_pinned_error_recovery] {} requests after recovery", count);
-        assert!(count >= 101, "expected at least 101 requests, got {}", count);
+        println!(
+            "[group_pinned_error_recovery] {} requests after recovery",
+            count
+        );
+        assert!(
+            count >= 101,
+            "expected at least 101 requests, got {}",
+            count
+        );
     });
 }
 

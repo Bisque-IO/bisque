@@ -3,13 +3,13 @@
 //! This example stress tests the tokio TCP transport and RPC layer
 //! without any Raft logic, to isolate networking performance issues.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
 // Simple framed protocol: 4-byte length prefix + payload
 async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> std::io::Result<()> {
@@ -201,8 +201,7 @@ async fn run_client(
     let reader_shutdown = shutdown.clone();
     tokio::spawn(async move {
         while reader_shutdown.load(Ordering::Relaxed) == 0 {
-            match tokio::time::timeout(Duration::from_millis(500), read_frame(&mut read_half))
-                .await
+            match tokio::time::timeout(Duration::from_millis(500), read_frame(&mut read_half)).await
             {
                 Ok(Ok(data)) => {
                     reader_stats

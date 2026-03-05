@@ -16,9 +16,9 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
+use super::OtlpReceiver;
 use super::convert::{any_value_to_string_typed, key_values_to_json, pad_or_truncate};
 use super::schema;
-use super::OtlpReceiver;
 
 #[tonic::async_trait]
 impl LogsService for OtlpReceiver {
@@ -100,7 +100,9 @@ impl LogsService for OtlpReceiver {
                     observed_timestamp.append_value(lr.observed_time_unix_nano as i64);
 
                     let tid = pad_or_truncate(&lr.trace_id, 16);
-                    trace_id.append_value(&tid).expect("trace_id must be 16 bytes");
+                    trace_id
+                        .append_value(&tid)
+                        .expect("trace_id must be 16 bytes");
 
                     let sid = pad_or_truncate(&lr.span_id, 8);
                     span_id.append_value(&sid).expect("span_id must be 8 bytes");
@@ -150,8 +152,7 @@ impl LogsService for OtlpReceiver {
             Arc::new(event_name.finish()),
         ];
 
-        let batch =
-            RecordBatch::try_new(schema, columns).expect("schema mismatch in log batch");
+        let batch = RecordBatch::try_new(schema, columns).expect("schema mismatch in log batch");
 
         debug!(logs = total_logs, "otlp logs export");
 

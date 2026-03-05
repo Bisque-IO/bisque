@@ -27,9 +27,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
+use crate::LanceTypeConfig;
 use crate::catalog_events::CatalogEvent;
 use crate::types::PersistedTableEntry;
-use crate::LanceTypeConfig;
 
 const META_TABLE: &str = "lance_meta";
 const TABLES_TABLE: &str = "lance_tables";
@@ -315,11 +315,9 @@ impl GroupMdbxEnv {
         let table = unsafe { self.meta_table_ro(&txn) };
         match txn.get::<std::borrow::Cow<[u8]>>(&table, META_KEY) {
             Ok(Some(bytes)) => {
-                let (meta, _): (GroupMeta, _) = bincode::serde::decode_from_slice(
-                    &bytes,
-                    bincode::config::standard(),
-                )
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                let (meta, _): (GroupMeta, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 Ok(Some(meta))
             }
             Ok(None) => Ok(None),
@@ -365,11 +363,9 @@ impl GroupMdbxEnv {
         let table = unsafe { self.tables_table_ro(&txn) };
         match txn.get::<std::borrow::Cow<[u8]>>(&table, table_name.as_bytes()) {
             Ok(Some(bytes)) => {
-                let (entry, _): (PersistedTableEntry, _) = bincode::serde::decode_from_slice(
-                    &bytes,
-                    bincode::config::standard(),
-                )
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                let (entry, _): (PersistedTableEntry, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 Ok(Some(entry))
             }
             Ok(None) => Ok(None),
@@ -455,9 +451,8 @@ impl GroupMdbxEnv {
         let table = unsafe { self.wal_table_rw(txn) };
         for event in events {
             let key = event.seq.to_be_bytes();
-            let value =
-                bincode::serde::encode_to_vec(event, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let value = bincode::serde::encode_to_vec(event, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             txn.put(&table, &key[..], &value, WriteFlags::empty())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         }
@@ -614,9 +609,8 @@ impl GroupMdbxEnv {
 
         if let Some(meta) = meta {
             let meta_tbl = unsafe { self.meta_table_rw(&txn) };
-            let value =
-                bincode::serde::encode_to_vec(meta, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let value = bincode::serde::encode_to_vec(meta, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             txn.put(&meta_tbl, META_KEY, &value, WriteFlags::empty())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         }
@@ -629,25 +623,16 @@ impl GroupMdbxEnv {
                     Some(entry) => {
                         let value =
                             bincode::serde::encode_to_vec(entry, bincode::config::standard())
-                                .map_err(|e| {
-                                    io::Error::new(io::ErrorKind::Other, e.to_string())
-                                })?;
+                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                         txn.put(&tables_tbl, key, &value, WriteFlags::empty())
-                            .map_err(|e| {
-                                io::Error::new(io::ErrorKind::Other, e.to_string())
-                            })?;
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                     }
-                    None => {
-                        match txn.del(&tables_tbl, key, None) {
-                            Ok(_) | Err(libmdbx::Error::NotFound) => {}
-                            Err(e) => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    e.to_string(),
-                                ));
-                            }
+                    None => match txn.del(&tables_tbl, key, None) {
+                        Ok(_) | Err(libmdbx::Error::NotFound) => {}
+                        Err(e) => {
+                            return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
                         }
-                    }
+                    },
                 }
             }
         }
@@ -670,9 +655,8 @@ impl GroupMdbxEnv {
 
         // Write meta
         let meta_tbl = unsafe { self.meta_table_rw(&txn) };
-        let meta_value =
-            bincode::serde::encode_to_vec(meta, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let meta_value = bincode::serde::encode_to_vec(meta, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         txn.put(&meta_tbl, META_KEY, &meta_value, WriteFlags::empty())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -683,11 +667,15 @@ impl GroupMdbxEnv {
 
         // Write new entries
         for (table_name, entry) in entries {
-            let value =
-                bincode::serde::encode_to_vec(entry, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            txn.put(&tables_tbl, table_name.as_bytes(), &value, WriteFlags::empty())
+            let value = bincode::serde::encode_to_vec(entry, bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            txn.put(
+                &tables_tbl,
+                table_name.as_bytes(),
+                &value,
+                WriteFlags::empty(),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         }
 
         txn.commit()
@@ -830,11 +818,7 @@ impl LanceManifestManager {
     }
 
     /// Read WAL events with sequence number > `since_seq`.
-    pub fn read_wal_since(
-        &self,
-        group_id: u64,
-        since_seq: u64,
-    ) -> io::Result<Vec<CatalogEvent>> {
+    pub fn read_wal_since(&self, group_id: u64, since_seq: u64) -> io::Result<Vec<CatalogEvent>> {
         let env = self.get_env(group_id)?;
         env.read_wal_since(since_seq)
     }
@@ -1009,7 +993,10 @@ impl LanceManifestManager {
         }
     }
 
-    fn commit_batch(envs: &Arc<RwLock<HashMap<u64, Arc<GroupMdbxEnv>>>>, pending: &mut Vec<ManifestCommand>) {
+    fn commit_batch(
+        envs: &Arc<RwLock<HashMap<u64, Arc<GroupMdbxEnv>>>>,
+        pending: &mut Vec<ManifestCommand>,
+    ) {
         // Coalesce per group: latest meta wins, latest table entry wins per key.
         // WAL events are accumulated in order (not coalesced).
         struct GroupBatch {
@@ -1075,10 +1062,7 @@ impl LanceManifestManager {
                         done_senders.push(d);
                     }
                 }
-                ManifestCommand::AppendWalEvents {
-                    group_id,
-                    events,
-                } => {
+                ManifestCommand::AppendWalEvents { group_id, events } => {
                     let batch = per_group.entry(group_id).or_insert_with(|| GroupBatch {
                         meta: None,
                         table_updates: HashMap::new(),
@@ -1096,10 +1080,7 @@ impl LanceManifestManager {
             let env = match envs_guard.get(group_id) {
                 Some(e) => e,
                 None => {
-                    warn!(
-                        group_id,
-                        "Manifest command for unopened group, skipping"
-                    );
+                    warn!(group_id, "Manifest command for unopened group, skipping");
                     continue;
                 }
             };
@@ -1210,10 +1191,7 @@ mod tests {
 
     #[test]
     fn test_group_meta_none_roundtrip() {
-        let meta = GroupMeta::from_raft(
-            &None,
-            &StoredMembership::<LanceTypeConfig>::default(),
-        );
+        let meta = GroupMeta::from_raft(&None, &StoredMembership::<LanceTypeConfig>::default());
         let (last_applied, _) = meta.to_raft().unwrap();
         assert!(last_applied.is_none());
     }

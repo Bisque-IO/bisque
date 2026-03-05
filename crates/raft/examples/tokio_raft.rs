@@ -155,11 +155,18 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         Ok(())
     }
 
-    async fn truncate_after(&mut self, after: Option<LogId<TypeConfig>>) -> Result<(), std::io::Error> {
+    async fn truncate_after(
+        &mut self,
+        after: Option<LogId<TypeConfig>>,
+    ) -> Result<(), std::io::Error> {
         let mut log = self.log.write().await;
         match after {
-            Some(log_id) => { log.split_off(&(log_id.index + 1)); }
-            None => { log.clear(); }
+            Some(log_id) => {
+                log.split_off(&(log_id.index + 1));
+            }
+            None => {
+                log.clear();
+            }
         }
         Ok(())
     }

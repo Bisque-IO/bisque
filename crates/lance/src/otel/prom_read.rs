@@ -198,8 +198,7 @@ async fn process_prom_query(
     let mut all_timeseries: Vec<TimeSeries> = Vec::new();
 
     for table in &tables {
-        let batches =
-            query_metric_table(ctx, table, start_nanos, end_nanos, name_matcher).await?;
+        let batches = query_metric_table(ctx, table, start_nanos, end_nanos, name_matcher).await?;
         let series = batches_to_timeseries(&batches, &query.matchers)?;
         all_timeseries.extend(series);
     }
@@ -231,10 +230,10 @@ async fn query_metric_table(
                     Some(start_nanos),
                     None,
                 )))
-                .and(col("timestamp").lt_eq(lit(ScalarValue::TimestampNanosecond(
-                    Some(end_nanos),
-                    None,
-                )))),
+                .and(
+                    col("timestamp")
+                        .lt_eq(lit(ScalarValue::TimestampNanosecond(Some(end_nanos), None))),
+                ),
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
 
@@ -244,16 +243,12 @@ async fn query_metric_table(
             Ok(MatcherType::Eq) => {
                 df = df
                     .filter(col("metric_name").eq(lit(&matcher.value)))
-                    .map_err(|e| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}"))
-                    })?;
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
             }
             Ok(MatcherType::Neq) => {
                 df = df
                     .filter(col("metric_name").not_eq(lit(&matcher.value)))
-                    .map_err(|e| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}"))
-                    })?;
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
             }
             // RE/NRE: skip SQL-level filter, apply in Rust
             _ => {}
@@ -307,51 +302,44 @@ fn batches_to_timeseries(
             // Build a group key from the metric identity
             let group_key = format!("{metric_name}\x00{attrs_json}\x00{res_attrs_json}");
 
-            let entry =
-                series_map
-                    .entry(group_key)
-                    .or_insert_with(|| {
-                        let mut labels = Vec::new();
+            let entry = series_map.entry(group_key).or_insert_with(|| {
+                let mut labels = Vec::new();
+                labels.push(PromLabel {
+                    name: "__name__".to_string(),
+                    value: metric_name.to_string(),
+                });
+
+                // Parse span attributes as labels
+                if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(attrs_json) {
+                    for (k, v) in &map {
                         labels.push(PromLabel {
-                            name: "__name__".to_string(),
-                            value: metric_name.to_string(),
+                            name: k.clone(),
+                            value: json_value_to_label_value(v),
                         });
+                    }
+                }
 
-                        // Parse span attributes as labels
-                        if let Ok(serde_json::Value::Object(map)) =
-                            serde_json::from_str(attrs_json)
-                        {
-                            for (k, v) in &map {
-                                labels.push(PromLabel {
-                                    name: k.clone(),
-                                    value: json_value_to_label_value(v),
-                                });
-                            }
-                        }
+                // Extract service.name → job from resource attributes
+                if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(res_attrs_json) {
+                    if let Some(sn) = map.get("service.name") {
+                        labels.push(PromLabel {
+                            name: "job".to_string(),
+                            value: json_value_to_label_value(sn),
+                        });
+                    }
+                    if let Some(si) = map.get("service.instance.id") {
+                        labels.push(PromLabel {
+                            name: "instance".to_string(),
+                            value: json_value_to_label_value(si),
+                        });
+                    }
+                }
 
-                        // Extract service.name → job from resource attributes
-                        if let Ok(serde_json::Value::Object(map)) =
-                            serde_json::from_str(res_attrs_json)
-                        {
-                            if let Some(sn) = map.get("service.name") {
-                                labels.push(PromLabel {
-                                    name: "job".to_string(),
-                                    value: json_value_to_label_value(sn),
-                                });
-                            }
-                            if let Some(si) = map.get("service.instance.id") {
-                                labels.push(PromLabel {
-                                    name: "instance".to_string(),
-                                    value: json_value_to_label_value(si),
-                                });
-                            }
-                        }
+                // Sort labels by name for consistency
+                labels.sort_by(|a, b| a.name.cmp(&b.name));
 
-                        // Sort labels by name for consistency
-                        labels.sort_by(|a, b| a.name.cmp(&b.name));
-
-                        (labels, Vec::new())
-                    });
+                (labels, Vec::new())
+            });
 
             // Coalesce value
             let value = if !batch.column(5).is_null(i) {

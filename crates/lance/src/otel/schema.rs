@@ -60,8 +60,7 @@ static SPAN_EVENT_SCHEMA: LazyLock<Arc<Schema>> =
 static SPAN_LINK_SCHEMA: LazyLock<Arc<Schema>> =
     LazyLock::new(|| Arc::new(build_span_link_schema()));
 static LOG_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| Arc::new(build_log_schema()));
-static EXEMPLAR_SCHEMA: LazyLock<Arc<Schema>> =
-    LazyLock::new(|| Arc::new(build_exemplar_schema()));
+static EXEMPLAR_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| Arc::new(build_exemplar_schema()));
 
 // ---------------------------------------------------------------------------
 // Public schema accessors
@@ -207,11 +206,7 @@ fn counter_passthrough_tail_fields() -> Vec<Field> {
         Field::new("aggregation_temporality", DataType::Int32, false),
         Field::new("is_monotonic", DataType::Boolean, false),
         Field::new("flags", DataType::UInt32, false),
-        Field::new(
-            "resource_dropped_attributes_count",
-            DataType::UInt32,
-            false,
-        ),
+        Field::new("resource_dropped_attributes_count", DataType::UInt32, false),
         Field::new("scope_dropped_attributes_count", DataType::UInt32, false),
     ]
 }
@@ -222,21 +217,13 @@ fn counter_passthrough_tail_fields() -> Vec<Field> {
 fn gauge_passthrough_tail_fields() -> Vec<Field> {
     vec![
         Field::new("flags", DataType::UInt32, false),
-        Field::new(
-            "resource_dropped_attributes_count",
-            DataType::UInt32,
-            false,
-        ),
+        Field::new("resource_dropped_attributes_count", DataType::UInt32, false),
         Field::new("scope_dropped_attributes_count", DataType::UInt32, false),
     ]
 }
 
 fn ts_field(name: &str) -> Field {
-    Field::new(
-        name,
-        DataType::Timestamp(TimeUnit::Nanosecond, None),
-        false,
-    )
+    Field::new(name, DataType::Timestamp(TimeUnit::Nanosecond, None), false)
 }
 
 /// Two nullable columns for OTLP NumberDataPoint value (oneof as_int / as_double).
@@ -331,11 +318,7 @@ fn build_summary_schema() -> Schema {
         Field::new("metadata", DataType::Utf8, false),
         Field::new("attributes", DataType::Utf8, false),
         Field::new("resource_attributes", DataType::Utf8, false),
-        Field::new(
-            "resource_dropped_attributes_count",
-            DataType::UInt32,
-            false,
-        ),
+        Field::new("resource_dropped_attributes_count", DataType::UInt32, false),
         Field::new("resource_schema_url", DataType::Utf8, false),
         Field::new("scope_name", DataType::Utf8, false),
         Field::new("scope_version", DataType::Utf8, false),
@@ -365,11 +348,7 @@ fn build_span_schema() -> Schema {
         Field::new("status_code", DataType::Int32, false),
         Field::new("status_message", DataType::Utf8, false),
         Field::new("resource_attributes", DataType::Utf8, false),
-        Field::new(
-            "resource_dropped_attributes_count",
-            DataType::UInt32,
-            false,
-        ),
+        Field::new("resource_dropped_attributes_count", DataType::UInt32, false),
         Field::new("resource_schema_url", DataType::Utf8, false),
         Field::new("scope_name", DataType::Utf8, false),
         Field::new("scope_version", DataType::Utf8, false),
@@ -420,11 +399,7 @@ fn build_log_schema() -> Schema {
         Field::new("body_type", DataType::Utf8, false),
         Field::new("attributes", DataType::Utf8, false),
         Field::new("resource_attributes", DataType::Utf8, false),
-        Field::new(
-            "resource_dropped_attributes_count",
-            DataType::UInt32,
-            false,
-        ),
+        Field::new("resource_dropped_attributes_count", DataType::UInt32, false),
         Field::new("resource_schema_url", DataType::Utf8, false),
         Field::new("scope_name", DataType::Utf8, false),
         Field::new("scope_version", DataType::Utf8, false),

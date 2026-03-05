@@ -17,15 +17,18 @@ use std::time::Duration;
 
 use maniac::BufResult;
 use maniac::driver::{IoPool, IoPoolBuilder};
+use maniac::net::TcpListener;
 use maniac::net::TcpStream;
 use maniac::net::tls::{ClientConfig, TlsAcceptor, TlsConnector, TlsStream};
-use maniac::net::TcpListener;
 use maniac::scheduler::ContractGroup;
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 
 /// Generate a self-signed certificate for "localhost" using rcgen.
-fn generate_test_certs() -> (Vec<CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>) {
+fn generate_test_certs() -> (
+    Vec<CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+) {
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
@@ -34,7 +37,9 @@ fn generate_test_certs() -> (Vec<CertificateDer<'static>>, rustls::pki_types::Pr
 
     (
         vec![cert_der],
-        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)),
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            key_der,
+        )),
     )
 }
 
@@ -124,7 +129,10 @@ async fn run_server(
                             // Perform TLS handshake
                             match acceptor.accept(tcp_stream).await {
                                 Ok(tls_stream) => {
-                                    println!("[Server] TLS handshake complete with client {}", client_id);
+                                    println!(
+                                        "[Server] TLS handshake complete with client {}",
+                                        client_id
+                                    );
                                     if let Err(e) =
                                         handle_client(tls_stream, client_id, clients_done).await
                                     {
@@ -169,7 +177,11 @@ async fn run_client(
     let mut tls_stream = connector.connect("localhost", tcp_stream).await?;
     println!("[Client {}] TLS handshake complete!", client_name);
 
-    let messages = ["Hello, TLS server!", "Encrypted echo test", "Secure channel!"];
+    let messages = [
+        "Hello, TLS server!",
+        "Encrypted echo test",
+        "Secure channel!",
+    ];
 
     for msg in messages {
         let BufResult(result, _) = tls_stream.send(msg.as_bytes().to_vec()).await;
@@ -219,7 +231,9 @@ fn main() -> io::Result<()> {
 
     // Build client TLS config that trusts our self-signed cert.
     let mut root_store = RootCertStore::empty();
-    root_store.add(certs[0].clone()).expect("failed to add root cert");
+    root_store
+        .add(certs[0].clone())
+        .expect("failed to add root cert");
     let client_config = Arc::new(
         ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -228,10 +242,7 @@ fn main() -> io::Result<()> {
     let connector = TlsConnector::new(client_config);
 
     let pool = Arc::new(IoPoolBuilder::new().force_poll(false).build()?);
-    println!(
-        "IO Pool created with {} threads",
-        pool.num_threads()
-    );
+    println!("IO Pool created with {} threads", pool.num_threads());
 
     let group = Arc::new(ContractGroup::new_blocking());
     let stop = Arc::new(AtomicBool::new(false));

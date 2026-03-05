@@ -27,7 +27,9 @@ use arrow_array::{Int32Array, RecordBatch, StringArray, TimestampMillisecondArra
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use datafusion::execution::context::SessionContext;
 
-use bisque_lance::{BisqueLance, BisqueLanceConfig, BisqueLanceTableProvider, IndexSpec, SealReason};
+use bisque_lance::{
+    BisqueLance, BisqueLanceConfig, BisqueLanceTableProvider, IndexSpec, SealReason,
+};
 use lance_index::scalar::FullTextSearchQuery;
 
 // =============================================================================
@@ -53,7 +55,12 @@ fn log_schema() -> Arc<Schema> {
 fn generate_log_batch(schema: &Arc<Schema>, batch_id: i64, num_rows: usize) -> RecordBatch {
     let base_ts = 1_700_000_000_000i64 + batch_id * 60_000;
     let levels = ["INFO", "WARN", "ERROR", "DEBUG"];
-    let services = ["api-gateway", "auth-service", "user-service", "payment-service"];
+    let services = [
+        "api-gateway",
+        "auth-service",
+        "user-service",
+        "payment-service",
+    ];
     let messages = [
         "Request processed successfully",
         "Connection pool exhausted, retrying",
@@ -65,9 +72,7 @@ fn generate_log_batch(schema: &Arc<Schema>, batch_id: i64, num_rows: usize) -> R
         "TLS handshake completed",
     ];
 
-    let timestamps: Vec<i64> = (0..num_rows)
-        .map(|i| base_ts + (i as i64) * 100)
-        .collect();
+    let timestamps: Vec<i64> = (0..num_rows).map(|i| base_ts + (i as i64) * 100).collect();
 
     let level_values: Vec<&str> = (0..num_rows).map(|i| levels[i % levels.len()]).collect();
 
@@ -142,7 +147,10 @@ async fn main() -> anyhow::Result<()> {
 
     println!("  Engine opened at: {}", data_dir.display());
     println!("  Deep storage at:  {}", deep_storage_dir.display());
-    println!("  Table 'logs' active segment: {}", logs.catalog().active_segment);
+    println!(
+        "  Table 'logs' active segment: {}",
+        logs.catalog().active_segment
+    );
     println!();
 
     // =========================================================================
@@ -172,7 +180,8 @@ async fn main() -> anyhow::Result<()> {
     let sealed_id = logs.catalog().active_segment;
     let new_active_id = logs.next_segment_id();
 
-    logs.apply_seal(sealed_id, new_active_id, SealReason::MaxAge).await?;
+    logs.apply_seal(sealed_id, new_active_id, SealReason::MaxAge)
+        .await?;
 
     println!("  Sealed segment {} (now read-only)", sealed_id);
     println!("  New active segment: {}", new_active_id);
@@ -295,14 +304,18 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Count by log level
-    println!("\n  >> SELECT level, COUNT(*) as count FROM logs GROUP BY level ORDER BY count DESC\n");
+    println!(
+        "\n  >> SELECT level, COUNT(*) as count FROM logs GROUP BY level ORDER BY count DESC\n"
+    );
     ctx.sql("SELECT level, COUNT(*) as count FROM logs GROUP BY level ORDER BY count DESC")
         .await?
         .show()
         .await?;
 
     // Errors only
-    println!("\n  >> SELECT service, message, status_code FROM logs WHERE level = 'ERROR' LIMIT 5\n");
+    println!(
+        "\n  >> SELECT service, message, status_code FROM logs WHERE level = 'ERROR' LIMIT 5\n"
+    );
     ctx.sql("SELECT service, message, status_code FROM logs WHERE level = 'ERROR' LIMIT 5")
         .await?
         .show()
@@ -314,22 +327,20 @@ async fn main() -> anyhow::Result<()> {
     println!("\n--- Step 6: Flush Sealed → Deep Storage (Cold) ---\n");
 
     let flush_handle = logs.begin_flush()?;
-    println!(
-        "  Flush handle: segment_id={}",
-        flush_handle.segment_id
-    );
+    println!("  Flush handle: segment_id={}", flush_handle.segment_id);
 
     logs.apply_begin_flush(flush_handle.segment_id);
 
     let s3_version = logs.execute_flush(&flush_handle).await?;
+    println!("  Deep storage write complete: version={}", s3_version);
+
+    logs.apply_promote(flush_handle.segment_id, s3_version)
+        .await?;
+
     println!(
-        "  Deep storage write complete: version={}",
-        s3_version
+        "  Promoted segment {} to deep storage",
+        flush_handle.segment_id
     );
-
-    logs.apply_promote(flush_handle.segment_id, s3_version).await?;
-
-    println!("  Promoted segment {} to deep storage", flush_handle.segment_id);
     println!(
         "  Catalog: active={}, sealed={:?}, deep_storage_version={}",
         logs.catalog().active_segment,
@@ -380,7 +391,9 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Per-service breakdown across both tiers
-    println!("\n  >> SELECT service, COUNT(*) as count, MIN(status_code) as min_status, MAX(status_code) as max_status FROM logs GROUP BY service ORDER BY count DESC\n");
+    println!(
+        "\n  >> SELECT service, COUNT(*) as count, MIN(status_code) as min_status, MAX(status_code) as max_status FROM logs GROUP BY service ORDER BY count DESC\n"
+    );
     ctx.sql(
         "SELECT service, COUNT(*) as count, \
          MIN(status_code) as min_status, MAX(status_code) as max_status \
@@ -391,7 +404,9 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     // Time range query spanning both tiers
-    println!("\n  >> SELECT level, COUNT(*) as count FROM logs WHERE status_code >= 400 GROUP BY level ORDER BY count DESC\n");
+    println!(
+        "\n  >> SELECT level, COUNT(*) as count FROM logs WHERE status_code >= 400 GROUP BY level ORDER BY count DESC\n"
+    );
     ctx.sql(
         "SELECT level, COUNT(*) as count FROM logs \
          WHERE status_code >= 400 GROUP BY level ORDER BY count DESC",
@@ -406,13 +421,19 @@ async fn main() -> anyhow::Result<()> {
     println!("\n--- Step 9: Multi-Table — Create 'metrics' Table ---\n");
 
     let metrics_schema = Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new("host", DataType::Utf8, false),
         Field::new("cpu_percent", DataType::Float64, false),
         Field::new("mem_mb", DataType::Int32, false),
     ]));
 
-    let metrics_config = engine.config().build_table_config("metrics", metrics_schema.clone());
+    let metrics_config = engine
+        .config()
+        .build_table_config("metrics", metrics_schema.clone());
     let metrics = engine.create_table(metrics_config, None).await?;
 
     println!("  Created 'metrics' table");
@@ -443,7 +464,10 @@ async fn main() -> anyhow::Result<()> {
     println!("  Metrics table: {} rows", metrics_rows);
 
     // Query the metrics table
-    let metrics_provider = Arc::new(BisqueLanceTableProvider::new(metrics.clone(), metrics_schema));
+    let metrics_provider = Arc::new(BisqueLanceTableProvider::new(
+        metrics.clone(),
+        metrics_schema,
+    ));
     let ctx = SessionContext::new();
     ctx.register_table("metrics", metrics_provider)?;
 
@@ -456,11 +480,17 @@ async fn main() -> anyhow::Result<()> {
     // Show schema history
     println!("\n  Schema history for 'logs':");
     for sv in logs.schema_history() {
-        println!("    version={}, created_at={}", sv.version, sv.created_at_millis);
+        println!(
+            "    version={}, created_at={}",
+            sv.version, sv.created_at_millis
+        );
     }
     println!("  Schema history for 'metrics':");
     for sv in metrics.schema_history() {
-        println!("    version={}, created_at={}", sv.version, sv.created_at_millis);
+        println!(
+            "    version={}, created_at={}",
+            sv.version, sv.created_at_millis
+        );
     }
 
     // =========================================================================

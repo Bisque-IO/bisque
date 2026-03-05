@@ -17,13 +17,13 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::LanceTypeConfig;
 use crate::async_apply::AppliedWatermark;
 use crate::engine::BisqueLance;
 use crate::ipc;
 use crate::manifest::{LanceManifestManager, TableUpdate};
 use crate::types::{LanceCommand, LanceResponse, WriteResult};
 use crate::write_batcher::{WriteBatcher, WriteBatcherConfig};
-use crate::LanceTypeConfig;
 
 /// Raft-integrated node for bisque-lance.
 ///
@@ -61,11 +61,7 @@ impl LanceRaftNode {
     /// Create a new `LanceRaftNode`.
     ///
     /// Does NOT start background tasks — call [`start`] after construction.
-    pub fn new(
-        raft: Raft<LanceTypeConfig>,
-        engine: Arc<BisqueLance>,
-        node_id: u64,
-    ) -> Self {
+    pub fn new(raft: Raft<LanceTypeConfig>, engine: Arc<BisqueLance>, node_id: u64) -> Self {
         Self {
             raft,
             engine,
@@ -148,7 +144,11 @@ impl LanceRaftNode {
     ///
     /// When an MDBX manifest is configured, the batcher/processor config is
     /// persisted so it survives restarts (restored automatically in [`start`]).
-    pub fn configure_table_batcher(&self, table_name: impl Into<String>, config: WriteBatcherConfig) {
+    pub fn configure_table_batcher(
+        &self,
+        table_name: impl Into<String>,
+        config: WriteBatcherConfig,
+    ) {
         let table_name = table_name.into();
         if let Some(batcher) = &self.write_batcher {
             batcher.configure_table(&table_name, config.clone());
@@ -192,13 +192,11 @@ impl LanceRaftNode {
                             let batcher_cfg = entry.config.batcher.as_ref();
                             let processor_desc = entry.config.processor.as_ref();
                             let restored = WriteBatcherConfig::from_persisted(
-                                batcher_cfg.unwrap_or(
-                                    &crate::types::PersistedBatcherConfig {
-                                        linger_ms: 5,
-                                        max_batch_bytes: 8 * 1024 * 1024,
-                                        channel_capacity: 1024,
-                                    },
-                                ),
+                                batcher_cfg.unwrap_or(&crate::types::PersistedBatcherConfig {
+                                    linger_ms: 5,
+                                    max_batch_bytes: 8 * 1024 * 1024,
+                                    channel_capacity: 1024,
+                                }),
                                 processor_desc,
                             );
                             debug!(
@@ -253,7 +251,10 @@ impl LanceRaftNode {
             self.shutdown.clone(),
         )));
 
-        info!(node_id = self.node_id, "LanceRaftNode background tasks started");
+        info!(
+            node_id = self.node_id,
+            "LanceRaftNode background tasks started"
+        );
     }
 
     /// Create a table through Raft consensus.
@@ -262,8 +263,8 @@ impl LanceRaftNode {
         table_name: &str,
         schema: &arrow_schema::Schema,
     ) -> Result<WriteResult, WriteError> {
-        let schema_ipc = ipc::schema_to_ipc(schema)
-            .map_err(|e| WriteError::Encode(e.to_string()))?;
+        let schema_ipc =
+            ipc::schema_to_ipc(schema).map_err(|e| WriteError::Encode(e.to_string()))?;
 
         let cmd = LanceCommand::CreateTable {
             table_name: table_name.to_string(),
@@ -273,10 +274,7 @@ impl LanceRaftNode {
     }
 
     /// Drop a table through Raft consensus.
-    pub async fn drop_table(
-        &self,
-        table_name: &str,
-    ) -> Result<WriteResult, WriteError> {
+    pub async fn drop_table(&self, table_name: &str) -> Result<WriteResult, WriteError> {
         let cmd = LanceCommand::DropTable {
             table_name: table_name.to_string(),
         };
@@ -305,8 +303,8 @@ impl LanceRaftNode {
             return batcher.submit(table_name, batches.to_vec()).await;
         }
 
-        let data = ipc::encode_record_batches(batches)
-            .map_err(|e| WriteError::Encode(e.to_string()))?;
+        let data =
+            ipc::encode_record_batches(batches).map_err(|e| WriteError::Encode(e.to_string()))?;
 
         let cmd = LanceCommand::AppendRecords {
             table_name: table_name.to_string(),

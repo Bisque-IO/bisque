@@ -162,22 +162,22 @@ impl CounterAggregator {
                 })
                 .collect();
 
-            let ts_values = self.timestamp_column.as_ref().map(|name| {
-                extract_timestamp_array(batch, name, self.timestamp_unit)
-            });
+            let ts_values = self
+                .timestamp_column
+                .as_ref()
+                .map(|name| extract_timestamp_array(batch, name, self.timestamp_unit));
 
-            let st_values = self.start_time_column.as_ref().map(|name| {
-                extract_timestamp_array(batch, name, self.timestamp_unit)
-            });
+            let st_values = self
+                .start_time_column
+                .as_ref()
+                .map(|name| extract_timestamp_array(batch, name, self.timestamp_unit));
 
             let value_array = batch
                 .column_by_name(&self.value_column)
                 .unwrap_or_else(|| panic!("value column '{}' not found", self.value_column))
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .unwrap_or_else(|| {
-                    panic!("value column '{}' must be Float64", self.value_column)
-                });
+                .unwrap_or_else(|| panic!("value column '{}' must be Float64", self.value_column));
 
             for row in 0..num_rows {
                 // Build composite key: "col0\0col1\0...\0truncated_ts"
@@ -195,10 +195,7 @@ impl CounterAggregator {
                     // Include truncated timestamp in the key for grouping.
                     key_buf.push('\0');
                     // Use fixed-width encoding to avoid ambiguity.
-                    let _ = std::fmt::Write::write_fmt(
-                        &mut key_buf,
-                        format_args!("{truncated}"),
-                    );
+                    let _ = std::fmt::Write::write_fmt(&mut key_buf, format_args!("{truncated}"));
                     truncated
                 });
 
@@ -227,7 +224,11 @@ impl CounterAggregator {
         self.build_output(&accum, num_key_cols)
     }
 
-    fn build_output(&self, accum: &HashMap<String, CounterAccum>, num_key_cols: usize) -> RecordBatch {
+    fn build_output(
+        &self,
+        accum: &HashMap<String, CounterAccum>,
+        num_key_cols: usize,
+    ) -> RecordBatch {
         let num_groups = accum.len();
         let has_ts = self.timestamp_column.is_some();
         let has_st = self.start_time_column.is_some();
@@ -268,11 +269,19 @@ impl CounterAggregator {
             .collect();
 
         if has_ts {
-            columns.push(build_timestamp_array(&ts_values, self.timestamp_unit, num_groups));
+            columns.push(build_timestamp_array(
+                &ts_values,
+                self.timestamp_unit,
+                num_groups,
+            ));
         }
 
         if has_st {
-            columns.push(build_timestamp_array(&st_values, self.timestamp_unit, num_groups));
+            columns.push(build_timestamp_array(
+                &st_values,
+                self.timestamp_unit,
+                num_groups,
+            ));
         }
 
         columns.push(Arc::new(value_builder.finish()) as ArrayRef);
@@ -320,27 +329,19 @@ pub(crate) fn extract_timestamp_array<'a>(
         TimeUnit::Millisecond => col
             .as_any()
             .downcast_ref::<TimestampMillisecondArray>()
-            .unwrap_or_else(|| {
-                panic!("timestamp column '{}' must be TimestampMillisecond", name)
-            })
+            .unwrap_or_else(|| panic!("timestamp column '{}' must be TimestampMillisecond", name))
             .values(),
         TimeUnit::Nanosecond => col
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
-            .unwrap_or_else(|| {
-                panic!("timestamp column '{}' must be TimestampNanosecond", name)
-            })
+            .unwrap_or_else(|| panic!("timestamp column '{}' must be TimestampNanosecond", name))
             .values(),
         other => panic!("unsupported timestamp unit: {:?}", other),
     }
 }
 
 /// Build a timestamp ArrayRef from collected i64 values.
-pub(crate) fn build_timestamp_array(
-    values: &[i64],
-    unit: TimeUnit,
-    capacity: usize,
-) -> ArrayRef {
+pub(crate) fn build_timestamp_array(values: &[i64], unit: TimeUnit, capacity: usize) -> ArrayRef {
     match unit {
         TimeUnit::Millisecond => {
             let mut builder = TimestampMillisecondBuilder::with_capacity(capacity);
@@ -482,8 +483,8 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec!["cpu", "cpu", "cpu"])),
                 Arc::new(TimestampMillisecondArray::from(vec![
-                    60_000, // :00 of minute 1
-                    75_000, // :15 of minute 1
+                    60_000,  // :00 of minute 1
+                    75_000,  // :15 of minute 1
                     120_000, // :00 of minute 2
                 ])),
                 Arc::new(Float64Array::from(vec![1.0, 2.0, 5.0])),

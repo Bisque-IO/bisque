@@ -18,26 +18,26 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, TimestampNanosecondType, UInt32Type};
-use arrow_array::RecordBatch;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use datafusion::common::ScalarValue;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::*;
-use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
 use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{
-    ResourceSpans, ScopeSpans, Span, Status as SpanStatus, TracesData,
-    span::Event as SpanEvent, span::Link as SpanLink,
+    ResourceSpans, ScopeSpans, Span, Status as SpanStatus, TracesData, span::Event as SpanEvent,
+    span::Link as SpanLink,
 };
 use prost::Message;
 use serde::Deserialize;
@@ -111,14 +111,13 @@ pub async fn get_trace(
             .into_response())
     } else {
         // JSON response using serde (opentelemetry-proto has with-serde)
-        let body = serde_json::to_vec(&traces_data)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("json encode: {e}")))?;
-        Ok((
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            body,
-        )
-            .into_response())
+        let body = serde_json::to_vec(&traces_data).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("json encode: {e}"),
+            )
+        })?;
+        Ok((StatusCode::OK, [("content-type", "application/json")], body).into_response())
     }
 }
 
@@ -162,44 +161,40 @@ pub async fn search_traces(
     if let Some(start) = params.start {
         let start_nanos = start * 1_000_000_000;
         df = df
-            .filter(col("start_time").gt_eq(lit(ScalarValue::TimestampNanosecond(
-                Some(start_nanos),
-                None,
-            ))))
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
-    }
-    if let Some(end) = params.end {
-        let end_nanos = end * 1_000_000_000;
-        df = df
-            .filter(col("start_time").lt_eq(lit(ScalarValue::TimestampNanosecond(
-                Some(end_nanos),
-                None,
-            ))))
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
-    }
-
-    // Duration filters
-    if let Some(ref min_dur) = params.min_duration {
-        let min_nanos = parse_duration_nanos(min_dur)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-        df = df
             .filter(
-                (col("end_time") - col("start_time")).gt_eq(lit(ScalarValue::TimestampNanosecond(
-                    Some(min_nanos),
+                col("start_time").gt_eq(lit(ScalarValue::TimestampNanosecond(
+                    Some(start_nanos),
                     None,
                 ))),
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
     }
-    if let Some(ref max_dur) = params.max_duration {
-        let max_nanos = parse_duration_nanos(max_dur)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if let Some(end) = params.end {
+        let end_nanos = end * 1_000_000_000;
         df = df
             .filter(
-                (col("end_time") - col("start_time")).lt_eq(lit(ScalarValue::TimestampNanosecond(
-                    Some(max_nanos),
-                    None,
-                ))),
+                col("start_time")
+                    .lt_eq(lit(ScalarValue::TimestampNanosecond(Some(end_nanos), None))),
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
+    }
+
+    // Duration filters
+    if let Some(ref min_dur) = params.min_duration {
+        let min_nanos = parse_duration_nanos(min_dur).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        df = df
+            .filter(
+                (col("end_time") - col("start_time"))
+                    .gt_eq(lit(ScalarValue::TimestampNanosecond(Some(min_nanos), None))),
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
+    }
+    if let Some(ref max_dur) = params.max_duration {
+        let max_nanos = parse_duration_nanos(max_dur).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        df = df
+            .filter(
+                (col("end_time") - col("start_time"))
+                    .lt_eq(lit(ScalarValue::TimestampNanosecond(Some(max_nanos), None))),
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
     }
@@ -335,8 +330,7 @@ pub async fn get_tags(
 pub async fn get_tags_v2(
     State(state): State<Arc<HttpQueryState>>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    let (span_tags, resource_tags, scope_tags) =
-        collect_tag_names_by_scope(&state.ctx).await?;
+    let (span_tags, resource_tags, scope_tags) = collect_tag_names_by_scope(&state.ctx).await?;
 
     let scopes = serde_json::json!([
         { "name": "span", "tags": span_tags.into_iter().collect::<Vec<_>>() },
@@ -568,9 +562,7 @@ fn reconstruct_trace(
 // Tag collection helpers
 // ---------------------------------------------------------------------------
 
-async fn collect_tag_names(
-    ctx: &SessionContext,
-) -> Result<Vec<String>, (StatusCode, String)> {
+async fn collect_tag_names(ctx: &SessionContext) -> Result<Vec<String>, (StatusCode, String)> {
     let (span_tags, resource_tags, scope_tags) = collect_tag_names_by_scope(ctx).await?;
     let mut all: BTreeSet<String> = BTreeSet::new();
     all.extend(span_tags);
@@ -624,9 +616,7 @@ async fn collect_tag_values(
         ("attributes", tag)
     };
 
-    let sql = format!(
-        "SELECT {column} FROM otel_spans LIMIT 10000"
-    );
+    let sql = format!("SELECT {column} FROM otel_spans LIMIT 10000");
     let batches = ctx
         .sql(&sql)
         .await
@@ -698,11 +688,7 @@ fn parse_logfmt_tags(s: &str) -> Vec<(String, String)> {
 }
 
 /// Check if a span's attributes match all tag filters.
-fn matches_tags(
-    filters: &[(String, String)],
-    attrs_json: &str,
-    resource_attrs_json: &str,
-) -> bool {
+fn matches_tags(filters: &[(String, String)], attrs_json: &str, resource_attrs_json: &str) -> bool {
     let attrs: serde_json::Value =
         serde_json::from_str(attrs_json).unwrap_or(serde_json::Value::Null);
     let res_attrs: serde_json::Value =
@@ -831,7 +817,6 @@ fn decode_otlp_body<T: Message + Default + serde::de::DeserializeOwned>(
         serde_json::from_slice(body)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("JSON decode: {e}")))
     } else {
-        T::decode(body)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("protobuf decode: {e}")))
+        T::decode(body).map_err(|e| (StatusCode::BAD_REQUEST, format!("protobuf decode: {e}")))
     }
 }

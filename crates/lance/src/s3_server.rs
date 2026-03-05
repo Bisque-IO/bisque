@@ -93,15 +93,9 @@ pub async fn serve_s3(
 
     let app = axum::Router::new()
         // Catalog metadata (custom endpoint)
-        .route(
-            "/{bucket}/_bisque/catalog",
-            axum::routing::get(get_catalog),
-        )
+        .route("/{bucket}/_bisque/catalog", axum::routing::get(get_catalog))
         // WebSocket endpoint for real-time catalog events
-        .route(
-            "/{bucket}/_bisque/ws",
-            axum::routing::get(ws_handler),
-        )
+        .route("/{bucket}/_bisque/ws", axum::routing::get(ws_handler))
         // ListObjectsV2 — must come before the wildcard
         .route("/{bucket}", axum::routing::get(list_objects))
         // GetObject / HeadObject
@@ -246,9 +240,8 @@ async fn get_catalog(
                 .map(|ds| ds.manifest.version);
 
             // Include non-credential S3 storage options from the table config.
-            let s3_storage_options = filter_non_credential_options(
-                &table.config().s3_storage_options,
-            );
+            let s3_storage_options =
+                filter_non_credential_options(&table.config().s3_storage_options);
 
             catalog.insert(
                 name.clone(),
@@ -298,10 +291,9 @@ async fn get_object(
 ) -> Result<Response, Response> {
     let parsed = parse_key(&key).ok_or_else(|| s3_not_found(&key))?;
 
-    let (store, path) =
-        resolve_to_object_store(&state, &parsed)
-            .await
-            .ok_or_else(|| s3_not_found(&key))?;
+    let (store, path) = resolve_to_object_store(&state, &parsed)
+        .await
+        .ok_or_else(|| s3_not_found(&key))?;
 
     // Build GetOptions from Range header
     let get_opts = if let Some(range_header) = headers.get("range") {
@@ -315,21 +307,14 @@ async fn get_object(
         Default::default()
     };
 
-    let result = store
-        .get_opts(&path, get_opts)
-        .await
-        .map_err(|e| match e {
-            object_store::Error::NotFound { .. } => s3_not_found(&key),
-            _ => s3_internal_error(&e.to_string()),
-        })?;
+    let result = store.get_opts(&path, get_opts).await.map_err(|e| match e {
+        object_store::Error::NotFound { .. } => s3_not_found(&key),
+        _ => s3_internal_error(&e.to_string()),
+    })?;
 
     let meta = &result.meta;
     let total_size = meta.size;
-    let etag = meta
-        .e_tag
-        .as_deref()
-        .unwrap_or("\"unknown\"")
-        .to_string();
+    let etag = meta.e_tag.as_deref().unwrap_or("\"unknown\"").to_string();
     let last_modified = meta.last_modified.to_rfc2822();
     let range = result.range.clone();
     let content_length = range.end - range.start;
@@ -349,17 +334,15 @@ async fn get_object(
         .header("last-modified", &last_modified);
 
     if is_partial {
-        builder = builder
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header(
-                "content-range",
-                format!(
-                    "bytes {}-{}/{}",
-                    range.start,
-                    range.end.saturating_sub(1),
-                    total_size
-                ),
-            );
+        builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
+            "content-range",
+            format!(
+                "bytes {}-{}/{}",
+                range.start,
+                range.end.saturating_sub(1),
+                total_size
+            ),
+        );
     } else {
         builder = builder.status(StatusCode::OK);
     }
@@ -404,10 +387,9 @@ async fn head_object(
 ) -> Result<Response, Response> {
     let parsed = parse_key(&key).ok_or_else(|| s3_not_found(&key))?;
 
-    let (store, path) =
-        resolve_to_object_store(&state, &parsed)
-            .await
-            .ok_or_else(|| s3_not_found(&key))?;
+    let (store, path) = resolve_to_object_store(&state, &parsed)
+        .await
+        .ok_or_else(|| s3_not_found(&key))?;
 
     let meta = store.head(&path).await.map_err(|e| match e {
         object_store::Error::NotFound { .. } => s3_not_found(&key),
@@ -589,14 +571,8 @@ fn list_objects_xml_response(
     xml.push_str(&format!("<Name>{}</Name>", escape_xml(bucket)));
     xml.push_str(&format!("<Prefix>{}</Prefix>", escape_xml(prefix)));
     xml.push_str(&format!("<KeyCount>{}</KeyCount>", objects.len()));
-    xml.push_str(&format!(
-        "<MaxKeys>{}</MaxKeys>",
-        objects.len().max(1000)
-    ));
-    xml.push_str(&format!(
-        "<IsTruncated>{}</IsTruncated>",
-        is_truncated
-    ));
+    xml.push_str(&format!("<MaxKeys>{}</MaxKeys>", objects.len().max(1000)));
+    xml.push_str(&format!("<IsTruncated>{}</IsTruncated>", is_truncated));
 
     if let Some(token) = next_continuation_token {
         xml.push_str(&format!(
@@ -680,7 +656,17 @@ async fn ws_handler(
     tokio::spawn(async move {
         match fut.await {
             Ok(ws) => {
-                if let Err(e) = handle_ws_connection(ws, bus, manifest, group_id, since, pins.clone(), session_id).await {
+                if let Err(e) = handle_ws_connection(
+                    ws,
+                    bus,
+                    manifest,
+                    group_id,
+                    since,
+                    pins.clone(),
+                    session_id,
+                )
+                .await
+                {
                     debug!("WebSocket connection ended: {}", e);
                 }
             }
@@ -699,8 +685,16 @@ async fn ws_handler(
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientWsMessage {
-    Pin { table: String, tier: String, version: u64 },
-    Unpin { table: String, tier: String, version: u64 },
+    Pin {
+        table: String,
+        tier: String,
+        version: u64,
+    },
+    Unpin {
+        table: String,
+        tier: String,
+        version: u64,
+    },
     Heartbeat,
 }
 
@@ -801,16 +795,38 @@ fn handle_client_pin_message(text: &str, pins: &VersionPinTracker, session_id: u
     };
 
     match msg {
-        ClientWsMessage::Pin { table, tier, version } => {
+        ClientWsMessage::Pin {
+            table,
+            tier,
+            version,
+        } => {
             if let Some(tier) = PinTier::from_str(&tier) {
                 debug!(session_id, %table, %version, "Client pinned version");
-                pins.pin(session_id, PinKey { table, tier, version });
+                pins.pin(
+                    session_id,
+                    PinKey {
+                        table,
+                        tier,
+                        version,
+                    },
+                );
             }
         }
-        ClientWsMessage::Unpin { table, tier, version } => {
+        ClientWsMessage::Unpin {
+            table,
+            tier,
+            version,
+        } => {
             if let Some(tier) = PinTier::from_str(&tier) {
                 debug!(session_id, %table, %version, "Client unpinned version");
-                pins.unpin(session_id, PinKey { table, tier, version });
+                pins.unpin(
+                    session_id,
+                    PinKey {
+                        table,
+                        tier,
+                        version,
+                    },
+                );
             }
         }
         ClientWsMessage::Heartbeat => {

@@ -17,9 +17,9 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
+use super::OtlpReceiver;
 use super::convert::{key_values_to_json, pad_or_truncate};
 use super::schema;
-use super::OtlpReceiver;
 
 #[tonic::async_trait]
 impl TraceService for OtlpReceiver {
@@ -79,24 +79,18 @@ impl TraceService for OtlpReceiver {
         // Event builders
         let mut evt_trace_id = FixedSizeBinaryBuilder::with_capacity(total_events, 16);
         let mut evt_span_id = FixedSizeBinaryBuilder::with_capacity(total_events, 8);
-        let mut evt_timestamp =
-            TimestampNanosecondBuilder::with_capacity(total_events);
+        let mut evt_timestamp = TimestampNanosecondBuilder::with_capacity(total_events);
         let mut evt_name = StringBuilder::with_capacity(total_events, total_events * 32);
-        let mut evt_attributes =
-            StringBuilder::with_capacity(total_events, total_events * 64);
+        let mut evt_attributes = StringBuilder::with_capacity(total_events, total_events * 64);
         let mut evt_dropped_attrs = UInt32Builder::with_capacity(total_events);
 
         // Link builders
         let mut lnk_trace_id = FixedSizeBinaryBuilder::with_capacity(total_links, 16);
         let mut lnk_span_id = FixedSizeBinaryBuilder::with_capacity(total_links, 8);
-        let mut lnk_linked_trace_id =
-            FixedSizeBinaryBuilder::with_capacity(total_links, 16);
-        let mut lnk_linked_span_id =
-            FixedSizeBinaryBuilder::with_capacity(total_links, 8);
-        let mut lnk_trace_state =
-            StringBuilder::with_capacity(total_links, total_links * 16);
-        let mut lnk_attributes =
-            StringBuilder::with_capacity(total_links, total_links * 64);
+        let mut lnk_linked_trace_id = FixedSizeBinaryBuilder::with_capacity(total_links, 16);
+        let mut lnk_linked_span_id = FixedSizeBinaryBuilder::with_capacity(total_links, 8);
+        let mut lnk_trace_state = StringBuilder::with_capacity(total_links, total_links * 16);
+        let mut lnk_attributes = StringBuilder::with_capacity(total_links, total_links * 64);
         let mut lnk_flags = UInt32Builder::with_capacity(total_links);
         let mut lnk_dropped_attrs = UInt32Builder::with_capacity(total_links);
 
@@ -133,7 +127,9 @@ impl TraceService for OtlpReceiver {
 
                 for span in &ss.spans {
                     let tid = pad_or_truncate(&span.trace_id, 16);
-                    trace_id.append_value(&tid).expect("trace_id must be 16 bytes");
+                    trace_id
+                        .append_value(&tid)
+                        .expect("trace_id must be 16 bytes");
 
                     let sid = pad_or_truncate(&span.span_id, 8);
                     span_id.append_value(&sid).expect("span_id must be 8 bytes");

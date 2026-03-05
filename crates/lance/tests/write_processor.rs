@@ -12,8 +12,8 @@ use std::time::Duration;
 use arrow_array::{Float64Array, RecordBatch, StringArray, TimestampMillisecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use futures::TryStreamExt;
-use openraft::impls::BasicNode;
 use openraft::Config;
+use openraft::impls::BasicNode;
 
 use bisque_lance::{
     BisqueLance, BisqueLanceConfig, CounterAggregator, GaugeAggregator, LanceRaftNode,
@@ -82,9 +82,8 @@ async fn setup_with_processor(
         .with_linger(linger)
         .with_processor(processor);
 
-    let raft_node = Arc::new(
-        LanceRaftNode::new(raft, engine, node_id).with_write_batcher(batcher_config),
-    );
+    let raft_node =
+        Arc::new(LanceRaftNode::new(raft, engine, node_id).with_write_batcher(batcher_config));
     raft_node.start();
 
     // Wait for leadership.

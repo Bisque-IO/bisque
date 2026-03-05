@@ -42,8 +42,7 @@ pub fn any_value_to_json(av: &AnyValue) -> serde_json::Value {
             json!(hex)
         }
         Some(Value::ArrayValue(arr)) => {
-            let items: Vec<serde_json::Value> =
-                arr.values.iter().map(any_value_to_json).collect();
+            let items: Vec<serde_json::Value> = arr.values.iter().map(any_value_to_json).collect();
             serde_json::Value::Array(items)
         }
         Some(Value::KvlistValue(kvl)) => {
@@ -166,9 +165,7 @@ mod tests {
     fn kv(key: &str, value: Value) -> KeyValue {
         KeyValue {
             key: key.to_string(),
-            value: Some(AnyValue {
-                value: Some(value),
-            }),
+            value: Some(AnyValue { value: Some(value) }),
         }
     }
 

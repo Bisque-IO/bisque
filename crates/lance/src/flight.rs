@@ -40,7 +40,7 @@ use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
     ActionCreatePreparedStatementResult, CommandGetCatalogs, CommandGetDbSchemas,
-    CommandGetSqlInfo, CommandGetTables, CommandGetTableTypes, CommandStatementIngest,
+    CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables, CommandStatementIngest,
     CommandStatementQuery, CommandStatementUpdate, DoPutPreparedStatementResult,
     ProstMessageExt as _, SqlInfo, TicketStatementQuery,
 };
@@ -126,9 +126,8 @@ impl BisqueFlightService {
                 let s = val
                     .to_str()
                     .map_err(|_| Status::invalid_argument("x-bisque-min-log-id must be ASCII"))?;
-                s.parse::<u64>().map_err(|_| {
-                    Status::invalid_argument("x-bisque-min-log-id must be a u64")
-                })?
+                s.parse::<u64>()
+                    .map_err(|_| Status::invalid_argument("x-bisque-min-log-id must be a u64"))?
             }
             None => return Ok(()),
         };
@@ -290,7 +289,8 @@ impl FlightSqlService for BisqueFlightService {
 
         self.wait_for_read_fence(&request).await?;
 
-        let df = self.ctx
+        let df = self
+            .ctx
             .sql(sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("SQL error: {e}")))?;
@@ -307,8 +307,9 @@ impl FlightSqlService for BisqueFlightService {
             .with_schema(schema)
             .build(batch_stream);
 
-        let response_stream = flight_stream
-            .map(|result| result.map_err(|e| Status::internal(format!("flight encode error: {e}"))));
+        let response_stream = flight_stream.map(|result| {
+            result.map_err(|e| Status::internal(format!("flight encode error: {e}")))
+        });
 
         Ok(Response::new(Box::pin(response_stream)))
     }
@@ -448,9 +449,8 @@ impl FlightSqlService for BisqueFlightService {
             .map_err(|e| Status::internal(format!("table builder build error: {e}")))?;
         let schema = batch.schema();
 
-        let batch_stream = futures::stream::once(async {
-            Ok::<_, arrow_flight::error::FlightError>(batch)
-        });
+        let batch_stream =
+            futures::stream::once(async { Ok::<_, arrow_flight::error::FlightError>(batch) });
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batch_stream);
@@ -498,9 +498,8 @@ impl FlightSqlService for BisqueFlightService {
         )
         .map_err(|e| Status::internal(format!("batch error: {e}")))?;
 
-        let batch_stream = futures::stream::once(async {
-            Ok::<_, arrow_flight::error::FlightError>(batch)
-        });
+        let batch_stream =
+            futures::stream::once(async { Ok::<_, arrow_flight::error::FlightError>(batch) });
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batch_stream);
@@ -553,9 +552,8 @@ impl FlightSqlService for BisqueFlightService {
         )
         .map_err(|e| Status::internal(format!("batch error: {e}")))?;
 
-        let batch_stream = futures::stream::once(async {
-            Ok::<_, arrow_flight::error::FlightError>(batch)
-        });
+        let batch_stream =
+            futures::stream::once(async { Ok::<_, arrow_flight::error::FlightError>(batch) });
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batch_stream);
@@ -603,9 +601,8 @@ impl FlightSqlService for BisqueFlightService {
         )
         .map_err(|e| Status::internal(format!("batch error: {e}")))?;
 
-        let batch_stream = futures::stream::once(async {
-            Ok::<_, arrow_flight::error::FlightError>(batch)
-        });
+        let batch_stream =
+            futures::stream::once(async { Ok::<_, arrow_flight::error::FlightError>(batch) });
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batch_stream);
@@ -669,9 +666,8 @@ impl FlightSqlService for BisqueFlightService {
         )
         .map_err(|e| Status::internal(format!("batch error: {e}")))?;
 
-        let batch_stream = futures::stream::once(async {
-            Ok::<_, arrow_flight::error::FlightError>(batch)
-        });
+        let batch_stream =
+            futures::stream::once(async { Ok::<_, arrow_flight::error::FlightError>(batch) });
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batch_stream);
@@ -696,11 +692,10 @@ impl FlightSqlService for BisqueFlightService {
         let (schema, _batches) = self.execute_sql(&query.query).await?;
 
         let options = IpcWriteOptions::default();
-        let ipc_msg: arrow_flight::IpcMessage = SchemaAsIpc::new(&schema, &options)
-            .try_into()
-            .map_err(|e: arrow_schema::ArrowError| {
-                Status::internal(format!("schema encode error: {e}"))
-            })?;
+        let ipc_msg: arrow_flight::IpcMessage =
+            SchemaAsIpc::new(&schema, &options).try_into().map_err(
+                |e: arrow_schema::ArrowError| Status::internal(format!("schema encode error: {e}")),
+            )?;
 
         Ok(ActionCreatePreparedStatementResult {
             // Embed the SQL query as the handle — stateless prepared statements.
@@ -724,12 +719,14 @@ impl FlightSqlService for BisqueFlightService {
         query: arrow_flight::sql::CommandPreparedStatementQuery,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let sql = std::str::from_utf8(&query.prepared_statement_handle)
-            .map_err(|_| Status::invalid_argument("prepared statement handle is not valid UTF-8"))?;
+        let sql = std::str::from_utf8(&query.prepared_statement_handle).map_err(|_| {
+            Status::invalid_argument("prepared statement handle is not valid UTF-8")
+        })?;
 
         debug!(sql = %sql, "do_get_prepared_statement");
 
-        let df = self.ctx
+        let df = self
+            .ctx
             .sql(sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("SQL error: {e}")))?;
@@ -757,8 +754,9 @@ impl FlightSqlService for BisqueFlightService {
         query: arrow_flight::sql::CommandPreparedStatementQuery,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let sql = std::str::from_utf8(&query.prepared_statement_handle)
-            .map_err(|_| Status::invalid_argument("prepared statement handle is not valid UTF-8"))?;
+        let sql = std::str::from_utf8(&query.prepared_statement_handle).map_err(|_| {
+            Status::invalid_argument("prepared statement handle is not valid UTF-8")
+        })?;
 
         let (schema, _) = self.execute_sql(sql).await?;
 

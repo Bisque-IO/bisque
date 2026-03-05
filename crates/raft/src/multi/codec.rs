@@ -421,10 +421,10 @@ where
 impl<C> Encode for openraft::LogId<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         self.leader_id.term.encode(writer)?;
@@ -440,10 +440,10 @@ where
 impl<C> Decode for openraft::LogId<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         let term = u64::decode(reader)?;
@@ -461,10 +461,10 @@ where
 impl<C> Encode for openraft::impls::Vote<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         self.leader_id.encode(writer)?;
@@ -479,10 +479,10 @@ where
 impl<C> Decode for openraft::impls::Vote<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         Ok(Self {
@@ -537,11 +537,12 @@ where
 
     fn encoded_size(&self) -> usize {
         let configs = self.get_joint_config();
-        let configs_size: usize =
-            4 + configs.iter().map(|c| 4 + c.len() * 8).sum::<usize>();
+        let configs_size: usize = 4 + configs.iter().map(|c| 4 + c.len() * 8).sum::<usize>();
         let nodes: Vec<_> = self.nodes().collect();
-        let nodes_size: usize =
-            4 + nodes.iter().map(|(_, n)| 8 + n.encoded_size()).sum::<usize>();
+        let nodes_size: usize = 4 + nodes
+            .iter()
+            .map(|(_, n)| 8 + n.encoded_size())
+            .sum::<usize>();
         configs_size + nodes_size
     }
 }
@@ -617,9 +618,7 @@ where
         let tag = EntryPayloadType::try_from(u8::decode(reader)?)?;
         match tag {
             EntryPayloadType::Blank => Ok(openraft::EntryPayload::Blank),
-            EntryPayloadType::Normal => {
-                Ok(openraft::EntryPayload::Normal(C::D::decode(reader)?))
-            }
+            EntryPayloadType::Normal => Ok(openraft::EntryPayload::Normal(C::D::decode(reader)?)),
             EntryPayloadType::Membership => Ok(openraft::EntryPayload::Membership(
                 openraft::Membership::<C>::decode(reader)?,
             )),
@@ -632,11 +631,11 @@ where
 impl<C> Encode for openraft::impls::Entry<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::D: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -653,11 +652,11 @@ where
 impl<C> Decode for openraft::impls::Entry<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::D: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -673,11 +672,11 @@ where
 impl<C> Encode for openraft::StoredMembership<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         // log_id() returns Option<&LogId<C>> — encode manually
@@ -706,11 +705,11 @@ where
 impl<C> Decode for openraft::StoredMembership<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         let log_id = Option::<openraft::LogId<C>>::decode(reader)?;
@@ -724,11 +723,11 @@ where
 impl<C> Encode for openraft::storage::SnapshotMeta<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         self.last_log_id.encode(writer)?;
@@ -747,11 +746,11 @@ where
 impl<C> Decode for openraft::storage::SnapshotMeta<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         Ok(openraft::storage::SnapshotMeta {
@@ -771,11 +770,11 @@ where
 impl<C> Encode for openraft::raft::AppendEntriesRequest<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Encode,
     C::Entry: Encode,
 {
@@ -798,11 +797,11 @@ where
 impl<C> Decode for openraft::raft::AppendEntriesRequest<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Decode,
     C::Entry: Decode,
 {
@@ -821,10 +820,10 @@ where
 impl<C> Encode for openraft::raft::AppendEntriesResponse<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -850,9 +849,7 @@ where
     fn encoded_size(&self) -> usize {
         1 + match self {
             openraft::raft::AppendEntriesResponse::Success => 0,
-            openraft::raft::AppendEntriesResponse::PartialSuccess(log_id) => {
-                log_id.encoded_size()
-            }
+            openraft::raft::AppendEntriesResponse::PartialSuccess(log_id) => log_id.encoded_size(),
             openraft::raft::AppendEntriesResponse::Conflict => 0,
             openraft::raft::AppendEntriesResponse::HigherVote(vote) => vote.encoded_size(),
         }
@@ -862,10 +859,10 @@ where
 impl<C> Decode for openraft::raft::AppendEntriesResponse<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -882,11 +879,9 @@ where
             AppendEntriesResponseType::Conflict => {
                 Ok(openraft::raft::AppendEntriesResponse::Conflict)
             }
-            AppendEntriesResponseType::HigherVote => {
-                Ok(openraft::raft::AppendEntriesResponse::HigherVote(
-                    C::Vote::decode(reader)?,
-                ))
-            }
+            AppendEntriesResponseType::HigherVote => Ok(
+                openraft::raft::AppendEntriesResponse::HigherVote(C::Vote::decode(reader)?),
+            ),
         }
     }
 }
@@ -896,10 +891,10 @@ where
 impl<C> Encode for openraft::raft::VoteRequest<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -916,10 +911,10 @@ where
 impl<C> Decode for openraft::raft::VoteRequest<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -935,10 +930,10 @@ where
 impl<C> Encode for openraft::raft::VoteResponse<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -956,10 +951,10 @@ where
 impl<C> Decode for openraft::raft::VoteResponse<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -978,11 +973,11 @@ where
 impl<C> Encode for openraft::raft::InstallSnapshotRequest<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -997,23 +992,18 @@ where
     }
 
     fn encoded_size(&self) -> usize {
-        self.vote.encoded_size()
-            + self.meta.encoded_size()
-            + 8
-            + 4
-            + self.data.len()
-            + 1
+        self.vote.encoded_size() + self.meta.encoded_size() + 8 + 4 + self.data.len() + 1
     }
 }
 
 impl<C> Decode for openraft::raft::InstallSnapshotRequest<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -1039,10 +1029,10 @@ where
 impl<C> Encode for openraft::raft::InstallSnapshotResponse<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -1057,10 +1047,10 @@ where
 impl<C> Decode for openraft::raft::InstallSnapshotResponse<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -1135,10 +1125,10 @@ pub enum ResponseMessage<C: RaftTypeConfig> {
 impl<C> Encode for ResponseMessage<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -1171,10 +1161,10 @@ where
 impl<C> Decode for ResponseMessage<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -1228,10 +1218,7 @@ pub enum RpcMessage<C: RaftTypeConfig> {
         responses: Vec<(u64, ResponseMessage<C>)>,
     },
     /// Error response
-    Error {
-        request_id: u64,
-        error: String,
-    },
+    Error { request_id: u64, error: String },
 }
 
 impl<C: RaftTypeConfig> RpcMessage<C> {
@@ -1251,11 +1238,11 @@ impl<C: RaftTypeConfig> RpcMessage<C> {
 impl<C> Encode for RpcMessage<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Encode,
     C::Entry: Encode,
 {
@@ -1351,11 +1338,11 @@ where
 impl<C> Decode for RpcMessage<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        Node = openraft::impls::BasicNode,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            Node = openraft::impls::BasicNode,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+        >,
     C::Vote: Decode,
     C::Entry: Decode,
 {
@@ -1403,10 +1390,7 @@ mod tests {
 
     type C = crate::multi::test_support::TestConfig;
 
-    fn make_leader_id(
-        term: u64,
-        node_id: u64,
-    ) -> openraft::impls::leader_id_adv::LeaderId<C> {
+    fn make_leader_id(term: u64, node_id: u64) -> openraft::impls::leader_id_adv::LeaderId<C> {
         openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id }
     }
 
@@ -1417,11 +1401,7 @@ mod tests {
         }
     }
 
-    fn make_vote(
-        term: u64,
-        node_id: u64,
-        committed: bool,
-    ) -> openraft::impls::Vote<C> {
+    fn make_vote(term: u64, node_id: u64, committed: bool) -> openraft::impls::Vote<C> {
         openraft::impls::Vote::<C> {
             leader_id: make_leader_id(term, node_id),
             committed,
@@ -1530,7 +1510,9 @@ mod tests {
             entries: vec![
                 openraft::impls::Entry::<C> {
                     log_id: make_log_id(5, 10, 100),
-                    payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(vec![1, 2, 3].into())),
+                    payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(
+                        vec![1, 2, 3].into(),
+                    )),
                 },
                 openraft::impls::Entry::<C> {
                     log_id: make_log_id(5, 10, 101),
@@ -1585,10 +1567,8 @@ mod tests {
         let decoded = RpcMessage::<C>::decode_from_slice(&encoded).unwrap();
         // Compare request_id since RpcMessage doesn't derive PartialEq with openraft types
         assert_eq!(msg.request_id(), decoded.request_id());
-        if let (
-            RpcMessage::Vote { rpc: rpc1, .. },
-            RpcMessage::Vote { rpc: rpc2, .. },
-        ) = (&msg, &decoded)
+        if let (RpcMessage::Vote { rpc: rpc1, .. }, RpcMessage::Vote { rpc: rpc2, .. }) =
+            (&msg, &decoded)
         {
             assert_eq!(rpc1, rpc2);
         } else {

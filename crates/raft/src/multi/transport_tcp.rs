@@ -143,7 +143,7 @@ impl Default for BisqueTcpTransportConfig {
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             write_channel_capacity: 256,
-            max_batch_bytes: 64 * 1024, // 64KB
+            max_batch_bytes: 64 * 1024,               // 64KB
             connection_ttl: Duration::from_secs(300), // 5 minutes
             tcp_nodelay: true,
             #[cfg(feature = "tls")]
@@ -303,7 +303,10 @@ pub fn encode_framed<E: Encode>(msg: &E) -> Result<Vec<u8>, BisqueTransportError
 /// appended for batch writing (each gets its own length prefix).
 ///
 /// After warmup the buffer is large enough to hold any response — zero alloc.
-pub fn encode_framed_append<E: Encode>(msg: &E, buf: &mut Vec<u8>) -> Result<(), BisqueTransportError> {
+pub fn encode_framed_append<E: Encode>(
+    msg: &E,
+    buf: &mut Vec<u8>,
+) -> Result<(), BisqueTransportError> {
     let start = buf.len();
     // Reserve space for the 4-byte frame length prefix
     buf.extend_from_slice(&[0u8; FRAME_PREFIX_LEN]);
@@ -362,21 +365,18 @@ impl GroupConnection {
         max_batch_bytes: usize,
         channel_capacity: usize,
     ) -> Self {
-        let (write_tx, write_rx) =
-            crossfire::mpsc::bounded_async::<WriteRequest>(channel_capacity);
+        let (write_tx, write_rx) = crossfire::mpsc::bounded_async::<WriteRequest>(channel_capacity);
         let alive = Arc::new(AtomicBool::new(true));
 
         // Unbounded FIFO for response dispatch: writer pushes oneshot senders,
         // reader pops them in the same order to match responses. Unbounded
         // because the writer can push faster than the reader pops (TCP RTT).
-        let (resp_tx, resp_rx) =
-            crossfire::mpsc::unbounded_async::<PendingResponseSender>();
+        let (resp_tx, resp_rx) = crossfire::mpsc::unbounded_async::<PendingResponseSender>();
 
         // Spawn writer task
         let writer_alive = alive.clone();
         tokio::spawn(async move {
-            Self::writer_loop(writer, write_rx, resp_tx, writer_alive, max_batch_bytes)
-                .await;
+            Self::writer_loop(writer, write_rx, resp_tx, writer_alive, max_batch_bytes).await;
         });
 
         // Spawn reader task
@@ -572,9 +572,7 @@ impl GroupConnection {
     }
 
     /// Drain remaining response senders from the FIFO and notify them of connection error.
-    fn drain_and_error(
-        resp_rx: &crossfire::AsyncRx<crossfire::mpsc::List<PendingResponseSender>>,
-    ) {
+    fn drain_and_error(resp_rx: &crossfire::AsyncRx<crossfire::mpsc::List<PendingResponseSender>>) {
         while let Ok(sender) = resp_rx.try_recv() {
             let _ = sender.send(Err(BisqueTransportError::ConnectionClosed));
         }
@@ -793,24 +791,26 @@ where
     }
 
     /// Establish a TCP connection (with optional TLS)
-    async fn connect(&self, addr: SocketAddr) -> Result<(BoxedReader, BoxedWriter), BisqueTransportError> {
-        let stream = tokio::time::timeout(
-            self.config.connect_timeout,
-            TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| {
-            BisqueTransportError::ConnectionError(
-                format!("Connection to {} timed out", addr).into(),
-            )
-        })?
-        .map_err(|e| {
-            BisqueTransportError::ConnectionError(
-                format!("Failed to connect to {}: {}", addr, e).into(),
-            )
-        })?;
+    async fn connect(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(BoxedReader, BoxedWriter), BisqueTransportError> {
+        let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                BisqueTransportError::ConnectionError(
+                    format!("Connection to {} timed out", addr).into(),
+                )
+            })?
+            .map_err(|e| {
+                BisqueTransportError::ConnectionError(
+                    format!("Failed to connect to {}: {}", addr, e).into(),
+                )
+            })?;
 
-        stream.set_nodelay(self.config.tcp_nodelay).map_err(BisqueTransportError::IoError)?;
+        stream
+            .set_nodelay(self.config.tcp_nodelay)
+            .map_err(BisqueTransportError::IoError)?;
 
         #[cfg(feature = "tls")]
         if let Some(ref tls_config) = self.config.tls_client_config {
@@ -820,14 +820,9 @@ where
                 .tls_server_name
                 .clone()
                 .unwrap_or_else(|| rustls::pki_types::ServerName::IpAddress(addr.ip().into()));
-            let tls_stream = connector
-                .connect(server_name, stream)
-                .await
-                .map_err(|e| {
-                    BisqueTransportError::ConnectionError(
-                        format!("TLS handshake failed: {}", e).into(),
-                    )
-                })?;
+            let tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
+                BisqueTransportError::ConnectionError(format!("TLS handshake failed: {}", e).into())
+            })?;
             let (reader, writer) = tokio::io::split(tls_stream);
             return Ok((
                 Box::new(reader) as BoxedReader,
@@ -876,9 +871,8 @@ where
                 group_id,
             };
             // Only remove if it's the same generation (avoid removing a fresh replacement)
-            self.connections.remove_if(&key, |_, existing| {
-                existing.generation == conn.generation
-            });
+            self.connections
+                .remove_if(&key, |_, existing| existing.generation == conn.generation);
         }
 
         result
@@ -888,13 +882,13 @@ where
 impl<C> MultiplexedTransport<C> for BisqueTcpTransport<C>
 where
     C: RaftTypeConfig<
-        NodeId = u64,
-        Term = u64,
-        LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        Vote = openraft::impls::Vote<C>,
-        Node = openraft::impls::BasicNode,
-        Entry = openraft::impls::Entry<C>,
-    >,
+            NodeId = u64,
+            Term = u64,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+            Vote = openraft::impls::Vote<C>,
+            Node = openraft::impls::BasicNode,
+            Entry = openraft::impls::Entry<C>,
+        >,
     C::SnapshotData: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
     C::Entry: Clone,
     C::D: Encode + Decode,

@@ -121,8 +121,12 @@ impl Decode for KvCommand {
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf)?;
         let (cmd, _): (KvCommand, _) =
-            bincode::serde::decode_from_slice(&buf, bincode::config::standard())
-                .map_err(|e| CodecError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+            bincode::serde::decode_from_slice(&buf, bincode::config::standard()).map_err(|e| {
+                CodecError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                ))
+            })?;
         Ok(cmd)
     }
 }
@@ -332,8 +336,7 @@ async fn create_node(
     std::fs::create_dir_all(&node_dir).expect("Failed to create node dir");
 
     // Create storage configuration
-    let storage_config = MmapStorageConfig::new(&node_dir)
-        .with_segment_size(64 * 1024 * 1024); // 64MB segment files
+    let storage_config = MmapStorageConfig::new(&node_dir).with_segment_size(64 * 1024 * 1024); // 64MB segment files
 
     // Create the mmap log storage
     let storage = MultiplexedLogStorage::<KvTypeConfig>::new(storage_config)

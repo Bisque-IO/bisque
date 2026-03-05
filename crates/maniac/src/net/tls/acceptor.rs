@@ -26,12 +26,16 @@ impl TlsAcceptor {
 
     /// Create a `TlsAcceptor` from PEM-encoded certificate and private key data.
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Self> {
-        let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(cert_pem))
-            .collect::<Result<_, _>>()?;
+        let certs: Vec<_> =
+            rustls_pemfile::certs(&mut io::BufReader::new(cert_pem)).collect::<Result<_, _>>()?;
 
-        let key = rustls_pemfile::private_key(&mut io::BufReader::new(key_pem))?.ok_or_else(
-            || io::Error::new(io::ErrorKind::InvalidInput, "no private key found in PEM data"),
-        )?;
+        let key =
+            rustls_pemfile::private_key(&mut io::BufReader::new(key_pem))?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "no private key found in PEM data",
+                )
+            })?;
 
         let config = ServerConfig::builder()
             .with_no_client_auth()

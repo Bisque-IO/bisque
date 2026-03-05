@@ -75,10 +75,7 @@ impl OtlpReceiver {
             (schema::COUNTERS_TABLE, schema::counter_schema()),
             (schema::GAUGES_TABLE, schema::gauge_schema()),
             (schema::HISTOGRAMS_TABLE, schema::histogram_schema()),
-            (
-                schema::EXP_HISTOGRAMS_TABLE,
-                schema::exp_histogram_schema(),
-            ),
+            (schema::EXP_HISTOGRAMS_TABLE, schema::exp_histogram_schema()),
             (schema::SUMMARIES_TABLE, schema::summary_schema()),
             (schema::SPANS_TABLE, schema::span_schema()),
             (schema::SPAN_EVENTS_TABLE, schema::span_event_schema()),
@@ -105,14 +102,12 @@ impl OtlpReceiver {
 
         self.raft_node.configure_table_batcher(
             schema::GAUGES_TABLE,
-            WriteBatcherConfig::default()
-                .with_processor(Arc::new(OtelGaugeProcessor::new())),
+            WriteBatcherConfig::default().with_processor(Arc::new(OtelGaugeProcessor::new())),
         );
 
         self.raft_node.configure_table_batcher(
             schema::HISTOGRAMS_TABLE,
-            WriteBatcherConfig::default()
-                .with_processor(Arc::new(OtelHistogramProcessor::new())),
+            WriteBatcherConfig::default().with_processor(Arc::new(OtelHistogramProcessor::new())),
         );
 
         self.raft_node.configure_table_batcher(
@@ -270,7 +265,10 @@ pub async fn serve_http(
 
     let app = axum::Router::new()
         // --- Tempo endpoints ---
-        .route("/api/traces/{traceID}", axum::routing::get(tempo::get_trace))
+        .route(
+            "/api/traces/{traceID}",
+            axum::routing::get(tempo::get_trace),
+        )
         .route("/api/search", axum::routing::get(tempo::search_traces))
         .route("/api/search/tags", axum::routing::get(tempo::get_tags))
         .route(
@@ -295,26 +293,18 @@ pub async fn serve_http(
         // --- Prometheus/Mimir endpoints ---
         .route(
             "/api/v1/query",
-            axum::routing::get(prom_api::prom_instant_query)
-                .post(prom_api::prom_instant_query),
+            axum::routing::get(prom_api::prom_instant_query).post(prom_api::prom_instant_query),
         )
         .route(
             "/api/v1/query_range",
-            axum::routing::get(prom_api::prom_range_query)
-                .post(prom_api::prom_range_query),
+            axum::routing::get(prom_api::prom_range_query).post(prom_api::prom_range_query),
         )
-        .route(
-            "/api/v1/labels",
-            axum::routing::get(prom_api::prom_labels),
-        )
+        .route("/api/v1/labels", axum::routing::get(prom_api::prom_labels))
         .route(
             "/api/v1/label/{name}/values",
             axum::routing::get(prom_api::prom_label_values),
         )
-        .route(
-            "/api/v1/series",
-            axum::routing::get(prom_api::prom_series),
-        )
+        .route("/api/v1/series", axum::routing::get(prom_api::prom_series))
         .route(
             "/api/v1/metadata",
             axum::routing::get(prom_api::prom_metadata),
@@ -328,30 +318,18 @@ pub async fn serve_http(
             axum::routing::post(prom_api::prom_remote_write),
         )
         // --- Loki endpoints ---
-        .route(
-            "/loki/api/v1/query",
-            axum::routing::get(loki::loki_query),
-        )
+        .route("/loki/api/v1/query", axum::routing::get(loki::loki_query))
         .route(
             "/loki/api/v1/query_range",
             axum::routing::get(loki::loki_query_range),
         )
-        .route(
-            "/loki/api/v1/labels",
-            axum::routing::get(loki::loki_labels),
-        )
+        .route("/loki/api/v1/labels", axum::routing::get(loki::loki_labels))
         .route(
             "/loki/api/v1/label/{name}/values",
             axum::routing::get(loki::loki_label_values),
         )
-        .route(
-            "/loki/api/v1/series",
-            axum::routing::get(loki::loki_series),
-        )
-        .route(
-            "/loki/api/v1/push",
-            axum::routing::post(loki::loki_push),
-        )
+        .route("/loki/api/v1/series", axum::routing::get(loki::loki_series))
+        .route("/loki/api/v1/push", axum::routing::post(loki::loki_push))
         .with_state(state);
 
     info!(%addr, "starting Tempo/Prometheus/Loki HTTP server");

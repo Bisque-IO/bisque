@@ -55,9 +55,8 @@ impl TlsConnector {
             .try_into()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        let client_conn =
-            rustls::ClientConnection::new(Arc::clone(&self.config), server_name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let client_conn = rustls::ClientConnection::new(Arc::clone(&self.config), server_name)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
         let conn = rustls::Connection::Client(client_conn);
         let mut stream = TlsStream::new(tcp, conn);

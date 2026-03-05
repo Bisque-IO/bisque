@@ -20,9 +20,7 @@
 //!
 //! Plus shared manifest MDBX in `{base_dir}/.raft_manifest/` for fast recovery.
 
-use crate::multi::codec::{
-    BorrowPayload, Decode, Encode,
-};
+use crate::multi::codec::{BorrowPayload, Decode, Encode};
 use crate::multi::manifest_mdbx::{ManifestManager, SegmentMeta};
 use crate::multi::record_format::{
     AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, HEADER_SIZE, LENGTH_SIZE, LogIndex,
@@ -553,7 +551,9 @@ impl<C: RaftTypeConfig> FsyncState<C> {
     /// Push a callback for the given segment. Tracks `max_bytes` and
     /// `first_enqueue_nanos` on the Segment atomically (no allocation).
     fn push(&self, segment: &Arc<Segment>, bytes_written: u64, callback: IOFlushed<C>) {
-        segment.pending_max_bytes.fetch_max(bytes_written, Ordering::Release);
+        segment
+            .pending_max_bytes
+            .fetch_max(bytes_written, Ordering::Release);
         segment.mark_first_enqueue();
 
         let mut inner = self.mu.lock().unwrap();
@@ -637,8 +637,7 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
                 match earliest_deadline {
                     Some(deadline) if deadline > now => {
                         let remaining = std::time::Duration::from_nanos(deadline - now);
-                        let (new_inner, _) =
-                            state.cv.wait_timeout(inner, remaining).unwrap();
+                        let (new_inner, _) = state.cv.wait_timeout(inner, remaining).unwrap();
                         inner = new_inner;
                     }
                     _ => break, // At least one segment is ready (or no timestamps)
@@ -671,7 +670,12 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
 
             let seal_requests = std::mem::take(&mut inner.seal_queue);
             let prealloc_requests = std::mem::take(&mut inner.prealloc_queue);
-            (ready_entries, seal_requests, prealloc_requests, inner.shutdown)
+            (
+                ready_entries,
+                seal_requests,
+                prealloc_requests,
+                inner.shutdown,
+            )
         };
 
         // Sync each segment's file once, drain callbacks, update flushed_size
@@ -716,14 +720,11 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
 
         // Process pre-allocation requests: create segment files off the hot path
         for req in prealloc_requests {
-            let result = match ActiveMmapSegment::create(
-                &req.group_dir,
-                req.segment_id,
-                req.segment_size,
-            ) {
-                Ok(seg) => PreallocResult::Ready(seg),
-                Err(_) => PreallocResult::Failed,
-            };
+            let result =
+                match ActiveMmapSegment::create(&req.group_dir, req.segment_id, req.segment_size) {
+                    Ok(seg) => PreallocResult::Ready(seg),
+                    Err(_) => PreallocResult::Failed,
+                };
             *req.result.lock().unwrap() = result;
         }
 
@@ -1262,8 +1263,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
 
             // Track min/max from scan results
             if let Some(min) = scan.min_entry_index {
-                overall_first_index =
-                    Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
+                overall_first_index = Some(overall_first_index.map_or(min, |v: u64| v.min(min)));
             }
             if let Some(max) = scan.max_entry_index {
                 overall_last_index = Some(overall_last_index.map_or(max, |v: u64| v.max(max)));
@@ -1286,8 +1286,13 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             }
 
             let mmap_raw = memmap2::MmapOptions::new().map_raw_read_only(&file)?;
-            segment_map
-                .add_sealed(Arc::new(Segment::new(seg_id, mmap_raw, valid as u64, None, path)));
+            segment_map.add_sealed(Arc::new(Segment::new(
+                seg_id,
+                mmap_raw,
+                valid as u64,
+                None,
+                path,
+            )));
         }
 
         // Open or create active (tail) segment
@@ -1483,26 +1488,34 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                                     len: total as u32,
                                 },
                             );
-                            min_entry_index = Some(min_entry_index.map_or(index, |v: u64| v.min(index)));
-                            max_entry_index = Some(max_entry_index.map_or(index, |v: u64| v.max(index)));
+                            min_entry_index =
+                                Some(min_entry_index.map_or(index, |v: u64| v.min(index)));
+                            max_entry_index =
+                                Some(max_entry_index.map_or(index, |v: u64| v.max(index)));
                             *last_log_id = Some(lid);
                         }
                     }
                     RecordType::Vote => {
                         flags.has_vote = true;
-                        if let Ok(decoded_vote) = openraft::impls::Vote::<C>::decode_from_slice(parsed.payload) {
+                        if let Ok(decoded_vote) =
+                            openraft::impls::Vote::<C>::decode_from_slice(parsed.payload)
+                        {
                             *vote = Some(decoded_vote);
                         }
                     }
                     RecordType::Truncate => {
                         flags.has_truncate = true;
-                        if let Ok(decoded_lid) = openraft::LogId::<C>::decode_from_slice(parsed.payload) {
+                        if let Ok(decoded_lid) =
+                            openraft::LogId::<C>::decode_from_slice(parsed.payload)
+                        {
                             *last_log_id = Some(decoded_lid);
                         }
                     }
                     RecordType::Purge => {
                         flags.has_purge = true;
-                        if let Ok(decoded_lid) = openraft::LogId::<C>::decode_from_slice(parsed.payload) {
+                        if let Ok(decoded_lid) =
+                            openraft::LogId::<C>::decode_from_slice(parsed.payload)
+                        {
                             *last_purged_log_id = Some(decoded_lid);
                         }
                     }
@@ -1521,7 +1534,6 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             max_entry_index,
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1689,7 +1701,9 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
     /// Get the purge floor handle for a specific group.
     /// Returns `None` if the group has not been initialized yet.
     pub fn get_purge_floor(&self, group_id: u64) -> Option<Arc<AtomicU64>> {
-        self.groups.get(group_id).map(|state| state.purge_floor.clone())
+        self.groups
+            .get(group_id)
+            .map(|state| state.purge_floor.clone())
     }
 }
 
@@ -1795,7 +1809,10 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
         // Entry payload layout: [term:8][node_id:8][index:8][tag:1][data...]
         let p = parsed.payload;
         if p.len() < 25 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "entry payload too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entry payload too short",
+            ));
         }
         let term = u64::from_le_bytes(p[0..8].try_into().unwrap());
         let node_id = u64::from_le_bytes(p[8..16].try_into().unwrap());
@@ -1803,10 +1820,7 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
         let tag = p[24];
 
         let log_id = openraft::LogId::<C> {
-            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> {
-                term,
-                node_id,
-            },
+            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
             index: log_index,
         };
 
@@ -1925,8 +1939,10 @@ where
 
         // Inline vote encoding — 17 bytes: [term:8][node_id:8][committed:1]
         self.payload_buf.clear();
-        self.payload_buf.extend_from_slice(&vote.leader_id.term.to_le_bytes());
-        self.payload_buf.extend_from_slice(&vote.leader_id.node_id.to_le_bytes());
+        self.payload_buf
+            .extend_from_slice(&vote.leader_id.term.to_le_bytes());
+        self.payload_buf
+            .extend_from_slice(&vote.leader_id.node_id.to_le_bytes());
         self.payload_buf.push(vote.committed as u8);
 
         // Build full record (header + payload + CRC) outside the lock
@@ -2242,7 +2258,10 @@ mod tests {
     }
 
     impl Encode for TestData {
-        fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), crate::multi::codec::CodecError> {
+        fn encode<W: std::io::Write>(
+            &self,
+            writer: &mut W,
+        ) -> Result<(), crate::multi::codec::CodecError> {
             (self.0.len() as u32).encode(writer)?;
             writer.write_all(&self.0)?;
             Ok(())
@@ -2253,7 +2272,9 @@ mod tests {
     }
 
     impl Decode for TestData {
-        fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, crate::multi::codec::CodecError> {
+        fn decode<R: std::io::Read>(
+            reader: &mut R,
+        ) -> Result<Self, crate::multi::codec::CodecError> {
             let len = u32::decode(reader)? as usize;
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf)?;
@@ -3051,7 +3072,11 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| {
                     let name = e.ok()?.file_name().to_string_lossy().to_string();
-                    if name.ends_with(".log") { Some(name) } else { None }
+                    if name.ends_with(".log") {
+                        Some(name)
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             let unique_count = seg_files.len();
@@ -3179,8 +3204,8 @@ mod tests {
                 let mut valid_end = 0;
                 let mut offset = 0;
                 while offset + 4 <= data.len() {
-                    let rlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
-                        as usize;
+                    let rlen =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     if rlen == 0 || offset + 4 + rlen > data.len() {
                         break;
                     }
@@ -3260,12 +3285,11 @@ mod tests {
                 file.read_exact(&mut data).unwrap();
 
                 // Find second record
-                let rlen1 =
-                    u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                let rlen1 = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
                 let second_start = 4 + rlen1;
-                let rlen2 = u32::from_le_bytes(
-                    data[second_start..second_start + 4].try_into().unwrap(),
-                ) as usize;
+                let rlen2 =
+                    u32::from_le_bytes(data[second_start..second_start + 4].try_into().unwrap())
+                        as usize;
                 // CRC is the last 8 bytes of the record
                 let crc_offset = second_start + 4 + rlen2 - 8;
                 // Flip CRC bytes
@@ -3284,7 +3308,11 @@ mod tests {
             let mut log = storage.get_log_storage(0).await.unwrap();
 
             let result = log.try_get_log_entries(1..4).await.unwrap();
-            assert_eq!(result.len(), 1, "Only first entry should survive CRC corruption");
+            assert_eq!(
+                result.len(),
+                1,
+                "Only first entry should survive CRC corruption"
+            );
             assert_eq!(result[0].log_id.index, 1);
 
             storage.stop();
@@ -3322,7 +3350,10 @@ mod tests {
             for entry in std::fs::read_dir(&manifest_dir).unwrap() {
                 let entry = entry.unwrap();
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("manifest") || name.ends_with(".mdbx") || name.ends_with("-lock") {
+                if name.starts_with("manifest")
+                    || name.ends_with(".mdbx")
+                    || name.ends_with("-lock")
+                {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -3337,7 +3368,11 @@ mod tests {
             let mut log = storage.get_log_storage(0).await.unwrap();
 
             let result = log.try_get_log_entries(1..21).await.unwrap();
-            assert_eq!(result.len(), 20, "All entries should be recovered via CRC scan");
+            assert_eq!(
+                result.len(),
+                20,
+                "All entries should be recovered via CRC scan"
+            );
             for (i, entry) in result.iter().enumerate() {
                 assert_eq!(entry.log_id.index, (i + 1) as u64);
             }
@@ -3397,8 +3432,8 @@ mod tests {
                 // Find end of records
                 let mut offset = 0;
                 while offset + 4 <= data.len() {
-                    let rlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
-                        as usize;
+                    let rlen =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     if rlen == 0 || offset + 4 + rlen > data.len() {
                         break;
                     }
@@ -3419,7 +3454,11 @@ mod tests {
             let mut log = storage.get_log_storage(0).await.unwrap();
 
             let result = log.try_get_log_entries(1..3).await.unwrap();
-            assert_eq!(result.len(), 2, "Both entries before zero record should be recovered");
+            assert_eq!(
+                result.len(),
+                2,
+                "Both entries before zero record should be recovered"
+            );
 
             storage.stop();
         });
@@ -3492,7 +3531,10 @@ mod tests {
 
             // Truncate after index 3
             let trunc_lid = LogId {
-                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index: 3,
             };
             log.truncate_after(Some(trunc_lid)).await.unwrap();
@@ -3558,7 +3600,10 @@ mod tests {
             // Purge entries 1-5 — only affects in-memory state and log_index
             // (no purge record written to active segment in current impl)
             let purge_lid = LogId {
-                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index: 5,
             };
             log.purge(purge_lid).await.unwrap();
@@ -3778,8 +3823,8 @@ mod tests {
         // With a short fsync delay, callbacks should fire before or during shutdown.
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            let config = MmapStorageConfig::new(tmp.path())
-                .with_fsync_delay(Duration::from_millis(10));
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_millis(10));
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
             let mut log = storage.get_log_storage(0).await.unwrap();
 
@@ -3813,8 +3858,8 @@ mod tests {
         // Callbacks may be dropped (channel closed), that's OK.
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            let config = MmapStorageConfig::new(tmp.path())
-                .with_fsync_delay(Duration::from_secs(60)); // Very long delay
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_secs(60)); // Very long delay
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
             let mut log = storage.get_log_storage(0).await.unwrap();
 
@@ -3863,7 +3908,10 @@ mod tests {
 
             // Entry 2: Normal
             assert_eq!(result[1].log_id.index, 2);
-            assert!(matches!(result[1].payload, openraft::EntryPayload::Normal(_)));
+            assert!(matches!(
+                result[1].payload,
+                openraft::EntryPayload::Normal(_)
+            ));
 
             // Entry 3: Blank
             assert_eq!(result[2].log_id.index, 3);
@@ -3907,7 +3955,10 @@ mod tests {
             let result = log.try_get_log_entries(1..4).await.unwrap();
             assert_eq!(result.len(), 3);
             assert!(matches!(result[0].payload, openraft::EntryPayload::Blank));
-            assert!(matches!(result[1].payload, openraft::EntryPayload::Normal(_)));
+            assert!(matches!(
+                result[1].payload,
+                openraft::EntryPayload::Normal(_)
+            ));
             assert!(matches!(result[2].payload, openraft::EntryPayload::Blank));
 
             storage.stop();
@@ -4114,7 +4165,10 @@ mod tests {
 
             // Truncate back to index 5 — should remove sealed segments too
             let trunc_lid = LogId {
-                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index: 5,
             };
             log.truncate_after(Some(trunc_lid)).await.unwrap();
@@ -4159,7 +4213,10 @@ mod tests {
 
             // Truncate at current last — no-op
             let trunc_lid = LogId {
-                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index: 5,
             };
             log.truncate_after(Some(trunc_lid)).await.unwrap();
@@ -4192,7 +4249,10 @@ mod tests {
 
             // Purge all entries
             let purge_lid = LogId {
-                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index: 5,
             };
             log.purge(purge_lid).await.unwrap();
@@ -4238,7 +4298,10 @@ mod tests {
 
             // Purge most entries
             let purge_lid = LogId {
-                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index: 25,
             };
             log.purge(purge_lid).await.unwrap();
@@ -4333,8 +4396,8 @@ mod tests {
         // into a single fsync.
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            let config = MmapStorageConfig::new(tmp.path())
-                .with_fsync_delay(Duration::from_millis(50));
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_millis(50));
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
             let mut log = storage.get_log_storage(0).await.unwrap();
 
@@ -4363,8 +4426,8 @@ mod tests {
         // With zero delay, callbacks should fire as quickly as possible.
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            let config = MmapStorageConfig::new(tmp.path())
-                .with_fsync_delay(Duration::from_millis(0));
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_millis(0));
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
             let mut log = storage.get_log_storage(0).await.unwrap();
 
@@ -4373,7 +4436,10 @@ mod tests {
                 let (cb, rx) = make_callback();
                 log.append(entries, cb).await.unwrap();
                 let result = tokio::time::timeout(Duration::from_secs(2), rx).await;
-                assert!(result.is_ok(), "Callback should fire quickly with zero delay");
+                assert!(
+                    result.is_ok(),
+                    "Callback should fire quickly with zero delay"
+                );
                 result.unwrap().unwrap().unwrap();
             }
 

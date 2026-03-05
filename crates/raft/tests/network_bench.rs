@@ -743,12 +743,10 @@ fn bench_connection_refresh_throughput() {
         let total: u64 = 50_000;
 
         // ---- Baseline run: long TTL, no refreshes ----
-        let baseline_harness = SingleNodeHarness::with_transport_config(
-            BisqueTcpTransportConfig {
-                connection_ttl: Duration::from_secs(300),
-                ..Default::default()
-            },
-        )
+        let baseline_harness = SingleNodeHarness::with_transport_config(BisqueTcpTransportConfig {
+            connection_ttl: Duration::from_secs(300),
+            ..Default::default()
+        })
         .await;
         baseline_harness.add_groups(&[1]).await;
 
@@ -768,12 +766,10 @@ fn bench_connection_refresh_throughput() {
         );
 
         // ---- Refresh run: 50ms TTL, forces ~60+ refreshes over a ~3s test ----
-        let refresh_harness = SingleNodeHarness::with_transport_config(
-            BisqueTcpTransportConfig {
-                connection_ttl: Duration::from_millis(50),
-                ..Default::default()
-            },
-        )
+        let refresh_harness = SingleNodeHarness::with_transport_config(BisqueTcpTransportConfig {
+            connection_ttl: Duration::from_millis(50),
+            ..Default::default()
+        })
         .await;
         refresh_harness.add_groups(&[1]).await;
 

@@ -57,7 +57,10 @@ fn decode_table_name<R: Read>(reader: &mut R) -> Result<String, CodecError> {
 /// Decode a table name from a `Bytes` buffer at the given offset.
 /// Returns `(table_name, bytes_consumed)`.
 #[inline]
-fn decode_table_name_from_bytes(data: &Bytes, offset: usize) -> Result<(String, usize), CodecError> {
+fn decode_table_name_from_bytes(
+    data: &Bytes,
+    offset: usize,
+) -> Result<(String, usize), CodecError> {
     if data.len() < offset + 2 {
         return Err(CodecError::BufferTooSmall {
             needed: offset + 2,
@@ -280,10 +283,7 @@ impl Decode for LanceCommand {
     /// obtained via `Bytes::slice()` — no memcpy for mmap-backed buffers.
     fn decode_from_bytes(data: Bytes) -> Result<Self, CodecError> {
         if data.is_empty() {
-            return Err(CodecError::BufferTooSmall {
-                needed: 1,
-                have: 0,
-            });
+            return Err(CodecError::BufferTooSmall { needed: 1, have: 0 });
         }
         let disc = data[0];
         let mut offset = 1;
