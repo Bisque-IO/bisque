@@ -19,6 +19,8 @@ use crate::write_processor::{ProcessorOutput, WriteProcessor};
 struct GaugeAccum {
     /// Last-seen timestamp (in the configured unit), if timestamp is enabled.
     timestamp: Option<i64>,
+    /// Last-seen start_time, if start_time column is enabled.
+    start_time: Option<i64>,
     /// Last-seen value.
     value: f64,
 }
@@ -35,6 +37,8 @@ pub struct GaugeAggregator {
     timestamp_column: Option<String>,
     /// Time unit for the timestamp column.
     timestamp_unit: TimeUnit,
+    /// Optional start_time column — last-write-wins per group.
+    start_time_column: Option<String>,
 }
 
 impl GaugeAggregator {
@@ -48,6 +52,7 @@ impl GaugeAggregator {
             value_column: value_column.into(),
             timestamp_column: None,
             timestamp_unit: TimeUnit::Millisecond,
+            start_time_column: None,
         }
     }
 
@@ -64,6 +69,13 @@ impl GaugeAggregator {
         self
     }
 
+    /// Add a start_time column. During aggregation, the last-seen start_time
+    /// per group is preserved (same semantics as the gauge value itself).
+    pub fn with_start_time(mut self, column: impl Into<String>) -> Self {
+        self.start_time_column = Some(column.into());
+        self
+    }
+
     fn output_schema(&self) -> Schema {
         let mut fields: Vec<Field> = self
             .key_columns
@@ -74,6 +86,14 @@ impl GaugeAggregator {
         if let Some(ts_col) = &self.timestamp_column {
             fields.push(Field::new(
                 ts_col,
+                DataType::Timestamp(self.timestamp_unit, None),
+                false,
+            ));
+        }
+
+        if let Some(st_col) = &self.start_time_column {
+            fields.push(Field::new(
+                st_col,
                 DataType::Timestamp(self.timestamp_unit, None),
                 false,
             ));
@@ -110,6 +130,10 @@ impl GaugeAggregator {
                 extract_timestamp_array(batch, name, self.timestamp_unit)
             });
 
+            let st_values = self.start_time_column.as_ref().map(|name| {
+                extract_timestamp_array(batch, name, self.timestamp_unit)
+            });
+
             let value_array = batch
                 .column_by_name(&self.value_column)
                 .unwrap_or_else(|| panic!("value column '{}' not found", self.value_column))
@@ -130,17 +154,20 @@ impl GaugeAggregator {
                 }
 
                 let ts = ts_values.as_ref().map(|ts| ts[row]);
+                let st = st_values.as_ref().map(|st| st[row]);
                 let value = value_array.value(row);
 
                 // Last-write-wins: overwrite on hit, avoiding key clone.
                 if let Some(entry) = accum.get_mut(key_buf.as_str()) {
                     entry.value = value;
                     entry.timestamp = ts;
+                    entry.start_time = st;
                 } else {
                     accum.insert(
                         key_buf.clone(),
                         GaugeAccum {
                             timestamp: ts,
+                            start_time: st,
                             value,
                         },
                     );
@@ -154,12 +181,18 @@ impl GaugeAggregator {
     fn build_output(&self, accum: &HashMap<String, GaugeAccum>, num_key_cols: usize) -> RecordBatch {
         let num_groups = accum.len();
         let has_ts = self.timestamp_column.is_some();
+        let has_st = self.start_time_column.is_some();
 
         let mut key_builders: Vec<StringBuilder> = (0..num_key_cols)
             .map(|_| StringBuilder::with_capacity(num_groups, num_groups * 32))
             .collect();
         let mut value_builder = Float64Builder::with_capacity(num_groups);
         let mut ts_values: Vec<i64> = if has_ts {
+            Vec::with_capacity(num_groups)
+        } else {
+            Vec::new()
+        };
+        let mut st_values: Vec<i64> = if has_st {
             Vec::with_capacity(num_groups)
         } else {
             Vec::new()
@@ -173,6 +206,9 @@ impl GaugeAggregator {
             if let Some(ts) = entry.timestamp {
                 ts_values.push(ts);
             }
+            if let Some(st) = entry.start_time {
+                st_values.push(st);
+            }
             value_builder.append_value(entry.value);
         }
 
@@ -184,6 +220,10 @@ impl GaugeAggregator {
 
         if has_ts {
             columns.push(build_timestamp_array(&ts_values, self.timestamp_unit, num_groups));
+        }
+
+        if has_st {
+            columns.push(build_timestamp_array(&st_values, self.timestamp_unit, num_groups));
         }
 
         columns.push(Arc::new(value_builder.finish()) as ArrayRef);
@@ -207,6 +247,7 @@ impl WriteProcessor for GaugeAggregator {
             value_column: self.value_column.clone(),
             timestamp_column: self.timestamp_column.clone(),
             timestamp_unit: time_unit_to_string(self.timestamp_unit),
+            start_time_column: self.start_time_column.clone(),
         })
     }
 }

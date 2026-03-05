@@ -295,12 +295,16 @@ pub enum ProcessorDescriptor {
         timestamp_column: Option<String>,
         timestamp_resolution_ms: i64,
         timestamp_unit: String,
+        #[serde(default)]
+        start_time_column: Option<String>,
     },
     Gauge {
         key_columns: Vec<String>,
         value_column: String,
         timestamp_column: Option<String>,
         timestamp_unit: String,
+        #[serde(default)]
+        start_time_column: Option<String>,
     },
     Histogram {
         key_columns: Vec<String>,
@@ -310,7 +314,23 @@ pub enum ProcessorDescriptor {
         count_column: String,
         timestamp_column: Option<String>,
         timestamp_unit: String,
+        #[serde(default)]
+        start_time_column: Option<String>,
+        #[serde(default)]
+        min_column: Option<String>,
+        #[serde(default)]
+        max_column: Option<String>,
     },
+    /// Specialized OTEL sum (counter) aggregator (sums values, truncates timestamps).
+    OtelSum {
+        timestamp_resolution_ms: i64,
+    },
+    /// Specialized OTEL gauge processor (last-write-wins).
+    OtelGauge,
+    /// Specialized OTEL histogram processor (merges buckets).
+    OtelHistogram,
+    /// Specialized OTEL exponential histogram aggregator (merges exp buckets).
+    OtelExpHistogram,
 }
 
 impl ProcessorDescriptor {
@@ -324,6 +344,7 @@ impl ProcessorDescriptor {
                 timestamp_column,
                 timestamp_resolution_ms,
                 timestamp_unit,
+                start_time_column,
             } => {
                 let mut agg = crate::processors::CounterAggregator::new(
                     key_columns.clone(),
@@ -333,6 +354,9 @@ impl ProcessorDescriptor {
                     agg = agg.with_timestamp(ts_col.clone(), *timestamp_resolution_ms);
                 }
                 agg = agg.with_timestamp_unit(parse_time_unit(timestamp_unit));
+                if let Some(st_col) = start_time_column {
+                    agg = agg.with_start_time(st_col.clone());
+                }
                 Arc::new(agg)
             }
             ProcessorDescriptor::Gauge {
@@ -340,6 +364,7 @@ impl ProcessorDescriptor {
                 value_column,
                 timestamp_column,
                 timestamp_unit,
+                start_time_column,
             } => {
                 let mut agg = crate::processors::GaugeAggregator::new(
                     key_columns.clone(),
@@ -349,6 +374,9 @@ impl ProcessorDescriptor {
                     agg = agg.with_timestamp(ts_col.clone());
                 }
                 agg = agg.with_timestamp_unit(parse_time_unit(timestamp_unit));
+                if let Some(st_col) = start_time_column {
+                    agg = agg.with_start_time(st_col.clone());
+                }
                 Arc::new(agg)
             }
             ProcessorDescriptor::Histogram {
@@ -359,6 +387,9 @@ impl ProcessorDescriptor {
                 count_column,
                 timestamp_column,
                 timestamp_unit,
+                start_time_column,
+                min_column,
+                max_column,
             } => {
                 let mut agg =
                     crate::processors::HistogramAggregator::new(key_columns.clone())
@@ -372,7 +403,30 @@ impl ProcessorDescriptor {
                     agg = agg.with_timestamp(ts_col.clone());
                 }
                 agg = agg.with_timestamp_unit(parse_time_unit(timestamp_unit));
+                if let Some(st_col) = start_time_column {
+                    agg = agg.with_start_time(st_col.clone());
+                }
+                if let Some(min_col) = min_column {
+                    agg = agg.with_min_column(min_col.clone());
+                }
+                if let Some(max_col) = max_column {
+                    agg = agg.with_max_column(max_col.clone());
+                }
                 Arc::new(agg)
+            }
+            ProcessorDescriptor::OtelSum {
+                timestamp_resolution_ms,
+            } => Arc::new(
+                crate::otel::processors::OtelSumAggregator::new(*timestamp_resolution_ms),
+            ),
+            ProcessorDescriptor::OtelGauge => {
+                Arc::new(crate::otel::processors::OtelGaugeProcessor::new())
+            }
+            ProcessorDescriptor::OtelHistogram => {
+                Arc::new(crate::otel::processors::OtelHistogramProcessor::new())
+            }
+            ProcessorDescriptor::OtelExpHistogram => {
+                Arc::new(crate::otel::processors::OtelExpHistogramAggregator::new())
             }
         }
     }

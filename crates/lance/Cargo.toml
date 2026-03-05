@@ -41,6 +41,7 @@ futures = { workspace = true }
 
 # gRPC
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 prost = { workspace = true }
 
 # PostgreSQL wire protocol
@@ -48,6 +49,13 @@ datafusion-postgres = { workspace = true }
 
 # OpenTelemetry
 opentelemetry-proto = { workspace = true }
+
+# HTTP (Tempo / Prometheus / Loki)
+axum = { workspace = true }
+snap = { workspace = true }
+hex = { workspace = true }
+promql-parser = { workspace = true }
+regex = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

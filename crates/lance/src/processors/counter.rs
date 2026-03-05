@@ -36,6 +36,8 @@ use crate::write_processor::{ProcessorOutput, WriteProcessor};
 struct CounterAccum {
     /// Truncated timestamp (in the configured unit), if timestamp is enabled.
     timestamp: Option<i64>,
+    /// Minimum start_time seen, if start_time column is enabled.
+    start_time: Option<i64>,
     /// Accumulated sum.
     sum: f64,
 }
@@ -56,6 +58,8 @@ pub struct CounterAggregator {
     timestamp_resolution_ms: i64,
     /// Time unit for the timestamp column.
     timestamp_unit: TimeUnit,
+    /// Optional start_time column — aggregated as min(start_time) per group.
+    start_time_column: Option<String>,
 }
 
 impl CounterAggregator {
@@ -70,6 +74,7 @@ impl CounterAggregator {
             timestamp_column: None,
             timestamp_resolution_ms: 60_000,
             timestamp_unit: TimeUnit::Millisecond,
+            start_time_column: None,
         }
     }
 
@@ -84,6 +89,13 @@ impl CounterAggregator {
     /// Set the time unit for the timestamp column (default: Millisecond).
     pub fn with_timestamp_unit(mut self, unit: TimeUnit) -> Self {
         self.timestamp_unit = unit;
+        self
+    }
+
+    /// Add a start_time column. During aggregation, the minimum start_time
+    /// across all rows in a group is preserved.
+    pub fn with_start_time(mut self, column: impl Into<String>) -> Self {
+        self.start_time_column = Some(column.into());
         self
     }
 
@@ -107,6 +119,14 @@ impl CounterAggregator {
         if let Some(ts_col) = &self.timestamp_column {
             fields.push(Field::new(
                 ts_col,
+                DataType::Timestamp(self.timestamp_unit, None),
+                false,
+            ));
+        }
+
+        if let Some(st_col) = &self.start_time_column {
+            fields.push(Field::new(
+                st_col,
                 DataType::Timestamp(self.timestamp_unit, None),
                 false,
             ));
@@ -146,6 +166,10 @@ impl CounterAggregator {
                 extract_timestamp_array(batch, name, self.timestamp_unit)
             });
 
+            let st_values = self.start_time_column.as_ref().map(|name| {
+                extract_timestamp_array(batch, name, self.timestamp_unit)
+            });
+
             let value_array = batch
                 .column_by_name(&self.value_column)
                 .unwrap_or_else(|| panic!("value column '{}' not found", self.value_column))
@@ -178,13 +202,21 @@ impl CounterAggregator {
                     truncated
                 });
 
+                let st = st_values.as_ref().map(|st| st[row]);
+
                 if let Some(entry) = accum.get_mut(key_buf.as_str()) {
                     entry.sum += value_array.value(row);
+                    // Keep minimum start_time across group.
+                    if let Some(new_st) = st {
+                        entry.start_time =
+                            Some(entry.start_time.map_or(new_st, |old| old.min(new_st)));
+                    }
                 } else {
                     accum.insert(
                         key_buf.clone(),
                         CounterAccum {
                             timestamp: truncated_ts,
+                            start_time: st,
                             sum: value_array.value(row),
                         },
                     );
@@ -198,6 +230,7 @@ impl CounterAggregator {
     fn build_output(&self, accum: &HashMap<String, CounterAccum>, num_key_cols: usize) -> RecordBatch {
         let num_groups = accum.len();
         let has_ts = self.timestamp_column.is_some();
+        let has_st = self.start_time_column.is_some();
 
         let mut key_builders: Vec<StringBuilder> = (0..num_key_cols)
             .map(|_| StringBuilder::with_capacity(num_groups, num_groups * 32))
@@ -208,17 +241,22 @@ impl CounterAggregator {
         } else {
             Vec::new()
         };
+        let mut st_values: Vec<i64> = if has_st {
+            Vec::with_capacity(num_groups)
+        } else {
+            Vec::new()
+        };
 
         for (composite_key, entry) in accum {
-            // Reconstruct key parts from the composite key (split by \0).
-            // For counter with timestamp, the last \0-delimited segment is
-            // the stringified truncated timestamp — consumed by splitn limit.
             let mut parts = composite_key.split('\0');
             for builder in key_builders.iter_mut() {
                 builder.append_value(parts.next().unwrap());
             }
             if let Some(ts) = entry.timestamp {
                 ts_values.push(ts);
+            }
+            if let Some(st) = entry.start_time {
+                st_values.push(st);
             }
             value_builder.append_value(entry.sum);
         }
@@ -231,6 +269,10 @@ impl CounterAggregator {
 
         if has_ts {
             columns.push(build_timestamp_array(&ts_values, self.timestamp_unit, num_groups));
+        }
+
+        if has_st {
+            columns.push(build_timestamp_array(&st_values, self.timestamp_unit, num_groups));
         }
 
         columns.push(Arc::new(value_builder.finish()) as ArrayRef);
@@ -255,6 +297,7 @@ impl WriteProcessor for CounterAggregator {
             timestamp_column: self.timestamp_column.clone(),
             timestamp_resolution_ms: self.timestamp_resolution_ms,
             timestamp_unit: time_unit_to_string(self.timestamp_unit),
+            start_time_column: self.start_time_column.clone(),
         })
     }
 }

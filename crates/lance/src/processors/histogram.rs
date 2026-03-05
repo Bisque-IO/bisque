@@ -36,6 +36,12 @@ struct HistogramAccum {
     count: u64,
     /// Latest (max) timestamp, if timestamp is enabled.
     timestamp: Option<i64>,
+    /// Minimum start_time across all rows in the group.
+    start_time: Option<i64>,
+    /// Minimum of all min values in the group.
+    min: Option<f64>,
+    /// Maximum of all max values in the group.
+    max: Option<f64>,
 }
 
 /// Stateless histogram aggregator — groups by key columns and merges
@@ -56,6 +62,12 @@ pub struct HistogramAggregator {
     timestamp_column: Option<String>,
     /// Time unit for the timestamp column.
     timestamp_unit: TimeUnit,
+    /// Optional start_time column — aggregated as min(start_time) per group.
+    start_time_column: Option<String>,
+    /// Optional min column — aggregated as min(all mins) per group.
+    min_column: Option<String>,
+    /// Optional max column — aggregated as max(all maxes) per group.
+    max_column: Option<String>,
 }
 
 impl HistogramAggregator {
@@ -71,6 +83,9 @@ impl HistogramAggregator {
             count_column: "count".to_string(),
             timestamp_column: None,
             timestamp_unit: TimeUnit::Millisecond,
+            start_time_column: None,
+            min_column: None,
+            max_column: None,
         }
     }
 
@@ -102,6 +117,27 @@ impl HistogramAggregator {
         self
     }
 
+    /// Add a start_time column. During aggregation, the minimum start_time
+    /// across all rows in a group is preserved.
+    pub fn with_start_time(mut self, column: impl Into<String>) -> Self {
+        self.start_time_column = Some(column.into());
+        self
+    }
+
+    /// Add a min column. During aggregation, the minimum value across all
+    /// rows in a group is preserved.
+    pub fn with_min_column(mut self, column: impl Into<String>) -> Self {
+        self.min_column = Some(column.into());
+        self
+    }
+
+    /// Add a max column. During aggregation, the maximum value across all
+    /// rows in a group is preserved.
+    pub fn with_max_column(mut self, column: impl Into<String>) -> Self {
+        self.max_column = Some(column.into());
+        self
+    }
+
     fn output_schema(&self) -> Schema {
         let mut fields: Vec<Field> = self
             .key_columns
@@ -112,6 +148,14 @@ impl HistogramAggregator {
         if let Some(ts_col) = &self.timestamp_column {
             fields.push(Field::new(
                 ts_col,
+                DataType::Timestamp(self.timestamp_unit, None),
+                false,
+            ));
+        }
+
+        if let Some(st_col) = &self.start_time_column {
+            fields.push(Field::new(
+                st_col,
                 DataType::Timestamp(self.timestamp_unit, None),
                 false,
             ));
@@ -129,6 +173,13 @@ impl HistogramAggregator {
         ));
         fields.push(Field::new(&self.sum_column, DataType::Float64, false));
         fields.push(Field::new(&self.count_column, DataType::UInt64, false));
+
+        if let Some(min_col) = &self.min_column {
+            fields.push(Field::new(min_col, DataType::Float64, false));
+        }
+        if let Some(max_col) = &self.max_column {
+            fields.push(Field::new(max_col, DataType::Float64, false));
+        }
 
         Schema::new(fields)
     }
@@ -205,6 +256,28 @@ impl HistogramAggregator {
                 extract_timestamp_array(batch, name, self.timestamp_unit)
             });
 
+            let st_values = self.start_time_column.as_ref().map(|name| {
+                extract_timestamp_array(batch, name, self.timestamp_unit)
+            });
+
+            let min_array = self.min_column.as_ref().map(|name| {
+                batch
+                    .column_by_name(name)
+                    .unwrap_or_else(|| panic!("min column '{}' not found", name))
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap_or_else(|| panic!("min column '{}' must be Float64", name))
+            });
+
+            let max_array = self.max_column.as_ref().map(|name| {
+                batch
+                    .column_by_name(name)
+                    .unwrap_or_else(|| panic!("max column '{}' not found", name))
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap_or_else(|| panic!("max column '{}' must be Float64", name))
+            });
+
             for row in 0..num_rows {
                 // Build composite key: "col0\0col1\0..."
                 key_buf.clear();
@@ -216,8 +289,11 @@ impl HistogramAggregator {
                 }
 
                 let ts = ts_values.as_ref().map(|ts| ts[row]);
+                let st = st_values.as_ref().map(|st| st[row]);
                 let sum = sum_array.value(row);
                 let count = count_array.value(row);
+                let row_min = min_array.as_ref().map(|a| a.value(row));
+                let row_max = max_array.as_ref().map(|a| a.value(row));
 
                 // Last-write-wins for key lookup; merge on hit.
                 if let Some(existing) = accum.get_mut(key_buf.as_str()) {
@@ -244,6 +320,21 @@ impl HistogramAggregator {
                         existing.timestamp =
                             Some(existing.timestamp.map_or(new_ts, |old| old.max(new_ts)));
                     }
+                    // Keep the earliest (min) start_time.
+                    if let Some(new_st) = st {
+                        existing.start_time =
+                            Some(existing.start_time.map_or(new_st, |old| old.min(new_st)));
+                    }
+                    // Aggregate min (take minimum).
+                    if let Some(v) = row_min {
+                        existing.min =
+                            Some(existing.min.map_or(v, |old| old.min(v)));
+                    }
+                    // Aggregate max (take maximum).
+                    if let Some(v) = row_max {
+                        existing.max =
+                            Some(existing.max.map_or(v, |old| old.max(v)));
+                    }
                 } else {
                     // First occurrence: extract boundaries and bucket counts.
                     let b_values = boundaries_list.value(row);
@@ -264,6 +355,9 @@ impl HistogramAggregator {
                             sum,
                             count,
                             timestamp: ts,
+                            start_time: st,
+                            min: row_min,
+                            max: row_max,
                         },
                     );
                 }
@@ -280,6 +374,9 @@ impl HistogramAggregator {
     ) -> RecordBatch {
         let num_groups = accum.len();
         let has_ts = self.timestamp_column.is_some();
+        let has_st = self.start_time_column.is_some();
+        let has_min = self.min_column.is_some();
+        let has_max = self.max_column.is_some();
 
         let mut key_builders: Vec<StringBuilder> = (0..num_key_cols)
             .map(|_| StringBuilder::with_capacity(num_groups, num_groups * 32))
@@ -299,6 +396,21 @@ impl HistogramAggregator {
         } else {
             Vec::new()
         };
+        let mut st_values: Vec<i64> = if has_st {
+            Vec::with_capacity(num_groups)
+        } else {
+            Vec::new()
+        };
+        let mut min_builder = if has_min {
+            Some(Float64Builder::with_capacity(num_groups))
+        } else {
+            None
+        };
+        let mut max_builder = if has_max {
+            Some(Float64Builder::with_capacity(num_groups))
+        } else {
+            None
+        };
 
         for (composite_key, entry) in accum.iter() {
             let mut parts = composite_key.split('\0');
@@ -308,6 +420,9 @@ impl HistogramAggregator {
 
             if let Some(ts) = entry.timestamp {
                 ts_values.push(ts);
+            }
+            if let Some(st) = entry.start_time {
+                st_values.push(st);
             }
 
             let b_inner = boundaries_builder.values();
@@ -324,6 +439,13 @@ impl HistogramAggregator {
 
             sum_builder.append_value(entry.sum);
             count_builder.append_value(entry.count);
+
+            if let Some(ref mut builder) = min_builder {
+                builder.append_value(entry.min.unwrap_or(0.0));
+            }
+            if let Some(ref mut builder) = max_builder {
+                builder.append_value(entry.max.unwrap_or(0.0));
+            }
         }
 
         let schema = Arc::new(self.output_schema());
@@ -340,10 +462,25 @@ impl HistogramAggregator {
             ));
         }
 
+        if has_st {
+            columns.push(build_timestamp_array(
+                &st_values,
+                self.timestamp_unit,
+                num_groups,
+            ));
+        }
+
         columns.push(Arc::new(boundaries_builder.finish()) as ArrayRef);
         columns.push(Arc::new(bucket_counts_builder.finish()) as ArrayRef);
         columns.push(Arc::new(sum_builder.finish()) as ArrayRef);
         columns.push(Arc::new(count_builder.finish()) as ArrayRef);
+
+        if let Some(mut builder) = min_builder {
+            columns.push(Arc::new(builder.finish()) as ArrayRef);
+        }
+        if let Some(mut builder) = max_builder {
+            columns.push(Arc::new(builder.finish()) as ArrayRef);
+        }
 
         RecordBatch::try_new(schema, columns).expect("schema mismatch in histogram aggregation")
     }
@@ -367,6 +504,9 @@ impl WriteProcessor for HistogramAggregator {
             count_column: self.count_column.clone(),
             timestamp_column: self.timestamp_column.clone(),
             timestamp_unit: time_unit_to_string(self.timestamp_unit),
+            start_time_column: self.start_time_column.clone(),
+            min_column: self.min_column.clone(),
+            max_column: self.max_column.clone(),
         })
     }
 }

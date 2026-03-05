@@ -45,6 +45,7 @@ categories = ["asynchronous", "concurrency"]
 allocator-api2 = "0.4"
 anyerror = "0.1"
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
 arrow = { version = "57", default-features = false }
 arrow-array = { version = "57", default-features = false }
 arrow-cast = { version = "57", default-features = false, features = ["prettyprint"] }
@@ -91,6 +92,7 @@ futures-lite = "2.6"
 futures-util = "0.3"
 # ghost-cell = "0.2.6"
 hdrhistogram = "7.5"
+hex = "0.4"
 hyper = { version = "1.8" }
 libc = "0.2"
 datafusion = { version = "52.1.0", default-features = false }
@@ -117,6 +119,7 @@ native-tls = "0.2"
 nix = { version = "0.30", features = ["sched"] }
 once_cell = "1.21"
 parking_lot = "0.12"
+promql-parser = "0.4"
 prost = { version = "0.14", default-features = false }
 pin-project-lite = "0.2"
 pollster = "0.4"
@@ -125,6 +128,7 @@ proc-macro2 = "1.0.60"
 proptest = "1.0"
 quote = "1"
 rand = "0.9"
+regex = "1"
 rcgen = "0.13"
 reusable-box-future = { version = "0.2" }
 rlsf = "0.2"
@@ -136,6 +140,7 @@ rustls-webpki = "0.103"
 semver = "1"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+snap = "1"
 snmalloc-rs = "0.3"
 socket2 = { version = "0.6", features = ["all"] }
 syn = "2"
@@ -144,6 +149,7 @@ thiserror = "2.0"
 tokio = { version = "1", default-features = false }
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "router", "gzip"] }
+tonic-prost = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
 tokio-test = "0.4"
 tokio-util = "0.7"

@@ -39,7 +39,7 @@ pub use engine::BisqueLance;
 pub use error::{Error, Result};
 pub use flight::BisqueFlightService;
 pub use manifest::LanceManifestManager;
-pub use otel::{OtlpReceiver, serve_otlp};
+pub use otel::{OtlpReceiver, serve_http, serve_otlp};
 pub use postgres::{PostgresServerConfig, serve_postgres};
 pub use processors::{CounterAggregator, GaugeAggregator, HistogramAggregator};
 pub use query::BisqueLanceTableProvider;

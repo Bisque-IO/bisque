@@ -1,12 +1,7 @@
 Create system to limit max concurrent tables for compaction
   - Try to constrain memory and disk to some user configurable threshold
 
-Metrics Specialized Tables
-  - Histogram
-  - Counter
-  - Gauge
+Create table stats that get persisted in the manifest
 
-Logging Table Type
-  - Store application logs
-  - Flexible schema to support any log fields
-  - Full-text search support
+rename OtelCounterAggregator to OtelSumAggregator
+add aggregator for exponential histogram
