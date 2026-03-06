@@ -7,6 +7,10 @@ import type {
   TempoTraceResult,
   PromResult,
   LokiStream,
+  ClusterNode,
+  ClusterStatus,
+  TableIndex,
+  Operation,
 } from "./api"
 
 // ---------------------------------------------------------------------------
@@ -113,6 +117,7 @@ export interface MockTableInfo {
     cold: StorageTierInfo
   }
   metrics: IngestionMetrics
+  indexes: TableIndex[]
 }
 
 function mockStorage(hotMB: number, warmMB: number, coldMB: number, hotRows: number, warmRows: number, coldRows: number): MockTableInfo["storage"] {
@@ -151,6 +156,11 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
       ],
       storage: mockStorage(128, 512, 2048, 850_000, 3_200_000, 12_500_000),
       metrics: mockMetrics(1200, 3.2, 18.5, 450, 120),
+      indexes: [
+        { name: "timestamp_btree", columns: ["timestamp"], index_type: "BTree", dataset_version: 40, fragment_count: 32, total_fragments: 32 },
+        { name: "user_id_btree", columns: ["user_id"], index_type: "BTree", dataset_version: 40, fragment_count: 32, total_fragments: 32 },
+        { name: "page_url_fts", columns: ["page_url"], index_type: "Inverted", dataset_version: 40, fragment_count: 32, total_fragments: 32 },
+      ],
     },
     conversions: {
       active_version: 18,
@@ -164,6 +174,10 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
       ],
       storage: mockStorage(32, 96, 384, 120_000, 450_000, 1_800_000),
       metrics: mockMetrics(180, 2.1, 12.0, 80, 45),
+      indexes: [
+        { name: "timestamp_btree", columns: ["timestamp"], index_type: "BTree", dataset_version: 16, fragment_count: 4, total_fragments: 4 },
+        { name: "event_name_btree", columns: ["event_name"], index_type: "BTree", dataset_version: 16, fragment_count: 4, total_fragments: 4 },
+      ],
     },
     user_profiles: {
       active_version: 7,
@@ -177,6 +191,11 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
       ],
       storage: mockStorage(256, 128, 64, 50_000, 25_000, 10_000),
       metrics: mockMetrics(15, 8.5, 42.0, 0, 0),
+      indexes: [
+        { name: "user_id_btree", columns: ["user_id"], index_type: "BTree", dataset_version: 5, fragment_count: 2, total_fragments: 2 },
+        { name: "email_fts", columns: ["email"], index_type: "Inverted", dataset_version: 5, fragment_count: 2, total_fragments: 2 },
+        { name: "embedding_vector", columns: ["embedding"], index_type: "IvfHnswSq", dataset_version: 5, fragment_count: 2, total_fragments: 2 },
+      ],
     },
   },
   events: {
@@ -192,6 +211,10 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
       ],
       storage: mockStorage(256, 1024, 4096, 2_000_000, 8_000_000, 32_000_000),
       metrics: mockMetrics(5500, 1.8, 9.2, 1200, 220),
+      indexes: [
+        { name: "timestamp_btree", columns: ["timestamp"], index_type: "BTree", dataset_version: 100, fragment_count: 64, total_fragments: 64 },
+        { name: "session_id_btree", columns: ["session_id"], index_type: "BTree", dataset_version: 100, fragment_count: 64, total_fragments: 64 },
+      ],
     },
     purchases: {
       active_version: 55,
@@ -205,6 +228,11 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
       ],
       storage: mockStorage(64, 256, 1024, 300_000, 1_200_000, 4_800_000),
       metrics: mockMetrics(350, 4.5, 22.0, 150, 85),
+      indexes: [
+        { name: "timestamp_btree", columns: ["timestamp"], index_type: "BTree", dataset_version: 53, fragment_count: 8, total_fragments: 8 },
+        { name: "order_id_btree", columns: ["order_id"], index_type: "BTree", dataset_version: 53, fragment_count: 8, total_fragments: 8 },
+        { name: "user_id_btree", columns: ["user_id"], index_type: "BTree", dataset_version: 53, fragment_count: 8, total_fragments: 8 },
+      ],
     },
     impressions: {
       active_version: 210,
@@ -217,6 +245,11 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
       ],
       storage: mockStorage(512, 2048, 8192, 4_000_000, 16_000_000, 64_000_000),
       metrics: mockMetrics(12000, 1.2, 6.5, 3500, 290),
+      indexes: [
+        { name: "timestamp_btree", columns: ["timestamp"], index_type: "BTree", dataset_version: 208, fragment_count: 128, total_fragments: 128 },
+        { name: "ad_id_bitmap", columns: ["ad_id"], index_type: "Bitmap", dataset_version: 208, fragment_count: 128, total_fragments: 128 },
+        { name: "placement_bitmap", columns: ["placement"], index_type: "Bitmap", dataset_version: 208, fragment_count: 128, total_fragments: 128 },
+      ],
     },
   },
   otel: {
@@ -235,6 +268,12 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
       ],
       storage: mockStorage(384, 1536, 6144, 3_000_000, 12_000_000, 48_000_000),
       metrics: mockMetrics(8500, 2.0, 11.0, 2100, 250),
+      indexes: [
+        { name: "start_time_btree", columns: ["start_time"], index_type: "BTree", dataset_version: 318, fragment_count: 96, total_fragments: 96 },
+        { name: "trace_id_btree", columns: ["trace_id"], index_type: "BTree", dataset_version: 318, fragment_count: 96, total_fragments: 96 },
+        { name: "service_name_bitmap", columns: ["service_name"], index_type: "Bitmap", dataset_version: 318, fragment_count: 96, total_fragments: 96 },
+        { name: "operation_name_fts", columns: ["operation_name"], index_type: "Inverted", dataset_version: 318, fragment_count: 96, total_fragments: 96 },
+      ],
     },
     otel_logs: {
       active_version: 150,
@@ -249,6 +288,12 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
       ],
       storage: mockStorage(192, 768, 3072, 1_500_000, 6_000_000, 24_000_000),
       metrics: mockMetrics(4200, 1.5, 8.0, 800, 190),
+      indexes: [
+        { name: "timestamp_btree", columns: ["timestamp"], index_type: "BTree", dataset_version: 148, fragment_count: 48, total_fragments: 48 },
+        { name: "severity_bitmap", columns: ["severity"], index_type: "Bitmap", dataset_version: 148, fragment_count: 48, total_fragments: 48 },
+        { name: "body_fts", columns: ["body"], index_type: "Inverted", dataset_version: 148, fragment_count: 48, total_fragments: 48 },
+        { name: "service_name_bitmap", columns: ["service_name"], index_type: "Bitmap", dataset_version: 148, fragment_count: 48, total_fragments: 48 },
+      ],
     },
     otel_metrics: {
       active_version: 88,
@@ -261,6 +306,10 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
       ],
       storage: mockStorage(96, 384, 1536, 750_000, 3_000_000, 12_000_000),
       metrics: mockMetrics(2800, 1.0, 5.5, 400, 95),
+      indexes: [
+        { name: "timestamp_btree", columns: ["timestamp"], index_type: "BTree", dataset_version: 86, fragment_count: 24, total_fragments: 24 },
+        { name: "metric_name_btree", columns: ["metric_name"], index_type: "BTree", dataset_version: 86, fragment_count: 24, total_fragments: 24 },
+      ],
     },
   },
 }
@@ -500,10 +549,293 @@ export interface MockApiKey {
   created_at: string
 }
 
+// ---------------------------------------------------------------------------
+// Cluster nodes
+// ---------------------------------------------------------------------------
+
+export const MOCK_CLUSTER_NODES: ClusterNode[] = [
+  {
+    node_id: 1,
+    address: "10.0.1.1:3200",
+    raft_role: "leader",
+    raft_term: 5,
+    raft_applied_index: 10248,
+    raft_commit_index: 10248,
+    current_leader_id: 1,
+    uptime_seconds: 86400 * 3 + 7200,
+    catalogs: 3,
+    tables: 9,
+    requests_total: 1_284_320,
+    cpu_usage_pct: 32.5,
+    memory_used_bytes: 512 * 1024 * 1024,
+    memory_total_bytes: 2048 * 1024 * 1024,
+    version: "0.1.0",
+    started_at: "2026-03-03T08:00:00Z",
+  },
+  {
+    node_id: 2,
+    address: "10.0.1.2:3200",
+    raft_role: "follower",
+    raft_term: 5,
+    raft_applied_index: 10246,
+    raft_commit_index: 10248,
+    current_leader_id: 1,
+    uptime_seconds: 86400 * 3 + 7100,
+    catalogs: 3,
+    tables: 9,
+    requests_total: 842_100,
+    cpu_usage_pct: 18.2,
+    memory_used_bytes: 384 * 1024 * 1024,
+    memory_total_bytes: 2048 * 1024 * 1024,
+    version: "0.1.0",
+    started_at: "2026-03-03T08:01:40Z",
+  },
+  {
+    node_id: 3,
+    address: "10.0.1.3:3200",
+    raft_role: "follower",
+    raft_term: 5,
+    raft_applied_index: 10245,
+    raft_commit_index: 10248,
+    current_leader_id: 1,
+    uptime_seconds: 86400 * 2 + 3600,
+    catalogs: 3,
+    tables: 9,
+    requests_total: 791_540,
+    cpu_usage_pct: 15.8,
+    memory_used_bytes: 356 * 1024 * 1024,
+    memory_total_bytes: 2048 * 1024 * 1024,
+    version: "0.1.0",
+    started_at: "2026-03-04T09:00:00Z",
+  },
+]
+
+export const MOCK_CLUSTER_STATUS: ClusterStatus = {
+  cluster_name: "production",
+  nodes: MOCK_CLUSTER_NODES,
+  total_catalogs: 3,
+  total_tables: 9,
+  total_raft_groups: 3,
+}
+
+// ---------------------------------------------------------------------------
+// API Keys
+// ---------------------------------------------------------------------------
+
 export const MOCK_API_KEYS: MockApiKey[] = [
   { id: 1, tenant_id: 1, scopes: ["TenantAdmin"], revoked: false, created_at: "2025-12-01T00:00:00Z" },
   { id: 2, tenant_id: 1, scopes: ["TenantAdmin"], revoked: false, created_at: "2025-12-05T10:30:00Z" },
   { id: 3, tenant_id: 1, scopes: [{ Catalog: "analytics" }], revoked: false, created_at: "2026-01-10T14:00:00Z" },
   { id: 4, tenant_id: 1, scopes: [{ CatalogRead: "events" }], revoked: false, created_at: "2026-02-01T09:00:00Z" },
   { id: 5, tenant_id: 1, scopes: [{ Catalog: "otel" }], revoked: true, created_at: "2026-01-20T16:45:00Z" },
+]
+
+// ---------------------------------------------------------------------------
+// Operations (mock background reindex/compact tasks)
+// ---------------------------------------------------------------------------
+
+let mockOpCounter = 0
+
+function mockOpId(): string {
+  return `mock-op-${++mockOpCounter}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+export const MOCK_OPERATIONS: Operation[] = [
+  // ---- Cold (S3) operations — queued ----
+  {
+    id: mockOpId(),
+    node_id: 1,
+    op_type: "reindex",
+    tier: "cold",
+    tenant: "Acme Corp",
+    catalog: "analytics",
+    catalog_type: "Lance",
+    table: "page_views",
+    status: "running",
+    progress: 0.65,
+    created_at: "2026-03-06T10:00:00Z",
+    started_at: "2026-03-06T10:00:02Z",
+    fragments_done: 130,
+    fragments_total: 200,
+  },
+  {
+    id: mockOpId(),
+    node_id: 2,
+    op_type: "compact",
+    tier: "cold",
+    tenant: "Acme Corp",
+    catalog: "otel",
+    catalog_type: "Lance",
+    table: "otel_spans",
+    status: "running",
+    progress: 0.3,
+    created_at: "2026-03-06T10:01:00Z",
+    started_at: "2026-03-06T10:01:05Z",
+    fragments_done: 45,
+    fragments_total: 150,
+  },
+  {
+    id: mockOpId(),
+    node_id: 1,
+    op_type: "reindex",
+    tier: "cold",
+    tenant: "Acme Corp",
+    catalog: "events",
+    catalog_type: "Lance",
+    table: "user_events",
+    status: "queued",
+    progress: 0.0,
+    created_at: "2026-03-06T10:02:00Z",
+  },
+  {
+    id: mockOpId(),
+    node_id: 3,
+    op_type: "compact",
+    tier: "cold",
+    tenant: "Acme Corp",
+    catalog: "analytics",
+    catalog_type: "Lance",
+    table: "sessions",
+    status: "queued",
+    progress: 0.0,
+    created_at: "2026-03-06T10:03:00Z",
+  },
+  // ---- Hot/Warm operations — automatic, tracked inline ----
+  {
+    id: mockOpId(),
+    node_id: 1,
+    op_type: "compact",
+    tier: "hot",
+    tenant: "Acme Corp",
+    catalog: "analytics",
+    catalog_type: "Lance",
+    table: "page_views",
+    status: "running",
+    progress: 0.8,
+    created_at: "2026-03-06T10:04:00Z",
+    started_at: "2026-03-06T10:04:01Z",
+    fragments_done: 16,
+    fragments_total: 20,
+  },
+  {
+    id: mockOpId(),
+    node_id: 2,
+    op_type: "compact",
+    tier: "warm",
+    tenant: "Acme Corp",
+    catalog: "otel",
+    catalog_type: "Lance",
+    table: "otel_counters",
+    status: "running",
+    progress: 0.55,
+    created_at: "2026-03-06T10:03:30Z",
+    started_at: "2026-03-06T10:03:31Z",
+    fragments_done: 11,
+    fragments_total: 20,
+  },
+  {
+    id: mockOpId(),
+    node_id: 3,
+    op_type: "reindex",
+    tier: "warm",
+    tenant: "Acme Corp",
+    catalog: "events",
+    catalog_type: "Lance",
+    table: "user_events",
+    status: "done",
+    progress: 1.0,
+    created_at: "2026-03-06T09:55:00Z",
+    started_at: "2026-03-06T09:55:01Z",
+    finished_at: "2026-03-06T09:55:08Z",
+    fragments_done: 5,
+    fragments_total: 5,
+  },
+  {
+    id: mockOpId(),
+    node_id: 1,
+    op_type: "flush",
+    tier: "cold",
+    tenant: "Acme Corp",
+    catalog: "analytics",
+    catalog_type: "Lance",
+    table: "sessions",
+    status: "done",
+    progress: 1.0,
+    created_at: "2026-03-06T09:50:00Z",
+    started_at: "2026-03-06T09:50:02Z",
+    finished_at: "2026-03-06T09:51:15Z",
+    fragments_done: 30,
+    fragments_total: 30,
+  },
+  // ---- Completed cold operations ----
+  {
+    id: mockOpId(),
+    node_id: 2,
+    op_type: "reindex",
+    tier: "cold",
+    tenant: "Acme Corp",
+    catalog: "otel",
+    catalog_type: "Lance",
+    table: "otel_counters",
+    status: "done",
+    progress: 1.0,
+    created_at: "2026-03-06T09:30:00Z",
+    started_at: "2026-03-06T09:30:03Z",
+    finished_at: "2026-03-06T09:32:15Z",
+    fragments_done: 80,
+    fragments_total: 80,
+  },
+  {
+    id: mockOpId(),
+    node_id: 1,
+    op_type: "compact",
+    tier: "cold",
+    tenant: "Acme Corp",
+    catalog: "analytics",
+    catalog_type: "Lance",
+    table: "user_profiles",
+    status: "done",
+    progress: 1.0,
+    created_at: "2026-03-06T09:00:00Z",
+    started_at: "2026-03-06T09:00:02Z",
+    finished_at: "2026-03-06T09:05:30Z",
+    fragments_done: 120,
+    fragments_total: 120,
+  },
+  {
+    id: mockOpId(),
+    node_id: 3,
+    op_type: "compact",
+    tier: "hot",
+    tenant: "Acme Corp",
+    catalog: "events",
+    catalog_type: "Lance",
+    table: "notifications",
+    status: "done",
+    progress: 1.0,
+    created_at: "2026-03-06T09:45:00Z",
+    started_at: "2026-03-06T09:45:01Z",
+    finished_at: "2026-03-06T09:45:03Z",
+    fragments_done: 8,
+    fragments_total: 8,
+  },
+  // ---- Failed ----
+  {
+    id: mockOpId(),
+    node_id: 2,
+    op_type: "reindex",
+    tier: "cold",
+    tenant: "Acme Corp",
+    catalog: "events",
+    catalog_type: "Lance",
+    table: "notifications",
+    status: "failed",
+    progress: 0.45,
+    created_at: "2026-03-06T08:00:00Z",
+    started_at: "2026-03-06T08:00:05Z",
+    finished_at: "2026-03-06T08:01:30Z",
+    error: "S3 connection timeout after 90s",
+    fragments_done: 36,
+    fragments_total: 80,
+  },
 ]

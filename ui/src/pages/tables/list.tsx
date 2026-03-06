@@ -59,7 +59,7 @@ export function TableListPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold">Tables</h1>
+
 
       {allTables.length === 0 ? (
         <Card>

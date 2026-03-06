@@ -33,9 +33,14 @@ use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use lance_index::DatasetIndexExt;
+
+use bisque_meta::mesh::{ClusterMesh, OperationSnapshot};
+
 use crate::catalog_events::{CatalogEvent, CatalogEventBus};
 use crate::engine::BisqueLance;
 use crate::manifest::LanceManifestManager;
+use crate::operations::{OpStatus, OpTier, OpType, Operation, OperationsManager};
 use crate::version_pins::{PinKey, PinTier, VersionPinTracker};
 
 /// Shared state for the S3-compatible HTTP server.
@@ -46,6 +51,10 @@ pub struct S3ServerState {
     group_id: u64,
     /// Tracks which dataset versions are pinned by remote clients.
     pub version_pins: Arc<VersionPinTracker>,
+    /// Background operations manager for reindex/compact.
+    pub operations: Arc<OperationsManager>,
+    /// Optional cluster mesh for cross-node operation visibility.
+    pub mesh: Option<ClusterMesh>,
 }
 
 impl S3ServerState {
@@ -55,6 +64,7 @@ impl S3ServerState {
         catalog_events: Option<Arc<CatalogEventBus>>,
         manifest: Option<Arc<LanceManifestManager>>,
         group_id: u64,
+        mesh: Option<ClusterMesh>,
     ) -> Arc<Self> {
         let version_pins = Arc::new(VersionPinTracker::new(std::time::Duration::from_secs(30)));
 
@@ -70,12 +80,16 @@ impl S3ServerState {
             }
         });
 
+        let operations = OperationsManager::new(group_id, 4, 2);
+
         Arc::new(Self {
             engine,
             catalog_events,
             manifest,
             group_id,
             version_pins,
+            operations,
+            mesh,
         })
     }
 }
@@ -86,7 +100,27 @@ impl S3ServerState {
 pub fn s3_router(state: Arc<S3ServerState>) -> axum::Router {
     axum::Router::new()
         .route("/_bisque/ws", axum::routing::get(tenant_ws_handler))
+        .route(
+            "/_bisque/v1/operations",
+            axum::routing::get(list_operations),
+        )
+        .route(
+            "/_bisque/v1/operations/ws",
+            axum::routing::get(operations_ws_handler),
+        )
+        .route(
+            "/_bisque/v1/operations/{op_id}",
+            axum::routing::get(get_operation).delete(cancel_operation),
+        )
         .route("/{bucket}/_bisque/catalog", axum::routing::get(get_catalog))
+        .route(
+            "/{bucket}/_bisque/reindex/{table}",
+            axum::routing::post(reindex_table),
+        )
+        .route(
+            "/{bucket}/_bisque/compact/{table}",
+            axum::routing::post(compact_table),
+        )
         .route("/{bucket}/_bisque/ws", axum::routing::get(ws_handler))
         .route("/{bucket}", axum::routing::get(list_objects))
         .route(
@@ -117,7 +151,7 @@ pub async fn serve_s3(
     manifest: Option<Arc<LanceManifestManager>>,
     group_id: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = S3ServerState::new(engine, catalog_events, manifest, group_id);
+    let state = S3ServerState::new(engine, catalog_events, manifest, group_id, None);
     let app = s3_router(state);
 
     info!(%addr, "starting S3-compatible HTTP server");
@@ -232,6 +266,19 @@ struct CatalogTableInfo {
     /// only need to supply their own credentials.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     s3_storage_options: HashMap<String, String>,
+    /// Index metadata for the sealed segment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    indexes: Vec<CatalogIndexInfo>,
+}
+
+#[derive(Serialize, Default)]
+struct CatalogIndexInfo {
+    name: String,
+    columns: Vec<String>,
+    index_type: String,
+    dataset_version: u64,
+    fragment_count: u64,
+    total_fragments: u64,
 }
 
 async fn get_catalog(
@@ -249,10 +296,16 @@ async fn get_catalog(
                 .active_dataset_snapshot()
                 .await
                 .map(|ds| ds.manifest.version);
-            let sealed_version = table
-                .sealed_dataset_snapshot()
-                .await
-                .map(|ds| ds.manifest.version);
+
+            let sealed_ds = table.sealed_dataset_snapshot().await;
+            let sealed_version = sealed_ds.as_ref().map(|ds| ds.manifest.version);
+
+            // Collect index metadata from the sealed dataset.
+            let indexes = if let Some(ds) = &sealed_ds {
+                collect_index_info(ds).await
+            } else {
+                Vec::new()
+            };
 
             // Include non-credential S3 storage options from the table config.
             let s3_storage_options =
@@ -267,6 +320,7 @@ async fn get_catalog(
                     active_version,
                     sealed_version,
                     s3_storage_options,
+                    indexes,
                 },
             );
         }
@@ -274,6 +328,431 @@ async fn get_catalog(
 
     metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "catalog").increment(1);
     axum::Json(CatalogResponse { tables: catalog })
+}
+
+/// Collect index metadata from a Lance dataset.
+async fn collect_index_info(ds: &lance::dataset::Dataset) -> Vec<CatalogIndexInfo> {
+    let indices = match ds.load_indices().await {
+        Ok(idx) => idx,
+        Err(e) => {
+            warn!("Failed to load indices: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let schema = ds.schema();
+    let total_fragments = ds.get_fragments().len() as u64;
+
+    indices
+        .iter()
+        .filter(|idx| !idx.name.starts_with("__"))
+        .map(|idx| {
+            let columns: Vec<String> = idx
+                .fields
+                .iter()
+                .filter_map(|field_id| schema.field_by_id(*field_id).map(|f| f.name.clone()))
+                .collect();
+
+            let index_type = idx
+                .index_details
+                .as_ref()
+                .map(|d| {
+                    // Extract type name from protobuf type_url like "/lance.table.BTreeIndexDetails"
+                    d.type_url
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&d.type_url)
+                        .strip_suffix("IndexDetails")
+                        .unwrap_or(&d.type_url)
+                        .to_string()
+                })
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            let fragment_count = idx
+                .fragment_bitmap
+                .as_ref()
+                .map(|bm| bm.len() as u64)
+                .unwrap_or(0);
+
+            CatalogIndexInfo {
+                name: idx.name.clone(),
+                columns,
+                index_type,
+                dataset_version: idx.dataset_version,
+                fragment_count,
+                total_fragments,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Operations endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct SubmitResponse {
+    op_id: String,
+    message: String,
+}
+
+/// Queue a reindex operation on a table's S3 (cold) dataset.
+///
+/// POST `/{bucket}/_bisque/reindex/{table}`
+async fn reindex_table(
+    State(state): State<Arc<S3ServerState>>,
+    AxumPath((bucket, table_name)): AxumPath<(String, String)>,
+) -> Result<Response, Response> {
+    state
+        .engine
+        .get_table(&table_name)
+        .ok_or_else(|| s3_not_found(&table_name))?;
+
+    let op_id = state.operations.submit_reindex(
+        String::new(),
+        bucket,
+        "Lance".to_string(),
+        table_name.clone(),
+        state.engine.clone(),
+    );
+
+    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "reindex").increment(1);
+
+    Ok(axum::Json(SubmitResponse {
+        op_id,
+        message: format!("Reindex queued for table '{}'", table_name),
+    })
+    .into_response())
+}
+
+/// Queue a compaction operation on a table's S3 (cold) dataset.
+///
+/// POST `/{bucket}/_bisque/compact/{table}`
+async fn compact_table(
+    State(state): State<Arc<S3ServerState>>,
+    AxumPath((bucket, table_name)): AxumPath<(String, String)>,
+) -> Result<Response, Response> {
+    state
+        .engine
+        .get_table(&table_name)
+        .ok_or_else(|| s3_not_found(&table_name))?;
+
+    let op_id = state.operations.submit_compact(
+        String::new(),
+        bucket,
+        "Lance".to_string(),
+        table_name.clone(),
+        state.engine.clone(),
+    );
+
+    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "compact").increment(1);
+
+    Ok(axum::Json(SubmitResponse {
+        op_id,
+        message: format!("Compaction queued for table '{}'", table_name),
+    })
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct ListOpsParams {
+    #[serde(default, rename = "type")]
+    op_type: Option<String>,
+    #[serde(default)]
+    tier: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Convert a mesh `OperationSnapshot` into a local `Operation` for JSON serialization.
+fn snapshot_to_operation(snap: &OperationSnapshot) -> Operation {
+    Operation {
+        id: snap.id.clone(),
+        node_id: snap.node_id,
+        op_type: match snap.op_type {
+            0 => OpType::Compact,
+            1 => OpType::Reindex,
+            _ => OpType::Flush,
+        },
+        tier: match snap.tier {
+            0 => OpTier::Hot,
+            1 => OpTier::Warm,
+            _ => OpTier::Cold,
+        },
+        tenant: snap.tenant.clone(),
+        catalog: snap.catalog.clone(),
+        catalog_type: snap.catalog_type.clone(),
+        table: snap.table.clone(),
+        status: match snap.status {
+            0 => OpStatus::Queued,
+            1 => OpStatus::Running,
+            2 => OpStatus::Done,
+            3 => OpStatus::Failed,
+            _ => OpStatus::Cancelled,
+        },
+        progress: f64::from_bits(snap.progress_bits),
+        created_at: snap.created_at.clone(),
+        started_at: snap.started_at.clone(),
+        finished_at: snap.finished_at.clone(),
+        error: snap.error.clone(),
+        fragments_done: snap.fragments_done,
+        fragments_total: snap.fragments_total,
+    }
+}
+
+/// Convert a local `Operation` into a mesh `OperationSnapshot` for broadcasting.
+fn operation_to_snapshot(op: &Operation) -> OperationSnapshot {
+    OperationSnapshot {
+        id: op.id.clone(),
+        node_id: op.node_id,
+        op_type: match op.op_type {
+            OpType::Compact => 0,
+            OpType::Reindex => 1,
+            OpType::Flush => 2,
+        },
+        tier: match op.tier {
+            OpTier::Hot => 0,
+            OpTier::Warm => 1,
+            OpTier::Cold => 2,
+        },
+        tenant: op.tenant.clone(),
+        catalog: op.catalog.clone(),
+        catalog_type: op.catalog_type.clone(),
+        table: op.table.clone(),
+        status: match op.status {
+            OpStatus::Queued => 0,
+            OpStatus::Running => 1,
+            OpStatus::Done => 2,
+            OpStatus::Failed => 3,
+            OpStatus::Cancelled => 4,
+        },
+        progress_bits: op.progress.to_bits(),
+        created_at: op.created_at.clone(),
+        started_at: op.started_at.clone(),
+        finished_at: op.finished_at.clone(),
+        error: op.error.clone(),
+        fragments_done: op.fragments_done,
+        fragments_total: op.fragments_total,
+    }
+}
+
+/// List all operations, optionally filtered by type, tier, and status.
+///
+/// GET `/_bisque/v1/operations?type=reindex&tier=cold&status=running`
+async fn list_operations(
+    State(state): State<Arc<S3ServerState>>,
+    Query(params): Query<ListOpsParams>,
+) -> impl IntoResponse {
+    let op_type = params.op_type.and_then(|t| match t.as_str() {
+        "reindex" => Some(OpType::Reindex),
+        "compact" => Some(OpType::Compact),
+        "flush" => Some(OpType::Flush),
+        _ => None,
+    });
+
+    let tier = params.tier.and_then(|t| match t.as_str() {
+        "hot" => Some(OpTier::Hot),
+        "warm" => Some(OpTier::Warm),
+        "cold" => Some(OpTier::Cold),
+        _ => None,
+    });
+
+    let status = params.status.and_then(|s| match s.as_str() {
+        "queued" => Some(OpStatus::Queued),
+        "running" => Some(OpStatus::Running),
+        "done" => Some(OpStatus::Done),
+        "failed" => Some(OpStatus::Failed),
+        "cancelled" => Some(OpStatus::Cancelled),
+        _ => None,
+    });
+
+    let mut ops = state.operations.list(op_type, tier, status);
+
+    // Merge remote operations from the cluster mesh
+    if let Some(mesh) = &state.mesh {
+        let remote_snapshots = mesh.cluster_state().all_remote_operations();
+        for snap in &remote_snapshots {
+            let op = snapshot_to_operation(snap);
+            // Apply same filters
+            if let Some(t) = op_type {
+                if op.op_type != t {
+                    continue;
+                }
+            }
+            if let Some(t) = tier {
+                if op.tier != t {
+                    continue;
+                }
+            }
+            if let Some(s) = status {
+                if op.status != s {
+                    continue;
+                }
+            }
+            ops.push(op);
+        }
+    }
+
+    // Sort: running first, then queued, then by created_at desc
+    ops.sort_by(|a, b| {
+        fn status_order(s: OpStatus) -> u8 {
+            match s {
+                OpStatus::Running => 0,
+                OpStatus::Queued => 1,
+                OpStatus::Failed => 2,
+                OpStatus::Done => 3,
+                OpStatus::Cancelled => 4,
+            }
+        }
+        status_order(a.status)
+            .cmp(&status_order(b.status))
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+
+    axum::Json(ops)
+}
+
+/// Get a single operation by ID.
+///
+/// GET `/_bisque/v1/operations/{op_id}`
+async fn get_operation(
+    State(state): State<Arc<S3ServerState>>,
+    AxumPath(op_id): AxumPath<String>,
+) -> Result<Response, Response> {
+    let op = state
+        .operations
+        .get(&op_id)
+        .ok_or_else(|| s3_not_found(&op_id))?;
+
+    Ok(axum::Json(op).into_response())
+}
+
+/// Cancel a queued operation.
+///
+/// DELETE `/_bisque/v1/operations/{op_id}`
+async fn cancel_operation(
+    State(state): State<Arc<S3ServerState>>,
+    AxumPath(op_id): AxumPath<String>,
+) -> Result<Response, Response> {
+    if state.operations.cancel(&op_id) {
+        Ok(axum::Json(serde_json::json!({
+            "message": "Operation cancelled",
+            "op_id": op_id,
+        }))
+        .into_response())
+    } else {
+        Err(Response::builder()
+            .status(StatusCode::CONFLICT)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": "Operation cannot be cancelled (not in queued state)"
+                })
+                .to_string(),
+            ))
+            .unwrap())
+    }
+}
+
+/// WebSocket endpoint for real-time operation status updates.
+///
+/// GET `/_bisque/v1/operations/ws` (WebSocket upgrade)
+///
+/// Sends JSON-encoded `Operation` objects whenever an operation's state changes.
+/// The initial message is a JSON array of all current operations (snapshot).
+async fn operations_ws_handler(
+    State(state): State<Arc<S3ServerState>>,
+    upgrade: fastwebsockets::upgrade::IncomingUpgrade,
+) -> Response {
+    let (response, fut) = match upgrade.upgrade() {
+        Ok((response, fut)) => (response, fut),
+        Err(e) => {
+            warn!("Operations WebSocket upgrade failed: {}", e);
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("WebSocket upgrade failed: {}", e)))
+                .unwrap();
+        }
+    };
+
+    let operations = state.operations.clone();
+    let mesh = state.mesh.clone();
+
+    tokio::spawn(async move {
+        match fut.await {
+            Ok(ws) => {
+                if let Err(e) = handle_operations_ws(ws, operations, mesh).await {
+                    debug!("Operations WebSocket ended: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("Operations WebSocket handshake failed: {}", e);
+            }
+        }
+    });
+
+    response.into_response()
+}
+
+async fn handle_operations_ws<S>(
+    mut ws: fastwebsockets::WebSocket<S>,
+    operations: Arc<OperationsManager>,
+    mesh: Option<ClusterMesh>,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    use fastwebsockets::{Frame, OpCode, Payload};
+
+    // Send initial snapshot of all operations (local + remote)
+    let mut all_ops = operations.list(None, None, None);
+    if let Some(ref mesh) = mesh {
+        for snap in &mesh.cluster_state().all_remote_operations() {
+            all_ops.push(snapshot_to_operation(snap));
+        }
+    }
+    let snapshot = serde_json::to_vec(&all_ops)?;
+    ws.write_frame(Frame::binary(Payload::Owned(snapshot)))
+        .await?;
+
+    // Subscribe to live updates
+    let mut rx = operations.subscribe();
+
+    ws.set_auto_pong(true);
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(op) => {
+                        let bytes = serde_json::to_vec(&op)?;
+                        ws.write_frame(Frame::binary(Payload::Owned(bytes))).await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(lagged = n, "Operations WS subscriber lagged, sending full snapshot");
+                        let all_ops = operations.list(None, None, None);
+                        let snapshot = serde_json::to_vec(&all_ops)?;
+                        ws.write_frame(Frame::binary(Payload::Owned(snapshot))).await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+            frame = ws.read_frame() => {
+                let frame = frame?;
+                match frame.opcode {
+                    OpCode::Close => {
+                        debug!("Operations WS client sent close frame");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Filter S3 storage options to exclude credentials.

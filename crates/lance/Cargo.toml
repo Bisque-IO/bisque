@@ -12,6 +12,7 @@ categories = ["database-implementations", "data-structures"]
 [dependencies]
 # Bisque
 bisque-raft = { workspace = true }
+bisque-meta = { path = "../meta" }
 
 # Raft consensus
 openraft = { workspace = true, features = ["tokio-rt"] }
@@ -91,6 +92,7 @@ parking_lot = { workspace = true }
 crossfire = { workspace = true }
 metrics = { workspace = true }
 dashmap = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

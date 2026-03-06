@@ -1,0 +1,28 @@
+import { type SVGProps } from "react"
+
+export function LogoIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" {...props}>
+      {/* Spoon handle */}
+      <line x1="44" y1="28" x2="56" y2="8" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" />
+      {/* Spoon bowl */}
+      <ellipse cx="57.5" cy="6.5" rx="4" ry="2.5" transform="rotate(-60 57.5 6.5)" fill="currentColor" />
+      {/* Data bars */}
+      <rect x="16" y="16" width="4" height="8" rx="1" fill="currentColor" />
+      <rect x="22" y="10" width="4" height="14" rx="1" fill="currentColor" />
+      <rect x="28" y="14" width="4" height="10" rx="1" fill="currentColor" />
+      <rect x="34" y="6" width="4" height="18" rx="1" fill="currentColor" />
+      <rect x="40" y="12" width="4" height="12" rx="1" fill="currentColor" />
+      {/* Bowl body */}
+      <path d="M6 30 Q6 52 32 52 Q58 52 58 30 Z" fill="currentColor" />
+      {/* Bowl rim */}
+      <ellipse cx="32" cy="30" rx="26" ry="6" fill="currentColor" />
+      {/* Soup surface */}
+      <ellipse cx="32" cy="30" rx="22" ry="4.5" fill="currentColor" />
+      {/* Soup highlight */}
+      <ellipse cx="26" cy="29.5" rx="9" ry="2" fill="currentColor" />
+      {/* Bowl foot */}
+      <rect x="22" y="52" width="20" height="3" rx="1.5" fill="currentColor" />
+    </svg>
+  )
+}

@@ -417,6 +417,83 @@ impl TableEngine {
         Ok(())
     }
 
+    /// Create indices on the S3 (cold) dataset.
+    ///
+    /// Uses the same index specs as sealed segments (`seal_indices` from config).
+    /// This allows retroactively indexing cold storage data that was promoted
+    /// before an index was added to the configuration.
+    pub async fn create_s3_indices(&self) -> Result<()> {
+        if self.config.seal_indices.is_empty() {
+            return Ok(());
+        }
+
+        if !self.config.has_s3() {
+            return Err(Error::S3NotConfigured);
+        }
+
+        let _guard = self.s3_write.lock().await;
+        let mut ds = match self.s3_dataset.read().clone() {
+            Some(ds) => ds,
+            None => {
+                warn!(table = %self.name, "No S3 dataset to index");
+                return Ok(());
+            }
+        };
+
+        for spec in &self.config.seal_indices {
+            let columns: Vec<&str> = spec.columns.iter().map(|s| s.as_str()).collect();
+            let params = index_params_for_type(spec.index_type);
+
+            info!(
+                table = %self.name,
+                columns = ?spec.columns,
+                index_type = %spec.index_type,
+                name = ?spec.name,
+                "Creating index on S3 dataset"
+            );
+
+            match ds
+                .create_index(
+                    &columns,
+                    spec.index_type,
+                    spec.name.clone(),
+                    params.as_ref(),
+                    true,
+                )
+                .await
+            {
+                Ok(meta) => {
+                    info!(
+                        table = %self.name,
+                        name = %meta.name,
+                        columns = ?spec.columns,
+                        "Index created on S3 dataset"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        table = %self.name,
+                        columns = ?spec.columns,
+                        index_type = %spec.index_type,
+                        "Failed to create index on S3 dataset: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Update catalog with new S3 version
+        let new_version = ds.version().version;
+        {
+            let mut cat = self.catalog.write();
+            cat.s3_manifest_version = new_version;
+        }
+
+        *self.s3_dataset.write() = Some(ds);
+        info!(table = %self.name, new_version, "S3 reindex complete");
+        Ok(())
+    }
+
     /// Apply a BeginFlush command — records that a flush is in progress.
     pub fn apply_begin_flush(&self, segment_id: SegmentId) {
         *self.flush_state.write() = FlushState::InProgress {

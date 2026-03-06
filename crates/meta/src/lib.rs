@@ -25,6 +25,7 @@
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod mesh;
 pub mod node;
 pub mod state_machine;
 pub mod token;

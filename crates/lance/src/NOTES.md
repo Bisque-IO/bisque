@@ -22,4 +22,4 @@ Dictionary for multi-tenant
   - Catalog = Single raft group
 
   
-Version pinning must be cluster-wide since HTTP may route to any node in the cluster. In addition the bisque client websocket may connect to any node in the cluster including follower nodes and not just the leader.
+Version pinning for bisque-lance must be cluster-wide since HTTP may route to any node in the cluster. In addition the bisque client websocket may connect to any node in the cluster including follower nodes and not just the leader. Otherwise, a tenant could be pinned to a specific node and not have access to other nodes in the cluster but that makes S3 http requests more difficult I think. What do you think?

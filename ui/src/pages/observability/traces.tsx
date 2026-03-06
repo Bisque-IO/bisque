@@ -80,7 +80,7 @@ export function TracesPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold">Traces</h1>
+
 
       <Card>
         <CardHeader>

@@ -1,7 +1,9 @@
 import { useState, useCallback } from "react"
-import { NavLink } from "react-router"
+import { NavLink, useNavigate } from "react-router"
 import {
   LayoutDashboard,
+  Network,
+  ListChecks,
   Users,
   Database,
   Table2,
@@ -13,9 +15,12 @@ import {
   Settings,
   Waypoints,
   PanelLeftClose,
-  PanelLeftOpen,
+  LogOut,
+  User,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { LogoIcon } from "@/components/logo"
+import { useAuthStore } from "@/stores/auth"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Tooltip,
@@ -23,9 +28,18 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard" },
+  { to: "/cluster", icon: Network, label: "Cluster" },
+  { to: "/operations", icon: ListChecks, label: "Operations" },
   { to: "/tenants", icon: Users, label: "Tenants" },
   { to: "/catalogs", icon: Database, label: "Catalogs" },
   { to: "/tables", icon: Table2, label: "Tables" },
@@ -50,6 +64,13 @@ function getInitialCollapsed(): boolean {
 
 export function Sidebar() {
   const [collapsed, setCollapsed] = useState(getInitialCollapsed)
+  const { username, accountName, logout } = useAuthStore()
+  const navigate = useNavigate()
+
+  const handleLogout = () => {
+    logout()
+    navigate("/login")
+  }
 
   const toggle = useCallback(() => {
     setCollapsed((prev) => {
@@ -69,29 +90,41 @@ export function Sidebar() {
       >
         {/* Header */}
         <div className="flex h-14 items-center border-b px-3 justify-between">
-          {!collapsed && (
-            <span className="text-lg font-semibold tracking-tight pl-1">bisque</span>
+          {collapsed ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  onClick={toggle}
+                  className="flex items-center justify-center h-9 w-9 mx-auto rounded-md hover:bg-sidebar-accent/50 transition-colors"
+                >
+                  <LogoIcon className="h-7 w-7" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="right" sideOffset={4}>
+                Expand sidebar
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <>
+              <div className="flex items-center gap-2 pl-1">
+                <LogoIcon className="h-7 w-7" />
+                <span className="text-lg font-semibold tracking-tight translate-y-px">bisque</span>
+              </div>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={toggle}
+                    className="flex items-center justify-center h-8 w-8 rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground transition-colors"
+                  >
+                    <PanelLeftClose className="h-4 w-4" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={4}>
+                  Collapse sidebar
+                </TooltipContent>
+              </Tooltip>
+            </>
           )}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                onClick={toggle}
-                className={cn(
-                  "flex items-center justify-center h-8 w-8 rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground transition-colors",
-                  collapsed && "mx-auto",
-                )}
-              >
-                {collapsed ? (
-                  <PanelLeftOpen className="h-4 w-4" />
-                ) : (
-                  <PanelLeftClose className="h-4 w-4" />
-                )}
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right" sideOffset={4}>
-              {collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            </TooltipContent>
-          </Tooltip>
         </div>
 
         {/* Navigation */}
@@ -148,6 +181,45 @@ export function Sidebar() {
             })}
           </nav>
         </ScrollArea>
+
+        {/* User */}
+        <div className="border-t px-2 py-2">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              {collapsed ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button className="flex items-center justify-center h-9 w-9 mx-auto rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground transition-colors">
+                      <User className="h-4 w-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="right" sideOffset={4}>
+                    {username || "User"}
+                  </TooltipContent>
+                </Tooltip>
+              ) : (
+                <button className="flex items-center gap-3 w-full rounded-md px-3 py-2 text-sm font-medium text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground transition-colors">
+                  <User className="h-4 w-4 shrink-0" />
+                  <span className="truncate">{username || accountName || "User"}</span>
+                </button>
+              )}
+            </DropdownMenuTrigger>
+            <DropdownMenuContent side="right" align="end" sideOffset={8}>
+              {username && (
+                <>
+                  <DropdownMenuItem disabled className="text-xs text-muted-foreground">
+                    {username}
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                </>
+              )}
+              <DropdownMenuItem onClick={handleLogout}>
+                <LogOut className="h-4 w-4 mr-2" />
+                Logout
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       </aside>
     </TooltipProvider>
   )

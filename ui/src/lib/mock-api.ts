@@ -11,6 +11,12 @@ import type {
   PromResponse,
   LokiResponse,
   LokiLabelsResponse,
+  ClusterStatus,
+  SubmitResponse,
+  Operation,
+  OpType,
+  OpTier,
+  OpStatus,
 } from "./api"
 import {
   MOCK_ACCOUNTS,
@@ -23,6 +29,8 @@ import {
   MOCK_METRICS,
   MOCK_METRIC_LABELS,
   MOCK_API_KEYS,
+  MOCK_CLUSTER_STATUS,
+  MOCK_OPERATIONS,
   mockTraceSpans,
   mockSegmentFiles,
   generateMockLogs,
@@ -285,6 +293,18 @@ export const mockLokiApi = {
 // S3 / Catalog API
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Cluster API
+// ---------------------------------------------------------------------------
+
+export const mockClusterApi = {
+  getStatus: () => delay<ClusterStatus>(MOCK_CLUSTER_STATUS),
+}
+
+// ---------------------------------------------------------------------------
+// S3 / Catalog API
+// ---------------------------------------------------------------------------
+
 export const mockS3Api = {
   getCatalog: (bucket: string) =>
     delay<Record<string, unknown>>({
@@ -309,5 +329,79 @@ export const mockS3Api = {
   <KeyCount>${files.length}</KeyCount>
   ${keys}
 </ListBucketResult>`
+    })()),
+
+  reindexTable: (_bucket: string, table: string) =>
+    delay<SubmitResponse>({
+      op_id: `mock-op-${Date.now()}`,
+      message: `Reindex queued for table '${table}'`,
+    }, 200),
+
+  compactTable: (_bucket: string, table: string) =>
+    delay<SubmitResponse>({
+      op_id: `mock-op-${Date.now()}`,
+      message: `Compaction queued for table '${table}'`,
+    }, 200),
+}
+
+// ---------------------------------------------------------------------------
+// Operations API
+// ---------------------------------------------------------------------------
+
+// Mutable copy of mock operations so mutations feel real
+const mockOps = [...MOCK_OPERATIONS]
+
+// Simulate progress ticks for running operations
+let progressInterval: ReturnType<typeof setInterval> | null = null
+function ensureProgressTicker() {
+  if (progressInterval) return
+  progressInterval = setInterval(() => {
+    for (const op of mockOps) {
+      if (op.status === "running" && op.progress < 1.0) {
+        op.progress = Math.min(1.0, op.progress + 0.02 + Math.random() * 0.03)
+        if (op.fragments_total) {
+          op.fragments_done = Math.round(op.progress * op.fragments_total)
+        }
+        if (op.progress >= 1.0) {
+          op.status = "done"
+          op.finished_at = new Date().toISOString()
+        }
+      }
+    }
+  }, 1000)
+}
+ensureProgressTicker()
+
+export const mockOperationsApi = {
+  list: (params?: { type?: OpType; tier?: OpTier; status?: OpStatus }) =>
+    delay<Operation[]>((() => {
+      let ops = [...mockOps]
+      if (params?.type) ops = ops.filter((o) => o.op_type === params.type)
+      if (params?.tier) ops = ops.filter((o) => o.tier === params.tier)
+      if (params?.status) ops = ops.filter((o) => o.status === params.status)
+      // Sort: running first, then queued, then by created_at desc
+      const statusOrder = { running: 0, queued: 1, failed: 2, done: 3, cancelled: 4 }
+      ops.sort((a, b) =>
+        (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9)
+        || b.created_at.localeCompare(a.created_at)
+      )
+      return ops
+    })()),
+
+  get: (opId: string) =>
+    delay<Operation>((() => {
+      const op = mockOps.find((o) => o.id === opId)
+      if (!op) throw new Error("not found")
+      return { ...op }
+    })()),
+
+  cancel: (opId: string) =>
+    delay<{ message: string; op_id: string }>((() => {
+      const op = mockOps.find((o) => o.id === opId)
+      if (op && op.status === "queued") {
+        op.status = "cancelled"
+        op.finished_at = new Date().toISOString()
+      }
+      return { message: "Operation cancelled", op_id: opId }
     })()),
 }

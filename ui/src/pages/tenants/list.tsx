@@ -15,6 +15,7 @@ import {
 import { Plus } from "lucide-react"
 import { toast } from "sonner"
 import { Link } from "react-router"
+import { HeaderActions } from "@/components/layout/header-actions"
 
 export function TenantListPage() {
   const tenantId = useAuthStore((s) => s.tenantId)
@@ -42,11 +43,10 @@ export function TenantListPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Tenants</h1>
+      <HeaderActions>
         <Dialog open={open} onOpenChange={setOpen}>
           <DialogTrigger asChild>
-            <Button>
+            <Button size="sm" variant="secondary">
               <Plus className="h-4 w-4 mr-2" />
               Create Tenant
             </Button>
@@ -70,7 +70,7 @@ export function TenantListPage() {
             </form>
           </DialogContent>
         </Dialog>
-      </div>
+      </HeaderActions>
 
       <Card>
         <CardHeader>

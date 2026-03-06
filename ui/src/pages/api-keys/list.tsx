@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/select"
 import { Plus, Copy, Key } from "lucide-react"
 import { toast } from "sonner"
+import { HeaderActions } from "@/components/layout/header-actions"
 
 export function ApiKeyListPage() {
   const tenantId = useAuthStore((s) => s.tenantId)
@@ -68,8 +69,7 @@ export function ApiKeyListPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">API Keys</h1>
+      <HeaderActions>
         <Dialog
           open={open}
           onOpenChange={(v) => {
@@ -78,7 +78,7 @@ export function ApiKeyListPage() {
           }}
         >
           <DialogTrigger asChild>
-            <Button>
+            <Button size="sm" variant="secondary">
               <Plus className="h-4 w-4 mr-2" />
               Create API Key
             </Button>
@@ -166,7 +166,7 @@ export function ApiKeyListPage() {
             )}
           </DialogContent>
         </Dialog>
-      </div>
+      </HeaderActions>
 
       <Card>
         <CardHeader>

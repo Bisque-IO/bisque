@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react"
 import { useParams } from "react-router"
-import { s3Api } from "@/lib/api"
+import { s3Api, type TableIndex } from "@/lib/api"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import {
   Table,
   TableBody,
@@ -11,6 +12,9 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { RefreshCw } from "lucide-react"
+import { toast } from "sonner"
+import { HeaderActions } from "@/components/layout/header-actions"
 import type { StorageTierInfo, IngestionMetrics } from "@/lib/mock-data"
 
 interface TableInfo {
@@ -23,6 +27,7 @@ interface TableInfo {
     cold: StorageTierInfo
   }
   metrics?: IngestionMetrics
+  indexes?: TableIndex[]
 }
 
 interface SchemaField {
@@ -50,10 +55,30 @@ function formatRate(n: number): string {
   return `${formatNumber(n)}/s`
 }
 
+function indexBadgeVariant(indexType: string): "default" | "secondary" | "outline" {
+  if (indexType.startsWith("Ivf") || indexType === "Vector") return "default"
+  if (indexType === "Inverted" || indexType === "NGram") return "secondary"
+  return "outline"
+}
+
 export function TableDetailPage() {
   const { catalogName, tableName } = useParams()
   const [tableInfo, setTableInfo] = useState<TableInfo | null>(null)
   const [files, setFiles] = useState<string[]>([])
+  const [reindexing, setReindexing] = useState(false)
+
+  const handleReindex = async () => {
+    if (!catalogName || !tableName) return
+    setReindexing(true)
+    try {
+      const result = await s3Api.reindexTable(catalogName, tableName)
+      toast.success(result.message)
+    } catch {
+      toast.error("Reindex failed")
+    } finally {
+      setReindexing(false)
+    }
+  }
 
   useEffect(() => {
     if (!catalogName || !tableName) return
@@ -94,10 +119,19 @@ export function TableDetailPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <h1 className="text-2xl font-bold">{tableName}</h1>
-        <Badge variant="outline">{catalogName}</Badge>
-      </div>
+      <HeaderActions>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={reindexing}
+          onClick={handleReindex}
+        >
+          <RefreshCw className={`h-4 w-4 mr-2 ${reindexing ? "animate-spin" : ""}`} />
+          {reindexing ? "Reindexing..." : "Reindex Cold Storage"}
+        </Button>
+      </HeaderActions>
+
+      <Badge variant="outline">{catalogName}</Badge>
 
       {/* Summary row */}
       {tableInfo && (
@@ -289,6 +323,54 @@ export function TableDetailPage() {
                 ))}
               </TableBody>
             </Table>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Indexes */}
+      {tableInfo?.indexes && tableInfo.indexes.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Indexes ({tableInfo.indexes.length})</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Name</TableHead>
+                  <TableHead>Columns</TableHead>
+                  <TableHead>Type</TableHead>
+                  <TableHead className="text-right">Coverage</TableHead>
+                  <TableHead className="text-right">Dataset Version</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {tableInfo.indexes.map((idx) => (
+                  <TableRow key={idx.name}>
+                    <TableCell className="font-mono text-sm">{idx.name}</TableCell>
+                    <TableCell className="font-mono text-sm">
+                      {idx.columns.join(", ")}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={indexBadgeVariant(idx.index_type)}>
+                        {idx.index_type}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-sm">
+                      {idx.total_fragments > 0
+                        ? `${idx.fragment_count}/${idx.total_fragments} (${Math.round((idx.fragment_count / idx.total_fragments) * 100)}%)`
+                        : "—"}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-sm">
+                      v{idx.dataset_version}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            <p className="mt-3 text-xs text-muted-foreground">
+              Indexes are built on sealed (warm) segments and carried over to cold storage.
+            </p>
           </CardContent>
         </Card>
       )}

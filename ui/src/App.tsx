@@ -19,6 +19,8 @@ import { MetricsPage } from "@/pages/observability/metrics"
 import { LogsPage } from "@/pages/observability/logs"
 import { ObservabilityOverviewPage } from "@/pages/observability/overview"
 import { SettingsPage } from "@/pages/settings"
+import { ClusterPage } from "@/pages/cluster"
+import { OperationsPage } from "@/pages/operations"
 
 // Lazy-load the query page to keep Monaco out of the main bundle
 const QueryPage = lazy(() =>
@@ -45,6 +47,8 @@ export default function App() {
             }
           >
             <Route index element={<DashboardPage />} />
+            <Route path="cluster" element={<ClusterPage />} />
+            <Route path="operations" element={<OperationsPage />} />
             <Route path="tenants" element={<TenantListPage />} />
             <Route path="tenants/:tenantId" element={<TenantDetailPage />} />
             <Route path="catalogs" element={<CatalogListPage />} />

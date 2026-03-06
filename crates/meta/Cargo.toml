@@ -33,7 +33,15 @@ argon2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
+dashmap = { workspace = true }
+socket2 = { workspace = true }
+rand = { workspace = true }
 chrono = { workspace = true }
+
+# TLS
+tokio-rustls = { workspace = true }
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

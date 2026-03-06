@@ -85,10 +85,7 @@ export function TraceDetailPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">Trace Detail</h1>
-        <p className="font-mono text-sm text-muted-foreground">{traceId}</p>
-      </div>
+      <p className="font-mono text-sm text-muted-foreground">{traceId}</p>
 
       <div className="grid gap-4 md:grid-cols-3">
         <Card>

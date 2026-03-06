@@ -171,6 +171,68 @@ export interface LokiLabelsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Table index types
+// ---------------------------------------------------------------------------
+
+export type IndexType =
+  | "BTree"
+  | "Bitmap"
+  | "Inverted"
+  | "NGram"
+  | "IvfFlat"
+  | "IvfSq"
+  | "IvfPq"
+  | "IvfHnswSq"
+  | "IvfHnswPq"
+  | "IvfHnswFlat"
+  | "IvfRq"
+  | "RTree"
+  | "Scalar"
+  | "LabelList"
+
+export interface TableIndex {
+  name: string
+  columns: string[]
+  index_type: IndexType
+  dataset_version: number
+  fragment_count: number
+  total_fragments: number
+}
+
+// ---------------------------------------------------------------------------
+// Cluster types
+// ---------------------------------------------------------------------------
+
+export type RaftRole = "leader" | "follower" | "candidate" | "learner"
+
+export interface ClusterNode {
+  node_id: number
+  address: string
+  raft_role: RaftRole
+  raft_term: number
+  raft_applied_index: number
+  raft_commit_index: number
+  current_leader_id: number | null
+  uptime_seconds: number
+  catalogs: number
+  tables: number
+  requests_total: number
+  cpu_usage_pct: number
+  memory_used_bytes: number
+  memory_total_bytes: number
+  version: string
+  started_at: string
+}
+
+export interface ClusterStatus {
+  cluster_name: string
+  nodes: ClusterNode[]
+  total_catalogs: number
+  total_tables: number
+  total_raft_groups: number
+}
+
+// ---------------------------------------------------------------------------
 // Real API implementations
 // ---------------------------------------------------------------------------
 
@@ -271,6 +333,43 @@ const realLokiApi = {
     api.get(`loki/api/v1/label/${name}/values`).json<LokiLabelsResponse>(),
 }
 
+const realClusterApi = {
+  getStatus: () =>
+    api.get("_bisque/v1/cluster/status").json<ClusterStatus>(),
+}
+
+export interface SubmitResponse {
+  op_id: string
+  message: string
+}
+
+// ---------------------------------------------------------------------------
+// Operation types (for the Operations page)
+// ---------------------------------------------------------------------------
+
+export type OpType = "reindex" | "compact" | "flush"
+export type OpTier = "hot" | "warm" | "cold"
+export type OpStatus = "queued" | "running" | "done" | "failed" | "cancelled"
+
+export interface Operation {
+  id: string
+  node_id: number
+  op_type: OpType
+  tier: OpTier
+  tenant: string
+  catalog: string
+  catalog_type: string
+  table: string
+  status: OpStatus
+  progress: number
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  error?: string
+  fragments_done?: number
+  fragments_total?: number
+}
+
 const realS3Api = {
   getCatalog: (bucket: string) =>
     api.get(`${bucket}/_bisque/catalog`).json<Record<string, unknown>>(),
@@ -279,6 +378,25 @@ const realS3Api = {
     api
       .get(bucket, { searchParams: prefix ? { prefix, "list-type": "2" } : { "list-type": "2" } })
       .text(),
+
+  reindexTable: (bucket: string, table: string) =>
+    api.post(`${bucket}/_bisque/reindex/${table}`).json<SubmitResponse>(),
+
+  compactTable: (bucket: string, table: string) =>
+    api.post(`${bucket}/_bisque/compact/${table}`).json<SubmitResponse>(),
+}
+
+const realOperationsApi = {
+  list: (params?: { type?: OpType; tier?: OpTier; status?: OpStatus }) =>
+    api
+      .get("_bisque/v1/operations", { searchParams: params as Record<string, string> ?? {} })
+      .json<Operation[]>(),
+
+  get: (opId: string) =>
+    api.get(`_bisque/v1/operations/${opId}`).json<Operation>(),
+
+  cancel: (opId: string) =>
+    api.delete(`_bisque/v1/operations/${opId}`).json<{ message: string; op_id: string }>(),
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +413,8 @@ import {
   mockPromApi,
   mockLokiApi,
   mockS3Api,
+  mockClusterApi,
+  mockOperationsApi,
 } from "./mock-api"
 
 export const authApi = MOCK ? mockAuthApi : realAuthApi
@@ -306,3 +426,5 @@ export const tempoApi = MOCK ? mockTempoApi : realTempoApi
 export const promApi = MOCK ? mockPromApi : realPromApi
 export const lokiApi = MOCK ? mockLokiApi : realLokiApi
 export const s3Api = MOCK ? mockS3Api : realS3Api
+export const clusterApi = MOCK ? mockClusterApi : realClusterApi
+export const operationsApi = MOCK ? mockOperationsApi : realOperationsApi
