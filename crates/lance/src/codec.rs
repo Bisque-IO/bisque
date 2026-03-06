@@ -19,6 +19,10 @@ const CMD_BEGIN_FLUSH: u8 = 2;
 const CMD_PROMOTE_TO_DEEP_STORAGE: u8 = 3;
 const CMD_CREATE_TABLE: u8 = 4;
 const CMD_DROP_TABLE: u8 = 5;
+const CMD_REGISTER_SESSION: u8 = 6;
+const CMD_PIN_VERSION: u8 = 7;
+const CMD_UNPIN_VERSION: u8 = 8;
+const CMD_EXPIRE_SESSION: u8 = 9;
 
 // Discriminant bytes for SealReason
 const SEAL_MAX_AGE: u8 = 0;
@@ -190,6 +194,38 @@ impl Encode for LanceCommand {
                 segment_id.encode(writer)?;
                 s3_manifest_version.encode(writer)?;
             }
+            LanceCommand::RegisterSession { session_id } => {
+                CMD_REGISTER_SESSION.encode(writer)?;
+                session_id.encode(writer)?;
+            }
+            LanceCommand::PinVersion {
+                session_id,
+                table_name,
+                tier,
+                version,
+            } => {
+                CMD_PIN_VERSION.encode(writer)?;
+                session_id.encode(writer)?;
+                encode_table_name(table_name, writer)?;
+                encode_table_name(tier, writer)?;
+                version.encode(writer)?;
+            }
+            LanceCommand::UnpinVersion {
+                session_id,
+                table_name,
+                tier,
+                version,
+            } => {
+                CMD_UNPIN_VERSION.encode(writer)?;
+                session_id.encode(writer)?;
+                encode_table_name(table_name, writer)?;
+                encode_table_name(tier, writer)?;
+                version.encode(writer)?;
+            }
+            LanceCommand::ExpireSession { session_id } => {
+                CMD_EXPIRE_SESSION.encode(writer)?;
+                session_id.encode(writer)?;
+            }
         }
         Ok(())
     }
@@ -211,6 +247,14 @@ impl Encode for LanceCommand {
             LanceCommand::PromoteToDeepStorage { table_name, .. } => {
                 table_name_size(table_name) + 8 + 8
             }
+            LanceCommand::RegisterSession { .. } => 8,
+            LanceCommand::PinVersion {
+                table_name, tier, ..
+            } => 8 + table_name_size(table_name) + table_name_size(tier) + 8,
+            LanceCommand::UnpinVersion {
+                table_name, tier, ..
+            } => 8 + table_name_size(table_name) + table_name_size(tier) + 8,
+            LanceCommand::ExpireSession { .. } => 8,
         }
     }
 }
@@ -272,6 +316,38 @@ impl Decode for LanceCommand {
                     segment_id,
                     s3_manifest_version,
                 })
+            }
+            CMD_REGISTER_SESSION => {
+                let session_id = u64::decode(reader)?;
+                Ok(LanceCommand::RegisterSession { session_id })
+            }
+            CMD_PIN_VERSION => {
+                let session_id = u64::decode(reader)?;
+                let table_name = decode_table_name(reader)?;
+                let tier = decode_table_name(reader)?;
+                let version = u64::decode(reader)?;
+                Ok(LanceCommand::PinVersion {
+                    session_id,
+                    table_name,
+                    tier,
+                    version,
+                })
+            }
+            CMD_UNPIN_VERSION => {
+                let session_id = u64::decode(reader)?;
+                let table_name = decode_table_name(reader)?;
+                let tier = decode_table_name(reader)?;
+                let version = u64::decode(reader)?;
+                Ok(LanceCommand::UnpinVersion {
+                    session_id,
+                    table_name,
+                    tier,
+                    version,
+                })
+            }
+            CMD_EXPIRE_SESSION => {
+                let session_id = u64::decode(reader)?;
+                Ok(LanceCommand::ExpireSession { session_id })
             }
             d => Err(CodecError::InvalidDiscriminant(d)),
         }
@@ -373,6 +449,44 @@ impl Decode for LanceCommand {
                     segment_id,
                     s3_manifest_version,
                 })
+            }
+            CMD_REGISTER_SESSION => {
+                let session_id = read_u64_at(&data, offset)?;
+                Ok(LanceCommand::RegisterSession { session_id })
+            }
+            CMD_PIN_VERSION => {
+                let session_id = read_u64_at(&data, offset)?;
+                offset += 8;
+                let (table_name, consumed) = decode_table_name_from_bytes(&data, offset)?;
+                offset += consumed;
+                let (tier, consumed) = decode_table_name_from_bytes(&data, offset)?;
+                offset += consumed;
+                let version = read_u64_at(&data, offset)?;
+                Ok(LanceCommand::PinVersion {
+                    session_id,
+                    table_name,
+                    tier,
+                    version,
+                })
+            }
+            CMD_UNPIN_VERSION => {
+                let session_id = read_u64_at(&data, offset)?;
+                offset += 8;
+                let (table_name, consumed) = decode_table_name_from_bytes(&data, offset)?;
+                offset += consumed;
+                let (tier, consumed) = decode_table_name_from_bytes(&data, offset)?;
+                offset += consumed;
+                let version = read_u64_at(&data, offset)?;
+                Ok(LanceCommand::UnpinVersion {
+                    session_id,
+                    table_name,
+                    tier,
+                    version,
+                })
+            }
+            CMD_EXPIRE_SESSION => {
+                let session_id = read_u64_at(&data, offset)?;
+                Ok(LanceCommand::ExpireSession { session_id })
             }
             d => Err(CodecError::InvalidDiscriminant(d)),
         }

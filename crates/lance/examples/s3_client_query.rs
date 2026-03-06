@@ -296,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
     let persist_dir = temp_dir.path().join("bisque-client");
     let bisque_client = BisqueClient::connect(
         format!("http://{}", s3_addr),
-        "bisque",
+        vec!["bisque".to_string()],
         credentials,
         Some(&persist_dir),
     )
@@ -400,7 +400,9 @@ async fn setup_single_node_raft(
         .expect("invalid raft config"),
     );
 
-    let state_machine = LanceStateMachine::new(engine.clone()).with_catalog_events(catalog_bus);
+    let state_machine = LanceStateMachine::new(engine.clone())
+        .with_catalog_events(catalog_bus)
+        .with_catalog_name("bisque".to_string());
     let raft = manager
         .add_group(group_id, node_id, raft_config, state_machine)
         .await

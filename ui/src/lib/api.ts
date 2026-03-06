@@ -1,0 +1,308 @@
+import ky from "ky"
+import { useAuthStore } from "@/stores/auth"
+import { useClusterStore } from "@/stores/cluster"
+
+// ---------------------------------------------------------------------------
+// Mock mode flag — set VITE_MOCK=true to use fake data without a server
+// ---------------------------------------------------------------------------
+
+export const MOCK = import.meta.env.VITE_MOCK === "true"
+
+// ---------------------------------------------------------------------------
+// Real HTTP client — delegates to active cluster via Proxy
+// ---------------------------------------------------------------------------
+
+function getApi() {
+  const cluster = useClusterStore.getState().activeCluster
+  const prefixUrl = cluster.url || "/"
+  return ky.create({
+    prefixUrl,
+    hooks: {
+      beforeRequest: [
+        (request) => {
+          const token = useAuthStore.getState().token
+          if (token) {
+            request.headers.set("Authorization", `Bearer ${token}`)
+          }
+        },
+      ],
+      afterResponse: [
+        (_request, _options, response) => {
+          if (response.status === 401) {
+            useAuthStore.getState().logout()
+          }
+        },
+      ],
+    },
+  })
+}
+
+export const api = new Proxy({} as ReturnType<typeof ky.create>, {
+  get(_target, prop, receiver) {
+    return Reflect.get(getApi(), prop, receiver)
+  },
+})
+
+// ---------------------------------------------------------------------------
+// Type exports (shared by real and mock implementations)
+// ---------------------------------------------------------------------------
+
+export interface Account {
+  id: u64
+  name: string
+  created_at: string
+}
+
+export interface User {
+  id: u64
+  username: string
+  disabled: boolean
+  created_at: string
+}
+
+export interface AccountMembership {
+  user_id: u64
+  account_id: u64
+  role: "admin" | "member"
+}
+
+export interface LoginResponse {
+  user_id: number
+  token: string
+  accounts: Account[]
+}
+
+export interface Tenant {
+  id: u64
+  account_id: u64
+  name: string
+  limits: TenantLimits
+  created_at: string
+}
+
+export interface TenantLimits {
+  max_catalogs: number
+  max_api_keys: number
+}
+
+export interface CatalogEntry {
+  id: u64
+  tenant_id: u64
+  name: string
+  engine: string
+  config: string
+  raft_group_id: u64
+}
+
+export interface ApiKeyEntry {
+  id: u64
+  tenant_id: u64
+  scopes: Scope[]
+  revoked: boolean
+  created_at: string
+}
+
+export type Scope =
+  | "SuperAdmin"
+  | "TenantAdmin"
+  | { AccountAdmin: number }
+  | { Catalog: string }
+  | { CatalogRead: string }
+
+type u64 = number
+
+export interface TempoSearchResponse {
+  traces: TempoTraceResult[]
+}
+
+export interface TempoTraceResult {
+  traceID: string
+  rootServiceName: string
+  rootTraceName: string
+  startTimeUnixNano: string
+  durationMs: number
+  spanSets?: { spans: unknown[] }[]
+}
+
+export interface TempoTraceResponse {
+  batches: unknown[]
+}
+
+export interface TempoTagScope {
+  name: string
+  tags: string[]
+}
+
+export interface TempoTagValue {
+  type: string
+  value: string
+}
+
+export interface PromResponse {
+  status: string
+  data: {
+    resultType?: string
+    result?: PromResult[]
+  }
+}
+
+export interface PromResult {
+  metric: Record<string, string>
+  value?: [number, string]
+  values?: [number, string][]
+}
+
+export interface LokiResponse {
+  status: string
+  data: {
+    resultType: string
+    result: LokiStream[]
+  }
+}
+
+export interface LokiStream {
+  stream: Record<string, string>
+  values: [string, string][]
+}
+
+export interface LokiLabelsResponse {
+  status: string
+  data: string[]
+}
+
+// ---------------------------------------------------------------------------
+// Real API implementations
+// ---------------------------------------------------------------------------
+
+const realAuthApi = {
+  login: (username: string, password: string) =>
+    api.post("_bisque/v1/auth/login", { json: { username, password } }).json<LoginResponse>(),
+}
+
+const realAccountApi = {
+  list: () => api.get("_bisque/v1/accounts").json<Account[]>(),
+  get: (accountId: number) => api.get(`_bisque/v1/accounts/${accountId}`).json<Account>(),
+  create: (name: string) =>
+    api.post("_bisque/v1/accounts", { json: { name } }).json<{ account_id: number }>(),
+}
+
+const realTenantApi = {
+  create: (accountId: number, name: string, limits?: Partial<TenantLimits>) =>
+    api.post("_bisque/v1/tenants", { json: { account_id: accountId, name, limits } }).json<{ tenant_id: number }>(),
+
+  get: (tenantId: number) =>
+    api.get(`_bisque/v1/tenants/${tenantId}`).json<Tenant>(),
+}
+
+const realCatalogApi = {
+  list: (tenantId: number) =>
+    api.get(`_bisque/v1/tenants/${tenantId}/catalogs`).json<CatalogEntry[]>(),
+
+  create: (tenantId: number, name: string, engine: string, config = "") =>
+    api
+      .post(`_bisque/v1/tenants/${tenantId}/catalogs`, {
+        json: { name, engine, config },
+      })
+      .json<{ catalog_id: number; raft_group_id: number }>(),
+}
+
+const realApiKeyApi = {
+  create: (tenantId: number, scopes: Scope[], ttlSecs?: number) =>
+    api
+      .post(`_bisque/v1/tenants/${tenantId}/api-keys`, {
+        json: { scopes, ttl_secs: ttlSecs },
+      })
+      .json<{ key_id: number; raw_key: string; token: string }>(),
+
+  revoke: (keyId: number) => api.delete(`_bisque/v1/api-keys/${keyId}`),
+}
+
+const realTempoApi = {
+  searchTraces: (params: Record<string, string>) =>
+    api.get("api/search", { searchParams: params }).json<TempoSearchResponse>(),
+
+  getTrace: (traceId: string) =>
+    api.get(`api/traces/${traceId}`).json<TempoTraceResponse>(),
+
+  getTags: () =>
+    api.get("api/v2/search/tags").json<{ scopes: TempoTagScope[] }>(),
+
+  getTagValues: (tag: string) =>
+    api.get(`api/v2/search/tag/${tag}/values`).json<{ tagValues: TempoTagValue[] }>(),
+}
+
+const realPromApi = {
+  query: (query: string, time?: string) =>
+    api
+      .get("api/v1/query", { searchParams: { query, ...(time ? { time } : {}) } })
+      .json<PromResponse>(),
+
+  queryRange: (query: string, start: string, end: string, step: string) =>
+    api
+      .get("api/v1/query_range", { searchParams: { query, start, end, step } })
+      .json<PromResponse>(),
+
+  labels: () => api.get("api/v1/labels").json<PromResponse>(),
+
+  labelValues: (name: string) =>
+    api.get(`api/v1/label/${name}/values`).json<PromResponse>(),
+
+  metadata: () => api.get("api/v1/metadata").json<PromResponse>(),
+}
+
+const realLokiApi = {
+  query: (query: string, limit?: number, time?: string) =>
+    api
+      .get("loki/api/v1/query", {
+        searchParams: { query, ...(limit ? { limit: String(limit) } : {}), ...(time ? { time } : {}) },
+      })
+      .json<LokiResponse>(),
+
+  queryRange: (query: string, start: string, end: string, limit?: number) =>
+    api
+      .get("loki/api/v1/query_range", {
+        searchParams: { query, start, end, ...(limit ? { limit: String(limit) } : {}) },
+      })
+      .json<LokiResponse>(),
+
+  labels: () => api.get("loki/api/v1/labels").json<LokiLabelsResponse>(),
+
+  labelValues: (name: string) =>
+    api.get(`loki/api/v1/label/${name}/values`).json<LokiLabelsResponse>(),
+}
+
+const realS3Api = {
+  getCatalog: (bucket: string) =>
+    api.get(`${bucket}/_bisque/catalog`).json<Record<string, unknown>>(),
+
+  listObjects: (bucket: string, prefix?: string) =>
+    api
+      .get(bucket, { searchParams: prefix ? { prefix, "list-type": "2" } : { "list-type": "2" } })
+      .text(),
+}
+
+// ---------------------------------------------------------------------------
+// Conditional exports — mock or real depending on VITE_MOCK
+// ---------------------------------------------------------------------------
+
+import {
+  mockAuthApi,
+  mockAccountApi,
+  mockTenantApi,
+  mockCatalogApi,
+  mockApiKeyApi,
+  mockTempoApi,
+  mockPromApi,
+  mockLokiApi,
+  mockS3Api,
+} from "./mock-api"
+
+export const authApi = MOCK ? mockAuthApi : realAuthApi
+export const accountApi = MOCK ? mockAccountApi : realAccountApi
+export const tenantApi = MOCK ? mockTenantApi : realTenantApi
+export const catalogApi = MOCK ? mockCatalogApi : realCatalogApi
+export const apiKeyApi = MOCK ? mockApiKeyApi : realApiKeyApi
+export const tempoApi = MOCK ? mockTempoApi : realTempoApi
+export const promApi = MOCK ? mockPromApi : realPromApi
+export const lokiApi = MOCK ? mockLokiApi : realLokiApi
+export const s3Api = MOCK ? mockS3Api : realS3Api

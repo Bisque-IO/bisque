@@ -140,7 +140,22 @@ impl OtlpReceiver {
         table_name: &str,
         batches: Vec<RecordBatch>,
     ) -> Result<(), WriteError> {
-        self.raft_node.write_records(table_name, &batches).await?;
+        let start = std::time::Instant::now();
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let signal = match table_name {
+            "otel_counters" | "otel_gauges" | "otel_histograms" | "otel_exp_histograms"
+            | "otel_summaries" | "otel_exemplars" => "metrics",
+            "otel_spans" | "otel_span_events" | "otel_span_links" => "traces",
+            "otel_logs" => "logs",
+            _ => "unknown",
+        };
+        let result = self.raft_node.write_records(table_name, &batches).await;
+        ::metrics::counter!("bisque_otel_received_total", "signal" => signal, "table" => table_name.to_string()).increment(row_count as u64);
+        ::metrics::histogram!("bisque_otel_ingest_latency_seconds", "signal" => signal).record(start.elapsed().as_secs_f64());
+        if result.is_err() {
+            ::metrics::counter!("bisque_otel_ingest_errors_total", "signal" => signal).increment(1);
+        }
+        result?;
         Ok(())
     }
 

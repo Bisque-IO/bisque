@@ -33,7 +33,7 @@ use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::catalog_events::CatalogEventBus;
+use crate::catalog_events::{CatalogEvent, CatalogEventBus};
 use crate::engine::BisqueLance;
 use crate::manifest::LanceManifestManager;
 use crate::version_pins::{PinKey, PinTier, VersionPinTracker};
@@ -46,6 +46,54 @@ pub struct S3ServerState {
     group_id: u64,
     /// Tracks which dataset versions are pinned by remote clients.
     pub version_pins: Arc<VersionPinTracker>,
+}
+
+impl S3ServerState {
+    /// Create a new S3 server state and spawn the version-pin reaper task.
+    pub fn new(
+        engine: Arc<BisqueLance>,
+        catalog_events: Option<Arc<CatalogEventBus>>,
+        manifest: Option<Arc<LanceManifestManager>>,
+        group_id: u64,
+    ) -> Arc<Self> {
+        let version_pins = Arc::new(VersionPinTracker::new(std::time::Duration::from_secs(30)));
+
+        // Start background reaper for expired version pin sessions
+        let reaper_pins = version_pins.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let reaped = reaper_pins.reap_expired();
+                if reaped > 0 {
+                    info!(reaped, "Reaped expired version pin sessions");
+                }
+            }
+        });
+
+        Arc::new(Self {
+            engine,
+            catalog_events,
+            manifest,
+            group_id,
+            version_pins,
+        })
+    }
+}
+
+/// Build the S3-compatible axum Router without starting a listener.
+///
+/// Used by the `bisque` crate to compose into a unified server.
+pub fn s3_router(state: Arc<S3ServerState>) -> axum::Router {
+    axum::Router::new()
+        .route("/_bisque/ws", axum::routing::get(tenant_ws_handler))
+        .route("/{bucket}/_bisque/catalog", axum::routing::get(get_catalog))
+        .route("/{bucket}/_bisque/ws", axum::routing::get(ws_handler))
+        .route("/{bucket}", axum::routing::get(list_objects))
+        .route(
+            "/{bucket}/{*key}",
+            axum::routing::get(get_object).head(head_object),
+        )
+        .with_state(state)
 }
 
 /// Start an S3-compatible HTTP server exposing local Lance segment files.
@@ -69,41 +117,8 @@ pub async fn serve_s3(
     manifest: Option<Arc<LanceManifestManager>>,
     group_id: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let version_pins = Arc::new(VersionPinTracker::new(std::time::Duration::from_secs(30)));
-
-    // Start background reaper for expired version pin sessions
-    let reaper_pins = version_pins.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            let reaped = reaper_pins.reap_expired();
-            if reaped > 0 {
-                info!(reaped, "Reaped expired version pin sessions");
-            }
-        }
-    });
-
-    let state = Arc::new(S3ServerState {
-        engine,
-        catalog_events,
-        manifest,
-        group_id,
-        version_pins,
-    });
-
-    let app = axum::Router::new()
-        // Catalog metadata (custom endpoint)
-        .route("/{bucket}/_bisque/catalog", axum::routing::get(get_catalog))
-        // WebSocket endpoint for real-time catalog events
-        .route("/{bucket}/_bisque/ws", axum::routing::get(ws_handler))
-        // ListObjectsV2 — must come before the wildcard
-        .route("/{bucket}", axum::routing::get(list_objects))
-        // GetObject / HeadObject
-        .route(
-            "/{bucket}/{*key}",
-            axum::routing::get(get_object).head(head_object),
-        )
-        .with_state(state);
+    let state = S3ServerState::new(engine, catalog_events, manifest, group_id);
+    let app = s3_router(state);
 
     info!(%addr, "starting S3-compatible HTTP server");
 
@@ -257,6 +272,7 @@ async fn get_catalog(
         }
     }
 
+    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "catalog").increment(1);
     axum::Json(CatalogResponse { tables: catalog })
 }
 
@@ -289,6 +305,7 @@ async fn get_object(
     AxumPath((_bucket, key)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
+    let req_start = std::time::Instant::now();
     let parsed = parse_key(&key).ok_or_else(|| s3_not_found(&key))?;
 
     let (store, path) = resolve_to_object_store(&state, &parsed)
@@ -347,6 +364,8 @@ async fn get_object(
         builder = builder.status(StatusCode::OK);
     }
 
+    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "get").increment(1);
+    metrics::histogram!("bisque_request_latency_seconds", "protocol" => "s3", "op" => "get").record(req_start.elapsed().as_secs_f64());
     Ok(builder.body(body).unwrap())
 }
 
@@ -385,6 +404,7 @@ async fn head_object(
     State(state): State<Arc<S3ServerState>>,
     AxumPath((_bucket, key)): AxumPath<(String, String)>,
 ) -> Result<Response, Response> {
+    let req_start = std::time::Instant::now();
     let parsed = parse_key(&key).ok_or_else(|| s3_not_found(&key))?;
 
     let (store, path) = resolve_to_object_store(&state, &parsed)
@@ -399,6 +419,8 @@ async fn head_object(
     let etag = meta.e_tag.as_deref().unwrap_or("\"unknown\"");
     let last_modified = meta.last_modified.to_rfc2822();
 
+    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "head").increment(1);
+    metrics::histogram!("bisque_request_latency_seconds", "protocol" => "s3", "op" => "head").record(req_start.elapsed().as_secs_f64());
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-length", meta.size.to_string())
@@ -433,6 +455,7 @@ async fn list_objects(
     AxumPath(bucket): AxumPath<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Response, Response> {
+    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "list").increment(1);
     let prefix = params.prefix.unwrap_or_default();
     let delimiter = params.delimiter.unwrap_or_default();
     let max_keys = params.max_keys.unwrap_or(1000).min(10000);
@@ -620,10 +643,30 @@ struct WsParams {
     since: Option<u64>,
 }
 
+/// Tenant-scoped WebSocket handler at `/_bisque/ws`.
+///
+/// Used by multi-catalog `BisqueClient` — no bucket path parameter needed.
+/// The client sends a `Subscribe { catalogs }` message after connecting.
+async fn tenant_ws_handler(
+    State(state): State<Arc<S3ServerState>>,
+    Query(params): Query<WsParams>,
+    upgrade: fastwebsockets::upgrade::IncomingUpgrade,
+) -> Response {
+    ws_handler_inner(state, params, upgrade).await
+}
+
 async fn ws_handler(
     State(state): State<Arc<S3ServerState>>,
     AxumPath(_bucket): AxumPath<String>,
     Query(params): Query<WsParams>,
+    upgrade: fastwebsockets::upgrade::IncomingUpgrade,
+) -> Response {
+    ws_handler_inner(state, params, upgrade).await
+}
+
+async fn ws_handler_inner(
+    state: Arc<S3ServerState>,
+    params: WsParams,
     upgrade: fastwebsockets::upgrade::IncomingUpgrade,
 ) -> Response {
     let bus = match &state.catalog_events {
@@ -681,21 +724,40 @@ async fn ws_handler(
     response.into_response()
 }
 
-/// JSON messages clients can send for version pinning.
-#[derive(Deserialize)]
+/// MessagePack messages sent from server to client over WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ClientWsMessage {
+pub(crate) enum ServerWsMessage {
+    /// Initial session assignment.
+    Session { session_id: u64 },
+    /// A catalog event (table create/drop, version bump, seal, promote).
+    Event {
+        #[serde(flatten)]
+        event: CatalogEvent,
+    },
+    /// Client fell behind; must re-fetch full catalog for this catalog.
+    SnapshotRequired { catalog: String },
+}
+
+/// MessagePack messages clients send for version pinning and catalog subscription.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ClientWsMessage {
     Pin {
+        catalog: String,
         table: String,
         tier: String,
         version: u64,
     },
     Unpin {
+        catalog: String,
         table: String,
         tier: String,
         version: u64,
     },
     Heartbeat,
+    /// Subscribe to catalog events for the specified catalogs.
+    Subscribe { catalogs: Vec<String> },
 }
 
 async fn handle_ws_connection<S>(
@@ -712,10 +774,9 @@ where
 {
     use fastwebsockets::{Frame, OpCode, Payload};
 
-    // Send session_id to client so it knows its identity
-    let hello = serde_json::json!({"type": "session", "session_id": session_id});
-    let hello_bytes = hello.to_string();
-    ws.write_frame(Frame::text(Payload::Borrowed(hello_bytes.as_bytes())))
+    // Send session_id to client
+    let hello = rmp_serde::to_vec(&ServerWsMessage::Session { session_id })?;
+    ws.write_frame(Frame::binary(Payload::Owned(hello)))
         .await?;
 
     // Replay WAL events if `since` was provided and we have a manifest
@@ -723,15 +784,17 @@ where
         match manifest.read_wal_since(group_id, since_seq) {
             Ok(events) => {
                 for event in events {
-                    let json = serde_json::to_string(&event)?;
-                    ws.write_frame(Frame::text(Payload::Borrowed(json.as_bytes())))
+                    let bytes = rmp_serde::to_vec(&ServerWsMessage::Event { event })?;
+                    ws.write_frame(Frame::binary(Payload::Owned(bytes)))
                         .await?;
                 }
             }
             Err(e) => {
                 warn!("Failed to read WAL for replay: {}", e);
-                let msg = r#"{"type":"snapshot_required"}"#;
-                ws.write_frame(Frame::text(Payload::Borrowed(msg.as_bytes())))
+                let bytes = rmp_serde::to_vec(&ServerWsMessage::SnapshotRequired {
+                    catalog: String::new(),
+                })?;
+                ws.write_frame(Frame::binary(Payload::Owned(bytes)))
                     .await?;
             }
         }
@@ -749,14 +812,16 @@ where
             event = rx.recv() => {
                 match event {
                     Ok(event) => {
-                        let json = serde_json::to_string(&event)?;
-                        ws.write_frame(Frame::text(Payload::Borrowed(json.as_bytes())))
+                        let bytes = rmp_serde::to_vec(&ServerWsMessage::Event { event })?;
+                        ws.write_frame(Frame::binary(Payload::Owned(bytes)))
                             .await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(lagged = n, "WebSocket subscriber lagged, sending snapshot_required");
-                        let msg = r#"{"type":"snapshot_required"}"#;
-                        ws.write_frame(Frame::text(Payload::Borrowed(msg.as_bytes())))
+                        let bytes = rmp_serde::to_vec(&ServerWsMessage::SnapshotRequired {
+                            catalog: String::new(),
+                        })?;
+                        ws.write_frame(Frame::binary(Payload::Owned(bytes)))
                             .await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -768,9 +833,8 @@ where
             frame = ws.read_frame() => {
                 let frame = frame?;
                 match frame.opcode {
-                    OpCode::Text => {
-                        let text = std::str::from_utf8(&frame.payload)?;
-                        handle_client_pin_message(text, &pins, session_id);
+                    OpCode::Binary => {
+                        handle_client_pin_message(&frame.payload, &pins, session_id);
                     }
                     OpCode::Close => {
                         debug!(session_id, "Client sent close frame");
@@ -785,8 +849,8 @@ where
     Ok(())
 }
 
-fn handle_client_pin_message(text: &str, pins: &VersionPinTracker, session_id: u64) {
-    let msg: ClientWsMessage = match serde_json::from_str(text) {
+fn handle_client_pin_message(data: &[u8], pins: &VersionPinTracker, session_id: u64) {
+    let msg: ClientWsMessage = match rmp_serde::from_slice(data) {
         Ok(m) => m,
         Err(_) => {
             debug!(session_id, "Ignoring unrecognized client WS message");
@@ -796,15 +860,17 @@ fn handle_client_pin_message(text: &str, pins: &VersionPinTracker, session_id: u
 
     match msg {
         ClientWsMessage::Pin {
+            catalog,
             table,
             tier,
             version,
         } => {
             if let Some(tier) = PinTier::from_str(&tier) {
-                debug!(session_id, %table, %version, "Client pinned version");
+                debug!(session_id, %catalog, %table, %version, "Client pinned version");
                 pins.pin(
                     session_id,
                     PinKey {
+                        catalog,
                         table,
                         tier,
                         version,
@@ -813,15 +879,17 @@ fn handle_client_pin_message(text: &str, pins: &VersionPinTracker, session_id: u
             }
         }
         ClientWsMessage::Unpin {
+            catalog,
             table,
             tier,
             version,
         } => {
             if let Some(tier) = PinTier::from_str(&tier) {
-                debug!(session_id, %table, %version, "Client unpinned version");
+                debug!(session_id, %catalog, %table, %version, "Client unpinned version");
                 pins.unpin(
                     session_id,
                     PinKey {
+                        catalog,
                         table,
                         tier,
                         version,
@@ -831,6 +899,10 @@ fn handle_client_pin_message(text: &str, pins: &VersionPinTracker, session_id: u
         }
         ClientWsMessage::Heartbeat => {
             pins.heartbeat(session_id);
+        }
+        ClientWsMessage::Subscribe { catalogs } => {
+            debug!(session_id, ?catalogs, "Client subscribed to catalogs");
+            // Subscription handling is done at the connection level for multi-catalog WS
         }
     }
 }

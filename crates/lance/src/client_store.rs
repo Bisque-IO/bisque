@@ -21,8 +21,16 @@ const STATE_KEY: &[u8] = b"state";
 /// Metadata about the client's connection state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ClientMeta {
-    pub last_seq: u64,
+    /// Cluster URL this client connects to.
     pub cluster_url: String,
+    /// Catalog names this client is subscribed to.
+    #[serde(default)]
+    pub catalogs: Vec<String>,
+    /// Legacy field for backward compat — ignored when `catalogs` is non-empty.
+    #[serde(default)]
+    pub last_seq: u64,
+    /// Legacy field for backward compat.
+    #[serde(default)]
     pub bucket: String,
 }
 
@@ -333,13 +341,14 @@ mod tests {
         assert!(store.load_state().unwrap().is_none());
 
         let meta = ClientMeta {
-            last_seq: 42,
             cluster_url: "http://localhost:3300".into(),
-            bucket: "data".into(),
+            catalogs: vec!["data".into()],
+            last_seq: 42,
+            bucket: String::new(),
         };
         let mut tables = HashMap::new();
         tables.insert(
-            "events".into(),
+            "data\0events".into(),
             PersistedCatalogEntry {
                 active_segment: 1,
                 sealed_segment: Some(2),
@@ -354,11 +363,10 @@ mod tests {
         store.save_state(&meta, &tables).unwrap();
 
         let (loaded_meta, loaded_tables) = store.load_state().unwrap().unwrap();
-        assert_eq!(loaded_meta.last_seq, 42);
         assert_eq!(loaded_meta.cluster_url, "http://localhost:3300");
-        assert_eq!(loaded_meta.bucket, "data");
+        assert_eq!(loaded_meta.catalogs, vec!["data"]);
         assert_eq!(loaded_tables.len(), 1);
-        let entry = loaded_tables.get("events").unwrap();
+        let entry = loaded_tables.get("data\0events").unwrap();
         assert_eq!(entry.active_segment, 1);
         assert_eq!(entry.sealed_segment, Some(2));
         assert_eq!(entry.active_version, Some(5));
@@ -371,9 +379,10 @@ mod tests {
         let store = ClientStore::open(dir.path()).unwrap();
 
         let meta = ClientMeta {
-            last_seq: 0,
             cluster_url: "http://localhost:3300".into(),
-            bucket: "data".into(),
+            catalogs: vec!["data".into()],
+            last_seq: 0,
+            bucket: String::new(),
         };
         store.save_state(&meta, &HashMap::new()).unwrap();
 
@@ -386,14 +395,14 @@ mod tests {
             sealed_version: None,
             schema_ipc: vec![10, 20],
         };
-        store.update_table("logs", &entry).unwrap();
+        store.update_table("data\0logs", &entry).unwrap();
 
         let (_, tables) = store.load_state().unwrap().unwrap();
-        assert!(tables.contains_key("logs"));
+        assert!(tables.contains_key("data\0logs"));
 
-        store.remove_table("logs").unwrap();
+        store.remove_table("data\0logs").unwrap();
         let (_, tables) = store.load_state().unwrap().unwrap();
-        assert!(!tables.contains_key("logs"));
+        assert!(!tables.contains_key("data\0logs"));
     }
 
     #[test]
@@ -402,9 +411,10 @@ mod tests {
         let store = ClientStore::open(dir.path()).unwrap();
 
         let meta = ClientMeta {
-            last_seq: 10,
             cluster_url: "http://localhost:3300".into(),
-            bucket: "data".into(),
+            catalogs: vec!["data".into()],
+            last_seq: 10,
+            bucket: String::new(),
         };
         store.save_state(&meta, &HashMap::new()).unwrap();
 
@@ -422,13 +432,14 @@ mod tests {
         {
             let store = ClientStore::open(dir.path()).unwrap();
             let meta = ClientMeta {
-                last_seq: 55,
                 cluster_url: "http://host:3300".into(),
-                bucket: "mybucket".into(),
+                catalogs: vec!["mybucket".into()],
+                last_seq: 55,
+                bucket: String::new(),
             };
             let mut tables = HashMap::new();
             tables.insert(
-                "metrics".into(),
+                "mybucket\0metrics".into(),
                 PersistedCatalogEntry {
                     active_segment: 3,
                     sealed_segment: Some(2),
@@ -447,9 +458,12 @@ mod tests {
             let store = ClientStore::open(dir.path()).unwrap();
             let (meta, tables) = store.load_state().unwrap().unwrap();
             assert_eq!(meta.last_seq, 55);
-            assert_eq!(meta.bucket, "mybucket");
+            assert_eq!(meta.catalogs, vec!["mybucket"]);
             assert_eq!(tables.len(), 1);
-            assert_eq!(tables.get("metrics").unwrap().active_version, Some(10));
+            assert_eq!(
+                tables.get("mybucket\0metrics").unwrap().active_version,
+                Some(10)
+            );
         }
     }
 }

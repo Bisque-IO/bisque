@@ -39,6 +39,10 @@ pub struct LanceStateMachine {
     group_id: u64,
     /// Optional catalog event bus for real-time push notifications.
     catalog_events: Option<Arc<CatalogEventBus>>,
+    /// Catalog name (raft group name) used to tag catalog events.
+    catalog_name: String,
+    /// Optional version pin tracker for Raft-replicated version pins.
+    version_pins: Option<Arc<crate::version_pins::VersionPinTracker>>,
 }
 
 impl LanceStateMachine {
@@ -52,12 +56,26 @@ impl LanceStateMachine {
             manifest: None,
             group_id: 0,
             catalog_events: None,
+            catalog_name: String::new(),
+            version_pins: None,
         }
     }
 
     /// Set the catalog event bus for real-time push notifications.
     pub fn with_catalog_events(mut self, bus: Arc<CatalogEventBus>) -> Self {
         self.catalog_events = Some(bus);
+        self
+    }
+
+    /// Set the catalog name used to tag catalog events.
+    pub fn with_catalog_name(mut self, name: String) -> Self {
+        self.catalog_name = name;
+        self
+    }
+
+    /// Set the version pin tracker for Raft-replicated version pins.
+    pub fn with_version_pins(mut self, pins: Arc<crate::version_pins::VersionPinTracker>) -> Self {
+        self.version_pins = Some(pins);
         self
     }
 
@@ -96,6 +114,8 @@ impl LanceStateMachine {
             manifest: None,
             group_id: 0,
             catalog_events: None,
+            catalog_name: String::new(),
+            version_pins: None,
         };
         (sm, watermark)
     }
@@ -355,7 +375,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
             // Emit catalog event + persist to WAL.
             if let Some(event_kind) = catalog_event {
                 if let Some(bus) = &self.catalog_events {
-                    let event = bus.publish(event_kind);
+                    let event = bus.publish(self.catalog_name.clone(), event_kind);
                     // Persist to MDBX WAL (fire-and-forget).
                     if let Some(manifest) = &self.manifest {
                         manifest
@@ -668,6 +688,66 @@ impl LanceStateMachine {
                         LanceResponse::Error(e.to_string())
                     }
                 }
+            }
+
+            LanceCommand::RegisterSession { session_id } => {
+                if let Some(pins) = &self.version_pins {
+                    // Session ID is pre-allocated by the server; just ensure it exists.
+                    debug!(session_id, "Raft-replicated session registration");
+                    let _ = pins.create_session();
+                }
+                LanceResponse::Ok
+            }
+
+            LanceCommand::PinVersion {
+                session_id,
+                table_name,
+                tier,
+                version,
+            } => {
+                if let Some(pins) = &self.version_pins {
+                    if let Some(pin_tier) = crate::version_pins::PinTier::from_str(&tier) {
+                        pins.pin(
+                            session_id,
+                            crate::version_pins::PinKey {
+                                catalog: self.catalog_name.clone(),
+                                table: table_name,
+                                tier: pin_tier,
+                                version,
+                            },
+                        );
+                    }
+                }
+                LanceResponse::Ok
+            }
+
+            LanceCommand::UnpinVersion {
+                session_id,
+                table_name,
+                tier,
+                version,
+            } => {
+                if let Some(pins) = &self.version_pins {
+                    if let Some(pin_tier) = crate::version_pins::PinTier::from_str(&tier) {
+                        pins.unpin(
+                            session_id,
+                            crate::version_pins::PinKey {
+                                catalog: self.catalog_name.clone(),
+                                table: table_name,
+                                tier: pin_tier,
+                                version,
+                            },
+                        );
+                    }
+                }
+                LanceResponse::Ok
+            }
+
+            LanceCommand::ExpireSession { session_id } => {
+                if let Some(pins) = &self.version_pins {
+                    pins.remove_session(session_id);
+                }
+                LanceResponse::Ok
             }
         }
     }

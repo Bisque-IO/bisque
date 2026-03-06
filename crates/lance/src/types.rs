@@ -125,6 +125,28 @@ pub enum LanceCommand {
         segment_id: SegmentId,
         s3_manifest_version: u64,
     },
+
+    /// Register a new client session for version pinning (replicated cluster-wide).
+    RegisterSession { session_id: u64 },
+
+    /// Pin a dataset version so compaction doesn't delete it.
+    PinVersion {
+        session_id: u64,
+        table_name: String,
+        tier: String,
+        version: u64,
+    },
+
+    /// Release a previously pinned version.
+    UnpinVersion {
+        session_id: u64,
+        table_name: String,
+        tier: String,
+        version: u64,
+    },
+
+    /// Expire/remove a client session, releasing all its pins.
+    ExpireSession { session_id: u64 },
 }
 
 impl fmt::Display for LanceCommand {
@@ -181,6 +203,32 @@ impl fmt::Display for LanceCommand {
                 "PromoteToDeepStorage(table={}, segment={}, version={})",
                 table_name, segment_id, s3_manifest_version
             ),
+            LanceCommand::RegisterSession { session_id } => {
+                write!(f, "RegisterSession(session={})", session_id)
+            }
+            LanceCommand::PinVersion {
+                session_id,
+                table_name,
+                tier,
+                version,
+            } => write!(
+                f,
+                "PinVersion(session={}, table={}, tier={}, version={})",
+                session_id, table_name, tier, version
+            ),
+            LanceCommand::UnpinVersion {
+                session_id,
+                table_name,
+                tier,
+                version,
+            } => write!(
+                f,
+                "UnpinVersion(session={}, table={}, tier={}, version={})",
+                session_id, table_name, tier, version
+            ),
+            LanceCommand::ExpireSession { session_id } => {
+                write!(f, "ExpireSession(session={})", session_id)
+            }
         }
     }
 }

@@ -7,10 +7,10 @@
 //!
 //! # Protocol
 //!
-//! Clients send JSON messages over the WebSocket:
-//! - `{"type":"pin","table":"events","tier":"active","version":42}` — pin a version
-//! - `{"type":"unpin","table":"events","tier":"active","version":42}` — release a pin
-//! - `{"type":"heartbeat"}` — renew the session lease
+//! Clients send MessagePack binary messages over the WebSocket:
+//! - Pin `{ catalog, table, tier, version }` — pin a version
+//! - Unpin `{ catalog, table, tier, version }` — release a pin
+//! - Heartbeat — renew the session lease
 //!
 //! The server reaps expired sessions (no heartbeat within `lease_timeout`).
 
@@ -21,9 +21,10 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
-/// Identifies a pinned dataset version.
+/// Identifies a pinned dataset version within a specific catalog.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct PinKey {
+    pub catalog: String,
     pub table: String,
     pub tier: PinTier,
     pub version: u64,
@@ -172,14 +173,14 @@ impl VersionPinTracker {
         }
     }
 
-    /// Get the minimum pinned version for a table+tier, or `None` if nothing is pinned.
+    /// Get the minimum pinned version for a catalog+table+tier, or `None` if nothing is pinned.
     ///
     /// Compaction cleanup must not delete versions >= this value.
-    pub fn min_pinned_version(&self, table: &str, tier: PinTier) -> Option<u64> {
+    pub fn min_pinned_version(&self, catalog: &str, table: &str, tier: PinTier) -> Option<u64> {
         let counts = self.pin_counts.lock();
         counts
             .keys()
-            .filter(|k| k.table == table && k.tier == tier)
+            .filter(|k| k.catalog == catalog && k.table == table && k.tier == tier)
             .map(|k| k.version)
             .min()
     }
@@ -221,33 +222,41 @@ impl VersionPinTracker {
 mod tests {
     use super::*;
 
+    fn pin_key(table: &str, tier: PinTier, version: u64) -> PinKey {
+        PinKey {
+            catalog: "test".into(),
+            table: table.into(),
+            tier,
+            version,
+        }
+    }
+
     #[test]
     fn test_pin_unpin() {
         let tracker = VersionPinTracker::new(Duration::from_secs(30));
         let s1 = tracker.create_session();
         let s2 = tracker.create_session();
 
-        let key = PinKey {
-            table: "events".into(),
-            tier: PinTier::Active,
-            version: 5,
-        };
+        let key = pin_key("events", PinTier::Active, 5);
 
         tracker.pin(s1, key.clone());
         tracker.pin(s2, key.clone());
         assert_eq!(
-            tracker.min_pinned_version("events", PinTier::Active),
+            tracker.min_pinned_version("test", "events", PinTier::Active),
             Some(5)
         );
 
         tracker.unpin(s1, key.clone());
         assert_eq!(
-            tracker.min_pinned_version("events", PinTier::Active),
+            tracker.min_pinned_version("test", "events", PinTier::Active),
             Some(5)
         );
 
         tracker.unpin(s2, key.clone());
-        assert_eq!(tracker.min_pinned_version("events", PinTier::Active), None);
+        assert_eq!(
+            tracker.min_pinned_version("test", "events", PinTier::Active),
+            None
+        );
     }
 
     #[test]
@@ -256,29 +265,21 @@ mod tests {
         let s1 = tracker.create_session();
         let s2 = tracker.create_session();
 
-        tracker.pin(
-            s1,
-            PinKey {
-                table: "events".into(),
-                tier: PinTier::Active,
-                version: 10,
-            },
-        );
-        tracker.pin(
-            s2,
-            PinKey {
-                table: "events".into(),
-                tier: PinTier::Active,
-                version: 5,
-            },
-        );
+        tracker.pin(s1, pin_key("events", PinTier::Active, 10));
+        tracker.pin(s2, pin_key("events", PinTier::Active, 5));
 
         assert_eq!(
-            tracker.min_pinned_version("events", PinTier::Active),
+            tracker.min_pinned_version("test", "events", PinTier::Active),
             Some(5)
         );
-        assert_eq!(tracker.min_pinned_version("events", PinTier::Sealed), None);
-        assert_eq!(tracker.min_pinned_version("other", PinTier::Active), None);
+        assert_eq!(
+            tracker.min_pinned_version("test", "events", PinTier::Sealed),
+            None
+        );
+        assert_eq!(
+            tracker.min_pinned_version("test", "other", PinTier::Active),
+            None
+        );
     }
 
     #[test]
@@ -286,22 +287,8 @@ mod tests {
         let tracker = VersionPinTracker::new(Duration::from_secs(30));
         let s1 = tracker.create_session();
 
-        tracker.pin(
-            s1,
-            PinKey {
-                table: "t".into(),
-                tier: PinTier::Active,
-                version: 1,
-            },
-        );
-        tracker.pin(
-            s1,
-            PinKey {
-                table: "t".into(),
-                tier: PinTier::Sealed,
-                version: 2,
-            },
-        );
+        tracker.pin(s1, pin_key("t", PinTier::Active, 1));
+        tracker.pin(s1, pin_key("t", PinTier::Sealed, 2));
 
         assert_eq!(tracker.pin_count(), 2);
         tracker.remove_session(s1);
@@ -313,14 +300,7 @@ mod tests {
     fn test_reap_expired() {
         let tracker = VersionPinTracker::new(Duration::from_millis(10));
         let s1 = tracker.create_session();
-        tracker.pin(
-            s1,
-            PinKey {
-                table: "t".into(),
-                tier: PinTier::Active,
-                version: 1,
-            },
-        );
+        tracker.pin(s1, pin_key("t", PinTier::Active, 1));
 
         std::thread::sleep(Duration::from_millis(20));
         let reaped = tracker.reap_expired();
@@ -333,14 +313,7 @@ mod tests {
     fn test_heartbeat_prevents_reap() {
         let tracker = VersionPinTracker::new(Duration::from_millis(50));
         let s1 = tracker.create_session();
-        tracker.pin(
-            s1,
-            PinKey {
-                table: "t".into(),
-                tier: PinTier::Active,
-                version: 1,
-            },
-        );
+        tracker.pin(s1, pin_key("t", PinTier::Active, 1));
 
         std::thread::sleep(Duration::from_millis(30));
         tracker.heartbeat(s1);

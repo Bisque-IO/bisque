@@ -19,6 +19,9 @@ use tokio::sync::broadcast;
 pub struct CatalogEvent {
     /// Monotonically increasing sequence number.
     pub seq: u64,
+    /// The catalog (raft group) this event belongs to.
+    #[serde(default)]
+    pub catalog: String,
     /// The mutation that occurred.
     pub event: CatalogEventKind,
 }
@@ -31,7 +34,6 @@ pub enum CatalogEventKind {
     TableCreated {
         table: String,
         /// Arrow IPC-encoded schema bytes.
-        #[serde(with = "base64_bytes")]
         schema_ipc: Vec<u8>,
     },
     /// A table was dropped.
@@ -82,9 +84,13 @@ impl CatalogEventBus {
     ///
     /// Returns the published event (with its assigned sequence number).
     /// Returns `None` if there are no active subscribers.
-    pub fn publish(&self, kind: CatalogEventKind) -> CatalogEvent {
+    pub fn publish(&self, catalog: String, kind: CatalogEventKind) -> CatalogEvent {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let event = CatalogEvent { seq, event: kind };
+        let event = CatalogEvent {
+            seq,
+            catalog,
+            event: kind,
+        };
         // Ignore send error — it just means no subscribers are connected.
         let _ = self.tx.send(event.clone());
         event
@@ -96,21 +102,3 @@ impl CatalogEventBus {
     }
 }
 
-/// Serde helper for base64-encoding byte vectors in JSON.
-mod base64_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        serializer.serialize_str(&encoded)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        use base64::Engine;
-        let s = String::deserialize(deserializer)?;
-        base64::engine::general_purpose::STANDARD
-            .decode(&s)
-            .map_err(serde::de::Error::custom)
-    }
-}

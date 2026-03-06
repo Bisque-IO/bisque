@@ -337,6 +337,16 @@ impl LanceRaftNode {
         }
     }
 
+    /// Get this node's ID.
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    /// Get the Raft group ID.
+    pub fn group_id(&self) -> u64 {
+        self.group_id
+    }
+
     /// Check if this node is currently the leader.
     pub fn is_leader(&self) -> bool {
         let metrics = self.raft.metrics().borrow_watched().clone();
@@ -437,9 +447,11 @@ async fn leader_watcher(
         };
 
         if is_leader && !was_leader {
+            metrics::gauge!("bisque_raft_is_leader").set(1.0);
             info!(node_id, "This node became leader");
             on_become_leader(&engine).await;
         } else if !is_leader && was_leader {
+            metrics::gauge!("bisque_raft_is_leader").set(0.0);
             info!(node_id, "This node lost leadership");
         }
 
@@ -494,6 +506,11 @@ async fn seal_check_loop(
 
         if !is_leader(&raft, node_id) {
             continue;
+        }
+
+        // Emit applied index gauge on each seal check iteration (leader only).
+        if let Some(log_id) = raft.metrics().borrow_watched().last_applied {
+            metrics::gauge!("bisque_raft_applied_index").set(log_id.index as f64);
         }
 
         for table_name in engine.list_tables() {

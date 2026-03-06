@@ -1,11 +1,15 @@
-//! BisqueClient — auto-syncing remote query client for bisque-lance.
+//! BisqueClient — multi-catalog auto-syncing remote query client for bisque-lance.
 //!
-//! Connects to a bisque-lance cluster, opens remote Lance datasets through
-//! the S3-compatible API, and maintains a `SessionContext` that automatically
-//! updates when the server pushes catalog events over WebSocket.
+//! Connects to a bisque-lance cluster over a single WebSocket and opens remote
+//! Lance datasets through the S3-compatible API for any number of catalogs
+//! within a tenant. Maintains a `SessionContext` that automatically updates
+//! when the server pushes catalog events.
 //!
 //! # Architecture
 //!
+//! - One WebSocket connection per client, multiplexing events from N catalogs.
+//! - Each catalog maps to a DataFusion `CatalogProvider`, enabling cross-catalog
+//!   queries like `SELECT * FROM catalog_a.public.t1 JOIN catalog_b.public.t2`.
 //! - Each table is backed by a [`RemoteLanceTableProvider`] that holds
 //!   `Arc<ArcSwap<Dataset>>` handles per tier (active, sealed).
 //! - When the server pushes events (e.g. `ActiveVersionBumped`), the client
@@ -26,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use arrow_schema::SchemaRef;
-use datafusion::catalog::TableProvider;
+use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::common::Result as DfResult;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
@@ -38,7 +42,6 @@ use lance_table::io::commit::RenameCommitHandler;
 use object_store::ObjectStore;
 use parking_lot::RwLock;
 use serde::Deserialize;
-use serde::Serialize;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -47,175 +50,233 @@ use url::Url;
 use crate::catalog_events::{CatalogEvent, CatalogEventKind};
 use crate::client_store::{ClientMeta, ClientStore, PersistedCatalogEntry};
 use crate::cold_store::CredentialConfig;
+use crate::s3_server::{ClientWsMessage, ServerWsMessage};
 use crate::s3_store::BisqueRoutingStore;
 
-/// Outbound message sent to the WebSocket writer for version pinning.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WsOutbound {
-    Pin {
-        table: String,
-        tier: String,
-        version: u64,
-    },
-    Unpin {
-        table: String,
-        tier: String,
-        version: u64,
-    },
-    Heartbeat,
+// ---------------------------------------------------------------------------
+// Per-catalog state
+// ---------------------------------------------------------------------------
+
+/// State for a single catalog (raft group) within the multi-catalog client.
+pub(crate) struct CatalogState {
+    pub name: String,
+    pub routing_store: Arc<BisqueRoutingStore>,
+    pub tables: RwLock<HashMap<String, Arc<RemoteLanceTableProvider>>>,
+    pub last_seq: AtomicU64,
 }
+
+impl std::fmt::Debug for CatalogState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogState")
+            .field("name", &self.name)
+            .field("tables", &self.tables.read().keys().collect::<Vec<_>>())
+            .field("last_seq", &self.last_seq.load(std::sync::atomic::Ordering::Relaxed))
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BisqueClient
+// ---------------------------------------------------------------------------
 
 /// A remote query client that auto-syncs with a bisque-lance cluster.
 ///
-/// Maintains a `SessionContext` with dynamically updated table providers
-/// that reflect real-time catalog changes pushed over WebSocket.
+/// Supports connecting to multiple catalogs within a tenant over a single
+/// WebSocket connection. Each catalog is registered as a DataFusion
+/// `CatalogProvider`, enabling cross-catalog SQL queries.
 pub struct BisqueClient {
     ctx: SessionContext,
-    routing_store: Arc<BisqueRoutingStore>,
-    tables: Arc<RwLock<HashMap<String, Arc<RemoteLanceTableProvider>>>>,
+    catalogs: Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
     ws_handle: Option<JoinHandle<()>>,
     shutdown: Arc<Notify>,
-    last_seq: Arc<AtomicU64>,
     cluster_url: String,
-    bucket: String,
-    ws_tx: mpsc::UnboundedSender<WsOutbound>,
+    ws_tx: mpsc::UnboundedSender<ClientWsMessage>,
+    credentials: Arc<CredentialConfig>,
 }
 
 impl BisqueClient {
-    /// Connect to a bisque-lance cluster and set up auto-syncing.
+    /// Connect to a bisque-lance cluster and set up auto-syncing for multiple catalogs.
     ///
-    /// Fetches the initial catalog, opens all datasets, registers table
-    /// providers in a new `SessionContext`, and starts a WebSocket listener
-    /// for real-time updates.
+    /// Fetches the initial catalog for each catalog name, opens all datasets,
+    /// registers table providers in a `SessionContext` (namespaced by catalog),
+    /// and starts a WebSocket listener for real-time updates across all catalogs.
     ///
-    /// If `persist_path` is `Some`, catalog state is persisted to a local
-    /// MDBX database. On subsequent connections, the client does delta sync
-    /// and opens datasets lazily for near-instant startup.
+    /// Tables are accessible as `catalog_name.public.table_name` in SQL queries.
     pub async fn connect(
         cluster_url: impl Into<String>,
-        bucket: impl Into<String>,
+        catalog_names: Vec<String>,
         credentials: Arc<CredentialConfig>,
         persist_path: Option<&Path>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cluster_url = cluster_url.into().trim_end_matches('/').to_string();
-        let bucket = bucket.into();
 
-        let routing_store = Arc::new(BisqueRoutingStore::new(&cluster_url, &bucket, credentials));
-
-        let ctx = SessionContext::new();
-        let tables: Arc<RwLock<HashMap<String, Arc<RemoteLanceTableProvider>>>> =
+        // When there's a single catalog, set it as the default so queries
+        // can use unqualified table names (e.g., `SELECT * FROM events`
+        // instead of `SELECT * FROM catalog.public.events`).
+        let ctx = if catalog_names.len() == 1 {
+            let config = datafusion::prelude::SessionConfig::new()
+                .with_default_catalog_and_schema(&catalog_names[0], "public")
+                .with_create_default_catalog_and_schema(false);
+            SessionContext::new_with_config(config)
+        } else {
+            SessionContext::new()
+        };
+        let catalogs: Arc<RwLock<HashMap<String, Arc<CatalogState>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(Notify::new());
-        let last_seq = Arc::new(AtomicU64::new(0));
-        let (ws_tx, ws_rx) = mpsc::unbounded_channel::<WsOutbound>();
+        let (ws_tx, ws_rx) = mpsc::unbounded_channel::<ClientWsMessage>();
 
         // Try to restore from persisted state
         let client_store = persist_path
             .and_then(|p| ClientStore::open(p).ok())
             .map(Arc::new);
-        let restored = client_store
-            .as_ref()
-            .and_then(|store| match store.load_state() {
-                Ok(Some((meta, entries)))
-                    if meta.cluster_url == cluster_url && meta.bucket == bucket =>
-                {
-                    Some((meta, entries))
-                }
-                _ => None,
+
+        // Initialize each catalog
+        for catalog_name in &catalog_names {
+            let routing_store = Arc::new(BisqueRoutingStore::new(
+                &cluster_url,
+                catalog_name,
+                credentials.clone(),
+            ));
+
+            let catalog_state = Arc::new(CatalogState {
+                name: catalog_name.clone(),
+                routing_store: routing_store.clone(),
+                tables: RwLock::new(HashMap::new()),
+                last_seq: AtomicU64::new(0),
             });
 
-        if let Some((meta, entries)) = restored {
-            // Delta sync: restore from persisted catalog, open datasets lazily
-            info!(
-                last_seq = meta.last_seq,
-                tables = entries.len(),
-                "Restoring from persisted catalog state"
-            );
-            last_seq.store(meta.last_seq, Ordering::Relaxed);
-
-            for (table_name, entry) in &entries {
-                let schema = match crate::ipc::schema_from_ipc(&entry.schema_ipc) {
-                    Ok(s) => Arc::new(s),
-                    Err(e) => {
-                        warn!(table = %table_name, "Failed to decode persisted schema: {}", e);
-                        continue;
+            // Try restore from persisted state for this catalog
+            let restored = client_store.as_ref().and_then(|store| {
+                match store.load_state() {
+                    Ok(Some((meta, entries)))
+                        if meta.cluster_url == cluster_url
+                            && meta.catalogs.contains(catalog_name) =>
+                    {
+                        // Filter entries for this catalog (compound key: catalog\0table)
+                        let prefix = format!("{}\0", catalog_name);
+                        let catalog_entries: HashMap<String, PersistedCatalogEntry> = entries
+                            .into_iter()
+                            .filter_map(|(k, v)| {
+                                k.strip_prefix(&prefix).map(|table| (table.to_string(), v))
+                            })
+                            .collect();
+                        if catalog_entries.is_empty() {
+                            None
+                        } else {
+                            Some(catalog_entries)
+                        }
                     }
-                };
-
-                // Create provider with lazy opening flags
-                let provider = Arc::new(RemoteLanceTableProvider::new_lazy(
-                    schema,
-                    routing_store.clone(),
-                    table_name.clone(),
-                    entry.active_version.is_some(),
-                    entry.sealed_segment.is_some(),
-                ));
-
-                if let Err(e) = ctx.register_table(table_name, provider.clone()) {
-                    warn!(table = %table_name, "Failed to register restored table: {}", e);
-                } else {
-                    tables.write().insert(table_name.clone(), provider);
+                    _ => None,
                 }
-            }
-        } else {
-            // Full fetch: same as before
-            let catalog = fetch_catalog(&cluster_url, &bucket).await?;
-            let mut persisted_entries = HashMap::new();
+            });
 
-            for (table_name, info) in &catalog.tables {
-                let provider = open_table_provider(&routing_store, table_name, info).await?;
-                let provider = Arc::new(provider);
+            if let Some(entries) = restored {
+                info!(
+                    catalog = %catalog_name,
+                    tables = entries.len(),
+                    "Restoring catalog from persisted state"
+                );
 
-                // Pin initial versions
-                if let Some(v) = info.active_version {
-                    let _ = ws_tx.send(WsOutbound::Pin {
-                        table: table_name.clone(),
-                        tier: "active".into(),
-                        version: v,
-                    });
+                for (table_name, entry) in &entries {
+                    let schema = match crate::ipc::schema_from_ipc(&entry.schema_ipc) {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            warn!(catalog = %catalog_name, table = %table_name,
+                                  "Failed to decode persisted schema: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let provider = Arc::new(RemoteLanceTableProvider::new_lazy(
+                        schema,
+                        routing_store.clone(),
+                        table_name.clone(),
+                        entry.active_version.is_some(),
+                        entry.sealed_segment.is_some(),
+                    ));
+
+                    catalog_state
+                        .tables
+                        .write()
+                        .insert(table_name.clone(), provider);
                 }
-                if info.sealed_segment.is_some() {
-                    if let Some(v) = info.sealed_version {
-                        let _ = ws_tx.send(WsOutbound::Pin {
+            } else {
+                // Full fetch for this catalog
+                let catalog_resp = fetch_catalog(&cluster_url, catalog_name).await?;
+
+                for (table_name, info) in &catalog_resp.tables {
+                    let provider =
+                        open_table_provider(&routing_store, table_name, info).await?;
+                    let provider = Arc::new(provider);
+
+                    // Pin initial versions
+                    if let Some(v) = info.active_version {
+                        let _ = ws_tx.send(ClientWsMessage::Pin {
+                            catalog: catalog_name.clone(),
                             table: table_name.clone(),
-                            tier: "sealed".into(),
+                            tier: "active".into(),
                             version: v,
                         });
                     }
-                }
+                    if info.sealed_segment.is_some() {
+                        if let Some(v) = info.sealed_version {
+                            let _ = ws_tx.send(ClientWsMessage::Pin {
+                                catalog: catalog_name.clone(),
+                                table: table_name.clone(),
+                                tier: "sealed".into(),
+                                version: v,
+                            });
+                        }
+                    }
 
-                // Build persisted entry before consuming provider
-                if client_store.is_some() {
-                    persisted_entries.insert(
-                        table_name.clone(),
+                    catalog_state
+                        .tables
+                        .write()
+                        .insert(table_name.clone(), provider);
+                }
+            }
+
+            // Register as DataFusion CatalogProvider
+            let df_catalog = Arc::new(BisqueClientCatalogProvider {
+                state: catalog_state.clone(),
+            });
+            ctx.register_catalog(catalog_name, df_catalog);
+
+            catalogs
+                .write()
+                .insert(catalog_name.clone(), catalog_state);
+        }
+
+        // Persist initial state if needed
+        if let Some(store) = &client_store {
+            let meta = ClientMeta {
+                cluster_url: cluster_url.clone(),
+                catalogs: catalog_names.clone(),
+                bucket: String::new(),
+                last_seq: 0,
+            };
+            let mut all_entries = HashMap::new();
+            for (cat_name, cat_state) in catalogs.read().iter() {
+                for (table_name, provider) in cat_state.tables.read().iter() {
+                    let key = format!("{}\0{}", cat_name, table_name);
+                    all_entries.insert(
+                        key,
                         PersistedCatalogEntry {
-                            active_segment: info.active_segment,
-                            sealed_segment: info.sealed_segment,
-                            s3_dataset_uri: info.s3_dataset_uri.clone(),
-                            s3_storage_options: info.s3_storage_options.clone(),
-                            active_version: info.active_version,
-                            sealed_version: info.sealed_version,
+                            active_segment: 0,
+                            sealed_segment: None,
+                            s3_dataset_uri: String::new(),
+                            s3_storage_options: HashMap::new(),
+                            active_version: provider.active_version(),
+                            sealed_version: provider.sealed_version(),
                             schema_ipc: crate::ipc::schema_to_ipc(&provider.schema)
                                 .unwrap_or_default(),
                         },
                     );
                 }
-
-                ctx.register_table(table_name, provider.clone())?;
-                tables.write().insert(table_name.clone(), provider);
             }
-
-            // Persist initial state
-            if let Some(store) = &client_store {
-                let meta = ClientMeta {
-                    last_seq: 0,
-                    cluster_url: cluster_url.clone(),
-                    bucket: bucket.clone(),
-                };
-                if let Err(e) = store.save_state(&meta, &persisted_entries) {
-                    warn!("Failed to persist initial catalog state: {}", e);
-                }
+            if let Err(e) = store.save_state(&meta, &all_entries) {
+                warn!("Failed to persist initial catalog state: {}", e);
             }
         }
 
@@ -226,7 +287,7 @@ impl BisqueClient {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                        if heartbeat_tx.send(WsOutbound::Heartbeat).is_err() {
+                        if heartbeat_tx.send(ClientWsMessage::Heartbeat).is_err() {
                             break;
                         }
                     }
@@ -238,24 +299,18 @@ impl BisqueClient {
         // Start WebSocket listener
         let ws_handle = {
             let cluster_url = cluster_url.clone();
-            let bucket = bucket.clone();
-            let routing_store = routing_store.clone();
-            let tables = tables.clone();
-            let ctx = ctx.clone();
+            let catalog_names = catalog_names.clone();
+            let catalogs = catalogs.clone();
             let shutdown = shutdown.clone();
-            let last_seq = last_seq.clone();
             let ws_tx_clone = ws_tx.clone();
             let client_store_clone = client_store.clone();
 
             tokio::spawn(async move {
                 ws_listener_loop(
                     &cluster_url,
-                    &bucket,
-                    routing_store,
-                    tables,
-                    ctx,
+                    &catalog_names,
+                    catalogs,
                     shutdown,
-                    last_seq,
                     ws_rx,
                     ws_tx_clone,
                     client_store_clone,
@@ -266,18 +321,18 @@ impl BisqueClient {
 
         Ok(Self {
             ctx,
-            routing_store,
-            tables,
+            catalogs,
             ws_handle: Some(ws_handle),
             shutdown,
-            last_seq,
             cluster_url,
-            bucket,
             ws_tx,
+            credentials,
         })
     }
 
     /// Execute a SQL query and collect results.
+    ///
+    /// Tables are accessible as `catalog_name.public.table_name`.
     pub async fn sql(&self, query: &str) -> DfResult<Vec<arrow::array::RecordBatch>> {
         let df = self.ctx.sql(query).await?;
         df.collect().await
@@ -288,9 +343,17 @@ impl BisqueClient {
         &self.ctx
     }
 
-    /// Get the last received event sequence number.
-    pub fn last_seq(&self) -> u64 {
-        self.last_seq.load(Ordering::Relaxed)
+    /// Get the last received event sequence number for a specific catalog.
+    pub fn last_seq(&self, catalog: &str) -> Option<u64> {
+        self.catalogs
+            .read()
+            .get(catalog)
+            .map(|s| s.last_seq.load(Ordering::Relaxed))
+    }
+
+    /// List the catalog names this client is connected to.
+    pub fn catalog_names(&self) -> Vec<String> {
+        self.catalogs.read().keys().cloned().collect()
     }
 
     /// Shut down the client, stopping the WebSocket listener.
@@ -299,6 +362,70 @@ impl BisqueClient {
         if let Some(handle) = self.ws_handle.take() {
             let _ = handle.await;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DataFusion CatalogProvider integration
+// ---------------------------------------------------------------------------
+
+/// DataFusion `CatalogProvider` backed by a single bisque-lance catalog.
+#[derive(Debug)]
+struct BisqueClientCatalogProvider {
+    state: Arc<CatalogState>,
+}
+
+impl CatalogProvider for BisqueClientCatalogProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        vec!["public".to_string()]
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        if name == "public" {
+            Some(Arc::new(BisqueClientSchemaProvider {
+                state: self.state.clone(),
+            }))
+        } else {
+            None
+        }
+    }
+}
+
+/// DataFusion `SchemaProvider` that lists tables from a single catalog.
+#[derive(Debug)]
+struct BisqueClientSchemaProvider {
+    state: Arc<CatalogState>,
+}
+
+#[async_trait::async_trait]
+impl SchemaProvider for BisqueClientSchemaProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        self.state.tables.read().keys().cloned().collect()
+    }
+
+    async fn table(
+        &self,
+        name: &str,
+    ) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        Ok(self
+            .state
+            .tables
+            .read()
+            .get(name)
+            .cloned()
+            .map(|p| p as Arc<dyn TableProvider>))
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.state.tables.read().contains_key(name)
     }
 }
 
@@ -315,13 +442,9 @@ pub struct RemoteLanceTableProvider {
     schema: SchemaRef,
     active: Arc<ArcSwap<Option<Dataset>>>,
     sealed: Arc<ArcSwap<Option<Dataset>>>,
-    /// For lazy opening: routing store reference.
     routing_store: Option<Arc<BisqueRoutingStore>>,
-    /// For lazy opening: table name.
     table_name: String,
-    /// Whether the active dataset needs to be lazily opened.
     needs_active_open: AtomicBool,
-    /// Whether the sealed dataset needs to be lazily opened.
     needs_sealed_open: AtomicBool,
 }
 
@@ -347,7 +470,6 @@ impl RemoteLanceTableProvider {
         }
     }
 
-    /// Create a provider that opens datasets lazily on first scan.
     fn new_lazy(
         schema: SchemaRef,
         routing_store: Arc<BisqueRoutingStore>,
@@ -376,19 +498,16 @@ impl RemoteLanceTableProvider {
         self.sealed.store(Arc::new(ds));
     }
 
-    /// Get the current active dataset's manifest version, if any.
     fn active_version(&self) -> Option<u64> {
         let guard = self.active.load();
         guard.as_ref().as_ref().map(|ds| ds.manifest.version)
     }
 
-    /// Get the current sealed dataset's manifest version, if any.
     fn sealed_version(&self) -> Option<u64> {
         let guard = self.sealed.load();
         guard.as_ref().as_ref().map(|ds| ds.manifest.version)
     }
 
-    /// Lazily open datasets that haven't been loaded yet.
     async fn ensure_datasets_open(&self) {
         if self
             .needs_active_open
@@ -403,7 +522,6 @@ impl RemoteLanceTableProvider {
                     }
                     Err(e) => {
                         warn!(table = %self.table_name, "Failed to lazily open active dataset: {}", e);
-                        // Reset flag so we retry next time
                         self.needs_active_open.store(true, Ordering::Relaxed);
                     }
                 }
@@ -452,12 +570,10 @@ impl TableProvider for RemoteLanceTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        // Lazy open datasets if needed
         self.ensure_datasets_open().await;
 
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
 
-        // Load current dataset snapshots (pinned for this query)
         let active_guard = self.active.load();
         if let Some(ds) = active_guard.as_ref() {
             let plan = build_scan_plan(ds, &self.schema, projection, filters, limit).await?;
@@ -471,7 +587,6 @@ impl TableProvider for RemoteLanceTableProvider {
         }
 
         if plans.is_empty() {
-            // Return an empty exec with the correct schema
             Ok(Arc::new(datafusion_physical_plan::empty::EmptyExec::new(
                 self.schema.clone(),
             )))
@@ -492,7 +607,6 @@ async fn build_scan_plan(
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
     let mut scan = dataset.scan();
 
-    // Projection pushdown
     match projection {
         Some(proj) if proj.is_empty() => {
             scan.empty_project()
@@ -511,12 +625,8 @@ async fn build_scan_plan(
         None => {}
     }
 
-    // Filter pushdown — Lance scanner applies filters via string expressions.
-    // DataFusion handles filter execution at the plan level, so we skip
-    // complex filter translation here and rely on DataFusion's native filtering.
     let _ = filters;
 
-    // Limit pushdown
     if let Some(limit) = limit {
         scan.limit(Some(limit as i64), None)
             .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))?;
@@ -543,17 +653,15 @@ struct CatalogTableInfo {
     s3_dataset_uri: String,
     active_version: Option<u64>,
     sealed_version: Option<u64>,
-    /// Non-credential S3 storage options from the server (region, endpoint, etc.).
-    /// Consumed by `BisqueRoutingStore` via its own catalog fetch.
     #[serde(default)]
     s3_storage_options: HashMap<String, String>,
 }
 
 async fn fetch_catalog(
     cluster_url: &str,
-    bucket: &str,
+    catalog_name: &str,
 ) -> Result<CatalogResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/{}/{}", cluster_url, bucket, "_bisque/catalog");
+    let url = format!("{}/{}/{}", cluster_url, catalog_name, "_bisque/catalog");
     let resp = reqwest::Client::new().get(&url).send().await?;
     let catalog: CatalogResponse = resp.json().await?;
     Ok(catalog)
@@ -583,7 +691,6 @@ async fn open_table_provider(
     table_name: &str,
     info: &CatalogTableInfo,
 ) -> Result<RemoteLanceTableProvider, Box<dyn std::error::Error + Send + Sync>> {
-    // Open active dataset
     let active_ds = match info.active_version {
         Some(_) => match open_remote_dataset(routing_store, table_name, "active").await {
             Ok(ds) => Some(ds),
@@ -595,7 +702,6 @@ async fn open_table_provider(
         None => None,
     };
 
-    // Open sealed dataset
     let sealed_ds = match info.sealed_segment {
         Some(_) => match open_remote_dataset(routing_store, table_name, "sealed").await {
             Ok(ds) => Some(ds),
@@ -607,7 +713,6 @@ async fn open_table_provider(
         None => None,
     };
 
-    // Determine schema from whichever dataset is available
     let schema = active_ds
         .as_ref()
         .or(sealed_ds.as_ref())
@@ -623,26 +728,27 @@ async fn open_table_provider(
 
 async fn ws_listener_loop(
     cluster_url: &str,
-    bucket: &str,
-    routing_store: Arc<BisqueRoutingStore>,
-    tables: Arc<RwLock<HashMap<String, Arc<RemoteLanceTableProvider>>>>,
-    ctx: SessionContext,
+    catalog_names: &[String],
+    catalogs: Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
     shutdown: Arc<Notify>,
-    last_seq: Arc<AtomicU64>,
-    mut ws_rx: mpsc::UnboundedReceiver<WsOutbound>,
-    ws_tx: mpsc::UnboundedSender<WsOutbound>,
+    mut ws_rx: mpsc::UnboundedReceiver<ClientWsMessage>,
+    ws_tx: mpsc::UnboundedSender<ClientWsMessage>,
     client_store: Option<Arc<ClientStore>>,
 ) {
     loop {
-        let since = last_seq.load(Ordering::Relaxed);
+        // Use min sequence across all catalogs for delta sync
+        let since = {
+            let cats = catalogs.read();
+            cats.values()
+                .map(|s| s.last_seq.load(Ordering::Relaxed))
+                .min()
+                .unwrap_or(0)
+        };
         match ws_connect_and_listen(
             cluster_url,
-            bucket,
-            &routing_store,
-            &tables,
-            &ctx,
+            catalog_names,
+            &catalogs,
             &shutdown,
-            &last_seq,
             since,
             &mut ws_rx,
             &ws_tx,
@@ -667,25 +773,22 @@ async fn ws_listener_loop(
 
 async fn ws_connect_and_listen(
     cluster_url: &str,
-    bucket: &str,
-    routing_store: &Arc<BisqueRoutingStore>,
-    tables: &Arc<RwLock<HashMap<String, Arc<RemoteLanceTableProvider>>>>,
-    ctx: &SessionContext,
+    catalog_names: &[String],
+    catalogs: &Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
     shutdown: &Arc<Notify>,
-    last_seq: &Arc<AtomicU64>,
     since: u64,
-    ws_rx: &mut mpsc::UnboundedReceiver<WsOutbound>,
-    ws_tx: &mpsc::UnboundedSender<WsOutbound>,
+    ws_rx: &mut mpsc::UnboundedReceiver<ClientWsMessage>,
+    ws_tx: &mpsc::UnboundedSender<ClientWsMessage>,
     client_store: &Option<Arc<ClientStore>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Convert http(s):// to ws(s)://
+    // Connect to tenant-scoped WS endpoint
     let ws_url = cluster_url
         .replace("http://", "ws://")
         .replace("https://", "wss://");
     let url = if since > 0 {
-        format!("{}/{}/{}/ws?since={}", ws_url, bucket, "_bisque", since)
+        format!("{}/_bisque/ws?since={}", ws_url, since)
     } else {
-        format!("{}/{}/{}/ws", ws_url, bucket, "_bisque")
+        format!("{}/_bisque/ws", ws_url)
     };
 
     info!(%url, "Connecting to WebSocket for catalog events");
@@ -713,12 +816,22 @@ async fn ws_connect_and_listen(
 
     info!("WebSocket connected, listening for catalog events");
 
+    // Send subscribe message for all catalogs
+    let subscribe = ClientWsMessage::Subscribe {
+        catalogs: catalog_names.to_vec(),
+    };
+    let subscribe_bytes = rmp_serde::to_vec(&subscribe)?;
+    ws.write_frame(fastwebsockets::Frame::binary(
+        fastwebsockets::Payload::Owned(subscribe_bytes),
+    ))
+    .await?;
+
     // Drain any queued outbound messages (pins from initial connect, heartbeats)
     while let Ok(msg) = ws_rx.try_recv() {
-        let json = serde_json::to_string(&msg)?;
-        ws.write_frame(fastwebsockets::Frame::text(fastwebsockets::Payload::Owned(
-            json.into_bytes(),
-        )))
+        let bytes = rmp_serde::to_vec(&msg)?;
+        ws.write_frame(fastwebsockets::Frame::binary(
+            fastwebsockets::Payload::Owned(bytes),
+        ))
         .await?;
     }
 
@@ -727,9 +840,8 @@ async fn ws_connect_and_listen(
             frame = ws.read_frame() => {
                 let frame = frame?;
                 match frame.opcode {
-                    fastwebsockets::OpCode::Text => {
-                        let text = std::str::from_utf8(&frame.payload)?;
-                        handle_ws_message(text, routing_store, tables, ctx, last_seq, ws_tx, client_store).await;
+                    fastwebsockets::OpCode::Binary => {
+                        handle_ws_message(&frame.payload, catalogs, ws_tx, client_store).await;
                     }
                     fastwebsockets::OpCode::Close => {
                         debug!("WebSocket server sent close frame");
@@ -741,13 +853,12 @@ async fn ws_connect_and_listen(
             msg = ws_rx.recv() => {
                 match msg {
                     Some(outbound) => {
-                        let json = serde_json::to_string(&outbound)?;
-                        ws.write_frame(fastwebsockets::Frame::text(
-                            fastwebsockets::Payload::Owned(json.into_bytes()),
+                        let bytes = rmp_serde::to_vec(&outbound)?;
+                        ws.write_frame(fastwebsockets::Frame::binary(
+                            fastwebsockets::Payload::Owned(bytes),
                         )).await?;
                     }
                     None => {
-                        // Channel closed, shutdown
                         let _ = ws.write_frame(fastwebsockets::Frame::close_raw(vec![].into())).await;
                         return Ok(());
                     }
@@ -762,67 +873,80 @@ async fn ws_connect_and_listen(
 }
 
 async fn handle_ws_message(
-    text: &str,
-    routing_store: &Arc<BisqueRoutingStore>,
-    tables: &Arc<RwLock<HashMap<String, Arc<RemoteLanceTableProvider>>>>,
-    ctx: &SessionContext,
-    last_seq: &Arc<AtomicU64>,
-    ws_tx: &mpsc::UnboundedSender<WsOutbound>,
+    data: &[u8],
+    catalogs: &Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
+    ws_tx: &mpsc::UnboundedSender<ClientWsMessage>,
     client_store: &Option<Arc<ClientStore>>,
 ) {
-    // Check for snapshot_required signal
-    if text.contains("snapshot_required") {
-        warn!("Received snapshot_required — full catalog re-sync needed");
-        // TODO: implement full re-sync from catalog endpoint
-        return;
-    }
-
-    // Ignore session messages from server
-    if text.contains("\"type\":\"session\"") {
-        return;
-    }
-
-    // Parse as CatalogEvent
-    let event: CatalogEvent = match serde_json::from_str(text) {
-        Ok(e) => e,
+    let msg: ServerWsMessage = match rmp_serde::from_slice(data) {
+        Ok(m) => m,
         Err(e) => {
-            warn!("Failed to parse catalog event: {}", e);
+            warn!("Failed to parse server WS message: {}", e);
             return;
         }
     };
 
-    last_seq.store(event.seq, Ordering::Relaxed);
+    match msg {
+        ServerWsMessage::Session { session_id } => {
+            debug!(session_id, "Received session assignment");
+        }
+        ServerWsMessage::SnapshotRequired { catalog } => {
+            warn!(catalog = %catalog, "Received snapshot_required — full catalog re-sync needed");
+            // TODO: implement full re-sync from catalog endpoint
+        }
+        ServerWsMessage::Event { event } => {
+            handle_catalog_event(event, catalogs, ws_tx, client_store).await;
+        }
+    }
+}
+
+async fn handle_catalog_event(
+    event: CatalogEvent,
+    catalogs: &Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
+    ws_tx: &mpsc::UnboundedSender<ClientWsMessage>,
+    client_store: &Option<Arc<ClientStore>>,
+) {
+    let catalog_name = event.catalog.clone();
+    let catalog_state = catalogs.read().get(&catalog_name).cloned();
+    let Some(catalog_state) = catalog_state else {
+        debug!(catalog = %catalog_name, "Ignoring event for unknown catalog");
+        return;
+    };
+
+    catalog_state.last_seq.store(event.seq, Ordering::Relaxed);
+    let routing_store = &catalog_state.routing_store;
 
     match &event.event {
         CatalogEventKind::ActiveVersionBumped { table, version } => {
-            let provider = tables.read().get(table).cloned();
+            let provider = catalog_state.tables.read().get(table).cloned();
             if let Some(provider) = provider {
                 let old_version = provider.active_version();
                 match open_remote_dataset(routing_store, table, "active").await {
                     Ok(ds) => {
-                        // Pin new version, swap, then unpin old
-                        let _ = ws_tx.send(WsOutbound::Pin {
+                        let _ = ws_tx.send(ClientWsMessage::Pin {
+                            catalog: catalog_name.clone(),
                             table: table.clone(),
                             tier: "active".into(),
                             version: *version,
                         });
                         provider.swap_active(Some(ds));
                         if let Some(old_v) = old_version {
-                            let _ = ws_tx.send(WsOutbound::Unpin {
+                            let _ = ws_tx.send(ClientWsMessage::Unpin {
+                                catalog: catalog_name.clone(),
                                 table: table.clone(),
                                 tier: "active".into(),
                                 version: old_v,
                             });
                         }
-                        debug!(table = %table, seq = event.seq, "Swapped active dataset");
+                        debug!(catalog = %catalog_name, table = %table, seq = event.seq,
+                               "Swapped active dataset");
                     }
                     Err(e) => {
                         warn!(table = %table, "Failed to re-open active dataset: {}", e);
                     }
                 }
             }
-            // Persist
-            persist_version_update(client_store, table, |entry| {
+            persist_version_update(client_store, &catalog_name, table, |entry| {
                 entry.active_version = Some(*version);
             });
         }
@@ -831,22 +955,23 @@ async fn handle_ws_message(
             active_version,
             sealed_version,
         } => {
-            let provider = tables.read().get(table).cloned();
+            let provider = catalog_state.tables.read().get(table).cloned();
             if let Some(provider) = provider {
                 let old_active_v = provider.active_version();
                 let old_sealed_v = provider.sealed_version();
 
-                // Re-open both tiers
                 match open_remote_dataset(routing_store, table, "active").await {
                     Ok(ds) => {
-                        let _ = ws_tx.send(WsOutbound::Pin {
+                        let _ = ws_tx.send(ClientWsMessage::Pin {
+                            catalog: catalog_name.clone(),
                             table: table.clone(),
                             tier: "active".into(),
                             version: *active_version,
                         });
                         provider.swap_active(Some(ds));
                         if let Some(old_v) = old_active_v {
-                            let _ = ws_tx.send(WsOutbound::Unpin {
+                            let _ = ws_tx.send(ClientWsMessage::Unpin {
+                                catalog: catalog_name.clone(),
                                 table: table.clone(),
                                 tier: "active".into(),
                                 version: old_v,
@@ -857,14 +982,16 @@ async fn handle_ws_message(
                 }
                 match open_remote_dataset(routing_store, table, "sealed").await {
                     Ok(ds) => {
-                        let _ = ws_tx.send(WsOutbound::Pin {
+                        let _ = ws_tx.send(ClientWsMessage::Pin {
+                            catalog: catalog_name.clone(),
                             table: table.clone(),
                             tier: "sealed".into(),
                             version: *sealed_version,
                         });
                         provider.swap_sealed(Some(ds));
                         if let Some(old_v) = old_sealed_v {
-                            let _ = ws_tx.send(WsOutbound::Unpin {
+                            let _ = ws_tx.send(ClientWsMessage::Unpin {
+                                catalog: catalog_name.clone(),
                                 table: table.clone(),
                                 tier: "sealed".into(),
                                 version: old_v,
@@ -873,14 +1000,12 @@ async fn handle_ws_message(
                     }
                     Err(e) => warn!(table = %table, "Failed to re-open sealed dataset: {}", e),
                 }
-                debug!(table = %table, seq = event.seq, "Swapped active+sealed datasets after seal");
+                debug!(catalog = %catalog_name, table = %table, seq = event.seq,
+                       "Swapped active+sealed datasets after seal");
             }
-            // Persist
-            persist_version_update(client_store, table, |entry| {
+            persist_version_update(client_store, &catalog_name, table, |entry| {
                 entry.active_version = Some(*active_version);
                 entry.sealed_version = Some(*sealed_version);
-                // sealed_segment gets set but we don't know the exact ID from the event
-                // — the important thing is it's Some
                 if entry.sealed_segment.is_none() {
                     entry.sealed_segment = Some(1);
                 }
@@ -895,14 +1020,15 @@ async fn handle_ws_message(
                 }
             };
             let provider = Arc::new(RemoteLanceTableProvider::new(schema.clone(), None, None));
-            if let Err(e) = ctx.register_table(table, provider.clone()) {
-                warn!(table = %table, "Failed to register new table: {}", e);
-            } else {
-                tables.write().insert(table.clone(), provider);
-                info!(table = %table, seq = event.seq, "Registered new table from event");
-            }
-            // Persist
+            catalog_state
+                .tables
+                .write()
+                .insert(table.clone(), provider);
+            info!(catalog = %catalog_name, table = %table, seq = event.seq,
+                  "Registered new table from event");
+
             if let Some(store) = client_store {
+                let key = format!("{}\0{}", catalog_name, table);
                 let entry = PersistedCatalogEntry {
                     active_segment: 1,
                     sealed_segment: None,
@@ -912,58 +1038,58 @@ async fn handle_ws_message(
                     sealed_version: None,
                     schema_ipc: schema_ipc.clone(),
                 };
-                if let Err(e) = store.update_table(table, &entry) {
+                if let Err(e) = store.update_table(&key, &entry) {
                     warn!(table = %table, "Failed to persist new table: {}", e);
                 }
             }
         }
         CatalogEventKind::TableDropped { table } => {
-            // Unpin all versions for this table
-            let provider = tables.read().get(table).cloned();
+            let provider = catalog_state.tables.read().get(table).cloned();
             if let Some(provider) = provider {
                 if let Some(v) = provider.active_version() {
-                    let _ = ws_tx.send(WsOutbound::Unpin {
+                    let _ = ws_tx.send(ClientWsMessage::Unpin {
+                        catalog: catalog_name.clone(),
                         table: table.clone(),
                         tier: "active".into(),
                         version: v,
                     });
                 }
                 if let Some(v) = provider.sealed_version() {
-                    let _ = ws_tx.send(WsOutbound::Unpin {
+                    let _ = ws_tx.send(ClientWsMessage::Unpin {
+                        catalog: catalog_name.clone(),
                         table: table.clone(),
                         tier: "sealed".into(),
                         version: v,
                     });
                 }
             }
-            tables.write().remove(table);
-            if let Err(e) = ctx.deregister_table(table) {
-                warn!(table = %table, "Failed to deregister table: {}", e);
-            } else {
-                info!(table = %table, seq = event.seq, "Deregistered dropped table");
-            }
-            // Persist
+            catalog_state.tables.write().remove(table);
+            info!(catalog = %catalog_name, table = %table, seq = event.seq,
+                  "Removed dropped table");
+
             if let Some(store) = client_store {
-                if let Err(e) = store.remove_table(table) {
+                let key = format!("{}\0{}", catalog_name, table);
+                if let Err(e) = store.remove_table(&key) {
                     warn!(table = %table, "Failed to remove persisted table: {}", e);
                 }
             }
         }
         CatalogEventKind::SegmentPromoted { table, .. } => {
-            let provider = tables.read().get(table).cloned();
+            let provider = catalog_state.tables.read().get(table).cloned();
             if let Some(provider) = provider {
                 if let Some(v) = provider.sealed_version() {
-                    let _ = ws_tx.send(WsOutbound::Unpin {
+                    let _ = ws_tx.send(ClientWsMessage::Unpin {
+                        catalog: catalog_name.clone(),
                         table: table.clone(),
                         tier: "sealed".into(),
                         version: v,
                     });
                 }
                 provider.swap_sealed(None);
-                debug!(table = %table, seq = event.seq, "Cleared sealed dataset after promote");
+                debug!(catalog = %catalog_name, table = %table, seq = event.seq,
+                       "Cleared sealed dataset after promote");
             }
-            // Persist
-            persist_version_update(client_store, table, |entry| {
+            persist_version_update(client_store, &catalog_name, table, |entry| {
                 entry.sealed_segment = None;
                 entry.sealed_version = None;
             });
@@ -972,6 +1098,7 @@ async fn handle_ws_message(
 
     // Update persisted sequence number
     if let Some(store) = client_store {
+        let _seq_key = format!("seq:{}", catalog_name);
         if let Err(e) = store.update_seq(event.seq) {
             warn!("Failed to persist event seq {}: {}", event.seq, e);
         }
@@ -981,17 +1108,18 @@ async fn handle_ws_message(
 /// Helper to read-modify-write a persisted table entry.
 fn persist_version_update(
     client_store: &Option<Arc<ClientStore>>,
+    catalog: &str,
     table: &str,
     mutate: impl FnOnce(&mut PersistedCatalogEntry),
 ) {
     let Some(store) = client_store else { return };
 
-    // Load existing entry, update it, save it back
+    let key = format!("{}\0{}", catalog, table);
     match store.load_state() {
         Ok(Some((_, tables))) => {
-            if let Some(mut entry) = tables.get(table).cloned() {
+            if let Some(mut entry) = tables.get(&key).cloned() {
                 mutate(&mut entry);
-                if let Err(e) = store.update_table(table, &entry) {
+                if let Err(e) = store.update_table(&key, &entry) {
                     warn!(table = %table, "Failed to persist table update: {}", e);
                 }
             }
