@@ -1,3 +1,4 @@
+import { lazy, Suspense } from "react"
 import { BrowserRouter, Routes, Route, Navigate } from "react-router"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { Toaster } from "@/components/ui/sonner"
@@ -12,13 +13,17 @@ import { CatalogDetailPage } from "@/pages/catalogs/detail"
 import { ApiKeyListPage } from "@/pages/api-keys/list"
 import { TableListPage } from "@/pages/tables/list"
 import { TableDetailPage } from "@/pages/tables/detail"
-import { QueryPage } from "@/pages/tables/query"
 import { TracesPage } from "@/pages/observability/traces"
 import { TraceDetailPage } from "@/pages/observability/trace-detail"
 import { MetricsPage } from "@/pages/observability/metrics"
 import { LogsPage } from "@/pages/observability/logs"
 import { ObservabilityOverviewPage } from "@/pages/observability/overview"
 import { SettingsPage } from "@/pages/settings"
+
+// Lazy-load the query page to keep Monaco out of the main bundle
+const QueryPage = lazy(() =>
+  import("@/pages/tables/query").then((m) => ({ default: m.QueryPage })),
+)
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token)
@@ -46,7 +51,7 @@ export default function App() {
             <Route path="catalogs/:catalogName" element={<CatalogDetailPage />} />
             <Route path="tables" element={<TableListPage />} />
             <Route path="tables/:catalogName/:tableName" element={<TableDetailPage />} />
-            <Route path="query" element={<QueryPage />} />
+            <Route path="query" element={<Suspense fallback={<div className="p-6 text-muted-foreground">Loading editor...</div>}><QueryPage /></Suspense>} />
             <Route path="observability" element={<ObservabilityOverviewPage />} />
             <Route path="traces" element={<TracesPage />} />
             <Route path="traces/:traceId" element={<TraceDetailPage />} />

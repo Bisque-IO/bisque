@@ -86,10 +86,54 @@ export const MOCK_CATALOGS: CatalogEntry[] = [
 // Tables (per catalog)
 // ---------------------------------------------------------------------------
 
+export interface StorageTierInfo {
+  size_bytes: number
+  row_count: number
+  segment_count: number
+}
+
+export interface IngestionMetrics {
+  ingest_rate_rows_sec: number
+  ingest_latency_p50_ms: number
+  ingest_latency_p99_ms: number
+  async_lag_rows: number
+  async_lag_ms: number
+  compaction_pending: number
+  last_compaction_ms: number
+  last_ingest_at: string
+}
+
 export interface MockTableInfo {
   active_version: number
   sealed_version: number
   schema: { name: string; type: string; nullable: boolean }[]
+  storage: {
+    hot: StorageTierInfo
+    warm: StorageTierInfo
+    cold: StorageTierInfo
+  }
+  metrics: IngestionMetrics
+}
+
+function mockStorage(hotMB: number, warmMB: number, coldMB: number, hotRows: number, warmRows: number, coldRows: number): MockTableInfo["storage"] {
+  return {
+    hot:  { size_bytes: hotMB * 1024 * 1024,  row_count: hotRows,  segment_count: Math.ceil(hotRows / 100_000) },
+    warm: { size_bytes: warmMB * 1024 * 1024,  row_count: warmRows, segment_count: Math.ceil(warmRows / 500_000) },
+    cold: { size_bytes: coldMB * 1024 * 1024,  row_count: coldRows, segment_count: Math.ceil(coldRows / 1_000_000) },
+  }
+}
+
+function mockMetrics(rateRows: number, p50: number, p99: number, lagRows: number, lagMs: number): IngestionMetrics {
+  return {
+    ingest_rate_rows_sec: rateRows,
+    ingest_latency_p50_ms: p50,
+    ingest_latency_p99_ms: p99,
+    async_lag_rows: lagRows,
+    async_lag_ms: lagMs,
+    compaction_pending: Math.floor(Math.random() * 5),
+    last_compaction_ms: 200 + Math.floor(Math.random() * 800),
+    last_ingest_at: new Date(Date.now() - Math.floor(Math.random() * 60_000)).toISOString(),
+  }
 }
 
 export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> = {
@@ -105,6 +149,8 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
         { name: "duration_ms", type: "Int64", nullable: false },
         { name: "country", type: "Utf8", nullable: true },
       ],
+      storage: mockStorage(128, 512, 2048, 850_000, 3_200_000, 12_500_000),
+      metrics: mockMetrics(1200, 3.2, 18.5, 450, 120),
     },
     conversions: {
       active_version: 18,
@@ -116,6 +162,8 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
         { name: "revenue_cents", type: "Int64", nullable: true },
         { name: "campaign", type: "Utf8", nullable: true },
       ],
+      storage: mockStorage(32, 96, 384, 120_000, 450_000, 1_800_000),
+      metrics: mockMetrics(180, 2.1, 12.0, 80, 45),
     },
     user_profiles: {
       active_version: 7,
@@ -127,6 +175,8 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
         { name: "signup_date", type: "Date32", nullable: false },
         { name: "embedding", type: "FixedSizeList(Float32, 384)", nullable: true },
       ],
+      storage: mockStorage(256, 128, 64, 50_000, 25_000, 10_000),
+      metrics: mockMetrics(15, 8.5, 42.0, 0, 0),
     },
   },
   events: {
@@ -140,6 +190,8 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
         { name: "x", type: "Int32", nullable: false },
         { name: "y", type: "Int32", nullable: false },
       ],
+      storage: mockStorage(256, 1024, 4096, 2_000_000, 8_000_000, 32_000_000),
+      metrics: mockMetrics(5500, 1.8, 9.2, 1200, 220),
     },
     purchases: {
       active_version: 55,
@@ -151,6 +203,8 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
         { name: "total_cents", type: "Int64", nullable: false },
         { name: "items", type: "List(Utf8)", nullable: false },
       ],
+      storage: mockStorage(64, 256, 1024, 300_000, 1_200_000, 4_800_000),
+      metrics: mockMetrics(350, 4.5, 22.0, 150, 85),
     },
     impressions: {
       active_version: 210,
@@ -161,6 +215,8 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
         { name: "placement", type: "Utf8", nullable: false },
         { name: "viewport_pct", type: "Float32", nullable: true },
       ],
+      storage: mockStorage(512, 2048, 8192, 4_000_000, 16_000_000, 64_000_000),
+      metrics: mockMetrics(12000, 1.2, 6.5, 3500, 290),
     },
   },
   otel: {
@@ -177,6 +233,8 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
         { name: "duration_ns", type: "Int64", nullable: false },
         { name: "status_code", type: "Int32", nullable: false },
       ],
+      storage: mockStorage(384, 1536, 6144, 3_000_000, 12_000_000, 48_000_000),
+      metrics: mockMetrics(8500, 2.0, 11.0, 2100, 250),
     },
     otel_logs: {
       active_version: 150,
@@ -189,6 +247,8 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
         { name: "trace_id", type: "Utf8", nullable: true },
         { name: "attributes", type: "Utf8", nullable: true },
       ],
+      storage: mockStorage(192, 768, 3072, 1_500_000, 6_000_000, 24_000_000),
+      metrics: mockMetrics(4200, 1.5, 8.0, 800, 190),
     },
     otel_metrics: {
       active_version: 88,
@@ -199,6 +259,8 @@ export const MOCK_CATALOG_TABLES: Record<string, Record<string, MockTableInfo>> 
         { name: "value", type: "Float64", nullable: false },
         { name: "labels", type: "Utf8", nullable: true },
       ],
+      storage: mockStorage(96, 384, 1536, 750_000, 3_000_000, 12_000_000),
+      metrics: mockMetrics(2800, 1.0, 5.5, 400, 95),
     },
   },
 }
