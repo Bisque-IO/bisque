@@ -1,0 +1,15 @@
+[package]
+name = "bisque-protocol"
+version = "0.1.0"
+edition = "2024"
+authors = ["Bisque Team"]
+description = "Shared WebSocket protocol types for bisque"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bisque-io/bisque"
+keywords = ["protocol", "websocket"]
+categories = ["database-implementations"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }

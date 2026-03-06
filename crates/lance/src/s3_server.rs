@@ -66,7 +66,8 @@ impl S3ServerState {
         group_id: u64,
         mesh: Option<ClusterMesh>,
     ) -> Arc<Self> {
-        let version_pins = Arc::new(VersionPinTracker::new(std::time::Duration::from_secs(30)));
+        // M3: 60s lease timeout — gives clients enough time between heartbeats (15s interval).
+        let version_pins = Arc::new(VersionPinTracker::new(std::time::Duration::from_secs(60)));
 
         // Start background reaper for expired version pin sessions
         let reaper_pins = version_pins.clone();
@@ -92,6 +93,148 @@ impl S3ServerState {
             mesh,
         })
     }
+
+    // -----------------------------------------------------------------------
+    // Public facade for the unified WebSocket handler (lives in bisque crate)
+    // -----------------------------------------------------------------------
+
+    /// Current catalog event bus sequence number.
+    pub fn catalog_seq(&self) -> u64 {
+        self.catalog_events
+            .as_ref()
+            .map(|b| b.current_seq())
+            .unwrap_or(0)
+    }
+
+    /// Subscribe to the catalog event broadcast channel.
+    pub fn subscribe_catalog_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<CatalogEvent>> {
+        self.catalog_events.as_ref().map(|b| b.subscribe())
+    }
+
+    /// Replay WAL entries since the given sequence number.
+    pub fn replay_wal_since(&self, since_seq: u64) -> Option<std::io::Result<Vec<CatalogEvent>>> {
+        let manifest = self.manifest.as_ref()?;
+        Some(manifest.read_wal_since(self.group_id, since_seq))
+    }
+
+    /// Collect all operations (local + remote mesh) capped at `max`.
+    pub fn collect_operations(&self, max: usize) -> Vec<Operation> {
+        let mut all_ops = self.operations.list(None, None, None);
+        if let Some(ref mesh) = self.mesh {
+            for snap in &mesh.cluster_state().all_remote_operations() {
+                if all_ops.len() >= max {
+                    break;
+                }
+                all_ops.push(snapshot_to_operation(snap));
+            }
+        }
+        all_ops.truncate(max);
+        all_ops
+    }
+
+    /// List operations with optional filters, including remote mesh operations.
+    pub fn list_operations_filtered(
+        &self,
+        op_type: Option<OpType>,
+        tier: Option<OpTier>,
+        status: Option<OpStatus>,
+    ) -> Vec<Operation> {
+        let mut ops = self.operations.list(op_type, tier, status);
+        if let Some(ref mesh) = self.mesh {
+            for snap in &mesh.cluster_state().all_remote_operations() {
+                let op = snapshot_to_operation(snap);
+                if let Some(t) = op_type {
+                    if op.op_type != t {
+                        continue;
+                    }
+                }
+                if let Some(t) = tier {
+                    if op.tier != t {
+                        continue;
+                    }
+                }
+                if let Some(s) = status {
+                    if op.status != s {
+                        continue;
+                    }
+                }
+                ops.push(op);
+            }
+        }
+        ops
+    }
+
+    /// Submit a reindex operation. Returns `Ok(op_id)` or `Err(message)`.
+    pub fn submit_reindex(&self, bucket: String, table: String) -> Result<String, String> {
+        if self.engine.get_table(&table).is_none() {
+            return Err(format!("table '{}' not found", table));
+        }
+        let op_id = self.operations.submit_reindex(
+            String::new(),
+            bucket,
+            "Lance".to_string(),
+            table,
+            self.engine.clone(),
+        );
+        Ok(op_id)
+    }
+
+    /// Submit a compact operation. Returns `Ok(op_id)` or `Err(message)`.
+    pub fn submit_compact(&self, bucket: String, table: String) -> Result<String, String> {
+        if self.engine.get_table(&table).is_none() {
+            return Err(format!("table '{}' not found", table));
+        }
+        let op_id = self.operations.submit_compact(
+            String::new(),
+            bucket,
+            "Lance".to_string(),
+            table,
+            self.engine.clone(),
+        );
+        Ok(op_id)
+    }
+
+    /// Get the full catalog as a JSON value.
+    pub async fn get_catalog_json(&self) -> serde_json::Value {
+        let tables = self.engine.list_tables();
+        let mut catalog = std::collections::HashMap::new();
+
+        for name in &tables {
+            if let Some(table) = self.engine.get_table(name) {
+                let seg_catalog = table.catalog();
+                let active_version = table
+                    .active_dataset_snapshot()
+                    .await
+                    .map(|ds| ds.manifest.version);
+                let sealed_ds = table.sealed_dataset_snapshot().await;
+                let sealed_version = sealed_ds.as_ref().map(|ds| ds.manifest.version);
+                let indexes = if let Some(ds) = &sealed_ds {
+                    collect_index_info(ds).await
+                } else {
+                    Vec::new()
+                };
+                let s3_storage_options =
+                    filter_non_credential_options(&table.config().s3_storage_options);
+
+                catalog.insert(
+                    name.clone(),
+                    CatalogTableInfo {
+                        active_segment: seg_catalog.active_segment,
+                        sealed_segment: seg_catalog.sealed_segment,
+                        s3_dataset_uri: seg_catalog.s3_dataset_uri.clone(),
+                        active_version,
+                        sealed_version,
+                        s3_storage_options,
+                        indexes,
+                    },
+                );
+            }
+        }
+
+        serde_json::to_value(CatalogResponse { tables: catalog }).unwrap_or_default()
+    }
 }
 
 /// Build the S3-compatible axum Router without starting a listener.
@@ -99,14 +242,9 @@ impl S3ServerState {
 /// Used by the `bisque` crate to compose into a unified server.
 pub fn s3_router(state: Arc<S3ServerState>) -> axum::Router {
     axum::Router::new()
-        .route("/_bisque/ws", axum::routing::get(tenant_ws_handler))
         .route(
             "/_bisque/v1/operations",
             axum::routing::get(list_operations),
-        )
-        .route(
-            "/_bisque/v1/operations/ws",
-            axum::routing::get(operations_ws_handler),
         )
         .route(
             "/_bisque/v1/operations/{op_id}",
@@ -121,7 +259,6 @@ pub fn s3_router(state: Arc<S3ServerState>) -> axum::Router {
             "/{bucket}/_bisque/compact/{table}",
             axum::routing::post(compact_table),
         )
-        .route("/{bucket}/_bisque/ws", axum::routing::get(ws_handler))
         .route("/{bucket}", axum::routing::get(list_objects))
         .route(
             "/{bucket}/{*key}",
@@ -490,7 +627,11 @@ fn snapshot_to_operation(snap: &OperationSnapshot) -> Operation {
             3 => OpStatus::Failed,
             _ => OpStatus::Cancelled,
         },
-        progress: f64::from_bits(snap.progress_bits),
+        // L6: Guard against NaN/Inf from corrupted progress_bits.
+        progress: {
+            let v = f64::from_bits(snap.progress_bits);
+            if v.is_finite() { v } else { 0.0 }
+        },
         created_at: snap.created_at.clone(),
         started_at: snap.started_at.clone(),
         finished_at: snap.finished_at.clone(),
@@ -654,106 +795,6 @@ async fn cancel_operation(
     }
 }
 
-/// WebSocket endpoint for real-time operation status updates.
-///
-/// GET `/_bisque/v1/operations/ws` (WebSocket upgrade)
-///
-/// Sends JSON-encoded `Operation` objects whenever an operation's state changes.
-/// The initial message is a JSON array of all current operations (snapshot).
-async fn operations_ws_handler(
-    State(state): State<Arc<S3ServerState>>,
-    upgrade: fastwebsockets::upgrade::IncomingUpgrade,
-) -> Response {
-    let (response, fut) = match upgrade.upgrade() {
-        Ok((response, fut)) => (response, fut),
-        Err(e) => {
-            warn!("Operations WebSocket upgrade failed: {}", e);
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(format!("WebSocket upgrade failed: {}", e)))
-                .unwrap();
-        }
-    };
-
-    let operations = state.operations.clone();
-    let mesh = state.mesh.clone();
-
-    tokio::spawn(async move {
-        match fut.await {
-            Ok(ws) => {
-                if let Err(e) = handle_operations_ws(ws, operations, mesh).await {
-                    debug!("Operations WebSocket ended: {}", e);
-                }
-            }
-            Err(e) => {
-                warn!("Operations WebSocket handshake failed: {}", e);
-            }
-        }
-    });
-
-    response.into_response()
-}
-
-async fn handle_operations_ws<S>(
-    mut ws: fastwebsockets::WebSocket<S>,
-    operations: Arc<OperationsManager>,
-    mesh: Option<ClusterMesh>,
-) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-{
-    use fastwebsockets::{Frame, OpCode, Payload};
-
-    // Send initial snapshot of all operations (local + remote)
-    let mut all_ops = operations.list(None, None, None);
-    if let Some(ref mesh) = mesh {
-        for snap in &mesh.cluster_state().all_remote_operations() {
-            all_ops.push(snapshot_to_operation(snap));
-        }
-    }
-    let snapshot = serde_json::to_vec(&all_ops)?;
-    ws.write_frame(Frame::binary(Payload::Owned(snapshot)))
-        .await?;
-
-    // Subscribe to live updates
-    let mut rx = operations.subscribe();
-
-    ws.set_auto_pong(true);
-
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Ok(op) => {
-                        let bytes = serde_json::to_vec(&op)?;
-                        ws.write_frame(Frame::binary(Payload::Owned(bytes))).await?;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(lagged = n, "Operations WS subscriber lagged, sending full snapshot");
-                        let all_ops = operations.list(None, None, None);
-                        let snapshot = serde_json::to_vec(&all_ops)?;
-                        ws.write_frame(Frame::binary(Payload::Owned(snapshot))).await?;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
-            frame = ws.read_frame() => {
-                let frame = frame?;
-                match frame.opcode {
-                    OpCode::Close => {
-                        debug!("Operations WS client sent close frame");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
 
 /// Filter S3 storage options to exclude credentials.
 ///
@@ -1112,283 +1153,12 @@ fn list_objects_xml_response(
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket — real-time catalog event push
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct WsParams {
-    /// Resume from this sequence number. Events after `since` will be replayed.
-    #[serde(default)]
-    since: Option<u64>,
-}
-
-/// Tenant-scoped WebSocket handler at `/_bisque/ws`.
-///
-/// Used by multi-catalog `BisqueClient` — no bucket path parameter needed.
-/// The client sends a `Subscribe { catalogs }` message after connecting.
-async fn tenant_ws_handler(
-    State(state): State<Arc<S3ServerState>>,
-    Query(params): Query<WsParams>,
-    upgrade: fastwebsockets::upgrade::IncomingUpgrade,
-) -> Response {
-    ws_handler_inner(state, params, upgrade).await
-}
-
-async fn ws_handler(
-    State(state): State<Arc<S3ServerState>>,
-    AxumPath(_bucket): AxumPath<String>,
-    Query(params): Query<WsParams>,
-    upgrade: fastwebsockets::upgrade::IncomingUpgrade,
-) -> Response {
-    ws_handler_inner(state, params, upgrade).await
-}
-
-async fn ws_handler_inner(
-    state: Arc<S3ServerState>,
-    params: WsParams,
-    upgrade: fastwebsockets::upgrade::IncomingUpgrade,
-) -> Response {
-    let bus = match &state.catalog_events {
-        Some(bus) => bus.clone(),
-        None => {
-            return Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("catalog events not configured"))
-                .unwrap();
-        }
-    };
-
-    let (response, fut) = match upgrade.upgrade() {
-        Ok((response, fut)) => (response, fut),
-        Err(e) => {
-            warn!("WebSocket upgrade failed: {}", e);
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(format!("WebSocket upgrade failed: {}", e)))
-                .unwrap();
-        }
-    };
-
-    let manifest = state.manifest.clone();
-    let group_id = state.group_id;
-    let since = params.since;
-    let pins = state.version_pins.clone();
-    let session_id = pins.create_session();
-
-    tokio::spawn(async move {
-        match fut.await {
-            Ok(ws) => {
-                if let Err(e) = handle_ws_connection(
-                    ws,
-                    bus,
-                    manifest,
-                    group_id,
-                    since,
-                    pins.clone(),
-                    session_id,
-                )
-                .await
-                {
-                    debug!("WebSocket connection ended: {}", e);
-                }
-            }
-            Err(e) => {
-                warn!("WebSocket handshake failed: {}", e);
-            }
-        }
-        // Always clean up session pins on disconnect
-        pins.remove_session(session_id);
-    });
-
-    response.into_response()
-}
-
-/// MessagePack messages sent from server to client over WebSocket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ServerWsMessage {
-    /// Initial session assignment.
-    Session { session_id: u64 },
-    /// A catalog event (table create/drop, version bump, seal, promote).
-    Event {
-        #[serde(flatten)]
-        event: CatalogEvent,
-    },
-    /// Client fell behind; must re-fetch full catalog for this catalog.
-    SnapshotRequired { catalog: String },
-}
-
-/// MessagePack messages clients send for version pinning and catalog subscription.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ClientWsMessage {
-    Pin {
-        catalog: String,
-        table: String,
-        tier: String,
-        version: u64,
-    },
-    Unpin {
-        catalog: String,
-        table: String,
-        tier: String,
-        version: u64,
-    },
-    Heartbeat,
-    /// Subscribe to catalog events for the specified catalogs.
-    Subscribe { catalogs: Vec<String> },
-}
-
-async fn handle_ws_connection<S>(
-    mut ws: fastwebsockets::WebSocket<S>,
-    bus: Arc<CatalogEventBus>,
-    manifest: Option<Arc<LanceManifestManager>>,
-    group_id: u64,
-    since: Option<u64>,
-    pins: Arc<VersionPinTracker>,
-    session_id: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-{
-    use fastwebsockets::{Frame, OpCode, Payload};
-
-    // Send session_id to client
-    let hello = rmp_serde::to_vec(&ServerWsMessage::Session { session_id })?;
-    ws.write_frame(Frame::binary(Payload::Owned(hello)))
-        .await?;
-
-    // Replay WAL events if `since` was provided and we have a manifest
-    if let (Some(since_seq), Some(manifest)) = (since, &manifest) {
-        match manifest.read_wal_since(group_id, since_seq) {
-            Ok(events) => {
-                for event in events {
-                    let bytes = rmp_serde::to_vec(&ServerWsMessage::Event { event })?;
-                    ws.write_frame(Frame::binary(Payload::Owned(bytes)))
-                        .await?;
-                }
-            }
-            Err(e) => {
-                warn!("Failed to read WAL for replay: {}", e);
-                let bytes = rmp_serde::to_vec(&ServerWsMessage::SnapshotRequired {
-                    catalog: String::new(),
-                })?;
-                ws.write_frame(Frame::binary(Payload::Owned(bytes)))
-                    .await?;
-            }
-        }
-    }
-
-    // Subscribe to live events
-    let mut rx = bus.subscribe();
-
-    // Set up fragmented read for bidirectional communication
-    ws.set_auto_pong(true);
-
-    loop {
-        tokio::select! {
-            // Forward catalog events to client
-            event = rx.recv() => {
-                match event {
-                    Ok(event) => {
-                        let bytes = rmp_serde::to_vec(&ServerWsMessage::Event { event })?;
-                        ws.write_frame(Frame::binary(Payload::Owned(bytes)))
-                            .await?;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(lagged = n, "WebSocket subscriber lagged, sending snapshot_required");
-                        let bytes = rmp_serde::to_vec(&ServerWsMessage::SnapshotRequired {
-                            catalog: String::new(),
-                        })?;
-                        ws.write_frame(Frame::binary(Payload::Owned(bytes)))
-                            .await?;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
-            // Handle client messages (pin/unpin/heartbeat)
-            frame = ws.read_frame() => {
-                let frame = frame?;
-                match frame.opcode {
-                    OpCode::Binary => {
-                        handle_client_pin_message(&frame.payload, &pins, session_id);
-                    }
-                    OpCode::Close => {
-                        debug!(session_id, "Client sent close frame");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn handle_client_pin_message(data: &[u8], pins: &VersionPinTracker, session_id: u64) {
-    let msg: ClientWsMessage = match rmp_serde::from_slice(data) {
-        Ok(m) => m,
-        Err(_) => {
-            debug!(session_id, "Ignoring unrecognized client WS message");
-            return;
-        }
-    };
-
-    match msg {
-        ClientWsMessage::Pin {
-            catalog,
-            table,
-            tier,
-            version,
-        } => {
-            if let Some(tier) = PinTier::from_str(&tier) {
-                debug!(session_id, %catalog, %table, %version, "Client pinned version");
-                pins.pin(
-                    session_id,
-                    PinKey {
-                        catalog,
-                        table,
-                        tier,
-                        version,
-                    },
-                );
-            }
-        }
-        ClientWsMessage::Unpin {
-            catalog,
-            table,
-            tier,
-            version,
-        } => {
-            if let Some(tier) = PinTier::from_str(&tier) {
-                debug!(session_id, %catalog, %table, %version, "Client unpinned version");
-                pins.unpin(
-                    session_id,
-                    PinKey {
-                        catalog,
-                        table,
-                        tier,
-                        version,
-                    },
-                );
-            }
-        }
-        ClientWsMessage::Heartbeat => {
-            pins.heartbeat(session_id);
-        }
-        ClientWsMessage::Subscribe { catalogs } => {
-            debug!(session_id, ?catalogs, "Client subscribed to catalogs");
-            // Subscription handling is done at the connection level for multi-catalog WS
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// NOTE: The unified WebSocket handler has been moved to the bisque crate
+// (bisque/src/ws.rs) where it belongs as global server infrastructure.
+// Engine-specific data is accessed via the S3ServerState public facade methods.
 
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")

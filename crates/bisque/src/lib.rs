@@ -20,6 +20,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod server;
+pub mod ws;
 
 pub use auth::AuthContext;
 pub use config::BisqueConfig;

@@ -17,10 +17,16 @@ path = "src/main.rs"
 # Bisque engines
 bisque-lance = { path = "../lance" }
 bisque-meta = { path = "../meta" }
+bisque-protocol = { workspace = true }
+bisque-raft = { workspace = true }
+openraft = { workspace = true, features = ["tokio-rt"] }
 
 # Web framework
 axum = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace", "fs"] }
+
+# WebSocket
+fastwebsockets = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
@@ -28,10 +34,14 @@ tokio = { workspace = true, features = ["full"] }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+rmp-serde = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# Metrics
+metrics = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

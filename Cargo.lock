@@ -697,11 +697,17 @@ dependencies = [
  "axum",
  "bisque-lance",
  "bisque-meta",
+ "bisque-protocol",
+ "bisque-raft",
  "chrono",
  "clap",
  "dashmap",
+ "fastwebsockets",
+ "metrics",
+ "openraft",
  "parking_lot",
  "reqwest",
+ "rmp-serde",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -728,6 +734,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",
  "bisque-meta",
+ "bisque-protocol",
  "bisque-raft",
  "bytes",
  "chrono",
@@ -796,6 +803,15 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+]
+
+[[package]]
+name = "bisque-protocol"
+version = "0.1.0"
+dependencies = [
+ "rmp-serde",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

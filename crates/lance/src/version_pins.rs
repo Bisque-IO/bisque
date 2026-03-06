@@ -62,6 +62,9 @@ struct SessionState {
     last_heartbeat: Instant,
 }
 
+/// H4: Maximum pins per session to prevent resource exhaustion.
+const MAX_PINS_PER_SESSION: usize = 1000;
+
 /// Tracks version pins across all WebSocket sessions.
 ///
 /// Thread-safe via interior `Mutex`. Operations are fast (no I/O).
@@ -133,43 +136,45 @@ impl VersionPinTracker {
         }
     }
 
-    /// Pin a version for a session.
-    pub fn pin(&self, session_id: SessionId, key: PinKey) {
-        let inserted = {
-            let mut sessions = self.sessions.lock();
-            match sessions.get_mut(&session_id) {
-                Some(state) => {
-                    state.last_heartbeat = Instant::now();
-                    state.pins.insert(key.clone())
+    /// Pin a version for a session. Returns false if the session's pin quota is exceeded.
+    /// M1: Holds both locks together to prevent TOCTOU races.
+    pub fn pin(&self, session_id: SessionId, key: PinKey) -> bool {
+        let mut sessions = self.sessions.lock();
+        let mut counts = self.pin_counts.lock();
+        match sessions.get_mut(&session_id) {
+            Some(state) => {
+                // H4: Enforce per-session pin quota.
+                if state.pins.len() >= MAX_PINS_PER_SESSION && !state.pins.contains(&key) {
+                    debug!(session_id, max = MAX_PINS_PER_SESSION, "Pin quota exceeded");
+                    return false;
                 }
-                None => return,
+                state.last_heartbeat = Instant::now();
+                if state.pins.insert(key.clone()) {
+                    *counts.entry(key).or_insert(0) += 1;
+                }
+                true
             }
-        };
-
-        if inserted {
-            let mut counts = self.pin_counts.lock();
-            *counts.entry(key).or_insert(0) += 1;
+            None => false,
         }
     }
 
     /// Unpin a version for a session.
+    /// M1: Holds both locks together to prevent TOCTOU races.
     pub fn unpin(&self, session_id: SessionId, key: PinKey) {
-        let removed = {
-            let mut sessions = self.sessions.lock();
-            match sessions.get_mut(&session_id) {
-                Some(state) => state.pins.remove(&key),
-                None => return,
-            }
-        };
-
-        if removed {
-            let mut counts = self.pin_counts.lock();
-            if let Some(count) = counts.get_mut(&key) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    counts.remove(&key);
+        let mut sessions = self.sessions.lock();
+        let mut counts = self.pin_counts.lock();
+        match sessions.get_mut(&session_id) {
+            Some(state) => {
+                if state.pins.remove(&key) {
+                    if let Some(count) = counts.get_mut(&key) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            counts.remove(&key);
+                        }
+                    }
                 }
             }
+            None => {}
         }
     }
 

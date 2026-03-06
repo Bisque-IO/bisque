@@ -152,6 +152,40 @@ pub async fn auth_middleware(
     next.run(request).await
 }
 
+/// Validate a bearer token and return the auth context.
+///
+/// Used by the WebSocket handler where tokens arrive in the handshake frame
+/// rather than the HTTP Authorization header.
+pub fn validate_token(auth_state: &AuthState, token: &str) -> Result<AuthContext, &'static str> {
+    let claims = auth_state
+        .token_manager
+        .verify(token)
+        .ok_or("invalid or expired token")?;
+
+    // Check API key is not revoked (skip for user-login tokens with key_id=0)
+    if claims.key_id != 0 {
+        match auth_state.meta_engine.get_api_key(claims.key_id) {
+            Some(key) => {
+                if key.revoked {
+                    return Err("API key has been revoked");
+                }
+                if key.tenant_id != claims.tenant_id {
+                    return Err("tenant mismatch");
+                }
+            }
+            None => return Err("API key not found"),
+        }
+    }
+
+    Ok(AuthContext {
+        user_id: claims.user_id,
+        account_id: claims.account_id,
+        tenant_id: claims.tenant_id,
+        key_id: claims.key_id,
+        scopes: claims.scopes,
+    })
+}
+
 /// Extract the Bearer token string from the Authorization header.
 fn extract_bearer_token(request: &Request) -> Option<&str> {
     request

@@ -1,5 +1,6 @@
 import { create } from "zustand"
-import type { CatalogEvent } from "@/lib/ws"
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type CatalogEvent = Record<string, any>
 
 interface CatalogsState {
   events: CatalogEvent[]

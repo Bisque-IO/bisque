@@ -50,7 +50,7 @@ use url::Url;
 use crate::catalog_events::{CatalogEvent, CatalogEventKind};
 use crate::client_store::{ClientMeta, ClientStore, PersistedCatalogEntry};
 use crate::cold_store::CredentialConfig;
-use crate::s3_server::{ClientWsMessage, ServerWsMessage};
+use bisque_protocol::ws::{ClientMessage, ServerMessage, WS_PROTOCOL_VERSION};
 use crate::s3_store::BisqueRoutingStore;
 
 // ---------------------------------------------------------------------------
@@ -90,8 +90,10 @@ pub struct BisqueClient {
     ws_handle: Option<JoinHandle<()>>,
     shutdown: Arc<Notify>,
     cluster_url: String,
-    ws_tx: mpsc::UnboundedSender<ClientWsMessage>,
+    ws_tx: mpsc::UnboundedSender<ClientMessage>,
     credentials: Arc<CredentialConfig>,
+    /// Optional auth token for WebSocket handshake (C3).
+    auth_token: String,
 }
 
 impl BisqueClient {
@@ -102,11 +104,26 @@ impl BisqueClient {
     /// and starts a WebSocket listener for real-time updates across all catalogs.
     ///
     /// Tables are accessible as `catalog_name.public.table_name` in SQL queries.
+    /// Connect to a bisque-lance cluster with an optional auth token.
+    ///
+    /// The `auth_token` is sent in the WebSocket handshake frame for authentication.
+    /// Pass an empty string for unauthenticated connections.
     pub async fn connect(
         cluster_url: impl Into<String>,
         catalog_names: Vec<String>,
         credentials: Arc<CredentialConfig>,
         persist_path: Option<&Path>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::connect_with_token(cluster_url, catalog_names, credentials, persist_path, String::new()).await
+    }
+
+    /// Connect with an explicit auth token for WebSocket authentication.
+    pub async fn connect_with_token(
+        cluster_url: impl Into<String>,
+        catalog_names: Vec<String>,
+        credentials: Arc<CredentialConfig>,
+        persist_path: Option<&Path>,
+        auth_token: String,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cluster_url = cluster_url.into().trim_end_matches('/').to_string();
 
@@ -124,7 +141,7 @@ impl BisqueClient {
         let catalogs: Arc<RwLock<HashMap<String, Arc<CatalogState>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(Notify::new());
-        let (ws_tx, ws_rx) = mpsc::unbounded_channel::<ClientWsMessage>();
+        let (ws_tx, ws_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
         // Try to restore from persisted state
         let client_store = persist_path
@@ -212,7 +229,7 @@ impl BisqueClient {
 
                     // Pin initial versions
                     if let Some(v) = info.active_version {
-                        let _ = ws_tx.send(ClientWsMessage::Pin {
+                        let _ = ws_tx.send(ClientMessage::Pin {
                             catalog: catalog_name.clone(),
                             table: table_name.clone(),
                             tier: "active".into(),
@@ -221,7 +238,7 @@ impl BisqueClient {
                     }
                     if info.sealed_segment.is_some() {
                         if let Some(v) = info.sealed_version {
-                            let _ = ws_tx.send(ClientWsMessage::Pin {
+                            let _ = ws_tx.send(ClientMessage::Pin {
                                 catalog: catalog_name.clone(),
                                 table: table_name.clone(),
                                 tier: "sealed".into(),
@@ -280,14 +297,22 @@ impl BisqueClient {
             }
         }
 
-        // Start heartbeat task
+        // H6: Start heartbeat task — reads min seq across catalogs instead of always 0.
         let heartbeat_tx = ws_tx.clone();
         let heartbeat_shutdown = shutdown.clone();
+        let heartbeat_catalogs = catalogs.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                        if heartbeat_tx.send(ClientWsMessage::Heartbeat).is_err() {
+                        let last_seen_seq = {
+                            let cats = heartbeat_catalogs.read();
+                            cats.values()
+                                .map(|s| s.last_seq.load(Ordering::Relaxed))
+                                .min()
+                                .unwrap_or(0)
+                        };
+                        if heartbeat_tx.send(ClientMessage::Heartbeat { last_seen_seq }).is_err() {
                             break;
                         }
                     }
@@ -304,6 +329,7 @@ impl BisqueClient {
             let shutdown = shutdown.clone();
             let ws_tx_clone = ws_tx.clone();
             let client_store_clone = client_store.clone();
+            let auth_token = auth_token.clone();
 
             tokio::spawn(async move {
                 ws_listener_loop(
@@ -314,6 +340,7 @@ impl BisqueClient {
                     ws_rx,
                     ws_tx_clone,
                     client_store_clone,
+                    &auth_token,
                 )
                 .await;
             })
@@ -327,6 +354,7 @@ impl BisqueClient {
             cluster_url,
             ws_tx,
             credentials,
+            auth_token,
         })
     }
 
@@ -657,12 +685,19 @@ struct CatalogTableInfo {
     s3_storage_options: HashMap<String, String>,
 }
 
+/// L9: Reuse a single reqwest client across fetch_catalog calls.
+fn shared_http_client() -> &'static reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| reqwest::Client::new())
+}
+
 async fn fetch_catalog(
     cluster_url: &str,
     catalog_name: &str,
 ) -> Result<CatalogResponse, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/{}/{}", cluster_url, catalog_name, "_bisque/catalog");
-    let resp = reqwest::Client::new().get(&url).send().await?;
+    let resp = shared_http_client().get(&url).send().await?;
     let catalog: CatalogResponse = resp.json().await?;
     Ok(catalog)
 }
@@ -726,15 +761,29 @@ async fn open_table_provider(
 // WebSocket listener
 // ---------------------------------------------------------------------------
 
+/// Reconnect constants (C1: jittered exponential backoff).
+const WS_INITIAL_RECONNECT_DELAY_MS: u64 = 1000;
+const WS_MAX_RECONNECT_DELAY_MS: u64 = 30_000;
+/// Handshake timeout (H1).
+const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Read timeout — if no server message in this window, consider connection dead (H2).
+/// 45 seconds = 3 missed heartbeats at 15s interval.
+const WS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+/// TTL refresh reconnect delay (M1).
+const WS_TTL_REFRESH_DELAY_MS: u64 = 100;
+
 async fn ws_listener_loop(
     cluster_url: &str,
     catalog_names: &[String],
     catalogs: Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
     shutdown: Arc<Notify>,
-    mut ws_rx: mpsc::UnboundedReceiver<ClientWsMessage>,
-    ws_tx: mpsc::UnboundedSender<ClientWsMessage>,
+    mut ws_rx: mpsc::UnboundedReceiver<ClientMessage>,
+    ws_tx: mpsc::UnboundedSender<ClientMessage>,
     client_store: Option<Arc<ClientStore>>,
+    auth_token: &str,
 ) {
+    let mut reconnect_delay_ms = WS_INITIAL_RECONNECT_DELAY_MS;
+
     loop {
         // Use min sequence across all catalogs for delta sync
         let since = {
@@ -753,22 +802,57 @@ async fn ws_listener_loop(
             &mut ws_rx,
             &ws_tx,
             &client_store,
+            auth_token,
         )
         .await
         {
-            Ok(()) => {
+            Ok(WsDisconnectReason::Shutdown) => {
                 info!("WebSocket listener shut down cleanly");
                 return;
             }
-            Err(e) => {
-                warn!("WebSocket connection lost: {}, reconnecting in 1s...", e);
+            Ok(WsDisconnectReason::TtlRefresh) => {
+                // M1: TTL refresh — reconnect immediately with short delay.
+                debug!("WebSocket TTL refresh, reconnecting in {}ms", WS_TTL_REFRESH_DELAY_MS);
+                reconnect_delay_ms = WS_INITIAL_RECONNECT_DELAY_MS; // Reset backoff
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(WS_TTL_REFRESH_DELAY_MS)) => {}
                     _ = shutdown.notified() => return,
                 }
             }
+            Err(e) => {
+                // C1: Jittered exponential backoff.
+                let jitter = 0.75 + (rand_jitter() * 0.5); // 0.75..1.25
+                let delay = (reconnect_delay_ms as f64 * jitter) as u64;
+                warn!("WebSocket connection lost: {}, reconnecting in {}ms...", e, delay);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
+                    _ = shutdown.notified() => return,
+                }
+                reconnect_delay_ms = (reconnect_delay_ms * 2).min(WS_MAX_RECONNECT_DELAY_MS);
+            }
         }
     }
+}
+
+/// Simple pseudo-random jitter [0.0, 1.0) without pulling in rand crate.
+/// M15: Uses multiple entropy sources to avoid deterministic sequences.
+fn rand_jitter() -> f64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = DefaultHasher::new();
+    std::time::Instant::now().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+    (hasher.finish() % 10_000) as f64 / 10_000.0
+}
+
+/// Why the WS connection ended cleanly (vs Err for unexpected disconnects).
+enum WsDisconnectReason {
+    Shutdown,
+    TtlRefresh,
 }
 
 async fn ws_connect_and_listen(
@@ -777,25 +861,24 @@ async fn ws_connect_and_listen(
     catalogs: &Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
     shutdown: &Arc<Notify>,
     since: u64,
-    ws_rx: &mut mpsc::UnboundedReceiver<ClientWsMessage>,
-    ws_tx: &mpsc::UnboundedSender<ClientWsMessage>,
+    ws_rx: &mut mpsc::UnboundedReceiver<ClientMessage>,
+    ws_tx: &mpsc::UnboundedSender<ClientMessage>,
     client_store: &Option<Arc<ClientStore>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Connect to tenant-scoped WS endpoint
+    auth_token: &str,
+) -> Result<WsDisconnectReason, Box<dyn std::error::Error + Send + Sync>> {
+    // Connect to unified WS endpoint
     let ws_url = cluster_url
         .replace("http://", "ws://")
         .replace("https://", "wss://");
-    let url = if since > 0 {
-        format!("{}/_bisque/ws?since={}", ws_url, since)
-    } else {
-        format!("{}/_bisque/ws", ws_url)
-    };
+    let url = format!("{}/_bisque/ws", ws_url);
 
     info!(%url, "Connecting to WebSocket for catalog events");
 
     let uri: hyper::Uri = url.parse()?;
     let host = uri.host().unwrap_or("localhost");
-    let port = uri.port_u16().unwrap_or(80);
+    // C4: Use scheme-appropriate default port (443 for wss, 80 for ws).
+    let is_tls = uri.scheme_str() == Some("wss");
+    let port = uri.port_u16().unwrap_or(if is_tls { 443 } else { 80 });
     let addr = format!("{}:{}", host, port);
 
     let tcp = tokio::net::TcpStream::connect(&addr).await?;
@@ -814,21 +897,49 @@ async fn ws_connect_and_listen(
 
     let (mut ws, _) = fastwebsockets::handshake::client(&TokioSpawnExecutor, req, tcp).await?;
 
-    info!("WebSocket connected, listening for catalog events");
+    info!("WebSocket connected, waiting for server handshake");
 
-    // Send subscribe message for all catalogs
-    let subscribe = ClientWsMessage::Subscribe {
-        catalogs: catalog_names.to_vec(),
+    // H1: Handshake timeout — don't hang forever waiting for server handshake.
+    let frame = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, ws.read_frame())
+        .await
+        .map_err(|_| "Server handshake timed out")??;
+    if frame.opcode != fastwebsockets::OpCode::Binary {
+        return Err("Expected binary handshake frame from server".into());
+    }
+    let server_handshake: ServerMessage = rmp_serde::from_slice(&frame.payload)?;
+    match &server_handshake {
+        ServerMessage::Handshake { protocol_version, session_id, .. } => {
+            if *protocol_version != WS_PROTOCOL_VERSION {
+                return Err(format!(
+                    "Protocol version mismatch: server={}, client={}",
+                    protocol_version, WS_PROTOCOL_VERSION
+                ).into());
+            }
+            debug!(session_id, "Received server handshake");
+        }
+        _ => {
+            return Err("Expected Handshake message from server".into());
+        }
+    }
+
+    // Respond with client handshake (C3: includes auth token for authentication)
+    let client_handshake = ClientMessage::Handshake {
+        protocol_version: WS_PROTOCOL_VERSION,
+        token: auth_token.to_string(),
+        last_seen_seq: since,
+        subscribe_catalogs: catalog_names.to_vec(),
     };
-    let subscribe_bytes = rmp_serde::to_vec(&subscribe)?;
+    let handshake_bytes = rmp_serde::to_vec_named(&client_handshake)?;
     ws.write_frame(fastwebsockets::Frame::binary(
-        fastwebsockets::Payload::Owned(subscribe_bytes),
+        fastwebsockets::Payload::Owned(handshake_bytes),
     ))
     .await?;
 
+    info!("Handshake complete, listening for catalog events");
+
     // Drain any queued outbound messages (pins from initial connect, heartbeats)
     while let Ok(msg) = ws_rx.try_recv() {
-        let bytes = rmp_serde::to_vec(&msg)?;
+        let bytes = rmp_serde::to_vec_named(&msg)?;
         ws.write_frame(fastwebsockets::Frame::binary(
             fastwebsockets::Payload::Owned(bytes),
         ))
@@ -837,15 +948,33 @@ async fn ws_connect_and_listen(
 
     loop {
         tokio::select! {
-            frame = ws.read_frame() => {
-                let frame = frame?;
+            // H2: Read timeout — if no server message in WS_READ_TIMEOUT, connection is dead.
+            result = tokio::time::timeout(WS_READ_TIMEOUT, ws.read_frame()) => {
+                let frame = result.map_err(|_| "WebSocket read timed out (no heartbeat)")??;
                 match frame.opcode {
                     fastwebsockets::OpCode::Binary => {
-                        handle_ws_message(&frame.payload, catalogs, ws_tx, client_store).await;
+                        let action = handle_ws_message(&frame.payload, catalogs, ws_tx, client_store).await;
+                        match action {
+                            WsAction::Continue => {}
+                            // M1: TTL refresh — server is closing for TTL, reconnect quickly.
+                            WsAction::TtlRefresh => return Ok(WsDisconnectReason::TtlRefresh),
+                            // C2: SnapshotRequired — re-fetch full catalog state.
+                            // H7: Spawn to avoid blocking the WS receive loop.
+                            WsAction::SnapshotRequired(catalog) => {
+                                let cats = catalogs.clone();
+                                let tx = ws_tx.clone();
+                                let store = client_store.clone();
+                                tokio::spawn(async move {
+                                    handle_snapshot_required(&catalog, &cats, &tx, &store).await;
+                                });
+                            }
+                        }
                     }
                     fastwebsockets::OpCode::Close => {
-                        debug!("WebSocket server sent close frame");
-                        return Ok(());
+                        // H9: Server WS close frame should trigger reconnect, not clean shutdown.
+                        // Only explicit app-level Close with shutdown reason is a clean exit.
+                        debug!("WebSocket server sent close frame, will reconnect");
+                        return Err("Server sent close frame".into());
                     }
                     _ => {}
                 }
@@ -853,57 +982,164 @@ async fn ws_connect_and_listen(
             msg = ws_rx.recv() => {
                 match msg {
                     Some(outbound) => {
-                        let bytes = rmp_serde::to_vec(&outbound)?;
+                        let bytes = rmp_serde::to_vec_named(&outbound)?;
                         ws.write_frame(fastwebsockets::Frame::binary(
                             fastwebsockets::Payload::Owned(bytes),
                         )).await?;
                     }
                     None => {
                         let _ = ws.write_frame(fastwebsockets::Frame::close_raw(vec![].into())).await;
-                        return Ok(());
+                        return Ok(WsDisconnectReason::Shutdown);
                     }
                 }
             }
             _ = shutdown.notified() => {
                 let _ = ws.write_frame(fastwebsockets::Frame::close_raw(vec![].into())).await;
-                return Ok(());
+                return Ok(WsDisconnectReason::Shutdown);
             }
         }
     }
 }
 
+/// Action returned by handle_ws_message to signal the connection loop.
+enum WsAction {
+    Continue,
+    TtlRefresh,
+    SnapshotRequired(String),
+}
+
+/// C2: Handle SnapshotRequired — re-fetch all tables for the given catalog.
+async fn handle_snapshot_required(
+    catalog_name: &str,
+    catalogs: &Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
+    ws_tx: &mpsc::UnboundedSender<ClientMessage>,
+    client_store: &Option<Arc<ClientStore>>,
+) {
+    let catalog_state = catalogs.read().get(catalog_name).cloned();
+    let Some(cat) = catalog_state else {
+        warn!(catalog = %catalog_name, "SnapshotRequired for unknown catalog, ignoring");
+        return;
+    };
+
+    info!(catalog = %catalog_name, "Performing full catalog re-sync (SnapshotRequired)");
+
+    // Re-open every registered table's datasets from scratch.
+    let table_names: Vec<String> = cat.tables.read().keys().cloned().collect();
+    for table_name in &table_names {
+        let provider = cat.tables.read().get(table_name).cloned();
+        let Some(provider) = provider else { continue };
+        let routing_store = &cat.routing_store;
+
+        // Re-open active tier
+        match open_remote_dataset(routing_store, table_name, "active").await {
+            Ok(ds) => {
+                let new_version = ds.version().version;
+                let old_version = provider.active_version();
+                let _ = ws_tx.send(ClientMessage::Pin {
+                    catalog: catalog_name.to_string(),
+                    table: table_name.clone(),
+                    tier: "active".into(),
+                    version: new_version,
+                });
+                provider.swap_active(Some(ds));
+                if let Some(old_v) = old_version {
+                    let _ = ws_tx.send(ClientMessage::Unpin {
+                        catalog: catalog_name.to_string(),
+                        table: table_name.clone(),
+                        tier: "active".into(),
+                        version: old_v,
+                    });
+                }
+            }
+            Err(e) => {
+                warn!(catalog = %catalog_name, table = %table_name, "Failed to re-open active on snapshot: {}", e);
+            }
+        }
+
+        // Re-open sealed tier
+        match open_remote_dataset(routing_store, table_name, "sealed").await {
+            Ok(ds) => {
+                let new_version = ds.version().version;
+                let old_version = provider.sealed_version();
+                let _ = ws_tx.send(ClientMessage::Pin {
+                    catalog: catalog_name.to_string(),
+                    table: table_name.clone(),
+                    tier: "sealed".into(),
+                    version: new_version,
+                });
+                provider.swap_sealed(Some(ds));
+                if let Some(old_v) = old_version {
+                    let _ = ws_tx.send(ClientMessage::Unpin {
+                        catalog: catalog_name.to_string(),
+                        table: table_name.clone(),
+                        tier: "sealed".into(),
+                        version: old_v,
+                    });
+                }
+            }
+            Err(e) => {
+                debug!(catalog = %catalog_name, table = %table_name, "No sealed tier on snapshot: {}", e);
+            }
+        }
+    }
+
+    // Reset seq to 0 so the next reconnect does a full replay.
+    cat.last_seq.store(0, Ordering::Relaxed);
+    info!(catalog = %catalog_name, tables = table_names.len(), "Snapshot re-sync complete");
+}
+
 async fn handle_ws_message(
     data: &[u8],
     catalogs: &Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
-    ws_tx: &mpsc::UnboundedSender<ClientWsMessage>,
+    ws_tx: &mpsc::UnboundedSender<ClientMessage>,
     client_store: &Option<Arc<ClientStore>>,
-) {
-    let msg: ServerWsMessage = match rmp_serde::from_slice(data) {
+) -> WsAction {
+    let msg: ServerMessage = match rmp_serde::from_slice(data) {
         Ok(m) => m,
         Err(e) => {
             warn!("Failed to parse server WS message: {}", e);
-            return;
+            return WsAction::Continue;
         }
     };
 
     match msg {
-        ServerWsMessage::Session { session_id } => {
-            debug!(session_id, "Received session assignment");
+        ServerMessage::Handshake { session_id, .. } => {
+            debug!(session_id, "Received server handshake (unexpected in message loop)");
         }
-        ServerWsMessage::SnapshotRequired { catalog } => {
+        ServerMessage::CatalogEvent { event, .. } => {
+            match serde_json::from_value::<CatalogEvent>(event) {
+                Ok(catalog_event) => {
+                    handle_catalog_event(catalog_event, catalogs, ws_tx, client_store).await;
+                }
+                Err(e) => {
+                    warn!("Failed to decode CatalogEvent from Value: {}", e);
+                }
+            }
+        }
+        ServerMessage::SnapshotRequired { catalog, .. } => {
             warn!(catalog = %catalog, "Received snapshot_required — full catalog re-sync needed");
-            // TODO: implement full re-sync from catalog endpoint
+            return WsAction::SnapshotRequired(catalog);
         }
-        ServerWsMessage::Event { event } => {
-            handle_catalog_event(event, catalogs, ws_tx, client_store).await;
+        ServerMessage::Heartbeat { .. } => {
+            // Server heartbeat — no action needed for Rust SDK client
+        }
+        ServerMessage::Close { reason } => {
+            debug!(%reason, "Server sent close message");
+            if reason == "ttl_refresh" {
+                return WsAction::TtlRefresh;
+            }
+        }
+        _ => {
+            // Response, OperationUpdate, OperationsSnapshot — not used by Rust SDK client
         }
     }
+    WsAction::Continue
 }
 
 async fn handle_catalog_event(
     event: CatalogEvent,
     catalogs: &Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
-    ws_tx: &mpsc::UnboundedSender<ClientWsMessage>,
+    ws_tx: &mpsc::UnboundedSender<ClientMessage>,
     client_store: &Option<Arc<ClientStore>>,
 ) {
     let catalog_name = event.catalog.clone();
@@ -923,7 +1159,7 @@ async fn handle_catalog_event(
                 let old_version = provider.active_version();
                 match open_remote_dataset(routing_store, table, "active").await {
                     Ok(ds) => {
-                        let _ = ws_tx.send(ClientWsMessage::Pin {
+                        let _ = ws_tx.send(ClientMessage::Pin {
                             catalog: catalog_name.clone(),
                             table: table.clone(),
                             tier: "active".into(),
@@ -931,7 +1167,7 @@ async fn handle_catalog_event(
                         });
                         provider.swap_active(Some(ds));
                         if let Some(old_v) = old_version {
-                            let _ = ws_tx.send(ClientWsMessage::Unpin {
+                            let _ = ws_tx.send(ClientMessage::Unpin {
                                 catalog: catalog_name.clone(),
                                 table: table.clone(),
                                 tier: "active".into(),
@@ -962,7 +1198,7 @@ async fn handle_catalog_event(
 
                 match open_remote_dataset(routing_store, table, "active").await {
                     Ok(ds) => {
-                        let _ = ws_tx.send(ClientWsMessage::Pin {
+                        let _ = ws_tx.send(ClientMessage::Pin {
                             catalog: catalog_name.clone(),
                             table: table.clone(),
                             tier: "active".into(),
@@ -970,7 +1206,7 @@ async fn handle_catalog_event(
                         });
                         provider.swap_active(Some(ds));
                         if let Some(old_v) = old_active_v {
-                            let _ = ws_tx.send(ClientWsMessage::Unpin {
+                            let _ = ws_tx.send(ClientMessage::Unpin {
                                 catalog: catalog_name.clone(),
                                 table: table.clone(),
                                 tier: "active".into(),
@@ -982,7 +1218,7 @@ async fn handle_catalog_event(
                 }
                 match open_remote_dataset(routing_store, table, "sealed").await {
                     Ok(ds) => {
-                        let _ = ws_tx.send(ClientWsMessage::Pin {
+                        let _ = ws_tx.send(ClientMessage::Pin {
                             catalog: catalog_name.clone(),
                             table: table.clone(),
                             tier: "sealed".into(),
@@ -990,7 +1226,7 @@ async fn handle_catalog_event(
                         });
                         provider.swap_sealed(Some(ds));
                         if let Some(old_v) = old_sealed_v {
-                            let _ = ws_tx.send(ClientWsMessage::Unpin {
+                            let _ = ws_tx.send(ClientMessage::Unpin {
                                 catalog: catalog_name.clone(),
                                 table: table.clone(),
                                 tier: "sealed".into(),
@@ -1047,7 +1283,7 @@ async fn handle_catalog_event(
             let provider = catalog_state.tables.read().get(table).cloned();
             if let Some(provider) = provider {
                 if let Some(v) = provider.active_version() {
-                    let _ = ws_tx.send(ClientWsMessage::Unpin {
+                    let _ = ws_tx.send(ClientMessage::Unpin {
                         catalog: catalog_name.clone(),
                         table: table.clone(),
                         tier: "active".into(),
@@ -1055,7 +1291,7 @@ async fn handle_catalog_event(
                     });
                 }
                 if let Some(v) = provider.sealed_version() {
-                    let _ = ws_tx.send(ClientWsMessage::Unpin {
+                    let _ = ws_tx.send(ClientMessage::Unpin {
                         catalog: catalog_name.clone(),
                         table: table.clone(),
                         tier: "sealed".into(),
@@ -1078,7 +1314,7 @@ async fn handle_catalog_event(
             let provider = catalog_state.tables.read().get(table).cloned();
             if let Some(provider) = provider {
                 if let Some(v) = provider.sealed_version() {
-                    let _ = ws_tx.send(ClientWsMessage::Unpin {
+                    let _ = ws_tx.send(ClientMessage::Unpin {
                         catalog: catalog_name.clone(),
                         table: table.clone(),
                         tier: "sealed".into(),

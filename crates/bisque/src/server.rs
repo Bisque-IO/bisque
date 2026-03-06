@@ -2,10 +2,12 @@
 //!
 //! Builds a single axum HTTP server that mounts:
 //! - Management API at `/_bisque/v1/...` for tenant/catalog/key CRUD
-//! - Engine-specific routes (S3, OTLP HTTP) with auth middleware
+//! - Lance S3-compatible API at `/{bucket}/{key}` for data access
+//! - Unified WebSocket at `/_bisque/ws` for real-time push + RPC
 //!
-//! gRPC services (Flight SQL, OTLP gRPC) run on separate ports.
+//! gRPC services (Flight SQL) run on a separate port.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path as AxumPath, State};
@@ -13,19 +15,30 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Json;
+use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
+use bisque_lance::{
+    BisqueLance, BisqueLanceConfig, CatalogEventBus, LanceManifestManager, LanceRaftNode,
+    LanceStateMachine, S3ServerState, WriteBatcherConfig, s3_router,
+    flight::serve_flight,
+};
 use bisque_meta::engine::MetaEngine;
 use bisque_meta::token::{self, TokenClaims, TokenManager};
 use bisque_meta::types::{
     Account, CatalogEntry, EngineType, Scope, Tenant, TenantLimits,
 };
 use bisque_meta::MetaConfig;
+use bisque_raft::multi::{
+    BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
+    MultiRaftManager, MultiplexedLogStorage, NodeAddressResolver,
+};
 
 use crate::auth::{AuthContext, AuthState, auth_middleware};
 use crate::config::BisqueConfig;
 use crate::error::ApiError;
+use crate::ws::{WsState, unified_ws_handler};
 
 /// Shared application state for the unified server.
 #[derive(Clone)]
@@ -36,6 +49,9 @@ pub struct AppState {
 
 /// Build the unified bisque HTTP server and start listening.
 pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // -----------------------------------------------------------------------
+    // 1. Meta engine (control plane)
+    // -----------------------------------------------------------------------
     let meta_config = MetaConfig::new(config.token_secret.clone())
         .with_token_ttl_secs(config.token_ttl_secs);
 
@@ -51,6 +67,129 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
         token_manager: token_manager.clone(),
         meta_engine: meta_engine.clone(),
     };
+
+    // -----------------------------------------------------------------------
+    // 2. Lance engine (analytics storage)
+    // -----------------------------------------------------------------------
+    let lance_dir = config.data_dir.join("lance");
+    let raft_dir = config.data_dir.join("raft-data");
+    let group_id: u64 = 1;
+    let node_id = config.node_id;
+
+    // 2a. Open the BisqueLance multi-table storage engine.
+    let lance_config = BisqueLanceConfig::new(&lance_dir);
+    let engine = Arc::new(BisqueLance::open(lance_config).await?);
+    info!(data_dir = %lance_dir.display(), "lance engine opened");
+
+    // 2b. Set up Raft log storage (memory-mapped).
+    std::fs::create_dir_all(&raft_dir)?;
+    let storage_config = MmapStorageConfig::new(&raft_dir)
+        .with_segment_size(8 * 1024 * 1024);
+    let storage = MultiplexedLogStorage::new(storage_config).await?;
+    info!(raft_dir = %raft_dir.display(), "raft log storage initialized");
+
+    // 2c. Set up Raft transport (TCP for clustering, single-node for now).
+    // M13: Register with actual HTTP addr for multi-node compatibility.
+    let registry = Arc::new(DefaultNodeRegistry::new());
+    registry.register(node_id, config.http_addr);
+    let transport = BisqueTcpTransport::new(
+        BisqueTcpTransportConfig::default(),
+        registry,
+    );
+
+    // 2d. Create the multi-raft manager.
+    let manager: Arc<MultiRaftManager<
+        bisque_lance::LanceTypeConfig,
+        BisqueTcpTransport<bisque_lance::LanceTypeConfig>,
+        MultiplexedLogStorage<bisque_lance::LanceTypeConfig>,
+    >> = Arc::new(MultiRaftManager::new(transport, storage));
+
+    // 2e. MDBX manifest for crash-consistent catalog metadata and WAL.
+    let manifest_dir = config.data_dir.join("manifest");
+    std::fs::create_dir_all(&manifest_dir)?;
+    let manifest = Arc::new(LanceManifestManager::new(&manifest_dir)?);
+    manifest.open_group(group_id)?;
+    info!(manifest_dir = %manifest_dir.display(), group_id, "MDBX manifest opened");
+
+    // 2f. Catalog event bus — seed from WAL's latest seq so post-restart events
+    // continue the monotonic sequence and reconnecting clients can delta-sync.
+    let initial_seq = manifest.latest_wal_seq(group_id).unwrap_or(0);
+    let catalog_bus = Arc::new(CatalogEventBus::new(initial_seq));
+    info!(initial_seq, "catalog event bus initialized from WAL");
+
+    // 2g. Create the Raft state machine with catalog events, manifest, and WAL.
+    let state_machine = LanceStateMachine::new(engine.clone())
+        .with_catalog_events(catalog_bus.clone())
+        .with_catalog_name("bisque".to_string())
+        .with_manifest(manifest.clone(), group_id);
+
+    // 2h. Create the Raft group and initialize single-node membership.
+    let raft_config = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 200,
+            election_timeout_min: 400,
+            election_timeout_max: 600,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+
+    let raft = manager
+        .add_group(group_id, node_id, raft_config, state_machine)
+        .await?;
+
+    let mut members = BTreeMap::new();
+    members.insert(node_id, BasicNode::default());
+    match raft.initialize(members).await {
+        Ok(_) => info!(node_id, group_id, "raft group initialized"),
+        Err(e) => {
+            // Already initialized is fine (e.g., restart with existing data).
+            if raft.is_initialized().await.unwrap_or(false) {
+                info!(node_id, group_id, "raft group already initialized");
+            } else {
+                return Err(Box::new(e));
+            }
+        }
+    }
+
+    // 2i. Create the LanceRaftNode and start background tasks.
+    let raft_node = Arc::new(
+        LanceRaftNode::new(raft, engine.clone(), node_id)
+            .with_group_id(group_id)
+            .with_write_batcher(WriteBatcherConfig::default()),
+    );
+    raft_node.start();
+
+    // H3: Poll for leadership instead of a fixed sleep.
+    // Election timeout is 150-600ms, so poll up to 2s with 50ms intervals.
+    {
+        let mut elected = false;
+        for _ in 0..40 {
+            if raft_node.is_leader() {
+                elected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if elected {
+            info!(node_id, "raft node is leader");
+        } else {
+            warn!(node_id, "raft node is NOT leader after 2s — writes may fail until election completes");
+        }
+    }
+
+    // 2j. Build the S3ServerState (used by S3 router and WS handler).
+    let s3_state = S3ServerState::new(
+        engine.clone(),
+        Some(catalog_bus),
+        Some(manifest),
+        group_id,
+        None, // ClusterMesh — wire up for multi-node
+    );
+
+    // -----------------------------------------------------------------------
+    // 3. Build HTTP routes
+    // -----------------------------------------------------------------------
 
     // Public routes (no auth required)
     let public_routes = axum::Router::new()
@@ -74,10 +213,25 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
     let health_route = axum::Router::new()
         .route("/_bisque/health", get(health_check));
 
+    // Unified WebSocket (auth via handshake frame)
+    let ws_state = WsState {
+        s3: s3_state.clone(),
+        auth: auth_state.clone(),
+        ip_connections: Arc::new(dashmap::DashMap::new()),
+    };
+    let ws_route = axum::Router::new()
+        .route("/_bisque/ws", get(unified_ws_handler).with_state(ws_state));
+
+    // Lance S3-compatible API routes
+    let s3_routes = s3_router(s3_state);
+
+    // Compose: management + WS first (specific paths), then S3 (wildcard catch-all)
     let mut app = axum::Router::new()
         .nest("/_bisque/v1", public_routes)
         .nest("/_bisque/v1", management_routes)
-        .merge(health_route);
+        .merge(health_route)
+        .merge(ws_route)
+        .merge(s3_routes);
 
     // Serve static UI files if ui_dir is configured
     if let Some(ref ui_dir) = config.ui_dir {
@@ -89,6 +243,21 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
         info!(ui_dir = %ui_dir.display(), "serving static UI files");
     }
 
+    // -----------------------------------------------------------------------
+    // 4. Start gRPC services on separate ports
+    // -----------------------------------------------------------------------
+    let flight_addr = config.flight_addr;
+    let flight_node = raft_node.clone();
+    tokio::spawn(async move {
+        info!(%flight_addr, "starting Flight SQL gRPC server");
+        if let Err(e) = serve_flight(flight_node, flight_addr).await {
+            tracing::error!(error = %e, "Flight SQL server failed");
+        }
+    });
+
+    // -----------------------------------------------------------------------
+    // 5. Start unified HTTP server
+    // -----------------------------------------------------------------------
     info!(addr = %config.http_addr, "starting bisque unified HTTP server");
 
     let listener = tokio::net::TcpListener::bind(config.http_addr).await?;
@@ -203,12 +372,13 @@ async fn login(
         .filter_map(|m| state.meta_engine.get_account(m.account_id))
         .collect();
 
-    // Build scopes from memberships
+    // Build scopes from memberships.
+    // C1: Members get CatalogRead("*") — NOT AccountAdmin.
     let scopes: Vec<Scope> = memberships
         .iter()
         .map(|m| match m.role {
             bisque_meta::types::AccountRole::Admin => Scope::AccountAdmin(m.account_id),
-            bisque_meta::types::AccountRole::Member => Scope::AccountAdmin(m.account_id),
+            bisque_meta::types::AccountRole::Member => Scope::CatalogRead("*".into()),
         })
         .collect();
 

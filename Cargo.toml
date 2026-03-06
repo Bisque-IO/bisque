@@ -13,6 +13,7 @@ members = [
     # "crates/macros",
     "crates/maniac",
     "crates/raft",           # maniac-raft: OpenRaft adapter for Maniac runtime
+    "crates/protocol",       # bisque-protocol: Shared WebSocket protocol types
     "crates/lance",          # bisque-lance: Distributed search & analytics storage engine
     "crates/meta",           # bisque-meta: Multi-tenant control plane
     "crates/bisque",         # bisque: Unified server with auth middleware
@@ -185,6 +186,7 @@ zstd = "0.13"
 # maniac-allocator = { path = "crates/maniac-allocator", version = "0.1.0", default-features = false }
 # maniac-sys = { path = "crates/maniac-sys", version = "0.1.0" }
 # maniac-usockets = { path = "crates/maniac-usockets", version = "0.1.0", default-features = false }
+bisque-protocol = { path = "crates/protocol", version = "0.1.0" }
 bisque-raft = { path = "crates/raft", version = "0.1.0" }
 maniac = { path = "crates/bisque-runtime", version = "0.1.0" }
 # maniac = { path = "crates/maniac", version = "0.1.0" }

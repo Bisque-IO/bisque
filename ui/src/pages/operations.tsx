@@ -1,6 +1,7 @@
-import { useEffect, useState, useCallback, useRef } from "react"
-import { operationsApi, MOCK, type Operation, type OpType, type OpTier, type OpStatus } from "@/lib/api"
-import { useClusterStore } from "@/stores/cluster"
+import { useCallback, useState } from "react"
+import { MOCK, type OpType, type OpTier, type OpStatus } from "@/lib/api"
+import { wsClient } from "@/lib/ws"
+import { useOperationsStore } from "@/stores/operations"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -86,103 +87,45 @@ function formatTime(iso?: string): string {
 }
 
 export function OperationsPage() {
-  const [operations, setOperations] = useState<Operation[]>([])
+  // Operations are populated via the unified WebSocket (OperationsSnapshot + OperationUpdate push).
+  const operations = useOperationsStore((s) => s.operations)
   const [filterType, setFilterType] = useState<string>("all")
   const [filterTier, setFilterTier] = useState<string>("all")
   const [filterStatus, setFilterStatus] = useState<string>("all")
-  const [loading, setLoading] = useState(true)
-  const wsRef = useRef<WebSocket | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
 
-  const fetchOps = useCallback(async () => {
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true)
     try {
-      const params: { type?: OpType; tier?: OpTier; status?: OpStatus } = {}
-      if (filterType !== "all") params.type = filterType as OpType
-      if (filterTier !== "all") params.tier = filterTier as OpTier
-      if (filterStatus !== "all") params.status = filterStatus as OpStatus
-      const ops = await operationsApi.list(params)
-      setOperations(ops)
+      if (!MOCK && wsClient.connected) {
+        const ops = await wsClient.listOperations({
+          type: filterType !== "all" ? filterType : undefined,
+          tier: filterTier !== "all" ? filterTier : undefined,
+          status: filterStatus !== "all" ? filterStatus : undefined,
+        })
+        useOperationsStore.getState().setOperations(ops)
+      }
     } catch {
       // ignore
     } finally {
-      setLoading(false)
+      setRefreshing(false)
     }
   }, [filterType, filterTier, filterStatus])
 
-  // Initial fetch
-  useEffect(() => {
-    fetchOps()
-  }, [fetchOps])
-
-  // WebSocket for real-time updates (real mode only)
-  useEffect(() => {
-    if (MOCK) {
-      const interval = setInterval(fetchOps, 2000)
-      return () => clearInterval(interval)
-    }
-
-    const cluster = useClusterStore.getState().activeCluster
-    const baseUrl = cluster.url || window.location.origin
-    const wsUrl = baseUrl.replace(/^http/, "ws") + "/_bisque/v1/operations/ws"
-
-    let ws: WebSocket
-    let reconnectTimer: ReturnType<typeof setTimeout>
-
-    function connect() {
-      ws = new WebSocket(wsUrl)
-      wsRef.current = ws
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data)
-          if (Array.isArray(data)) {
-            setOperations(data)
-          } else {
-            setOperations((prev) => {
-              const idx = prev.findIndex((o) => o.id === data.id)
-              if (idx >= 0) {
-                const next = [...prev]
-                next[idx] = data
-                return next
-              }
-              return [data, ...prev]
-            })
-          }
-        } catch {
-          // ignore parse errors
-        }
-      }
-
-      ws.onclose = () => {
-        reconnectTimer = setTimeout(connect, 3000)
-      }
-
-      ws.onerror = () => {
-        ws.close()
-      }
-    }
-
-    connect()
-
-    return () => {
-      clearTimeout(reconnectTimer)
-      if (wsRef.current) {
-        wsRef.current.close()
-        wsRef.current = null
-      }
-    }
-  }, [fetchOps])
-
   const handleCancel = async (opId: string) => {
     try {
-      await operationsApi.cancel(opId)
+      if (MOCK) {
+        toast.success("Operation cancelled")
+        return
+      }
+      await wsClient.cancelOperation(opId)
       toast.success("Operation cancelled")
-      fetchOps()
     } catch {
       toast.error("Failed to cancel operation")
     }
   }
 
-  // Apply client-side filters (WebSocket delivers all ops)
+  // Apply client-side filters (WS push delivers all ops)
   const filtered = operations.filter((op) => {
     if (filterType !== "all" && op.op_type !== filterType) return false
     if (filterTier !== "all" && op.tier !== filterTier) return false
@@ -256,8 +199,8 @@ export function OperationsPage() {
               <SelectItem value="cancelled">Cancelled</SelectItem>
             </SelectContent>
           </Select>
-          <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={fetchOps} disabled={loading}>
-            <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+          <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={handleRefresh} disabled={refreshing}>
+            <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} />
           </Button>
         </div>
       </div>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react"
 import { useParams } from "react-router"
-import { s3Api, type TableIndex } from "@/lib/api"
+import { s3Api, MOCK, type TableIndex } from "@/lib/api"
+import { wsClient } from "@/lib/ws"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -71,7 +72,9 @@ export function TableDetailPage() {
     if (!catalogName || !tableName) return
     setReindexing(true)
     try {
-      const result = await s3Api.reindexTable(catalogName, tableName)
+      const result = MOCK
+        ? await s3Api.reindexTable(catalogName, tableName)
+        : await wsClient.submitReindex(catalogName, tableName)
       toast.success(result.message)
     } catch {
       toast.error("Reindex failed")
