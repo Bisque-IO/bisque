@@ -8,9 +8,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bisque::ServerHandle;
 use bisque::config::BisqueConfig;
 use bisque::server;
-use bisque::ServerHandle;
 use bisque_meta::engine::MetaEngine;
 use bisque_meta::token::{self, TokenClaims, TokenManager};
 use bisque_meta::types::{AccountRole, Scope, TenantLimits};
@@ -99,7 +99,11 @@ impl TestServer {
 
         // Wait for health check
         for _ in 0..100 {
-            if let Ok(resp) = client.get(format!("{base_url}/_bisque/health")).send().await {
+            if let Ok(resp) = client
+                .get(format!("{base_url}/_bisque/health"))
+                .send()
+                .await
+            {
                 if resp.status().is_success() {
                     break;
                 }
@@ -305,11 +309,7 @@ impl WsClient {
 
     /// Connect but expect the connection to close (e.g., bad auth or wrong version).
     /// Returns the close reason if a Close message was received, or the raw ServerMessage.
-    async fn connect_expect_close(
-        addr: SocketAddr,
-        token: &str,
-        protocol_version: u8,
-    ) -> String {
+    async fn connect_expect_close(addr: SocketAddr, token: &str, protocol_version: u8) -> String {
         let tcp = tokio::net::TcpStream::connect(addr)
             .await
             .expect("TCP connect");
@@ -399,11 +399,8 @@ impl WsClient {
     }
 
     async fn request(&mut self, request_id: u32, method: RequestMethod) -> ResponseResult {
-        self.send(&ClientMessage::Request {
-            request_id,
-            method,
-        })
-        .await;
+        self.send(&ClientMessage::Request { request_id, method })
+            .await;
 
         // Read messages until we get a Response with matching request_id
         loop {
@@ -411,7 +408,10 @@ impl WsClient {
                 .await
                 .expect("timeout waiting for response");
             match msg {
-                ServerMessage::Response { request_id: rid, result } if rid == request_id => {
+                ServerMessage::Response {
+                    request_id: rid,
+                    result,
+                } if rid == request_id => {
                     return result;
                 }
                 ServerMessage::Heartbeat { .. }
@@ -517,10 +517,7 @@ async fn test_revoked_api_key_returns_401() {
 
     // Works before revocation
     let resp = server
-        .get_with_token(
-            &format!("/_bisque/v1/tenants/{}", server.tenant_id),
-            &token,
-        )
+        .get_with_token(&format!("/_bisque/v1/tenants/{}", server.tenant_id), &token)
         .await;
     assert_eq!(resp.status(), 200);
 
@@ -529,10 +526,7 @@ async fn test_revoked_api_key_returns_401() {
 
     // Fails after revocation
     let resp = server
-        .get_with_token(
-            &format!("/_bisque/v1/tenants/{}", server.tenant_id),
-            &token,
-        )
+        .get_with_token(&format!("/_bisque/v1/tenants/{}", server.tenant_id), &token)
         .await;
     assert_eq!(resp.status(), 401);
     server.shutdown().await;
@@ -851,10 +845,7 @@ async fn test_revoked_key_token_rejected() {
 
     // Token should be rejected
     let resp = server
-        .get_with_token(
-            &format!("/_bisque/v1/tenants/{}", server.tenant_id),
-            &token,
-        )
+        .get_with_token(&format!("/_bisque/v1/tenants/{}", server.tenant_id), &token)
         .await;
     assert_eq!(resp.status(), 401);
     server.shutdown().await;
@@ -931,12 +922,8 @@ async fn test_ws_handshake() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ws_handshake_invalid_token() {
     let server = TestServer::start().await;
-    let reason = WsClient::connect_expect_close(
-        server.http_addr,
-        "bad-token",
-        WS_PROTOCOL_VERSION,
-    )
-    .await;
+    let reason =
+        WsClient::connect_expect_close(server.http_addr, "bad-token", WS_PROTOCOL_VERSION).await;
     assert!(
         reason.contains("invalid")
             || reason.contains("expired")
@@ -1141,10 +1128,7 @@ async fn test_ws_create_api_key() {
 
             // Verify the issued token actually works
             let resp = server
-                .get_with_token(
-                    &format!("/_bisque/v1/tenants/{}", server.tenant_id),
-                    &token,
-                )
+                .get_with_token(&format!("/_bisque/v1/tenants/{}", server.tenant_id), &token)
                 .await;
             assert_eq!(resp.status(), 200);
         }
@@ -1280,7 +1264,7 @@ async fn test_ws_receives_catalog_events() {
 
     // Write data via S3 PUT to trigger a catalog event through Raft.
     // First, create a table via the raft node.
-        use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     let schema = Schema::new(vec![

@@ -739,10 +739,18 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
         for req in seal_requests {
             if let Some(ref file) = req.segment.file {
                 if let Err(e) = file.sync_data() {
-                    tracing::error!(segment_id = req.segment.segment_id, "seal fsync failed: {}", e);
+                    tracing::error!(
+                        segment_id = req.segment.segment_id,
+                        "seal fsync failed: {}",
+                        e
+                    );
                 }
                 if let Err(e) = file.set_len(req.valid_bytes) {
-                    tracing::error!(segment_id = req.segment.segment_id, "seal truncate failed: {}", e);
+                    tracing::error!(
+                        segment_id = req.segment.segment_id,
+                        "seal truncate failed: {}",
+                        e
+                    );
                 }
             }
 
@@ -7564,8 +7572,7 @@ mod tests {
     fn test_fsync_error_propagation() {
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            let config = MmapStorageConfig::new(tmp.path())
-                .with_fsync_delay(Duration::ZERO);
+            let config = MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::ZERO);
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
             let mut log = storage.get_log_storage(0).await.unwrap();
 
@@ -7615,8 +7622,8 @@ mod tests {
     fn test_fsync_coalescing_count() {
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            let config = MmapStorageConfig::new(tmp.path())
-                .with_fsync_delay(Duration::from_millis(50));
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_millis(50));
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
             let mut log = storage.get_log_storage(0).await.unwrap();
 
@@ -7634,10 +7641,7 @@ mod tests {
                 rx.await.unwrap().unwrap();
             }
 
-            let sync_count = storage
-                .fsync_state
-                .sync_count
-                .load(Ordering::Relaxed);
+            let sync_count = storage.fsync_state.sync_count.load(Ordering::Relaxed);
 
             assert!(
                 sync_count >= 1,
@@ -7658,8 +7662,7 @@ mod tests {
     fn test_push_after_stop_fires_error() {
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            let config = MmapStorageConfig::new(tmp.path())
-                .with_fsync_delay(Duration::ZERO);
+            let config = MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::ZERO);
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
 
             // Write one entry to confirm normal operation
@@ -7697,8 +7700,7 @@ mod tests {
     fn test_fsync_push_during_processing() {
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            let config = MmapStorageConfig::new(tmp.path())
-                .with_fsync_delay(Duration::ZERO);
+            let config = MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::ZERO);
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
             let mut log = storage.get_log_storage(0).await.unwrap();
 

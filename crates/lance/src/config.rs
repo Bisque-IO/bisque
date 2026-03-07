@@ -595,33 +595,27 @@ mod tests {
 
     #[test]
     fn bisque_lance_config_with_seal_max_age() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_seal_max_age(Duration::from_secs(300));
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_seal_max_age(Duration::from_secs(300));
         assert_eq!(cfg.seal_max_age, Duration::from_secs(300));
     }
 
     #[test]
     fn bisque_lance_config_with_seal_max_size() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_seal_max_size(512 * 1024);
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_seal_max_size(512 * 1024);
         assert_eq!(cfg.seal_max_size, 512 * 1024);
     }
 
     #[test]
     fn bisque_lance_config_with_schema() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_schema(schema.clone());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_schema(schema.clone());
         assert!(cfg.schema.is_some());
         assert_eq!(cfg.schema.unwrap().fields().len(), 1);
     }
 
     #[test]
     fn bisque_lance_config_with_s3_uri() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_s3_uri("s3://my-bucket/prefix");
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_s3_uri("s3://my-bucket/prefix");
         assert_eq!(cfg.s3_uri, Some("s3://my-bucket/prefix".to_string()));
     }
 
@@ -629,8 +623,7 @@ mod tests {
     fn bisque_lance_config_with_s3_storage_options() {
         let mut opts = HashMap::new();
         opts.insert("region".to_string(), "us-east-1".to_string());
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_s3_storage_options(opts);
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_s3_storage_options(opts);
         assert_eq!(cfg.s3_storage_options.get("region").unwrap(), "us-east-1");
     }
 
@@ -646,15 +639,13 @@ mod tests {
 
     #[test]
     fn bisque_lance_config_with_s3_max_rows_per_file() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_s3_max_rows_per_file(1_000_000);
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_s3_max_rows_per_file(1_000_000);
         assert_eq!(cfg.s3_max_rows_per_file, 1_000_000);
     }
 
     #[test]
     fn bisque_lance_config_with_s3_max_rows_per_group() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_s3_max_rows_per_group(10_000);
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_s3_max_rows_per_group(10_000);
         assert_eq!(cfg.s3_max_rows_per_group, 10_000);
     }
 
@@ -669,36 +660,32 @@ mod tests {
     #[test]
     fn bisque_lance_config_with_seal_indices() {
         let indices = vec![IndexSpec::fts("text"), IndexSpec::vector("emb")];
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_seal_indices(indices);
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_seal_indices(indices);
         assert_eq!(cfg.seal_indices.len(), 2);
     }
 
     #[test]
     fn bisque_lance_config_with_compaction_target_rows() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_compaction_target_rows_per_fragment(500_000);
+        let cfg =
+            BisqueLanceConfig::new("/tmp/data").with_compaction_target_rows_per_fragment(500_000);
         assert_eq!(cfg.compaction_target_rows_per_fragment, 500_000);
     }
 
     #[test]
     fn bisque_lance_config_with_compaction_materialize_deletions() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_compaction_materialize_deletions(false);
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_compaction_materialize_deletions(false);
         assert!(!cfg.compaction_materialize_deletions);
     }
 
     #[test]
     fn bisque_lance_config_with_compaction_deletion_threshold() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_compaction_deletion_threshold(0.5);
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_compaction_deletion_threshold(0.5);
         assert!((cfg.compaction_deletion_threshold - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]
     fn bisque_lance_config_with_compaction_min_fragments() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_compaction_min_fragments(8);
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_compaction_min_fragments(8);
         assert_eq!(cfg.compaction_min_fragments, 8);
     }
 
@@ -725,8 +712,7 @@ mod tests {
 
     #[test]
     fn bisque_lance_config_has_s3_true_with_uri() {
-        let cfg = BisqueLanceConfig::new("/tmp/data")
-            .with_s3_uri("s3://bucket/path");
+        let cfg = BisqueLanceConfig::new("/tmp/data").with_s3_uri("s3://bucket/path");
         assert!(cfg.has_s3());
     }
 
@@ -777,11 +763,8 @@ mod tests {
 
     #[test]
     fn bisque_lance_config_build_table_config_with_s3_overrides() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
-        let cfg = BisqueLanceConfig::new("/data")
-            .with_s3_uri("s3://default-bucket");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let cfg = BisqueLanceConfig::new("/data").with_s3_uri("s3://default-bucket");
 
         let tc = cfg.build_table_config_with_s3("logs", schema, "s3://override-bucket/logs");
 
@@ -855,7 +838,10 @@ mod tests {
         assert!(paths.iter().any(|p| p.contains("manifest.json")));
 
         // Verify sizes
-        let lance_entry = manifest.iter().find(|e| e.relative_path.contains("0.lance")).unwrap();
+        let lance_entry = manifest
+            .iter()
+            .find(|e| e.relative_path.contains("0.lance"))
+            .unwrap();
         assert_eq!(lance_entry.size, 14); // b"fake data 1234".len()
     }
 
@@ -867,7 +853,9 @@ mod tests {
         // Create a table directory without a segments/ subdirectory
         let table_dir = tmp.path().join("tables").join("no_segments_table");
         tokio::fs::create_dir_all(&table_dir).await.unwrap();
-        tokio::fs::write(table_dir.join("metadata.json"), b"{}").await.unwrap();
+        tokio::fs::write(table_dir.join("metadata.json"), b"{}")
+            .await
+            .unwrap();
 
         let manifest = cfg.build_file_manifest().await.unwrap();
         assert!(manifest.is_empty());
@@ -878,9 +866,7 @@ mod tests {
     // =========================================================================
 
     fn make_test_table_config(name: &str) -> TableOpenConfig {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let cfg = BisqueLanceConfig::new("/data/lance");
         cfg.build_table_config(name, schema)
     }
@@ -924,11 +910,8 @@ mod tests {
 
     #[test]
     fn table_open_config_has_s3_true() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
-        let cfg = BisqueLanceConfig::new("/data")
-            .with_s3_uri("s3://bucket");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let cfg = BisqueLanceConfig::new("/data").with_s3_uri("s3://bucket");
         let tc = cfg.build_table_config("t", schema);
         assert!(tc.has_s3());
     }
@@ -939,9 +922,7 @@ mod tests {
 
     #[test]
     fn table_open_config_compaction_options() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let cfg = BisqueLanceConfig::new("/data")
             .with_compaction_target_rows_per_fragment(750_000)
             .with_compaction_materialize_deletions(true)
@@ -1002,11 +983,17 @@ mod tests {
         );
 
         assert_eq!(restored.name, "roundtrip_table");
-        assert_eq!(restored.table_data_dir, cfg.table_data_dir("roundtrip_table"));
+        assert_eq!(
+            restored.table_data_dir,
+            cfg.table_data_dir("roundtrip_table")
+        );
         assert_eq!(restored.seal_max_age, Duration::from_secs(180));
         assert_eq!(restored.seal_max_size, 4096);
         assert_eq!(restored.s3_uri, Some("s3://bucket/prefix".to_string()));
-        assert_eq!(restored.s3_storage_options.get("region").unwrap(), "eu-west-1");
+        assert_eq!(
+            restored.s3_storage_options.get("region").unwrap(),
+            "eu-west-1"
+        );
         assert_eq!(restored.s3_max_rows_per_file, 200_000);
         assert_eq!(restored.s3_max_rows_per_group, 5_000);
         assert_eq!(restored.seal_indices.len(), 2);
@@ -1063,8 +1050,14 @@ mod tests {
         );
 
         // s3_storage_options should come from engine_config
-        assert_eq!(restored.s3_storage_options.get("access_key").unwrap(), "AKID123");
-        assert_eq!(restored.s3_storage_options.get("secret_key").unwrap(), "SECRET");
+        assert_eq!(
+            restored.s3_storage_options.get("access_key").unwrap(),
+            "AKID123"
+        );
+        assert_eq!(
+            restored.s3_storage_options.get("secret_key").unwrap(),
+            "SECRET"
+        );
 
         // When schema is None, from_persisted provides a placeholder schema
         let schema = restored.schema.unwrap();
@@ -1108,20 +1101,24 @@ mod tests {
             ..PersistedTableConfig::default()
         };
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("col_a", DataType::Int32, false),
-        ]));
-        let restored = TableOpenConfig::from_persisted(
-            "filter_test",
-            &persisted,
-            Some(schema),
-            &engine_cfg,
-        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col_a",
+            DataType::Int32,
+            false,
+        )]));
+        let restored =
+            TableOpenConfig::from_persisted("filter_test", &persisted, Some(schema), &engine_cfg);
 
         // "BadType" should be filtered out, leaving 2 valid indices
         assert_eq!(restored.seal_indices.len(), 2);
-        assert!(matches!(restored.seal_indices[0].index_type, IndexType::BTree));
-        assert!(matches!(restored.seal_indices[1].index_type, IndexType::Inverted));
+        assert!(matches!(
+            restored.seal_indices[0].index_type,
+            IndexType::BTree
+        ));
+        assert!(matches!(
+            restored.seal_indices[1].index_type,
+            IndexType::Inverted
+        ));
     }
 
     // =========================================================================

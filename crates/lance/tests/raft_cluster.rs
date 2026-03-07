@@ -28,8 +28,8 @@ use futures::StreamExt;
 use openraft::async_runtime::watch::WatchReceiver;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
 use prost::Message;
 use tokio::sync::broadcast;
@@ -117,9 +117,21 @@ impl TestCluster {
         let raft_dir3 = tempfile::tempdir().unwrap();
 
         // Engines
-        let engine1 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path())).await.unwrap());
-        let engine2 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path())).await.unwrap());
-        let engine3 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path())).await.unwrap());
+        let engine1 = Arc::new(
+            BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path()))
+                .await
+                .unwrap(),
+        );
+        let engine2 = Arc::new(
+            BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path()))
+                .await
+                .unwrap(),
+        );
+        let engine3 = Arc::new(
+            BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path()))
+                .await
+                .unwrap(),
+        );
 
         // Catalog event buses
         let bus1 = Arc::new(CatalogEventBus::new(0));
@@ -210,15 +222,21 @@ impl TestCluster {
 
         tokio::spawn({
             let s = server1.clone();
-            async move { let _ = s.serve().await; }
+            async move {
+                let _ = s.serve().await;
+            }
         });
         tokio::spawn({
             let s = server2.clone();
-            async move { let _ = s.serve().await; }
+            async move {
+                let _ = s.serve().await;
+            }
         });
         tokio::spawn({
             let s = server3.clone();
-            async move { let _ = s.serve().await; }
+            async move {
+                let _ = s.serve().await;
+            }
         });
 
         // Give servers time to bind
@@ -251,10 +269,7 @@ impl TestCluster {
             .add_group(0, 2, raft_cfg.clone(), sm2)
             .await
             .unwrap();
-        let _raft3 = manager3
-            .add_group(0, 3, raft_cfg, sm3)
-            .await
-            .unwrap();
+        let _raft3 = manager3.add_group(0, 3, raft_cfg, sm3).await.unwrap();
 
         // Initialize from node 1
         tokio::time::timeout(Duration::from_secs(5), raft1.initialize(members))
@@ -317,7 +332,9 @@ impl TestCluster {
             pins2,
             pins3,
             flight_addr: None,
-            _dirs: vec![lance_dir1, lance_dir2, lance_dir3, raft_dir1, raft_dir2, raft_dir3],
+            _dirs: vec![
+                lance_dir1, lance_dir2, lance_dir3, raft_dir1, raft_dir2, raft_dir3,
+            ],
         }
     }
 
@@ -452,7 +469,6 @@ async fn test_create_table_emits_table_created_event() {
         }
         other => panic!("expected TableCreated, got {:?}", other),
     }
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -503,7 +519,6 @@ async fn test_drop_table_emits_table_dropped_event() {
         }
         other => panic!("expected TableDropped, got {:?}", other),
     }
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -519,7 +534,6 @@ async fn test_create_duplicate_table_returns_error() {
     // Second create should fail
     let result = cluster.leader().create_table("t1", &test_schema()).await;
     assert!(result.is_err(), "duplicate create should fail");
-
 }
 
 // =============================================================================
@@ -539,7 +553,10 @@ async fn test_write_records_replicates_to_follower() {
 
     let write = cluster
         .leader()
-        .write_records("t1", &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])])
+        .write_records(
+            "t1",
+            &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])],
+        )
         .await
         .unwrap();
     cluster.wait_for_replication(write.log_index).await;
@@ -585,7 +602,6 @@ async fn test_write_records_emits_active_version_bumped() {
         }
         other => panic!("expected ActiveVersionBumped, got {:?}", other),
     }
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -610,7 +626,6 @@ async fn test_write_records_returns_log_index() {
         "response should be Ok, got {:?}",
         result.response
     );
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -654,7 +669,6 @@ async fn test_write_to_nonexistent_table_returns_error() {
         .await;
 
     assert!(result.is_err(), "write to nonexistent table should fail");
-
 }
 
 // =============================================================================
@@ -672,7 +686,10 @@ async fn test_delete_replicates_to_follower() {
         .unwrap();
     let write = cluster
         .leader()
-        .write_records("t1", &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])])
+        .write_records(
+            "t1",
+            &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])],
+        )
         .await
         .unwrap();
     cluster.wait_for_replication(write.log_index).await;
@@ -691,7 +708,10 @@ async fn test_delete_replicates_to_follower() {
 
     assert_eq!(leader_rows, 3, "leader should have 3 rows after delete");
     assert_eq!(follower_rows, 3, "follower should have 3 rows after delete");
-    assert_eq!(follower2_rows, 3, "follower2 should have 3 rows after delete");
+    assert_eq!(
+        follower2_rows, 3,
+        "follower2 should have 3 rows after delete"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -705,7 +725,10 @@ async fn test_delete_returns_rows_affected() {
         .unwrap();
     cluster
         .leader()
-        .write_records("t1", &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])])
+        .write_records(
+            "t1",
+            &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])],
+        )
         .await
         .unwrap();
 
@@ -720,7 +743,6 @@ async fn test_delete_returns_rows_affected() {
         other => panic!("expected RowsAffected, got {:?}", other),
     }
     assert!(result.log_index > 0);
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -763,7 +785,6 @@ async fn test_delete_emits_data_mutated_event() {
         }
         other => panic!("expected DataMutated, got {:?}", other),
     }
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -791,7 +812,6 @@ async fn test_delete_error_does_not_emit_event() {
         rx.try_recv().is_err(),
         "should not receive DataMutated on error"
     );
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -819,7 +839,6 @@ async fn test_delete_no_matching_rows_returns_zero() {
         LanceResponse::RowsAffected(n) => assert_eq!(n, 0),
         other => panic!("expected RowsAffected(0), got {:?}", other),
     }
-
 }
 
 // =============================================================================
@@ -858,7 +877,10 @@ async fn test_update_replicates_to_follower() {
 
     assert_eq!(leader_rows, 3, "leader should have 3 rows after update");
     assert_eq!(follower_rows, 3, "follower should have 3 rows after update");
-    assert_eq!(follower2_rows, 3, "follower2 should have 3 rows after update");
+    assert_eq!(
+        follower2_rows, 3,
+        "follower2 should have 3 rows after update"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -886,7 +908,6 @@ async fn test_update_returns_rows_affected() {
         LanceResponse::RowsAffected(n) => assert_eq!(n, 1, "should affect 1 row"),
         other => panic!("expected RowsAffected, got {:?}", other),
     }
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -924,7 +945,6 @@ async fn test_update_emits_data_mutated_event() {
         }
         other => panic!("expected DataMutated, got {:?}", other),
     }
-
 }
 
 // =============================================================================
@@ -963,7 +983,10 @@ async fn test_seal_replicates_to_follower() {
     cluster.wait_for_replication(seal_result.log_index).await;
 
     // Verify both followers have sealed segment
-    for (name, engine) in [("follower", cluster.follower_engine()), ("follower2", cluster.follower2_engine())] {
+    for (name, engine) in [
+        ("follower", cluster.follower_engine()),
+        ("follower2", cluster.follower2_engine()),
+    ] {
         let follower_table = engine.require_table("t1").unwrap();
         let follower_cat = follower_table.catalog();
         assert!(
@@ -1025,7 +1048,6 @@ async fn test_seal_emits_segment_sealed_event() {
         }
         other => panic!("expected SegmentSealed, got {:?}", other),
     }
-
 }
 
 // =============================================================================
@@ -1070,7 +1092,6 @@ async fn test_flight_sql_query_returns_data() {
         total_rows += batch.unwrap().num_rows();
     }
     assert_eq!(total_rows, 3, "query should return 3 rows");
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1143,7 +1164,10 @@ async fn test_flight_sql_update_routes_through_raft() {
     let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
 
     let affected = client
-        .execute_update("UPDATE t1 SET name = 'updated' WHERE id = 2".to_string(), None)
+        .execute_update(
+            "UPDATE t1 SET name = 'updated' WHERE id = 2".to_string(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -1195,8 +1219,11 @@ async fn test_flight_sql_get_tables_returns_metadata() {
     while let Some(batch) = stream.next().await {
         total_rows += batch.unwrap().num_rows();
     }
-    assert!(total_rows >= 2, "should have at least 2 tables, got {}", total_rows);
-
+    assert!(
+        total_rows >= 2,
+        "should have at least 2 tables, got {}",
+        total_rows
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1290,7 +1317,10 @@ async fn test_write_delete_write_consistency() {
     // Write 5 rows
     cluster
         .leader()
-        .write_records("t1", &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])])
+        .write_records(
+            "t1",
+            &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])],
+        )
         .await
         .unwrap();
 
@@ -1376,10 +1406,7 @@ async fn test_create_multiple_tables_isolation() {
 async fn test_follower_rejects_writes() {
     let cluster = TestCluster::new().await;
 
-    let result = cluster
-        .follower()
-        .create_table("t1", &test_schema())
-        .await;
+    let result = cluster.follower().create_table("t1", &test_schema()).await;
 
     match result {
         Err(bisque_lance::WriteError::NotLeader { .. }) => {} // expected
@@ -1387,10 +1414,7 @@ async fn test_follower_rejects_writes() {
         Ok(_) => panic!("follower should not accept writes"),
     }
 
-    let result2 = cluster
-        .follower2()
-        .create_table("t1", &test_schema())
-        .await;
+    let result2 = cluster.follower2().create_table("t1", &test_schema()).await;
 
     match result2 {
         Err(bisque_lance::WriteError::NotLeader { .. }) => {} // expected
@@ -1407,7 +1431,11 @@ async fn test_follower_rejects_writes() {
 async fn test_begin_flush_replicates_to_followers() {
     let cluster = TestCluster::new().await;
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     let write = cluster
         .leader()
         .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
@@ -1458,7 +1486,11 @@ async fn test_promote_to_deep_storage_replicates_and_emits_event() {
     let cluster = TestCluster::new().await;
     let mut rx = cluster.leader_bus().subscribe();
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster
         .leader()
         .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
@@ -1521,8 +1553,14 @@ async fn test_promote_to_deep_storage_replicates_and_emits_event() {
     ] {
         let t = engine.require_table("t1").unwrap();
         let c = t.catalog();
-        assert_eq!(c.sealed_segment, None, "{name} sealed should be None after promote");
-        assert_eq!(c.s3_manifest_version, 42, "{name} s3_manifest_version should be 42");
+        assert_eq!(
+            c.sealed_segment, None,
+            "{name} sealed should be None after promote"
+        );
+        assert_eq!(
+            c.s3_manifest_version, 42,
+            "{name} s3_manifest_version should be 42"
+        );
     }
 }
 
@@ -1641,8 +1679,16 @@ async fn test_expire_session_releases_all_pins() {
         ("follower", cluster.follower_pins()),
         ("follower2", cluster.follower2_pins()),
     ] {
-        assert_eq!(pins.pin_count(), 0, "{name} should have 0 pins after expire");
-        assert_eq!(pins.session_count(), 0, "{name} should have 0 sessions after expire");
+        assert_eq!(
+            pins.pin_count(),
+            0,
+            "{name} should have 0 pins after expire"
+        );
+        assert_eq!(
+            pins.session_count(),
+            0,
+            "{name} should have 0 sessions after expire"
+        );
     }
 }
 
@@ -1655,10 +1701,17 @@ async fn test_flight_delete_records_action() {
     let mut cluster = TestCluster::new().await;
     let addr = cluster.start_flight_server().await;
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     let write = cluster
         .leader()
-        .write_records("t1", &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])])
+        .write_records(
+            "t1",
+            &[test_batch(&[1, 2, 3, 4, 5], &["a", "b", "c", "d", "e"])],
+        )
         .await
         .unwrap();
     cluster.wait_for_replication(write.log_index).await;
@@ -1703,7 +1756,11 @@ async fn test_flight_update_records_action() {
     let mut cluster = TestCluster::new().await;
     let addr = cluster.start_flight_server().await;
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     let write = cluster
         .leader()
         .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
@@ -1761,7 +1818,11 @@ async fn test_flight_sql_ingest_routes_through_raft() {
     let mut cluster = TestCluster::new().await;
     let addr = cluster.start_flight_server().await;
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))
         .unwrap()
@@ -1813,7 +1874,11 @@ async fn test_flight_sql_prepared_statement_flow() {
     let mut cluster = TestCluster::new().await;
     let addr = cluster.start_flight_server().await;
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster
         .leader()
         .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
@@ -1863,10 +1928,7 @@ async fn test_flight_sql_get_catalogs() {
         .unwrap();
     let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
 
-    let flight_info = client
-        .get_catalogs()
-        .await
-        .unwrap();
+    let flight_info = client.get_catalogs().await.unwrap();
     let ticket = flight_info.endpoint[0].ticket.as_ref().unwrap();
     let mut stream = client.do_get(ticket.clone()).await.unwrap();
     let mut total_rows = 0usize;
@@ -1913,10 +1975,7 @@ async fn test_flight_sql_get_table_types() {
         .unwrap();
     let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
 
-    let flight_info = client
-        .get_table_types()
-        .await
-        .unwrap();
+    let flight_info = client.get_table_types().await.unwrap();
     let ticket = flight_info.endpoint[0].ticket.as_ref().unwrap();
     let mut stream = client.do_get(ticket.clone()).await.unwrap();
     let mut total_rows = 0usize;
@@ -1938,10 +1997,7 @@ async fn test_flight_sql_get_sql_info() {
         .unwrap();
     let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
 
-    let flight_info = client
-        .get_sql_info(vec![])
-        .await
-        .unwrap();
+    let flight_info = client.get_sql_info(vec![]).await.unwrap();
     let ticket = flight_info.endpoint[0].ticket.as_ref().unwrap();
     let mut stream = client.do_get(ticket.clone()).await.unwrap();
     let mut total_rows = 0usize;
@@ -1989,7 +2045,11 @@ async fn test_update_nonexistent_table_returns_error() {
 async fn test_update_with_invalid_filter_returns_error() {
     let cluster = TestCluster::new().await;
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster
         .leader()
         .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
@@ -2022,7 +2082,11 @@ async fn test_update_with_invalid_filter_returns_error() {
 async fn test_concurrent_writes_all_succeed() {
     let cluster = TestCluster::new().await;
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
 
     // Fire 10 concurrent writes
     let mut handles = Vec::new();
@@ -2058,7 +2122,11 @@ async fn test_concurrent_writes_all_succeed() {
 async fn test_large_batch_replicates_correctly() {
     let cluster = TestCluster::new().await;
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
 
     // Write 1000 rows in a single batch
     let ids: Vec<i64> = (1..=1000).collect();
@@ -2099,17 +2167,33 @@ async fn test_flight_sql_list_actions() {
     }
 
     // Verify all custom actions are advertised
-    assert!(action_types.contains(&"create_table".to_string()), "should advertise create_table");
-    assert!(action_types.contains(&"drop_table".to_string()), "should advertise drop_table");
-    assert!(action_types.contains(&"delete_records".to_string()), "should advertise delete_records");
-    assert!(action_types.contains(&"update_records".to_string()), "should advertise update_records");
+    assert!(
+        action_types.contains(&"create_table".to_string()),
+        "should advertise create_table"
+    );
+    assert!(
+        action_types.contains(&"drop_table".to_string()),
+        "should advertise drop_table"
+    );
+    assert!(
+        action_types.contains(&"delete_records".to_string()),
+        "should advertise delete_records"
+    );
+    assert!(
+        action_types.contains(&"update_records".to_string()),
+        "should advertise update_records"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_full_segment_lifecycle_seal_flush_promote() {
     let cluster = TestCluster::new().await;
 
-    cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     let write = cluster
         .leader()
         .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
@@ -2131,7 +2215,11 @@ async fn test_full_segment_lifecycle_seal_flush_promote() {
     cluster.wait_for_replication(s.log_index).await;
 
     // Verify sealed on all nodes
-    for engine in [cluster.leader_engine(), cluster.follower_engine(), cluster.follower2_engine()] {
+    for engine in [
+        cluster.leader_engine(),
+        cluster.follower_engine(),
+        cluster.follower2_engine(),
+    ] {
         let c = engine.require_table("t1").unwrap().catalog();
         assert_eq!(c.sealed_segment, Some(active_seg));
         assert_eq!(c.active_segment, active_seg + 1);
@@ -2145,7 +2233,11 @@ async fn test_full_segment_lifecycle_seal_flush_promote() {
     let f = cluster.leader().propose(flush).await.unwrap();
     cluster.wait_for_replication(f.log_index).await;
 
-    for engine in [cluster.leader_engine(), cluster.follower_engine(), cluster.follower2_engine()] {
+    for engine in [
+        cluster.leader_engine(),
+        cluster.follower_engine(),
+        cluster.follower2_engine(),
+    ] {
         let fs = engine.require_table("t1").unwrap().flush_state();
         assert!(matches!(fs, bisque_lance::FlushState::InProgress { .. }));
     }
@@ -2159,13 +2251,23 @@ async fn test_full_segment_lifecycle_seal_flush_promote() {
     let p = cluster.leader().propose(promote).await.unwrap();
     cluster.wait_for_replication(p.log_index).await;
 
-    for engine in [cluster.leader_engine(), cluster.follower_engine(), cluster.follower2_engine()] {
+    for engine in [
+        cluster.leader_engine(),
+        cluster.follower_engine(),
+        cluster.follower2_engine(),
+    ] {
         let t = engine.require_table("t1").unwrap();
         let c = t.catalog();
-        assert_eq!(c.sealed_segment, None, "sealed should be cleared after promote");
+        assert_eq!(
+            c.sealed_segment, None,
+            "sealed should be cleared after promote"
+        );
         assert_eq!(c.s3_manifest_version, 1);
         let fs = t.flush_state();
-        assert!(matches!(fs, bisque_lance::FlushState::Idle), "flush should be idle after promote");
+        assert!(
+            matches!(fs, bisque_lance::FlushState::Idle),
+            "flush should be idle after promote"
+        );
     }
 }
 
@@ -2218,7 +2320,10 @@ async fn test_leader_shutdown_triggers_reelection() {
     .await
     .expect("new leader election timeout");
 
-    assert!(new_leader_id == 2 || new_leader_id == 3, "expected node 2 or 3 to become leader");
+    assert!(
+        new_leader_id == 2 || new_leader_id == 3,
+        "expected node 2 or 3 to become leader"
+    );
 
     // Write through the new leader.
     let new_leader_node = if new_leader_id == 2 {
@@ -2277,7 +2382,11 @@ async fn test_follower_rejects_writes_with_not_leader_error() {
 
     // Try to write records on follower — should also fail.
     // First create table on leader so follower has it.
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     let result = cluster
@@ -2306,7 +2415,11 @@ async fn test_writes_survive_leader_reelection() {
     let cluster = TestCluster::new().await;
 
     // Create table and write data.
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     // Write 3 batches to build up some history.
@@ -2350,7 +2463,11 @@ async fn test_writes_survive_leader_reelection() {
     .await
     .expect("re-election timeout");
 
-    let new_leader = if new_leader_id == 2 { &cluster.node2 } else { &cluster.node3 };
+    let new_leader = if new_leader_id == 2 {
+        &cluster.node2
+    } else {
+        &cluster.node3
+    };
 
     // Data should still be on the surviving nodes.
     assert_eq!(count_active_rows(new_leader.engine(), "t1").await, 9);
@@ -2362,7 +2479,11 @@ async fn test_writes_survive_leader_reelection() {
         .unwrap();
 
     // Wait for replication on the other surviving node.
-    let other = if new_leader_id == 2 { &cluster.node3 } else { &cluster.node2 };
+    let other = if new_leader_id == 2 {
+        &cluster.node3
+    } else {
+        &cluster.node2
+    };
     let other_raft = other.raft().clone();
     tokio::time::timeout(Duration::from_secs(5), async move {
         loop {
@@ -2389,10 +2510,18 @@ async fn test_trigger_snapshot_captures_table_metadata() {
     let cluster = TestCluster::new().await;
 
     // Create tables and write some data.
-    let c1 = cluster.leader().create_table("snap_t1", &test_schema()).await.unwrap();
+    let c1 = cluster
+        .leader()
+        .create_table("snap_t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(c1.log_index).await;
 
-    let c2 = cluster.leader().create_table("snap_t2", &test_schema()).await.unwrap();
+    let c2 = cluster
+        .leader()
+        .create_table("snap_t2", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(c2.log_index).await;
 
     let w1 = cluster
@@ -2442,9 +2571,21 @@ async fn test_snapshot_install_on_lagging_follower() {
     let raft_dir2 = tempfile::tempdir().unwrap();
     let raft_dir3 = tempfile::tempdir().unwrap();
 
-    let engine1 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path())).await.unwrap());
-    let engine2 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path())).await.unwrap());
-    let engine3 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path())).await.unwrap());
+    let engine1 = Arc::new(
+        BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path()))
+            .await
+            .unwrap(),
+    );
+    let engine2 = Arc::new(
+        BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path()))
+            .await
+            .unwrap(),
+    );
+    let engine3 = Arc::new(
+        BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path()))
+            .await
+            .unwrap(),
+    );
 
     let bus1 = Arc::new(CatalogEventBus::new(0));
     let bus2 = Arc::new(CatalogEventBus::new(0));
@@ -2468,17 +2609,23 @@ async fn test_snapshot_install_on_lagging_follower() {
         MmapStorageConfig::new(raft_dir1.path())
             .with_segment_size(4 * 1024 * 1024)
             .with_fsync_delay(Duration::ZERO),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     let storage2 = MultiplexedLogStorage::<LanceTypeConfig>::new(
         MmapStorageConfig::new(raft_dir2.path())
             .with_segment_size(4 * 1024 * 1024)
             .with_fsync_delay(Duration::ZERO),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     let storage3 = MultiplexedLogStorage::<LanceTypeConfig>::new(
         MmapStorageConfig::new(raft_dir3.path())
             .with_segment_size(4 * 1024 * 1024)
             .with_fsync_delay(Duration::ZERO),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     let transport_cfg = BisqueTcpTransportConfig {
         connect_timeout: Duration::from_secs(2),
@@ -2487,8 +2634,10 @@ async fn test_snapshot_install_on_lagging_follower() {
         tcp_nodelay: true,
         ..Default::default()
     };
-    let transport1 = BisqueTcpTransport::<LanceTypeConfig>::new(transport_cfg.clone(), registry.clone());
-    let transport2 = BisqueTcpTransport::<LanceTypeConfig>::new(transport_cfg.clone(), registry.clone());
+    let transport1 =
+        BisqueTcpTransport::<LanceTypeConfig>::new(transport_cfg.clone(), registry.clone());
+    let transport2 =
+        BisqueTcpTransport::<LanceTypeConfig>::new(transport_cfg.clone(), registry.clone());
     let transport3 = BisqueTcpTransport::<LanceTypeConfig>::new(transport_cfg, registry.clone());
 
     let manager1 = Arc::new(MultiRaftManager::new(transport1, storage1));
@@ -2496,21 +2645,45 @@ async fn test_snapshot_install_on_lagging_follower() {
     let manager3 = Arc::new(MultiRaftManager::new(transport3, storage3));
 
     let server1 = Arc::new(BisqueRpcServer::new(
-        BisqueRpcServerConfig { bind_addr: addr1, ..Default::default() },
+        BisqueRpcServerConfig {
+            bind_addr: addr1,
+            ..Default::default()
+        },
         manager1.clone(),
     ));
     let server2 = Arc::new(BisqueRpcServer::new(
-        BisqueRpcServerConfig { bind_addr: addr2, ..Default::default() },
+        BisqueRpcServerConfig {
+            bind_addr: addr2,
+            ..Default::default()
+        },
         manager2.clone(),
     ));
     let server3 = Arc::new(BisqueRpcServer::new(
-        BisqueRpcServerConfig { bind_addr: addr3, ..Default::default() },
+        BisqueRpcServerConfig {
+            bind_addr: addr3,
+            ..Default::default()
+        },
         manager3.clone(),
     ));
 
-    tokio::spawn({ let s = server1.clone(); async move { let _ = s.serve().await; } });
-    tokio::spawn({ let s = server2.clone(); async move { let _ = s.serve().await; } });
-    tokio::spawn({ let s = server3.clone(); async move { let _ = s.serve().await; } });
+    tokio::spawn({
+        let s = server1.clone();
+        async move {
+            let _ = s.serve().await;
+        }
+    });
+    tokio::spawn({
+        let s = server2.clone();
+        async move {
+            let _ = s.serve().await;
+        }
+    });
+    tokio::spawn({
+        let s = server3.clone();
+        async move {
+            let _ = s.serve().await;
+        }
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Use low snapshot threshold so snapshot is triggered after few log entries.
@@ -2533,8 +2706,14 @@ async fn test_snapshot_install_on_lagging_follower() {
     members.insert(2u64, openraft::impls::BasicNode::default());
     members.insert(3u64, openraft::impls::BasicNode::default());
 
-    let raft1 = manager1.add_group(0, 1, raft_cfg.clone(), sm1).await.unwrap();
-    let _raft2 = manager2.add_group(0, 2, raft_cfg.clone(), sm2).await.unwrap();
+    let raft1 = manager1
+        .add_group(0, 1, raft_cfg.clone(), sm1)
+        .await
+        .unwrap();
+    let _raft2 = manager2
+        .add_group(0, 2, raft_cfg.clone(), sm2)
+        .await
+        .unwrap();
     let _raft3 = manager3.add_group(0, 3, raft_cfg, sm3).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), raft1.initialize(members))
@@ -2547,10 +2726,14 @@ async fn test_snapshot_install_on_lagging_follower() {
     tokio::time::timeout(Duration::from_secs(5), async move {
         loop {
             let m = raft1_clone.metrics().borrow_watched().clone();
-            if m.current_leader == Some(1) { break; }
+            if m.current_leader == Some(1) {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }).await.expect("leader election timeout");
+    })
+    .await
+    .expect("leader election timeout");
 
     let node1 = Arc::new(
         LanceRaftNode::new(raft1.clone(), engine1.clone(), 1)
@@ -2561,7 +2744,10 @@ async fn test_snapshot_install_on_lagging_follower() {
     node1.start();
 
     // Create table and write enough data to generate log entries that trigger snapshot.
-    node1.create_table("snap_table", &test_schema()).await.unwrap();
+    node1
+        .create_table("snap_table", &test_schema())
+        .await
+        .unwrap();
 
     // Write many batches to exceed the snapshot threshold (5 logs).
     for i in 0..10 {
@@ -2579,7 +2765,10 @@ async fn test_snapshot_install_on_lagging_follower() {
 
     // Verify snapshot was built.
     let metrics = raft1.metrics().borrow_watched().clone();
-    assert!(metrics.snapshot.is_some(), "snapshot should exist after writes");
+    assert!(
+        metrics.snapshot.is_some(),
+        "snapshot should exist after writes"
+    );
 
     // Verify leader has the table with data.
     assert!(engine1.has_table("snap_table"));
@@ -2613,7 +2802,11 @@ async fn test_snapshot_install_on_lagging_follower() {
     }
 
     // Create a fresh engine and state machine for node3 (simulating a fresh restart).
-    let engine3_new = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path())).await.unwrap());
+    let engine3_new = Arc::new(
+        BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path()))
+            .await
+            .unwrap(),
+    );
     let bus3_new = Arc::new(CatalogEventBus::new(0));
     let pins3_new = Arc::new(VersionPinTracker::new(Duration::from_secs(30)));
     let sm3_new = LanceStateMachine::new(engine3_new.clone())
@@ -2634,7 +2827,10 @@ async fn test_snapshot_install_on_lagging_follower() {
         .validate()
         .unwrap(),
     );
-    let _raft3_new = manager3.add_group(0, 3, raft_cfg_new, sm3_new).await.unwrap();
+    let _raft3_new = manager3
+        .add_group(0, 3, raft_cfg_new, sm3_new)
+        .await
+        .unwrap();
 
     // Wait for node3 to receive the snapshot and apply it.
     // The snapshot contains table metadata; the table should appear on node3.
@@ -2652,7 +2848,10 @@ async fn test_snapshot_install_on_lagging_follower() {
     // The table should exist after snapshot install (metadata is restored).
     // Data files may not be present since we don't have SegmentSyncServer,
     // but the table metadata (catalog, schema) should be restored.
-    assert!(result.is_ok(), "node3 should have snap_table after snapshot install");
+    assert!(
+        result.is_ok(),
+        "node3 should have snap_table after snapshot install"
+    );
 }
 
 // =============================================================================
@@ -2664,23 +2863,26 @@ async fn test_write_wrong_schema_returns_error() {
     let cluster = TestCluster::new().await;
 
     // Create table with (id: Int64, name: Utf8).
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     // Write a batch with a completely different schema (value: Float64).
-    let wrong_schema = Arc::new(Schema::new(vec![
-        Field::new("value", DataType::Float64, false),
-    ]));
+    let wrong_schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Float64,
+        false,
+    )]));
     let wrong_batch = RecordBatch::try_new(
         wrong_schema,
         vec![Arc::new(arrow_array::Float64Array::from(vec![1.0, 2.0]))],
     )
     .unwrap();
 
-    let result = cluster
-        .leader()
-        .write_records("t1", &[wrong_batch])
-        .await;
+    let result = cluster.leader().write_records("t1", &[wrong_batch]).await;
 
     // The write should succeed at the Raft level (IPC encoding/decoding works),
     // but Lance's append may produce an error if schemas are incompatible.
@@ -2710,7 +2912,11 @@ async fn test_write_wrong_schema_returns_error() {
 async fn test_write_empty_batch_returns_error() {
     let cluster = TestCluster::new().await;
 
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     // Create an empty batch (0 rows).
@@ -2723,10 +2929,7 @@ async fn test_write_empty_batch_returns_error() {
     )
     .unwrap();
 
-    let result = cluster
-        .leader()
-        .write_records("t1", &[empty_batch])
-        .await;
+    let result = cluster.leader().write_records("t1", &[empty_batch]).await;
 
     // An empty batch may succeed (no-op append) or fail. Either way, no panic.
     match result {
@@ -2746,13 +2949,17 @@ async fn test_write_with_nullable_field_mismatch() {
     let cluster = TestCluster::new().await;
 
     // Create table with (id: Int64 NOT NULL, name: Utf8 NULLABLE).
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     // Write with reversed nullability: (id: Int64 NULLABLE, name: Utf8 NOT NULL).
     let alt_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),     // was false
-        Field::new("name", DataType::Utf8, false),    // was true
+        Field::new("id", DataType::Int64, true),   // was false
+        Field::new("name", DataType::Utf8, false), // was true
     ]));
     let batch = RecordBatch::try_new(
         alt_schema,
@@ -2786,7 +2993,11 @@ async fn test_write_with_nullable_field_mismatch() {
 async fn test_delete_with_malformed_sql_filter() {
     let cluster = TestCluster::new().await;
 
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     let write = cluster
@@ -2806,7 +3017,10 @@ async fn test_delete_with_malformed_sql_filter() {
         .await;
 
     // Should return a clean error, not panic.
-    assert!(result.is_err(), "malformed SQL filter should produce an error");
+    assert!(
+        result.is_err(),
+        "malformed SQL filter should produce an error"
+    );
     match result.unwrap_err() {
         WriteError::Raft(msg) => {
             assert!(!msg.is_empty(), "error message should describe the problem");
@@ -2824,7 +3038,11 @@ async fn test_delete_with_malformed_sql_filter() {
 async fn test_update_with_malformed_sql_filter() {
     let cluster = TestCluster::new().await;
 
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     let write = cluster
@@ -2840,7 +3058,10 @@ async fn test_update_with_malformed_sql_filter() {
         .update_records("t1", "NOT VALID SQL :::", &[test_batch(&[99], &["z"])])
         .await;
 
-    assert!(result.is_err(), "malformed SQL filter should produce an error");
+    assert!(
+        result.is_err(),
+        "malformed SQL filter should produce an error"
+    );
 
     // Data unchanged.
     assert_eq!(count_active_rows(cluster.leader_engine(), "t1").await, 2);
@@ -2855,7 +3076,11 @@ async fn test_version_pins_block_cleanup() {
     let cluster = TestCluster::new().await;
 
     // Create table and write data.
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     let write = cluster
@@ -2892,14 +3117,22 @@ async fn test_version_pins_block_cleanup() {
     cluster.wait_for_replication(pin.log_index).await;
 
     // Verify version pins are registered on all nodes.
-    for pins in [cluster.leader_pins(), cluster.follower_pins(), cluster.follower2_pins()] {
+    for pins in [
+        cluster.leader_pins(),
+        cluster.follower_pins(),
+        cluster.follower2_pins(),
+    ] {
         assert_eq!(pins.session_count(), 1, "session should exist");
         assert_eq!(pins.pin_count(), 1, "pin should exist");
     }
 
     // Verify min_pinned_version reflects the pin on all nodes.
     // The catalog name in the state machine defaults to empty string in tests.
-    for pins in [cluster.leader_pins(), cluster.follower_pins(), cluster.follower2_pins()] {
+    for pins in [
+        cluster.leader_pins(),
+        cluster.follower_pins(),
+        cluster.follower2_pins(),
+    ] {
         use bisque_lance::version_pins::PinTier;
         let min = pins.min_pinned_version("", "t1", PinTier::Active);
         assert_eq!(min, Some(1), "pinned version should be 1");
@@ -2918,7 +3151,11 @@ async fn test_version_pins_block_cleanup() {
         .unwrap();
     cluster.wait_for_replication(unpin.log_index).await;
 
-    for pins in [cluster.leader_pins(), cluster.follower_pins(), cluster.follower2_pins()] {
+    for pins in [
+        cluster.leader_pins(),
+        cluster.follower_pins(),
+        cluster.follower2_pins(),
+    ] {
         assert_eq!(pins.pin_count(), 0, "pin should be removed");
         use bisque_lance::version_pins::PinTier;
         let min = pins.min_pinned_version("", "t1", PinTier::Active);
@@ -2930,7 +3167,11 @@ async fn test_version_pins_block_cleanup() {
 async fn test_expire_session_removes_all_pins() {
     let cluster = TestCluster::new().await;
 
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     // Register session. Auto-generated session ID is 1.
@@ -2958,19 +3199,29 @@ async fn test_expire_session_removes_all_pins() {
     }
 
     // Verify 3 pins on all nodes.
-    for pins in [cluster.leader_pins(), cluster.follower_pins(), cluster.follower2_pins()] {
+    for pins in [
+        cluster.leader_pins(),
+        cluster.follower_pins(),
+        cluster.follower2_pins(),
+    ] {
         assert_eq!(pins.pin_count(), 3);
     }
 
     // Expire the session — should remove all 3 pins.
     let expire = cluster
         .leader()
-        .propose(bisque_lance::LanceCommand::ExpireSession { session_id: actual_session_id })
+        .propose(bisque_lance::LanceCommand::ExpireSession {
+            session_id: actual_session_id,
+        })
         .await
         .unwrap();
     cluster.wait_for_replication(expire.log_index).await;
 
-    for pins in [cluster.leader_pins(), cluster.follower_pins(), cluster.follower2_pins()] {
+    for pins in [
+        cluster.leader_pins(),
+        cluster.follower_pins(),
+        cluster.follower2_pins(),
+    ] {
         assert_eq!(pins.session_count(), 0, "session should be gone");
         assert_eq!(pins.pin_count(), 0, "all pins should be removed");
     }
@@ -2980,53 +3231,93 @@ async fn test_expire_session_removes_all_pins() {
 async fn test_multiple_sessions_pin_same_version() {
     let cluster = TestCluster::new().await;
 
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     // Register two sessions. Auto-generated IDs: 1 and 2.
-    let r1 = cluster.leader().propose(bisque_lance::LanceCommand::RegisterSession { session_id: 0 }).await.unwrap();
-    let r2 = cluster.leader().propose(bisque_lance::LanceCommand::RegisterSession { session_id: 0 }).await.unwrap();
+    let r1 = cluster
+        .leader()
+        .propose(bisque_lance::LanceCommand::RegisterSession { session_id: 0 })
+        .await
+        .unwrap();
+    let r2 = cluster
+        .leader()
+        .propose(bisque_lance::LanceCommand::RegisterSession { session_id: 0 })
+        .await
+        .unwrap();
     cluster.wait_for_replication(r2.log_index).await;
     let sid1 = 1u64; // first auto-generated
     let sid2 = 2u64; // second auto-generated
 
     // Both sessions pin version 5.
-    let p1 = cluster.leader().propose(bisque_lance::LanceCommand::PinVersion {
-        session_id: sid1,
-        table_name: "t1".to_string(),
-        tier: "sealed".to_string(),
-        version: 5,
-    }).await.unwrap();
-    let p2 = cluster.leader().propose(bisque_lance::LanceCommand::PinVersion {
-        session_id: sid2,
-        table_name: "t1".to_string(),
-        tier: "sealed".to_string(),
-        version: 5,
-    }).await.unwrap();
+    let p1 = cluster
+        .leader()
+        .propose(bisque_lance::LanceCommand::PinVersion {
+            session_id: sid1,
+            table_name: "t1".to_string(),
+            tier: "sealed".to_string(),
+            version: 5,
+        })
+        .await
+        .unwrap();
+    let p2 = cluster
+        .leader()
+        .propose(bisque_lance::LanceCommand::PinVersion {
+            session_id: sid2,
+            table_name: "t1".to_string(),
+            tier: "sealed".to_string(),
+            version: 5,
+        })
+        .await
+        .unwrap();
     cluster.wait_for_replication(p2.log_index).await;
 
     // Pin count should be 2 (two sessions pinning same version).
-    for pins in [cluster.leader_pins(), cluster.follower_pins(), cluster.follower2_pins()] {
+    for pins in [
+        cluster.leader_pins(),
+        cluster.follower_pins(),
+        cluster.follower2_pins(),
+    ] {
         assert_eq!(pins.pin_count(), 2);
         use bisque_lance::version_pins::PinTier;
         assert_eq!(pins.min_pinned_version("", "t1", PinTier::Sealed), Some(5));
     }
 
     // Expire session 1 — pin count drops to 1, but version still pinned.
-    let e1 = cluster.leader().propose(bisque_lance::LanceCommand::ExpireSession { session_id: sid1 }).await.unwrap();
+    let e1 = cluster
+        .leader()
+        .propose(bisque_lance::LanceCommand::ExpireSession { session_id: sid1 })
+        .await
+        .unwrap();
     cluster.wait_for_replication(e1.log_index).await;
 
-    for pins in [cluster.leader_pins(), cluster.follower_pins(), cluster.follower2_pins()] {
+    for pins in [
+        cluster.leader_pins(),
+        cluster.follower_pins(),
+        cluster.follower2_pins(),
+    ] {
         assert_eq!(pins.pin_count(), 1);
         use bisque_lance::version_pins::PinTier;
         assert_eq!(pins.min_pinned_version("", "t1", PinTier::Sealed), Some(5));
     }
 
     // Expire session 2 — version no longer pinned.
-    let e2 = cluster.leader().propose(bisque_lance::LanceCommand::ExpireSession { session_id: sid2 }).await.unwrap();
+    let e2 = cluster
+        .leader()
+        .propose(bisque_lance::LanceCommand::ExpireSession { session_id: sid2 })
+        .await
+        .unwrap();
     cluster.wait_for_replication(e2.log_index).await;
 
-    for pins in [cluster.leader_pins(), cluster.follower_pins(), cluster.follower2_pins()] {
+    for pins in [
+        cluster.leader_pins(),
+        cluster.follower_pins(),
+        cluster.follower2_pins(),
+    ] {
         assert_eq!(pins.pin_count(), 0);
         use bisque_lance::version_pins::PinTier;
         assert_eq!(pins.min_pinned_version("", "t1", PinTier::Sealed), None);
@@ -3038,14 +3329,22 @@ async fn test_compaction_respects_version_pins_on_table_engine() {
     let cluster = TestCluster::new().await;
 
     // Create table and wire up version pins directly on the TableEngine.
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
     // Write enough data to have something to compact.
     for i in 0..5 {
         let ids = vec![i as i64];
         let names = vec!["row"];
-        let w = cluster.leader().write_records("t1", &[test_batch(&ids, &names)]).await.unwrap();
+        let w = cluster
+            .leader()
+            .write_records("t1", &[test_batch(&ids, &names)])
+            .await
+            .unwrap();
         cluster.wait_for_replication(w.log_index).await;
     }
 
@@ -3058,16 +3357,24 @@ async fn test_compaction_respects_version_pins_on_table_engine() {
     table.set_catalog_name("".to_string());
 
     // Register session. Auto-generated session ID is 1.
-    let reg = cluster.leader().propose(bisque_lance::LanceCommand::RegisterSession { session_id: 0 }).await.unwrap();
+    let reg = cluster
+        .leader()
+        .propose(bisque_lance::LanceCommand::RegisterSession { session_id: 0 })
+        .await
+        .unwrap();
     cluster.wait_for_replication(reg.log_index).await;
     let actual_session_id = 1u64;
 
-    let pin = cluster.leader().propose(bisque_lance::LanceCommand::PinVersion {
-        session_id: actual_session_id,
-        table_name: "t1".to_string(),
-        tier: "active".to_string(),
-        version: 1,
-    }).await.unwrap();
+    let pin = cluster
+        .leader()
+        .propose(bisque_lance::LanceCommand::PinVersion {
+            session_id: actual_session_id,
+            table_name: "t1".to_string(),
+            tier: "active".to_string(),
+            version: 1,
+        })
+        .await
+        .unwrap();
     cluster.wait_for_replication(pin.log_index).await;
 
     // Verify the pin is set.
@@ -3083,10 +3390,19 @@ async fn test_compaction_respects_version_pins_on_table_engine() {
     // With 5 single-row writes, there should be 5 fragments (but compaction threshold
     // is typically 4, so it may or may not run).
     let compact_result = table.compact_active().await;
-    assert!(compact_result.is_ok(), "compaction should still work with version pins");
+    assert!(
+        compact_result.is_ok(),
+        "compaction should still work with version pins"
+    );
 
     // Clean up: expire session.
-    let expire = cluster.leader().propose(bisque_lance::LanceCommand::ExpireSession { session_id: actual_session_id }).await.unwrap();
+    let expire = cluster
+        .leader()
+        .propose(bisque_lance::LanceCommand::ExpireSession {
+            session_id: actual_session_id,
+        })
+        .await
+        .unwrap();
     cluster.wait_for_replication(expire.log_index).await;
     assert_eq!(pins.min_pinned_version("", "t1", PinTier::Active), None);
 }
@@ -3149,10 +3465,8 @@ impl MultiplexedTransport<LanceTypeConfig> for FaultInjectingTransport {
         target: u64,
         group_id: u64,
         rpc: VoteRequest<LanceTypeConfig>,
-    ) -> Result<
-        VoteResponse<LanceTypeConfig>,
-        RPCError<LanceTypeConfig, RaftError<LanceTypeConfig>>,
-    > {
+    ) -> Result<VoteResponse<LanceTypeConfig>, RPCError<LanceTypeConfig, RaftError<LanceTypeConfig>>>
+    {
         if self.control.is_blocked(target) {
             return Err(RPCError::Unreachable(Unreachable::from_string(
                 "network partition",
@@ -3212,9 +3526,21 @@ impl PartitionCluster {
         let raft_dir2 = tempfile::tempdir().unwrap();
         let raft_dir3 = tempfile::tempdir().unwrap();
 
-        let engine1 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path())).await.unwrap());
-        let engine2 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path())).await.unwrap());
-        let engine3 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path())).await.unwrap());
+        let engine1 = Arc::new(
+            BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path()))
+                .await
+                .unwrap(),
+        );
+        let engine2 = Arc::new(
+            BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path()))
+                .await
+                .unwrap(),
+        );
+        let engine3 = Arc::new(
+            BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path()))
+                .await
+                .unwrap(),
+        );
 
         let bus1 = Arc::new(CatalogEventBus::new(0));
         let bus2 = Arc::new(CatalogEventBus::new(0));
@@ -3228,17 +3554,23 @@ impl PartitionCluster {
             MmapStorageConfig::new(raft_dir1.path())
                 .with_segment_size(4 * 1024 * 1024)
                 .with_fsync_delay(Duration::ZERO),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let storage2 = MultiplexedLogStorage::<LanceTypeConfig>::new(
             MmapStorageConfig::new(raft_dir2.path())
                 .with_segment_size(4 * 1024 * 1024)
                 .with_fsync_delay(Duration::ZERO),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let storage3 = MultiplexedLogStorage::<LanceTypeConfig>::new(
             MmapStorageConfig::new(raft_dir3.path())
                 .with_segment_size(4 * 1024 * 1024)
                 .with_fsync_delay(Duration::ZERO),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         let blocked = Arc::new(DashSet::new());
 
@@ -3267,21 +3599,45 @@ impl PartitionCluster {
         let manager3 = Arc::new(MultiRaftManager::new(t3, storage3));
 
         let server1 = Arc::new(BisqueRpcServer::new(
-            BisqueRpcServerConfig { bind_addr: addr1, ..Default::default() },
+            BisqueRpcServerConfig {
+                bind_addr: addr1,
+                ..Default::default()
+            },
             manager1.clone(),
         ));
         let server2 = Arc::new(BisqueRpcServer::new(
-            BisqueRpcServerConfig { bind_addr: addr2, ..Default::default() },
+            BisqueRpcServerConfig {
+                bind_addr: addr2,
+                ..Default::default()
+            },
             manager2.clone(),
         ));
         let server3 = Arc::new(BisqueRpcServer::new(
-            BisqueRpcServerConfig { bind_addr: addr3, ..Default::default() },
+            BisqueRpcServerConfig {
+                bind_addr: addr3,
+                ..Default::default()
+            },
             manager3.clone(),
         ));
 
-        tokio::spawn({ let s = server1.clone(); async move { let _ = s.serve().await; } });
-        tokio::spawn({ let s = server2.clone(); async move { let _ = s.serve().await; } });
-        tokio::spawn({ let s = server3.clone(); async move { let _ = s.serve().await; } });
+        tokio::spawn({
+            let s = server1.clone();
+            async move {
+                let _ = s.serve().await;
+            }
+        });
+        tokio::spawn({
+            let s = server2.clone();
+            async move {
+                let _ = s.serve().await;
+            }
+        });
+        tokio::spawn({
+            let s = server3.clone();
+            async move {
+                let _ = s.serve().await;
+            }
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let raft_cfg = Arc::new(
@@ -3300,21 +3656,33 @@ impl PartitionCluster {
         members.insert(2u64, openraft::impls::BasicNode::default());
         members.insert(3u64, openraft::impls::BasicNode::default());
 
-        let raft1 = manager1.add_group(0, 1, raft_cfg.clone(), sm1).await.unwrap();
-        let _raft2 = manager2.add_group(0, 2, raft_cfg.clone(), sm2).await.unwrap();
+        let raft1 = manager1
+            .add_group(0, 1, raft_cfg.clone(), sm1)
+            .await
+            .unwrap();
+        let _raft2 = manager2
+            .add_group(0, 2, raft_cfg.clone(), sm2)
+            .await
+            .unwrap();
         let _raft3 = manager3.add_group(0, 3, raft_cfg, sm3).await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(5), raft1.initialize(members))
-            .await.expect("init timeout").expect("init failed");
+            .await
+            .expect("init timeout")
+            .expect("init failed");
 
         let raft1_clone = raft1.clone();
         tokio::time::timeout(Duration::from_secs(5), async move {
             loop {
                 let m = raft1_clone.metrics().borrow_watched().clone();
-                if m.current_leader == Some(1) { break; }
+                if m.current_leader == Some(1) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }).await.expect("leader election timeout");
+        })
+        .await
+        .expect("leader election timeout");
 
         let node1 = Arc::new(
             LanceRaftNode::new(raft1, engine1.clone(), 1)
@@ -3343,10 +3711,16 @@ impl PartitionCluster {
         node3.start();
 
         PartitionCluster {
-            node1, node2, node3,
-            engine1, engine2, engine3,
+            node1,
+            node2,
+            node3,
+            engine1,
+            engine2,
+            engine3,
             blocked,
-            _dirs: vec![lance_dir1, lance_dir2, lance_dir3, raft_dir1, raft_dir2, raft_dir3],
+            _dirs: vec![
+                lance_dir1, lance_dir2, lance_dir3, raft_dir1, raft_dir2, raft_dir3,
+            ],
         }
     }
 
@@ -3411,7 +3785,10 @@ impl PartitionCluster {
 
     /// Wait for any of the given nodes to become leader. Returns the leader's node_id.
     async fn wait_for_leader_among(&self, candidates: &[u64], timeout_secs: u64) -> u64 {
-        let rafts: Vec<_> = candidates.iter().map(|&id| (id, self.node(id).raft().clone())).collect();
+        let rafts: Vec<_> = candidates
+            .iter()
+            .map(|&id| (id, self.node(id).raft().clone()))
+            .collect();
         tokio::time::timeout(Duration::from_secs(timeout_secs), async {
             loop {
                 for (id, raft) in &rafts {
@@ -3433,13 +3810,19 @@ async fn test_partition_isolate_leader_causes_reelection() {
     let cluster = PartitionCluster::new().await;
 
     // Create table and write data while healthy.
-    let create = cluster.node1.create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .node1
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_node(2, create.log_index).await;
     cluster.wait_for_node(3, create.log_index).await;
 
-    let write = cluster.node1
+    let write = cluster
+        .node1
         .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
-        .await.unwrap();
+        .await
+        .unwrap();
     cluster.wait_for_node(2, write.log_index).await;
     cluster.wait_for_node(3, write.log_index).await;
 
@@ -3451,7 +3834,8 @@ async fn test_partition_isolate_leader_causes_reelection() {
     assert!(new_leader == 2 || new_leader == 3);
 
     // Write through new leader — should succeed with quorum of 2.
-    let w = cluster.node(new_leader)
+    let w = cluster
+        .node(new_leader)
         .write_records("t1", &[test_batch(&[4, 5], &["d", "e"])])
         .await
         .unwrap();
@@ -3468,7 +3852,11 @@ async fn test_partition_isolate_leader_causes_reelection() {
 async fn test_partition_minority_cannot_elect_leader() {
     let cluster = PartitionCluster::new().await;
 
-    let create = cluster.node1.create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .node1
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_node(2, create.log_index).await;
     cluster.wait_for_node(3, create.log_index).await;
 
@@ -3478,10 +3866,14 @@ async fn test_partition_minority_cannot_elect_leader() {
 
     // Node1 should remain leader (has quorum with node2).
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(cluster.node1.is_leader(), "node1 should remain leader with majority");
+    assert!(
+        cluster.node1.is_leader(),
+        "node1 should remain leader with majority"
+    );
 
     // Writes through node1 should still work (quorum = node1 + node2).
-    let w = cluster.node1
+    let w = cluster
+        .node1
         .write_records("t1", &[test_batch(&[10, 20], &["x", "y"])])
         .await
         .unwrap();
@@ -3495,7 +3887,11 @@ async fn test_partition_minority_cannot_elect_leader() {
 async fn test_partition_heal_resumes_replication() {
     let cluster = PartitionCluster::new().await;
 
-    let create = cluster.node1.create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .node1
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_node(2, create.log_index).await;
     cluster.wait_for_node(3, create.log_index).await;
 
@@ -3503,14 +3899,18 @@ async fn test_partition_heal_resumes_replication() {
     cluster.isolate_node(3);
 
     // Write data while node3 is partitioned.
-    let w1 = cluster.node1
+    let w1 = cluster
+        .node1
         .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
-        .await.unwrap();
+        .await
+        .unwrap();
     cluster.wait_for_node(2, w1.log_index).await;
 
-    let w2 = cluster.node1
+    let w2 = cluster
+        .node1
         .write_records("t1", &[test_batch(&[4, 5], &["d", "e"])])
-        .await.unwrap();
+        .await
+        .unwrap();
     cluster.wait_for_node(2, w2.log_index).await;
 
     // Node3 should NOT have the new data.
@@ -3534,7 +3934,11 @@ async fn test_partition_heal_resumes_replication() {
 async fn test_partition_asymmetric_leader_can_send_but_not_receive() {
     let cluster = PartitionCluster::new().await;
 
-    let create = cluster.node1.create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .node1
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_node(2, create.log_index).await;
     cluster.wait_for_node(3, create.log_index).await;
 
@@ -3550,8 +3954,11 @@ async fn test_partition_asymmetric_leader_can_send_but_not_receive() {
     // Try a write — it needs responses from followers to commit.
     let write_result = tokio::time::timeout(
         Duration::from_secs(3),
-        cluster.node1.write_records("t1", &[test_batch(&[10], &["x"])]),
-    ).await;
+        cluster
+            .node1
+            .write_records("t1", &[test_batch(&[10], &["x"])]),
+    )
+    .await;
 
     // Heal and verify cluster recovers.
     cluster.heal_all();
@@ -3560,9 +3967,11 @@ async fn test_partition_asymmetric_leader_can_send_but_not_receive() {
     // After healing, writes should work again.
     // Wait for any leader to be elected.
     let leader = cluster.wait_for_leader_among(&[1, 2, 3], 10).await;
-    let w = cluster.node(leader)
+    let w = cluster
+        .node(leader)
         .write_records("t1", &[test_batch(&[100], &["recovered"])])
-        .await.unwrap();
+        .await
+        .unwrap();
 
     // Wait for replication to all nodes.
     for id in [1, 2, 3] {
@@ -3600,23 +4009,50 @@ async fn test_add_learner_and_promote_to_voter() {
     let raft_dir2 = tempfile::tempdir().unwrap();
     let raft_dir3 = tempfile::tempdir().unwrap();
 
-    let engine1 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path())).await.unwrap());
-    let engine2 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path())).await.unwrap());
-    let engine3 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path())).await.unwrap());
+    let engine1 = Arc::new(
+        BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path()))
+            .await
+            .unwrap(),
+    );
+    let engine2 = Arc::new(
+        BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path()))
+            .await
+            .unwrap(),
+    );
+    let engine3 = Arc::new(
+        BisqueLance::open(BisqueLanceConfig::new(lance_dir3.path()))
+            .await
+            .unwrap(),
+    );
 
-    let sm1 = LanceStateMachine::new(engine1.clone()).with_catalog_events(Arc::new(CatalogEventBus::new(0)));
-    let sm2 = LanceStateMachine::new(engine2.clone()).with_catalog_events(Arc::new(CatalogEventBus::new(0)));
-    let sm3 = LanceStateMachine::new(engine3.clone()).with_catalog_events(Arc::new(CatalogEventBus::new(0)));
+    let sm1 = LanceStateMachine::new(engine1.clone())
+        .with_catalog_events(Arc::new(CatalogEventBus::new(0)));
+    let sm2 = LanceStateMachine::new(engine2.clone())
+        .with_catalog_events(Arc::new(CatalogEventBus::new(0)));
+    let sm3 = LanceStateMachine::new(engine3.clone())
+        .with_catalog_events(Arc::new(CatalogEventBus::new(0)));
 
     let storage1 = MultiplexedLogStorage::<LanceTypeConfig>::new(
-        MmapStorageConfig::new(raft_dir1.path()).with_segment_size(4 * 1024 * 1024).with_fsync_delay(Duration::ZERO),
-    ).await.unwrap();
+        MmapStorageConfig::new(raft_dir1.path())
+            .with_segment_size(4 * 1024 * 1024)
+            .with_fsync_delay(Duration::ZERO),
+    )
+    .await
+    .unwrap();
     let storage2 = MultiplexedLogStorage::<LanceTypeConfig>::new(
-        MmapStorageConfig::new(raft_dir2.path()).with_segment_size(4 * 1024 * 1024).with_fsync_delay(Duration::ZERO),
-    ).await.unwrap();
+        MmapStorageConfig::new(raft_dir2.path())
+            .with_segment_size(4 * 1024 * 1024)
+            .with_fsync_delay(Duration::ZERO),
+    )
+    .await
+    .unwrap();
     let storage3 = MultiplexedLogStorage::<LanceTypeConfig>::new(
-        MmapStorageConfig::new(raft_dir3.path()).with_segment_size(4 * 1024 * 1024).with_fsync_delay(Duration::ZERO),
-    ).await.unwrap();
+        MmapStorageConfig::new(raft_dir3.path())
+            .with_segment_size(4 * 1024 * 1024)
+            .with_fsync_delay(Duration::ZERO),
+    )
+    .await
+    .unwrap();
 
     let transport_cfg = BisqueTcpTransportConfig {
         connect_timeout: Duration::from_secs(2),
@@ -3633,13 +4069,46 @@ async fn test_add_learner_and_promote_to_voter() {
     let manager2 = Arc::new(MultiRaftManager::new(t2, storage2));
     let manager3 = Arc::new(MultiRaftManager::new(t3, storage3));
 
-    let server1 = Arc::new(BisqueRpcServer::new(BisqueRpcServerConfig { bind_addr: addr1, ..Default::default() }, manager1.clone()));
-    let server2 = Arc::new(BisqueRpcServer::new(BisqueRpcServerConfig { bind_addr: addr2, ..Default::default() }, manager2.clone()));
-    let server3 = Arc::new(BisqueRpcServer::new(BisqueRpcServerConfig { bind_addr: addr3, ..Default::default() }, manager3.clone()));
+    let server1 = Arc::new(BisqueRpcServer::new(
+        BisqueRpcServerConfig {
+            bind_addr: addr1,
+            ..Default::default()
+        },
+        manager1.clone(),
+    ));
+    let server2 = Arc::new(BisqueRpcServer::new(
+        BisqueRpcServerConfig {
+            bind_addr: addr2,
+            ..Default::default()
+        },
+        manager2.clone(),
+    ));
+    let server3 = Arc::new(BisqueRpcServer::new(
+        BisqueRpcServerConfig {
+            bind_addr: addr3,
+            ..Default::default()
+        },
+        manager3.clone(),
+    ));
 
-    tokio::spawn({ let s = server1.clone(); async move { let _ = s.serve().await; } });
-    tokio::spawn({ let s = server2.clone(); async move { let _ = s.serve().await; } });
-    tokio::spawn({ let s = server3.clone(); async move { let _ = s.serve().await; } });
+    tokio::spawn({
+        let s = server1.clone();
+        async move {
+            let _ = s.serve().await;
+        }
+    });
+    tokio::spawn({
+        let s = server2.clone();
+        async move {
+            let _ = s.serve().await;
+        }
+    });
+    tokio::spawn({
+        let s = server3.clone();
+        async move {
+            let _ = s.serve().await;
+        }
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let raft_cfg = Arc::new(
@@ -3648,29 +4117,43 @@ async fn test_add_learner_and_promote_to_voter() {
             election_timeout_min: 400,
             election_timeout_max: 600,
             ..Default::default()
-        }.validate().unwrap(),
+        }
+        .validate()
+        .unwrap(),
     );
 
     // Initialize with 2-node cluster (node1 + node2).
-    let raft1 = manager1.add_group(0, 1, raft_cfg.clone(), sm1).await.unwrap();
-    let _raft2 = manager2.add_group(0, 2, raft_cfg.clone(), sm2).await.unwrap();
+    let raft1 = manager1
+        .add_group(0, 1, raft_cfg.clone(), sm1)
+        .await
+        .unwrap();
+    let _raft2 = manager2
+        .add_group(0, 2, raft_cfg.clone(), sm2)
+        .await
+        .unwrap();
 
     let mut initial_members = BTreeMap::new();
     initial_members.insert(1u64, openraft::impls::BasicNode::default());
     initial_members.insert(2u64, openraft::impls::BasicNode::default());
 
     tokio::time::timeout(Duration::from_secs(5), raft1.initialize(initial_members))
-        .await.expect("init timeout").expect("init failed");
+        .await
+        .expect("init timeout")
+        .expect("init failed");
 
     // Wait for leader.
     let raft1_clone = raft1.clone();
     tokio::time::timeout(Duration::from_secs(5), async move {
         loop {
             let m = raft1_clone.metrics().borrow_watched().clone();
-            if m.current_leader == Some(1) { break; }
+            if m.current_leader == Some(1) {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }).await.expect("leader election timeout");
+    })
+    .await
+    .expect("leader election timeout");
 
     let node1 = Arc::new(
         LanceRaftNode::new(raft1.clone(), engine1.clone(), 1)
@@ -3682,19 +4165,24 @@ async fn test_add_learner_and_promote_to_voter() {
 
     // Write some data with the 2-node cluster.
     let create = node1.create_table("t1", &test_schema()).await.unwrap();
-    let write = node1.write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])]).await.unwrap();
+    let write = node1
+        .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
+        .await
+        .unwrap();
 
     // Now add node3 as a Raft group member.
     let _raft3 = manager3.add_group(0, 3, raft_cfg, sm3).await.unwrap();
 
     // Add node3 as a learner first.
-    raft1.add_learner(3, openraft::impls::BasicNode::default(), true)
+    raft1
+        .add_learner(3, openraft::impls::BasicNode::default(), true)
         .await
         .expect("add_learner failed");
 
     // Promote node3 to voter.
     let new_members: BTreeSet<u64> = [1, 2, 3].into();
-    raft1.change_membership(new_members, false)
+    raft1
+        .change_membership(new_members, false)
         .await
         .expect("change_membership failed");
 
@@ -3709,23 +4197,35 @@ async fn test_add_learner_and_promote_to_voter() {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }).await.expect("node3 replication timeout");
+    })
+    .await
+    .expect("node3 replication timeout");
 
     // Node3 should have the table and data.
-    assert!(engine3.has_table("t1"), "node3 should have table after joining");
+    assert!(
+        engine3.has_table("t1"),
+        "node3 should have table after joining"
+    );
     assert_eq!(count_active_rows(&engine3, "t1").await, 3);
 
     // Write more data — all 3 nodes should participate.
-    let w2 = node1.write_records("t1", &[test_batch(&[4, 5], &["d", "e"])]).await.unwrap();
+    let w2 = node1
+        .write_records("t1", &[test_batch(&[4, 5], &["d", "e"])])
+        .await
+        .unwrap();
 
     let raft3_clone2 = raft3.clone();
     tokio::time::timeout(Duration::from_secs(5), async move {
         loop {
             let m = raft3_clone2.metrics().borrow_watched().clone();
-            if m.last_applied.map(|id| id.index).unwrap_or(0) >= w2.log_index { break; }
+            if m.last_applied.map(|id| id.index).unwrap_or(0) >= w2.log_index {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }).await.expect("node3 replication timeout after promotion");
+    })
+    .await
+    .expect("node3 replication timeout after promotion");
 
     assert_eq!(count_active_rows(&engine3, "t1").await, 5);
 }
@@ -3735,34 +4235,49 @@ async fn test_remove_voter_from_cluster() {
     let cluster = TestCluster::new().await;
 
     // Create table and write data with 3 nodes.
-    let create = cluster.leader().create_table("t1", &test_schema()).await.unwrap();
+    let create = cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
     cluster.wait_for_replication(create.log_index).await;
 
-    let write = cluster.leader()
+    let write = cluster
+        .leader()
         .write_records("t1", &[test_batch(&[1, 2, 3], &["a", "b", "c"])])
-        .await.unwrap();
+        .await
+        .unwrap();
     cluster.wait_for_replication(write.log_index).await;
 
     // Remove node3 from the cluster. retain=true to keep as learner.
     let new_members: BTreeSet<u64> = [1, 2].into();
-    cluster.leader().raft().change_membership(new_members, true)
+    cluster
+        .leader()
+        .raft()
+        .change_membership(new_members, true)
         .await
         .expect("change_membership failed");
 
     // Write more data — should succeed with 2-node quorum.
-    let w2 = cluster.leader()
+    let w2 = cluster
+        .leader()
         .write_records("t1", &[test_batch(&[4, 5], &["d", "e"])])
-        .await.unwrap();
+        .await
+        .unwrap();
 
     // Wait for node2 to replicate.
     let raft2 = cluster.node2.raft().clone();
     tokio::time::timeout(Duration::from_secs(5), async move {
         loop {
             let m = raft2.metrics().borrow_watched().clone();
-            if m.last_applied.map(|id| id.index).unwrap_or(0) >= w2.log_index { break; }
+            if m.last_applied.map(|id| id.index).unwrap_or(0) >= w2.log_index {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }).await.expect("node2 replication timeout");
+    })
+    .await
+    .expect("node2 replication timeout");
 
     assert_eq!(count_active_rows(cluster.leader_engine(), "t1").await, 5);
     assert_eq!(count_active_rows(cluster.follower_engine(), "t1").await, 5);
@@ -3798,8 +4313,16 @@ impl ManifestCluster {
         let raft_dir2 = tempfile::tempdir().unwrap();
         let manifest_dir = tempfile::tempdir().unwrap();
 
-        let engine1 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path())).await.unwrap());
-        let engine2 = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path())).await.unwrap());
+        let engine1 = Arc::new(
+            BisqueLance::open(BisqueLanceConfig::new(lance_dir1.path()))
+                .await
+                .unwrap(),
+        );
+        let engine2 = Arc::new(
+            BisqueLance::open(BisqueLanceConfig::new(lance_dir2.path()))
+                .await
+                .unwrap(),
+        );
 
         let manifest = Arc::new(LanceManifestManager::new(manifest_dir.path()).unwrap());
         manifest.open_group(0).unwrap();
@@ -3811,11 +4334,19 @@ impl ManifestCluster {
             .with_catalog_events(Arc::new(CatalogEventBus::new(0)));
 
         let storage1 = MultiplexedLogStorage::<LanceTypeConfig>::new(
-            MmapStorageConfig::new(raft_dir1.path()).with_segment_size(4 * 1024 * 1024).with_fsync_delay(Duration::ZERO),
-        ).await.unwrap();
+            MmapStorageConfig::new(raft_dir1.path())
+                .with_segment_size(4 * 1024 * 1024)
+                .with_fsync_delay(Duration::ZERO),
+        )
+        .await
+        .unwrap();
         let storage2 = MultiplexedLogStorage::<LanceTypeConfig>::new(
-            MmapStorageConfig::new(raft_dir2.path()).with_segment_size(4 * 1024 * 1024).with_fsync_delay(Duration::ZERO),
-        ).await.unwrap();
+            MmapStorageConfig::new(raft_dir2.path())
+                .with_segment_size(4 * 1024 * 1024)
+                .with_fsync_delay(Duration::ZERO),
+        )
+        .await
+        .unwrap();
 
         let transport_cfg = BisqueTcpTransportConfig {
             connect_timeout: Duration::from_secs(2),
@@ -3824,27 +4355,57 @@ impl ManifestCluster {
             tcp_nodelay: true,
             ..Default::default()
         };
-        let t1 = BisqueTcpTransport::<LanceTypeConfig>::new(transport_cfg.clone(), registry.clone());
+        let t1 =
+            BisqueTcpTransport::<LanceTypeConfig>::new(transport_cfg.clone(), registry.clone());
         let t2 = BisqueTcpTransport::<LanceTypeConfig>::new(transport_cfg, registry.clone());
 
         let manager1 = Arc::new(MultiRaftManager::new(t1, storage1));
         let manager2 = Arc::new(MultiRaftManager::new(t2, storage2));
 
-        let server1 = Arc::new(BisqueRpcServer::new(BisqueRpcServerConfig { bind_addr: addr1, ..Default::default() }, manager1.clone()));
-        let server2 = Arc::new(BisqueRpcServer::new(BisqueRpcServerConfig { bind_addr: addr2, ..Default::default() }, manager2.clone()));
+        let server1 = Arc::new(BisqueRpcServer::new(
+            BisqueRpcServerConfig {
+                bind_addr: addr1,
+                ..Default::default()
+            },
+            manager1.clone(),
+        ));
+        let server2 = Arc::new(BisqueRpcServer::new(
+            BisqueRpcServerConfig {
+                bind_addr: addr2,
+                ..Default::default()
+            },
+            manager2.clone(),
+        ));
 
-        tokio::spawn({ let s = server1.clone(); async move { let _ = s.serve().await; } });
-        tokio::spawn({ let s = server2.clone(); async move { let _ = s.serve().await; } });
+        tokio::spawn({
+            let s = server1.clone();
+            async move {
+                let _ = s.serve().await;
+            }
+        });
+        tokio::spawn({
+            let s = server2.clone();
+            async move {
+                let _ = s.serve().await;
+            }
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let raft_cfg = Arc::new(openraft::Config {
-            heartbeat_interval: 200,
-            election_timeout_min: 400,
-            election_timeout_max: 600,
-            ..Default::default()
-        }.validate().unwrap());
+        let raft_cfg = Arc::new(
+            openraft::Config {
+                heartbeat_interval: 200,
+                election_timeout_min: 400,
+                election_timeout_max: 600,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        );
 
-        let raft1 = manager1.add_group(0, 1, raft_cfg.clone(), sm1).await.unwrap();
+        let raft1 = manager1
+            .add_group(0, 1, raft_cfg.clone(), sm1)
+            .await
+            .unwrap();
         let _raft2 = manager2.add_group(0, 2, raft_cfg, sm2).await.unwrap();
 
         let mut members = BTreeMap::new();
@@ -3852,16 +4413,22 @@ impl ManifestCluster {
         members.insert(2u64, openraft::impls::BasicNode::default());
 
         tokio::time::timeout(Duration::from_secs(5), raft1.initialize(members))
-            .await.expect("init timeout").expect("init failed");
+            .await
+            .expect("init timeout")
+            .expect("init failed");
 
         let raft1_clone = raft1.clone();
         tokio::time::timeout(Duration::from_secs(5), async move {
             loop {
                 let m = raft1_clone.metrics().borrow_watched().clone();
-                if m.current_leader == Some(1) { break; }
+                if m.current_leader == Some(1) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }).await.expect("leader election timeout");
+        })
+        .await
+        .expect("leader election timeout");
 
         let node1 = Arc::new(
             LanceRaftNode::new(raft1, engine1.clone(), 1)
@@ -3872,7 +4439,11 @@ impl ManifestCluster {
         node1.start();
 
         ManifestCluster {
-            node1, engine1, manifest, lance_dir1, manifest_dir,
+            node1,
+            engine1,
+            manifest,
+            lance_dir1,
+            manifest_dir,
             _dirs: vec![lance_dir2, raft_dir1, raft_dir2],
         }
     }
@@ -3905,9 +4476,16 @@ async fn recover_from_entries(
     lance_path: &std::path::Path,
     entries: std::collections::HashMap<String, PersistedTableEntry>,
 ) -> Arc<BisqueLance> {
-    let engine = Arc::new(BisqueLance::open(BisqueLanceConfig::new(lance_path)).await.unwrap());
+    let engine = Arc::new(
+        BisqueLance::open(BisqueLanceConfig::new(lance_path))
+            .await
+            .unwrap(),
+    );
     if !entries.is_empty() {
-        engine.restore_from_persisted_entries(entries).await.unwrap();
+        engine
+            .restore_from_persisted_entries(entries)
+            .await
+            .unwrap();
     }
     engine
 }
@@ -3917,10 +4495,26 @@ async fn test_crash_recovery_restores_tables_from_manifest() {
     let cluster = ManifestCluster::new().await;
 
     // Create two tables and write data.
-    cluster.node1.create_table("table_a", &test_schema()).await.unwrap();
-    cluster.node1.create_table("table_b", &test_schema()).await.unwrap();
-    cluster.node1.write_records("table_a", &[test_batch(&[1, 2, 3], &["x", "y", "z"])]).await.unwrap();
-    cluster.node1.write_records("table_b", &[test_batch(&[10, 20], &["aa", "bb"])]).await.unwrap();
+    cluster
+        .node1
+        .create_table("table_a", &test_schema())
+        .await
+        .unwrap();
+    cluster
+        .node1
+        .create_table("table_b", &test_schema())
+        .await
+        .unwrap();
+    cluster
+        .node1
+        .write_records("table_a", &[test_batch(&[1, 2, 3], &["x", "y", "z"])])
+        .await
+        .unwrap();
+    cluster
+        .node1
+        .write_records("table_b", &[test_batch(&[10, 20], &["aa", "bb"])])
+        .await
+        .unwrap();
 
     cluster.flush_manifest().await;
 
@@ -3935,8 +4529,14 @@ async fn test_crash_recovery_restores_tables_from_manifest() {
     let engine_recovered = recover_from_entries(&lance_path, entries).await;
 
     // Verify recovered state.
-    assert!(engine_recovered.has_table("table_a"), "table_a should survive crash");
-    assert!(engine_recovered.has_table("table_b"), "table_b should survive crash");
+    assert!(
+        engine_recovered.has_table("table_a"),
+        "table_a should survive crash"
+    );
+    assert!(
+        engine_recovered.has_table("table_b"),
+        "table_b should survive crash"
+    );
     assert_eq!(count_active_rows(&engine_recovered, "table_a").await, 3);
     assert_eq!(count_active_rows(&engine_recovered, "table_b").await, 2);
 }
@@ -3946,8 +4546,16 @@ async fn test_crash_recovery_preserves_segment_catalog() {
     let cluster = ManifestCluster::new().await;
 
     // Create table, write data, then seal.
-    cluster.node1.create_table("t1", &test_schema()).await.unwrap();
-    cluster.node1.write_records("t1", &[test_batch(&[1, 2], &["a", "b"])]).await.unwrap();
+    cluster
+        .node1
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
+    cluster
+        .node1
+        .write_records("t1", &[test_batch(&[1, 2], &["a", "b"])])
+        .await
+        .unwrap();
 
     let table = cluster.engine1.require_table("t1").unwrap();
     let active_seg = table.catalog().active_segment;
@@ -3976,11 +4584,22 @@ async fn test_crash_recovery_preserves_segment_catalog() {
     let engine_recovered = recover_from_entries(&lance_path, entries).await;
 
     // Verify: table exists and seal state is preserved.
-    assert!(engine_recovered.has_table("t1"), "table should survive crash");
+    assert!(
+        engine_recovered.has_table("t1"),
+        "table should survive crash"
+    );
     let recovered_table = engine_recovered.require_table("t1").unwrap();
     let recovered_cat = recovered_table.catalog();
-    assert_eq!(recovered_cat.sealed_segment, Some(active_seg), "sealed segment should be preserved");
-    assert_eq!(recovered_cat.active_segment, active_seg + 1, "active segment should be preserved");
+    assert_eq!(
+        recovered_cat.sealed_segment,
+        Some(active_seg),
+        "sealed segment should be preserved"
+    );
+    assert_eq!(
+        recovered_cat.active_segment,
+        active_seg + 1,
+        "active segment should be preserved"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3988,10 +4607,26 @@ async fn test_crash_recovery_table_drop_persists() {
     let cluster = ManifestCluster::new().await;
 
     // Create two tables, then drop one.
-    cluster.node1.create_table("keep_me", &test_schema()).await.unwrap();
-    cluster.node1.create_table("drop_me", &test_schema()).await.unwrap();
-    cluster.node1.write_records("keep_me", &[test_batch(&[1], &["a"])]).await.unwrap();
-    cluster.node1.write_records("drop_me", &[test_batch(&[2], &["b"])]).await.unwrap();
+    cluster
+        .node1
+        .create_table("keep_me", &test_schema())
+        .await
+        .unwrap();
+    cluster
+        .node1
+        .create_table("drop_me", &test_schema())
+        .await
+        .unwrap();
+    cluster
+        .node1
+        .write_records("keep_me", &[test_batch(&[1], &["a"])])
+        .await
+        .unwrap();
+    cluster
+        .node1
+        .write_records("drop_me", &[test_batch(&[2], &["b"])])
+        .await
+        .unwrap();
     cluster.node1.drop_table("drop_me").await.unwrap();
 
     assert!(cluster.engine1.has_table("keep_me"));
@@ -4007,7 +4642,13 @@ async fn test_crash_recovery_table_drop_persists() {
     let engine_recovered = recover_from_entries(&lance_path, entries).await;
 
     // Verify: keep_me exists, drop_me does not.
-    assert!(engine_recovered.has_table("keep_me"), "kept table should survive crash");
-    assert!(!engine_recovered.has_table("drop_me"), "dropped table should stay dropped after crash");
+    assert!(
+        engine_recovered.has_table("keep_me"),
+        "kept table should survive crash"
+    );
+    assert!(
+        !engine_recovered.has_table("drop_me"),
+        "dropped table should stay dropped after crash"
+    );
     assert_eq!(count_active_rows(&engine_recovered, "keep_me").await, 1);
 }

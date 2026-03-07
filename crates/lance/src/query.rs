@@ -205,8 +205,7 @@ mod tests {
         )
         .unwrap();
 
-        let reader =
-            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let ds = Dataset::write(reader, tmp.path().to_str().unwrap(), None)
             .await
             .unwrap();

@@ -251,10 +251,16 @@ where
     pub async fn shutdown_and_drain(&self, drain_timeout: std::time::Duration) {
         self.shutdown();
         let deadline = tokio::time::Instant::now() + drain_timeout;
-        while self.active_connections.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        while self
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
             if tokio::time::Instant::now() >= deadline {
                 tracing::warn!(
-                    remaining = self.active_connections.load(std::sync::atomic::Ordering::Relaxed),
+                    remaining = self
+                        .active_connections
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     "Connection drain timeout"
                 );
                 break;
@@ -418,7 +424,13 @@ where
 
         // Run reader+dispatcher in current task
         let result = self
-            .request_reader_loop(read_half, peer_addr, response_tx, alive.clone(), shutdown_rx)
+            .request_reader_loop(
+                read_half,
+                peer_addr,
+                response_tx,
+                alive.clone(),
+                shutdown_rx,
+            )
             .await;
 
         // Mark connection as done and wait for writer to finish
@@ -538,7 +550,10 @@ where
 
         // Check if already shutting down
         if *shutdown_rx.borrow() {
-            tracing::debug!("RPC reader: shutdown already signaled, closing connection from {}", peer_addr);
+            tracing::debug!(
+                "RPC reader: shutdown already signaled, closing connection from {}",
+                peer_addr
+            );
             return Ok(());
         }
 

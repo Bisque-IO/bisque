@@ -122,13 +122,7 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<
-        (
-            Option<LogId<TestConfig>>,
-            StoredMembership<TestConfig>,
-        ),
-        std::io::Error,
-    > {
+    ) -> Result<(Option<LogId<TestConfig>>, StoredMembership<TestConfig>), std::io::Error> {
         let la = self.last_applied.read().clone();
         let lm = self.last_membership.read().clone();
         Ok((la, lm))
@@ -230,17 +224,11 @@ impl openraft::RaftSnapshotBuilder<TestConfig> for TestStateMachine {
 // E2eCluster harness
 // ---------------------------------------------------------------------------
 
-type Manager = MultiRaftManager<
-    TestConfig,
-    BisqueTcpTransport<TestConfig>,
-    MultiplexedLogStorage<TestConfig>,
->;
+type Manager =
+    MultiRaftManager<TestConfig, BisqueTcpTransport<TestConfig>, MultiplexedLogStorage<TestConfig>>;
 
-type Server = BisqueRpcServer<
-    TestConfig,
-    BisqueTcpTransport<TestConfig>,
-    MultiplexedLogStorage<TestConfig>,
->;
+type Server =
+    BisqueRpcServer<TestConfig, BisqueTcpTransport<TestConfig>, MultiplexedLogStorage<TestConfig>>;
 
 struct E2eNode {
     node_id: u64,
@@ -496,9 +484,7 @@ impl E2eCluster {
 
         // 2. Drain connections — shutdown_rx propagates to all connection
         //    handler tasks so they exit promptly, releasing Arc refs.
-        node.server
-            .shutdown_and_drain(Duration::from_secs(5))
-            .await;
+        node.server.shutdown_and_drain(Duration::from_secs(5)).await;
 
         // 3. Stop storage (fsync thread, manifest worker)
         node.manager.storage().stop();
@@ -561,13 +547,8 @@ impl E2eCluster {
     }
 
     async fn add_new_node(&mut self, node_id: u64, group_ids: &[u64]) -> Vec<TestStateMachine> {
-        let new_node = Self::create_node(
-            node_id,
-            &self.node_registry,
-            &self.transport_cfg,
-            None,
-        )
-        .await;
+        let new_node =
+            Self::create_node(node_id, &self.node_registry, &self.transport_cfg, None).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -753,9 +734,7 @@ fn test_leader_shutdown_triggers_reelection() {
 
         // Wait for replication on surviving nodes
         let survivor_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
-        cluster
-            .wait_for_replication(1, 10, &survivor_ids, 10)
-            .await;
+        cluster.wait_for_replication(1, 10, &survivor_ids, 10).await;
 
         cluster.shutdown();
     });
@@ -786,17 +765,13 @@ fn test_follower_restart_catches_up() {
         // Write 10 more entries while follower is down
         write_entries(&cluster, 1, leader, 10).await;
         let survivor_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
-        cluster
-            .wait_for_replication(1, 15, &survivor_ids, 10)
-            .await;
+        cluster.wait_for_replication(1, 15, &survivor_ids, 10).await;
 
         // Restart the follower
         let new_sms = cluster.restart_node(follower, &[1]).await;
 
         // Wait for the restarted node to catch up
-        cluster
-            .wait_for_replication(1, 15, &[follower], 15)
-            .await;
+        cluster.wait_for_replication(1, 15, &[follower], 15).await;
 
         // The restarted SM replays all log entries from disk (applied_state returns None)
         assert!(
@@ -832,17 +807,13 @@ fn test_leader_restart_rejoins_as_follower() {
         // Write 5 more
         write_entries(&cluster, 1, new_leader, 5).await;
         let survivor_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
-        cluster
-            .wait_for_replication(1, 10, &survivor_ids, 10)
-            .await;
+        cluster.wait_for_replication(1, 10, &survivor_ids, 10).await;
 
         // Restart old leader
         let new_sms = cluster.restart_node(old_leader, &[1]).await;
 
         // Wait for it to catch up
-        cluster
-            .wait_for_replication(1, 10, &[old_leader], 15)
-            .await;
+        cluster.wait_for_replication(1, 10, &[old_leader], 15).await;
 
         assert!(
             new_sms[0].applied() >= 10,
@@ -1022,9 +993,7 @@ fn test_snapshot_install_on_lagging_follower() {
         // Write 15 more entries while follower is down (20 total)
         write_entries(&cluster, 1, leader, 15).await;
         let survivor_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
-        cluster
-            .wait_for_replication(1, 20, &survivor_ids, 10)
-            .await;
+        cluster.wait_for_replication(1, 20, &survivor_ids, 10).await;
 
         // Trigger snapshot on leader
         let leader_raft = cluster.get_raft(1, leader);
@@ -1057,9 +1026,7 @@ fn test_snapshot_install_on_lagging_follower() {
         let new_sms = cluster.restart_node(follower, &[1]).await;
 
         // Wait for the follower to catch up via snapshot install
-        cluster
-            .wait_for_replication(1, 20, &[follower], 15)
-            .await;
+        cluster.wait_for_replication(1, 20, &[follower], 15).await;
 
         // The snapshot carries the applied_normal count, so the SM should reflect it
         assert!(

@@ -497,7 +497,9 @@ type Transport = BisqueTcpTransport<LanceTypeConfig>;
 type Storage = MultiplexedLogStorage<LanceTypeConfig>;
 type Manager = MultiRaftManager<LanceTypeConfig, Transport, Storage>;
 
-async fn setup_single_node_raft(base_dir: &std::path::Path) -> anyhow::Result<(Arc<LanceRaftNode>, Arc<Manager>)> {
+async fn setup_single_node_raft(
+    base_dir: &std::path::Path,
+) -> anyhow::Result<(Arc<LanceRaftNode>, Arc<Manager>)> {
     let node_id: u64 = 1;
     let group_id: u64 = 1;
 

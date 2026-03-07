@@ -205,7 +205,8 @@ async fn counter_aggregator_reduces_rows() {
         "value",
     ));
 
-    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
+    let (node, _manager) =
+        setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
 
     // Create table with the counter output schema (metric_name + value).
     let schema = counter_schema();
@@ -241,7 +242,8 @@ async fn gauge_aggregator_keeps_last_value() {
         "value",
     ));
 
-    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
+    let (node, _manager) =
+        setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
 
     let schema = counter_schema(); // Same schema works for gauges
     node.create_table("gauges", &schema).await.unwrap();
@@ -272,7 +274,8 @@ async fn counter_with_timestamp_truncation() {
             .with_timestamp("timestamp", 60_000), // 1-minute resolution
     );
 
-    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
+    let (node, _manager) =
+        setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
 
     let schema = counter_schema_with_ts();
     node.create_table("ts_counters", &schema).await.unwrap();
@@ -301,7 +304,8 @@ async fn processor_with_empty_batches() {
         "value",
     ));
 
-    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(10)).await;
+    let (node, _manager) =
+        setup_with_processor(tmp.path(), processor, Duration::from_millis(10)).await;
 
     let schema = counter_schema();
     node.create_table("empty_test", &schema).await.unwrap();
@@ -323,7 +327,8 @@ async fn concurrent_writes_through_processor() {
     ));
 
     // Longer linger to increase chance of coalescing concurrent writes.
-    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(100)).await;
+    let (node, _manager) =
+        setup_with_processor(tmp.path(), processor, Duration::from_millis(100)).await;
 
     let schema = counter_schema();
     node.create_table("concurrent", &schema).await.unwrap();

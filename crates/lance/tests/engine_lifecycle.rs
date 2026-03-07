@@ -337,7 +337,10 @@ async fn test_seal_creates_sealed_segment() {
         .unwrap();
 
     let sealed_ds = table.sealed_dataset_snapshot().await;
-    assert!(sealed_ds.is_some(), "Sealed dataset should exist after seal");
+    assert!(
+        sealed_ds.is_some(),
+        "Sealed dataset should exist after seal"
+    );
 
     let sealed_rows = sealed_ds.unwrap().count_rows(None).await.unwrap();
     assert_eq!(sealed_rows, 2);
@@ -371,7 +374,10 @@ async fn test_seal_creates_new_active_segment() {
 
     let active_ds = table.active_dataset_snapshot().await.unwrap();
     let active_rows = active_ds.count_rows(None).await.unwrap();
-    assert_eq!(active_rows, 3, "New writes should be in the new active segment");
+    assert_eq!(
+        active_rows, 3,
+        "New writes should be in the new active segment"
+    );
 
     // Sealed should still have the original 2 rows.
     let sealed_ds = table.sealed_dataset_snapshot().await.unwrap();
@@ -410,12 +416,8 @@ async fn test_should_seal_by_size() {
 async fn test_should_seal_by_age() {
     let tmp = tempdir().unwrap();
     // Set a very short seal_max_age (1 ms).
-    let engine = new_engine_with_seal(
-        tmp.path(),
-        Duration::from_millis(1),
-        1024 * 1024 * 1024,
-    )
-    .await;
+    let engine =
+        new_engine_with_seal(tmp.path(), Duration::from_millis(1), 1024 * 1024 * 1024).await;
 
     let cfg = engine
         .config()
@@ -763,12 +765,18 @@ async fn test_delete_then_seal_respects_deletion_vectors() {
     assert_eq!(deleted, 2);
 
     // Seal the active segment
-    table.apply_seal(1, 2, bisque_lance::SealReason::MaxSize).await.unwrap();
+    table
+        .apply_seal(1, 2, bisque_lance::SealReason::MaxSize)
+        .await
+        .unwrap();
 
     // The sealed segment should reflect the deletions
     let sealed_ds = table.sealed_dataset_snapshot().await.unwrap();
     let sealed_count = sealed_ds.count_rows(None).await.unwrap();
-    assert_eq!(sealed_count, 3, "sealed segment should have 3 rows (5 - 2 deleted)");
+    assert_eq!(
+        sealed_count, 3,
+        "sealed segment should have 3 rows (5 - 2 deleted)"
+    );
 
     // Active segment (newly created) should be empty
     let active_ds = table.active_dataset_snapshot().await.unwrap();
@@ -789,7 +797,10 @@ async fn test_delete_across_active_and_sealed_tiers() {
     // Write data to active and then seal to get data in sealed tier
     let batch1 = test_batch(&[1, 2, 3], &["a", "b", "c"]);
     table.apply_append(vec![batch1]).await.unwrap();
-    table.apply_seal(1, 2, bisque_lance::SealReason::MaxSize).await.unwrap();
+    table
+        .apply_seal(1, 2, bisque_lance::SealReason::MaxSize)
+        .await
+        .unwrap();
 
     // Write more data to the new active segment
     let batch2 = test_batch(&[4, 5, 6], &["d", "e", "f"]);
@@ -830,7 +841,10 @@ async fn test_tier_versions_after_delete() {
     table.apply_delete("id = 1").await.unwrap();
 
     let (av_after, _, _) = table.tier_versions();
-    assert!(av_after.unwrap() > av_before.unwrap(), "version should increase after delete");
+    assert!(
+        av_after.unwrap() > av_before.unwrap(),
+        "version should increase after delete"
+    );
 }
 
 // =============================================================================
@@ -851,7 +865,10 @@ async fn test_update_replaces_rows() {
 
     // Update: replace rows where id > 2 with new data
     let replacement = test_batch(&[3], &["charles"]);
-    let deleted = table.apply_update("id > 2", vec![replacement]).await.unwrap();
+    let deleted = table
+        .apply_update("id > 2", vec![replacement])
+        .await
+        .unwrap();
     assert_eq!(deleted, 1);
 
     // Total should be: 2 original + 1 replacement = 3
@@ -874,7 +891,10 @@ async fn test_update_with_no_matching_rows() {
 
     // Update with no matching filter — replacement still appended
     let replacement = test_batch(&[99], &["new"]);
-    let deleted = table.apply_update("id > 100", vec![replacement]).await.unwrap();
+    let deleted = table
+        .apply_update("id > 100", vec![replacement])
+        .await
+        .unwrap();
     assert_eq!(deleted, 0);
 
     // Total: 3 original + 1 appended = 4
@@ -896,7 +916,10 @@ async fn test_update_across_tiers() {
     // Write to active and seal
     let batch1 = test_batch(&[1, 2, 3], &["a", "b", "c"]);
     table.apply_append(vec![batch1]).await.unwrap();
-    table.apply_seal(1, 2, bisque_lance::SealReason::MaxSize).await.unwrap();
+    table
+        .apply_seal(1, 2, bisque_lance::SealReason::MaxSize)
+        .await
+        .unwrap();
 
     // Write to new active
     let batch2 = test_batch(&[4, 5], &["d", "e"]);
@@ -904,7 +927,10 @@ async fn test_update_across_tiers() {
 
     // Update id=2 (sealed) and id=4 (active) — deletes from both tiers, appends to active
     let replacement = test_batch(&[2, 4], &["b_updated", "d_updated"]);
-    let deleted = table.apply_update("id = 2 OR id = 4", vec![replacement]).await.unwrap();
+    let deleted = table
+        .apply_update("id = 2 OR id = 4", vec![replacement])
+        .await
+        .unwrap();
     assert_eq!(deleted, 2);
 
     // Sealed: 3 original - 1 deleted = 2
@@ -1555,21 +1581,14 @@ async fn test_update_schema_column_count_mismatch() {
     table.apply_append(vec![batch]).await.unwrap();
 
     // Build a replacement batch with only one column (id: i64) -- column count mismatch.
-    let mismatched_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-    ]));
-    let mismatched_batch = RecordBatch::try_new(
-        mismatched_schema,
-        vec![Arc::new(Int64Array::from(vec![2]))],
-    )
-    .unwrap();
+    let mismatched_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let mismatched_batch =
+        RecordBatch::try_new(mismatched_schema, vec![Arc::new(Int64Array::from(vec![2]))]).unwrap();
 
     // The update delete part should succeed, but the append with mismatched
     // schema may either error or succeed (Lance may accept schema evolution).
     // We just verify no panic occurs.
-    let result = table
-        .apply_update("id = 2", vec![mismatched_batch])
-        .await;
+    let result = table.apply_update("id = 2", vec![mismatched_batch]).await;
 
     // Whether it errors or succeeds, no panic should occur.
     // If it succeeded, verify we can still read the table.
@@ -1603,10 +1622,8 @@ async fn test_concurrent_delete_and_append() {
     let t2 = table.clone();
     let new_batch = test_batch(&[11, 12], &["k", "l"]);
 
-    let (del_result, app_result) = tokio::join!(
-        t1.apply_delete("id <= 3"),
-        t2.apply_append(vec![new_batch]),
-    );
+    let (del_result, app_result) =
+        tokio::join!(t1.apply_delete("id <= 3"), t2.apply_append(vec![new_batch]),);
 
     // Both should succeed without panicking.
     del_result.unwrap();
@@ -1831,11 +1848,8 @@ async fn test_delete_with_null_handling() {
         None,
         Some("eve"),
     ]);
-    let batch = RecordBatch::try_new(
-        nullable_schema,
-        vec![Arc::new(ids), Arc::new(names)],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(nullable_schema, vec![Arc::new(ids), Arc::new(names)]).unwrap();
     table.apply_append(vec![batch]).await.unwrap();
 
     // Delete rows where name IS NULL (ids 2 and 4).

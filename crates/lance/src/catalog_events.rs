@@ -287,7 +287,12 @@ mod tests {
         let mut prev_seq = 0u64;
         for _ in 0..count {
             let event = rx.recv().await.unwrap();
-            assert!(event.seq > prev_seq, "seq {} should be > {}", event.seq, prev_seq);
+            assert!(
+                event.seq > prev_seq,
+                "seq {} should be > {}",
+                event.seq,
+                prev_seq
+            );
             prev_seq = event.seq;
         }
         assert_eq!(prev_seq, count as u64);
@@ -522,8 +527,20 @@ mod tests {
         };
         let json = serde_json::to_string(&kind).unwrap();
         // The JSON should contain active_version but NOT sealed_version or s3_version.
-        assert!(json.contains("\"active_version\":1"), "expected active_version in JSON: {}", json);
-        assert!(!json.contains("sealed_version"), "sealed_version should be omitted from JSON: {}", json);
-        assert!(!json.contains("s3_version"), "s3_version should be omitted from JSON: {}", json);
+        assert!(
+            json.contains("\"active_version\":1"),
+            "expected active_version in JSON: {}",
+            json
+        );
+        assert!(
+            !json.contains("sealed_version"),
+            "sealed_version should be omitted from JSON: {}",
+            json
+        );
+        assert!(
+            !json.contains("s3_version"),
+            "s3_version should be omitted from JSON: {}",
+            json
+        );
     }
 }

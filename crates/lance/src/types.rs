@@ -247,15 +247,8 @@ impl fmt::Display for LanceCommand {
             LanceCommand::ExpireSession { session_id } => {
                 write!(f, "ExpireSession(session={})", session_id)
             }
-            LanceCommand::DeleteRecords {
-                table_name,
-                filter,
-            } => {
-                write!(
-                    f,
-                    "DeleteRecords(table={}, filter={})",
-                    table_name, filter
-                )
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                write!(f, "DeleteRecords(table={}, filter={})", table_name, filter)
             }
             LanceCommand::UpdateRecords {
                 table_name,

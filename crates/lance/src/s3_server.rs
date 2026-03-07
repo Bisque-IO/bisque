@@ -1386,14 +1386,12 @@ mod tests {
 
     #[test]
     fn list_objects_xml_produces_valid_structure() {
-        let objects = vec![
-            S3Object {
-                key: "table/active/data/file.lance".into(),
-                size: 1024,
-                last_modified: "2025-01-01T00:00:00.000Z".into(),
-                etag: "\"abc123\"".into(),
-            },
-        ];
+        let objects = vec![S3Object {
+            key: "table/active/data/file.lance".into(),
+            size: 1024,
+            last_modified: "2025-01-01T00:00:00.000Z".into(),
+            etag: "\"abc123\"".into(),
+        }];
         let common_prefixes = vec!["table/active/data/".to_string()];
 
         let resp = list_objects_xml_response(

@@ -672,7 +672,10 @@ mod tests {
     #[test]
     fn url_encode_alphanumerics_unchanged() {
         assert_eq!(url_encode("abcXYZ012"), "abcXYZ012");
-        assert_eq!(url_encode("hello-world_v1.0~draft"), "hello-world_v1.0~draft");
+        assert_eq!(
+            url_encode("hello-world_v1.0~draft"),
+            "hello-world_v1.0~draft"
+        );
     }
 
     #[test]
@@ -767,10 +770,7 @@ mod tests {
             extract_xml_tag(block, "Key"),
             Some("my/path/file.lance".to_string())
         );
-        assert_eq!(
-            extract_xml_tag(block, "Size"),
-            Some("1024".to_string())
-        );
+        assert_eq!(extract_xml_tag(block, "Size"), Some("1024".to_string()));
     }
 
     #[test]

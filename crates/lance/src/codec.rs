@@ -228,10 +228,7 @@ impl Encode for LanceCommand {
                 CMD_EXPIRE_SESSION.encode(writer)?;
                 session_id.encode(writer)?;
             }
-            LanceCommand::DeleteRecords {
-                table_name,
-                filter,
-            } => {
+            LanceCommand::DeleteRecords { table_name, filter } => {
                 CMD_DELETE_RECORDS.encode(writer)?;
                 encode_table_name(table_name, writer)?;
                 (filter.len() as u32).encode(writer)?;
@@ -278,10 +275,9 @@ impl Encode for LanceCommand {
                 table_name, tier, ..
             } => 8 + table_name_size(table_name) + table_name_size(tier) + 8,
             LanceCommand::ExpireSession { .. } => 8,
-            LanceCommand::DeleteRecords {
-                table_name,
-                filter,
-            } => table_name_size(table_name) + 4 + filter.len(),
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                table_name_size(table_name) + 4 + filter.len()
+            }
             LanceCommand::UpdateRecords {
                 table_name,
                 filter,
@@ -564,15 +560,13 @@ impl Decode for LanceCommand {
                         have: data.len(),
                     });
                 }
-                let filter =
-                    String::from_utf8(data[offset..offset + filter_len].to_vec()).map_err(
-                        |_| {
-                            CodecError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "filter is not valid UTF-8",
-                            ))
-                        },
-                    )?;
+                let filter = String::from_utf8(data[offset..offset + filter_len].to_vec())
+                    .map_err(|_| {
+                        CodecError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "filter is not valid UTF-8",
+                        ))
+                    })?;
                 Ok(LanceCommand::DeleteRecords { table_name, filter })
             }
             CMD_UPDATE_RECORDS => {
@@ -586,15 +580,13 @@ impl Decode for LanceCommand {
                         have: data.len(),
                     });
                 }
-                let filter =
-                    String::from_utf8(data[offset..offset + filter_len].to_vec()).map_err(
-                        |_| {
-                            CodecError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "filter is not valid UTF-8",
-                            ))
-                        },
-                    )?;
+                let filter = String::from_utf8(data[offset..offset + filter_len].to_vec())
+                    .map_err(|_| {
+                        CodecError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "filter is not valid UTF-8",
+                        ))
+                    })?;
                 offset += filter_len;
                 let data_len = read_u32_at(&data, offset)? as usize;
                 offset += 4;
@@ -859,7 +851,11 @@ mod tests {
         assert_eq!(encoded.len(), cmd.encoded_size());
         let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
         match decoded {
-            LanceCommand::UpdateRecords { table_name, filter, data } => {
+            LanceCommand::UpdateRecords {
+                table_name,
+                filter,
+                data,
+            } => {
                 assert_eq!(table_name, "metrics");
                 assert_eq!(filter, "ts < '2024-01-01'");
                 assert_eq!(&data[..], &[10, 20, 30, 40, 50]);
@@ -879,7 +875,11 @@ mod tests {
         assert_eq!(encoded.len(), cmd.encoded_size());
         let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
         match decoded {
-            LanceCommand::UpdateRecords { table_name, filter, data } => {
+            LanceCommand::UpdateRecords {
+                table_name,
+                filter,
+                data,
+            } => {
                 assert_eq!(table_name, "t");
                 assert_eq!(filter, "id = 1");
                 assert!(data.is_empty());
@@ -917,7 +917,11 @@ mod tests {
         let bytes = Bytes::from(encoded);
         let decoded = LanceCommand::decode_from_bytes(bytes).unwrap();
         match decoded {
-            LanceCommand::UpdateRecords { table_name, filter, data } => {
+            LanceCommand::UpdateRecords {
+                table_name,
+                filter,
+                data,
+            } => {
                 assert_eq!(table_name, "data");
                 assert_eq!(filter, "x > 0");
                 assert_eq!(&data[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -1010,7 +1014,10 @@ mod tests {
         let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
         match decoded {
             LanceCommand::DeleteRecords { table_name, filter } => {
-                assert_eq!(table_name, "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30fc}\u{30d6}\u{30eb}");
+                assert_eq!(
+                    table_name,
+                    "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30fc}\u{30d6}\u{30eb}"
+                );
                 assert_eq!(filter, "name = '\u{1f3af}'");
             }
             _ => panic!("wrong variant"),

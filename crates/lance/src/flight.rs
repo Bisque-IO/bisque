@@ -1473,10 +1473,7 @@ mod tests {
     #[test]
     fn test_parse_delete_sql_quoted_table() {
         let result = parse_delete_sql("DELETE FROM \"my_table\" WHERE x = 1");
-        assert_eq!(
-            result,
-            Some(("my_table".to_string(), "x = 1".to_string()))
-        );
+        assert_eq!(result, Some(("my_table".to_string(), "x = 1".to_string())));
     }
 
     #[test]
@@ -1589,11 +1586,7 @@ mod tests {
         let result = parse_update_sql("UPDATE t SET x = 1 WHERE id = 1;");
         assert_eq!(
             result,
-            Some((
-                "t".to_string(),
-                "x = 1".to_string(),
-                "id = 1".to_string()
-            ))
+            Some(("t".to_string(), "x = 1".to_string(), "id = 1".to_string()))
         );
     }
 

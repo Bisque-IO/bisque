@@ -371,13 +371,12 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                                 });
                                 if matches!(response, LanceResponse::RowsAffected(_)) {
                                     let (av, sv, s3v) = table.tier_versions();
-                                    catalog_event =
-                                        Some(CatalogEventKind::DataMutated {
-                                            table: tname,
-                                            active_version: av,
-                                            sealed_version: sv,
-                                            s3_version: s3v,
-                                        });
+                                    catalog_event = Some(CatalogEventKind::DataMutated {
+                                        table: tname,
+                                        active_version: av,
+                                        sealed_version: sv,
+                                        s3_version: s3v,
+                                    });
                                 }
                             }
                             response
@@ -397,13 +396,12 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                                 });
                                 if matches!(response, LanceResponse::RowsAffected(_)) {
                                     let (av, sv, s3v) = table.tier_versions();
-                                    catalog_event =
-                                        Some(CatalogEventKind::DataMutated {
-                                            table: tname,
-                                            active_version: av,
-                                            sealed_version: sv,
-                                            s3_version: s3v,
-                                        });
+                                    catalog_event = Some(CatalogEventKind::DataMutated {
+                                        table: tname,
+                                        active_version: av,
+                                        sealed_version: sv,
+                                        s3_version: s3v,
+                                    });
                                 }
                             }
                             response
@@ -969,10 +967,7 @@ impl LanceStateMachine {
                 LanceResponse::Ok
             }
 
-            LanceCommand::DeleteRecords {
-                table_name,
-                filter,
-            } => {
+            LanceCommand::DeleteRecords { table_name, filter } => {
                 let table = match self.engine.require_table(&table_name) {
                     Ok(t) => t,
                     Err(e) => {

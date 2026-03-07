@@ -177,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
     println!("--- Step 1: Start Raft Node (with catalog events) ---\n");
 
     let catalog_bus = Arc::new(CatalogEventBus::new(0));
-    let (raft_node, _manager) = setup_single_node_raft(temp_dir.path(), catalog_bus.clone()).await?;
+    let (raft_node, _manager) =
+        setup_single_node_raft(temp_dir.path(), catalog_bus.clone()).await?;
     raft_node.start();
 
     for _ in 0..20 {
