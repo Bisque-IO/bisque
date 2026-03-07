@@ -304,7 +304,8 @@ impl FlightSqlService for BisqueFlightService {
             .map_err(|e| Status::internal(format!("execution error: {e}")))?
             .map_err(|e| arrow_flight::error::FlightError::Arrow(e.into()));
 
-        metrics::counter!("bisque_requests_total", "protocol" => "flight", "op" => "query").increment(1);
+        metrics::counter!("bisque_requests_total", "protocol" => "flight", "op" => "query")
+            .increment(1);
         metrics::histogram!("bisque_request_latency_seconds", "protocol" => "flight", "op" => "query").record(query_start.elapsed().as_secs_f64());
 
         let flight_stream = FlightDataEncoderBuilder::new()
@@ -383,7 +384,8 @@ impl FlightSqlService for BisqueFlightService {
             .await
             .map_err(write_error_to_status)?;
 
-        metrics::counter!("bisque_requests_total", "protocol" => "flight", "op" => "ingest").increment(1);
+        metrics::counter!("bisque_requests_total", "protocol" => "flight", "op" => "ingest")
+            .increment(1);
         debug!(table = %table_name, rows = num_rows, "do_put_statement_ingest: complete");
         Ok(num_rows as i64)
     }

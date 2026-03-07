@@ -47,9 +47,12 @@ impl AuthContext {
 
     /// Check if this context has tenant-wide admin privileges.
     pub fn is_tenant_admin(&self) -> bool {
-        self.scopes
-            .iter()
-            .any(|s| matches!(s, Scope::TenantAdmin | Scope::SuperAdmin | Scope::AccountAdmin(_)))
+        self.scopes.iter().any(|s| {
+            matches!(
+                s,
+                Scope::TenantAdmin | Scope::SuperAdmin | Scope::AccountAdmin(_)
+            )
+        })
     }
 
     pub fn is_super_admin(&self) -> bool {
@@ -76,10 +79,7 @@ pub struct AuthState {
 ///
 /// On success, injects `AuthContext` into request extensions.
 /// On failure, returns 401 Unauthorized.
-pub async fn auth_middleware(
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn auth_middleware(request: Request, next: Next) -> Response {
     let auth_state = request.extensions().get::<AuthState>().cloned();
     let Some(auth_state) = auth_state else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "auth not configured").into_response();
@@ -91,7 +91,9 @@ pub async fn auth_middleware(
         None => {
             return (
                 StatusCode::UNAUTHORIZED,
-                axum::Json(serde_json::json!({ "error": "missing or invalid Authorization header" })),
+                axum::Json(
+                    serde_json::json!({ "error": "missing or invalid Authorization header" }),
+                ),
             )
                 .into_response();
         }

@@ -1144,7 +1144,10 @@ mod tests {
             #[cfg(feature = "tls")]
             tls_server_config: None,
         };
-        assert_eq!(config.bind_addr, "0.0.0.0:9090".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            config.bind_addr,
+            "0.0.0.0:9090".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(config.max_connections, 500);
         assert_eq!(config.connection_timeout, Duration::from_secs(30));
         assert_eq!(config.max_concurrent_requests, 128);
@@ -1218,12 +1221,8 @@ mod tests {
         for group_id in 0..5u64 {
             let mut meta = test_snapshot_meta();
             meta.snapshot_id = format!("snap-{}", group_id);
-            let mut acc = manager.get_or_create(
-                group_id,
-                meta.snapshot_id.clone(),
-                vote.clone(),
-                meta,
-            );
+            let mut acc =
+                manager.get_or_create(group_id, meta.snapshot_id.clone(), vote.clone(), meta);
             acc.append_chunk(0, &vec![group_id as u8; 100]);
             drop(acc);
         }
@@ -1257,13 +1256,19 @@ mod tests {
         drop(acc2);
 
         // Continue first
-        let key1 = SnapshotTransferKey { group_id: 1, snapshot_id: "snap-a".to_string() };
+        let key1 = SnapshotTransferKey {
+            group_id: 1,
+            snapshot_id: "snap-a".to_string(),
+        };
         let mut acc1 = manager.transfers.get_mut(&key1).unwrap();
         acc1.append_chunk(4, b"AAAA");
         drop(acc1);
 
         // Continue second
-        let key2 = SnapshotTransferKey { group_id: 2, snapshot_id: "snap-b".to_string() };
+        let key2 = SnapshotTransferKey {
+            group_id: 2,
+            snapshot_id: "snap-b".to_string(),
+        };
         let mut acc2 = manager.transfers.get_mut(&key2).unwrap();
         acc2.append_chunk(4, b"BBBB");
         drop(acc2);

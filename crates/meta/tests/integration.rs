@@ -7,14 +7,16 @@
 use std::sync::Arc;
 
 use bisque_meta::{
-    CatalogStatus, EngineType, MetaCommand, MetaConfig, MetaEngine, MetaResponse,
-    MetaSnapshotData, MetaStateMachine, Scope, TenantLimits, TokenManager,
+    CatalogStatus, EngineType, MetaCommand, MetaConfig, MetaEngine, MetaResponse, MetaSnapshotData,
+    MetaStateMachine, Scope, TenantLimits, TokenManager,
 };
 
 const TEST_ACCOUNT: u64 = 1;
 
 fn new_engine() -> Arc<MetaEngine> {
-    let engine = Arc::new(MetaEngine::new(MetaConfig::new(b"integration-test-secret-key".to_vec())));
+    let engine = Arc::new(MetaEngine::new(MetaConfig::new(
+        b"integration-test-secret-key".to_vec(),
+    )));
     engine.create_account("test-org".into()).unwrap();
     engine
 }
@@ -31,13 +33,11 @@ fn test_full_tenant_lifecycle() {
     let sm = new_sm(&engine);
 
     // 1. Create tenant
-    let MetaResponse::TenantCreated { tenant_id } =
-        sm.apply_command(MetaCommand::CreateTenant {
-            account_id: TEST_ACCOUNT,
-            name: "acme-corp".into(),
-            limits: TenantLimits::default(),
-        })
-    else {
+    let MetaResponse::TenantCreated { tenant_id } = sm.apply_command(MetaCommand::CreateTenant {
+        account_id: TEST_ACCOUNT,
+        name: "acme-corp".into(),
+        limits: TenantLimits::default(),
+    }) else {
         panic!("expected TenantCreated");
     };
 
@@ -123,10 +123,7 @@ fn test_full_tenant_lifecycle() {
     let MetaResponse::ApiKeyCreated { key_id, raw_key } =
         sm.apply_command(MetaCommand::CreateApiKey {
             tenant_id,
-            scopes: vec![
-                Scope::TenantAdmin,
-                Scope::Catalog("analytics".into()),
-            ],
+            scopes: vec![Scope::TenantAdmin, Scope::Catalog("analytics".into())],
         })
     else {
         panic!("expected ApiKeyCreated");
@@ -328,9 +325,9 @@ fn test_snapshot_restore_preserves_full_state() {
     let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
 
     // Restore into fresh engine
-    let engine2 = Arc::new(MetaEngine::new(
-        MetaConfig::new(b"integration-test-secret-key".to_vec()),
-    ));
+    let engine2 = Arc::new(MetaEngine::new(MetaConfig::new(
+        b"integration-test-secret-key".to_vec(),
+    )));
     let (data, _): (MetaSnapshotData, _) =
         bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
     engine2.restore_from_snapshot(data);
@@ -378,12 +375,10 @@ fn test_token_integration_with_engine() {
         limits: TenantLimits::default(),
     });
 
-    let MetaResponse::ApiKeyCreated { key_id, .. } =
-        sm.apply_command(MetaCommand::CreateApiKey {
-            tenant_id: 1,
-            scopes: vec![Scope::Catalog("analytics".into())],
-        })
-    else {
+    let MetaResponse::ApiKeyCreated { key_id, .. } = sm.apply_command(MetaCommand::CreateApiKey {
+        tenant_id: 1,
+        scopes: vec![Scope::Catalog("analytics".into())],
+    }) else {
         panic!("expected ApiKeyCreated");
     };
 
@@ -492,8 +487,7 @@ fn test_routing_table_across_tenants() {
     assert_eq!(table.len(), 4);
 
     // Each routing entry should have a unique raft_group_id
-    let group_ids: std::collections::HashSet<u64> =
-        table.iter().map(|r| r.raft_group_id).collect();
+    let group_ids: std::collections::HashSet<u64> = table.iter().map(|r| r.raft_group_id).collect();
     assert_eq!(group_ids.len(), 4);
 }
 
@@ -530,15 +524,15 @@ fn test_deterministic_replay() {
         },
     ];
 
-    let engine1 = Arc::new(MetaEngine::new(
-        MetaConfig::new(b"integration-test-secret-key".to_vec()),
-    ));
+    let engine1 = Arc::new(MetaEngine::new(MetaConfig::new(
+        b"integration-test-secret-key".to_vec(),
+    )));
     engine1.create_account("test-org".into()).unwrap();
     let sm1 = MetaStateMachine::new(engine1.clone());
 
-    let engine2 = Arc::new(MetaEngine::new(
-        MetaConfig::new(b"integration-test-secret-key".to_vec()),
-    ));
+    let engine2 = Arc::new(MetaEngine::new(MetaConfig::new(
+        b"integration-test-secret-key".to_vec(),
+    )));
     engine2.create_account("test-org".into()).unwrap();
     let sm2 = MetaStateMachine::new(engine2.clone());
 

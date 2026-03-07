@@ -1222,7 +1222,10 @@ mod tests {
 
         run_async(async {
             let vote = openraft::impls::Vote::<TestConfig> {
-                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 committed: false,
             };
             let msg = RpcMessage::<TestConfig>::Vote {
@@ -1281,7 +1284,9 @@ mod tests {
             // Read into a reusable buffer
             let mut read_buf = Vec::new();
             let mut read_cursor = std::io::Cursor::new(&buffer[..]);
-            let n = read_frame_into(&mut read_cursor, &mut read_buf).await.unwrap();
+            let n = read_frame_into(&mut read_cursor, &mut read_buf)
+                .await
+                .unwrap();
             assert_eq!(n, data.len());
             assert_eq!(&read_buf[..], data);
         });
@@ -1305,13 +1310,19 @@ mod tests {
         use crate::multi::test_support::TestConfig;
 
         let vote = openraft::impls::Vote::<TestConfig> {
-            leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                term: 1,
+                node_id: 1,
+            },
             committed: false,
         };
         let msg = RpcMessage::<TestConfig>::Vote {
             request_id: 1,
             group_id: 0,
-            rpc: openraft::raft::VoteRequest { vote, last_log_id: None },
+            rpc: openraft::raft::VoteRequest {
+                vote,
+                last_log_id: None,
+            },
         };
 
         let mut buf = Vec::new();
@@ -1354,7 +1365,9 @@ mod tests {
             let mut buffer = Vec::new();
             let mut cursor = std::io::Cursor::new(&mut buffer);
 
-            let returned = write_frame_vectored(&mut cursor, data.clone()).await.unwrap();
+            let returned = write_frame_vectored(&mut cursor, data.clone())
+                .await
+                .unwrap();
             // Returned buffer should be cleared for reuse
             assert!(returned.is_empty());
             assert!(returned.capacity() >= data.len());
@@ -1428,9 +1441,15 @@ mod tests {
             request_data.extend_from_slice(&len.to_le_bytes());
             request_data.extend_from_slice(payload);
 
-            let result = conn.send_request(request_data, Duration::from_secs(5)).await;
+            let result = conn
+                .send_request(request_data, Duration::from_secs(5))
+                .await;
             // The echo server responds with >= 9 bytes, which is valid
-            assert!(result.is_ok(), "send_request should succeed: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "send_request should succeed: {:?}",
+                result.err()
+            );
 
             server.abort();
         });
@@ -1450,13 +1469,8 @@ mod tests {
 
             let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
             let (read_half, write_half) = stream.into_split();
-            let conn = GroupConnection::new(
-                Box::new(read_half),
-                Box::new(write_half),
-                0,
-                64 * 1024,
-                256,
-            );
+            let conn =
+                GroupConnection::new(Box::new(read_half), Box::new(write_half), 0, 64 * 1024, 256);
 
             // Should be usable when alive and within TTL
             assert!(conn.is_usable(Duration::from_secs(300)));
@@ -1479,13 +1493,8 @@ mod tests {
 
             let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
             let (read_half, write_half) = stream.into_split();
-            let conn = GroupConnection::new(
-                Box::new(read_half),
-                Box::new(write_half),
-                0,
-                64 * 1024,
-                256,
-            );
+            let conn =
+                GroupConnection::new(Box::new(read_half), Box::new(write_half), 0, 64 * 1024, 256);
 
             // Kill the connection
             conn.alive.store(false, Ordering::Release);

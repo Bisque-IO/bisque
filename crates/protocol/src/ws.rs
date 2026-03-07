@@ -71,21 +71,13 @@ pub enum ServerMessage {
     },
 
     /// Push: server heartbeat / keepalive with seq checkpoint.
-    Heartbeat {
-        seq: u64,
-        server_time_ms: u64,
-    },
+    Heartbeat { seq: u64, server_time_ms: u64 },
 
     /// Push: client fell behind on catalog events, must re-fetch.
-    SnapshotRequired {
-        seq: u64,
-        catalog: String,
-    },
+    SnapshotRequired { seq: u64, catalog: String },
 
     /// Graceful close notification. Client should reconnect if reason is `ttl_refresh`.
-    Close {
-        reason: String,
-    },
+    Close { reason: String },
 }
 
 /// Result wrapper for request/response.
@@ -108,45 +100,23 @@ pub enum ResponseResult {
 #[serde(tag = "method")]
 pub enum ResponseData {
     #[serde(rename = "list_catalogs")]
-    ListCatalogs {
-        catalogs: Vec<serde_json::Value>,
-    },
+    ListCatalogs { catalogs: Vec<serde_json::Value> },
     #[serde(rename = "create_catalog")]
-    CreateCatalog {
-        catalog_id: u64,
-        raft_group_id: u64,
-    },
+    CreateCatalog { catalog_id: u64, raft_group_id: u64 },
     #[serde(rename = "get_catalog")]
-    GetCatalog {
-        catalog: serde_json::Value,
-    },
+    GetCatalog { catalog: serde_json::Value },
     #[serde(rename = "get_tenant")]
-    GetTenant {
-        tenant: serde_json::Value,
-    },
+    GetTenant { tenant: serde_json::Value },
     #[serde(rename = "list_operations")]
-    ListOperations {
-        operations: Vec<serde_json::Value>,
-    },
+    ListOperations { operations: Vec<serde_json::Value> },
     #[serde(rename = "get_operation")]
-    GetOperation {
-        operation: serde_json::Value,
-    },
+    GetOperation { operation: serde_json::Value },
     #[serde(rename = "cancel_operation")]
-    CancelOperation {
-        op_id: String,
-        message: String,
-    },
+    CancelOperation { op_id: String, message: String },
     #[serde(rename = "submit_reindex")]
-    SubmitReindex {
-        op_id: String,
-        message: String,
-    },
+    SubmitReindex { op_id: String, message: String },
     #[serde(rename = "submit_compact")]
-    SubmitCompact {
-        op_id: String,
-        message: String,
-    },
+    SubmitCompact { op_id: String, message: String },
     #[serde(rename = "create_api_key")]
     CreateApiKey {
         key_id: u64,
@@ -154,9 +124,7 @@ pub enum ResponseData {
         token: String,
     },
     #[serde(rename = "cluster_status")]
-    ClusterStatus {
-        status: serde_json::Value,
-    },
+    ClusterStatus { status: serde_json::Value },
     #[serde(rename = "pinned")]
     Pinned,
     #[serde(rename = "unpinned")]
@@ -207,9 +175,7 @@ pub enum ClientMessage {
     },
 
     /// Client heartbeat — includes last_seen_seq for gap detection.
-    Heartbeat {
-        last_seen_seq: u64,
-    },
+    Heartbeat { last_seen_seq: u64 },
 
     /// Graceful close.
     Close,

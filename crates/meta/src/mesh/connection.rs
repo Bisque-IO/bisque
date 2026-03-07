@@ -27,10 +27,10 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
+use super::MeshConfig;
 use super::protocol::MeshMessage;
 use super::state::ClusterState;
 use super::tls::MeshStream;
-use super::MeshConfig;
 
 /// Maximum allowed frame size for mesh protocol (16 MiB).
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -492,7 +492,10 @@ pub async fn inbound_handshake(
         .map_err(MeshConnectionError::Codec)?;
     write_frame(stream, &encoded).await?;
 
-    info!(peer = peer_node_id, "Inbound mesh peer connected and synced");
+    info!(
+        peer = peer_node_id,
+        "Inbound mesh peer connected and synced"
+    );
 
     Ok(peer_node_id)
 }
@@ -523,15 +526,13 @@ pub async fn run_inbound_loop(
             loop {
                 match rx.recv().await {
                     Ok(msg) => match msg.encode_to_vec() {
-                        Ok(encoded) => {
-                            match outbound_tx.try_send(encoded) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    warn!("Outbound channel full, dropping message to peer");
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Ok(encoded) => match outbound_tx.try_send(encoded) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!("Outbound channel full, dropping message to peer");
                             }
-                        }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        },
                         Err(e) => {
                             warn!("Failed to encode mesh message: {e}");
                         }
@@ -671,9 +672,7 @@ fn apply_message(state: &ClusterState, msg: &MeshMessage) -> bool {
             health,
             seq,
         } => state.apply_heartbeat(*node_id, health.clone(), *seq),
-        MeshMessage::Handshake { .. }
-        | MeshMessage::RequestSnapshot
-        | MeshMessage::Close => false,
+        MeshMessage::Handshake { .. } | MeshMessage::RequestSnapshot | MeshMessage::Close => false,
     }
 }
 

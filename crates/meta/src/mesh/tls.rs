@@ -183,6 +183,5 @@ impl AsyncWrite for MeshStream {
 /// by node ID, not DNS. The CA must issue certs with this SAN or use
 /// IP-based SANs.
 pub fn mesh_server_name(node_id: u64) -> ServerName<'static> {
-    ServerName::try_from(format!("mesh-node-{node_id}"))
-        .expect("mesh server name is valid DNS")
+    ServerName::try_from(format!("mesh-node-{node_id}")).expect("mesh server name is valid DNS")
 }

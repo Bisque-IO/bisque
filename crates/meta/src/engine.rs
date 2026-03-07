@@ -98,7 +98,10 @@ impl MetaEngine {
     pub fn delete_account(&self, account_id: u64) -> Result<()> {
         // Check no tenants still reference this account
         let tenants = self.tenants.read();
-        let count = tenants.values().filter(|t| t.account_id == account_id).count();
+        let count = tenants
+            .values()
+            .filter(|t| t.account_id == account_id)
+            .count();
         if count > 0 {
             return Err(Error::InvalidState(format!(
                 "account {account_id} has {count} tenant(s)"
@@ -190,12 +193,7 @@ impl MetaEngine {
 
     // ── Membership operations ─────────────────────────────────────────
 
-    pub fn add_membership(
-        &self,
-        user_id: u64,
-        account_id: u64,
-        role: AccountRole,
-    ) -> Result<()> {
+    pub fn add_membership(&self, user_id: u64, account_id: u64, role: AccountRole) -> Result<()> {
         if !self.users.read().contains_key(&user_id) {
             return Err(Error::NotFound(format!("user {user_id}")));
         }
@@ -234,12 +232,7 @@ impl MetaEngine {
         Ok(())
     }
 
-    pub fn set_account_role(
-        &self,
-        user_id: u64,
-        account_id: u64,
-        role: AccountRole,
-    ) -> Result<()> {
+    pub fn set_account_role(&self, user_id: u64, account_id: u64, role: AccountRole) -> Result<()> {
         let mut memberships = self.memberships.write();
         let m = memberships
             .iter_mut()
@@ -468,10 +461,9 @@ impl MetaEngine {
         }
 
         // Check name uniqueness within tenant
-        if catalogs
-            .values()
-            .any(|c| c.tenant_id == tenant_id && c.name == name && c.status != CatalogStatus::Deleted)
-        {
+        if catalogs.values().any(|c| {
+            c.tenant_id == tenant_id && c.name == name && c.status != CatalogStatus::Deleted
+        }) {
             return Err(Error::CatalogAlreadyExists(name, tenant_id));
         }
         drop(catalogs);
@@ -532,7 +524,9 @@ impl MetaEngine {
         self.catalogs
             .read()
             .values()
-            .find(|c| c.tenant_id == tenant_id && c.name == name && c.status != CatalogStatus::Deleted)
+            .find(|c| {
+                c.tenant_id == tenant_id && c.name == name && c.status != CatalogStatus::Deleted
+            })
             .cloned()
     }
 
@@ -586,11 +580,7 @@ impl MetaEngine {
 
     // ── Routing ────────────────────────────────────────────────────────
 
-    pub fn update_leader(
-        &self,
-        raft_group_id: u64,
-        leader_node_id: Option<u64>,
-    ) -> Result<()> {
+    pub fn update_leader(&self, raft_group_id: u64, leader_node_id: Option<u64>) -> Result<()> {
         let mut routing = self.routing.write();
         let entry = routing
             .get_mut(&raft_group_id)
@@ -658,9 +648,7 @@ impl MetaEngine {
 
     pub fn revoke_api_key(&self, key_id: u64) -> Result<()> {
         let mut keys = self.api_keys.write();
-        let key = keys
-            .get_mut(&key_id)
-            .ok_or(Error::ApiKeyNotFound(key_id))?;
+        let key = keys.get_mut(&key_id).ok_or(Error::ApiKeyNotFound(key_id))?;
         key.revoked = true;
         info!(key_id, "revoked API key");
         Ok(())
@@ -861,7 +849,9 @@ mod tests {
             max_catalogs: 1,
             ..TenantLimits::default()
         };
-        let tid = engine.create_tenant(TEST_ACCOUNT, "acme".into(), limits).unwrap();
+        let tid = engine
+            .create_tenant(TEST_ACCOUNT, "acme".into(), limits)
+            .unwrap();
         engine
             .create_catalog(tid, "first".into(), EngineType::Lance, "{}".into())
             .unwrap();
@@ -913,9 +903,7 @@ mod tests {
         let (cid, gid) = engine
             .create_catalog(tid, "analytics".into(), EngineType::Lance, "{}".into())
             .unwrap();
-        engine
-            .update_catalog_placement(cid, vec![1, 2, 3])
-            .unwrap();
+        engine.update_catalog_placement(cid, vec![1, 2, 3]).unwrap();
 
         let cat = engine.get_catalog(cid).unwrap();
         assert_eq!(cat.placement, vec![1, 2, 3]);
@@ -1130,9 +1118,7 @@ mod tests {
     #[test]
     fn test_update_catalog_placement_not_found() {
         let engine = test_engine();
-        let err = engine
-            .update_catalog_placement(999, vec![1])
-            .unwrap_err();
+        let err = engine.update_catalog_placement(999, vec![1]).unwrap_err();
         assert!(matches!(err, Error::CatalogNotFound(999)));
     }
 
@@ -1443,8 +1429,12 @@ mod tests {
             .unwrap();
         assert_eq!(t1, t2);
 
-        let (k1, raw1) = engine1.create_api_key(t1, vec![Scope::TenantAdmin]).unwrap();
-        let (k2, raw2) = engine2.create_api_key(t2, vec![Scope::TenantAdmin]).unwrap();
+        let (k1, raw1) = engine1
+            .create_api_key(t1, vec![Scope::TenantAdmin])
+            .unwrap();
+        let (k2, raw2) = engine2
+            .create_api_key(t2, vec![Scope::TenantAdmin])
+            .unwrap();
 
         // Same key_id + tenant_id + secret = same raw key
         assert_eq!(k1, k2);
@@ -1609,15 +1599,19 @@ mod tests {
             max_catalogs: 1,
             ..TenantLimits::default()
         };
-        let tid = engine.create_tenant(TEST_ACCOUNT, "acme".into(), limits).unwrap();
+        let tid = engine
+            .create_tenant(TEST_ACCOUNT, "acme".into(), limits)
+            .unwrap();
         let (cid, _) = engine
             .create_catalog(tid, "first".into(), EngineType::Lance, "{}".into())
             .unwrap();
 
         // At limit
-        assert!(engine
-            .create_catalog(tid, "second".into(), EngineType::Lance, "{}".into())
-            .is_err());
+        assert!(
+            engine
+                .create_catalog(tid, "second".into(), EngineType::Lance, "{}".into())
+                .is_err()
+        );
 
         // Delete first, should free up the slot
         engine

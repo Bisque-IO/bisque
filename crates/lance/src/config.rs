@@ -259,7 +259,9 @@ impl BisqueLanceConfig {
     /// Walks every table's `segments/` directory, collecting relative paths
     /// and sizes for all files. Used by the snapshot builder to tell fresh
     /// nodes what files they need to fetch.
-    pub async fn build_file_manifest(&self) -> std::io::Result<Vec<crate::types::SnapshotFileEntry>> {
+    pub async fn build_file_manifest(
+        &self,
+    ) -> std::io::Result<Vec<crate::types::SnapshotFileEntry>> {
         use tokio::fs;
 
         let mut entries = Vec::new();

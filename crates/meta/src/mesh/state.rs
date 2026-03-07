@@ -69,8 +69,10 @@ impl ClusterState {
         health: NodeHealth,
         seq: u64,
     ) {
-        let ops_map: HashMap<String, OperationSnapshot> =
-            operations.into_iter().map(|op| (op.id.clone(), op)).collect();
+        let ops_map: HashMap<String, OperationSnapshot> = operations
+            .into_iter()
+            .map(|op| (op.id.clone(), op))
+            .collect();
 
         self.nodes.insert(
             node_id,
@@ -307,7 +309,12 @@ mod tests {
         assert_eq!(state.all_remote_operations().len(), 0);
     }
 
-    fn make_op_with_finished(id: &str, node_id: u64, status: u8, finished_at: Option<&str>) -> OperationSnapshot {
+    fn make_op_with_finished(
+        id: &str,
+        node_id: u64,
+        status: u8,
+        finished_at: Option<&str>,
+    ) -> OperationSnapshot {
         OperationSnapshot {
             id: id.into(),
             node_id,
@@ -337,10 +344,18 @@ mod tests {
 
         // Done op with recent finish — should NOT be evicted
         let recent = chrono::Utc::now().to_rfc3339();
-        state.apply_operation_update(2, make_op_with_finished("done-recent", 2, 2, Some(&recent)), 2);
+        state.apply_operation_update(
+            2,
+            make_op_with_finished("done-recent", 2, 2, Some(&recent)),
+            2,
+        );
 
         // Done op with old finish — should be evicted
-        state.apply_operation_update(2, make_op_with_finished("done-old", 2, 2, Some("2020-01-01T00:00:00Z")), 3);
+        state.apply_operation_update(
+            2,
+            make_op_with_finished("done-old", 2, 2, Some("2020-01-01T00:00:00Z")),
+            3,
+        );
 
         // Failed op with no finished_at — should be evicted (terminal with no timestamp)
         state.apply_operation_update(2, make_op_with_finished("failed-no-ts", 2, 3, None), 4);

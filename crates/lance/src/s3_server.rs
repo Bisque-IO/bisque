@@ -795,7 +795,6 @@ async fn cancel_operation(
     }
 }
 
-
 /// Filter S3 storage options to exclude credentials.
 ///
 /// Returns only non-sensitive options (region, endpoint, etc.) that are safe
@@ -885,7 +884,8 @@ async fn get_object(
     }
 
     metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "get").increment(1);
-    metrics::histogram!("bisque_request_latency_seconds", "protocol" => "s3", "op" => "get").record(req_start.elapsed().as_secs_f64());
+    metrics::histogram!("bisque_request_latency_seconds", "protocol" => "s3", "op" => "get")
+        .record(req_start.elapsed().as_secs_f64());
     Ok(builder.body(body).unwrap())
 }
 
@@ -940,7 +940,8 @@ async fn head_object(
     let last_modified = meta.last_modified.to_rfc2822();
 
     metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "head").increment(1);
-    metrics::histogram!("bisque_request_latency_seconds", "protocol" => "s3", "op" => "head").record(req_start.elapsed().as_secs_f64());
+    metrics::histogram!("bisque_request_latency_seconds", "protocol" => "s3", "op" => "head")
+        .record(req_start.elapsed().as_secs_f64());
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-length", meta.size.to_string())

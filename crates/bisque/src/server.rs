@@ -10,26 +10,23 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Extension, Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::Json;
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use bisque_lance::{
     BisqueLance, BisqueLanceConfig, CatalogEventBus, LanceManifestManager, LanceRaftNode,
-    LanceStateMachine, S3ServerState, WriteBatcherConfig, s3_router,
-    flight::serve_flight,
-};
-use bisque_meta::engine::MetaEngine;
-use bisque_meta::token::{self, TokenClaims, TokenManager};
-use bisque_meta::types::{
-    Account, CatalogEntry, EngineType, Scope, Tenant, TenantLimits,
+    LanceStateMachine, S3ServerState, WriteBatcherConfig, flight::serve_flight, s3_router,
 };
 use bisque_meta::MetaConfig;
+use bisque_meta::engine::MetaEngine;
+use bisque_meta::token::{self, TokenClaims, TokenManager};
+use bisque_meta::types::{Account, CatalogEntry, EngineType, Scope, Tenant, TenantLimits};
 use bisque_raft::multi::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
     MultiRaftManager, MultiplexedLogStorage, NodeAddressResolver,
@@ -52,8 +49,8 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
     // -----------------------------------------------------------------------
     // 1. Meta engine (control plane)
     // -----------------------------------------------------------------------
-    let meta_config = MetaConfig::new(config.token_secret.clone())
-        .with_token_ttl_secs(config.token_ttl_secs);
+    let meta_config =
+        MetaConfig::new(config.token_secret.clone()).with_token_ttl_secs(config.token_ttl_secs);
 
     let meta_engine = Arc::new(MetaEngine::new(meta_config));
     let token_manager = Arc::new(TokenManager::new(config.token_secret.clone()));
@@ -83,8 +80,7 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
 
     // 2b. Set up Raft log storage (memory-mapped).
     std::fs::create_dir_all(&raft_dir)?;
-    let storage_config = MmapStorageConfig::new(&raft_dir)
-        .with_segment_size(8 * 1024 * 1024);
+    let storage_config = MmapStorageConfig::new(&raft_dir).with_segment_size(8 * 1024 * 1024);
     let storage = MultiplexedLogStorage::new(storage_config).await?;
     info!(raft_dir = %raft_dir.display(), "raft log storage initialized");
 
@@ -92,17 +88,16 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
     // M13: Register with actual HTTP addr for multi-node compatibility.
     let registry = Arc::new(DefaultNodeRegistry::new());
     registry.register(node_id, config.http_addr);
-    let transport = BisqueTcpTransport::new(
-        BisqueTcpTransportConfig::default(),
-        registry,
-    );
+    let transport = BisqueTcpTransport::new(BisqueTcpTransportConfig::default(), registry);
 
     // 2d. Create the multi-raft manager.
-    let manager: Arc<MultiRaftManager<
-        bisque_lance::LanceTypeConfig,
-        BisqueTcpTransport<bisque_lance::LanceTypeConfig>,
-        MultiplexedLogStorage<bisque_lance::LanceTypeConfig>,
-    >> = Arc::new(MultiRaftManager::new(transport, storage));
+    let manager: Arc<
+        MultiRaftManager<
+            bisque_lance::LanceTypeConfig,
+            BisqueTcpTransport<bisque_lance::LanceTypeConfig>,
+            MultiplexedLogStorage<bisque_lance::LanceTypeConfig>,
+        >,
+    > = Arc::new(MultiRaftManager::new(transport, storage));
 
     // 2e. MDBX manifest for crash-consistent catalog metadata and WAL.
     let manifest_dir = config.data_dir.join("manifest");
@@ -174,7 +169,10 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
         if elected {
             info!(node_id, "raft node is leader");
         } else {
-            warn!(node_id, "raft node is NOT leader after 2s — writes may fail until election completes");
+            warn!(
+                node_id,
+                "raft node is NOT leader after 2s — writes may fail until election completes"
+            );
         }
     }
 
@@ -202,7 +200,10 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
         .route("/accounts/{account_id}", get(get_account))
         .route("/tenants", post(create_tenant))
         .route("/tenants/{tenant_id}", get(get_tenant))
-        .route("/tenants/{tenant_id}/catalogs", post(create_catalog).get(list_catalogs))
+        .route(
+            "/tenants/{tenant_id}/catalogs",
+            post(create_catalog).get(list_catalogs),
+        )
         .route("/tenants/{tenant_id}/api-keys", post(create_api_key))
         .route("/api-keys/{key_id}", delete(revoke_api_key))
         .layer(axum::middleware::from_fn(auth_middleware))
@@ -210,8 +211,7 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
         .with_state(app_state.clone());
 
     // Health check (no auth)
-    let health_route = axum::Router::new()
-        .route("/_bisque/health", get(health_check));
+    let health_route = axum::Router::new().route("/_bisque/health", get(health_check));
 
     // Unified WebSocket (auth via handshake frame)
     let ws_state = WsState {
@@ -219,8 +219,8 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
         auth: auth_state.clone(),
         ip_connections: Arc::new(dashmap::DashMap::new()),
     };
-    let ws_route = axum::Router::new()
-        .route("/_bisque/ws", get(unified_ws_handler).with_state(ws_state));
+    let ws_route =
+        axum::Router::new().route("/_bisque/ws", get(unified_ws_handler).with_state(ws_state));
 
     // Lance S3-compatible API routes
     let s3_routes = s3_router(s3_state);
@@ -235,10 +235,9 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
 
     // Serve static UI files if ui_dir is configured
     if let Some(ref ui_dir) = config.ui_dir {
-        let serve_dir = tower_http::services::ServeDir::new(ui_dir)
-            .not_found_service(tower_http::services::ServeFile::new(
-                ui_dir.join("index.html"),
-            ));
+        let serve_dir = tower_http::services::ServeDir::new(ui_dir).not_found_service(
+            tower_http::services::ServeFile::new(ui_dir.join("index.html")),
+        );
         app = app.fallback_service(serve_dir);
         info!(ui_dir = %ui_dir.display(), "serving static UI files");
     }
@@ -428,7 +427,11 @@ async fn create_account(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     info!(account_id, name = %req.name, "account created");
-    Ok((StatusCode::CREATED, Json(CreateAccountResponse { account_id })).into_response())
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateAccountResponse { account_id }),
+    )
+        .into_response())
 }
 
 async fn list_accounts(
@@ -484,11 +487,17 @@ async fn create_tenant(
     }
 
     let limits = req.limits.unwrap_or_default();
-    let result = state.meta_engine.create_tenant(req.account_id, req.name.clone(), limits);
+    let result = state
+        .meta_engine
+        .create_tenant(req.account_id, req.name.clone(), limits);
     match result {
         Ok(tenant_id) => {
             info!(tenant_id, name = %req.name, "tenant created");
-            Ok((StatusCode::CREATED, Json(CreateTenantResponse { tenant_id })).into_response())
+            Ok((
+                StatusCode::CREATED,
+                Json(CreateTenantResponse { tenant_id }),
+            )
+                .into_response())
         }
         Err(e) => {
             if e.to_string().contains("already exists") {
@@ -590,12 +599,16 @@ async fn create_api_key(
         return Err(ApiError::Forbidden("tenant admin scope required".into()));
     }
 
-    let result = state.meta_engine.create_api_key(tenant_id, req.scopes.clone());
+    let result = state
+        .meta_engine
+        .create_api_key(tenant_id, req.scopes.clone());
     match result {
         Ok((key_id, raw_key)) => {
             // Issue a bearer token for convenience
             let now = chrono::Utc::now().timestamp();
-            let ttl = req.ttl_secs.unwrap_or(state.meta_engine.config().token_ttl_secs);
+            let ttl = req
+                .ttl_secs
+                .unwrap_or(state.meta_engine.config().token_ttl_secs);
             let claims = TokenClaims {
                 user_id: None,
                 account_id: None,

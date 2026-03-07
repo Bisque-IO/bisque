@@ -5002,10 +5002,10 @@ mod tests {
                 file.read_exact(&mut data).unwrap();
 
                 // Corrupt first record: flip CRC bytes
-                let rlen =
-                    u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                let rlen = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
                 let crc_offset = 4 + rlen - 8;
-                file.seek(std::io::SeekFrom::Start(crc_offset as u64)).unwrap();
+                file.seek(std::io::SeekFrom::Start(crc_offset as u64))
+                    .unwrap();
                 file.write_all(&[0xFF; 8]).unwrap();
                 file.sync_all().unwrap();
             }
@@ -5018,7 +5018,11 @@ mod tests {
 
             // First record is corrupt — scan stops immediately
             let result = log.try_get_log_entries(1..4).await.unwrap();
-            assert_eq!(result.len(), 0, "All entries lost when first record is corrupt");
+            assert_eq!(
+                result.len(),
+                0,
+                "All entries lost when first record is corrupt"
+            );
 
             storage.stop();
         });
@@ -5075,7 +5079,8 @@ mod tests {
                 let second_start = 4 + rlen1;
 
                 // Overwrite length field of second record with 0xFFFFFFFF
-                file.seek(std::io::SeekFrom::Start(second_start as u64)).unwrap();
+                file.seek(std::io::SeekFrom::Start(second_start as u64))
+                    .unwrap();
                 file.write_all(&0xFFFF_FFFFu32.to_le_bytes()).unwrap();
                 file.sync_all().unwrap();
             }
@@ -5088,7 +5093,11 @@ mod tests {
 
             // Only first entry should survive
             let result = log.try_get_log_entries(1..4).await.unwrap();
-            assert_eq!(result.len(), 1, "Only first entry should survive bad length field");
+            assert_eq!(
+                result.len(),
+                1,
+                "Only first entry should survive bad length field"
+            );
             assert_eq!(result[0].log_id.index, 1);
 
             storage.stop();
@@ -5145,7 +5154,8 @@ mod tests {
                 let rlen1 = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
                 let second_start = 4 + rlen1;
                 // Type byte is at second_start + 4 (after length field)
-                file.seek(std::io::SeekFrom::Start((second_start + 4) as u64)).unwrap();
+                file.seek(std::io::SeekFrom::Start((second_start + 4) as u64))
+                    .unwrap();
                 file.write_all(&[0xFF]).unwrap(); // Invalid record type
                 file.sync_all().unwrap();
             }
@@ -5158,7 +5168,11 @@ mod tests {
 
             // CRC will mismatch due to corrupted type byte — scan stops
             let result = log.try_get_log_entries(1..4).await.unwrap();
-            assert!(result.len() <= 1, "Corrupt type byte should stop scan: got {}", result.len());
+            assert!(
+                result.len() <= 1,
+                "Corrupt type byte should stop scan: got {}",
+                result.len()
+            );
 
             storage.stop();
         });
@@ -5233,7 +5247,11 @@ mod tests {
 
             // Only the first entry should survive
             let result = log.try_get_log_entries(1..3).await.unwrap();
-            assert_eq!(result.len(), 1, "Only first entry should survive partial write");
+            assert_eq!(
+                result.len(),
+                1,
+                "Only first entry should survive partial write"
+            );
             assert_eq!(result[0].log_id.index, 1);
 
             // Should be able to write new entries after recovery
@@ -5472,7 +5490,12 @@ mod tests {
 
                 // Verify entries before purge point are gone
                 let result = log.try_get_log_entries(1..(purge_idx + 1)).await.unwrap();
-                assert_eq!(result.len(), 0, "Purged entries should be gone after purge to {}", purge_idx);
+                assert_eq!(
+                    result.len(),
+                    0,
+                    "Purged entries should be gone after purge to {}",
+                    purge_idx
+                );
 
                 // Verify entries after purge point remain
                 let result = log.try_get_log_entries((purge_idx + 1)..51).await.unwrap();
@@ -5575,7 +5598,8 @@ mod tests {
 
             let state = log.get_log_state().await.unwrap();
             assert_eq!(
-                state.last_purged_log_id.unwrap().index, 5,
+                state.last_purged_log_id.unwrap().index,
+                5,
                 "Purge should be capped at floor - 1"
             );
 
@@ -5694,7 +5718,11 @@ mod tests {
 
             // Should have many segments
             let seg_count = count_segment_files(tmp.path());
-            assert!(seg_count >= 10, "Should have many segments: got {}", seg_count);
+            assert!(
+                seg_count >= 10,
+                "Should have many segments: got {}",
+                seg_count
+            );
 
             storage.stop();
         });
@@ -5737,7 +5765,11 @@ mod tests {
             let mut log = storage.get_log_storage(0).await.unwrap();
 
             let result = log.try_get_log_entries(1..31).await.unwrap();
-            assert_eq!(result.len(), 30, "All entries should survive recovery with rapid rotation");
+            assert_eq!(
+                result.len(),
+                30,
+                "All entries should survive recovery with rapid rotation"
+            );
 
             storage.stop();
         });
@@ -5893,7 +5925,10 @@ mod tests {
         let result = validate_record(&buf[4..], 100);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("exceeds max_record_size"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds max_record_size"),
             "Should report size exceeded"
         );
     }
@@ -6070,10 +6105,18 @@ mod tests {
         idx.truncate_from(6);
 
         for i in 1..=5 {
-            assert!(idx.get(i).is_some(), "Entry {} should survive truncation", i);
+            assert!(
+                idx.get(i).is_some(),
+                "Entry {} should survive truncation",
+                i
+            );
         }
         for i in 6..=10 {
-            assert!(idx.get(i).is_none(), "Entry {} should be removed by truncation", i);
+            assert!(
+                idx.get(i).is_none(),
+                "Entry {} should be removed by truncation",
+                i
+            );
         }
     }
 
@@ -6439,7 +6482,11 @@ mod tests {
             log.truncate_after(None).await.unwrap();
 
             let result = log.try_get_log_entries(1..6).await.unwrap();
-            assert_eq!(result.len(), 0, "All entries should be gone after truncate(None)");
+            assert_eq!(
+                result.len(),
+                0,
+                "All entries should be gone after truncate(None)"
+            );
 
             let state = log.get_log_state().await.unwrap();
             // last_log_id should be None after full truncation
@@ -6609,11 +6656,12 @@ mod tests {
                     offset += 4 + rlen;
                 }
                 // Corrupt CRC of last record
-                let rlen = u32::from_le_bytes(
-                    data[last_offset..last_offset + 4].try_into().unwrap(),
-                ) as usize;
+                let rlen =
+                    u32::from_le_bytes(data[last_offset..last_offset + 4].try_into().unwrap())
+                        as usize;
                 let crc_offset = last_offset + 4 + rlen - 8;
-                file.seek(std::io::SeekFrom::Start(crc_offset as u64)).unwrap();
+                file.seek(std::io::SeekFrom::Start(crc_offset as u64))
+                    .unwrap();
                 file.write_all(&[0xFF; 8]).unwrap();
                 file.sync_all().unwrap();
             }
@@ -6625,7 +6673,11 @@ mod tests {
             let mut log = storage.get_log_storage(0).await.unwrap();
 
             let result = log.try_get_log_entries(1..6).await.unwrap();
-            assert_eq!(result.len(), 4, "First 4 entries should survive last-record corruption");
+            assert_eq!(
+                result.len(),
+                4,
+                "First 4 entries should survive last-record corruption"
+            );
             for (i, entry) in result.iter().enumerate() {
                 assert_eq!(entry.log_id.index, (i + 1) as u64);
             }
@@ -6748,9 +6800,11 @@ mod tests {
                 // Write random garbage after valid data
                 if offset + 20 <= data.len() {
                     file.seek(std::io::SeekFrom::Start(offset as u64)).unwrap();
-                    file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-                                     0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
-                                     0x01, 0x02, 0x03, 0x04]).unwrap();
+                    file.write_all(&[
+                        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34, 0x56, 0x78,
+                        0x9A, 0xBC, 0xDE, 0xF0, 0x01, 0x02, 0x03, 0x04,
+                    ])
+                    .unwrap();
                     file.sync_all().unwrap();
                 }
             }
@@ -6762,7 +6816,11 @@ mod tests {
             let mut log = storage.get_log_storage(0).await.unwrap();
 
             let result = log.try_get_log_entries(1..4).await.unwrap();
-            assert_eq!(result.len(), 3, "All valid entries should survive garbage at end");
+            assert_eq!(
+                result.len(),
+                3,
+                "All valid entries should survive garbage at end"
+            );
 
             storage.stop();
         });
@@ -6833,7 +6891,10 @@ mod tests {
         });
         // The recovery panics because mmap reads reference offsets beyond truncated file.
         // This is acceptable — it prevents silent data corruption.
-        assert!(result.is_err(), "Truncated sealed segment should be detected");
+        assert!(
+            result.is_err(),
+            "Truncated sealed segment should be detected"
+        );
     }
 
     // ===================================================================
@@ -7239,7 +7300,12 @@ mod tests {
             // Read single entries
             for i in 1..=10 {
                 let result = log.try_get_log_entries(i..(i + 1)).await.unwrap();
-                assert_eq!(result.len(), 1, "Should read exactly one entry at index {}", i);
+                assert_eq!(
+                    result.len(),
+                    1,
+                    "Should read exactly one entry at index {}",
+                    i
+                );
                 assert_eq!(result[0].log_id.index, i);
             }
 
@@ -7356,14 +7422,18 @@ mod tests {
                 for _ in 0..3 {
                     let rlen =
                         u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    if rlen == 0 { break; }
+                    if rlen == 0 {
+                        break;
+                    }
                     offset += 4 + rlen;
                 }
                 // Now at vote record — corrupt its CRC
-                let rlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                let rlen =
+                    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                 if rlen > 0 {
                     let crc_offset = offset + 4 + rlen - 8;
-                    file.seek(std::io::SeekFrom::Start(crc_offset as u64)).unwrap();
+                    file.seek(std::io::SeekFrom::Start(crc_offset as u64))
+                        .unwrap();
                     file.write_all(&[0xFF; 8]).unwrap();
                     file.sync_all().unwrap();
                 }
@@ -7377,7 +7447,11 @@ mod tests {
 
             // First 3 entries should survive; scan stops at corrupt vote
             let result = log.try_get_log_entries(1..7).await.unwrap();
-            assert_eq!(result.len(), 3, "Entries before corrupt vote should survive");
+            assert_eq!(
+                result.len(),
+                3,
+                "Entries before corrupt vote should survive"
+            );
 
             storage.stop();
         });
@@ -7417,7 +7491,11 @@ mod tests {
             let mut log = storage.get_log_storage(0).await.unwrap();
 
             let result = log.try_get_log_entries(1..16).await.unwrap();
-            assert_eq!(result.len(), 15, "All entries should recover via CRC scan slow path");
+            assert_eq!(
+                result.len(),
+                15,
+                "All entries should recover via CRC scan slow path"
+            );
 
             storage.stop();
         });

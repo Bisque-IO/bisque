@@ -471,8 +471,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                 let total_bytes: u64 = manifest.iter().map(|e| e.size).sum();
                 info!(
                     files = manifest.len(),
-                    total_bytes,
-                    "Built snapshot file manifest"
+                    total_bytes, "Built snapshot file manifest"
                 );
                 manifest
             }

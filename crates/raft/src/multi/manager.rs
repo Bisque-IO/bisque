@@ -727,7 +727,9 @@ mod tests {
                 let m = manager.clone();
                 let cfg = raft_config.clone();
                 handles.push(tokio::spawn(async move {
-                    m.add_group(i, 1, cfg, TestStateMachine::new()).await.unwrap();
+                    m.add_group(i, 1, cfg, TestStateMachine::new())
+                        .await
+                        .unwrap();
                 }));
             }
             for h in handles {
@@ -774,7 +776,9 @@ mod tests {
                     let _ = m.get_group(1);
                     let _ = m.group_ids();
                     let _ = m.group_count();
-                    m.add_group(i, 1, cfg, TestStateMachine::new()).await.unwrap();
+                    m.add_group(i, 1, cfg, TestStateMachine::new())
+                        .await
+                        .unwrap();
                 }));
             }
             for h in handles {

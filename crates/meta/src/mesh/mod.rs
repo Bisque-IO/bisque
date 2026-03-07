@@ -38,13 +38,13 @@ pub use state::ClusterState;
 pub use tls::MeshTlsConfig;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch, Semaphore};
+use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -550,7 +550,9 @@ async fn liveness_loop(inner: Arc<MeshInner>) {
 
         // Evict stale completed/failed operations to prevent unbounded memory growth
         if !inner.config.operation_retention.is_zero() {
-            inner.state.evict_stale_operations(inner.config.operation_retention);
+            inner
+                .state
+                .evict_stale_operations(inner.config.operation_retention);
         }
     }
 }

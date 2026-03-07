@@ -1823,7 +1823,11 @@ mod tests {
         let decoded = RpcMessage::<C>::decode_from_slice(&encoded).unwrap();
 
         match decoded {
-            RpcMessage::AppendEntries { rpc, request_id, group_id } => {
+            RpcMessage::AppendEntries {
+                rpc,
+                request_id,
+                group_id,
+            } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(group_id, 7);
                 assert_eq!(rpc.entries.len(), 100);
@@ -1946,7 +1950,10 @@ mod tests {
         let decoded = RpcMessage::<C>::decode_from_slice(&encoded).unwrap();
 
         match decoded {
-            RpcMessage::Response { request_id, message: ResponseMessage::Vote(resp) } => {
+            RpcMessage::Response {
+                request_id,
+                message: ResponseMessage::Vote(resp),
+            } => {
                 assert_eq!(request_id, 77);
                 assert!(resp.vote_granted);
                 assert_eq!(resp.last_log_id.unwrap().index, 50);

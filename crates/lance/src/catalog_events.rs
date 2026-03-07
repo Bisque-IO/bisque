@@ -101,4 +101,3 @@ impl CatalogEventBus {
         self.seq.load(Ordering::Relaxed)
     }
 }
-

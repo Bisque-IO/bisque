@@ -19,19 +19,17 @@
 //! Raft → TableEngine → Lance → queryable via PromQL / SQL
 //! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use arrow_array::RecordBatch;
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
     TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
 };
-use arrow_array::RecordBatch;
 use dashmap::DashMap;
-use metrics::{
-    Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
-};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;

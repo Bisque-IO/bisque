@@ -38,12 +38,10 @@ impl MetaStateMachine {
 
     pub fn apply_command(&self, cmd: MetaCommand) -> MetaResponse {
         match cmd {
-            MetaCommand::CreateAccount { name } => {
-                match self.engine.create_account(name) {
-                    Ok(account_id) => MetaResponse::AccountCreated { account_id },
-                    Err(e) => MetaResponse::Error(e.to_string()),
-                }
-            }
+            MetaCommand::CreateAccount { name } => match self.engine.create_account(name) {
+                Ok(account_id) => MetaResponse::AccountCreated { account_id },
+                Err(e) => MetaResponse::Error(e.to_string()),
+            },
 
             MetaCommand::DeleteAccount { account_id } => {
                 match self.engine.delete_account(account_id) {
@@ -60,12 +58,10 @@ impl MetaStateMachine {
                 Err(e) => MetaResponse::Error(e.to_string()),
             },
 
-            MetaCommand::DisableUser { user_id } => {
-                match self.engine.disable_user(user_id) {
-                    Ok(()) => MetaResponse::Ok,
-                    Err(e) => MetaResponse::Error(e.to_string()),
-                }
-            }
+            MetaCommand::DisableUser { user_id } => match self.engine.disable_user(user_id) {
+                Ok(()) => MetaResponse::Ok,
+                Err(e) => MetaResponse::Error(e.to_string()),
+            },
 
             MetaCommand::UpdatePassword {
                 user_id,
@@ -113,20 +109,22 @@ impl MetaStateMachine {
                 Err(e) => MetaResponse::Error(e.to_string()),
             },
 
-            MetaCommand::RevokeTenantAccess {
-                user_id,
-                tenant_id,
-            } => match self.engine.revoke_tenant_access(user_id, tenant_id) {
-                Ok(()) => MetaResponse::Ok,
-                Err(e) => MetaResponse::Error(e.to_string()),
-            },
+            MetaCommand::RevokeTenantAccess { user_id, tenant_id } => {
+                match self.engine.revoke_tenant_access(user_id, tenant_id) {
+                    Ok(()) => MetaResponse::Ok,
+                    Err(e) => MetaResponse::Error(e.to_string()),
+                }
+            }
 
             MetaCommand::CreateTenant {
                 account_id,
                 name,
                 limits,
             } => {
-                match self.engine.create_tenant(account_id, name.clone(), limits.clone()) {
+                match self
+                    .engine
+                    .create_tenant(account_id, name.clone(), limits.clone())
+                {
                     Ok(tenant_id) => {
                         // Auto-create _otel catalog if configured
                         if self.engine.config().auto_create_otel_catalog {
@@ -156,12 +154,10 @@ impl MetaStateMachine {
                 }
             }
 
-            MetaCommand::DeleteTenant { tenant_id } => {
-                match self.engine.delete_tenant(tenant_id) {
-                    Ok(()) => MetaResponse::Ok,
-                    Err(e) => MetaResponse::Error(e.to_string()),
-                }
-            }
+            MetaCommand::DeleteTenant { tenant_id } => match self.engine.delete_tenant(tenant_id) {
+                Ok(()) => MetaResponse::Ok,
+                Err(e) => MetaResponse::Error(e.to_string()),
+            },
 
             MetaCommand::CreateCatalog {
                 tenant_id,
@@ -214,18 +210,19 @@ impl MetaStateMachine {
                 }
             }
 
-            MetaCommand::RevokeApiKey { key_id } => {
-                match self.engine.revoke_api_key(key_id) {
-                    Ok(()) => MetaResponse::Ok,
-                    Err(e) => MetaResponse::Error(e.to_string()),
-                }
-            }
+            MetaCommand::RevokeApiKey { key_id } => match self.engine.revoke_api_key(key_id) {
+                Ok(()) => MetaResponse::Ok,
+                Err(e) => MetaResponse::Error(e.to_string()),
+            },
 
             MetaCommand::ReportUsage {
                 catalog_id,
                 disk_bytes,
                 deep_storage_bytes,
-            } => match self.engine.report_usage(catalog_id, disk_bytes, deep_storage_bytes) {
+            } => match self
+                .engine
+                .report_usage(catalog_id, disk_bytes, deep_storage_bytes)
+            {
                 Ok(()) => MetaResponse::Ok,
                 Err(e) => MetaResponse::Error(e.to_string()),
             },
@@ -264,8 +261,7 @@ impl RaftStateMachine<MetaTypeConfig> for MetaStateMachine {
                 EntryPayload::Blank => MetaResponse::Ok,
                 EntryPayload::Normal(cmd) => self.apply_command(cmd),
                 EntryPayload::Membership(m) => {
-                    self.last_membership =
-                        StoredMembership::new(Some(entry.log_id.clone()), m);
+                    self.last_membership = StoredMembership::new(Some(entry.log_id.clone()), m);
                     MetaResponse::Ok
                 }
             };
@@ -426,11 +422,13 @@ mod tests {
         let sm = MetaStateMachine::new(engine.clone());
 
         // Create tenant
-        let MetaResponse::TenantCreated { tenant_id } = sm.apply_command(MetaCommand::CreateTenant {
-            account_id: TEST_ACCOUNT,
-            name: "acme".into(),
-            limits: TenantLimits::default(),
-        }) else {
+        let MetaResponse::TenantCreated { tenant_id } =
+            sm.apply_command(MetaCommand::CreateTenant {
+                account_id: TEST_ACCOUNT,
+                name: "acme".into(),
+                limits: TenantLimits::default(),
+            })
+        else {
             panic!("expected TenantCreated");
         };
 
@@ -929,26 +927,24 @@ mod tests {
         assert_ne!(t1, t2);
 
         // Create catalogs for each with the same name
-        let MetaResponse::CatalogCreated {
-            catalog_id: c1, ..
-        } = sm.apply_command(MetaCommand::CreateCatalog {
-            tenant_id: t1,
-            name: "analytics".into(),
-            engine: EngineType::Lance,
-            config: "{}".into(),
-        })
+        let MetaResponse::CatalogCreated { catalog_id: c1, .. } =
+            sm.apply_command(MetaCommand::CreateCatalog {
+                tenant_id: t1,
+                name: "analytics".into(),
+                engine: EngineType::Lance,
+                config: "{}".into(),
+            })
         else {
             panic!("expected CatalogCreated");
         };
 
-        let MetaResponse::CatalogCreated {
-            catalog_id: c2, ..
-        } = sm.apply_command(MetaCommand::CreateCatalog {
-            tenant_id: t2,
-            name: "analytics".into(),
-            engine: EngineType::Mq,
-            config: "{}".into(),
-        })
+        let MetaResponse::CatalogCreated { catalog_id: c2, .. } =
+            sm.apply_command(MetaCommand::CreateCatalog {
+                tenant_id: t2,
+                name: "analytics".into(),
+                engine: EngineType::Mq,
+                config: "{}".into(),
+            })
         else {
             panic!("expected CatalogCreated");
         };

@@ -392,7 +392,11 @@ async fn batcher_loop(
             propose_materialized_writes(materialized_writes, &raft, &table_name).await;
         }
 
-        let trigger = if accumulated_bytes >= config.max_batch_bytes { "size" } else { "linger" };
+        let trigger = if accumulated_bytes >= config.max_batch_bytes {
+            "size"
+        } else {
+            "linger"
+        };
         metrics::counter!("bisque_batcher_flushes_total", "table" => table_name.clone(), "reason" => trigger).increment(1);
         debug!(
             table = %table_name,

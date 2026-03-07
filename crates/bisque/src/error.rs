@@ -45,9 +45,7 @@ impl IntoResponse for ApiError {
 impl From<bisque_meta::WriteError> for ApiError {
     fn from(e: bisque_meta::WriteError) -> Self {
         match e {
-            bisque_meta::WriteError::NotLeader { .. } => {
-                ApiError::Internal("not leader".into())
-            }
+            bisque_meta::WriteError::NotLeader { .. } => ApiError::Internal("not leader".into()),
             bisque_meta::WriteError::Application(msg) => {
                 if msg.contains("not found") {
                     ApiError::NotFound(msg)

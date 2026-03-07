@@ -207,10 +207,7 @@ impl SegmentSyncServer {
 
     /// Start serving. Returns when the shutdown signal is received.
     /// This is designed to be spawned as a background task.
-    pub async fn serve(
-        &self,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> io::Result<()> {
+    pub async fn serve(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> io::Result<()> {
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         info!(
             addr = %self.config.bind_addr,
@@ -313,11 +310,7 @@ impl SegmentSyncServer {
 
         let total_bytes: u64 = manifest.iter().map(|e| e.size).sum();
         let files_total = manifest.len();
-        info!(
-            files = files_total,
-            total_bytes,
-            "Serving segment files"
-        );
+        info!(files = files_total, total_bytes, "Serving segment files");
 
         let mut progress = SyncProgress::new(total_bytes, files_total, "Segment sync send");
         let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
@@ -524,9 +517,8 @@ impl SegmentSyncClient {
 
         // Encode and send manifest
         let manifest_bytes =
-            bincode::serde::encode_to_vec(manifest, bincode::config::standard()).map_err(|e| {
-                crate::error::Error::SegmentSync(format!("Encode manifest: {}", e))
-            })?;
+            bincode::serde::encode_to_vec(manifest, bincode::config::standard())
+                .map_err(|e| crate::error::Error::SegmentSync(format!("Encode manifest: {}", e)))?;
         stream
             .write_u32_le(manifest_bytes.len() as u32)
             .await
@@ -538,8 +530,7 @@ impl SegmentSyncClient {
         stream.flush().await.map_err(io_to_sync)?;
 
         // Receive files
-        let mut progress =
-            SyncProgress::new(total_bytes, manifest.len(), "Segment sync receive");
+        let mut progress = SyncProgress::new(total_bytes, manifest.len(), "Segment sync receive");
         let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
         let mut files_transferred = 0usize;
         let mut files_missing = 0usize;

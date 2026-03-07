@@ -68,7 +68,11 @@ impl SnapshotTransferGuard {
     /// Multiple handles can be active concurrently (e.g., multiple nodes
     /// joining simultaneously). File deletions are deferred until ALL
     /// handles are released.
-    pub fn acquire(self: &Arc<Self>, timeout: Duration, watermark: Option<u64>) -> SnapshotGuardHandle {
+    pub fn acquire(
+        self: &Arc<Self>,
+        timeout: Duration,
+        watermark: Option<u64>,
+    ) -> SnapshotGuardHandle {
         self.active_count.fetch_add(1, Ordering::SeqCst);
         if let Some(w) = watermark {
             self.active_watermarks.lock().push(w);
@@ -148,10 +152,7 @@ impl SnapshotTransferGuard {
         }
 
         let prev = self.active_count.fetch_sub(1, Ordering::SeqCst);
-        info!(
-            active = prev - 1,
-            "Snapshot transfer guard released"
-        );
+        info!(active = prev - 1, "Snapshot transfer guard released");
 
         if prev == 1 {
             // Last transfer done — flush deferred deletions
@@ -265,9 +266,8 @@ impl BisqueLance {
             return Err(Error::TableAlreadyExists(name));
         }
 
-        let engine = Arc::new(
-            TableEngine::open(config, catalog, None, self.snapshot_guard.clone()).await?,
-        );
+        let engine =
+            Arc::new(TableEngine::open(config, catalog, None, self.snapshot_guard.clone()).await?);
         self.tables.write().insert(name.clone(), engine.clone());
 
         info!(table = %name, "Table created");
@@ -512,7 +512,10 @@ mod tests {
         // Wait for timeout to fire
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(guard.active_count(), 0);
-        assert!(!dir.exists(), "Timeout should have flushed deferred deletions");
+        assert!(
+            !dir.exists(),
+            "Timeout should have flushed deferred deletions"
+        );
     }
 
     #[tokio::test]
@@ -617,8 +620,14 @@ mod tests {
         // Release A — both dirs still exist (B still active)
         drop(handle_a);
         assert_eq!(guard.active_count(), 1);
-        assert!(dir1.exists(), "dir1 should survive until all transfers done");
-        assert!(dir2.exists(), "dir2 should survive until all transfers done");
+        assert!(
+            dir1.exists(),
+            "dir1 should survive until all transfers done"
+        );
+        assert!(
+            dir2.exists(),
+            "dir2 should survive until all transfers done"
+        );
 
         // Release B — now both are deleted
         drop(handle_b);
@@ -740,9 +749,16 @@ mod tests {
         // Give a small moment for Drop to execute
         tokio::time::sleep(Duration::from_millis(10)).await;
         // The guard should be released by Drop during panic unwinding.
-        assert_eq!(guard.active_count(), 0, "Guard should be released after panic");
+        assert_eq!(
+            guard.active_count(),
+            0,
+            "Guard should be released after panic"
+        );
         // Deferred deletion should have been flushed by the Drop
-        assert!(!dir.exists(), "Deferred deletion should be flushed after panic");
+        assert!(
+            !dir.exists(),
+            "Deferred deletion should be flushed after panic"
+        );
     }
 
     #[tokio::test]
@@ -1572,6 +1588,10 @@ mod tests {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        assert_eq!(effective, Some(50), "Guard watermark should keep floor at 50");
+        assert_eq!(
+            effective,
+            Some(50),
+            "Guard watermark should keep floor at 50"
+        );
     }
 }

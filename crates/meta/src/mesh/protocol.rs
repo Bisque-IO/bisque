@@ -260,7 +260,9 @@ impl Encode for MeshMessage {
                 node_id,
                 mesh_port,
                 protocol_version,
-            } => node_id.encoded_size() + mesh_port.encoded_size() + protocol_version.encoded_size(),
+            } => {
+                node_id.encoded_size() + mesh_port.encoded_size() + protocol_version.encoded_size()
+            }
             MeshMessage::StateSnapshot {
                 node_id,
                 operations,
@@ -470,7 +472,10 @@ mod tests {
         let msg2 = roundtrip(&msg);
         match msg2 {
             MeshMessage::Heartbeat {
-                node_id, seq, health, ..
+                node_id,
+                seq,
+                health,
+                ..
             } => {
                 assert_eq!(node_id, 3);
                 assert_eq!(seq, 7);

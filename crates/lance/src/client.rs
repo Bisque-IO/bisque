@@ -50,8 +50,8 @@ use url::Url;
 use crate::catalog_events::{CatalogEvent, CatalogEventKind};
 use crate::client_store::{ClientMeta, ClientStore, PersistedCatalogEntry};
 use crate::cold_store::CredentialConfig;
-use bisque_protocol::ws::{ClientMessage, ServerMessage, WS_PROTOCOL_VERSION};
 use crate::s3_store::BisqueRoutingStore;
+use bisque_protocol::ws::{ClientMessage, ServerMessage, WS_PROTOCOL_VERSION};
 
 // ---------------------------------------------------------------------------
 // Per-catalog state
@@ -70,7 +70,10 @@ impl std::fmt::Debug for CatalogState {
         f.debug_struct("CatalogState")
             .field("name", &self.name)
             .field("tables", &self.tables.read().keys().collect::<Vec<_>>())
-            .field("last_seq", &self.last_seq.load(std::sync::atomic::Ordering::Relaxed))
+            .field(
+                "last_seq",
+                &self.last_seq.load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -114,7 +117,14 @@ impl BisqueClient {
         credentials: Arc<CredentialConfig>,
         persist_path: Option<&Path>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::connect_with_token(cluster_url, catalog_names, credentials, persist_path, String::new()).await
+        Self::connect_with_token(
+            cluster_url,
+            catalog_names,
+            credentials,
+            persist_path,
+            String::new(),
+        )
+        .await
     }
 
     /// Connect with an explicit auth token for WebSocket authentication.
@@ -223,8 +233,7 @@ impl BisqueClient {
                 let catalog_resp = fetch_catalog(&cluster_url, catalog_name).await?;
 
                 for (table_name, info) in &catalog_resp.tables {
-                    let provider =
-                        open_table_provider(&routing_store, table_name, info).await?;
+                    let provider = open_table_provider(&routing_store, table_name, info).await?;
                     let provider = Arc::new(provider);
 
                     // Pin initial versions
@@ -260,9 +269,7 @@ impl BisqueClient {
             });
             ctx.register_catalog(catalog_name, df_catalog);
 
-            catalogs
-                .write()
-                .insert(catalog_name.clone(), catalog_state);
+            catalogs.write().insert(catalog_name.clone(), catalog_state);
         }
 
         // Persist initial state if needed
@@ -439,10 +446,7 @@ impl SchemaProvider for BisqueClientSchemaProvider {
         self.state.tables.read().keys().cloned().collect()
     }
 
-    async fn table(
-        &self,
-        name: &str,
-    ) -> DfResult<Option<Arc<dyn TableProvider>>> {
+    async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
         Ok(self
             .state
             .tables
@@ -812,7 +816,10 @@ async fn ws_listener_loop(
             }
             Ok(WsDisconnectReason::TtlRefresh) => {
                 // M1: TTL refresh — reconnect immediately with short delay.
-                debug!("WebSocket TTL refresh, reconnecting in {}ms", WS_TTL_REFRESH_DELAY_MS);
+                debug!(
+                    "WebSocket TTL refresh, reconnecting in {}ms",
+                    WS_TTL_REFRESH_DELAY_MS
+                );
                 reconnect_delay_ms = WS_INITIAL_RECONNECT_DELAY_MS; // Reset backoff
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(WS_TTL_REFRESH_DELAY_MS)) => {}
@@ -823,7 +830,10 @@ async fn ws_listener_loop(
                 // C1: Jittered exponential backoff.
                 let jitter = 0.75 + (rand_jitter() * 0.5); // 0.75..1.25
                 let delay = (reconnect_delay_ms as f64 * jitter) as u64;
-                warn!("WebSocket connection lost: {}, reconnecting in {}ms...", e, delay);
+                warn!(
+                    "WebSocket connection lost: {}, reconnecting in {}ms...",
+                    e, delay
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
                     _ = shutdown.notified() => return,
@@ -908,12 +918,17 @@ async fn ws_connect_and_listen(
     }
     let server_handshake: ServerMessage = rmp_serde::from_slice(&frame.payload)?;
     match &server_handshake {
-        ServerMessage::Handshake { protocol_version, session_id, .. } => {
+        ServerMessage::Handshake {
+            protocol_version,
+            session_id,
+            ..
+        } => {
             if *protocol_version != WS_PROTOCOL_VERSION {
                 return Err(format!(
                     "Protocol version mismatch: server={}, client={}",
                     protocol_version, WS_PROTOCOL_VERSION
-                ).into());
+                )
+                .into());
             }
             debug!(session_id, "Received server handshake");
         }
@@ -1104,7 +1119,10 @@ async fn handle_ws_message(
 
     match msg {
         ServerMessage::Handshake { session_id, .. } => {
-            debug!(session_id, "Received server handshake (unexpected in message loop)");
+            debug!(
+                session_id,
+                "Received server handshake (unexpected in message loop)"
+            );
         }
         ServerMessage::CatalogEvent { event, .. } => {
             match serde_json::from_value::<CatalogEvent>(event) {
@@ -1256,10 +1274,7 @@ async fn handle_catalog_event(
                 }
             };
             let provider = Arc::new(RemoteLanceTableProvider::new(schema.clone(), None, None));
-            catalog_state
-                .tables
-                .write()
-                .insert(table.clone(), provider);
+            catalog_state.tables.write().insert(table.clone(), provider);
             info!(catalog = %catalog_name, table = %table, seq = event.seq,
                   "Registered new table from event");
 

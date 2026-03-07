@@ -64,9 +64,7 @@ impl MetaRaftNode {
     // ── Tenant API ─────────────────────────────────────────────────────
 
     pub async fn create_account(&self, name: String) -> Result<u64, WriteError> {
-        let resp = self
-            .propose(MetaCommand::CreateAccount { name })
-            .await?;
+        let resp = self.propose(MetaCommand::CreateAccount { name }).await?;
         match resp {
             MetaResponse::AccountCreated { account_id } => Ok(account_id),
             other => Err(WriteError::Application(format!("unexpected: {other}"))),
@@ -129,11 +127,7 @@ impl MetaRaftNode {
         Ok(())
     }
 
-    pub async fn remove_membership(
-        &self,
-        user_id: u64,
-        account_id: u64,
-    ) -> Result<(), WriteError> {
+    pub async fn remove_membership(&self, user_id: u64, account_id: u64) -> Result<(), WriteError> {
         self.propose(MetaCommand::RemoveAccountMembership {
             user_id,
             account_id,
@@ -177,11 +171,8 @@ impl MetaRaftNode {
         user_id: u64,
         tenant_id: u64,
     ) -> Result<(), WriteError> {
-        self.propose(MetaCommand::RevokeTenantAccess {
-            user_id,
-            tenant_id,
-        })
-        .await?;
+        self.propose(MetaCommand::RevokeTenantAccess { user_id, tenant_id })
+            .await?;
         Ok(())
     }
 
@@ -269,11 +260,7 @@ impl MetaRaftNode {
         Ok(())
     }
 
-    pub async fn delete_catalog(
-        &self,
-        tenant_id: u64,
-        catalog_id: u64,
-    ) -> Result<(), WriteError> {
+    pub async fn delete_catalog(&self, tenant_id: u64, catalog_id: u64) -> Result<(), WriteError> {
         self.propose(MetaCommand::DeleteCatalog {
             tenant_id,
             catalog_id,

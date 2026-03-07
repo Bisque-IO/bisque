@@ -116,7 +116,12 @@ impl TrackedOp {
     }
 
     /// Update progress (0.0 to 1.0) and optionally fragment counts.
-    pub fn set_progress(&self, progress: f64, fragments_done: Option<u64>, fragments_total: Option<u64>) {
+    pub fn set_progress(
+        &self,
+        progress: f64,
+        fragments_done: Option<u64>,
+        fragments_total: Option<u64>,
+    ) {
         if let Some(mut entry) = self.mgr.ops.get_mut(&self.id) {
             entry.op.progress = progress;
             if let Some(fd) = fragments_done {
@@ -273,7 +278,15 @@ impl OperationsManager {
         table: String,
         engine: Arc<BisqueLance>,
     ) -> String {
-        self.submit(OpType::Reindex, OpTier::Cold, tenant, catalog, catalog_type, table, engine)
+        self.submit(
+            OpType::Reindex,
+            OpTier::Cold,
+            tenant,
+            catalog,
+            catalog_type,
+            table,
+            engine,
+        )
     }
 
     /// Queue a cold compaction operation. Returns the operation ID immediately.
@@ -285,7 +298,15 @@ impl OperationsManager {
         table: String,
         engine: Arc<BisqueLance>,
     ) -> String {
-        self.submit(OpType::Compact, OpTier::Cold, tenant, catalog, catalog_type, table, engine)
+        self.submit(
+            OpType::Compact,
+            OpTier::Cold,
+            tenant,
+            catalog,
+            catalog_type,
+            table,
+            engine,
+        )
     }
 
     /// Queue a flush (warm→cold promote) operation. Returns the operation ID immediately.
@@ -297,7 +318,15 @@ impl OperationsManager {
         table: String,
         engine: Arc<BisqueLance>,
     ) -> String {
-        self.submit(OpType::Flush, OpTier::Cold, tenant, catalog, catalog_type, table, engine)
+        self.submit(
+            OpType::Flush,
+            OpTier::Cold,
+            tenant,
+            catalog,
+            catalog_type,
+            table,
+            engine,
+        )
     }
 
     fn submit(
@@ -345,8 +374,7 @@ impl OperationsManager {
         let mgr = self.clone();
         let op_id = id.clone();
         tokio::spawn(async move {
-            mgr.run_queued(op_id, op_type, catalog, table, engine)
-                .await;
+            mgr.run_queued(op_id, op_type, catalog, table, engine).await;
         });
 
         id

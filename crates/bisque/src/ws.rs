@@ -143,7 +143,10 @@ pub async fn unified_ws_handler(
         Ok((response, fut)) => (response, fut),
         Err(e) => {
             warn!("Unified WebSocket upgrade failed: {}", e);
-            return (StatusCode::BAD_REQUEST, format!("WebSocket upgrade failed: {}", e))
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("WebSocket upgrade failed: {}", e),
+            )
                 .into_response();
         }
     };
@@ -163,16 +166,27 @@ pub async fn unified_ws_handler(
         };
 
         // C2/C3: Increment IP count and create session AFTER upgrade succeeds.
-        ip_connections.entry(client_ip).or_insert(IpConnectionState {
-            active: 0,
-            auth_failures: 0,
-            last_auth_failure: std::time::Instant::now(),
-        }).active += 1;
+        ip_connections
+            .entry(client_ip)
+            .or_insert(IpConnectionState {
+                active: 0,
+                auth_failures: 0,
+                last_auth_failure: std::time::Instant::now(),
+            })
+            .active += 1;
         let session_id = pins.create_session();
         metrics::gauge!("ws_connections_active").increment(1.0);
 
-        if let Err(e) =
-            handle_unified_ws(ws, state, auth_state, pins.clone(), session_id, client_ip, &ip_connections).await
+        if let Err(e) = handle_unified_ws(
+            ws,
+            state,
+            auth_state,
+            pins.clone(),
+            session_id,
+            client_ip,
+            &ip_connections,
+        )
+        .await
         {
             debug!(session_id, error = %e, "Unified WebSocket ended");
         }
@@ -204,9 +218,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     use fastwebsockets::{Frame, Payload};
-    tokio::time::timeout(WS_WRITE_TIMEOUT, ws.write_frame(Frame::binary(Payload::Owned(bytes))))
-        .await
-        .map_err(|_| "write timeout (30s)")??;
+    tokio::time::timeout(
+        WS_WRITE_TIMEOUT,
+        ws.write_frame(Frame::binary(Payload::Owned(bytes))),
+    )
+    .await
+    .map_err(|_| "write timeout (30s)")??;
     Ok(())
 }
 
@@ -284,26 +301,23 @@ where
     ws_write_frame(&mut ws, rmp_serde::to_vec_named(&handshake_msg)?).await?;
 
     // 2. Read client handshake (10s timeout).
-    let client_handshake: ClientMessage =
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let frame = ws.read_frame().await?;
-                match frame.opcode {
-                    OpCode::Binary => {
-                        return rmp_serde::from_slice::<ClientMessage>(&frame.payload)
-                            .map_err(|e| {
-                                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                            });
-                    }
-                    OpCode::Close => {
-                        return Err("client closed during handshake".into());
-                    }
-                    _ => continue,
+    let client_handshake: ClientMessage = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = ws.read_frame().await?;
+            match frame.opcode {
+                OpCode::Binary => {
+                    return rmp_serde::from_slice::<ClientMessage>(&frame.payload)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
                 }
+                OpCode::Close => {
+                    return Err("client closed during handshake".into());
+                }
+                _ => continue,
             }
-        })
-        .await
-        .map_err(|_| "handshake timeout (10s)")??;
+        }
+    })
+    .await
+    .map_err(|_| "handshake timeout (10s)")??;
 
     // H3: Keep auth_ctx for authorization checks on requests.
     let (last_seen_seq, auth_ctx, subscribe_catalogs) = match client_handshake {
@@ -709,15 +723,15 @@ where
     metrics::histogram!("ws_connection_duration_seconds").record(duration_secs);
     metrics::counter!("ws_messages_sent_total").increment(msgs_sent);
     metrics::counter!("ws_messages_recv_total").increment(msgs_recv);
-    info!(session_id, msgs_sent, msgs_recv, duration_secs, "Unified WS connection closed");
+    info!(
+        session_id,
+        msgs_sent, msgs_recv, duration_secs, "Unified WS connection closed"
+    );
     Ok(())
 }
 
 /// Route a WebSocket request to the appropriate handler logic.
-async fn handle_ws_request(
-    state: &Arc<S3ServerState>,
-    method: RequestMethod,
-) -> ResponseResult {
+async fn handle_ws_request(state: &Arc<S3ServerState>, method: RequestMethod) -> ResponseResult {
     match method {
         RequestMethod::ListOperations {
             op_type,
@@ -842,19 +856,16 @@ async fn handle_ws_request(
             // PERF4: Spawn on a separate task to avoid blocking the select! loop,
             // since get_catalog_json may do blocking I/O.
             let state_clone = Arc::clone(state);
-            let catalog_json = match tokio::spawn(async move {
-                state_clone.get_catalog_json().await
-            })
-            .await
-            {
-                Ok(json) => json,
-                Err(e) => {
-                    return ResponseResult::Error {
-                        code: 500,
-                        message: format!("Internal error: {}", e),
-                    };
-                }
-            };
+            let catalog_json =
+                match tokio::spawn(async move { state_clone.get_catalog_json().await }).await {
+                    Ok(json) => json,
+                    Err(e) => {
+                        return ResponseResult::Error {
+                            code: 500,
+                            message: format!("Internal error: {}", e),
+                        };
+                    }
+                };
             metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "catalog")
                 .increment(1);
             ResponseResult::Ok {

@@ -108,14 +108,8 @@ async fn test_sync_multiple_files_roundtrip() {
                 "tables/orders/segments/1.lance/_metadata",
                 small_data.as_slice(),
             ),
-            (
-                "tables/orders/segments/1.lance/data/0.lance",
-                &medium_data,
-            ),
-            (
-                "tables/users/segments/2.lance/data/0.lance",
-                &large_data,
-            ),
+            ("tables/orders/segments/1.lance/data/0.lance", &medium_data),
+            ("tables/users/segments/2.lance/data/0.lance", &large_data),
         ],
     );
 
@@ -247,10 +241,12 @@ async fn test_sync_missing_file_on_leader() {
     assert_eq!(received, existing_data);
 
     // The missing file should not exist on client
-    assert!(!client_dir
-        .path()
-        .join("tables/t1/segments/2.lance/data/0.lance")
-        .exists());
+    assert!(
+        !client_dir
+            .path()
+            .join("tables/t1/segments/2.lance/data/0.lance")
+            .exists()
+    );
 
     shutdown_tx.send(true).unwrap();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
@@ -392,9 +388,7 @@ async fn test_build_file_manifest_multiple_tables() {
     let manifest = config.build_file_manifest().await.unwrap();
     assert_eq!(manifest.len(), 2);
 
-    let has_orders = manifest
-        .iter()
-        .any(|e| e.relative_path.contains("orders"));
+    let has_orders = manifest.iter().any(|e| e.relative_path.contains("orders"));
     let has_users = manifest.iter().any(|e| e.relative_path.contains("users"));
     assert!(has_orders);
     assert!(has_users);
@@ -427,7 +421,10 @@ async fn test_sync_concurrent_clients() {
             let client_dir = tempfile::tempdir().unwrap();
             let client = make_client(client_dir.path());
             let result = client.sync_files(&addr, &manifest).await.unwrap();
-            assert_eq!(result.files_transferred, 1, "Client {i} should transfer 1 file");
+            assert_eq!(
+                result.files_transferred, 1,
+                "Client {i} should transfer 1 file"
+            );
             assert!(
                 result.verification_failures.is_empty(),
                 "Client {i} should have no verification failures"
@@ -528,7 +525,10 @@ async fn test_snapshot_data_roundtrip_serialization() {
 
     assert_eq!(decoded.min_safe_log_index, Some(42));
     assert_eq!(decoded.file_manifest.len(), 2);
-    assert_eq!(decoded.file_manifest[0].relative_path, "tables/t1/segments/1.lance/data/0.lance");
+    assert_eq!(
+        decoded.file_manifest[0].relative_path,
+        "tables/t1/segments/1.lance/data/0.lance"
+    );
     assert_eq!(decoded.file_manifest[0].size, 1024);
     assert_eq!(decoded.sync_addr, Some("10.0.0.1:9999".to_string()));
 
@@ -640,10 +640,7 @@ async fn test_sync_guard_defers_promote_during_transfer() {
     let segment_data = vec![0xAAu8; 64 * 1024]; // 64 KB
     let manifest = create_test_files(
         server_dir.path(),
-        &[(
-            "tables/orders/segments/1.lance/data/0.lance",
-            &segment_data,
-        )],
+        &[("tables/orders/segments/1.lance/data/0.lance", &segment_data)],
     );
 
     // Step 1: Acquire guard (simulates get_snapshot_builder)
@@ -654,9 +651,7 @@ async fn test_sync_guard_defers_promote_during_transfer() {
 
     // Step 3: Simulate apply_promote arriving during transfer
     // The sealed segment directory would be deleted, but guard defers it
-    let sealed_dir = server_dir
-        .path()
-        .join("tables/orders/segments/1.lance");
+    let sealed_dir = server_dir.path().join("tables/orders/segments/1.lance");
     assert!(guard.defer_or_delete(sealed_dir.clone()));
     assert!(
         sealed_dir.exists(),
@@ -700,10 +695,7 @@ async fn test_sync_guard_defers_drop_table_during_transfer() {
         server_dir.path(),
         &[
             ("tables/doomed/segments/1.lance/data/0.lance", b"data1"),
-            (
-                "tables/doomed/segments/1.lance/_metadata",
-                b"meta",
-            ),
+            ("tables/doomed/segments/1.lance/_metadata", b"meta"),
         ],
     );
 
@@ -974,10 +966,7 @@ async fn test_sync_rejects_nested_path_traversal() {
     let client = make_client(client_dir.path());
 
     let result = client.sync_files(&addr, &manifest).await;
-    assert!(
-        result.is_err(),
-        "Nested path traversal should be rejected"
-    );
+    assert!(result.is_err(), "Nested path traversal should be rejected");
 
     shutdown_tx.send(true).unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
@@ -995,9 +984,7 @@ async fn test_sync_zero_byte_file() {
     let server_dir = tempfile::tempdir().unwrap();
     let client_dir = tempfile::tempdir().unwrap();
 
-    let empty_path = server_dir
-        .path()
-        .join("tables/t1/segments/1.lance/empty");
+    let empty_path = server_dir.path().join("tables/t1/segments/1.lance/empty");
     std::fs::create_dir_all(empty_path.parent().unwrap()).unwrap();
     std::fs::write(&empty_path, b"").unwrap();
     assert_eq!(std::fs::metadata(&empty_path).unwrap().len(), 0);
@@ -1046,7 +1033,7 @@ async fn test_sync_server_rejects_invalid_magic() {
     let mut buf = [0u8; 1];
     let result = stream.read(&mut buf).await;
     match result {
-        Ok(0) => {} // connection closed cleanly
+        Ok(0) => {}  // connection closed cleanly
         Err(_) => {} // connection reset
         Ok(_) => panic!("Server should have closed connection on bad magic"),
     }
@@ -1242,9 +1229,8 @@ async fn test_sync_server_shutdown_during_transfer() {
     let addr_clone = addr.clone();
     let manifest_clone = manifest.clone();
 
-    let transfer = tokio::spawn(async move {
-        client.sync_files(&addr_clone, &manifest_clone).await
-    });
+    let transfer =
+        tokio::spawn(async move { client.sync_files(&addr_clone, &manifest_clone).await });
 
     // Send shutdown while transfer is likely still running
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1555,7 +1541,10 @@ async fn test_sync_server_handles_client_disconnect() {
     let client_dir = tempfile::tempdir().unwrap();
     let client = make_client(client_dir.path());
     let result = client.sync_files(&addr, &manifest).await.unwrap();
-    assert_eq!(result.files_transferred, 1, "Server should still work after client disconnect");
+    assert_eq!(
+        result.files_transferred, 1,
+        "Server should still work after client disconnect"
+    );
 
     shutdown_tx.send(true).unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
@@ -1582,10 +1571,7 @@ async fn test_sync_rapid_sequential_transfers() {
         let client_dir = tempfile::tempdir().unwrap();
         let client = make_client(client_dir.path());
         let result = client.sync_files(&addr, &manifest).await.unwrap();
-        assert_eq!(
-            result.files_transferred, 1,
-            "Transfer {i} should succeed"
-        );
+        assert_eq!(result.files_transferred, 1, "Transfer {i} should succeed");
         assert!(result.verification_failures.is_empty());
     }
 
@@ -1630,7 +1616,10 @@ async fn test_sync_mix_of_existing_and_missing_preserves_order() {
 
     let result = client.sync_files(&addr, &manifest).await.unwrap();
 
-    assert_eq!(result.files_transferred, 5, "Should transfer 5 existing files");
+    assert_eq!(
+        result.files_transferred, 5,
+        "Should transfer 5 existing files"
+    );
     assert_eq!(result.files_missing, 5, "Should report 5 missing files");
 
     // Verify each existing file was transferred correctly
@@ -1653,7 +1642,10 @@ async fn test_sync_mix_of_existing_and_missing_preserves_order() {
         let path = client_dir
             .path()
             .join(format!("tables/t/segments/{}.lance/data", i));
-        assert!(!path.exists(), "Missing file {i} should not exist on client");
+        assert!(
+            !path.exists(),
+            "Missing file {i} should not exist on client"
+        );
     }
 
     shutdown_tx.send(true).unwrap();

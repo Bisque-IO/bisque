@@ -25,13 +25,13 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
 use crate::config::TableOpenConfig;
+use crate::engine::SnapshotTransferGuard;
 use crate::error::{Error, Result};
 use crate::ipc;
 use crate::types::{
     CleanupStats, CompactionStats, FlushHandle, FlushState, SchemaVersion, SealReason,
     SegmentCatalog, SegmentId,
 };
-use crate::engine::SnapshotTransferGuard;
 use crate::version_pins::{PinTier, VersionPinTracker};
 
 /// Sentinel value for "no log index" in `AtomicU64` fields.
@@ -290,9 +290,12 @@ impl TableEngine {
         drop(_guard);
 
         self.active_bytes.fetch_add(append_bytes, Ordering::Relaxed);
-        metrics::counter!("bisque_writes_bytes_total", "table" => self.name.clone()).increment(append_bytes);
-        metrics::counter!("bisque_writes_rows_total", "table" => self.name.clone()).increment(total_rows as u64);
-        metrics::histogram!("bisque_write_latency_seconds", "table" => self.name.clone()).record(start.elapsed().as_secs_f64());
+        metrics::counter!("bisque_writes_bytes_total", "table" => self.name.clone())
+            .increment(append_bytes);
+        metrics::counter!("bisque_writes_rows_total", "table" => self.name.clone())
+            .increment(total_rows as u64);
+        metrics::histogram!("bisque_write_latency_seconds", "table" => self.name.clone())
+            .record(start.elapsed().as_secs_f64());
         debug!(table = %self.name, bytes = append_bytes, "Appended to active segment");
         Ok(())
     }
@@ -682,8 +685,10 @@ impl TableEngine {
 
         *self.s3_dataset.write() = Some(new_s3);
 
-        metrics::counter!("bisque_flush_rows_total", "table" => self.name.clone()).increment(total_rows as u64);
-        metrics::histogram!("bisque_flush_latency_seconds", "table" => self.name.clone()).record(flush_start.elapsed().as_secs_f64());
+        metrics::counter!("bisque_flush_rows_total", "table" => self.name.clone())
+            .increment(total_rows as u64);
+        metrics::histogram!("bisque_flush_latency_seconds", "table" => self.name.clone())
+            .record(flush_start.elapsed().as_secs_f64());
         info!(
             table = %self.name,
             segment_id = handle.segment_id,

@@ -108,10 +108,10 @@ pub struct TenantLimits {
 impl Default for TenantLimits {
     fn default() -> Self {
         Self {
-            max_disk_bytes: 100 * 1024 * 1024 * 1024,        // 100 GiB
+            max_disk_bytes: 100 * 1024 * 1024 * 1024,          // 100 GiB
             max_deep_storage_bytes: 1024 * 1024 * 1024 * 1024, // 1 TiB
             max_concurrent_queries: 64,
-            max_query_memory_bytes: 8 * 1024 * 1024 * 1024,   // 8 GiB
+            max_query_memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB
             max_catalogs: 64,
         }
     }
@@ -364,14 +364,11 @@ impl fmt::Display for MetaCommand {
                 role,
             } => write!(f, "SetAccountRole({user_id}, {account_id}, {role})"),
             MetaCommand::GrantTenantAccess {
-                user_id,
-                tenant_id,
-                ..
+                user_id, tenant_id, ..
             } => write!(f, "GrantTenantAccess({user_id}, {tenant_id})"),
-            MetaCommand::RevokeTenantAccess {
-                user_id,
-                tenant_id,
-            } => write!(f, "RevokeTenantAccess({user_id}, {tenant_id})"),
+            MetaCommand::RevokeTenantAccess { user_id, tenant_id } => {
+                write!(f, "RevokeTenantAccess({user_id}, {tenant_id})")
+            }
             MetaCommand::CreateTenant { name, .. } => write!(f, "CreateTenant({name})"),
             MetaCommand::UpdateTenantLimits { tenant_id, .. } => {
                 write!(f, "UpdateTenantLimits({tenant_id})")
@@ -698,10 +695,7 @@ mod tests {
                 },
                 "CreateApiKey(2)",
             ),
-            (
-                MetaCommand::RevokeApiKey { key_id: 99 },
-                "RevokeApiKey(99)",
-            ),
+            (MetaCommand::RevokeApiKey { key_id: 99 }, "RevokeApiKey(99)"),
             (
                 MetaCommand::ReportUsage {
                     catalog_id: 4,
