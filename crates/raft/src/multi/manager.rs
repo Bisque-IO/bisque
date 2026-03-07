@@ -104,6 +104,28 @@ where
         self.groups.len()
     }
 
+    /// Shut down all Raft groups and remove them from the manager.
+    pub async fn shutdown_all(&self) {
+        let groups: Vec<(u64, Raft<C>)> = self
+            .groups
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        for (group_id, raft) in groups {
+            let _ = raft.shutdown().await;
+            self.groups.remove(&group_id);
+            self.storage.remove_group(group_id);
+        }
+    }
+
+    /// Get a reference to the underlying storage.
+    ///
+    /// Useful for calling `stop()` after `shutdown_all()` to release
+    /// background threads and MDBX databases.
+    pub fn storage(&self) -> &Arc<S> {
+        &self.storage
+    }
+
     /// Get the purge floor handle for a specific group.
     ///
     /// Returns `None` if the group's log storage has not been initialized yet.

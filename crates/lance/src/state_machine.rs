@@ -356,6 +356,58 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
 
                             response
                         }
+                        LanceCommand::DeleteRecords { ref table_name, .. } => {
+                            let tname = table_name.clone();
+                            // Drain pending writes for this table before deleting.
+                            if let Some(buf) = &self.async_buffer {
+                                buf.drain_table(&tname).await;
+                            }
+                            let response = self.apply_command(cmd).await;
+
+                            if let Ok(table) = self.engine.require_table(&tname) {
+                                manifest_table_update = Some(TableUpdate::Set {
+                                    table_name: tname.clone(),
+                                    entry: LanceManifestManager::build_table_entry(&table),
+                                });
+                                if matches!(response, LanceResponse::RowsAffected(_)) {
+                                    let (av, sv, s3v) = table.tier_versions();
+                                    catalog_event =
+                                        Some(CatalogEventKind::DataMutated {
+                                            table: tname,
+                                            active_version: av,
+                                            sealed_version: sv,
+                                            s3_version: s3v,
+                                        });
+                                }
+                            }
+                            response
+                        }
+                        LanceCommand::UpdateRecords { ref table_name, .. } => {
+                            let tname = table_name.clone();
+                            // Drain pending writes for this table before updating.
+                            if let Some(buf) = &self.async_buffer {
+                                buf.drain_table(&tname).await;
+                            }
+                            let response = self.apply_command(cmd).await;
+
+                            if let Ok(table) = self.engine.require_table(&tname) {
+                                manifest_table_update = Some(TableUpdate::Set {
+                                    table_name: tname.clone(),
+                                    entry: LanceManifestManager::build_table_entry(&table),
+                                });
+                                if matches!(response, LanceResponse::RowsAffected(_)) {
+                                    let (av, sv, s3v) = table.tier_versions();
+                                    catalog_event =
+                                        Some(CatalogEventKind::DataMutated {
+                                            table: tname,
+                                            active_version: av,
+                                            sealed_version: sv,
+                                            s3_version: s3v,
+                                        });
+                                }
+                            }
+                            response
+                        }
                         other => {
                             // Extract table_name + schema_ipc before moving the command.
                             let (tname, schema_ipc) = match &other {
@@ -915,6 +967,53 @@ impl LanceStateMachine {
                     pins.remove_session(session_id);
                 }
                 LanceResponse::Ok
+            }
+
+            LanceCommand::DeleteRecords {
+                table_name,
+                filter,
+            } => {
+                let table = match self.engine.require_table(&table_name) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(table = %table_name, "Table not found: {}", e);
+                        return LanceResponse::Error(e.to_string());
+                    }
+                };
+                match table.apply_delete(&filter).await {
+                    Ok(count) => LanceResponse::RowsAffected(count),
+                    Err(e) => {
+                        error!(table = %table_name, "apply_delete failed: {}", e);
+                        LanceResponse::Error(e.to_string())
+                    }
+                }
+            }
+
+            LanceCommand::UpdateRecords {
+                table_name,
+                filter,
+                data,
+            } => {
+                let table = match self.engine.require_table(&table_name) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(table = %table_name, "Table not found: {}", e);
+                        return LanceResponse::Error(e.to_string());
+                    }
+                };
+                match ipc::decode_record_batches(&data) {
+                    Ok(batches) => match table.apply_update(&filter, batches).await {
+                        Ok(count) => LanceResponse::RowsAffected(count),
+                        Err(e) => {
+                            error!(table = %table_name, "apply_update failed: {}", e);
+                            LanceResponse::Error(e.to_string())
+                        }
+                    },
+                    Err(e) => {
+                        error!(table = %table_name, "Failed to decode IPC data: {}", e);
+                        LanceResponse::Error(e.to_string())
+                    }
+                }
             }
         }
     }

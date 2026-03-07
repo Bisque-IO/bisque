@@ -660,3 +660,207 @@ fn parse_content_range(header: &str) -> Option<std::ops::Range<u64>> {
     let end: u64 = end_str.parse().ok()?;
     Some(start..end + 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // url_encode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn url_encode_alphanumerics_unchanged() {
+        assert_eq!(url_encode("abcXYZ012"), "abcXYZ012");
+        assert_eq!(url_encode("hello-world_v1.0~draft"), "hello-world_v1.0~draft");
+    }
+
+    #[test]
+    fn url_encode_special_characters() {
+        assert_eq!(url_encode("hello world"), "hello%20world");
+        assert_eq!(url_encode("a=b&c=d"), "a%3Db%26c%3Dd");
+        assert_eq!(url_encode("100%"), "100%25");
+    }
+
+    #[test]
+    fn url_encode_preserves_slashes() {
+        assert_eq!(url_encode("table/active/data"), "table/active/data");
+        assert_eq!(
+            url_encode("prefix/with spaces/file"),
+            "prefix/with%20spaces/file"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_list_xml
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_list_xml_with_contents() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Contents>
+    <Key>table/active/data/file.lance</Key>
+    <Size>2048</Size>
+    <ETag>"abc123"</ETag>
+    <LastModified>2025-06-15T12:00:00.000Z</LastModified>
+  </Contents>
+</ListBucketResult>"#;
+
+        let items = parse_list_xml(xml);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].location.as_ref(), "table/active/data/file.lance");
+        assert_eq!(items[0].size, 2048);
+        assert_eq!(items[0].e_tag.as_deref(), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn parse_list_xml_empty() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Name>bucket</Name>
+  <KeyCount>0</KeyCount>
+</ListBucketResult>"#;
+
+        let items = parse_list_xml(xml);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_list_xml_multiple_objects() {
+        let xml = r#"<ListBucketResult>
+  <Contents>
+    <Key>a/active/f1.lance</Key>
+    <Size>100</Size>
+    <LastModified>2025-01-01T00:00:00Z</LastModified>
+  </Contents>
+  <Contents>
+    <Key>a/active/f2.lance</Key>
+    <Size>200</Size>
+    <LastModified>2025-01-02T00:00:00Z</LastModified>
+  </Contents>
+  <Contents>
+    <Key>b/sealed/f3.lance</Key>
+    <Size>300</Size>
+    <LastModified>2025-01-03T00:00:00Z</LastModified>
+  </Contents>
+</ListBucketResult>"#;
+
+        let items = parse_list_xml(xml);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].location.as_ref(), "a/active/f1.lance");
+        assert_eq!(items[0].size, 100);
+        assert_eq!(items[1].location.as_ref(), "a/active/f2.lance");
+        assert_eq!(items[1].size, 200);
+        assert_eq!(items[2].location.as_ref(), "b/sealed/f3.lance");
+        assert_eq!(items[2].size, 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_xml_tag
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_xml_tag_existing() {
+        let block = "<Key>my/path/file.lance</Key><Size>1024</Size>";
+        assert_eq!(
+            extract_xml_tag(block, "Key"),
+            Some("my/path/file.lance".to_string())
+        );
+        assert_eq!(
+            extract_xml_tag(block, "Size"),
+            Some("1024".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_xml_tag_missing_returns_none() {
+        let block = "<Key>file.lance</Key>";
+        assert_eq!(extract_xml_tag(block, "Size"), None);
+        assert_eq!(extract_xml_tag(block, "ETag"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_content_range
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_content_range_valid() {
+        let range = parse_content_range("bytes 0-499/1000").unwrap();
+        assert_eq!(range.start, 0);
+        assert_eq!(range.end, 500); // end is exclusive (499 + 1)
+
+        let range2 = parse_content_range("bytes 500-999/1000").unwrap();
+        assert_eq!(range2.start, 500);
+        assert_eq!(range2.end, 1000);
+    }
+
+    #[test]
+    fn parse_content_range_invalid_returns_none() {
+        assert!(parse_content_range("invalid").is_none());
+        assert!(parse_content_range("bytes abc-def/1000").is_none());
+        assert!(parse_content_range("chars 0-499/1000").is_none());
+        assert!(parse_content_range("bytes 0-499").is_none()); // missing /total
+    }
+
+    // -----------------------------------------------------------------------
+    // CachedCatalog
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cached_catalog_empty_is_stale() {
+        let catalog = CachedCatalog::empty();
+        assert!(catalog.is_stale());
+    }
+
+    #[test]
+    fn cached_catalog_fresh_then_stale() {
+        let catalog = CachedCatalog {
+            tables: HashMap::new(),
+            fetched_at: Instant::now(),
+            ttl: std::time::Duration::from_millis(50),
+        };
+        // Freshly created should not be stale
+        assert!(!catalog.is_stale());
+
+        // After waiting past TTL, should be stale
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(catalog.is_stale());
+    }
+
+    // -----------------------------------------------------------------------
+    // BisqueRoutingStore::is_cluster_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_cluster_path_classification() {
+        let creds = Arc::new(CredentialConfig::default());
+        let store = BisqueRoutingStore::new("http://localhost:3300", "bucket", creds);
+
+        // Populate catalog with a known table
+        {
+            let mut cached = store.catalog.write();
+            cached.tables.insert(
+                "events".to_string(),
+                SegmentInfo {
+                    active_segment: 1,
+                    sealed_segment: Some(0),
+                    s3_dataset_uri: "s3://bucket/events".to_string(),
+                    s3_storage_options: HashMap::new(),
+                },
+            );
+            cached.fetched_at = Instant::now();
+        }
+
+        // Known table with active tier -> cluster path
+        assert!(store.is_cluster_path(&ObjectPath::from("events/active/data/file")));
+        // Known table with sealed tier -> cluster path
+        assert!(store.is_cluster_path(&ObjectPath::from("events/sealed/data/file")));
+        // Unknown table -> not cluster path
+        assert!(!store.is_cluster_path(&ObjectPath::from("unknown/active/data/file")));
+        // Invalid tier -> not cluster path
+        assert!(!store.is_cluster_path(&ObjectPath::from("events/cold/data/file")));
+        // Empty path -> not cluster path
+        assert!(!store.is_cluster_path(&ObjectPath::from("")));
+    }
+}

@@ -51,4 +51,11 @@ where
     /// to prevent log purging below a certain index. Returns `None` if the
     /// group has not been initialized yet.
     fn get_purge_floor(&self, group_id: u64) -> Option<Arc<AtomicU64>>;
+
+    /// Stop background threads and release resources.
+    ///
+    /// Implementations with background threads (fsync, manifest workers)
+    /// should override this to join those threads and close databases.
+    /// Default is a no-op.
+    fn stop(&self) {}
 }

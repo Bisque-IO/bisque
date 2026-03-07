@@ -188,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     println!("--- Step 1: Start Raft Node ---\n");
 
-    let raft_node = setup_single_node_raft(temp_dir.path()).await?;
+    let (raft_node, _manager) = setup_single_node_raft(temp_dir.path()).await?;
     raft_node.start();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -319,7 +319,7 @@ type Transport = BisqueTcpTransport<LanceTypeConfig>;
 type Storage = MultiplexedLogStorage<LanceTypeConfig>;
 type Manager = MultiRaftManager<LanceTypeConfig, Transport, Storage>;
 
-async fn setup_single_node_raft(base_dir: &std::path::Path) -> anyhow::Result<Arc<LanceRaftNode>> {
+async fn setup_single_node_raft(base_dir: &std::path::Path) -> anyhow::Result<(Arc<LanceRaftNode>, Arc<Manager>)> {
     let node_id: u64 = 1;
     let group_id: u64 = 1;
 
@@ -367,5 +367,5 @@ async fn setup_single_node_raft(base_dir: &std::path::Path) -> anyhow::Result<Ar
     }
 
     let raft_node = Arc::new(LanceRaftNode::new(raft, engine, node_id));
-    Ok(raft_node)
+    Ok((raft_node, manager))
 }

@@ -58,7 +58,8 @@ type Storage = MultiplexedLogStorage<LanceTypeConfig>;
 type Manager = MultiRaftManager<LanceTypeConfig, Transport, Storage>;
 
 /// Bootstrap a single-node Raft cluster (no write processor).
-async fn setup_node(base_dir: &std::path::Path) -> Arc<LanceRaftNode> {
+/// Returns (node, manager) — the manager must be kept alive to prevent storage shutdown.
+async fn setup_node(base_dir: &std::path::Path) -> (Arc<LanceRaftNode>, Arc<Manager>) {
     let node_id: u64 = 1;
     let group_id: u64 = 1;
 
@@ -68,7 +69,9 @@ async fn setup_node(base_dir: &std::path::Path) -> Arc<LanceRaftNode> {
 
     let raft_dir = base_dir.join("raft-data");
     std::fs::create_dir_all(&raft_dir).unwrap();
-    let storage_config = MmapStorageConfig::new(&raft_dir).with_segment_size(8 * 1024 * 1024);
+    let storage_config = MmapStorageConfig::new(&raft_dir)
+        .with_segment_size(8 * 1024 * 1024)
+        .with_fsync_delay(Duration::ZERO);
     let storage = Storage::new(storage_config).await.unwrap();
 
     let registry = Arc::new(NodeRegistry::new());
@@ -108,7 +111,7 @@ async fn setup_node(base_dir: &std::path::Path) -> Arc<LanceRaftNode> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(raft_node.is_leader(), "single node should be leader");
 
-    raft_node
+    (raft_node, manager)
 }
 
 fn kv(key: &str, val: &str) -> KeyValue {
@@ -143,10 +146,10 @@ async fn read_batches(node: &LanceRaftNode, table_name: &str) -> Vec<RecordBatch
 // =============================================================================
 
 /// ensure_tables creates all OTEL tables.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ensure_tables_creates_all() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();
@@ -168,10 +171,10 @@ async fn ensure_tables_creates_all() {
 }
 
 /// MetricsService routes Sum data points to otel_counters.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn metrics_sum_to_counters() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();
@@ -283,10 +286,10 @@ async fn metrics_sum_to_counters() {
 }
 
 /// MetricsService routes Gauge data points to otel_gauges.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn metrics_gauge_to_gauges() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();
@@ -337,10 +340,10 @@ async fn metrics_gauge_to_gauges() {
 }
 
 /// MetricsService routes Histogram data points to otel_histograms.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn metrics_histogram_to_histograms() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();
@@ -420,10 +423,10 @@ async fn metrics_histogram_to_histograms() {
 }
 
 /// TraceService writes spans with events and links.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn trace_service_writes_spans_with_events_and_links() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();
@@ -573,10 +576,10 @@ async fn trace_service_writes_spans_with_events_and_links() {
 }
 
 /// LogsService writes log records with flags.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn logs_service_writes_logs() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();
@@ -643,10 +646,10 @@ async fn logs_service_writes_logs() {
 }
 
 /// Empty requests are handled gracefully.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn empty_requests() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();
@@ -688,10 +691,10 @@ async fn empty_requests() {
 }
 
 /// Mixed metric types in a single request are decomposed correctly.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn mixed_metric_types() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();
@@ -759,10 +762,10 @@ async fn mixed_metric_types() {
 }
 
 /// ExponentialHistogram data points are written to otel_exp_histograms.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn metrics_exp_histogram() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();
@@ -861,10 +864,10 @@ async fn metrics_exp_histogram() {
 }
 
 /// Exemplars are extracted to otel_exemplars table.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn metrics_exemplars() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_node(tmp.path()).await;
+    let (node, _manager) = setup_node(tmp.path()).await;
 
     let receiver = OtlpReceiver::new(node.clone());
     receiver.ensure_tables().await.unwrap();

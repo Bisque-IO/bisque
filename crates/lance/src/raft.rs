@@ -8,6 +8,7 @@
 //! - Periodic compaction across all tables
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use openraft::error::{ClientWriteError, RaftError};
@@ -53,6 +54,8 @@ pub struct LanceRaftNode {
     manifest: Option<Arc<LanceManifestManager>>,
     /// Notify handle to trigger shutdown of background tasks.
     shutdown: Arc<Notify>,
+    /// Durable flag that survives missed Notify wakeups.
+    shutdown_flag: Arc<AtomicBool>,
     /// Background task handles.
     task_handles: parking_lot::Mutex<Vec<JoinHandle<()>>>,
 }
@@ -74,6 +77,7 @@ impl LanceRaftNode {
             applied_watermark: None,
             manifest: None,
             shutdown: Arc::new(Notify::new()),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
             task_handles: parking_lot::Mutex::new(Vec::new()),
         }
     }
@@ -222,6 +226,7 @@ impl LanceRaftNode {
             self.engine.clone(),
             self.node_id,
             self.shutdown.clone(),
+            self.shutdown_flag.clone(),
         )));
 
         // 2. Seal check loop (all tables)
@@ -231,6 +236,7 @@ impl LanceRaftNode {
             self.node_id,
             self.seal_check_interval,
             self.shutdown.clone(),
+            self.shutdown_flag.clone(),
         )));
 
         // 3. Flush orchestration loop (all tables)
@@ -240,6 +246,7 @@ impl LanceRaftNode {
             self.node_id,
             self.flush_check_interval,
             self.shutdown.clone(),
+            self.shutdown_flag.clone(),
         )));
 
         // 4. Compaction loop (all tables)
@@ -249,6 +256,7 @@ impl LanceRaftNode {
             self.node_id,
             self.compaction_check_interval,
             self.shutdown.clone(),
+            self.shutdown_flag.clone(),
         )));
 
         info!(
@@ -295,7 +303,10 @@ impl LanceRaftNode {
         batches: &[arrow_array::RecordBatch],
     ) -> Result<WriteResult, WriteError> {
         if batches.is_empty() {
-            return Ok(WriteResult { log_index: 0 });
+            return Ok(WriteResult {
+                log_index: 0,
+                response: LanceResponse::Ok,
+            });
         }
 
         // Route through batcher if configured.
@@ -313,6 +324,43 @@ impl LanceRaftNode {
         self.propose(cmd).await
     }
 
+    /// Delete rows matching a SQL filter predicate from all tiers of a table.
+    ///
+    /// Uses Lance deletion vectors (soft delete) — no data files are rewritten.
+    /// The delete is applied to all tiers (active, sealed, S3) that contain data,
+    /// ensuring a consistent view across the entire table.
+    pub async fn delete_records(
+        &self,
+        table_name: &str,
+        filter: &str,
+    ) -> Result<WriteResult, WriteError> {
+        let cmd = LanceCommand::DeleteRecords {
+            table_name: table_name.to_string(),
+            filter: filter.to_string(),
+        };
+        self.propose(cmd).await
+    }
+
+    /// Update rows matching a filter with replacement data.
+    ///
+    /// Implemented as a cross-tier soft-delete of matching rows followed by
+    /// an append of the replacement batches to the active segment.
+    pub async fn update_records(
+        &self,
+        table_name: &str,
+        filter: &str,
+        batches: &[arrow_array::RecordBatch],
+    ) -> Result<WriteResult, WriteError> {
+        let data =
+            ipc::encode_record_batches(batches).map_err(|e| WriteError::Encode(e.to_string()))?;
+        let cmd = LanceCommand::UpdateRecords {
+            table_name: table_name.to_string(),
+            filter: filter.to_string(),
+            data: data.into(),
+        };
+        self.propose(cmd).await
+    }
+
     /// Propose a command through Raft consensus.
     ///
     /// Returns a [`WriteResult`] containing the committed log index.
@@ -320,11 +368,15 @@ impl LanceRaftNode {
         let result = self.raft.client_write(cmd).await;
         match result {
             Ok(resp) => {
-                if let LanceResponse::Error(e) = resp.response() {
+                let response = resp.response().clone();
+                if let LanceResponse::Error(e) = &response {
                     return Err(WriteError::Raft(e.clone()));
                 }
                 let log_index = resp.log_id().index;
-                Ok(WriteResult { log_index })
+                Ok(WriteResult {
+                    log_index,
+                    response,
+                })
             }
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
                 Err(WriteError::NotLeader {
@@ -378,6 +430,7 @@ impl LanceRaftNode {
             batcher.shutdown().await;
         }
 
+        self.shutdown_flag.store(true, Ordering::Release);
         self.shutdown.notify_waiters();
 
         let handles: Vec<_> = {
@@ -386,6 +439,18 @@ impl LanceRaftNode {
         };
         for handle in handles {
             let _ = handle.await;
+        }
+
+        // Shut down the Raft state machine (stops heartbeat, replication,
+        // and drains in-flight proposals). Must happen after background tasks
+        // are joined (they call client_write) but before engine shutdown
+        // (raft may still apply entries during its shutdown).
+        // Use a timeout because raft.shutdown() can block if peers are
+        // unreachable (waiting for replication acknowledgments).
+        match tokio::time::timeout(Duration::from_secs(5), self.raft.shutdown()).await {
+            Ok(Err(e)) => error!("Raft shutdown error: {:?}", e),
+            Err(_) => warn!("Raft shutdown timed out after 5s, proceeding with cleanup"),
+            _ => {}
         }
 
         if let Err(e) = self.engine.shutdown().await {
@@ -436,11 +501,15 @@ async fn leader_watcher(
     engine: Arc<BisqueLance>,
     node_id: u64,
     shutdown: Arc<Notify>,
+    shutdown_flag: Arc<AtomicBool>,
 ) {
     let mut metrics_rx = raft.metrics();
     let mut was_leader = false;
 
     loop {
+        if shutdown_flag.load(Ordering::Acquire) {
+            return;
+        }
         let is_leader = {
             let m = metrics_rx.borrow_watched();
             m.state == ServerState::Leader && m.current_leader == Some(node_id)
@@ -491,11 +560,15 @@ async fn seal_check_loop(
     node_id: u64,
     interval: Duration,
     shutdown: Arc<Notify>,
+    shutdown_flag: Arc<AtomicBool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        if shutdown_flag.load(Ordering::Acquire) {
+            return;
+        }
         tokio::select! {
             _ = ticker.tick() => {}
             _ = shutdown.notified() => {
@@ -553,11 +626,15 @@ async fn flush_orchestrator(
     node_id: u64,
     interval: Duration,
     shutdown: Arc<Notify>,
+    shutdown_flag: Arc<AtomicBool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        if shutdown_flag.load(Ordering::Acquire) {
+            return;
+        }
         tokio::select! {
             _ = ticker.tick() => {}
             _ = shutdown.notified() => {
@@ -644,11 +721,15 @@ async fn compaction_loop(
     node_id: u64,
     interval: Duration,
     shutdown: Arc<Notify>,
+    shutdown_flag: Arc<AtomicBool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        if shutdown_flag.load(Ordering::Acquire) {
+            return;
+        }
         tokio::select! {
             _ = ticker.tick() => {}
             _ = shutdown.notified() => {
@@ -720,9 +801,80 @@ async fn propose_cmd(
 ) -> std::result::Result<LanceResponse, String> {
     match raft.client_write(cmd).await {
         Ok(resp) => match resp.response().clone() {
-            LanceResponse::Ok => Ok(LanceResponse::Ok),
             LanceResponse::Error(e) => Err(format!("state machine error: {}", e)),
+            other => Ok(other),
         },
         Err(e) => Err(format!("raft write error: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_write_error_display_not_leader() {
+        let err = WriteError::NotLeader {
+            leader_id: Some(42),
+            leader_node: None,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("not leader"), "got: {}", msg);
+        assert!(msg.contains("42"), "got: {}", msg);
+
+        // Also test with None leader_id
+        let err_none = WriteError::NotLeader {
+            leader_id: None,
+            leader_node: None,
+        };
+        let msg_none = format!("{}", err_none);
+        assert!(msg_none.contains("not leader"), "got: {}", msg_none);
+        assert!(msg_none.contains("None"), "got: {}", msg_none);
+    }
+
+    #[test]
+    fn test_write_error_display_encode() {
+        let err = WriteError::Encode("bad IPC data".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("encode error"), "got: {}", msg);
+        assert!(msg.contains("bad IPC data"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_write_error_display_raft() {
+        let err = WriteError::Raft("consensus timeout".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("raft error"), "got: {}", msg);
+        assert!(msg.contains("consensus timeout"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_write_error_display_fatal() {
+        let err = WriteError::Fatal("storage corruption".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("fatal raft error"), "got: {}", msg);
+        assert!(msg.contains("storage corruption"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_write_error_clone() {
+        let err = WriteError::NotLeader {
+            leader_id: Some(7),
+            leader_node: None,
+        };
+        let cloned = err.clone();
+        assert_eq!(format!("{}", err), format!("{}", cloned));
+
+        let err2 = WriteError::Encode("test".to_string());
+        let cloned2 = err2.clone();
+        assert_eq!(format!("{}", err2), format!("{}", cloned2));
+
+        let err3 = WriteError::Raft("test".to_string());
+        let cloned3 = err3.clone();
+        assert_eq!(format!("{}", err3), format!("{}", cloned3));
+
+        let err4 = WriteError::Fatal("test".to_string());
+        let cloned4 = err4.clone();
+        assert_eq!(format!("{}", err4), format!("{}", cloned4));
     }
 }

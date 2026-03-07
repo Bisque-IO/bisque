@@ -23,6 +23,8 @@ const CMD_REGISTER_SESSION: u8 = 6;
 const CMD_PIN_VERSION: u8 = 7;
 const CMD_UNPIN_VERSION: u8 = 8;
 const CMD_EXPIRE_SESSION: u8 = 9;
+const CMD_DELETE_RECORDS: u8 = 10;
+const CMD_UPDATE_RECORDS: u8 = 11;
 
 // Discriminant bytes for SealReason
 const SEAL_MAX_AGE: u8 = 0;
@@ -226,6 +228,27 @@ impl Encode for LanceCommand {
                 CMD_EXPIRE_SESSION.encode(writer)?;
                 session_id.encode(writer)?;
             }
+            LanceCommand::DeleteRecords {
+                table_name,
+                filter,
+            } => {
+                CMD_DELETE_RECORDS.encode(writer)?;
+                encode_table_name(table_name, writer)?;
+                (filter.len() as u32).encode(writer)?;
+                writer.write_all(filter.as_bytes())?;
+            }
+            LanceCommand::UpdateRecords {
+                table_name,
+                filter,
+                data,
+            } => {
+                CMD_UPDATE_RECORDS.encode(writer)?;
+                encode_table_name(table_name, writer)?;
+                (filter.len() as u32).encode(writer)?;
+                writer.write_all(filter.as_bytes())?;
+                (data.len() as u32).encode(writer)?;
+                writer.write_all(data)?;
+            }
         }
         Ok(())
     }
@@ -255,6 +278,15 @@ impl Encode for LanceCommand {
                 table_name, tier, ..
             } => 8 + table_name_size(table_name) + table_name_size(tier) + 8,
             LanceCommand::ExpireSession { .. } => 8,
+            LanceCommand::DeleteRecords {
+                table_name,
+                filter,
+            } => table_name_size(table_name) + 4 + filter.len(),
+            LanceCommand::UpdateRecords {
+                table_name,
+                filter,
+                data,
+            } => table_name_size(table_name) + 4 + filter.len() + 4 + data.len(),
         }
     }
 }
@@ -348,6 +380,39 @@ impl Decode for LanceCommand {
             CMD_EXPIRE_SESSION => {
                 let session_id = u64::decode(reader)?;
                 Ok(LanceCommand::ExpireSession { session_id })
+            }
+            CMD_DELETE_RECORDS => {
+                let table_name = decode_table_name(reader)?;
+                let filter_len = u32::decode(reader)? as usize;
+                let mut filter_buf = vec![0u8; filter_len];
+                reader.read_exact(&mut filter_buf)?;
+                let filter = String::from_utf8(filter_buf).map_err(|_| {
+                    CodecError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "filter is not valid UTF-8",
+                    ))
+                })?;
+                Ok(LanceCommand::DeleteRecords { table_name, filter })
+            }
+            CMD_UPDATE_RECORDS => {
+                let table_name = decode_table_name(reader)?;
+                let filter_len = u32::decode(reader)? as usize;
+                let mut filter_buf = vec![0u8; filter_len];
+                reader.read_exact(&mut filter_buf)?;
+                let filter = String::from_utf8(filter_buf).map_err(|_| {
+                    CodecError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "filter is not valid UTF-8",
+                    ))
+                })?;
+                let data_len = u32::decode(reader)? as usize;
+                let mut data_buf = vec![0u8; data_len];
+                reader.read_exact(&mut data_buf)?;
+                Ok(LanceCommand::UpdateRecords {
+                    table_name,
+                    filter,
+                    data: Bytes::from(data_buf),
+                })
             }
             d => Err(CodecError::InvalidDiscriminant(d)),
         }
@@ -487,6 +552,64 @@ impl Decode for LanceCommand {
             CMD_EXPIRE_SESSION => {
                 let session_id = read_u64_at(&data, offset)?;
                 Ok(LanceCommand::ExpireSession { session_id })
+            }
+            CMD_DELETE_RECORDS => {
+                let (table_name, consumed) = decode_table_name_from_bytes(&data, offset)?;
+                offset += consumed;
+                let filter_len = read_u32_at(&data, offset)? as usize;
+                offset += 4;
+                if data.len() < offset + filter_len {
+                    return Err(CodecError::BufferTooSmall {
+                        needed: offset + filter_len,
+                        have: data.len(),
+                    });
+                }
+                let filter =
+                    String::from_utf8(data[offset..offset + filter_len].to_vec()).map_err(
+                        |_| {
+                            CodecError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "filter is not valid UTF-8",
+                            ))
+                        },
+                    )?;
+                Ok(LanceCommand::DeleteRecords { table_name, filter })
+            }
+            CMD_UPDATE_RECORDS => {
+                let (table_name, consumed) = decode_table_name_from_bytes(&data, offset)?;
+                offset += consumed;
+                let filter_len = read_u32_at(&data, offset)? as usize;
+                offset += 4;
+                if data.len() < offset + filter_len {
+                    return Err(CodecError::BufferTooSmall {
+                        needed: offset + filter_len,
+                        have: data.len(),
+                    });
+                }
+                let filter =
+                    String::from_utf8(data[offset..offset + filter_len].to_vec()).map_err(
+                        |_| {
+                            CodecError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "filter is not valid UTF-8",
+                            ))
+                        },
+                    )?;
+                offset += filter_len;
+                let data_len = read_u32_at(&data, offset)? as usize;
+                offset += 4;
+                if data.len() < offset + data_len {
+                    return Err(CodecError::BufferTooSmall {
+                        needed: offset + data_len,
+                        have: data.len(),
+                    });
+                }
+                let payload = data.slice(offset..offset + data_len);
+                Ok(LanceCommand::UpdateRecords {
+                    table_name,
+                    filter,
+                    data: payload,
+                })
             }
             d => Err(CodecError::InvalidDiscriminant(d)),
         }
@@ -684,6 +807,211 @@ mod tests {
             } => {
                 assert_eq!(table_name, "logs");
                 assert_eq!(&schema_ipc[..], &[10, 20, 30]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_delete_records() {
+        let cmd = LanceCommand::DeleteRecords {
+            table_name: "events".to_string(),
+            filter: "id > 100 AND status = 'inactive'".to_string(),
+        };
+        let encoded = cmd.encode_to_vec().unwrap();
+        assert_eq!(encoded.len(), cmd.encoded_size());
+        let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
+        match decoded {
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                assert_eq!(table_name, "events");
+                assert_eq!(filter, "id > 100 AND status = 'inactive'");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_delete_records_empty_filter() {
+        let cmd = LanceCommand::DeleteRecords {
+            table_name: "t".to_string(),
+            filter: "".to_string(),
+        };
+        let encoded = cmd.encode_to_vec().unwrap();
+        assert_eq!(encoded.len(), cmd.encoded_size());
+        let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
+        match decoded {
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                assert_eq!(table_name, "t");
+                assert_eq!(filter, "");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_update_records() {
+        let cmd = LanceCommand::UpdateRecords {
+            table_name: "metrics".to_string(),
+            filter: "ts < '2024-01-01'".to_string(),
+            data: Bytes::from_static(&[10, 20, 30, 40, 50]),
+        };
+        let encoded = cmd.encode_to_vec().unwrap();
+        assert_eq!(encoded.len(), cmd.encoded_size());
+        let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
+        match decoded {
+            LanceCommand::UpdateRecords { table_name, filter, data } => {
+                assert_eq!(table_name, "metrics");
+                assert_eq!(filter, "ts < '2024-01-01'");
+                assert_eq!(&data[..], &[10, 20, 30, 40, 50]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_update_records_empty_data() {
+        let cmd = LanceCommand::UpdateRecords {
+            table_name: "t".to_string(),
+            filter: "id = 1".to_string(),
+            data: Bytes::new(),
+        };
+        let encoded = cmd.encode_to_vec().unwrap();
+        assert_eq!(encoded.len(), cmd.encoded_size());
+        let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
+        match decoded {
+            LanceCommand::UpdateRecords { table_name, filter, data } => {
+                assert_eq!(table_name, "t");
+                assert_eq!(filter, "id = 1");
+                assert!(data.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn zero_copy_decode_delete_records() {
+        let cmd = LanceCommand::DeleteRecords {
+            table_name: "logs".to_string(),
+            filter: "level = 'DEBUG'".to_string(),
+        };
+        let encoded = cmd.encode_to_vec().unwrap();
+        let bytes = Bytes::from(encoded);
+        let decoded = LanceCommand::decode_from_bytes(bytes).unwrap();
+        match decoded {
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                assert_eq!(table_name, "logs");
+                assert_eq!(filter, "level = 'DEBUG'");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn zero_copy_decode_update_records() {
+        let cmd = LanceCommand::UpdateRecords {
+            table_name: "data".to_string(),
+            filter: "x > 0".to_string(),
+            data: Bytes::from_static(&[1, 2, 3, 4, 5, 6, 7, 8]),
+        };
+        let encoded = cmd.encode_to_vec().unwrap();
+        let bytes = Bytes::from(encoded);
+        let decoded = LanceCommand::decode_from_bytes(bytes).unwrap();
+        match decoded {
+            LanceCommand::UpdateRecords { table_name, filter, data } => {
+                assert_eq!(table_name, "data");
+                assert_eq!(filter, "x > 0");
+                assert_eq!(&data[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn borrow_payload_delete_returns_empty() {
+        let cmd = LanceCommand::DeleteRecords {
+            table_name: "t".to_string(),
+            filter: "id = 1".to_string(),
+        };
+        assert!(cmd.payload_bytes().is_empty());
+    }
+
+    #[test]
+    fn roundtrip_delete_records_long_table_name() {
+        // Table name is u16 length-prefixed, so 65535 bytes is the max.
+        let long_name = "x".repeat(65535);
+        let cmd = LanceCommand::DeleteRecords {
+            table_name: long_name.clone(),
+            filter: "id = 1".to_string(),
+        };
+        let encoded = cmd.encode_to_vec().unwrap();
+        assert_eq!(encoded.len(), cmd.encoded_size());
+        let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
+        match decoded {
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                assert_eq!(table_name.len(), 65535);
+                assert_eq!(table_name, long_name);
+                assert_eq!(filter, "id = 1");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Also verify zero-copy decode path.
+        let bytes = Bytes::from(cmd.encode_to_vec().unwrap());
+        let decoded2 = LanceCommand::decode_from_bytes(bytes).unwrap();
+        match decoded2 {
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                assert_eq!(table_name.len(), 65535);
+                assert_eq!(filter, "id = 1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_delete_records_max_filter() {
+        // Filter is u32 length-prefixed, so very long filters should work fine.
+        let long_filter = "id = 1 OR ".repeat(10_000); // 100,000 chars
+        let cmd = LanceCommand::DeleteRecords {
+            table_name: "t".to_string(),
+            filter: long_filter.clone(),
+        };
+        let encoded = cmd.encode_to_vec().unwrap();
+        assert_eq!(encoded.len(), cmd.encoded_size());
+        let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
+        match decoded {
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                assert_eq!(table_name, "t");
+                assert_eq!(filter.len(), long_filter.len());
+                assert_eq!(filter, long_filter);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Also verify zero-copy decode path.
+        let bytes = Bytes::from(cmd.encode_to_vec().unwrap());
+        let decoded2 = LanceCommand::decode_from_bytes(bytes).unwrap();
+        match decoded2 {
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                assert_eq!(table_name, "t");
+                assert_eq!(filter, long_filter);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_delete_records_unicode_filter() {
+        let cmd = LanceCommand::DeleteRecords {
+            table_name: "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30fc}\u{30d6}\u{30eb}".to_string(),
+            filter: "name = '\u{1f3af}'".to_string(),
+        };
+        let encoded = cmd.encode_to_vec().unwrap();
+        assert_eq!(encoded.len(), cmd.encoded_size());
+        let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
+        match decoded {
+            LanceCommand::DeleteRecords { table_name, filter } => {
+                assert_eq!(table_name, "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30fc}\u{30d6}\u{30eb}");
+                assert_eq!(filter, "name = '\u{1f3af}'");
             }
             _ => panic!("wrong variant"),
         }

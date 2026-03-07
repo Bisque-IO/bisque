@@ -38,6 +38,9 @@ pub enum Error {
 
     #[error("Segment sync error: {0}")]
     SegmentSync(String),
+
+    #[error("Delete failed: {0}")]
+    DeleteFailed(String),
 }
 
 impl From<Error> for io::Error {

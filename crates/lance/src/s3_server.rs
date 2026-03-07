@@ -1239,3 +1239,243 @@ fn s3_internal_error(message: &str) -> Response {
         .body(Body::from(body))
         .unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // parse_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_key_valid_active_key() {
+        let parsed = parse_key("my_table/active/data/foo.lance").unwrap();
+        assert_eq!(parsed.table_name, "my_table");
+        assert!(matches!(parsed.tier, SegmentTier::Active));
+        assert_eq!(parsed.relative_path, "data/foo.lance");
+    }
+
+    #[test]
+    fn parse_key_valid_sealed_key() {
+        let parsed = parse_key("otel_counters/sealed/indices/idx.lance").unwrap();
+        assert_eq!(parsed.table_name, "otel_counters");
+        assert!(matches!(parsed.tier, SegmentTier::Sealed));
+        assert_eq!(parsed.relative_path, "indices/idx.lance");
+    }
+
+    #[test]
+    fn parse_key_rejects_path_traversal() {
+        assert!(parse_key("table/../etc/passwd").is_none());
+        assert!(parse_key("table/active/../../secret").is_none());
+    }
+
+    #[test]
+    fn parse_key_rejects_unknown_tier() {
+        assert!(parse_key("table/warm/data/file").is_none());
+        assert!(parse_key("table/cold/data/file").is_none());
+        assert!(parse_key("table/ACTIVE/data/file").is_none());
+    }
+
+    #[test]
+    fn parse_key_with_no_relative_path() {
+        let parsed = parse_key("table/active").unwrap();
+        assert_eq!(parsed.table_name, "table");
+        assert!(matches!(parsed.tier, SegmentTier::Active));
+        assert_eq!(parsed.relative_path, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_range_to_get_range
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_range_bounded() {
+        let range = parse_range_to_get_range("bytes=0-499").unwrap();
+        match range {
+            object_store::GetRange::Bounded(r) => {
+                assert_eq!(r.start, 0);
+                assert_eq!(r.end, 500); // end is exclusive (parsed as 499+1)
+            }
+            other => panic!("expected Bounded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_range_suffix() {
+        let range = parse_range_to_get_range("bytes=-500").unwrap();
+        match range {
+            object_store::GetRange::Suffix(n) => assert_eq!(n, 500),
+            other => panic!("expected Suffix, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_range_offset() {
+        let range = parse_range_to_get_range("bytes=100-").unwrap();
+        match range {
+            object_store::GetRange::Offset(o) => assert_eq!(o, 100),
+            other => panic!("expected Offset, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_range_rejects_invalid_format() {
+        assert!(parse_range_to_get_range("invalid").is_err());
+        assert!(parse_range_to_get_range("bytes=abc-def").is_err());
+        assert!(parse_range_to_get_range("chars=0-100").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // filter_non_credential_options
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn filter_removes_credential_keys() {
+        let mut opts = HashMap::new();
+        opts.insert("aws_access_key_id".into(), "AKIA...".into());
+        opts.insert("aws_secret_access_key".into(), "secret123".into());
+        opts.insert("aws_session_token".into(), "tok".into());
+        opts.insert("password".into(), "hunter2".into());
+        opts.insert("credential_provider".into(), "some".into());
+        opts.insert("region".into(), "us-east-1".into());
+
+        let filtered = filter_non_credential_options(&opts);
+        assert!(!filtered.contains_key("aws_access_key_id"));
+        assert!(!filtered.contains_key("aws_secret_access_key"));
+        assert!(!filtered.contains_key("aws_session_token"));
+        assert!(!filtered.contains_key("password"));
+        assert!(!filtered.contains_key("credential_provider"));
+        assert_eq!(filtered.get("region").unwrap(), "us-east-1");
+    }
+
+    #[test]
+    fn filter_keeps_region_and_endpoint() {
+        let mut opts = HashMap::new();
+        opts.insert("region".into(), "us-west-2".into());
+        opts.insert("endpoint".into(), "https://s3.example.com".into());
+        opts.insert("force_path_style".into(), "true".into());
+
+        let filtered = filter_non_credential_options(&opts);
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered["region"], "us-west-2");
+        assert_eq!(filtered["endpoint"], "https://s3.example.com");
+        assert_eq!(filtered["force_path_style"], "true");
+    }
+
+    // -----------------------------------------------------------------------
+    // escape_xml
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn escape_xml_special_characters() {
+        assert_eq!(escape_xml("a & b"), "a &amp; b");
+        assert_eq!(escape_xml("<tag>"), "&lt;tag&gt;");
+        assert_eq!(escape_xml("he said \"hi\""), "he said &quot;hi&quot;");
+        assert_eq!(escape_xml("it's"), "it&apos;s");
+        assert_eq!(escape_xml("plain text"), "plain text");
+        assert_eq!(
+            escape_xml("<a>&\"'</a>"),
+            "&lt;a&gt;&amp;&quot;&apos;&lt;/a&gt;"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_objects_xml_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_objects_xml_produces_valid_structure() {
+        let objects = vec![
+            S3Object {
+                key: "table/active/data/file.lance".into(),
+                size: 1024,
+                last_modified: "2025-01-01T00:00:00.000Z".into(),
+                etag: "\"abc123\"".into(),
+            },
+        ];
+        let common_prefixes = vec!["table/active/data/".to_string()];
+
+        let resp = list_objects_xml_response(
+            "my-bucket",
+            "table/",
+            &objects,
+            &common_prefixes,
+            false,
+            None,
+        );
+
+        // Verify status and content-type
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/xml"
+        );
+
+        // Extract body synchronously via into_body
+        let body_bytes = {
+            use axum::body::to_bytes;
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(to_bytes(resp.into_body(), usize::MAX)).unwrap()
+        };
+        let xml = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert!(xml.starts_with("<?xml version=\"1.0\""));
+        assert!(xml.contains("<ListBucketResult"));
+        assert!(xml.contains("<Name>my-bucket</Name>"));
+        assert!(xml.contains("<Prefix>table/</Prefix>"));
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(xml.contains("<Key>table/active/data/file.lance</Key>"));
+        assert!(xml.contains("<Size>1024</Size>"));
+        assert!(xml.contains("<CommonPrefixes>"));
+        assert!(xml.contains("<Prefix>table/active/data/</Prefix>"));
+        // No continuation token when is_truncated is false
+        assert!(!xml.contains("<NextContinuationToken>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // snapshot_to_operation / operation_to_snapshot roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_operation_roundtrip() {
+        let original = Operation {
+            id: "op-123".into(),
+            node_id: 42,
+            op_type: OpType::Reindex,
+            tier: OpTier::Cold,
+            tenant: "tenant-a".into(),
+            catalog: "catalog-1".into(),
+            catalog_type: "Lance".into(),
+            table: "events".into(),
+            status: OpStatus::Running,
+            progress: 0.75,
+            created_at: "2025-01-01T00:00:00Z".into(),
+            started_at: Some("2025-01-01T00:01:00Z".into()),
+            finished_at: None,
+            error: None,
+            fragments_done: Some(30),
+            fragments_total: Some(40),
+        };
+
+        let snapshot = operation_to_snapshot(&original);
+        let recovered = snapshot_to_operation(&snapshot);
+
+        assert_eq!(recovered.id, original.id);
+        assert_eq!(recovered.node_id, original.node_id);
+        assert_eq!(recovered.op_type, original.op_type);
+        assert_eq!(recovered.tier, original.tier);
+        assert_eq!(recovered.tenant, original.tenant);
+        assert_eq!(recovered.catalog, original.catalog);
+        assert_eq!(recovered.catalog_type, original.catalog_type);
+        assert_eq!(recovered.table, original.table);
+        assert_eq!(recovered.status, original.status);
+        assert!((recovered.progress - original.progress).abs() < f64::EPSILON);
+        assert_eq!(recovered.created_at, original.created_at);
+        assert_eq!(recovered.started_at, original.started_at);
+        assert_eq!(recovered.finished_at, original.finished_at);
+        assert_eq!(recovered.error, original.error);
+        assert_eq!(recovered.fragments_done, original.fragments_done);
+        assert_eq!(recovered.fragments_total, original.fragments_total);
+    }
+}

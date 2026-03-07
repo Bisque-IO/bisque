@@ -945,7 +945,15 @@ impl LanceManifestManager {
             let _ = handle.join();
         }
     }
+}
 
+impl Drop for LanceManifestManager {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl LanceManifestManager {
     // -- Worker thread --
 
     fn worker_loop(

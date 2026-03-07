@@ -16,7 +16,7 @@
 //! | Flight SQL command | bisque-lance operation |
 //! |--------------------|------------------------|
 //! | `CommandStatementQuery` | DataFusion SQL → stream results |
-//! | `CommandStatementUpdate` | DataFusion DDL (CREATE TABLE, DROP TABLE) |
+//! | `CommandStatementUpdate` | DELETE/UPDATE via Raft; DDL via DataFusion |
 //! | `CommandStatementIngest` | Bulk write batches to a table |
 //! | `CommandGetTables` | List tables with schemas |
 //! | `CommandGetCatalogs` | Returns single "bisque" catalog |
@@ -216,6 +216,191 @@ fn decode_create_table_action(body: &[u8]) -> Result<(String, Schema), Status> {
     Ok((name, schema))
 }
 
+/// Decode the body of a `delete_records` custom action.
+///
+/// Format: `u16 BE name_len` + `name bytes` + `UTF-8 filter string`
+fn decode_delete_action(body: &[u8]) -> Result<(String, String), Status> {
+    if body.len() < 2 {
+        return Err(Status::invalid_argument(
+            "delete_records action body too short",
+        ));
+    }
+    let name_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    if body.len() < 2 + name_len {
+        return Err(Status::invalid_argument(
+            "delete_records action body truncated (name)",
+        ));
+    }
+    let name = std::str::from_utf8(&body[2..2 + name_len])
+        .map_err(|_| Status::invalid_argument("table name is not valid UTF-8"))?
+        .to_string();
+    let filter = std::str::from_utf8(&body[2 + name_len..])
+        .map_err(|_| Status::invalid_argument("filter is not valid UTF-8"))?
+        .to_string();
+    Ok((name, filter))
+}
+
+/// Decode the body of an `update_records` custom action.
+///
+/// Format: `u16 BE name_len` + `name bytes` + `u32 BE filter_len` + `filter bytes` + `IPC data`
+fn decode_update_action(body: &[u8]) -> Result<(String, String, bytes::Bytes), Status> {
+    if body.len() < 2 {
+        return Err(Status::invalid_argument(
+            "update_records action body too short",
+        ));
+    }
+    let name_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    if body.len() < 2 + name_len + 4 {
+        return Err(Status::invalid_argument(
+            "update_records action body truncated (name or filter_len)",
+        ));
+    }
+    let name = std::str::from_utf8(&body[2..2 + name_len])
+        .map_err(|_| Status::invalid_argument("table name is not valid UTF-8"))?
+        .to_string();
+    let filter_offset = 2 + name_len;
+    let filter_len = u32::from_be_bytes([
+        body[filter_offset],
+        body[filter_offset + 1],
+        body[filter_offset + 2],
+        body[filter_offset + 3],
+    ]) as usize;
+    let filter_start = filter_offset + 4;
+    if body.len() < filter_start + filter_len {
+        return Err(Status::invalid_argument(
+            "update_records action body truncated (filter)",
+        ));
+    }
+    let filter = std::str::from_utf8(&body[filter_start..filter_start + filter_len])
+        .map_err(|_| Status::invalid_argument("filter is not valid UTF-8"))?
+        .to_string();
+    let data = bytes::Bytes::copy_from_slice(&body[filter_start + filter_len..]);
+    Ok((name, filter, data))
+}
+
+// =============================================================================
+// SQL DELETE / UPDATE parsing helpers
+// =============================================================================
+
+/// Parse a SQL DELETE statement into (table_name, filter_predicate).
+///
+/// Supports: `DELETE FROM [schema.]table WHERE predicate`
+///
+/// Returns `None` if the SQL is not a DELETE statement.
+fn parse_delete_sql(sql: &str) -> Option<(String, String)> {
+    // Case-insensitive check for DELETE FROM
+    let upper = sql.to_uppercase();
+    if !upper.starts_with("DELETE") {
+        return None;
+    }
+
+    // Skip "DELETE" and optional whitespace
+    let rest = sql["DELETE".len()..].trim_start();
+
+    // Expect "FROM"
+    let upper_rest = rest.to_uppercase();
+    if !upper_rest.starts_with("FROM") {
+        return None;
+    }
+    let rest = rest["FROM".len()..].trim_start();
+
+    // Find WHERE clause
+    let upper_rest = rest.to_uppercase();
+    let where_pos = upper_rest.find("WHERE")?;
+
+    let table = rest[..where_pos].trim().trim_matches('"');
+    // Strip optional schema prefix (e.g. "public.my_table" → "my_table")
+    let table = table.rsplit('.').next().unwrap_or(table).trim_matches('"');
+    let filter = rest[where_pos + "WHERE".len()..].trim();
+
+    // Strip trailing semicolon
+    let filter = filter.strip_suffix(';').unwrap_or(filter).trim();
+
+    if table.is_empty() || filter.is_empty() {
+        return None;
+    }
+
+    Some((table.to_string(), filter.to_string()))
+}
+
+/// Parse a SQL UPDATE statement into (table_name, set_assignments, filter_predicate).
+///
+/// Supports: `UPDATE [schema.]table SET col1=val1, col2=val2 WHERE predicate`
+///
+/// Returns `None` if the SQL is not an UPDATE statement.
+fn parse_update_sql(sql: &str) -> Option<(String, String, String)> {
+    let upper = sql.to_uppercase();
+    if !upper.starts_with("UPDATE") {
+        return None;
+    }
+
+    let rest = sql["UPDATE".len()..].trim_start();
+
+    // Find SET keyword
+    let upper_rest = rest.to_uppercase();
+    let set_pos = upper_rest.find("SET")?;
+
+    let table = rest[..set_pos].trim().trim_matches('"');
+    let table = table.rsplit('.').next().unwrap_or(table).trim_matches('"');
+    let rest = rest[set_pos + "SET".len()..].trim_start();
+
+    // Find WHERE keyword
+    let upper_rest = rest.to_uppercase();
+    let where_pos = upper_rest.find("WHERE")?;
+
+    let assignments = rest[..where_pos].trim();
+    let filter = rest[where_pos + "WHERE".len()..].trim();
+
+    // Strip trailing semicolon
+    let filter = filter.strip_suffix(';').unwrap_or(filter).trim();
+    let assignments = assignments.strip_suffix(',').unwrap_or(assignments).trim();
+
+    if table.is_empty() || assignments.is_empty() || filter.is_empty() {
+        return None;
+    }
+
+    Some((
+        table.to_string(),
+        assignments.to_string(),
+        filter.to_string(),
+    ))
+}
+
+/// Build a SELECT query that produces updated rows for an UPDATE statement.
+///
+/// Given `UPDATE t SET col1=expr1, col2=expr2 WHERE pred`, produces:
+/// `SELECT expr1 AS col1, expr2 AS col2, <other_cols> FROM t WHERE pred`
+///
+/// This lets DataFusion evaluate the SET expressions and produce replacement
+/// RecordBatches that can be written back through Raft.
+fn build_update_select_sql(table: &str, assignments: &str, filter: &str) -> String {
+    // Parse assignments into (col, expr) pairs
+    let mut set_cols: Vec<(&str, &str)> = Vec::new();
+    for assignment in assignments.split(',') {
+        if let Some((col, expr)) = assignment.split_once('=') {
+            set_cols.push((col.trim(), expr.trim()));
+        }
+    }
+
+    // Build SELECT with SET expressions aliased to their column names,
+    // plus a wildcard EXCLUDE for untouched columns.
+    // DataFusion supports EXCLUDE syntax for this pattern.
+    let set_exprs: Vec<String> = set_cols
+        .iter()
+        .map(|(col, expr)| format!("{expr} AS {col}"))
+        .collect();
+    let exclude_cols: Vec<&str> = set_cols.iter().map(|(col, _)| *col).collect();
+
+    // Use EXCLUDE to get all non-modified columns, then add modified ones
+    format!(
+        "SELECT * EXCLUDE ({excludes}), {sets} FROM {table} WHERE {filter}",
+        excludes = exclude_cols.join(", "),
+        sets = set_exprs.join(", "),
+        table = table,
+        filter = filter,
+    )
+}
+
 // =============================================================================
 // FlightSqlService implementation
 // =============================================================================
@@ -325,7 +510,9 @@ impl FlightSqlService for BisqueFlightService {
 
     /// Handle `CommandStatementUpdate` — execute DDL/DML SQL statements.
     ///
-    /// Supports `CREATE TABLE ... AS SELECT ...`, `DROP TABLE`, etc.
+    /// DELETE and UPDATE statements are routed through Raft consensus so that
+    /// mutations are replicated to all nodes. Other DDL/DML (CREATE TABLE,
+    /// DROP TABLE, etc.) is executed directly via DataFusion.
     async fn do_put_statement_update(
         &self,
         ticket: CommandStatementUpdate,
@@ -334,6 +521,54 @@ impl FlightSqlService for BisqueFlightService {
         let sql = &ticket.query;
         debug!(sql = %sql, "do_put_statement_update");
 
+        let trimmed = sql.trim();
+
+        // Route DELETE statements through Raft consensus.
+        if let Some((table, filter)) = parse_delete_sql(trimmed) {
+            let result = self
+                .raft_node
+                .delete_records(&table, &filter)
+                .await
+                .map_err(write_error_to_status)?;
+            return match result.response {
+                crate::types::LanceResponse::RowsAffected(n) => Ok(n as i64),
+                crate::types::LanceResponse::Error(e) => {
+                    Err(Status::internal(format!("delete failed: {e}")))
+                }
+                _ => Ok(0),
+            };
+        }
+
+        // Route UPDATE statements through Raft consensus.
+        //
+        // SQL UPDATE requires evaluating SET expressions which needs query
+        // planning. We use DataFusion to plan a SELECT of the replacement
+        // rows (applying the SET transformations), then route the result
+        // through Raft as a delete + append.
+        if let Some((table, assignments, filter)) = parse_update_sql(trimmed) {
+            // Build a SELECT that produces the updated rows.
+            let select_sql = build_update_select_sql(&table, &assignments, &filter);
+            let (_schema, batches) = self.execute_sql(&select_sql).await?;
+
+            if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+                return Ok(0);
+            }
+
+            let result = self
+                .raft_node
+                .update_records(&table, &filter, &batches)
+                .await
+                .map_err(write_error_to_status)?;
+            return match result.response {
+                crate::types::LanceResponse::RowsAffected(n) => Ok(n as i64),
+                crate::types::LanceResponse::Error(e) => {
+                    Err(Status::internal(format!("update failed: {e}")))
+                }
+                _ => Ok(0),
+            };
+        }
+
+        // All other DDL/DML — execute directly via DataFusion.
         let (_schema, batches) = self.execute_sql(sql).await?;
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         Ok(rows as i64)
@@ -834,6 +1069,40 @@ impl FlightSqlService for BisqueFlightService {
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))
             }
+            "delete_records" => {
+                let (name, filter) = decode_delete_action(&action.body)?;
+                debug!(table = %name, filter = %filter, "do_action: deleting records");
+
+                self.raft_node
+                    .delete_records(&name, &filter)
+                    .await
+                    .map_err(write_error_to_status)?;
+
+                let result = arrow_flight::Result {
+                    body: bytes::Bytes::from_static(b"ok"),
+                };
+                let stream = futures::stream::once(async { Ok(result) });
+                Ok(Response::new(Box::pin(stream)))
+            }
+            "update_records" => {
+                let (name, filter, ipc_data) = decode_update_action(&action.body)?;
+                debug!(table = %name, filter = %filter, "do_action: updating records");
+
+                let batches = ipc::decode_record_batches(&ipc_data).map_err(|e| {
+                    Status::invalid_argument(format!("failed to decode IPC data: {e}"))
+                })?;
+
+                self.raft_node
+                    .update_records(&name, &filter, &batches)
+                    .await
+                    .map_err(write_error_to_status)?;
+
+                let result = arrow_flight::Result {
+                    body: bytes::Bytes::from_static(b"ok"),
+                };
+                let stream = futures::stream::once(async { Ok(result) });
+                Ok(Response::new(Box::pin(stream)))
+            }
             other => Err(Status::invalid_argument(format!(
                 "unknown action type: {other}"
             ))),
@@ -851,6 +1120,16 @@ impl FlightSqlService for BisqueFlightService {
             Ok(ActionType {
                 r#type: "drop_table".to_string(),
                 description: "Drop a table. Body: UTF-8 table name".to_string(),
+            }),
+            Ok(ActionType {
+                r#type: "delete_records".to_string(),
+                description:
+                    "Delete rows matching a filter. Body: u16 name_len + name + UTF-8 filter"
+                        .to_string(),
+            }),
+            Ok(ActionType {
+                r#type: "update_records".to_string(),
+                description: "Update rows: delete matching + append replacements. Body: u16 name_len + name + u32 filter_len + filter + IPC data".to_string(),
             }),
         ])
     }
@@ -890,4 +1169,498 @@ pub async fn serve_flight(
         .add_service(service.into_server())
         .serve(addr)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+
+    /// Build a valid `create_table` action body: u16 BE name_len + name + IPC schema.
+    fn build_create_table_body(name: &str, schema: &Schema) -> Vec<u8> {
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len() as u16;
+        let schema_ipc = ipc::schema_to_ipc(schema).expect("schema_to_ipc");
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&name_len.to_be_bytes());
+        body.extend_from_slice(name_bytes);
+        body.extend_from_slice(&schema_ipc);
+        body
+    }
+
+    #[test]
+    fn test_decode_create_table_action_valid() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]);
+        let body = build_create_table_body("my_table", &schema);
+
+        let (name, decoded_schema) = decode_create_table_action(&body).unwrap();
+        assert_eq!(name, "my_table");
+        assert_eq!(decoded_schema.fields().len(), 2);
+        assert_eq!(decoded_schema.field(0).name(), "id");
+        assert_eq!(decoded_schema.field(1).name(), "value");
+    }
+
+    #[test]
+    fn test_decode_create_table_action_body_too_short() {
+        // Empty body
+        let result = decode_create_table_action(&[]);
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("too short"));
+
+        // Single byte
+        let result = decode_create_table_action(&[0x00]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_create_table_action_truncated_name() {
+        // name_len = 100 but only 2 bytes of body after the length
+        let mut body = Vec::new();
+        body.extend_from_slice(&100u16.to_be_bytes());
+        body.extend_from_slice(b"ab");
+
+        let result = decode_create_table_action(&body);
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("truncated"));
+    }
+
+    #[test]
+    fn test_decode_create_table_action_invalid_utf8_name() {
+        // name_len = 2, name bytes are invalid UTF-8
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0xFF, 0xFE]); // Invalid UTF-8
+        // Add some dummy schema bytes (will never be reached)
+        body.extend_from_slice(&[0x00; 10]);
+
+        let result = decode_create_table_action(&body);
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("UTF-8"));
+    }
+
+    #[test]
+    fn test_write_error_to_status_not_leader() {
+        let err = WriteError::NotLeader {
+            leader_id: Some(5),
+            leader_node: None,
+        };
+        let status = write_error_to_status(err);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().contains("not leader"));
+        assert!(status.message().contains("5"));
+
+        // With unknown leader
+        let err_unknown = WriteError::NotLeader {
+            leader_id: None,
+            leader_node: None,
+        };
+        let status_unknown = write_error_to_status(err_unknown);
+        assert_eq!(status_unknown.code(), tonic::Code::Unavailable);
+        assert!(status_unknown.message().contains("unknown"));
+    }
+
+    #[test]
+    fn test_write_error_to_status_encode() {
+        let err = WriteError::Encode("bad data".to_string());
+        let status = write_error_to_status(err);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("encode error"));
+    }
+
+    #[test]
+    fn test_write_error_to_status_raft() {
+        let err = WriteError::Raft("consensus failed".to_string());
+        let status = write_error_to_status(err);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(status.message().contains("raft error"));
+    }
+
+    #[test]
+    fn test_write_error_to_status_fatal() {
+        let err = WriteError::Fatal("node crashed".to_string());
+        let status = write_error_to_status(err);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(status.message().contains("fatal raft error"));
+    }
+
+    // ---- decode_delete_action tests ----
+
+    #[test]
+    fn test_decode_delete_action_valid() {
+        let name = "events";
+        let filter = "id > 100";
+        let mut body = Vec::new();
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(filter.as_bytes());
+
+        let (decoded_name, decoded_filter) = decode_delete_action(&body).unwrap();
+        assert_eq!(decoded_name, "events");
+        assert_eq!(decoded_filter, "id > 100");
+    }
+
+    #[test]
+    fn test_decode_delete_action_empty_filter() {
+        let name = "t";
+        let mut body = Vec::new();
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name.as_bytes());
+        // No filter bytes = empty filter
+
+        let (decoded_name, decoded_filter) = decode_delete_action(&body).unwrap();
+        assert_eq!(decoded_name, "t");
+        assert_eq!(decoded_filter, "");
+    }
+
+    #[test]
+    fn test_decode_delete_action_body_too_short() {
+        let result = decode_delete_action(&[]);
+        assert!(result.is_err());
+        let result = decode_delete_action(&[0x00]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_delete_action_truncated_name() {
+        // Says name is 10 bytes but body only has 3 bytes after the length prefix
+        let body = vec![0x00, 0x0A, b'a', b'b', b'c'];
+        let result = decode_delete_action(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_delete_action_invalid_utf8_name() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+        body.extend_from_slice(b"filter");
+        let result = decode_delete_action(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_delete_action_invalid_utf8_filter() {
+        let name = "t";
+        let mut body = Vec::new();
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 filter
+        let result = decode_delete_action(&body);
+        assert!(result.is_err());
+    }
+
+    // ---- decode_update_action tests ----
+
+    #[test]
+    fn test_decode_update_action_valid() {
+        let name = "metrics";
+        let filter = "x > 0";
+        let ipc_data = vec![1u8, 2, 3, 4, 5];
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(&(filter.len() as u32).to_be_bytes());
+        body.extend_from_slice(filter.as_bytes());
+        body.extend_from_slice(&ipc_data);
+
+        let (decoded_name, decoded_filter, decoded_data) = decode_update_action(&body).unwrap();
+        assert_eq!(decoded_name, "metrics");
+        assert_eq!(decoded_filter, "x > 0");
+        assert_eq!(&decoded_data[..], &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_decode_update_action_empty_data() {
+        let name = "t";
+        let filter = "id = 1";
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(&(filter.len() as u32).to_be_bytes());
+        body.extend_from_slice(filter.as_bytes());
+        // No additional data
+
+        let (decoded_name, decoded_filter, decoded_data) = decode_update_action(&body).unwrap();
+        assert_eq!(decoded_name, "t");
+        assert_eq!(decoded_filter, "id = 1");
+        assert!(decoded_data.is_empty());
+    }
+
+    #[test]
+    fn test_decode_update_action_body_too_short() {
+        let result = decode_update_action(&[]);
+        assert!(result.is_err());
+        let result = decode_update_action(&[0x00]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_update_action_truncated_name() {
+        // Says name is 10 bytes but only has 2
+        let body = vec![0x00, 0x0A, b'a', b'b'];
+        let result = decode_update_action(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_update_action_truncated_filter() {
+        let name = "t";
+        let mut body = Vec::new();
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(&100u32.to_be_bytes()); // says filter is 100 bytes
+        body.extend_from_slice(b"short"); // but only 5 bytes of filter
+        let result = decode_update_action(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_update_action_missing_filter_len() {
+        // Name is valid but no room for filter_len u32
+        let name = "t";
+        let mut body = Vec::new();
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name.as_bytes());
+        // No filter_len bytes
+        let result = decode_update_action(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_update_action_invalid_utf8_filter() {
+        let name = "t";
+        let mut body = Vec::new();
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 filter
+        let result = decode_update_action(&body);
+        assert!(result.is_err());
+    }
+
+    // ---- parse_delete_sql tests ----
+
+    #[test]
+    fn test_parse_delete_sql_valid_basic() {
+        let result = parse_delete_sql("DELETE FROM users WHERE id = 5");
+        assert_eq!(result, Some(("users".to_string(), "id = 5".to_string())));
+    }
+
+    #[test]
+    fn test_parse_delete_sql_case_insensitive() {
+        let result = parse_delete_sql("delete from Users where id > 10");
+        assert_eq!(result, Some(("Users".to_string(), "id > 10".to_string())));
+    }
+
+    #[test]
+    fn test_parse_delete_sql_schema_qualified() {
+        let result = parse_delete_sql("DELETE FROM public.users WHERE id = 1");
+        assert_eq!(result, Some(("users".to_string(), "id = 1".to_string())));
+    }
+
+    #[test]
+    fn test_parse_delete_sql_quoted_table() {
+        let result = parse_delete_sql("DELETE FROM \"my_table\" WHERE x = 1");
+        assert_eq!(
+            result,
+            Some(("my_table".to_string(), "x = 1".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_delete_sql_trailing_semicolon() {
+        let result = parse_delete_sql("DELETE FROM t WHERE id = 1;");
+        assert_eq!(result, Some(("t".to_string(), "id = 1".to_string())));
+    }
+
+    #[test]
+    fn test_parse_delete_sql_extra_whitespace() {
+        let result = parse_delete_sql("DELETE   FROM   users   WHERE   id = 5");
+        assert_eq!(result, Some(("users".to_string(), "id = 5".to_string())));
+    }
+
+    #[test]
+    fn test_parse_delete_sql_complex_filter() {
+        let result = parse_delete_sql("DELETE FROM t WHERE id > 5 AND name = 'foo'");
+        assert_eq!(
+            result,
+            Some(("t".to_string(), "id > 5 AND name = 'foo'".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_delete_sql_no_where_clause() {
+        assert_eq!(parse_delete_sql("DELETE FROM users"), None);
+    }
+
+    #[test]
+    fn test_parse_delete_sql_not_a_delete() {
+        assert_eq!(parse_delete_sql("SELECT * FROM users"), None);
+    }
+
+    #[test]
+    fn test_parse_delete_sql_missing_from() {
+        assert_eq!(parse_delete_sql("DELETE users WHERE id = 1"), None);
+    }
+
+    #[test]
+    fn test_parse_delete_sql_empty_input() {
+        assert_eq!(parse_delete_sql(""), None);
+    }
+
+    #[test]
+    fn test_parse_delete_sql_just_delete() {
+        assert_eq!(parse_delete_sql("DELETE"), None);
+    }
+
+    #[test]
+    fn test_parse_delete_sql_empty_table() {
+        assert_eq!(parse_delete_sql("DELETE FROM WHERE x = 1"), None);
+    }
+
+    // ---- parse_update_sql tests ----
+
+    #[test]
+    fn test_parse_update_sql_valid_basic() {
+        let result = parse_update_sql("UPDATE users SET name = 'foo' WHERE id = 1");
+        assert_eq!(
+            result,
+            Some((
+                "users".to_string(),
+                "name = 'foo'".to_string(),
+                "id = 1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_update_sql_multiple_assignments() {
+        let result = parse_update_sql("UPDATE t SET a = 1, b = 2 WHERE id = 3");
+        assert_eq!(
+            result,
+            Some((
+                "t".to_string(),
+                "a = 1, b = 2".to_string(),
+                "id = 3".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_update_sql_case_insensitive() {
+        let result = parse_update_sql("update Users set name='test' where id=1");
+        assert_eq!(
+            result,
+            Some((
+                "Users".to_string(),
+                "name='test'".to_string(),
+                "id=1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_update_sql_schema_qualified() {
+        let result = parse_update_sql("UPDATE public.users SET x = 1 WHERE y = 2");
+        assert_eq!(
+            result,
+            Some((
+                "users".to_string(),
+                "x = 1".to_string(),
+                "y = 2".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_update_sql_trailing_semicolon() {
+        let result = parse_update_sql("UPDATE t SET x = 1 WHERE id = 1;");
+        assert_eq!(
+            result,
+            Some((
+                "t".to_string(),
+                "x = 1".to_string(),
+                "id = 1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_update_sql_expression_in_set() {
+        let result = parse_update_sql("UPDATE t SET price = price * 1.1 WHERE id = 1");
+        assert_eq!(
+            result,
+            Some((
+                "t".to_string(),
+                "price = price * 1.1".to_string(),
+                "id = 1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_update_sql_no_where() {
+        assert_eq!(parse_update_sql("UPDATE users SET name = 'foo'"), None);
+    }
+
+    #[test]
+    fn test_parse_update_sql_no_set() {
+        assert_eq!(parse_update_sql("UPDATE users WHERE id = 1"), None);
+    }
+
+    #[test]
+    fn test_parse_update_sql_not_an_update() {
+        assert_eq!(parse_update_sql("INSERT INTO users VALUES (1)"), None);
+    }
+
+    #[test]
+    fn test_parse_update_sql_empty_input() {
+        assert_eq!(parse_update_sql(""), None);
+    }
+
+    #[test]
+    fn test_parse_update_sql_empty_parts() {
+        assert_eq!(parse_update_sql("UPDATE SET WHERE"), None);
+    }
+
+    // ---- build_update_select_sql tests ----
+
+    #[test]
+    fn test_build_update_select_sql_single_assignment() {
+        let result = build_update_select_sql("users", "name = 'foo'", "id = 1");
+        assert_eq!(
+            result,
+            "SELECT * EXCLUDE (name), 'foo' AS name FROM users WHERE id = 1"
+        );
+    }
+
+    #[test]
+    fn test_build_update_select_sql_multiple_assignments() {
+        let result = build_update_select_sql("t", "a = 1, b = 2", "id = 3");
+        assert_eq!(
+            result,
+            "SELECT * EXCLUDE (a, b), 1 AS a, 2 AS b FROM t WHERE id = 3"
+        );
+    }
+
+    #[test]
+    fn test_build_update_select_sql_expression_assignment() {
+        let result = build_update_select_sql("t", "price = price * 1.1", "id = 1");
+        assert_eq!(
+            result,
+            "SELECT * EXCLUDE (price), price * 1.1 AS price FROM t WHERE id = 1"
+        );
+    }
 }

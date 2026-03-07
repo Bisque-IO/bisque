@@ -300,6 +300,104 @@ impl TableEngine {
         Ok(())
     }
 
+    // =========================================================================
+    // Delete / Update Path (called by Raft state machine apply)
+    // =========================================================================
+
+    /// Delete rows matching a SQL filter predicate from all tiers.
+    ///
+    /// Uses Lance deletion vectors (soft delete) — no data files are rewritten.
+    /// The delete is applied to every tier that currently holds data (active,
+    /// sealed, S3), ensuring a consistent view across the full table.
+    ///
+    /// Returns the total number of rows deleted across all tiers.
+    /// Uses Lance's `DeleteResult.num_deleted_rows` to avoid extra `count_rows` scans.
+    pub async fn apply_delete(&self, filter: &str) -> Result<u64> {
+        let start = std::time::Instant::now();
+        let mut total_deleted = 0u64;
+
+        // 1. Delete from active segment
+        {
+            let _guard = self.active_write.lock().await;
+            let maybe_ds = { self.active_dataset.read().clone() };
+            if let Some(mut ds) = maybe_ds {
+                let result = ds
+                    .delete(filter)
+                    .await
+                    .map_err(|e| Error::DeleteFailed(e.to_string()))?;
+                total_deleted += result.num_deleted_rows;
+                *self.active_dataset.write() = Some(ds);
+            }
+        }
+
+        // 2. Delete from sealed segment
+        {
+            let _guard = self.sealed_write.lock().await;
+            let maybe_ds = { self.sealed_dataset.read().clone() };
+            if let Some(mut ds) = maybe_ds {
+                let result = ds
+                    .delete(filter)
+                    .await
+                    .map_err(|e| Error::DeleteFailed(e.to_string()))?;
+                total_deleted += result.num_deleted_rows;
+                *self.sealed_dataset.write() = Some(ds);
+            }
+        }
+
+        // 3. Delete from S3 deep storage
+        {
+            let _guard = self.s3_write.lock().await;
+            let maybe_ds = { self.s3_dataset.read().clone() };
+            if let Some(mut ds) = maybe_ds {
+                let result = ds
+                    .delete(filter)
+                    .await
+                    .map_err(|e| Error::DeleteFailed(e.to_string()))?;
+                total_deleted += result.num_deleted_rows;
+                *self.s3_dataset.write() = Some(ds);
+            }
+        }
+
+        metrics::counter!("bisque_deletes_rows_total", "table" => self.name.clone())
+            .increment(total_deleted);
+        metrics::histogram!("bisque_delete_latency_seconds", "table" => self.name.clone())
+            .record(start.elapsed().as_secs_f64());
+        debug!(table = %self.name, deleted = total_deleted, filter, "Delete applied across all tiers");
+        Ok(total_deleted)
+    }
+
+    /// Update rows: soft-delete matching rows across all tiers, then append
+    /// replacement data to the active segment.
+    ///
+    /// Returns the number of rows that were deleted (replaced).
+    pub async fn apply_update(&self, filter: &str, batches: Vec<RecordBatch>) -> Result<u64> {
+        let deleted = self.apply_delete(filter).await?;
+        self.apply_append(batches).await?;
+        metrics::counter!("bisque_updates_rows_total", "table" => self.name.clone())
+            .increment(deleted);
+        Ok(deleted)
+    }
+
+    /// Get the current dataset version for each tier (for catalog event emission).
+    pub fn tier_versions(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let active_v = self
+            .active_dataset
+            .read()
+            .as_ref()
+            .map(|ds| ds.version().version);
+        let sealed_v = self
+            .sealed_dataset
+            .read()
+            .as_ref()
+            .map(|ds| ds.version().version);
+        let s3_v = self
+            .s3_dataset
+            .read()
+            .as_ref()
+            .map(|ds| ds.version().version);
+        (active_v, sealed_v, s3_v)
+    }
+
     /// Seal the active segment and rotate to a new one.
     ///
     /// Called on ALL nodes when a `SealActiveSegment` log is applied.

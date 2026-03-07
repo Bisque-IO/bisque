@@ -362,7 +362,10 @@ async fn batcher_loop(
 
         // Step 3b: IPC-encode and propose primary batches.
         let result: Result<WriteResult, WriteError> = if primary_batches.is_empty() {
-            Ok(WriteResult { log_index: 0 })
+            Ok(WriteResult {
+                log_index: 0,
+                response: LanceResponse::Ok,
+            })
         } else {
             match ipc::encode_record_batches(&primary_batches) {
                 Ok(data) => {
@@ -372,11 +375,13 @@ async fn batcher_loop(
                     };
                     match raft.client_write(cmd).await {
                         Ok(resp) => {
-                            if let LanceResponse::Error(e) = resp.response() {
+                            let response = resp.response().clone();
+                            if let LanceResponse::Error(e) = &response {
                                 Err(WriteError::Raft(e.clone()))
                             } else {
                                 Ok(WriteResult {
                                     log_index: resp.log_id().index,
+                                    response,
                                 })
                             }
                         }

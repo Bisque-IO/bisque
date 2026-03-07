@@ -244,6 +244,25 @@ where
         let _ = self.shutdown_tx.send(true);
     }
 
+    /// Trigger shutdown and wait for active connections to drain.
+    ///
+    /// Polls the active connection counter until it reaches zero or
+    /// the timeout expires.
+    pub async fn shutdown_and_drain(&self, drain_timeout: std::time::Duration) {
+        self.shutdown();
+        let deadline = tokio::time::Instant::now() + drain_timeout;
+        while self.active_connections.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    remaining = self.active_connections.load(std::sync::atomic::Ordering::Relaxed),
+                    "Connection drain timeout"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Start the server and listen for connections.
     /// Returns when the shutdown token is cancelled or on fatal error.
     pub async fn serve(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
@@ -312,6 +331,7 @@ where
             }
 
             let server = self.clone();
+            let conn_shutdown_rx = self.shutdown_rx.clone();
 
             #[cfg(feature = "tls")]
             let tls_acceptor = tls_acceptor.clone();
@@ -346,7 +366,7 @@ where
                 };
 
                 match server
-                    .handle_multiplexed_connection(reader, writer, peer_addr)
+                    .handle_multiplexed_connection(reader, writer, peer_addr, conn_shutdown_rx)
                     .await
                 {
                     Ok(_) => {
@@ -374,6 +394,7 @@ where
         read_half: BoxedReader,
         write_half: BoxedWriter,
         peer_addr: SocketAddr,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -397,7 +418,7 @@ where
 
         // Run reader+dispatcher in current task
         let result = self
-            .request_reader_loop(read_half, peer_addr, response_tx, alive.clone())
+            .request_reader_loop(read_half, peer_addr, response_tx, alive.clone(), shutdown_rx)
             .await;
 
         // Mark connection as done and wait for writer to finish
@@ -505,6 +526,7 @@ where
         peer_addr: SocketAddr,
         response_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<Vec<u8>>>,
         alive: Arc<std::sync::atomic::AtomicBool>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use std::sync::atomic::Ordering;
         use tokio::io::AsyncReadExt;
@@ -513,6 +535,12 @@ where
         let max_concurrent = self.config.max_concurrent_requests;
         let mut in_flight = FuturesUnordered::new();
         let mut eof = false;
+
+        // Check if already shutting down
+        if *shutdown_rx.borrow() {
+            tracing::debug!("RPC reader: shutdown already signaled, closing connection from {}", peer_addr);
+            return Ok(());
+        }
 
         loop {
             // Parse all complete frames from buffer, respecting concurrency limit
@@ -598,37 +626,57 @@ where
                 }
             } else if in_flight.is_empty() {
                 // Nothing in flight — just read (avoids polling empty FuturesUnordered)
-                match timeout(self.config.connection_timeout, read_half.read_buf(&mut buf)).await {
-                    Ok(Ok(0)) => {
-                        tracing::trace!("RPC reader: connection closed by peer: {}", peer_addr);
-                        eof = true;
-                    }
-                    Ok(Ok(_)) => {} // Data read, loop back to parse frames
-                    Ok(Err(e)) => {
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                            tracing::trace!("RPC reader: connection closed by peer: {}", peer_addr);
-                            eof = true;
-                        } else {
-                            return Err(Box::new(e));
-                        }
-                    }
-                    Err(_) => {
-                        tracing::trace!("RPC reader: connection timeout from: {}", peer_addr);
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        tracing::debug!("RPC reader: shutdown signal, closing connection from {}", peer_addr);
                         return Ok(());
+                    }
+                    read_result = timeout(self.config.connection_timeout, read_half.read_buf(&mut buf)) => {
+                        match read_result {
+                            Ok(Ok(0)) => {
+                                tracing::trace!("RPC reader: connection closed by peer: {}", peer_addr);
+                                eof = true;
+                            }
+                            Ok(Ok(_)) => {} // Data read, loop back to parse frames
+                            Ok(Err(e)) => {
+                                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                    tracing::trace!("RPC reader: connection closed by peer: {}", peer_addr);
+                                    eof = true;
+                                } else {
+                                    return Err(Box::new(e));
+                                }
+                            }
+                            Err(_) => {
+                                tracing::trace!("RPC reader: connection timeout from: {}", peer_addr);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             } else if in_flight.len() >= max_concurrent {
                 // At capacity — only drain futures (backpressure: stop reading)
-                if let Some(response) = in_flight.next().await {
-                    if response_tx.send(response).await.is_err() {
-                        tracing::trace!("RPC reader: response channel closed");
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        tracing::debug!("RPC reader: shutdown signal, closing connection from {}", peer_addr);
                         return Ok(());
+                    }
+                    Some(response) = in_flight.next() => {
+                        if response_tx.send(response).await.is_err() {
+                            tracing::trace!("RPC reader: response channel closed");
+                            return Ok(());
+                        }
                     }
                 }
             } else {
                 // Both reading and processing concurrently
                 tokio::select! {
                     biased;
+                    _ = shutdown_rx.changed() => {
+                        tracing::debug!("RPC reader: shutdown signal, closing connection from {}", peer_addr);
+                        return Ok(());
+                    }
                     // Prefer completing in-flight work
                     Some(response) = in_flight.next() => {
                         if response_tx.send(response).await.is_err() {

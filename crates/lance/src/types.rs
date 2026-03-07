@@ -147,6 +147,24 @@ pub enum LanceCommand {
 
     /// Expire/remove a client session, releasing all its pins.
     ExpireSession { session_id: u64 },
+
+    /// Delete rows matching a SQL filter predicate from all tiers.
+    /// Uses Lance deletion vectors (soft delete) — no data rewrite.
+    DeleteRecords {
+        table_name: String,
+        /// SQL filter predicate (e.g. "id = 5", "ts < '2024-01-01'").
+        filter: String,
+    },
+
+    /// Update rows: soft-delete matching rows across all tiers, then append
+    /// replacement data to the active segment.
+    UpdateRecords {
+        table_name: String,
+        /// SQL filter predicate for rows to replace.
+        filter: String,
+        /// IPC-encoded replacement RecordBatches.
+        data: Bytes,
+    },
 }
 
 impl fmt::Display for LanceCommand {
@@ -229,6 +247,29 @@ impl fmt::Display for LanceCommand {
             LanceCommand::ExpireSession { session_id } => {
                 write!(f, "ExpireSession(session={})", session_id)
             }
+            LanceCommand::DeleteRecords {
+                table_name,
+                filter,
+            } => {
+                write!(
+                    f,
+                    "DeleteRecords(table={}, filter={})",
+                    table_name, filter
+                )
+            }
+            LanceCommand::UpdateRecords {
+                table_name,
+                filter,
+                data,
+            } => {
+                write!(
+                    f,
+                    "UpdateRecords(table={}, filter={}, {} bytes)",
+                    table_name,
+                    filter,
+                    data.len()
+                )
+            }
         }
     }
 }
@@ -240,6 +281,8 @@ pub enum LanceResponse {
     Ok,
     /// Operation failed.
     Error(String),
+    /// Operation succeeded, returning the number of affected rows.
+    RowsAffected(u64),
 }
 
 /// Result of a successful write operation.
@@ -252,6 +295,8 @@ pub enum LanceResponse {
 pub struct WriteResult {
     /// Raft log index at which the write was committed.
     pub log_index: u64,
+    /// The response from the state machine.
+    pub response: LanceResponse,
 }
 
 impl fmt::Display for LanceResponse {
@@ -259,6 +304,7 @@ impl fmt::Display for LanceResponse {
         match self {
             LanceResponse::Ok => write!(f, "OK"),
             LanceResponse::Error(e) => write!(f, "Error: {}", e),
+            LanceResponse::RowsAffected(n) => write!(f, "RowsAffected({})", n),
         }
     }
 }
@@ -624,4 +670,763 @@ pub fn time_unit_to_string(unit: TimeUnit) -> String {
 /// Convert a `Duration` to milliseconds (saturating at u64::MAX).
 pub fn duration_to_ms(d: Duration) -> u64 {
     d.as_millis().min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // 1. SealReason Display
+    // =========================================================================
+
+    #[test]
+    fn seal_reason_display_max_age() {
+        assert_eq!(SealReason::MaxAge.to_string(), "MaxAge");
+    }
+
+    #[test]
+    fn seal_reason_display_max_size() {
+        assert_eq!(SealReason::MaxSize.to_string(), "MaxSize");
+    }
+
+    // =========================================================================
+    // 2. SealReason serialization roundtrip
+    // =========================================================================
+
+    #[test]
+    fn seal_reason_serde_roundtrip() {
+        for reason in [SealReason::MaxAge, SealReason::MaxSize] {
+            let json = serde_json::to_string(&reason).unwrap();
+            let back: SealReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(reason, back);
+        }
+    }
+
+    // =========================================================================
+    // 3. SegmentCatalog default values
+    // =========================================================================
+
+    #[test]
+    fn segment_catalog_default_values() {
+        let cat = SegmentCatalog::default();
+        assert_eq!(cat.active_segment, 1);
+        assert_eq!(cat.sealed_segment, None);
+        assert_eq!(cat.s3_manifest_version, 0);
+        assert_eq!(cat.s3_dataset_uri, "");
+        assert_eq!(cat.active_first_log_index, None);
+        assert_eq!(cat.sealed_first_log_index, None);
+    }
+
+    // =========================================================================
+    // 4. SegmentCatalog serialization roundtrip
+    // =========================================================================
+
+    #[test]
+    fn segment_catalog_serde_roundtrip_default() {
+        let cat = SegmentCatalog::default();
+        let json = serde_json::to_string(&cat).unwrap();
+        let back: SegmentCatalog = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active_segment, cat.active_segment);
+        assert_eq!(back.sealed_segment, cat.sealed_segment);
+        assert_eq!(back.s3_manifest_version, cat.s3_manifest_version);
+        assert_eq!(back.s3_dataset_uri, cat.s3_dataset_uri);
+        assert_eq!(back.active_first_log_index, cat.active_first_log_index);
+        assert_eq!(back.sealed_first_log_index, cat.sealed_first_log_index);
+    }
+
+    #[test]
+    fn segment_catalog_serde_roundtrip_populated() {
+        let cat = SegmentCatalog {
+            active_segment: 5,
+            sealed_segment: Some(4),
+            s3_manifest_version: 10,
+            s3_dataset_uri: "s3://bucket/path".to_string(),
+            active_first_log_index: Some(100),
+            sealed_first_log_index: Some(50),
+        };
+        let json = serde_json::to_string(&cat).unwrap();
+        let back: SegmentCatalog = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active_segment, 5);
+        assert_eq!(back.sealed_segment, Some(4));
+        assert_eq!(back.s3_manifest_version, 10);
+        assert_eq!(back.s3_dataset_uri, "s3://bucket/path");
+        assert_eq!(back.active_first_log_index, Some(100));
+        assert_eq!(back.sealed_first_log_index, Some(50));
+    }
+
+    #[test]
+    fn segment_catalog_deserialize_missing_optional_fields() {
+        // Fields with #[serde(default)] should default to None when absent.
+        let json = r#"{
+            "active_segment": 1,
+            "sealed_segment": null,
+            "s3_manifest_version": 0,
+            "s3_dataset_uri": ""
+        }"#;
+        let cat: SegmentCatalog = serde_json::from_str(json).unwrap();
+        assert_eq!(cat.active_first_log_index, None);
+        assert_eq!(cat.sealed_first_log_index, None);
+    }
+
+    // =========================================================================
+    // 5. FlushState default is Idle
+    // =========================================================================
+
+    #[test]
+    fn flush_state_default_is_idle() {
+        let state = FlushState::default();
+        assert!(matches!(state, FlushState::Idle));
+    }
+
+    // =========================================================================
+    // 6. FlushState::InProgress serialization roundtrip
+    // =========================================================================
+
+    #[test]
+    fn flush_state_idle_serde_roundtrip() {
+        let state = FlushState::Idle;
+        let json = serde_json::to_string(&state).unwrap();
+        let back: FlushState = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, FlushState::Idle));
+    }
+
+    #[test]
+    fn flush_state_in_progress_serde_roundtrip() {
+        let state = FlushState::InProgress {
+            segment_id: 42,
+            started_at: 1700000000000,
+            fragment_paths: vec!["frag/0.lance".to_string(), "frag/1.lance".to_string()],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: FlushState = serde_json::from_str(&json).unwrap();
+        match back {
+            FlushState::InProgress {
+                segment_id,
+                started_at,
+                fragment_paths,
+            } => {
+                assert_eq!(segment_id, 42);
+                assert_eq!(started_at, 1700000000000);
+                assert_eq!(fragment_paths.len(), 2);
+                assert_eq!(fragment_paths[0], "frag/0.lance");
+                assert_eq!(fragment_paths[1], "frag/1.lance");
+            }
+            _ => panic!("expected InProgress"),
+        }
+    }
+
+    // =========================================================================
+    // 7. LanceCommand Display for each variant
+    // =========================================================================
+
+    #[test]
+    fn lance_command_display_create_table() {
+        let cmd = LanceCommand::CreateTable {
+            table_name: "t1".to_string(),
+            schema_ipc: Bytes::from(vec![0u8; 64]),
+        };
+        assert_eq!(cmd.to_string(), "CreateTable(table=t1, schema=64 bytes)");
+    }
+
+    #[test]
+    fn lance_command_display_drop_table() {
+        let cmd = LanceCommand::DropTable {
+            table_name: "t1".to_string(),
+        };
+        assert_eq!(cmd.to_string(), "DropTable(table=t1)");
+    }
+
+    #[test]
+    fn lance_command_display_append_records() {
+        let cmd = LanceCommand::AppendRecords {
+            table_name: "t1".to_string(),
+            data: Bytes::from(vec![0u8; 128]),
+        };
+        assert_eq!(cmd.to_string(), "AppendRecords(table=t1, 128 bytes)");
+    }
+
+    #[test]
+    fn lance_command_display_seal_active_segment() {
+        let cmd = LanceCommand::SealActiveSegment {
+            table_name: "t1".to_string(),
+            sealed_segment_id: 2,
+            new_active_segment_id: 3,
+            reason: SealReason::MaxAge,
+        };
+        assert_eq!(
+            cmd.to_string(),
+            "SealActiveSegment(table=t1, sealed=2, new=3, reason=MaxAge)"
+        );
+    }
+
+    #[test]
+    fn lance_command_display_begin_flush() {
+        let cmd = LanceCommand::BeginFlush {
+            table_name: "t1".to_string(),
+            segment_id: 7,
+        };
+        assert_eq!(cmd.to_string(), "BeginFlush(table=t1, segment=7)");
+    }
+
+    #[test]
+    fn lance_command_display_promote_to_deep_storage() {
+        let cmd = LanceCommand::PromoteToDeepStorage {
+            table_name: "t1".to_string(),
+            segment_id: 7,
+            s3_manifest_version: 3,
+        };
+        assert_eq!(
+            cmd.to_string(),
+            "PromoteToDeepStorage(table=t1, segment=7, version=3)"
+        );
+    }
+
+    #[test]
+    fn lance_command_display_register_session() {
+        let cmd = LanceCommand::RegisterSession { session_id: 99 };
+        assert_eq!(cmd.to_string(), "RegisterSession(session=99)");
+    }
+
+    #[test]
+    fn lance_command_display_pin_version() {
+        let cmd = LanceCommand::PinVersion {
+            session_id: 1,
+            table_name: "t1".to_string(),
+            tier: "hot".to_string(),
+            version: 5,
+        };
+        assert_eq!(
+            cmd.to_string(),
+            "PinVersion(session=1, table=t1, tier=hot, version=5)"
+        );
+    }
+
+    #[test]
+    fn lance_command_display_unpin_version() {
+        let cmd = LanceCommand::UnpinVersion {
+            session_id: 1,
+            table_name: "t1".to_string(),
+            tier: "cold".to_string(),
+            version: 3,
+        };
+        assert_eq!(
+            cmd.to_string(),
+            "UnpinVersion(session=1, table=t1, tier=cold, version=3)"
+        );
+    }
+
+    #[test]
+    fn lance_command_display_expire_session() {
+        let cmd = LanceCommand::ExpireSession { session_id: 42 };
+        assert_eq!(cmd.to_string(), "ExpireSession(session=42)");
+    }
+
+    // =========================================================================
+    // 8. LanceCommand serialization roundtrip for each variant
+    // =========================================================================
+
+    fn assert_lance_command_roundtrip(cmd: &LanceCommand) {
+        let json = serde_json::to_string(cmd).unwrap();
+        let back: LanceCommand = serde_json::from_str(&json).unwrap();
+        // Compare via Debug representation since LanceCommand does not derive PartialEq.
+        assert_eq!(format!("{:?}", cmd), format!("{:?}", back));
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_create_table() {
+        assert_lance_command_roundtrip(&LanceCommand::CreateTable {
+            table_name: "t1".to_string(),
+            schema_ipc: Bytes::from(vec![1, 2, 3]),
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_drop_table() {
+        assert_lance_command_roundtrip(&LanceCommand::DropTable {
+            table_name: "t1".to_string(),
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_append_records() {
+        assert_lance_command_roundtrip(&LanceCommand::AppendRecords {
+            table_name: "t1".to_string(),
+            data: Bytes::from(vec![10, 20, 30]),
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_seal_active_segment() {
+        assert_lance_command_roundtrip(&LanceCommand::SealActiveSegment {
+            table_name: "t1".to_string(),
+            sealed_segment_id: 2,
+            new_active_segment_id: 3,
+            reason: SealReason::MaxSize,
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_begin_flush() {
+        assert_lance_command_roundtrip(&LanceCommand::BeginFlush {
+            table_name: "t1".to_string(),
+            segment_id: 5,
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_promote_to_deep_storage() {
+        assert_lance_command_roundtrip(&LanceCommand::PromoteToDeepStorage {
+            table_name: "t1".to_string(),
+            segment_id: 5,
+            s3_manifest_version: 10,
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_register_session() {
+        assert_lance_command_roundtrip(&LanceCommand::RegisterSession { session_id: 77 });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_pin_version() {
+        assert_lance_command_roundtrip(&LanceCommand::PinVersion {
+            session_id: 1,
+            table_name: "t1".to_string(),
+            tier: "hot".to_string(),
+            version: 5,
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_unpin_version() {
+        assert_lance_command_roundtrip(&LanceCommand::UnpinVersion {
+            session_id: 1,
+            table_name: "t1".to_string(),
+            tier: "cold".to_string(),
+            version: 3,
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_expire_session() {
+        assert_lance_command_roundtrip(&LanceCommand::ExpireSession { session_id: 42 });
+    }
+
+    #[test]
+    fn lance_command_display_delete_records() {
+        let cmd = LanceCommand::DeleteRecords {
+            table_name: "events".to_string(),
+            filter: "id > 100".to_string(),
+        };
+        assert_eq!(
+            cmd.to_string(),
+            "DeleteRecords(table=events, filter=id > 100)"
+        );
+    }
+
+    #[test]
+    fn lance_command_display_update_records() {
+        let cmd = LanceCommand::UpdateRecords {
+            table_name: "metrics".to_string(),
+            filter: "ts < '2024-01-01'".to_string(),
+            data: Bytes::from_static(&[10, 20, 30, 40, 50]),
+        };
+        assert_eq!(
+            cmd.to_string(),
+            "UpdateRecords(table=metrics, filter=ts < '2024-01-01', 5 bytes)"
+        );
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_delete_records() {
+        assert_lance_command_roundtrip(&LanceCommand::DeleteRecords {
+            table_name: "events".to_string(),
+            filter: "id > 100 AND status = 'inactive'".to_string(),
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_update_records() {
+        assert_lance_command_roundtrip(&LanceCommand::UpdateRecords {
+            table_name: "metrics".to_string(),
+            filter: "ts < '2024-01-01'".to_string(),
+            data: Bytes::from(vec![10, 20, 30, 40, 50]),
+        });
+    }
+
+    // =========================================================================
+    // 9. LanceResponse Display
+    // =========================================================================
+
+    #[test]
+    fn lance_response_display_ok() {
+        assert_eq!(LanceResponse::Ok.to_string(), "OK");
+    }
+
+    #[test]
+    fn lance_response_display_error() {
+        let resp = LanceResponse::Error("something went wrong".to_string());
+        assert_eq!(resp.to_string(), "Error: something went wrong");
+    }
+
+    // =========================================================================
+    // 10. LanceResponse serialization roundtrip
+    // =========================================================================
+
+    #[test]
+    fn lance_response_serde_roundtrip_ok() {
+        let resp = LanceResponse::Ok;
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: LanceResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(format!("{:?}", resp), format!("{:?}", back));
+    }
+
+    #[test]
+    fn lance_response_serde_roundtrip_error() {
+        let resp = LanceResponse::Error("fail".to_string());
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: LanceResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(format!("{:?}", resp), format!("{:?}", back));
+    }
+
+    #[test]
+    fn lance_response_display_rows_affected() {
+        let resp = LanceResponse::RowsAffected(42);
+        assert_eq!(resp.to_string(), "RowsAffected(42)");
+    }
+
+    #[test]
+    fn lance_response_display_rows_affected_zero() {
+        let resp = LanceResponse::RowsAffected(0);
+        assert_eq!(resp.to_string(), "RowsAffected(0)");
+    }
+
+    #[test]
+    fn lance_response_serde_roundtrip_rows_affected() {
+        let resp = LanceResponse::RowsAffected(1234);
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: LanceResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(format!("{:?}", resp), format!("{:?}", back));
+    }
+
+    // =========================================================================
+    // 11. PersistedTableConfig default values
+    // =========================================================================
+
+    #[test]
+    fn persisted_table_config_default_values() {
+        let cfg = PersistedTableConfig::default();
+        assert!(cfg.seal_indices.is_empty());
+        assert_eq!(cfg.s3_uri, None);
+        assert_eq!(cfg.s3_max_rows_per_file, 5_000_000);
+        assert_eq!(cfg.s3_max_rows_per_group, 50_000);
+        assert_eq!(cfg.seal_max_age_ms, 60_000);
+        assert_eq!(cfg.seal_max_size, 1024 * 1024 * 1024);
+        assert_eq!(cfg.compaction_target_rows_per_fragment, 1_048_576);
+        assert!(cfg.compaction_materialize_deletions);
+        assert!((cfg.compaction_deletion_threshold - 0.1).abs() < f32::EPSILON);
+        assert_eq!(cfg.compaction_min_fragments, 4);
+        assert_eq!(cfg.batcher, None);
+        assert_eq!(cfg.processor, None);
+    }
+
+    // =========================================================================
+    // 12. PersistedTableEntry to_snapshot()
+    // =========================================================================
+
+    #[test]
+    fn persisted_table_entry_to_snapshot() {
+        let catalog = SegmentCatalog {
+            active_segment: 3,
+            sealed_segment: Some(2),
+            s3_manifest_version: 7,
+            s3_dataset_uri: "s3://test".to_string(),
+            active_first_log_index: Some(50),
+            sealed_first_log_index: Some(20),
+        };
+        let schema_ver = SchemaVersion {
+            version: 1,
+            schema_ipc: vec![0, 1, 2],
+            created_at_millis: 1700000000000,
+        };
+        let entry = PersistedTableEntry {
+            config: PersistedTableConfig::default(),
+            catalog: catalog.clone(),
+            flush_state: FlushState::Idle,
+            schema_history: vec![schema_ver.clone()],
+        };
+
+        let snap = entry.to_snapshot();
+        assert_eq!(snap.catalog.active_segment, 3);
+        assert_eq!(snap.catalog.sealed_segment, Some(2));
+        assert_eq!(snap.catalog.s3_manifest_version, 7);
+        assert!(matches!(snap.flush_state, FlushState::Idle));
+        assert_eq!(snap.schema_history.len(), 1);
+        assert_eq!(snap.schema_history[0].version, 1);
+        assert_eq!(snap.schema_history[0].schema_ipc, vec![0, 1, 2]);
+    }
+
+    // =========================================================================
+    // 13. PersistedTableEntry from_snapshot_with_defaults()
+    // =========================================================================
+
+    #[test]
+    fn persisted_table_entry_from_snapshot_with_defaults() {
+        let snapshot = TableSnapshot {
+            catalog: SegmentCatalog {
+                active_segment: 10,
+                sealed_segment: None,
+                s3_manifest_version: 5,
+                s3_dataset_uri: "s3://bucket".to_string(),
+                active_first_log_index: None,
+                sealed_first_log_index: None,
+            },
+            flush_state: FlushState::Idle,
+            schema_history: vec![],
+        };
+
+        let entry = PersistedTableEntry::from_snapshot_with_defaults(snapshot);
+        // Config should be the default.
+        assert_eq!(entry.config, PersistedTableConfig::default());
+        // Catalog and flush_state should come from the snapshot.
+        assert_eq!(entry.catalog.active_segment, 10);
+        assert_eq!(entry.catalog.s3_manifest_version, 5);
+        assert!(matches!(entry.flush_state, FlushState::Idle));
+        assert!(entry.schema_history.is_empty());
+    }
+
+    // =========================================================================
+    // 14. SnapshotData serialization roundtrip
+    // =========================================================================
+
+    #[test]
+    fn snapshot_data_serde_roundtrip() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "my_table".to_string(),
+            PersistedTableEntry {
+                config: PersistedTableConfig::default(),
+                catalog: SegmentCatalog::default(),
+                flush_state: FlushState::Idle,
+                schema_history: vec![],
+            },
+        );
+
+        let snap = SnapshotData {
+            tables,
+            min_safe_log_index: Some(42),
+            file_manifest: vec![SnapshotFileEntry {
+                relative_path: "tables/t/segments/1.lance/data/0.lance".to_string(),
+                size: 4096,
+            }],
+            sync_addr: Some("127.0.0.1:9090".to_string()),
+        };
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SnapshotData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.tables.len(), 1);
+        assert!(back.tables.contains_key("my_table"));
+        assert_eq!(back.min_safe_log_index, Some(42));
+        assert_eq!(back.file_manifest.len(), 1);
+        assert_eq!(
+            back.file_manifest[0].relative_path,
+            "tables/t/segments/1.lance/data/0.lance"
+        );
+        assert_eq!(back.file_manifest[0].size, 4096);
+        assert_eq!(back.sync_addr, Some("127.0.0.1:9090".to_string()));
+    }
+
+    #[test]
+    fn snapshot_data_deserialize_missing_optional_fields() {
+        // file_manifest, sync_addr, and min_safe_log_index have #[serde(default)].
+        let json = r#"{"tables":{}}"#;
+        let snap: SnapshotData = serde_json::from_str(json).unwrap();
+        assert!(snap.tables.is_empty());
+        assert_eq!(snap.min_safe_log_index, None);
+        assert!(snap.file_manifest.is_empty());
+        assert_eq!(snap.sync_addr, None);
+    }
+
+    // =========================================================================
+    // 15. SnapshotFileEntry serialization roundtrip
+    // =========================================================================
+
+    #[test]
+    fn snapshot_file_entry_serde_roundtrip() {
+        let entry = SnapshotFileEntry {
+            relative_path: "segments/3.lance/data/1.lance".to_string(),
+            size: 1_048_576,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: SnapshotFileEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.relative_path, entry.relative_path);
+        assert_eq!(back.size, entry.size);
+    }
+
+    // =========================================================================
+    // 16. parse_time_unit for all variants + unknown default
+    // =========================================================================
+
+    #[test]
+    fn parse_time_unit_second() {
+        assert_eq!(parse_time_unit("Second"), TimeUnit::Second);
+    }
+
+    #[test]
+    fn parse_time_unit_millisecond() {
+        assert_eq!(parse_time_unit("Millisecond"), TimeUnit::Millisecond);
+    }
+
+    #[test]
+    fn parse_time_unit_microsecond() {
+        assert_eq!(parse_time_unit("Microsecond"), TimeUnit::Microsecond);
+    }
+
+    #[test]
+    fn parse_time_unit_nanosecond() {
+        assert_eq!(parse_time_unit("Nanosecond"), TimeUnit::Nanosecond);
+    }
+
+    #[test]
+    fn parse_time_unit_unknown_defaults_to_millisecond() {
+        assert_eq!(parse_time_unit("bogus"), TimeUnit::Millisecond);
+        assert_eq!(parse_time_unit(""), TimeUnit::Millisecond);
+        assert_eq!(parse_time_unit("seconds"), TimeUnit::Millisecond);
+    }
+
+    // =========================================================================
+    // 17. time_unit_to_string roundtrip for all variants
+    // =========================================================================
+
+    #[test]
+    fn time_unit_to_string_roundtrip() {
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            let s = time_unit_to_string(unit);
+            let back = parse_time_unit(&s);
+            assert_eq!(unit, back, "roundtrip failed for {:?}", unit);
+        }
+    }
+
+    #[test]
+    fn time_unit_to_string_values() {
+        assert_eq!(time_unit_to_string(TimeUnit::Second), "Second");
+        assert_eq!(time_unit_to_string(TimeUnit::Millisecond), "Millisecond");
+        assert_eq!(time_unit_to_string(TimeUnit::Microsecond), "Microsecond");
+        assert_eq!(time_unit_to_string(TimeUnit::Nanosecond), "Nanosecond");
+    }
+
+    // =========================================================================
+    // 18. duration_to_ms basic conversion
+    // =========================================================================
+
+    #[test]
+    fn duration_to_ms_basic() {
+        assert_eq!(duration_to_ms(Duration::from_millis(0)), 0);
+        assert_eq!(duration_to_ms(Duration::from_millis(500)), 500);
+        assert_eq!(duration_to_ms(Duration::from_secs(1)), 1_000);
+        assert_eq!(duration_to_ms(Duration::from_secs(60)), 60_000);
+    }
+
+    #[test]
+    fn duration_to_ms_sub_millisecond_truncates() {
+        // 999 microseconds is less than 1 millisecond -> truncated to 0.
+        assert_eq!(duration_to_ms(Duration::from_micros(999)), 0);
+        // 1500 microseconds -> 1 millisecond.
+        assert_eq!(duration_to_ms(Duration::from_micros(1500)), 1);
+    }
+
+    #[test]
+    fn duration_to_ms_large_value_saturates() {
+        // A very large duration should saturate at u64::MAX.
+        let huge = Duration::from_secs(u64::MAX);
+        let ms = duration_to_ms(huge);
+        assert_eq!(ms, u64::MAX);
+    }
+
+    // =========================================================================
+    // 19. WriteResult construction and field access
+    // =========================================================================
+
+    #[test]
+    fn test_write_result_with_ok_response() {
+        let wr = WriteResult {
+            log_index: 1,
+            response: LanceResponse::Ok,
+        };
+        assert_eq!(wr.log_index, 1);
+        assert!(matches!(wr.response, LanceResponse::Ok));
+    }
+
+    #[test]
+    fn test_write_result_with_rows_affected() {
+        let wr = WriteResult {
+            log_index: 99,
+            response: LanceResponse::RowsAffected(42),
+        };
+        assert_eq!(wr.log_index, 99);
+        match &wr.response {
+            LanceResponse::RowsAffected(n) => assert_eq!(*n, 42),
+            other => panic!("expected RowsAffected(42), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_write_result_with_error_response() {
+        let wr = WriteResult {
+            log_index: 7,
+            response: LanceResponse::Error("something failed".to_string()),
+        };
+        assert_eq!(wr.log_index, 7);
+        match &wr.response {
+            LanceResponse::Error(msg) => assert_eq!(msg, "something failed"),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_write_result_debug_format() {
+        let wr = WriteResult {
+            log_index: 55,
+            response: LanceResponse::RowsAffected(10),
+        };
+        let dbg = format!("{:?}", wr);
+        assert!(
+            dbg.contains("log_index: 55"),
+            "Debug output should contain log_index: {:?}",
+            dbg
+        );
+        assert!(
+            dbg.contains("RowsAffected(10)"),
+            "Debug output should contain RowsAffected(10): {:?}",
+            dbg
+        );
+    }
+
+    #[test]
+    fn test_write_result_display() {
+        // WriteResult derives Debug; verify the debug representation
+        // includes both the log_index and response fields.
+        let wr = WriteResult {
+            log_index: 123,
+            response: LanceResponse::Ok,
+        };
+        let dbg = format!("{:?}", wr);
+        assert!(
+            dbg.contains("123"),
+            "Debug output should contain log_index value: {:?}",
+            dbg
+        );
+        assert!(
+            dbg.contains("Ok"),
+            "Debug output should contain response variant: {:?}",
+            dbg
+        );
+    }
 }

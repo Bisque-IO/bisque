@@ -177,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
     println!("--- Step 1: Start Raft Node (with catalog events) ---\n");
 
     let catalog_bus = Arc::new(CatalogEventBus::new(0));
-    let raft_node = setup_single_node_raft(temp_dir.path(), catalog_bus.clone()).await?;
+    let (raft_node, _manager) = setup_single_node_raft(temp_dir.path(), catalog_bus.clone()).await?;
     raft_node.start();
 
     for _ in 0..20 {
@@ -370,7 +370,7 @@ type Manager = MultiRaftManager<LanceTypeConfig, Transport, Storage>;
 async fn setup_single_node_raft(
     base_dir: &std::path::Path,
     catalog_bus: Arc<CatalogEventBus>,
-) -> anyhow::Result<Arc<LanceRaftNode>> {
+) -> anyhow::Result<(Arc<LanceRaftNode>, Arc<Manager>)> {
     let node_id: u64 = 1;
     let group_id: u64 = 1;
 
@@ -420,5 +420,5 @@ async fn setup_single_node_raft(
     }
 
     let raft_node = Arc::new(LanceRaftNode::new(raft, engine, node_id));
-    Ok(raft_node)
+    Ok((raft_node, manager))
 }

@@ -38,7 +38,7 @@ async fn setup_with_processor(
     base_dir: &std::path::Path,
     processor: Arc<dyn WriteProcessor>,
     linger: Duration,
-) -> Arc<LanceRaftNode> {
+) -> (Arc<LanceRaftNode>, Arc<Manager>) {
     let node_id: u64 = 1;
     let group_id: u64 = 1;
 
@@ -48,7 +48,9 @@ async fn setup_with_processor(
 
     let raft_dir = base_dir.join("raft-data");
     std::fs::create_dir_all(&raft_dir).unwrap();
-    let storage_config = MmapStorageConfig::new(&raft_dir).with_segment_size(8 * 1024 * 1024);
+    let storage_config = MmapStorageConfig::new(&raft_dir)
+        .with_segment_size(8 * 1024 * 1024)
+        .with_fsync_delay(Duration::ZERO);
     let storage = Storage::new(storage_config).await.unwrap();
 
     let registry = Arc::new(NodeRegistry::new());
@@ -90,7 +92,7 @@ async fn setup_with_processor(
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(raft_node.is_leader(), "single node should be leader");
 
-    raft_node
+    (raft_node, manager)
 }
 
 fn counter_schema() -> Schema {
@@ -195,7 +197,7 @@ async fn count_rows(node: &LanceRaftNode, table_name: &str) -> usize {
 // =============================================================================
 
 /// CounterAggregator reduces duplicate keys within a linger window.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn counter_aggregator_reduces_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let processor = Arc::new(CounterAggregator::new(
@@ -203,7 +205,7 @@ async fn counter_aggregator_reduces_rows() {
         "value",
     ));
 
-    let node = setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
+    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
 
     // Create table with the counter output schema (metric_name + value).
     let schema = counter_schema();
@@ -231,7 +233,7 @@ async fn counter_aggregator_reduces_rows() {
 }
 
 /// GaugeAggregator keeps only the last value per key.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn gauge_aggregator_keeps_last_value() {
     let tmp = tempfile::tempdir().unwrap();
     let processor = Arc::new(GaugeAggregator::new(
@@ -239,7 +241,7 @@ async fn gauge_aggregator_keeps_last_value() {
         "value",
     ));
 
-    let node = setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
+    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
 
     let schema = counter_schema(); // Same schema works for gauges
     node.create_table("gauges", &schema).await.unwrap();
@@ -262,7 +264,7 @@ async fn gauge_aggregator_keeps_last_value() {
 }
 
 /// CounterAggregator with timestamp truncation collapses same-window rows.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn counter_with_timestamp_truncation() {
     let tmp = tempfile::tempdir().unwrap();
     let processor = Arc::new(
@@ -270,7 +272,7 @@ async fn counter_with_timestamp_truncation() {
             .with_timestamp("timestamp", 60_000), // 1-minute resolution
     );
 
-    let node = setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
+    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(50)).await;
 
     let schema = counter_schema_with_ts();
     node.create_table("ts_counters", &schema).await.unwrap();
@@ -291,7 +293,7 @@ async fn counter_with_timestamp_truncation() {
 }
 
 /// Empty batch with processor configured returns Ok without errors.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn processor_with_empty_batches() {
     let tmp = tempfile::tempdir().unwrap();
     let processor = Arc::new(CounterAggregator::new(
@@ -299,7 +301,7 @@ async fn processor_with_empty_batches() {
         "value",
     ));
 
-    let node = setup_with_processor(tmp.path(), processor, Duration::from_millis(10)).await;
+    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(10)).await;
 
     let schema = counter_schema();
     node.create_table("empty_test", &schema).await.unwrap();
@@ -312,7 +314,7 @@ async fn processor_with_empty_batches() {
 }
 
 /// Concurrent writes through a processor are all aggregated correctly.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_writes_through_processor() {
     let tmp = tempfile::tempdir().unwrap();
     let processor = Arc::new(CounterAggregator::new(
@@ -321,7 +323,7 @@ async fn concurrent_writes_through_processor() {
     ));
 
     // Longer linger to increase chance of coalescing concurrent writes.
-    let node = setup_with_processor(tmp.path(), processor, Duration::from_millis(100)).await;
+    let (node, _manager) = setup_with_processor(tmp.path(), processor, Duration::from_millis(100)).await;
 
     let schema = counter_schema();
     node.create_table("concurrent", &schema).await.unwrap();

@@ -729,6 +729,19 @@ where
         &self.node_registry
     }
 
+    /// Shut down all pooled connections.
+    ///
+    /// Signals each connection's reader/writer tasks to exit, then clears
+    /// the connection pool. Tasks exit on their next iteration once
+    /// `alive` is set to false.
+    pub fn shutdown(&self) {
+        for entry in self.connections.iter() {
+            entry.value().alive.store(false, Ordering::Release);
+        }
+        self.connections.clear();
+        self.creation_locks.clear();
+    }
+
     fn next_request_id(&self) -> u64 {
         self.request_id_counter.fetch_add(1, Ordering::Relaxed)
     }

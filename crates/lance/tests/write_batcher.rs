@@ -13,8 +13,8 @@ use openraft::Config;
 use openraft::impls::BasicNode;
 
 use bisque_lance::{
-    BisqueLance, BisqueLanceConfig, LanceRaftNode, LanceStateMachine, LanceTypeConfig,
-    WriteBatcherConfig,
+    BisqueLance, BisqueLanceConfig, LanceRaftNode, LanceResponse, LanceStateMachine,
+    LanceTypeConfig, WriteBatcherConfig,
 };
 use bisque_raft::multi::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
@@ -34,7 +34,7 @@ type Manager = MultiRaftManager<LanceTypeConfig, Transport, Storage>;
 async fn setup_with_batcher(
     base_dir: &std::path::Path,
     batcher_config: WriteBatcherConfig,
-) -> Arc<LanceRaftNode> {
+) -> (Arc<LanceRaftNode>, Arc<Manager>) {
     let node_id: u64 = 1;
     let group_id: u64 = 1;
 
@@ -44,7 +44,9 @@ async fn setup_with_batcher(
 
     let raft_dir = base_dir.join("raft-data");
     std::fs::create_dir_all(&raft_dir).unwrap();
-    let storage_config = MmapStorageConfig::new(&raft_dir).with_segment_size(8 * 1024 * 1024);
+    let storage_config = MmapStorageConfig::new(&raft_dir)
+        .with_segment_size(8 * 1024 * 1024)
+        .with_fsync_delay(Duration::ZERO);
     let storage = Storage::new(storage_config).await.unwrap();
 
     let registry = Arc::new(NodeRegistry::new());
@@ -82,11 +84,11 @@ async fn setup_with_batcher(
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(raft_node.is_leader(), "single node should be leader");
 
-    raft_node
+    (raft_node, manager)
 }
 
 /// Bootstrap a single-node Raft cluster without write batching.
-async fn setup_without_batcher(base_dir: &std::path::Path) -> Arc<LanceRaftNode> {
+async fn setup_without_batcher(base_dir: &std::path::Path) -> (Arc<LanceRaftNode>, Arc<Manager>) {
     let node_id: u64 = 1;
     let group_id: u64 = 1;
 
@@ -96,7 +98,9 @@ async fn setup_without_batcher(base_dir: &std::path::Path) -> Arc<LanceRaftNode>
 
     let raft_dir = base_dir.join("raft-data");
     std::fs::create_dir_all(&raft_dir).unwrap();
-    let storage_config = MmapStorageConfig::new(&raft_dir).with_segment_size(8 * 1024 * 1024);
+    let storage_config = MmapStorageConfig::new(&raft_dir)
+        .with_segment_size(8 * 1024 * 1024)
+        .with_fsync_delay(Duration::ZERO);
     let storage = Storage::new(storage_config).await.unwrap();
 
     let registry = Arc::new(NodeRegistry::new());
@@ -132,7 +136,7 @@ async fn setup_without_batcher(base_dir: &std::path::Path) -> Arc<LanceRaftNode>
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(raft_node.is_leader(), "single node should be leader");
 
-    raft_node
+    (raft_node, manager)
 }
 
 fn test_schema() -> Schema {
@@ -168,10 +172,10 @@ async fn count_rows(node: &LanceRaftNode, table_name: &str) -> usize {
 // =============================================================================
 
 /// Basic: a single write through the batcher succeeds and data lands.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn single_write_through_batcher() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_with_batcher(
+    let (node, _manager) = setup_with_batcher(
         tmp.path(),
         WriteBatcherConfig::default().with_linger(Duration::from_millis(50)),
     )
@@ -181,7 +185,14 @@ async fn single_write_through_batcher() {
     node.create_table("t1", &schema).await.unwrap();
 
     let batch = make_batch(10);
-    node.write_records("t1", &[batch]).await.unwrap();
+    let result = node.write_records("t1", &[batch]).await.unwrap();
+
+    // Verify the WriteResult indicates success.
+    assert!(
+        matches!(result.response, LanceResponse::Ok),
+        "expected LanceResponse::Ok, got {:?}",
+        result.response
+    );
 
     // Allow the batcher linger + Raft apply.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -191,10 +202,10 @@ async fn single_write_through_batcher() {
 }
 
 /// Multiple sequential writes accumulate correctly.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn multiple_sequential_writes() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_with_batcher(
+    let (node, _manager) = setup_with_batcher(
         tmp.path(),
         WriteBatcherConfig::default().with_linger(Duration::from_millis(10)),
     )
@@ -213,10 +224,10 @@ async fn multiple_sequential_writes() {
 }
 
 /// Concurrent writes within the linger window are all served.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_writes_within_linger_window() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_with_batcher(
+    let (node, _manager) = setup_with_batcher(
         tmp.path(),
         WriteBatcherConfig::default().with_linger(Duration::from_millis(100)),
     )
@@ -244,10 +255,10 @@ async fn concurrent_writes_within_linger_window() {
 }
 
 /// Writes to different tables are isolated and all succeed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn per_table_isolation() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_with_batcher(
+    let (node, _manager) = setup_with_batcher(
         tmp.path(),
         WriteBatcherConfig::default().with_linger(Duration::from_millis(50)),
     )
@@ -274,10 +285,10 @@ async fn per_table_isolation() {
 }
 
 /// Per-table config overrides the default.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn per_table_config() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_with_batcher(
+    let (node, _manager) = setup_with_batcher(
         tmp.path(),
         WriteBatcherConfig::default().with_linger(Duration::from_millis(10)),
     )
@@ -306,11 +317,11 @@ async fn per_table_config() {
 
 /// When max_batch_bytes is exceeded, the batcher flushes early
 /// without waiting for the full linger window.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn max_batch_bytes_triggers_early_flush() {
     let tmp = tempfile::tempdir().unwrap();
     // Very long linger, but tiny byte threshold — should flush immediately.
-    let node = setup_with_batcher(
+    let (node, _manager) = setup_with_batcher(
         tmp.path(),
         WriteBatcherConfig::default()
             .with_linger(Duration::from_secs(10))
@@ -338,10 +349,10 @@ async fn max_batch_bytes_triggers_early_flush() {
 }
 
 /// Writing with multiple batches in a single call works.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn multi_batch_single_call() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_with_batcher(
+    let (node, _manager) = setup_with_batcher(
         tmp.path(),
         WriteBatcherConfig::default().with_linger(Duration::from_millis(10)),
     )
@@ -359,10 +370,10 @@ async fn multi_batch_single_call() {
 }
 
 /// Empty batch writes are handled gracefully.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn empty_batch_noop() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_with_batcher(
+    let (node, _manager) = setup_with_batcher(
         tmp.path(),
         WriteBatcherConfig::default().with_linger(Duration::from_millis(10)),
     )
@@ -379,10 +390,10 @@ async fn empty_batch_noop() {
 }
 
 /// Without a batcher configured, writes go through the direct Raft path.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn direct_write_without_batcher() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_without_batcher(tmp.path()).await;
+    let (node, _manager) = setup_without_batcher(tmp.path()).await;
 
     let schema = test_schema();
     node.create_table("t1", &schema).await.unwrap();
@@ -395,10 +406,10 @@ async fn direct_write_without_batcher() {
 }
 
 /// High-volume concurrent writes: many small writes across multiple tables.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn high_volume_concurrent_writes() {
     let tmp = tempfile::tempdir().unwrap();
-    let node = setup_with_batcher(
+    let (node, _manager) = setup_with_batcher(
         tmp.path(),
         WriteBatcherConfig::default().with_linger(Duration::from_millis(20)),
     )

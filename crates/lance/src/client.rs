@@ -92,6 +92,8 @@ pub struct BisqueClient {
     catalogs: Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
     ws_handle: Option<JoinHandle<()>>,
     shutdown: Arc<Notify>,
+    /// Durable flag that survives missed Notify wakeups.
+    shutdown_flag: Arc<AtomicBool>,
     cluster_url: String,
     ws_tx: mpsc::UnboundedSender<ClientMessage>,
     credentials: Arc<CredentialConfig>,
@@ -151,6 +153,7 @@ impl BisqueClient {
         let catalogs: Arc<RwLock<HashMap<String, Arc<CatalogState>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(Notify::new());
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
         let (ws_tx, ws_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
         // Try to restore from persisted state
@@ -307,9 +310,13 @@ impl BisqueClient {
         // H6: Start heartbeat task — reads min seq across catalogs instead of always 0.
         let heartbeat_tx = ws_tx.clone();
         let heartbeat_shutdown = shutdown.clone();
+        let heartbeat_shutdown_flag = shutdown_flag.clone();
         let heartbeat_catalogs = catalogs.clone();
         tokio::spawn(async move {
             loop {
+                if heartbeat_shutdown_flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                         let last_seen_seq = {
@@ -334,6 +341,7 @@ impl BisqueClient {
             let catalog_names = catalog_names.clone();
             let catalogs = catalogs.clone();
             let shutdown = shutdown.clone();
+            let ws_shutdown_flag = shutdown_flag.clone();
             let ws_tx_clone = ws_tx.clone();
             let client_store_clone = client_store.clone();
             let auth_token = auth_token.clone();
@@ -344,6 +352,7 @@ impl BisqueClient {
                     &catalog_names,
                     catalogs,
                     shutdown,
+                    ws_shutdown_flag,
                     ws_rx,
                     ws_tx_clone,
                     client_store_clone,
@@ -358,6 +367,7 @@ impl BisqueClient {
             catalogs,
             ws_handle: Some(ws_handle),
             shutdown,
+            shutdown_flag,
             cluster_url,
             ws_tx,
             credentials,
@@ -393,6 +403,9 @@ impl BisqueClient {
 
     /// Shut down the client, stopping the WebSocket listener.
     pub async fn close(mut self) {
+        // Set the durable flag first so loops see it even if the Notify
+        // wakeup is missed (race between select! branches).
+        self.shutdown_flag.store(true, Ordering::Release);
         self.shutdown.notify_waiters();
         if let Some(handle) = self.ws_handle.take() {
             let _ = handle.await;
@@ -781,6 +794,7 @@ async fn ws_listener_loop(
     catalog_names: &[String],
     catalogs: Arc<RwLock<HashMap<String, Arc<CatalogState>>>>,
     shutdown: Arc<Notify>,
+    shutdown_flag: Arc<AtomicBool>,
     mut ws_rx: mpsc::UnboundedReceiver<ClientMessage>,
     ws_tx: mpsc::UnboundedSender<ClientMessage>,
     client_store: Option<Arc<ClientStore>>,
@@ -789,6 +803,13 @@ async fn ws_listener_loop(
     let mut reconnect_delay_ms = WS_INITIAL_RECONNECT_DELAY_MS;
 
     loop {
+        // Check the durable flag at the top of each iteration so we exit
+        // even if the Notify wakeup was missed between select! branches.
+        if shutdown_flag.load(Ordering::Acquire) {
+            info!("WebSocket listener shut down (flag)");
+            return;
+        }
+
         // Use min sequence across all catalogs for delta sync
         let since = {
             let cats = catalogs.read();
@@ -797,19 +818,28 @@ async fn ws_listener_loop(
                 .min()
                 .unwrap_or(0)
         };
-        match ws_connect_and_listen(
-            cluster_url,
-            catalog_names,
-            &catalogs,
-            &shutdown,
-            since,
-            &mut ws_rx,
-            &ws_tx,
-            &client_store,
-            auth_token,
-        )
-        .await
-        {
+
+        // Wrap the connect+listen call so shutdown can interrupt it
+        // even during TCP connect or WS handshake.
+        let result = tokio::select! {
+            r = ws_connect_and_listen(
+                cluster_url,
+                catalog_names,
+                &catalogs,
+                &shutdown,
+                since,
+                &mut ws_rx,
+                &ws_tx,
+                &client_store,
+                auth_token,
+            ) => r,
+            _ = shutdown.notified() => {
+                info!("WebSocket listener shut down cleanly");
+                return;
+            }
+        };
+
+        match result {
             Ok(WsDisconnectReason::Shutdown) => {
                 info!("WebSocket listener shut down cleanly");
                 return;
@@ -1345,6 +1375,70 @@ async fn handle_catalog_event(
                 entry.sealed_version = None;
             });
         }
+        CatalogEventKind::DataMutated {
+            table,
+            active_version,
+            sealed_version,
+            ..
+        } => {
+            let provider = catalog_state.tables.read().get(table).cloned();
+            if let Some(provider) = provider {
+                // Re-open active dataset to pick up new deletion vectors
+                if let Some(new_v) = active_version {
+                    let old_version = provider.active_version();
+                    match open_remote_dataset(routing_store, table, "active").await {
+                        Ok(ds) => {
+                            let _ = ws_tx.send(ClientMessage::Pin {
+                                catalog: catalog_name.clone(),
+                                table: table.clone(),
+                                tier: "active".into(),
+                                version: *new_v,
+                            });
+                            provider.swap_active(Some(ds));
+                            if let Some(old_v) = old_version {
+                                let _ = ws_tx.send(ClientMessage::Unpin {
+                                    catalog: catalog_name.clone(),
+                                    table: table.clone(),
+                                    tier: "active".into(),
+                                    version: old_v,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!(table = %table, "Failed to re-open active dataset after mutation: {}", e);
+                        }
+                    }
+                }
+                // Re-open sealed dataset to pick up new deletion vectors
+                if let Some(new_v) = sealed_version {
+                    let old_version = provider.sealed_version();
+                    match open_remote_dataset(routing_store, table, "sealed").await {
+                        Ok(ds) => {
+                            let _ = ws_tx.send(ClientMessage::Pin {
+                                catalog: catalog_name.clone(),
+                                table: table.clone(),
+                                tier: "sealed".into(),
+                                version: *new_v,
+                            });
+                            provider.swap_sealed(Some(ds));
+                            if let Some(old_v) = old_version {
+                                let _ = ws_tx.send(ClientMessage::Unpin {
+                                    catalog: catalog_name.clone(),
+                                    table: table.clone(),
+                                    tier: "sealed".into(),
+                                    version: old_v,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!(table = %table, "Failed to re-open sealed dataset after mutation: {}", e);
+                        }
+                    }
+                }
+                debug!(catalog = %catalog_name, table = %table, seq = event.seq,
+                       "Refreshed datasets after data mutation");
+            }
+        }
     }
 
     // Update persisted sequence number
@@ -1392,5 +1486,153 @@ where
 {
     fn execute(&self, fut: Fut) {
         tokio::task::spawn(fut);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn test_rand_jitter_range() {
+        // rand_jitter should return values in [0.0, 1.0)
+        for _ in 0..100 {
+            let val = rand_jitter();
+            assert!(val >= 0.0, "jitter {} should be >= 0.0", val);
+            assert!(val < 1.0, "jitter {} should be < 1.0", val);
+        }
+    }
+
+    #[test]
+    fn test_rand_jitter_not_constant() {
+        // Calling rand_jitter multiple times should not always return the same value
+        let values: Vec<f64> = (0..10).map(|_| rand_jitter()).collect();
+        let all_same = values.windows(2).all(|w| w[0] == w[1]);
+        assert!(!all_same, "rand_jitter should produce varying values");
+    }
+
+    #[test]
+    fn test_remote_lance_table_provider_new_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let provider = RemoteLanceTableProvider::new(schema.clone(), None, None);
+
+        // Schema should be preserved
+        assert_eq!(provider.schema.fields().len(), 2);
+        assert_eq!(provider.schema.field(0).name(), "id");
+        assert_eq!(provider.schema.field(1).name(), "name");
+
+        // Versions should be None when no datasets are loaded
+        assert!(provider.active_version().is_none());
+        assert!(provider.sealed_version().is_none());
+    }
+
+    #[test]
+    fn test_remote_lance_table_provider_table_type() {
+        use datafusion::datasource::TableProvider;
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let provider = RemoteLanceTableProvider::new(schema, None, None);
+        assert_eq!(provider.table_type(), datafusion_expr::TableType::Base);
+    }
+
+    #[test]
+    fn test_catalog_response_deserialization() {
+        let json = r#"{
+            "tables": {
+                "events": {
+                    "active_segment": 1,
+                    "sealed_segment": null,
+                    "s3_dataset_uri": "s3://bucket/path",
+                    "active_version": 5,
+                    "sealed_version": null
+                }
+            }
+        }"#;
+
+        let resp: CatalogResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.tables.len(), 1);
+        let info = resp.tables.get("events").unwrap();
+        assert_eq!(info.active_segment, 1);
+        assert!(info.sealed_segment.is_none());
+        assert_eq!(info.s3_dataset_uri, "s3://bucket/path");
+        assert_eq!(info.active_version, Some(5));
+        assert!(info.sealed_version.is_none());
+    }
+
+    #[test]
+    fn test_catalog_response_with_storage_options() {
+        let json = r#"{
+            "tables": {
+                "metrics": {
+                    "active_segment": 2,
+                    "sealed_segment": 1,
+                    "s3_dataset_uri": "s3://my-bucket/data",
+                    "active_version": 10,
+                    "sealed_version": 3,
+                    "s3_storage_options": {
+                        "region": "us-east-1"
+                    }
+                }
+            }
+        }"#;
+
+        let resp: CatalogResponse = serde_json::from_str(json).unwrap();
+        let info = resp.tables.get("metrics").unwrap();
+        assert_eq!(info.sealed_segment, Some(1));
+        assert_eq!(info.sealed_version, Some(3));
+        assert_eq!(
+            info.s3_storage_options.get("region").map(|s| s.as_str()),
+            Some("us-east-1")
+        );
+    }
+
+    #[test]
+    fn test_bisque_client_catalog_provider_schema_names() {
+        // BisqueClientCatalogProvider always reports "public" as its only schema
+        let state = Arc::new(CatalogState {
+            name: "test_catalog".to_string(),
+            routing_store: Arc::new(BisqueRoutingStore::new(
+                "http://localhost:9000",
+                "test_catalog",
+                Arc::new(CredentialConfig::default()),
+            )),
+            tables: RwLock::new(HashMap::new()),
+            last_seq: AtomicU64::new(0),
+        });
+
+        let provider = BisqueClientCatalogProvider {
+            state: state.clone(),
+        };
+
+        let names = provider.schema_names();
+        assert_eq!(names, vec!["public".to_string()]);
+    }
+
+    #[test]
+    fn test_bisque_client_catalog_provider_schema_lookup() {
+        let state = Arc::new(CatalogState {
+            name: "test_catalog".to_string(),
+            routing_store: Arc::new(BisqueRoutingStore::new(
+                "http://localhost:9000",
+                "test_catalog",
+                Arc::new(CredentialConfig::default()),
+            )),
+            tables: RwLock::new(HashMap::new()),
+            last_seq: AtomicU64::new(0),
+        });
+
+        let provider = BisqueClientCatalogProvider {
+            state: state.clone(),
+        };
+
+        // "public" should return Some
+        assert!(provider.schema("public").is_some());
+        // Any other name should return None
+        assert!(provider.schema("other").is_none());
+        assert!(provider.schema("information_schema").is_none());
     }
 }

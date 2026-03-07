@@ -108,11 +108,21 @@ tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = { workspace = true }
+arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+bisque-raft = { workspace = true }
+bytes = { workspace = true }
 datafusion = { workspace = true }
+futures = { workspace = true }
 lance = { workspace = true }
 lance-index = { workspace = true }
 lance-table = { workspace = true }
+openraft = { workspace = true }
+prost = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
+tonic = { workspace = true }
 url = { workspace = true }

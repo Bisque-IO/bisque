@@ -221,3 +221,70 @@ pub async fn serve_postgres(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BisqueLanceConfig;
+
+    #[test]
+    fn test_postgres_server_config_default() {
+        let config = PostgresServerConfig::default();
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 5432);
+    }
+
+    #[tokio::test]
+    async fn test_catalog_provider_schema_names_include_public() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lance_config = BisqueLanceConfig::new(tmp.path());
+        let engine = Arc::new(BisqueLance::open(lance_config).await.unwrap());
+
+        let provider = BisqueLanceCatalogProvider::new(engine);
+        let names = provider.schema_names();
+        assert!(
+            names.contains(&"public".to_string()),
+            "schema_names should contain 'public', got: {:?}",
+            names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_provider_schema_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lance_config = BisqueLanceConfig::new(tmp.path());
+        let engine = Arc::new(BisqueLance::open(lance_config).await.unwrap());
+
+        let provider = BisqueLanceCatalogProvider::new(engine);
+
+        // "public" schema should be resolvable
+        assert!(provider.schema("public").is_some());
+
+        // Unknown schema should return None
+        assert!(provider.schema("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_register_schema_adds_to_schema_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lance_config = BisqueLanceConfig::new(tmp.path());
+        let engine = Arc::new(BisqueLance::open(lance_config).await.unwrap());
+
+        let provider = BisqueLanceCatalogProvider::new(engine.clone());
+
+        // Register a new schema (reuse the same engine-backed schema provider)
+        let extra_schema = Arc::new(BisqueLanceSchemaProvider::new(engine));
+        let prev = provider
+            .register_schema("pg_catalog", extra_schema)
+            .unwrap();
+        assert!(prev.is_none(), "first registration should return None");
+
+        // Now schema_names should include both "public" and "pg_catalog"
+        let names = provider.schema_names();
+        assert!(names.contains(&"public".to_string()));
+        assert!(names.contains(&"pg_catalog".to_string()));
+
+        // And the schema should be resolvable
+        assert!(provider.schema("pg_catalog").is_some());
+    }
+}

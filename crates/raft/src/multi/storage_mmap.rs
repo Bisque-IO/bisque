@@ -41,7 +41,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -172,8 +172,6 @@ struct Segment {
     mmap: MmapRaw,
     /// Logical size: the write tail. Updated atomically after every append.
     logical_size: AtomicU64,
-    /// Flushed size: the last fsync'd offset. Updated by the fsync thread.
-    flushed_size: AtomicU64,
     /// File handle for fsync. Present for active segments, None for
     /// sealed segments loaded read-only during recovery.
     file: Option<std::fs::File>,
@@ -200,7 +198,6 @@ impl Segment {
             segment_id,
             mmap,
             logical_size: AtomicU64::new(valid_bytes),
-            flushed_size: AtomicU64::new(valid_bytes),
             file,
             path,
             pending_max_bytes: AtomicU64::new(0),
@@ -323,7 +320,6 @@ fn sentinel_segment() -> Arc<Segment> {
         segment_id: 0,
         mmap: raw,
         logical_size: AtomicU64::new(0),
-        flushed_size: AtomicU64::new(0),
         file: None,
         path: PathBuf::new(),
         pending_max_bytes: AtomicU64::new(0),
@@ -532,6 +528,12 @@ struct FsyncState<C: RaftTypeConfig> {
     cv: std::sync::Condvar,
     /// Delay before triggering fsync after first enqueue.
     fsync_delay: std::time::Duration,
+    /// Test-only: force sync_data() to return an error.
+    #[cfg(test)]
+    force_sync_error: AtomicBool,
+    /// Test-only: count of actual sync_data() calls.
+    #[cfg(test)]
+    sync_count: AtomicU64,
 }
 
 impl<C: RaftTypeConfig> FsyncState<C> {
@@ -545,6 +547,10 @@ impl<C: RaftTypeConfig> FsyncState<C> {
             }),
             cv: std::sync::Condvar::new(),
             fsync_delay,
+            #[cfg(test)]
+            force_sync_error: AtomicBool::new(false),
+            #[cfg(test)]
+            sync_count: AtomicU64::new(0),
         }
     }
 
@@ -557,6 +563,15 @@ impl<C: RaftTypeConfig> FsyncState<C> {
         segment.mark_first_enqueue();
 
         let mut inner = self.mu.lock().unwrap();
+        if inner.shutdown {
+            drop(inner);
+            tracing::warn!("fsync push after shutdown — returning error to callback");
+            callback.io_completed(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "fsync thread has been shut down",
+            )));
+            return;
+        }
         let key = Arc::as_ptr(segment) as usize;
         let entry = inner.pending.entry(key).or_insert_with(|| FsyncEntry {
             segment: segment.clone(),
@@ -678,29 +693,57 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
             )
         };
 
-        // Sync each segment's file once, drain callbacks, update flushed_size
+        // Sync each segment's file once, drain callbacks
         for entry in ready {
-            let max_bytes = entry.segment.take_pending();
+            let _max_bytes = entry.segment.take_pending();
 
-            if let Some(ref file) = entry.segment.file {
-                let _ = file.sync_data();
-            }
+            let sync_result: Result<(), io::Error> = if let Some(ref file) = entry.segment.file {
+                #[cfg(test)]
+                {
+                    state.sync_count.fetch_add(1, Ordering::Relaxed);
+                    if state.force_sync_error.load(Ordering::Relaxed) {
+                        Err(io::Error::new(io::ErrorKind::Other, "injected fsync error"))
+                    } else {
+                        file.sync_data()
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    file.sync_data()
+                }
+            } else {
+                Ok(())
+            };
 
-            entry
-                .segment
-                .flushed_size
-                .fetch_max(max_bytes, Ordering::Release);
-
-            for cb in entry.callbacks {
-                cb.io_completed(Ok(()));
+            match &sync_result {
+                Ok(()) => {
+                    for cb in entry.callbacks {
+                        cb.io_completed(Ok(()));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        segment_id = entry.segment.segment_id,
+                        error = %e,
+                        "fsync failed — notifying {} callbacks",
+                        entry.callbacks.len()
+                    );
+                    for cb in entry.callbacks {
+                        cb.io_completed(Err(io::Error::new(e.kind(), e.to_string())));
+                    }
+                }
             }
         }
 
         // Process seal requests: fsync + truncate + manifest update (no footer on file)
         for req in seal_requests {
             if let Some(ref file) = req.segment.file {
-                let _ = file.sync_data();
-                let _ = file.set_len(req.valid_bytes);
+                if let Err(e) = file.sync_data() {
+                    tracing::error!(segment_id = req.segment.segment_id, "seal fsync failed: {}", e);
+                }
+                if let Err(e) = file.set_len(req.valid_bytes) {
+                    tracing::error!(segment_id = req.segment.segment_id, "seal truncate failed: {}", e);
+                }
             }
 
             // Update manifest with all metadata (replaces on-file footer)
@@ -1614,7 +1657,15 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
         // Stop the manifest worker thread
         self.manifest.stop();
     }
+}
 
+impl<C: RaftTypeConfig> Drop for MmapPerGroupLogStorage<C> {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl<C: RaftTypeConfig> MmapPerGroupLogStorage<C> {
     async fn get_or_create_group(&self, group_id: u64) -> io::Result<Arc<MmapGroupState<C>>>
     where
         C: RaftTypeConfig<
@@ -2233,6 +2284,10 @@ where
 
     fn get_purge_floor(&self, group_id: u64) -> Option<Arc<AtomicU64>> {
         MmapPerGroupLogStorage::get_purge_floor(self, group_id)
+    }
+
+    fn stop(&self) {
+        MmapPerGroupLogStorage::stop(self);
     }
 }
 
@@ -7496,6 +7551,186 @@ mod tests {
                 15,
                 "All entries should recover via CRC scan slow path"
             );
+
+            storage.stop();
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Fsync hardening tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fsync_error_propagation() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_fsync_delay(Duration::ZERO);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Baseline: normal write succeeds
+            let entries = vec![make_entry(1, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            let result = rx.await.unwrap();
+            assert!(result.is_ok(), "baseline write should succeed");
+
+            // Inject fsync error
+            storage
+                .fsync_state
+                .force_sync_error
+                .store(true, Ordering::Relaxed);
+
+            let entries = vec![make_entry(2, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            let result = rx.await.unwrap();
+            assert!(result.is_err(), "write should fail when fsync errors");
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Other);
+            assert!(
+                err.to_string().contains("injected"),
+                "error message should contain 'injected', got: {}",
+                err
+            );
+
+            // Recovery: disable error injection
+            storage
+                .fsync_state
+                .force_sync_error
+                .store(false, Ordering::Relaxed);
+
+            let entries = vec![make_entry(3, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            let result = rx.await.unwrap();
+            assert!(result.is_ok(), "write should succeed after error clears");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_fsync_coalescing_count() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_fsync_delay(Duration::from_millis(50));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Rapidly write 20 entries, collecting all receivers
+            let mut receivers = Vec::new();
+            for i in 1..=20u64 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                receivers.push(rx);
+            }
+
+            // Wait for all callbacks
+            for rx in receivers {
+                rx.await.unwrap().unwrap();
+            }
+
+            let sync_count = storage
+                .fsync_state
+                .sync_count
+                .load(Ordering::Relaxed);
+
+            assert!(
+                sync_count >= 1,
+                "must have at least 1 sync call, got {}",
+                sync_count
+            );
+            assert!(
+                sync_count < 20,
+                "coalescing should reduce sync calls below 20, got {}",
+                sync_count
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_push_after_stop_fires_error() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_fsync_delay(Duration::ZERO);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            // Write one entry to confirm normal operation
+            let mut log = storage.get_log_storage(0).await.unwrap();
+            let entries = vec![make_entry(1, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            // Stop the storage (kills fsync thread)
+            storage.stop();
+
+            // Push after stop using a sentinel segment
+            let segment = sentinel_segment();
+            let (cb, rx) = make_callback();
+            storage.fsync_state.push(&segment, 100, cb);
+
+            let result = tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .expect("callback should fire within 2s")
+                .unwrap();
+
+            assert!(result.is_err(), "push after stop should return error");
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            assert!(
+                err.to_string().contains("shut down"),
+                "error should mention shutdown, got: {}",
+                err
+            );
+        });
+    }
+
+    #[test]
+    fn test_fsync_push_during_processing() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_fsync_delay(Duration::ZERO);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write 100 entries, yielding every 10 to allow fsync thread interleaving
+            let mut receivers = Vec::new();
+            for i in 1..=100u64 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                receivers.push(rx);
+                if i % 10 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            // All 100 callbacks must fire with Ok
+            for (i, rx) in receivers.into_iter().enumerate() {
+                let result = tokio::time::timeout(Duration::from_secs(5), rx)
+                    .await
+                    .unwrap_or_else(|_| panic!("callback {} timed out", i + 1))
+                    .unwrap();
+                assert!(
+                    result.is_ok(),
+                    "callback {} should succeed, got: {:?}",
+                    i + 1,
+                    result
+                );
+            }
+
+            // All 100 entries should be readable
+            let result = log.try_get_log_entries(1..101).await.unwrap();
+            assert_eq!(result.len(), 100, "all 100 entries should be readable");
 
             storage.stop();
         });
