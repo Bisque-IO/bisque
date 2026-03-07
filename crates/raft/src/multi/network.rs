@@ -758,4 +758,136 @@ mod tests {
             assert_eq!(transport.call_count.load(Ordering::Relaxed), 50);
         });
     }
+
+    // ===================================================================
+    // Network factory — additional coverage
+    // ===================================================================
+
+    #[test]
+    fn test_group_network_factory_routes_correctly() {
+        run_async(async {
+            let transport = FakeTransport::new();
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
+
+            let node = openraft::impls::BasicNode {
+                addr: "127.0.0.1:5000".to_string(),
+            };
+
+            // Group 1
+            let mut gf1 = GroupNetworkFactory::new(factory.clone(), 1);
+            let mut net1 = gf1.new_client(10, &node).await;
+            let hb = make_heartbeat_request(1, 1);
+            net1.append_entries(hb, RPCOption::new(Duration::from_secs(30)))
+                .await
+                .unwrap();
+
+            // Group 2
+            let mut gf2 = GroupNetworkFactory::new(factory, 2);
+            let mut net2 = gf2.new_client(10, &node).await;
+            let hb = make_heartbeat_request(1, 1);
+            net2.append_entries(hb, RPCOption::new(Duration::from_secs(30)))
+                .await
+                .unwrap();
+
+            // Verify group_id routing: both went to target=10 but with different group_ids
+            assert!(transport.append_entries_calls.contains_key(&(10, 1)));
+            assert!(transport.append_entries_calls.contains_key(&(10, 2)));
+        });
+    }
+
+    #[test]
+    fn test_network_factory_group_isolation() {
+        run_async(async {
+            let transport = FakeTransport::new();
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
+
+            let node = openraft::impls::BasicNode {
+                addr: "127.0.0.1:5000".to_string(),
+            };
+
+            // Send vote requests to different groups
+            for group_id in 1..=5 {
+                let mut gf = GroupNetworkFactory::new(factory.clone(), group_id);
+                let mut net = gf.new_client(1, &node).await;
+                let vote_req = openraft::raft::VoteRequest {
+                    vote: openraft::impls::Vote::new(1, 1),
+                    last_log_id: None,
+                };
+                net.vote(vote_req, RPCOption::new(Duration::from_secs(30)))
+                    .await
+                    .unwrap();
+            }
+
+            // Each group should have exactly one vote call
+            for group_id in 1..=5u64 {
+                let calls = transport.vote_calls.get(&(1, group_id)).unwrap();
+                assert_eq!(calls.len(), 1);
+            }
+            assert_eq!(transport.call_count.load(Ordering::Relaxed), 5);
+        });
+    }
+
+    #[test]
+    fn test_vote_request_through_factory() {
+        run_async(async {
+            let transport = FakeTransport::new();
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
+
+            let node = openraft::impls::BasicNode {
+                addr: "127.0.0.1:5000".to_string(),
+            };
+
+            let mut gf = GroupNetworkFactory::new(factory, 1);
+            let mut net = gf.new_client(10, &node).await;
+
+            let vote_req = openraft::raft::VoteRequest::<TestConfig> {
+                vote: openraft::impls::Vote::new(3, 2),
+                last_log_id: None,
+            };
+
+            let result = net
+                .vote(vote_req, RPCOption::new(Duration::from_secs(30)))
+                .await;
+            assert!(result.is_ok());
+            let resp = result.unwrap();
+            assert!(resp.vote_granted);
+            assert_eq!(transport.call_count.load(Ordering::Relaxed), 1);
+        });
+    }
+
+    #[test]
+    fn test_multiple_clients_same_factory() {
+        run_async(async {
+            let transport = FakeTransport::new();
+            let factory = Arc::new(MultiRaftNetworkFactory::new(Arc::new(transport.clone())));
+
+            let node1 = openraft::impls::BasicNode {
+                addr: "127.0.0.1:5000".to_string(),
+            };
+            let node2 = openraft::impls::BasicNode {
+                addr: "127.0.0.1:6000".to_string(),
+            };
+
+            let mut gf = GroupNetworkFactory::new(factory, 1);
+
+            // Create multiple clients from the same factory
+            let mut net1 = gf.new_client(10, &node1).await;
+            let mut net2 = gf.new_client(20, &node2).await;
+
+            let hb1 = make_heartbeat_request(1, 1);
+            let hb2 = make_heartbeat_request(1, 1);
+
+            net1.append_entries(hb1, RPCOption::new(Duration::from_secs(30)))
+                .await
+                .unwrap();
+            net2.append_entries(hb2, RPCOption::new(Duration::from_secs(30)))
+                .await
+                .unwrap();
+
+            // Both should be routed correctly
+            assert!(transport.append_entries_calls.contains_key(&(10, 1)));
+            assert!(transport.append_entries_calls.contains_key(&(20, 1)));
+            assert_eq!(transport.call_count.load(Ordering::Relaxed), 2);
+        });
+    }
 }

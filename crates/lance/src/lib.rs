@@ -35,6 +35,7 @@ pub mod query;
 pub mod raft;
 pub mod s3_server;
 pub mod s3_store;
+pub mod segment_sync;
 pub mod state_machine;
 pub mod table_engine;
 pub mod types;
@@ -47,7 +48,7 @@ pub use catalog_events::{CatalogEvent, CatalogEventBus, CatalogEventKind};
 pub use client::BisqueClient;
 pub use cold_store::CredentialConfig;
 pub use config::{BisqueLanceConfig, IndexSpec, TableOpenConfig};
-pub use engine::BisqueLance;
+pub use engine::{BisqueLance, SnapshotGuardHandle, SnapshotTransferGuard};
 pub use error::{Error, Result};
 pub use flight::BisqueFlightService;
 pub use manifest::LanceManifestManager;
@@ -59,13 +60,17 @@ pub use query::BisqueLanceTableProvider;
 pub use raft::{LanceRaftNode, WriteError};
 pub use s3_server::{S3ServerState, s3_router, serve_s3};
 pub use s3_store::BisqueRoutingStore;
+pub use segment_sync::{
+    SegmentSyncClient, SegmentSyncClientConfig, SegmentSyncServer, SegmentSyncServerConfig,
+    SyncResult,
+};
 pub use state_machine::LanceStateMachine;
 pub use table_engine::TableEngine;
 pub use types::{
     CleanupStats, CompactionStats, FlushHandle, FlushState, LanceCommand, LanceResponse,
     PersistedBatcherConfig, PersistedIndexSpec, PersistedTableConfig, PersistedTableEntry,
     ProcessorDescriptor, SchemaVersion, SealReason, SegmentCatalog, SegmentId, SnapshotData,
-    TableSnapshot, WriteResult,
+    SnapshotFileEntry, TableSnapshot, WriteResult,
 };
 pub use version_pins::VersionPinTracker;
 pub use write_batcher::WriteBatcherConfig;

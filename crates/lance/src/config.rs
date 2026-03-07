@@ -254,6 +254,53 @@ impl BisqueLanceConfig {
         self.local_data_dir.join("tables").join(table_name)
     }
 
+    /// Build a file manifest of all Lance segment files under `local_data_dir`.
+    ///
+    /// Walks every table's `segments/` directory, collecting relative paths
+    /// and sizes for all files. Used by the snapshot builder to tell fresh
+    /// nodes what files they need to fetch.
+    pub async fn build_file_manifest(&self) -> std::io::Result<Vec<crate::types::SnapshotFileEntry>> {
+        use tokio::fs;
+
+        let mut entries = Vec::new();
+        let tables_dir = self.local_data_dir.join("tables");
+
+        if !tables_dir.exists() {
+            return Ok(entries);
+        }
+
+        let mut table_dirs = fs::read_dir(&tables_dir).await?;
+        while let Some(table_entry) = table_dirs.next_entry().await? {
+            let segments_dir = table_entry.path().join("segments");
+            if !segments_dir.is_dir() {
+                continue;
+            }
+
+            // Recursively walk the segments directory
+            let mut stack = vec![segments_dir];
+            while let Some(dir) = stack.pop() {
+                let mut dir_entries = fs::read_dir(&dir).await?;
+                while let Some(entry) = dir_entries.next_entry().await? {
+                    let path = entry.path();
+                    let metadata = entry.metadata().await?;
+
+                    if metadata.is_dir() {
+                        stack.push(path);
+                    } else if metadata.is_file() {
+                        if let Ok(relative) = path.strip_prefix(&self.local_data_dir) {
+                            entries.push(crate::types::SnapshotFileEntry {
+                                relative_path: relative.to_string_lossy().into_owned(),
+                                size: metadata.len(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
     /// Build a [`TableOpenConfig`] for a table using this engine's defaults.
     pub fn build_table_config(
         &self,

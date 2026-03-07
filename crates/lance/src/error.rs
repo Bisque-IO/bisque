@@ -35,6 +35,9 @@ pub enum Error {
 
     #[error("Table already exists: {0}")]
     TableAlreadyExists(String),
+
+    #[error("Segment sync error: {0}")]
+    SegmentSync(String),
 }
 
 impl From<Error> for io::Error {

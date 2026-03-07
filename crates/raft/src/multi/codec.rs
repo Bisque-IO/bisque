@@ -1758,4 +1758,200 @@ mod tests {
         data.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // Invalid UTF-8
         assert!(String::decode_from_slice(&data).is_err());
     }
+
+    // ===================================================================
+    // Additional codec edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_codec_empty_entries_list() {
+        // AppendEntries with 0 entries — roundtrip
+        let vote = make_vote(1, 1, true);
+        let req = openraft::raft::AppendEntriesRequest::<C> {
+            vote,
+            prev_log_id: None,
+            entries: vec![],
+            leader_commit: None,
+        };
+
+        let msg = RpcMessage::<C>::AppendEntries {
+            request_id: 1,
+            group_id: 0,
+            rpc: req.clone(),
+        };
+
+        let encoded = msg.encode_to_vec().unwrap();
+        let decoded = RpcMessage::<C>::decode_from_slice(&encoded).unwrap();
+
+        match decoded {
+            RpcMessage::AppendEntries { rpc, .. } => {
+                assert!(rpc.entries.is_empty());
+                assert_eq!(rpc.prev_log_id, None);
+                assert_eq!(rpc.leader_commit, None);
+            }
+            _ => panic!("Expected AppendEntries"),
+        }
+    }
+
+    #[test]
+    fn test_codec_many_entries_roundtrip() {
+        // AppendEntries with many entries — roundtrip
+        use crate::multi::test_support::TestBytes;
+
+        let vote = make_vote(5, 2, true);
+        let entries: Vec<openraft::impls::Entry<C>> = (1..=100)
+            .map(|i| openraft::impls::Entry::<C> {
+                log_id: make_log_id(5, 2, i),
+                payload: openraft::EntryPayload::Normal(TestBytes::from_vec(vec![i as u8; 50])),
+            })
+            .collect();
+
+        let req = openraft::raft::AppendEntriesRequest::<C> {
+            vote,
+            prev_log_id: Some(make_log_id(4, 1, 0)),
+            entries,
+            leader_commit: Some(make_log_id(5, 2, 50)),
+        };
+
+        let msg = RpcMessage::<C>::AppendEntries {
+            request_id: 42,
+            group_id: 7,
+            rpc: req,
+        };
+
+        let encoded = msg.encode_to_vec().unwrap();
+        let decoded = RpcMessage::<C>::decode_from_slice(&encoded).unwrap();
+
+        match decoded {
+            RpcMessage::AppendEntries { rpc, request_id, group_id } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(group_id, 7);
+                assert_eq!(rpc.entries.len(), 100);
+                assert_eq!(rpc.entries[0].log_id.index, 1);
+                assert_eq!(rpc.entries[99].log_id.index, 100);
+            }
+            _ => panic!("Expected AppendEntries"),
+        }
+    }
+
+    #[test]
+    fn test_codec_snapshot_zero_offset() {
+        let vote = make_vote(1, 1, true);
+        let meta = openraft::storage::SnapshotMeta::<C> {
+            last_log_id: None,
+            last_membership: openraft::StoredMembership::default(),
+            snapshot_id: "snap-0".to_string(),
+        };
+
+        let req = openraft::raft::InstallSnapshotRequest::<C> {
+            vote,
+            meta,
+            offset: 0,
+            data: vec![1, 2, 3],
+            done: false,
+        };
+
+        let msg = RpcMessage::<C>::InstallSnapshot {
+            request_id: 10,
+            group_id: 1,
+            rpc: req,
+        };
+
+        let encoded = msg.encode_to_vec().unwrap();
+        let decoded = RpcMessage::<C>::decode_from_slice(&encoded).unwrap();
+
+        match decoded {
+            RpcMessage::InstallSnapshot { rpc, .. } => {
+                assert_eq!(rpc.offset, 0);
+                assert_eq!(rpc.data, vec![1, 2, 3]);
+                assert!(!rpc.done);
+            }
+            _ => panic!("Expected InstallSnapshot"),
+        }
+    }
+
+    #[test]
+    fn test_codec_snapshot_large_data() {
+        let vote = make_vote(1, 1, true);
+        let meta = openraft::storage::SnapshotMeta::<C> {
+            last_log_id: Some(make_log_id(1, 1, 100)),
+            last_membership: openraft::StoredMembership::default(),
+            snapshot_id: "snap-large".to_string(),
+        };
+
+        let large_data = vec![0xAB; 1024 * 1024]; // 1MB
+        let req = openraft::raft::InstallSnapshotRequest::<C> {
+            vote,
+            meta,
+            offset: 512 * 1024,
+            data: large_data.clone(),
+            done: true,
+        };
+
+        let msg = RpcMessage::<C>::InstallSnapshot {
+            request_id: 99,
+            group_id: 5,
+            rpc: req,
+        };
+
+        let encoded = msg.encode_to_vec().unwrap();
+        let decoded = RpcMessage::<C>::decode_from_slice(&encoded).unwrap();
+
+        match decoded {
+            RpcMessage::InstallSnapshot { rpc, .. } => {
+                assert_eq!(rpc.data.len(), 1024 * 1024);
+                assert_eq!(rpc.offset, 512 * 1024);
+                assert!(rpc.done);
+            }
+            _ => panic!("Expected InstallSnapshot"),
+        }
+    }
+
+    #[test]
+    fn test_codec_error_message_roundtrip() {
+        let msg = RpcMessage::<C>::Error {
+            request_id: 123,
+            error: "Something went wrong".to_string(),
+        };
+
+        let encoded = msg.encode_to_vec().unwrap();
+        let decoded = RpcMessage::<C>::decode_from_slice(&encoded).unwrap();
+
+        match decoded {
+            RpcMessage::Error { request_id, error } => {
+                assert_eq!(request_id, 123);
+                assert_eq!(error, "Something went wrong");
+            }
+            _ => panic!("Expected Error"),
+        }
+    }
+
+    #[test]
+    fn test_codec_response_message_roundtrip() {
+        let vote = make_vote(3, 2, true);
+
+        // Vote response
+        let resp = openraft::raft::VoteResponse::<C> {
+            vote: vote.clone(),
+            vote_granted: true,
+            last_log_id: Some(make_log_id(2, 1, 50)),
+        };
+
+        let msg = RpcMessage::<C>::Response {
+            request_id: 77,
+            message: ResponseMessage::Vote(resp),
+        };
+
+        let encoded = msg.encode_to_vec().unwrap();
+        let decoded = RpcMessage::<C>::decode_from_slice(&encoded).unwrap();
+
+        match decoded {
+            RpcMessage::Response { request_id, message: ResponseMessage::Vote(resp) } => {
+                assert_eq!(request_id, 77);
+                assert!(resp.vote_granted);
+                assert_eq!(resp.last_log_id.unwrap().index, 50);
+            }
+            _ => panic!("Expected Response(Vote)"),
+        }
+    }
 }

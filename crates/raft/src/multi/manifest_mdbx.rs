@@ -1317,4 +1317,486 @@ mod tests {
             assert_eq!(segments.get(&seg_id).unwrap().valid_bytes, seg_id * 1000);
         }
     }
+
+    // ===================================================================
+    // Reliability — additional coverage
+    // ===================================================================
+
+    #[test]
+    fn test_manifest_manager_stop_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let manager = ManifestManager::open(tmp.path()).unwrap();
+
+        // Calling stop twice should not panic
+        manager.stop();
+        manager.stop();
+    }
+
+    #[test]
+    fn test_manifest_manager_read_after_stop() {
+        let tmp = TempDir::new().unwrap();
+        let manager = ManifestManager::open(tmp.path()).unwrap();
+        let sender = manager.sender();
+
+        let meta = SegmentMeta {
+            group_id: 1,
+            segment_id: 0,
+            valid_bytes: 512,
+            min_index: Some(1),
+            max_index: Some(10),
+            min_ts: None,
+            max_ts: None,
+            sealed: true,
+            record_count: 5,
+            record_type_flags: RecordTypeFlags::default(),
+        };
+        sender.try_send(meta).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        manager.stop();
+
+        // Reads should still work after stop (direct manifest read)
+        let segments = manager.read_group_segments(1).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments.get(&0).unwrap().valid_bytes, 512);
+    }
+
+    #[test]
+    fn test_manifest_open_reopen_persistence() {
+        let tmp = TempDir::new().unwrap();
+
+        // Write via manager
+        {
+            let manager = ManifestManager::open(tmp.path()).unwrap();
+            let sender = manager.sender();
+            let meta = SegmentMeta {
+                group_id: 5,
+                segment_id: 3,
+                valid_bytes: 9999,
+                min_index: Some(100),
+                max_index: Some(200),
+                min_ts: Some(1000),
+                max_ts: Some(2000),
+                sealed: true,
+                record_count: 50,
+                record_type_flags: RecordTypeFlags::default(),
+            };
+            sender.try_send(meta).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            manager.stop();
+        }
+
+        // Reopen and verify
+        {
+            let manager = ManifestManager::open(tmp.path()).unwrap();
+            let segments = manager.read_group_segments(5).unwrap();
+            assert_eq!(segments.len(), 1);
+            let meta = segments.get(&3).unwrap();
+            assert_eq!(meta.valid_bytes, 9999);
+            assert_eq!(meta.min_index, Some(100));
+            assert_eq!(meta.max_index, Some(200));
+            assert!(meta.sealed);
+            manager.stop();
+        }
+    }
+
+    #[test]
+    fn test_manifest_empty_group_read() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = MdbxManifest::open(tmp.path()).unwrap();
+
+        // Non-existent groups return empty HashMap
+        for gid in [0, 1, 42, u64::MAX] {
+            let segments = manifest.read_group_segments(gid).unwrap();
+            assert!(segments.is_empty());
+        }
+    }
+
+    // ===================================================================
+    // SegmentMeta — additional edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_segment_meta_boundary_values() {
+        // group_id=0, segment_id=0
+        let meta = SegmentMeta {
+            group_id: 0,
+            segment_id: 0,
+            valid_bytes: 0,
+            min_index: Some(0),
+            max_index: Some(0),
+            min_ts: Some(0),
+            max_ts: Some(0),
+            sealed: false,
+            record_count: 0,
+            record_type_flags: RecordTypeFlags::default(),
+        };
+        let encoded = meta.encode_value();
+        let decoded = SegmentMeta::decode_value(0, 0, &encoded).unwrap();
+        assert_eq!(decoded.group_id, 0);
+        assert_eq!(decoded.segment_id, 0);
+        assert_eq!(decoded.min_index, Some(0));
+        assert_eq!(decoded.max_index, Some(0));
+    }
+
+    #[test]
+    fn test_segment_meta_key_ordering() {
+        // Keys should sort correctly for MDBX range scans
+        let m1 = SegmentMeta {
+            group_id: 1,
+            segment_id: 1,
+            ..make_segment_meta(1, 1)
+        };
+        let m2 = SegmentMeta {
+            group_id: 1,
+            segment_id: 2,
+            ..make_segment_meta(1, 2)
+        };
+        let m3 = SegmentMeta {
+            group_id: 2,
+            segment_id: 0,
+            ..make_segment_meta(2, 0)
+        };
+
+        let k1 = m1.key_bytes();
+        let k2 = m2.key_bytes();
+        let k3 = m3.key_bytes();
+
+        // Big-endian ordering: group 1 < group 2, and within group 1: seg 1 < seg 2
+        assert!(k1 < k2);
+        assert!(k2 < k3);
+    }
+
+    #[test]
+    fn test_segment_meta_decode_wrong_length_variants() {
+        // Various wrong-length payloads
+        for len in [0, 1, 15, 55, 57, 100, 255] {
+            let buf = vec![0u8; len];
+            assert!(SegmentMeta::decode_value(1, 1, &buf).is_none());
+        }
+    }
+
+    #[test]
+    fn test_segment_meta_merge_all_fields_comprehensive() {
+        let mut base = SegmentMeta {
+            group_id: 1,
+            segment_id: 1,
+            valid_bytes: 100,
+            min_index: Some(10),
+            max_index: Some(50),
+            min_ts: Some(500),
+            max_ts: Some(1500),
+            sealed: false,
+            record_count: 5,
+            record_type_flags: RecordTypeFlags::default(),
+        };
+
+        let other = SegmentMeta {
+            group_id: 1,
+            segment_id: 1,
+            valid_bytes: 200,
+            min_index: Some(5),
+            max_index: Some(100),
+            min_ts: Some(100),
+            max_ts: Some(3000),
+            sealed: true,
+            record_count: 10,
+            record_type_flags: RecordTypeFlags::default(),
+        };
+
+        base.merge_from(other);
+
+        assert_eq!(base.valid_bytes, 200); // max
+        assert_eq!(base.min_index, Some(5)); // min
+        assert_eq!(base.max_index, Some(100)); // max
+        assert_eq!(base.min_ts, Some(100)); // min
+        assert_eq!(base.max_ts, Some(3000)); // max
+        assert!(base.sealed); // OR
+        assert_eq!(base.record_count, 10); // max
+    }
+
+    #[test]
+    fn test_segment_meta_key_bytes_roundtrip() {
+        // key_bytes() → extract group_id and segment_id from bytes
+        let meta = SegmentMeta {
+            group_id: 12345,
+            segment_id: 67890,
+            ..make_segment_meta(12345, 67890)
+        };
+        let key = meta.key_bytes();
+        let gid = u64::from_be_bytes(key[0..8].try_into().unwrap());
+        let sid = u64::from_be_bytes(key[8..16].try_into().unwrap());
+        assert_eq!(gid, 12345);
+        assert_eq!(sid, 67890);
+    }
+
+    // ===================================================================
+    // MdbxManifest — additional coverage
+    // ===================================================================
+
+    #[test]
+    fn test_manifest_many_segments() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = MdbxManifest::open(tmp.path()).unwrap();
+
+        // 1000 segments in one group
+        let metas: Vec<_> = (0..1000u64)
+            .map(|i| SegmentMeta {
+                group_id: 1,
+                segment_id: i,
+                valid_bytes: i * 100,
+                min_index: Some(i * 10),
+                max_index: Some((i + 1) * 10 - 1),
+                min_ts: None,
+                max_ts: None,
+                sealed: true,
+                record_count: 10,
+                record_type_flags: RecordTypeFlags::default(),
+            })
+            .collect();
+
+        manifest.apply_segment_updates(metas.into_iter()).unwrap();
+
+        let segments = manifest.read_group_segments(1).unwrap();
+        assert_eq!(segments.len(), 1000);
+        assert_eq!(segments.get(&0).unwrap().valid_bytes, 0);
+        assert_eq!(segments.get(&999).unwrap().valid_bytes, 99900);
+    }
+
+    #[test]
+    fn test_manifest_many_groups() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = MdbxManifest::open(tmp.path()).unwrap();
+
+        // 100 groups with 10 segments each
+        let metas: Vec<_> = (0..100u64)
+            .flat_map(|g| {
+                (0..10u64).map(move |s| SegmentMeta {
+                    group_id: g,
+                    segment_id: s,
+                    valid_bytes: g * 1000 + s * 100,
+                    min_index: None,
+                    max_index: None,
+                    min_ts: None,
+                    max_ts: None,
+                    sealed: false,
+                    record_count: 0,
+                    record_type_flags: RecordTypeFlags::default(),
+                })
+            })
+            .collect();
+
+        manifest.apply_segment_updates(metas.into_iter()).unwrap();
+
+        for g in 0..100u64 {
+            let segments = manifest.read_group_segments(g).unwrap();
+            assert_eq!(segments.len(), 10);
+            for s in 0..10u64 {
+                assert_eq!(segments.get(&s).unwrap().valid_bytes, g * 1000 + s * 100);
+            }
+        }
+    }
+
+    // ===================================================================
+    // ManifestManager — concurrency
+    // ===================================================================
+
+    #[test]
+    fn test_manifest_concurrent_read_write() {
+        let tmp = TempDir::new().unwrap();
+        let manager = ManifestManager::open(tmp.path()).unwrap();
+        let sender = manager.sender();
+
+        // Send updates from multiple threads while reading
+        let mut handles = Vec::new();
+        for group_id in 0..10u64 {
+            let s = sender.clone();
+            handles.push(std::thread::spawn(move || {
+                for seg_id in 0..10u64 {
+                    let meta = SegmentMeta {
+                        group_id,
+                        segment_id: seg_id,
+                        valid_bytes: seg_id * 100,
+                        min_index: None,
+                        max_index: None,
+                        min_ts: None,
+                        max_ts: None,
+                        sealed: false,
+                        record_count: 0,
+                        record_type_flags: RecordTypeFlags::default(),
+                    };
+                    let _ = s.try_send(meta);
+                }
+            }));
+        }
+
+        // Concurrent reads should not corrupt
+        let mgr_clone = manager.clone();
+        let read_handle = std::thread::spawn(move || {
+            for _ in 0..50 {
+                for g in 0..10 {
+                    let _ = mgr_clone.read_group_segments(g);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        read_handle.join().unwrap();
+
+        // Wait for worker to flush
+        std::thread::sleep(Duration::from_millis(300));
+
+        // All groups should have their segments
+        for g in 0..10u64 {
+            let segments = manager.read_group_segments(g).unwrap();
+            assert_eq!(segments.len(), 10, "group {} missing segments", g);
+        }
+
+        manager.stop();
+    }
+
+    #[test]
+    fn test_manifest_worker_batch_timing() {
+        let tmp = TempDir::new().unwrap();
+        let manager = ManifestManager::open(tmp.path()).unwrap();
+        let sender = manager.sender();
+
+        // Send 100 updates rapidly
+        let start = std::time::Instant::now();
+        for i in 0..100u64 {
+            let meta = SegmentMeta {
+                group_id: 1,
+                segment_id: i,
+                valid_bytes: i * 100,
+                min_index: None,
+                max_index: None,
+                min_ts: None,
+                max_ts: None,
+                sealed: false,
+                record_count: 0,
+                record_type_flags: RecordTypeFlags::default(),
+            };
+            sender.try_send(meta).unwrap();
+        }
+
+        // Wait for all to be processed
+        std::thread::sleep(Duration::from_millis(500));
+
+        let segments = manager.read_group_segments(1).unwrap();
+        assert_eq!(segments.len(), 100);
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Processing took too long: {:?}",
+            elapsed
+        );
+
+        manager.stop();
+    }
+
+    #[test]
+    fn test_manifest_sender_dropped_before_stop() {
+        let tmp = TempDir::new().unwrap();
+        let manager = ManifestManager::open(tmp.path()).unwrap();
+        let sender = manager.sender();
+
+        let meta = SegmentMeta {
+            group_id: 1,
+            segment_id: 0,
+            valid_bytes: 100,
+            min_index: None,
+            max_index: None,
+            min_ts: None,
+            max_ts: None,
+            sealed: false,
+            record_count: 0,
+            record_type_flags: RecordTypeFlags::default(),
+        };
+        sender.try_send(meta).unwrap();
+        drop(sender);
+
+        // Worker should handle sender being dropped gracefully
+        std::thread::sleep(Duration::from_millis(200));
+        manager.stop();
+    }
+
+    #[test]
+    fn test_manifest_concurrent_stop_and_send() {
+        let tmp = TempDir::new().unwrap();
+        let manager = ManifestManager::open(tmp.path()).unwrap();
+        let sender = manager.sender();
+
+        // Spawn a thread that sends while main thread stops
+        let s = sender.clone();
+        let send_handle = std::thread::spawn(move || {
+            for i in 0..100u64 {
+                let meta = SegmentMeta {
+                    group_id: 1,
+                    segment_id: i,
+                    valid_bytes: i * 100,
+                    min_index: None,
+                    max_index: None,
+                    min_ts: None,
+                    max_ts: None,
+                    sealed: false,
+                    record_count: 0,
+                    record_type_flags: RecordTypeFlags::default(),
+                };
+                if s.try_send(meta).is_err() {
+                    break; // Channel closed
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        manager.stop();
+        send_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_manifest_encode_decode_record_type_flags() {
+        use crate::multi::record_format::RecordTypeFlags;
+
+        let meta = SegmentMeta {
+            group_id: 1,
+            segment_id: 0,
+            valid_bytes: 100,
+            min_index: None,
+            max_index: None,
+            min_ts: None,
+            max_ts: None,
+            sealed: false,
+            record_count: 0,
+            record_type_flags: RecordTypeFlags::from_u8(0b1111), // all flags set
+        };
+
+        let encoded = meta.encode_value();
+        let decoded = SegmentMeta::decode_value(1, 0, &encoded).unwrap();
+        assert_eq!(decoded.record_type_flags.to_u8(), 0b1111);
+    }
+
+    #[test]
+    fn test_manifest_encode_decode_record_count() {
+        let meta = SegmentMeta {
+            group_id: 1,
+            segment_id: 0,
+            valid_bytes: 100,
+            min_index: None,
+            max_index: None,
+            min_ts: None,
+            max_ts: None,
+            sealed: false,
+            record_count: 999_999,
+            record_type_flags: RecordTypeFlags::default(),
+        };
+
+        let encoded = meta.encode_value();
+        let decoded = SegmentMeta::decode_value(1, 0, &encoded).unwrap();
+        assert_eq!(decoded.record_count, 999_999);
+    }
 }

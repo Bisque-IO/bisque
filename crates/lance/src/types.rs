@@ -330,6 +330,26 @@ pub struct SnapshotData {
     /// sealed segments. `None` means all data is in S3 (or no tables exist).
     #[serde(default)]
     pub min_safe_log_index: Option<u64>,
+    /// File manifest for fresh node recovery.
+    /// Lists every Lance segment file that must be transferred to restore
+    /// hot/warm data on a fresh node.
+    #[serde(default)]
+    pub file_manifest: Vec<SnapshotFileEntry>,
+    /// Address of the leader's segment sync server (host:port).
+    /// Fresh nodes connect here to stream segment files after receiving
+    /// the metadata snapshot.
+    #[serde(default)]
+    pub sync_addr: Option<String>,
+}
+
+/// Entry in the snapshot file manifest describing a single file to transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotFileEntry {
+    /// Relative path from `local_data_dir`
+    /// (e.g., `"tables/my_table/segments/1.lance/data/0.lance"`)
+    pub relative_path: String,
+    /// File size in bytes.
+    pub size: u64,
 }
 
 // =============================================================================

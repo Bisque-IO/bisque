@@ -16,11 +16,12 @@ use tracing::{debug, error, info, warn};
 use crate::LanceTypeConfig;
 use crate::async_apply::{AppliedWatermark, AsyncApplyBuffer, AsyncApplyConfig};
 use crate::catalog_events::{CatalogEventBus, CatalogEventKind};
-use crate::engine::BisqueLance;
+use crate::engine::{BisqueLance, SnapshotGuardHandle};
 use crate::ipc;
 use crate::manifest::{
     GroupMeta, LanceManifestManager, ManifestCommand, ManifestUpdate, TableUpdate,
 };
+use crate::segment_sync::SegmentSyncClient;
 use crate::types::{LanceCommand, LanceResponse, PersistedTableEntry, SnapshotData};
 
 /// Raft state machine that drives the BisqueLance multi-table storage engine.
@@ -43,6 +44,15 @@ pub struct LanceStateMachine {
     catalog_name: String,
     /// Optional version pin tracker for Raft-replicated version pins.
     version_pins: Option<Arc<crate::version_pins::VersionPinTracker>>,
+    /// Client for streaming segment files from leader during snapshot install.
+    sync_client: Option<SegmentSyncClient>,
+    /// Address of this node's segment sync server (included in snapshots so
+    /// followers know where to connect).
+    sync_addr: Option<String>,
+    /// Active snapshot transfer guards. Each handle keeps file deletions
+    /// deferred until it is dropped (via timeout or explicit release).
+    /// Supports multiple concurrent transfers (e.g., multiple nodes joining).
+    snapshot_guards: Vec<SnapshotGuardHandle>,
 }
 
 impl LanceStateMachine {
@@ -58,6 +68,9 @@ impl LanceStateMachine {
             catalog_events: None,
             catalog_name: String::new(),
             version_pins: None,
+            sync_client: None,
+            sync_addr: None,
+            snapshot_guards: Vec::new(),
         }
     }
 
@@ -76,6 +89,18 @@ impl LanceStateMachine {
     /// Set the version pin tracker for Raft-replicated version pins.
     pub fn with_version_pins(mut self, pins: Arc<crate::version_pins::VersionPinTracker>) -> Self {
         self.version_pins = Some(pins);
+        self
+    }
+
+    /// Set the segment sync client for file transfer during snapshot install.
+    pub fn with_sync_client(mut self, client: SegmentSyncClient) -> Self {
+        self.sync_client = Some(client);
+        self
+    }
+
+    /// Set this node's segment sync server address (included in snapshots).
+    pub fn with_sync_addr(mut self, addr: String) -> Self {
+        self.sync_addr = Some(addr);
         self
     }
 
@@ -116,6 +141,9 @@ impl LanceStateMachine {
             catalog_events: None,
             catalog_name: String::new(),
             version_pins: None,
+            sync_client: None,
+            sync_addr: None,
+            snapshot_guards: Vec::new(),
         };
         (sm, watermark)
     }
@@ -426,15 +454,61 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
             }
         }
 
-        // Compute and update the purge floor before building the snapshot.
-        let min_safe = self.compute_min_safe_log_index();
-        self.update_purge_floor_with(min_safe);
+        // Pin purge floor to last_applied (watermark) so logs from this point
+        // are retained while a fresh node syncs files and catches up.
+        let watermark = self.last_applied.as_ref().map(|l| l.index);
+        self.update_purge_floor_with(watermark);
+        if let Some(idx) = watermark {
+            info!(
+                watermark = idx,
+                "Pinned purge floor for snapshot (protects logs during file sync)"
+            );
+        }
+
+        // Build file manifest by walking all segment directories.
+        let file_manifest = match self.engine.config().build_file_manifest().await {
+            Ok(manifest) => {
+                let total_bytes: u64 = manifest.iter().map(|e| e.size).sum();
+                info!(
+                    files = manifest.len(),
+                    total_bytes,
+                    "Built snapshot file manifest"
+                );
+                manifest
+            }
+            Err(e) => {
+                warn!("Failed to build file manifest: {}", e);
+                Vec::new()
+            }
+        };
+
+        // Acquire snapshot transfer guard to prevent file deletion until
+        // the handle is dropped (or the 10-minute timeout fires).
+        // The handle is stored on the state machine and dropped when the
+        // timeout expires. Multiple guards can be active concurrently
+        // for parallel node joins.
+        //
+        // The watermark is passed to the guard so that `min_watermark()`
+        // prevents `update_purge_floor()` from raising the floor above
+        // the earliest active snapshot point.
+        if !file_manifest.is_empty() {
+            // Prune any already-released guards from previous snapshots
+            self.snapshot_guards.retain(|h| !h.is_released());
+
+            let handle = self
+                .engine
+                .snapshot_guard()
+                .acquire(std::time::Duration::from_secs(600), watermark);
+            self.snapshot_guards.push(handle);
+        }
 
         LanceSnapshotBuilder {
             table_entries: self.engine.table_entries(),
             last_applied: self.last_applied.clone(),
             last_membership: self.last_membership.clone(),
-            min_safe_log_index: min_safe,
+            min_safe_log_index: watermark,
+            file_manifest,
+            sync_addr: self.sync_addr.clone(),
         }
     }
 
@@ -451,9 +525,16 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
             bincode::serde::decode_from_slice(snapshot.get_ref(), bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
+        let has_files = !data.file_manifest.is_empty();
+        let total_files = data.file_manifest.len();
+        let total_bytes: u64 = data.file_manifest.iter().map(|e| e.size).sum();
+
         info!(
             ?meta.last_log_id,
             tables = data.tables.len(),
+            manifest_files = total_files,
+            manifest_bytes = total_bytes,
+            has_sync_addr = data.sync_addr.is_some(),
             "Installing snapshot"
         );
 
@@ -462,6 +543,73 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
             warn!("Error shutting down engine during snapshot install: {}", e);
         }
 
+        // Stream segment files from leader BEFORE restoring tables.
+        // This ensures the Lance dataset directories exist on disk when
+        // TableEngine::open tries to open them.
+        if has_files {
+            if let Some(ref sync_addr) = data.sync_addr {
+                if let Some(ref client) = self.sync_client {
+                    info!(
+                        addr = sync_addr,
+                        files = total_files,
+                        bytes = total_bytes,
+                        "Syncing segment files from leader"
+                    );
+
+                    match client.sync_files(sync_addr, &data.file_manifest).await {
+                        Ok(result) => {
+                            info!(
+                                files_transferred = result.files_transferred,
+                                files_missing = result.files_missing,
+                                bytes_transferred = result.bytes_transferred,
+                                verification_failures = result.verification_failures.len(),
+                                "Segment file sync complete"
+                            );
+
+                            if !result.verification_failures.is_empty() {
+                                error!(
+                                    failures = ?result.verification_failures,
+                                    "Post-sync verification failed for some files"
+                                );
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!(
+                                        "Post-sync verification failed for {} files",
+                                        result.verification_failures.len()
+                                    ),
+                                ));
+                            }
+
+                            if result.files_missing > 0 {
+                                warn!(
+                                    missing = ?result.missing_paths,
+                                    "Some files were unavailable during sync (may have been promoted to S3)"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("Segment file sync failed: {}", e);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("Segment file sync failed: {}", e),
+                            ));
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Snapshot has {} files to sync but no sync client configured",
+                        total_files
+                    );
+                }
+            } else {
+                warn!(
+                    "Snapshot has {} files to sync but no sync address provided",
+                    total_files
+                );
+            }
+        }
+
+        // Now restore tables — segment files should be on disk.
         for (table_name, table_entry) in &data.tables {
             let snapshot = table_entry.to_snapshot();
             let schema = if let Some(latest) = table_entry.schema_history.last() {
@@ -490,6 +638,9 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
 
         self.last_applied = meta.last_log_id.clone();
         self.last_membership = meta.last_membership.clone();
+
+        // Restore normal purge floor computation now that sync is complete.
+        self.update_purge_floor();
 
         // Bulk-write snapshot state to MDBX manifest for crash consistency.
         if let Some(manifest) = &self.manifest {
@@ -545,15 +696,32 @@ impl LanceStateMachine {
     }
 
     /// Update the purge floor by recomputing from current state.
+    ///
+    /// Takes the minimum of `compute_min_safe_log_index()` (per-table
+    /// constraint) and `min_watermark()` (active snapshot transfer
+    /// constraint). This ensures the floor never rises above the
+    /// earliest snapshot point that still has an active file transfer.
     fn update_purge_floor(&self) {
         let min_safe = self.compute_min_safe_log_index();
-        self.update_purge_floor_with(min_safe);
+        let min_guard = self.engine.snapshot_guard().min_watermark();
+        let effective = match (min_safe, min_guard) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.update_purge_floor_with(effective);
     }
 
-    /// Update the purge floor with a precomputed value.
+    /// Update the purge floor with a precomputed value, still capped
+    /// by any active snapshot transfer watermarks.
     fn update_purge_floor_with(&self, min_safe: Option<u64>) {
         if let Some(floor) = &self.purge_floor {
-            let value = min_safe.unwrap_or(0);
+            // Never raise the floor above active snapshot watermarks
+            let min_guard = self.engine.snapshot_guard().min_watermark();
+            let effective = match (min_safe, min_guard) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let value = effective.unwrap_or(0);
             floor.store(value, Ordering::Release);
             if value > 0 {
                 info!(min_safe_log_index = value, "Updated purge floor");
@@ -759,6 +927,8 @@ pub struct LanceSnapshotBuilder {
     last_applied: Option<LogId<LanceTypeConfig>>,
     last_membership: StoredMembership<LanceTypeConfig>,
     min_safe_log_index: Option<u64>,
+    file_manifest: Vec<crate::types::SnapshotFileEntry>,
+    sync_addr: Option<String>,
 }
 
 impl RaftSnapshotBuilder<LanceTypeConfig> for LanceSnapshotBuilder {
@@ -766,6 +936,8 @@ impl RaftSnapshotBuilder<LanceTypeConfig> for LanceSnapshotBuilder {
         let data = SnapshotData {
             tables: self.table_entries.clone(),
             min_safe_log_index: self.min_safe_log_index,
+            file_manifest: self.file_manifest.clone(),
+            sync_addr: self.sync_addr.clone(),
         };
 
         let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard())

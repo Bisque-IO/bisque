@@ -9,6 +9,10 @@ repository = "https://github.com/bisque-io/bisque"
 keywords = ["lance", "raft", "columnar", "search", "analytics"]
 categories = ["database-implementations", "data-structures"]
 
+[features]
+default = ["tls"]
+tls = ["dep:tokio-rustls", "dep:rustls"]
+
 [dependencies]
 # Bisque
 bisque-raft = { workspace = true }
@@ -81,6 +85,10 @@ libmdbx = { workspace = true }
 
 # WebSocket
 fastwebsockets = { workspace = true }
+
+# TLS (optional, for segment sync)
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 
 # Utilities
 arc-swap = { workspace = true }

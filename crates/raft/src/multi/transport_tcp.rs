@@ -1133,4 +1133,424 @@ mod tests {
             assert_eq!(read2, data2);
         });
     }
+
+    // ===================================================================
+    // Node registry tests
+    // ===================================================================
+
+    #[test]
+    fn test_node_registry_register_resolve() {
+        let registry = DefaultNodeRegistry::<u64>::new();
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        registry.register(1, addr);
+        assert_eq!(registry.resolve(&1), Some(addr));
+    }
+
+    #[test]
+    fn test_node_registry_unregister() {
+        let registry = DefaultNodeRegistry::<u64>::new();
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        registry.register(1, addr);
+        registry.unregister(&1);
+        assert_eq!(registry.resolve(&1), None);
+    }
+
+    #[test]
+    fn test_node_registry_resolve_unknown() {
+        let registry = DefaultNodeRegistry::<u64>::new();
+        assert_eq!(registry.resolve(&999), None);
+    }
+
+    #[test]
+    fn test_node_registry_overwrite() {
+        let registry = DefaultNodeRegistry::<u64>::new();
+        let addr1: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        registry.register(1, addr1);
+        registry.register(1, addr2);
+        assert_eq!(registry.resolve(&1), Some(addr2));
+    }
+
+    #[test]
+    fn test_node_registry_multiple_nodes() {
+        let registry = DefaultNodeRegistry::<u64>::new();
+        for i in 1..=100u64 {
+            let addr: SocketAddr = format!("127.0.0.1:{}", 5000 + i).parse().unwrap();
+            registry.register(i, addr);
+        }
+        for i in 1..=100u64 {
+            let expected: SocketAddr = format!("127.0.0.1:{}", 5000 + i).parse().unwrap();
+            assert_eq!(registry.resolve(&i), Some(expected));
+        }
+    }
+
+    // ===================================================================
+    // Transport config tests
+    // ===================================================================
+
+    #[test]
+    fn test_transport_config_all_fields() {
+        let config = BisqueTcpTransportConfig {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(15),
+            write_channel_capacity: 128,
+            max_batch_bytes: 32 * 1024,
+            connection_ttl: Duration::from_secs(120),
+            tcp_nodelay: false,
+            #[cfg(feature = "tls")]
+            tls_client_config: None,
+            #[cfg(feature = "tls")]
+            tls_server_name: None,
+        };
+        assert_eq!(config.connect_timeout, Duration::from_secs(5));
+        assert_eq!(config.request_timeout, Duration::from_secs(15));
+        assert_eq!(config.write_channel_capacity, 128);
+        assert_eq!(config.max_batch_bytes, 32 * 1024);
+        assert_eq!(config.connection_ttl, Duration::from_secs(120));
+        assert!(!config.tcp_nodelay);
+    }
+
+    // ===================================================================
+    // Frame encoding/decoding tests
+    // ===================================================================
+
+    #[test]
+    fn test_encode_framed_roundtrip() {
+        // encode_framed + read via read_frame — full roundtrip
+        use crate::multi::codec::RpcMessage;
+        use crate::multi::test_support::TestConfig;
+
+        run_async(async {
+            let vote = openraft::impls::Vote::<TestConfig> {
+                leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+                committed: false,
+            };
+            let msg = RpcMessage::<TestConfig>::Vote {
+                request_id: 42,
+                group_id: 7,
+                rpc: openraft::raft::VoteRequest {
+                    vote,
+                    last_log_id: None,
+                },
+            };
+
+            let framed = encode_framed(&msg).unwrap();
+
+            // Verify frame structure: [4-byte LE len | payload]
+            assert!(framed.len() > FRAME_PREFIX_LEN);
+            let payload_len = u32::from_le_bytes(framed[..4].try_into().unwrap()) as usize;
+            assert_eq!(payload_len, framed.len() - FRAME_PREFIX_LEN);
+
+            // Read back via read_frame
+            let mut cursor = std::io::Cursor::new(framed);
+            let payload = read_frame(&mut cursor).await.unwrap();
+            assert_eq!(payload.len(), payload_len);
+        });
+    }
+
+    #[test]
+    fn test_write_preframed_roundtrip() {
+        run_async(async {
+            let payload = b"test payload data";
+            let len = payload.len() as u32;
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&len.to_le_bytes());
+            framed.extend_from_slice(payload);
+
+            let mut buffer = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut buffer);
+
+            let returned = write_preframed(&mut cursor, framed).await.unwrap();
+            assert!(returned.is_empty()); // Buffer was cleared for reuse
+
+            cursor.set_position(0);
+            let read_data = read_frame(&mut cursor).await.unwrap();
+            assert_eq!(read_data, payload);
+        });
+    }
+
+    #[test]
+    fn test_read_frame_into_reuse_buffer() {
+        run_async(async {
+            // Write a frame
+            let data = b"reusable buffer test";
+            let mut buffer = Vec::new();
+            let mut write_cursor = std::io::Cursor::new(&mut buffer);
+            write_frame(&mut write_cursor, data).await.unwrap();
+
+            // Read into a reusable buffer
+            let mut read_buf = Vec::new();
+            let mut read_cursor = std::io::Cursor::new(&buffer[..]);
+            let n = read_frame_into(&mut read_cursor, &mut read_buf).await.unwrap();
+            assert_eq!(n, data.len());
+            assert_eq!(&read_buf[..], data);
+        });
+    }
+
+    #[test]
+    fn test_read_frame_into_empty() {
+        run_async(async {
+            let buffer = vec![0u8; 4]; // length = 0
+            let mut cursor = std::io::Cursor::new(&buffer[..]);
+            let mut read_buf = Vec::new();
+            let n = read_frame_into(&mut cursor, &mut read_buf).await.unwrap();
+            assert_eq!(n, 0);
+            assert!(read_buf.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_encode_framed_append_multiple() {
+        use crate::multi::codec::RpcMessage;
+        use crate::multi::test_support::TestConfig;
+
+        let vote = openraft::impls::Vote::<TestConfig> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 1 },
+            committed: false,
+        };
+        let msg = RpcMessage::<TestConfig>::Vote {
+            request_id: 1,
+            group_id: 0,
+            rpc: openraft::raft::VoteRequest { vote, last_log_id: None },
+        };
+
+        let mut buf = Vec::new();
+        encode_framed_append(&msg, &mut buf).unwrap();
+        let first_len = buf.len();
+        encode_framed_append(&msg, &mut buf).unwrap();
+        // Buffer should contain two complete frames
+        assert!(buf.len() > first_len);
+        assert_eq!(buf.len(), first_len * 2);
+    }
+
+    // ===================================================================
+    // Large payload framing
+    // ===================================================================
+
+    #[test]
+    fn test_large_payload_framing() {
+        run_async(async {
+            let data = vec![0xABu8; 100_000]; // 100KB
+            let mut buffer = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut buffer);
+
+            write_frame(&mut cursor, &data).await.unwrap();
+
+            cursor.set_position(0);
+            let read_data = read_frame(&mut cursor).await.unwrap();
+            assert_eq!(read_data.len(), 100_000);
+            assert_eq!(read_data, data);
+        });
+    }
+
+    // ===================================================================
+    // write_frame_vectored tests
+    // ===================================================================
+
+    #[test]
+    fn test_write_frame_vectored_roundtrip() {
+        run_async(async {
+            let data = b"vectored write test".to_vec();
+            let mut buffer = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut buffer);
+
+            let returned = write_frame_vectored(&mut cursor, data.clone()).await.unwrap();
+            // Returned buffer should be cleared for reuse
+            assert!(returned.is_empty());
+            assert!(returned.capacity() >= data.len());
+
+            cursor.set_position(0);
+            let read_data = read_frame(&mut cursor).await.unwrap();
+            assert_eq!(read_data, data);
+        });
+    }
+
+    // ===================================================================
+    // Encode buffer pool tests
+    // ===================================================================
+
+    #[test]
+    fn test_encode_buffer_pool_reuse() {
+        // Return a large buffer, then take — should get the large capacity
+        let large_buf = Vec::with_capacity(1024 * 64);
+        return_encode_buffer(large_buf);
+
+        let small_buf = Vec::with_capacity(16);
+        return_encode_buffer(small_buf); // Should not replace — smaller
+
+        // Pool should still have the larger buffer
+        ENCODE_BUFFER.with(|buf| {
+            assert!(buf.borrow().capacity() >= 1024 * 64);
+        });
+    }
+
+    // ===================================================================
+    // Connection lifecycle tests (using real TCP)
+    // ===================================================================
+
+    #[test]
+    fn test_group_connection_basic_lifecycle() {
+        use crate::multi::type_config::ManiacRaftTypeConfig;
+
+        run_async(async {
+            // Create a TCP listener
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Spawn a simple echo server
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (mut reader, mut writer) = stream.into_split();
+                // Echo: read frame, write it back
+                match read_frame(&mut reader).await {
+                    Ok(data) => {
+                        // Build a minimal response frame (needs >= 9 bytes for the reader loop)
+                        let response = vec![0u8; 9.max(data.len())];
+                        write_frame(&mut writer, &response).await.ok();
+                    }
+                    Err(_) => {}
+                }
+            });
+
+            // Connect client
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (read_half, write_half) = stream.into_split();
+            let reader: BoxedReader = Box::new(read_half);
+            let writer: BoxedWriter = Box::new(write_half);
+
+            let conn = GroupConnection::new(reader, writer, 0, 64 * 1024, 256);
+            assert!(conn.alive.load(Ordering::Acquire));
+
+            // Send a request
+            let payload = b"hello";
+            let len = payload.len() as u32;
+            let mut request_data = Vec::new();
+            request_data.extend_from_slice(&len.to_le_bytes());
+            request_data.extend_from_slice(payload);
+
+            let result = conn.send_request(request_data, Duration::from_secs(5)).await;
+            // The echo server responds with >= 9 bytes, which is valid
+            assert!(result.is_ok(), "send_request should succeed: {:?}", result.err());
+
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn test_connection_usability_alive() {
+        run_async(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let _server = tokio::spawn(async move {
+                let _ = listener.accept().await;
+                // Just accept, don't process
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            });
+
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (read_half, write_half) = stream.into_split();
+            let conn = GroupConnection::new(
+                Box::new(read_half),
+                Box::new(write_half),
+                0,
+                64 * 1024,
+                256,
+            );
+
+            // Should be usable when alive and within TTL
+            assert!(conn.is_usable(Duration::from_secs(300)));
+
+            // Mark as dead
+            conn.alive.store(false, Ordering::Release);
+            assert!(!conn.is_usable(Duration::from_secs(300)));
+        });
+    }
+
+    #[test]
+    fn test_send_to_dead_connection() {
+        run_async(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let _server = tokio::spawn(async move {
+                let _ = listener.accept().await;
+            });
+
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (read_half, write_half) = stream.into_split();
+            let conn = GroupConnection::new(
+                Box::new(read_half),
+                Box::new(write_half),
+                0,
+                64 * 1024,
+                256,
+            );
+
+            // Kill the connection
+            conn.alive.store(false, Ordering::Release);
+
+            let result = conn.send_request(vec![0; 10], Duration::from_secs(1)).await;
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                BisqueTransportError::ConnectionClosed => {}
+                other => panic!("Expected ConnectionClosed, got {:?}", other),
+            }
+        });
+    }
+
+    // ===================================================================
+    // Error type tests
+    // ===================================================================
+
+    #[test]
+    fn test_transport_error_variants() {
+        let err = BisqueTransportError::ConnectionError("test".into());
+        assert!(format!("{}", err).contains("Connection failed"));
+
+        let err = BisqueTransportError::UnknownNode(42);
+        assert!(format!("{}", err).contains("42"));
+
+        let err = BisqueTransportError::RequestTimeout;
+        assert!(format!("{}", err).contains("timeout"));
+
+        let err = BisqueTransportError::ConnectionClosed;
+        assert!(format!("{}", err).contains("closed"));
+
+        let err = BisqueTransportError::InvalidResponse;
+        assert!(format!("{}", err).contains("Invalid"));
+    }
+
+    // ===================================================================
+    // GroupConnectionKey tests
+    // ===================================================================
+
+    #[test]
+    fn test_group_connection_key_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        let k1 = GroupConnectionKey {
+            target_addr: "127.0.0.1:8080".parse().unwrap(),
+            group_id: 1,
+        };
+        let k2 = GroupConnectionKey {
+            target_addr: "127.0.0.1:8080".parse().unwrap(),
+            group_id: 2,
+        };
+        let k3 = GroupConnectionKey {
+            target_addr: "127.0.0.1:9090".parse().unwrap(),
+            group_id: 1,
+        };
+        set.insert(k1.clone());
+        set.insert(k2);
+        set.insert(k3);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&k1));
+    }
+
+    #[test]
+    fn test_default_node_registry_default_trait() {
+        let registry = DefaultNodeRegistry::<u64>::default();
+        assert_eq!(registry.resolve(&1), None);
+    }
 }

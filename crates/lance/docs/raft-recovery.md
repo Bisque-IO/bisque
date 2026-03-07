@@ -2,7 +2,10 @@
 
 bisque-lance replicates all mutations through Raft consensus, providing strong
 consistency across a cluster. An optional MDBX manifest provides
-crash-consistent metadata for fast recovery without full log replay.
+crash-consistent metadata for fast recovery without full log replay. Fresh
+nodes joining the cluster receive segment files via a dedicated TCP streaming
+protocol, with a transfer guard system that prevents file deletion race
+conditions during the transfer.
 
 ## Raft Integration
 
@@ -175,7 +178,7 @@ State Machine          Worker Thread              MDBX
      │── send_update() ──►  │                       │
      │                      │── commit_batch() ────►│
      │                      │                       │── fsync
-     │                      │◄─ done ──────────────│
+     │                      │◄─ done ───────────────│
 ```
 
 **Batching**: The worker blocks for up to 50ms, then drains up to 4096
@@ -271,23 +274,301 @@ restores from the last committed MDBX state and replays only entries since
 `last_applied`. This makes recovery time proportional to the lag between
 MDBX commits and the crash point.
 
-### Snapshot Install
+### Snapshot Install with Segment File Streaming
 
-When a follower is too far behind for log replay:
+When a follower is too far behind for log replay (or is a fresh node joining
+the cluster), Raft installs a snapshot. This is a two-phase process: metadata
+via Raft, then segment files via a dedicated TCP stream.
 
-1. Leader calls `get_snapshot_builder()`:
-   - Drains async buffer to ensure Lance is caught up
-   - Flushes manifest durably (waits for fsync)
-   - Computes `min_safe_log_index` across all tables
-   - Returns `SnapshotData` with all table entries
+#### Phase 1: Leader Builds Snapshot
 
-2. Snapshot is transmitted to follower
+`get_snapshot_builder()` prepares the snapshot on the leader:
 
-3. Follower calls `install_snapshot()`:
-   - Shuts down existing tables
-   - Restores tables from `PersistedTableEntry` data
-   - Bulk-writes snapshot state to MDBX (atomic transaction)
-   - Resumes log replay from snapshot's `last_applied + 1`
+1. **Drain async buffer** — ensures all pending writes are applied to Lance
+2. **Flush manifest durably** — MDBX fsync so metadata is crash-consistent
+3. **Pin purge floor** — sets purge floor to `last_applied` so Raft log
+   entries needed for post-snapshot catchup are not purged during the transfer
+4. **Build file manifest** — walks all `tables/*/segments/*.lance/` directories,
+   enumerating every file with its relative path and size
+5. **Acquire snapshot transfer guard** — prevents file deletion during transfer
+   (see [Snapshot Transfer Guard](#snapshot-transfer-guard) below)
+6. **Return builder** with table entries, file manifest, and sync server address
+
+`build_snapshot()` serializes this into a `SnapshotData` payload:
+
+```rust
+pub struct SnapshotData {
+    pub tables: HashMap<String, PersistedTableEntry>,
+    pub min_safe_log_index: Option<u64>,
+    pub file_manifest: Vec<SnapshotFileEntry>,  // files to stream
+    pub sync_addr: Option<String>,               // leader's sync server
+}
+```
+
+#### Phase 2: Follower Installs Snapshot
+
+`install_snapshot()` runs on the follower:
+
+1. **Decode snapshot** — deserialize `SnapshotData` from bincode
+2. **Shutdown existing engine** — clean slate for the restore
+3. **Stream segment files from leader** — connect to `sync_addr` via the
+   BSYN protocol and download all files in `file_manifest` to local disk
+4. **Verify transfer** — post-sync verification checks every transferred
+   file exists with the correct size; verification failures abort the install
+5. **Restore tables** — reconstruct `TableEngine` instances from
+   `PersistedTableEntry` data (segment files are now on disk)
+6. **Update purge floor** — restore normal computation from table catalogs
+7. **Bulk-write to MDBX** — atomic transaction persists the snapshot state
+   for crash consistency
+8. **Resume Raft** — log replay continues from `last_applied + 1`
+
+#### Post-Snapshot Log Catchup
+
+After snapshot install, the follower is at the leader's `last_applied` point
+but may be behind by entries committed during the transfer. Raft automatically
+replays these entries:
+
+- The purge floor was pinned to `last_applied` during `get_snapshot_builder()`,
+  so all log entries from that point forward are retained on the leader
+- The follower applies these entries through normal `apply()`, bringing it
+  fully up to date
+- `AppendRecords` entries for data already in S3 are skipped via the
+  `min_safe_log_index` optimization (no duplicate work)
+- Once caught up, the follower participates normally in the Raft group
+
+This ensures zero data loss even when the transfer takes minutes — all writes
+committed during the transfer are replayed from the log after file sync
+completes.
+
+## Segment Sync Protocol
+
+### Architecture
+
+The segment sync system streams Lance dataset files directly from the
+leader's disk to the follower's disk with zero intermediate copies. This
+is necessary because Raft snapshots carry only metadata — the actual Lance
+columnar data (active and sealed segments) must be transferred out-of-band.
+
+```
+Leader                              Follower
+  |                                    |
+  |-- Raft InstallSnapshot(metadata) ->|
+  |                                    |-- connect to sync_addr -->|
+  |                                    |<-- BSYN handshake --------|
+  |<--- file manifest ----             |
+  |--- stream file 1 data ------------>|
+  |--- stream file 2 data ------------>|
+  |--- ...                             |
+  |--- end sentinel ------------------>|
+  |                                    |-- verify files on disk
+  |                                    |-- restore tables from metadata
+  |                                    |-- resume Raft log replay
+```
+
+### BSYN Protocol
+
+A framed TCP protocol for streaming files between leader and follower.
+
+**Request** (follower &rarr; leader):
+```
+[4B magic: "BSYN"]
+[4B version: u32 LE]
+[4B manifest_len: u32 LE]
+[manifest_len bytes: bincode-encoded Vec<SnapshotFileEntry>]
+```
+
+**Response** (leader &rarr; follower, per file):
+```
+[2B path_len: u16 LE]
+[path_len bytes: UTF-8 relative path]
+[8B file_len: u64 LE]
+[file_len bytes: raw file data, streamed in 256 KB chunks]
+```
+
+**End sentinel**: `[2B path_len: 0]`
+
+**Missing files**: If a file in the manifest no longer exists on the leader
+(e.g., promoted to S3 during the transfer), the server sends `file_len = 0`
+and the client records it as missing. This is not an error — the data is
+safely in deep storage.
+
+### Security
+
+All paths are validated on both server and client sides before any filesystem
+operations:
+
+- **Path traversal prevention** — `validate_relative_path()` rejects paths
+  containing `..` components, absolute paths (`/`, `\`), and null bytes
+- **Server-side validation** — prevents a malicious manifest from reading
+  files outside the data directory
+- **Client-side validation** — prevents a compromised leader from writing
+  files outside the follower's data directory
+- **TLS support** — optional TLS/mTLS for encrypted transfers (feature-gated)
+
+### SyncResult
+
+Every sync operation returns a detailed result for observability:
+
+```rust
+pub struct SyncResult {
+    pub files_requested: usize,
+    pub files_transferred: usize,
+    pub files_missing: usize,        // promoted to S3 during transfer
+    pub bytes_transferred: u64,
+    pub missing_paths: Vec<String>,
+    pub verification_failures: Vec<String>,  // size mismatches
+}
+```
+
+Post-sync verification checks every transferred file exists on disk with
+the expected size from the manifest. Verification failures cause the
+snapshot install to abort with an error.
+
+### Server Lifecycle
+
+The `SegmentSyncServer` runs as a background task on the leader:
+
+- Binds to a configured address and accepts TCP connections
+- Each connection is handled in a spawned task (concurrent clients supported)
+- Shutdown signal stops accepting new connections; in-flight transfers
+  complete to avoid leaving followers with partial data
+- Client disconnects mid-transfer are handled gracefully — the spawned task
+  logs the error and continues accepting new connections
+
+### Configuration
+
+```rust
+// Server (leader)
+let server = SegmentSyncServer::new(SegmentSyncServerConfig {
+    data_dir: data_dir.to_path_buf(),
+    bind_addr: "0.0.0.0:9876".parse().unwrap(),
+});
+
+// Client (follower, configured on state machine)
+let client = SegmentSyncClient::new(SegmentSyncClientConfig {
+    data_dir: data_dir.to_path_buf(),
+});
+```
+
+## Snapshot Transfer Guard
+
+### Problem
+
+The leader continues processing Raft commands while a snapshot transfer is
+in flight. Two commands can delete segment files that are being streamed:
+
+| Command | Deletion | Risk |
+|---------|----------|------|
+| `PromoteToDeepStorage` | `remove_dir_all` on sealed segment directory | **HIGH** — most common |
+| `DropTable` | `remove_dir_all` on entire table directory | **MEDIUM** — less frequent |
+
+If either executes between manifest build and transfer completion, the
+follower receives incomplete data and the snapshot install fails.
+
+### Solution: Deferred Deletion
+
+`SnapshotTransferGuard` defers all segment/table file deletions while any
+snapshot transfer is active, then flushes them when the last transfer
+completes.
+
+```rust
+pub struct SnapshotTransferGuard {
+    active_count: AtomicUsize,              // concurrent transfer count
+    deferred_deletions: Mutex<Vec<PathBuf>>, // paths queued for deletion
+    active_watermarks: Mutex<Vec<u64>>,      // purge floor watermarks per transfer
+}
+```
+
+### Guard Lifecycle
+
+```
+T0: get_snapshot_builder()    -> guard.acquire()        [active_count: 0->1]
+T1: build_snapshot()          -> snapshot serialized
+T2: Raft sends snapshot to follower
+T3: apply_promote() arrives   -> defer_or_delete(path)  [path queued, NOT deleted]
+T4: follower streams files    -> files still on disk
+T5: guard handle dropped      -> active_count: 1->0, flush queue
+T6: deferred paths deleted
+```
+
+### RAII Handle
+
+`acquire()` returns a `SnapshotGuardHandle` with these safety properties:
+
+- **Panic-safe**: `impl Drop` releases the guard during stack unwinding
+- **Exactly-once release**: `AtomicBool` flag prevents double-release from
+  Drop, explicit `release()`, and timeout task
+- **Timeout safety net**: background task auto-releases after 10 minutes if
+  the handle is leaked (e.g., follower crashes and never connects)
+- **Concurrent transfers**: multiple handles can be active simultaneously
+  (e.g., multiple nodes joining at once); deletions are deferred until ALL
+  handles are released
+
+```rust
+// In apply_promote():
+let segment_path = self.config.segment_path(segment_id);
+if segment_path.exists() {
+    if !self.snapshot_guard.defer_or_delete(segment_path.clone()) {
+        tokio::fs::remove_dir_all(&segment_path).await?;
+    }
+}
+
+// In drop_table():
+let table_dir = self.config.table_data_dir(name);
+if table_dir.exists() {
+    if !self.snapshot_guard.defer_or_delete(table_dir.clone()) {
+        tokio::fs::remove_dir_all(&table_dir).await?;
+    }
+}
+```
+
+### What Is Deferred vs. Immediate
+
+Only the filesystem deletion is deferred. All other state changes happen
+immediately:
+
+| Operation | Immediate | Deferred |
+|-----------|-----------|----------|
+| Catalog update (sealed = None, S3 version) | Yes | |
+| Sealed dataset handle dropped | Yes | |
+| Purge floor updated | Yes | |
+| `remove_dir_all` on segment/table dir | | Yes |
+| Table removed from registry | Yes | |
+
+This means the Raft state is always correct and consistent — deferred files
+are harmless orphans that get cleaned up after the transfer.
+
+### Guard Handle Storage
+
+The state machine maintains a `Vec<SnapshotGuardHandle>` to keep handles
+alive for the duration of each snapshot transfer:
+
+```rust
+// In get_snapshot_builder():
+self.snapshot_guards.retain(|h| !h.is_released());  // prune completed
+let handle = self.engine.snapshot_guard()
+    .acquire(Duration::from_secs(600), watermark);  // watermark = last_applied index
+self.snapshot_guards.push(handle);
+```
+
+Handles are released by:
+1. **Timeout** (10 min) — the background task fires and releases
+2. **Drop** — when the state machine is dropped or the Vec is cleared
+3. **Explicit release** — via `handle.release()` if needed
+
+### Edge Cases Handled
+
+| Scenario | Behavior |
+|----------|----------|
+| Multiple concurrent transfers | All deletions deferred until last handle released |
+| Promote during active transfer | Path queued, files survive until transfer completes |
+| Drop table during active transfer | Path queued, directory survives |
+| Follower never connects (crash) | 10-min timeout auto-releases guard, flushes deletions |
+| Panic during snapshot handling | `Drop` impl releases guard during stack unwinding |
+| Path already deleted externally | `do_release()` silently skips missing paths |
+| `release()` + `Drop` + timeout race | `AtomicBool` ensures exactly one release per handle |
+| Promote overwrites purge floor during transfer | `min_watermark()` caps floor at earliest active snapshot point |
+| Concurrent snapshots with different watermarks | Floor stays at minimum until all transfers complete |
 
 ### Flush Recovery
 
@@ -351,6 +632,69 @@ purged.
 
 The purge floor is shared between the state machine and log storage via
 `Arc<AtomicU64>` with release/acquire ordering.
+
+### Purge Floor Pinning During Snapshots
+
+When `get_snapshot_builder()` runs, the purge floor is pinned to the
+snapshot's `last_applied` index. This prevents Raft from purging log entries
+that the follower will need to replay after the snapshot transfer completes:
+
+```
+                    pinned purge floor
+                          |
+  [purged] ... [log N] [log N+1] ... [log M] [log M+1] ...
+                  ^                     ^         ^
+          snapshot.last_applied    committed   new writes
+                                  during       during
+                                  transfer     transfer
+```
+
+Without pinning, the leader could purge entries between `last_applied` and
+the current head, leaving the follower unable to catch up after receiving
+the snapshot. Once `install_snapshot()` completes, the purge floor is
+restored to normal computation based on table catalogs.
+
+### Watermark-Aware Purge Floor
+
+The purge floor is computed as:
+
+```
+effective_floor = min(
+    compute_min_safe_log_index(),   // per-table hot/warm constraint
+    guard.min_watermark()           // active snapshot transfer constraint
+)
+```
+
+Each `SnapshotGuardHandle` stores the `last_applied` index (watermark) at
+the time the snapshot was built. `min_watermark()` returns the minimum
+across all active handles. This prevents a critical race condition:
+
+**Without watermark tracking** (the bug):
+```
+T0: Snapshot 1 built at log 500 -> floor = 500
+T1: PromoteToDeepStorage applied -> update_purge_floor() -> floor = 700 (OVERWRITES 500!)
+T2: openraft purges logs 500-699
+T3: Follower finishes file sync, needs logs 501+ -> UNAVAILABLE
+T4: Leader must send another full snapshot (wasted transfer)
+```
+
+**With watermark tracking** (the fix):
+```
+T0: Snapshot 1 built at log 500 -> guard.acquire(watermark=500) -> min_watermark() = 500
+T1: PromoteToDeepStorage applied -> update_purge_floor()
+    -> effective = min(700, 500) = 500  (watermark prevents overwrite!)
+T2: openraft purge capped at 499
+T3: Follower finishes file sync, replays logs 501+ -> SUCCESS
+T4: Guard handle dropped -> min_watermark() = None -> floor relaxes to 700
+```
+
+This also handles concurrent snapshots correctly:
+```
+T0: Snapshot 1 at log 500 -> min_watermark() = 500
+T1: Snapshot 2 at log 700 -> min_watermark() = min(500, 700) = 500
+T2: Transfer 1 completes  -> min_watermark() = 700
+T3: Transfer 2 completes  -> min_watermark() = None
+```
 
 ## Raft Command Types
 

@@ -31,6 +31,7 @@ use crate::types::{
     CleanupStats, CompactionStats, FlushHandle, FlushState, SchemaVersion, SealReason,
     SegmentCatalog, SegmentId,
 };
+use crate::engine::SnapshotTransferGuard;
 use crate::version_pins::{PinTier, VersionPinTracker};
 
 /// Sentinel value for "no log index" in `AtomicU64` fields.
@@ -85,6 +86,8 @@ pub struct TableEngine {
     version_pins: RwLock<Option<Arc<VersionPinTracker>>>,
     /// Catalog name (raft group name) for scoping version pins.
     catalog_name: RwLock<String>,
+    /// Shared guard that defers file deletion while snapshot transfers are active.
+    snapshot_guard: Arc<SnapshotTransferGuard>,
 }
 
 impl TableEngine {
@@ -97,6 +100,7 @@ impl TableEngine {
         config: TableOpenConfig,
         catalog: Option<SegmentCatalog>,
         schema_history: Option<Vec<SchemaVersion>>,
+        snapshot_guard: Arc<SnapshotTransferGuard>,
     ) -> Result<Self> {
         let segments_dir = config.segments_dir();
         tokio::fs::create_dir_all(&segments_dir).await?;
@@ -192,6 +196,7 @@ impl TableEngine {
             schema_history: RwLock::new(schema_history),
             version_pins: RwLock::new(None),
             catalog_name: RwLock::new(String::new()),
+            snapshot_guard,
         })
     }
 
@@ -531,11 +536,13 @@ impl TableEngine {
             *self.sealed_dataset.write() = None;
         }
 
-        // Clean up local sealed segment files
+        // Clean up local sealed segment files (deferred if snapshot transfer is active)
         let segment_path = self.config.segment_path(segment_id);
         if segment_path.exists() {
-            tokio::fs::remove_dir_all(&segment_path).await?;
-            debug!(table = %self.name, ?segment_path, "Removed local sealed segment");
+            if !self.snapshot_guard.defer_or_delete(segment_path.clone()) {
+                tokio::fs::remove_dir_all(&segment_path).await?;
+                debug!(table = %self.name, ?segment_path, "Removed local sealed segment");
+            }
         }
 
         // Reset flush state

@@ -525,4 +525,304 @@ mod tests {
             assert!(manager.get_group(1).is_none());
         });
     }
+
+    // ===================================================================
+    // Reliability — additional coverage
+    // ===================================================================
+
+    #[test]
+    fn test_get_nonexistent_group() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            assert!(manager.get_group(42).is_none());
+            assert!(manager.get_group(0).is_none());
+            assert!(manager.get_group(u64::MAX).is_none());
+        });
+    }
+
+    #[test]
+    fn test_remove_nonexistent_group() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            // Should not panic
+            manager.remove_group(999).await;
+            assert_eq!(manager.group_count(), 0);
+        });
+    }
+
+    #[test]
+    fn test_group_ids_empty_manager() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            assert!(manager.group_ids().is_empty());
+            assert_eq!(manager.group_count(), 0);
+        });
+    }
+
+    #[test]
+    fn test_readd_group_after_remove() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            let raft_config = Arc::new(openraft::Config::default());
+
+            let _raft1 = manager
+                .add_group(1, 1, raft_config.clone(), TestStateMachine::new())
+                .await
+                .unwrap();
+            assert_eq!(manager.group_count(), 1);
+
+            manager.remove_group(1).await;
+            assert_eq!(manager.group_count(), 0);
+
+            // Re-add the same group
+            let _raft2 = manager
+                .add_group(1, 1, raft_config, TestStateMachine::new())
+                .await
+                .unwrap();
+            assert_eq!(manager.group_count(), 1);
+            assert!(manager.get_group(1).is_some());
+        });
+    }
+
+    #[test]
+    fn test_get_purge_floor() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            // InMemoryMultiStorage always returns None for purge_floor
+            assert!(manager.get_purge_floor(0).is_none());
+            assert!(manager.get_purge_floor(42).is_none());
+        });
+    }
+
+    #[test]
+    fn test_many_groups() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            let raft_config = Arc::new(openraft::Config::default());
+
+            for i in 0..50 {
+                manager
+                    .add_group(i, 1, raft_config.clone(), TestStateMachine::new())
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(manager.group_count(), 50);
+            let mut ids = manager.group_ids();
+            ids.sort();
+            assert_eq!(ids, (0..50).collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn test_remove_all_groups() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            let raft_config = Arc::new(openraft::Config::default());
+
+            for i in 0..5 {
+                manager
+                    .add_group(i, 1, raft_config.clone(), TestStateMachine::new())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(manager.group_count(), 5);
+
+            for i in 0..5 {
+                manager.remove_group(i).await;
+            }
+            assert_eq!(manager.group_count(), 0);
+            assert!(manager.group_ids().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_add_group_same_id_overwrites() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            let raft_config = Arc::new(openraft::Config::default());
+
+            let _raft1 = manager
+                .add_group(1, 1, raft_config.clone(), TestStateMachine::new())
+                .await
+                .unwrap();
+
+            // Adding same ID again — overwrites the previous
+            let _raft2 = manager
+                .add_group(1, 2, raft_config, TestStateMachine::new())
+                .await
+                .unwrap();
+
+            assert_eq!(manager.group_count(), 1);
+            assert!(manager.get_group(1).is_some());
+        });
+    }
+
+    #[test]
+    fn test_add_group_with_different_configs() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            let mut config1 = openraft::Config::default();
+            config1.heartbeat_interval = 100;
+            let mut config2 = openraft::Config::default();
+            config2.heartbeat_interval = 500;
+
+            let _raft1 = manager
+                .add_group(1, 1, Arc::new(config1), TestStateMachine::new())
+                .await
+                .unwrap();
+            let _raft2 = manager
+                .add_group(2, 1, Arc::new(config2), TestStateMachine::new())
+                .await
+                .unwrap();
+
+            assert_eq!(manager.group_count(), 2);
+        });
+    }
+
+    // ===================================================================
+    // Concurrency
+    // ===================================================================
+
+    #[test]
+    fn test_concurrent_add_remove_groups() {
+        use std::sync::Arc;
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            let raft_config = Arc::new(openraft::Config::default());
+
+            // Add groups 0..10
+            let mut handles = Vec::new();
+            for i in 0..10u64 {
+                let m = manager.clone();
+                let cfg = raft_config.clone();
+                handles.push(tokio::spawn(async move {
+                    m.add_group(i, 1, cfg, TestStateMachine::new()).await.unwrap();
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+            assert_eq!(manager.group_count(), 10);
+
+            // Remove odd groups concurrently
+            let mut handles = Vec::new();
+            for i in (1..10u64).step_by(2) {
+                let m = manager.clone();
+                handles.push(tokio::spawn(async move {
+                    m.remove_group(i).await;
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+            assert_eq!(manager.group_count(), 5);
+        });
+    }
+
+    #[test]
+    fn test_concurrent_get_during_modification() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            let raft_config = Arc::new(openraft::Config::default());
+
+            // Add a group first
+            manager
+                .add_group(1, 1, raft_config.clone(), TestStateMachine::new())
+                .await
+                .unwrap();
+
+            // Concurrent gets and adds should not panic
+            let mut handles = Vec::new();
+            for i in 2..20u64 {
+                let m = manager.clone();
+                let cfg = raft_config.clone();
+                handles.push(tokio::spawn(async move {
+                    let _ = m.get_group(1);
+                    let _ = m.group_ids();
+                    let _ = m.group_count();
+                    m.add_group(i, 1, cfg, TestStateMachine::new()).await.unwrap();
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    }
+
+    // ===================================================================
+    // Edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_manager_with_zero_groups_operations() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            // All operations on empty manager should work
+            assert!(manager.get_group(0).is_none());
+            assert_eq!(manager.group_count(), 0);
+            assert!(manager.group_ids().is_empty());
+            assert!(manager.get_purge_floor(0).is_none());
+            manager.remove_group(0).await; // no-op, no panic
+        });
+    }
+
+    #[test]
+    fn test_group_ids_sorted_consistency() {
+        run_async(async {
+            let transport = FakeTransport;
+            let storage = InMemoryMultiStorage::new();
+            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+
+            let raft_config = Arc::new(openraft::Config::default());
+
+            // Add groups in random order
+            for &id in &[5, 2, 8, 1, 9, 3] {
+                manager
+                    .add_group(id, 1, raft_config.clone(), TestStateMachine::new())
+                    .await
+                    .unwrap();
+            }
+
+            let mut ids = manager.group_ids();
+            ids.sort();
+            assert_eq!(ids, vec![1, 2, 3, 5, 8, 9]);
+        });
+    }
 }

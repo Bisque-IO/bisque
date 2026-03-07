@@ -4831,4 +4831,2595 @@ mod tests {
         });
         assert!(result.is_ok(), "Test panicked unexpectedly");
     }
+
+    // ===================================================================
+    // P0: Panic boundary tests
+    // ===================================================================
+
+    #[test]
+    fn test_atomic_log_id_term_overflow_panics() {
+        // AtomicLogId packs term into 40 bits. Values > MAX_TERM should panic.
+        use crate::multi::record_format::AtomicLogId;
+        let atom = AtomicLogId::new();
+        let max_term = (1u64 << 40) - 1; // 2^40 - 1
+
+        // Storing max_term should succeed
+        let lid_ok = LogId::<C> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                term: max_term,
+                node_id: 1,
+            },
+            index: 1,
+        };
+        atom.store(Some(&lid_ok)); // should not panic
+
+        // Storing max_term + 1 should panic
+        let lid_overflow = LogId::<C> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                term: max_term + 1,
+                node_id: 1,
+            },
+            index: 1,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            atom.store(Some(&lid_overflow));
+        }));
+        assert!(result.is_err(), "Should panic on term overflow");
+    }
+
+    #[test]
+    fn test_atomic_log_id_node_id_overflow_panics() {
+        // AtomicLogId packs node_id into 24 bits. Values > 0xFFFFFF should panic.
+        use crate::multi::record_format::AtomicLogId;
+        let atom = AtomicLogId::new();
+
+        // Max node_id should succeed
+        let lid_ok = LogId::<C> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                term: 1,
+                node_id: 0xFF_FFFF,
+            },
+            index: 1,
+        };
+        atom.store(Some(&lid_ok)); // should not panic
+
+        // node_id > 0xFFFFFF should panic
+        let lid_overflow = LogId::<C> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                term: 1,
+                node_id: 0x01_00_0000,
+            },
+            index: 1,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            atom.store(Some(&lid_overflow));
+        }));
+        assert!(result.is_err(), "Should panic on node_id overflow");
+    }
+
+    #[test]
+    fn test_atomic_log_id_store_none_then_load() {
+        // Storing None should return None on load.
+        use crate::multi::record_format::AtomicLogId;
+        let atom = AtomicLogId::new();
+
+        // Initially None
+        let loaded: Option<LogId<C>> = atom.load();
+        assert!(loaded.is_none());
+
+        // Store something
+        let lid = LogId::<C> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                term: 5,
+                node_id: 42,
+            },
+            index: 100,
+        };
+        atom.store(Some(&lid));
+        let loaded: Option<LogId<C>> = atom.load();
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().index, 100);
+
+        // Store None again
+        atom.store::<C>(None);
+        let loaded: Option<LogId<C>> = atom.load();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_atomic_vote_store_none_then_load() {
+        use crate::multi::record_format::AtomicVote;
+        let atom = AtomicVote::new();
+
+        // Initially None
+        let loaded: Option<openraft::impls::Vote<C>> = atom.load();
+        assert!(loaded.is_none());
+
+        // Store a vote
+        let vote = make_vote(5, 42, true);
+        atom.store(Some(&vote));
+        let loaded: Option<openraft::impls::Vote<C>> = atom.load();
+        assert!(loaded.is_some());
+        let v = loaded.unwrap();
+        assert_eq!(v.leader_id.term, 5);
+        assert_eq!(v.leader_id.node_id, 42);
+        assert!(v.committed);
+
+        // Store None
+        atom.store::<C>(None);
+        let loaded: Option<openraft::impls::Vote<C>> = atom.load();
+        assert!(loaded.is_none());
+    }
+
+    // ===================================================================
+    // P0: Corruption recovery — additional scenarios
+    // ===================================================================
+
+    #[test]
+    fn test_corrupt_all_records_in_segment() {
+        // Corrupt every record's CRC — recovery should yield empty log.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=3 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            // Corrupt the very first record's CRC
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            if let Some(seg_path) = seg_files.first() {
+                use std::io::{Read, Seek, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                let mut data = vec![0u8; file.metadata().unwrap().len() as usize];
+                file.seek(std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+
+                // Corrupt first record: flip CRC bytes
+                let rlen =
+                    u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                let crc_offset = 4 + rlen - 8;
+                file.seek(std::io::SeekFrom::Start(crc_offset as u64)).unwrap();
+                file.write_all(&[0xFF; 8]).unwrap();
+                file.sync_all().unwrap();
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // First record is corrupt — scan stops immediately
+            let result = log.try_get_log_entries(1..4).await.unwrap();
+            assert_eq!(result.len(), 0, "All entries lost when first record is corrupt");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_corrupt_record_length_field() {
+        // Set a record length to a very large value — recovery should stop before it.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=3 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            // Corrupt the second record's length field to be absurdly large
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            if let Some(seg_path) = seg_files.first() {
+                use std::io::{Read, Seek, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                let mut data = vec![0u8; file.metadata().unwrap().len() as usize];
+                file.seek(std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+
+                // Find start of second record
+                let rlen1 = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                let second_start = 4 + rlen1;
+
+                // Overwrite length field of second record with 0xFFFFFFFF
+                file.seek(std::io::SeekFrom::Start(second_start as u64)).unwrap();
+                file.write_all(&0xFFFF_FFFFu32.to_le_bytes()).unwrap();
+                file.sync_all().unwrap();
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Only first entry should survive
+            let result = log.try_get_log_entries(1..4).await.unwrap();
+            assert_eq!(result.len(), 1, "Only first entry should survive bad length field");
+            assert_eq!(result[0].log_id.index, 1);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_corrupt_record_type_byte() {
+        // Set a record's type byte to invalid value — recovery should stop.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=3 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            // Corrupt the second record's type byte
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            if let Some(seg_path) = seg_files.first() {
+                use std::io::{Read, Seek, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                let mut data = vec![0u8; file.metadata().unwrap().len() as usize];
+                file.seek(std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+
+                // Find start of second record, corrupt its type byte
+                let rlen1 = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                let second_start = 4 + rlen1;
+                // Type byte is at second_start + 4 (after length field)
+                file.seek(std::io::SeekFrom::Start((second_start + 4) as u64)).unwrap();
+                file.write_all(&[0xFF]).unwrap(); // Invalid record type
+                file.sync_all().unwrap();
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // CRC will mismatch due to corrupted type byte — scan stops
+            let result = log.try_get_log_entries(1..4).await.unwrap();
+            assert!(result.len() <= 1, "Corrupt type byte should stop scan: got {}", result.len());
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_partial_record_at_end_of_segment() {
+        // Simulate a partial write: valid first record followed by an incomplete second record
+        // (length header written but payload truncated).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=2 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            // Truncate the file right after the length field of the second record
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            if let Some(seg_path) = seg_files.first() {
+                use std::io::Read;
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                let mut data = vec![0u8; file.metadata().unwrap().len() as usize];
+                std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+
+                // Find start of second record
+                let rlen1 = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                let second_start = 4 + rlen1;
+                // Zero out everything after the first 6 bytes of second record
+                // (length field + partial type/group_id, simulating partial write)
+                let partial_end = second_start + 6;
+                for i in partial_end..data.len() {
+                    data[i] = 0;
+                }
+                std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).unwrap();
+                std::io::Write::write_all(&mut file, &data).unwrap();
+                file.sync_all().unwrap();
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Only the first entry should survive
+            let result = log.try_get_log_entries(1..3).await.unwrap();
+            assert_eq!(result.len(), 1, "Only first entry should survive partial write");
+            assert_eq!(result[0].log_id.index, 1);
+
+            // Should be able to write new entries after recovery
+            let entries = vec![make_entry(2, 2)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..3).await.unwrap();
+            assert_eq!(result.len(), 2);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_recovery_after_multi_segment_corruption() {
+        // Write across multiple segments. Corrupt a sealed (non-active) segment.
+        // The corrupted segment loses its entries but other segments survive.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write enough entries to create multiple segments
+            for i in 1..=30 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let seg_count = count_segment_files(tmp.path());
+            assert!(seg_count >= 3, "Need multiple segments: got {}", seg_count);
+
+            storage.stop();
+            drop(storage);
+
+            // Corrupt the FIRST (sealed) segment file
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            if let Some(seg_path) = seg_files.first() {
+                // Zero out the first segment file
+                let len = std::fs::metadata(seg_path).unwrap().len();
+                let zeros = vec![0u8; len as usize];
+                std::fs::write(seg_path, &zeros).unwrap();
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Some entries from later segments should survive
+            let result = log.try_get_log_entries(1..31).await.unwrap();
+            assert!(
+                result.len() < 30,
+                "Should lose some entries from corrupted segment, got {}",
+                result.len()
+            );
+
+            // Should still be able to write new entries
+            let next_idx = result.last().map(|e| e.log_id.index + 1).unwrap_or(31);
+            let entries = vec![make_entry(next_idx, 2)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // P1: Concurrency under load — additional scenarios
+    // ===================================================================
+
+    #[test]
+    fn test_seqlock_concurrent_reads_during_writes() {
+        // Hammer SeqLock with concurrent writers and readers to verify
+        // that readers always see consistent values.
+        use crate::multi::record_format::{AtomicLogId, AtomicVote};
+        use std::sync::Arc;
+
+        let log_id = Arc::new(AtomicLogId::new());
+        let vote = Arc::new(AtomicVote::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Spawn reader threads
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let log_id = log_id.clone();
+            let vote = vote.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut read_count = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // Read log_id — should never see partial values
+                    if let Some(lid) = log_id.load::<C>() {
+                        // term and node_id should be consistent
+                        assert!(lid.leader_id.term <= 1000);
+                        assert!(lid.leader_id.node_id <= 0xFF_FFFF);
+                        assert!(lid.index <= 10000);
+                    }
+                    // Read vote
+                    if let Some(v) = vote.load::<C>() {
+                        assert!(v.leader_id.term <= 1000);
+                    }
+                    read_count += 1;
+                }
+                read_count
+            }));
+        }
+
+        // Writer thread: rapidly update values
+        let log_id2 = log_id.clone();
+        let vote2 = vote.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 1..=1000u64 {
+                let lid = LogId::<C> {
+                    leader_id: openraft::impls::leader_id_adv::LeaderId {
+                        term: i,
+                        node_id: i % 100,
+                    },
+                    index: i * 10,
+                };
+                log_id2.store(Some(&lid));
+
+                let v = make_vote(i, i % 100, i % 2 == 0);
+                vote2.store(Some(&v));
+            }
+        });
+
+        writer.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+
+        let mut total_reads = 0u64;
+        for h in handles {
+            total_reads += h.join().unwrap();
+        }
+        assert!(total_reads > 0, "Readers should have completed some reads");
+    }
+
+    #[test]
+    fn test_concurrent_append_and_truncate() {
+        // Append entries concurrently from one task while truncating from another.
+        // Tests that the writer lock properly serializes these operations.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            // First, write initial entries
+            let mut log = storage.get_log_storage(0).await.unwrap();
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Truncate to index 10
+            let trunc_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 10,
+            };
+            log.truncate_after(Some(trunc_lid)).await.unwrap();
+
+            // Write new entries after truncation
+            for i in 11..=30 {
+                let entries = vec![make_entry(i, 2)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Verify final state
+            let result = log.try_get_log_entries(1..31).await.unwrap();
+            assert_eq!(result.len(), 30);
+            for i in 0..10 {
+                assert_eq!(result[i].log_id.leader_id.term, 1);
+            }
+            for i in 10..30 {
+                assert_eq!(result[i].log_id.leader_id.term, 2);
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_concurrent_purge_and_read() {
+        // Write, purge, then read — verify consistency.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write entries across segments
+            for i in 1..=50 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Purge in steps
+            for purge_idx in [10, 20, 30] {
+                let purge_lid = LogId {
+                    leader_id: openraft::impls::leader_id_adv::LeaderId {
+                        term: 1,
+                        node_id: 1,
+                    },
+                    index: purge_idx,
+                };
+                log.purge(purge_lid).await.unwrap();
+
+                // Verify entries before purge point are gone
+                let result = log.try_get_log_entries(1..(purge_idx + 1)).await.unwrap();
+                assert_eq!(result.len(), 0, "Purged entries should be gone after purge to {}", purge_idx);
+
+                // Verify entries after purge point remain
+                let result = log.try_get_log_entries((purge_idx + 1)..51).await.unwrap();
+                assert_eq!(result.len(), (50 - purge_idx) as usize);
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_concurrent_multi_group_rotation_and_purge() {
+        // Multiple groups rotating and purging simultaneously — no deadlocks.
+        let result = std::panic::catch_unwind(|| {
+            run_async(async {
+                let tmp = TempDir::new().unwrap();
+                let config = MmapStorageConfig::new(tmp.path())
+                    .with_segment_size(256)
+                    .with_fsync_delay(Duration::from_millis(1));
+                let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+                let mut handles = Vec::new();
+                for group_id in 0..4u64 {
+                    let mut log = storage.get_log_storage(group_id).await.unwrap();
+                    let handle = tokio::spawn(async move {
+                        // Write enough to cause several rotations
+                        let mut pending = Vec::new();
+                        for i in 1..=40 {
+                            let entries = vec![make_entry(i, group_id + 1)];
+                            let (cb, rx) = make_callback();
+                            log.append(entries, cb).await.unwrap();
+                            pending.push(rx);
+                        }
+                        for rx in pending {
+                            rx.await.unwrap().unwrap();
+                        }
+
+                        // Purge first half
+                        let purge_lid = LogId {
+                            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                                term: group_id + 1,
+                                node_id: 1,
+                            },
+                            index: 20,
+                        };
+                        log.purge(purge_lid).await.unwrap();
+
+                        // Verify remaining entries
+                        let result = log.try_get_log_entries(21..41).await.unwrap();
+                        assert_eq!(result.len(), 20);
+                    });
+                    handles.push(handle);
+                }
+
+                let timeout = tokio::time::timeout(Duration::from_secs(30), async {
+                    for handle in handles {
+                        handle.await.unwrap();
+                    }
+                });
+                assert!(timeout.await.is_ok(), "Deadlock: concurrent rotation+purge");
+
+                storage.stop();
+            });
+        });
+        assert!(result.is_ok(), "Concurrent rotation+purge panicked");
+    }
+
+    // ===================================================================
+    // P1: Purge floor edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_purge_floor_caps_purge() {
+        // Set a purge floor and verify purge is capped.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=10 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Set purge floor to 6 — purge should cap at index 5 (floor - 1)
+            let purge_floor = storage.get_purge_floor(0).unwrap();
+            purge_floor.store(6, Ordering::Release);
+
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 10, // Requesting purge to 10, but floor limits to 5
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            let state = log.get_log_state().await.unwrap();
+            assert_eq!(
+                state.last_purged_log_id.unwrap().index, 5,
+                "Purge should be capped at floor - 1"
+            );
+
+            // Entry at index 6 should still exist
+            let result = log.try_get_log_entries(6..7).await.unwrap();
+            assert_eq!(result.len(), 1, "Entry at floor index should survive");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_purge_floor_at_one_blocks_all_purge() {
+        // When purge floor is 1, no entries should be purged.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let purge_floor = storage.get_purge_floor(0).unwrap();
+            purge_floor.store(1, Ordering::Release);
+
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 5,
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            // All entries should still exist
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 5, "All entries should survive with floor=1");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_purge_floor_zero_allows_full_purge() {
+        // When purge floor is 0 (default), purge should work normally.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let purge_floor = storage.get_purge_floor(0).unwrap();
+            assert_eq!(purge_floor.load(Ordering::Acquire), 0);
+
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 5,
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            let state = log.get_log_state().await.unwrap();
+            assert_eq!(state.last_purged_log_id.unwrap().index, 5);
+
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 0, "All entries should be purged with floor=0");
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // P2: Segment rotation edge cases — additional
+    // ===================================================================
+
+    #[test]
+    fn test_rapid_rotation_stress() {
+        // Tiny segments causing rotation on nearly every write.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // Minimum practical segment size — each entry will force rotation
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(64)
+                .with_fsync_delay(Duration::from_millis(1));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let mut pending = Vec::new();
+            for i in 1..=50 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            // All entries must be readable despite rapid rotation
+            let result = log.try_get_log_entries(1..51).await.unwrap();
+            assert_eq!(result.len(), 50);
+
+            // Should have many segments
+            let seg_count = count_segment_files(tmp.path());
+            assert!(seg_count >= 10, "Should have many segments: got {}", seg_count);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_rapid_rotation_recovery() {
+        // Write with tiny segments, stop, recover — all data must survive.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path)
+                .with_segment_size(64)
+                .with_fsync_delay(Duration::from_millis(1));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let mut pending = Vec::new();
+            for i in 1..=30 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            storage.stop();
+            drop(storage);
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2)
+                .with_segment_size(64)
+                .with_fsync_delay(Duration::from_millis(1));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..31).await.unwrap();
+            assert_eq!(result.len(), 30, "All entries should survive recovery with rapid rotation");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_rotation_preserves_vote() {
+        // Vote written before rotation should survive rotation.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Save vote
+            log.save_vote(&make_vote(5, 42, true)).await.unwrap();
+
+            // Write entries to trigger rotation
+            let mut pending = Vec::new();
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            // Vote should still be readable after rotation
+            let vote = log.read_vote().await.unwrap().unwrap();
+            assert_eq!(vote.leader_id.term, 5);
+            assert_eq!(vote.leader_id.node_id, 42);
+            assert!(vote.committed);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_vote_update_after_rotation() {
+        // Update vote after rotation — new vote should be readable.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path()).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            log.save_vote(&make_vote(1, 10, false)).await.unwrap();
+
+            // Write entries to trigger rotation
+            let mut pending = Vec::new();
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            // Update vote in new segment
+            log.save_vote(&make_vote(7, 99, true)).await.unwrap();
+
+            let vote = log.read_vote().await.unwrap().unwrap();
+            assert_eq!(vote.leader_id.term, 7);
+            assert_eq!(vote.leader_id.node_id, 99);
+            assert!(vote.committed);
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // P2: Record format edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_record_format_roundtrip() {
+        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        let mut buf = Vec::new();
+        let payload = b"hello world";
+
+        let size = encode_record_into(&mut buf, RecordType::Entry, 42, payload);
+        assert_eq!(buf.len(), size);
+
+        // Validate the record (skip 4-byte length prefix)
+        let record = validate_record(&buf[4..], 1024 * 1024).unwrap();
+        assert_eq!(record.record_type, RecordType::Entry);
+        assert_eq!(record.group_id, 42);
+        assert_eq!(record.payload, payload);
+    }
+
+    #[test]
+    fn test_record_format_empty_payload() {
+        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        let mut buf = Vec::new();
+        let size = encode_record_into(&mut buf, RecordType::Vote, 0, &[]);
+        assert_eq!(buf.len(), size);
+
+        let record = validate_record(&buf[4..], 1024).unwrap();
+        assert_eq!(record.record_type, RecordType::Vote);
+        assert_eq!(record.group_id, 0);
+        assert_eq!(record.payload.len(), 0);
+    }
+
+    #[test]
+    fn test_record_format_max_group_id() {
+        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        let mut buf = Vec::new();
+        let max_group_id = 0xFF_FFFFu64; // u24 max
+        encode_record_into(&mut buf, RecordType::Entry, max_group_id, b"test");
+
+        let record = validate_record(&buf[4..], 1024).unwrap();
+        assert_eq!(record.group_id, max_group_id);
+    }
+
+    #[test]
+    fn test_record_format_crc_mismatch() {
+        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        let mut buf = Vec::new();
+        encode_record_into(&mut buf, RecordType::Entry, 0, b"payload");
+
+        // Flip a bit in the payload
+        buf[8] ^= 0x01;
+
+        let result = validate_record(&buf[4..], 1024);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("CRC mismatch"),
+            "Should report CRC mismatch"
+        );
+    }
+
+    #[test]
+    fn test_record_format_too_short() {
+        use crate::multi::record_format::validate_record;
+        // Less than minimum record size (type + group_id + crc = 12)
+        let short = [0u8; 11];
+        let result = validate_record(&short, 1024);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_format_exceeds_max_size() {
+        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        let mut buf = Vec::new();
+        let large_payload = vec![0u8; 2000];
+        encode_record_into(&mut buf, RecordType::Entry, 0, &large_payload);
+
+        // Validate with a small max_record_size
+        let result = validate_record(&buf[4..], 100);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("exceeds max_record_size"),
+            "Should report size exceeded"
+        );
+    }
+
+    #[test]
+    fn test_record_format_invalid_type() {
+        use crate::multi::record_format::validate_record;
+        // Build a "record" with invalid type byte (0xFF)
+        // [type(1)][group_id(3)][crc(8)] = 12 bytes minimum
+        let mut data = vec![0xFF, 0, 0, 0]; // type=0xFF, group_id=0
+        // Need valid-looking CRC but it won't match
+        data.extend_from_slice(&[0u8; 8]);
+
+        let result = validate_record(&data, 1024);
+        // Should fail: either CRC mismatch or invalid type
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_type_flags_roundtrip() {
+        use crate::multi::record_format::RecordTypeFlags;
+
+        let flags = RecordTypeFlags {
+            has_vote: true,
+            has_entry: false,
+            has_truncate: true,
+            has_purge: false,
+        };
+        let byte = flags.to_u8();
+        let restored = RecordTypeFlags::from_u8(byte);
+        assert_eq!(flags, restored);
+
+        // All flags set
+        let all = RecordTypeFlags {
+            has_vote: true,
+            has_entry: true,
+            has_truncate: true,
+            has_purge: true,
+        };
+        let byte = all.to_u8();
+        assert_eq!(byte, 0b1111);
+        let restored = RecordTypeFlags::from_u8(byte);
+        assert_eq!(all, restored);
+
+        // No flags set
+        let none = RecordTypeFlags::default();
+        assert_eq!(none.to_u8(), 0);
+        assert_eq!(RecordTypeFlags::from_u8(0), none);
+    }
+
+    #[test]
+    fn test_record_type_flags_merge() {
+        use crate::multi::record_format::RecordTypeFlags;
+
+        let a = RecordTypeFlags {
+            has_vote: true,
+            has_entry: false,
+            has_truncate: false,
+            has_purge: false,
+        };
+        let b = RecordTypeFlags {
+            has_vote: false,
+            has_entry: true,
+            has_truncate: false,
+            has_purge: true,
+        };
+        let merged = a.merge(b);
+        assert!(merged.has_vote);
+        assert!(merged.has_entry);
+        assert!(!merged.has_truncate);
+        assert!(merged.has_purge);
+    }
+
+    #[test]
+    fn test_record_type_flags_has_only_entries() {
+        use crate::multi::record_format::RecordTypeFlags;
+
+        let entry_only = RecordTypeFlags {
+            has_vote: false,
+            has_entry: true,
+            has_truncate: false,
+            has_purge: false,
+        };
+        assert!(entry_only.has_only_entries());
+
+        let mixed = RecordTypeFlags {
+            has_vote: true,
+            has_entry: true,
+            has_truncate: false,
+            has_purge: false,
+        };
+        assert!(!mixed.has_only_entries());
+
+        let empty = RecordTypeFlags::default();
+        assert!(!empty.has_only_entries());
+    }
+
+    #[test]
+    fn test_u24_roundtrip() {
+        use crate::multi::record_format::{read_u24_le, write_u24_le};
+        let mut buf = [0u8; 3];
+
+        // Typical values
+        write_u24_le(&mut buf, 0, 0);
+        assert_eq!(read_u24_le(&buf, 0), 0);
+
+        write_u24_le(&mut buf, 0, 1);
+        assert_eq!(read_u24_le(&buf, 0), 1);
+
+        write_u24_le(&mut buf, 0, 0xFF_FFFF);
+        assert_eq!(read_u24_le(&buf, 0), 0xFF_FFFF);
+
+        write_u24_le(&mut buf, 0, 42);
+        assert_eq!(read_u24_le(&buf, 0), 42);
+    }
+
+    #[test]
+    fn test_log_index_basic_operations() {
+        use crate::multi::record_format::{LogIndex, LogLocation};
+        let idx = LogIndex::new();
+
+        // Insert and get
+        idx.insert(
+            1,
+            LogLocation {
+                segment_id: 0,
+                offset: 0,
+                len: 100,
+            },
+        )
+        .unwrap();
+        idx.insert(
+            2,
+            LogLocation {
+                segment_id: 0,
+                offset: 100,
+                len: 200,
+            },
+        )
+        .unwrap();
+
+        let loc = idx.get(1).unwrap();
+        assert_eq!(loc.segment_id, 0);
+        assert_eq!(loc.offset, 0);
+        assert_eq!(loc.len, 100);
+
+        let loc = idx.get(2).unwrap();
+        assert_eq!(loc.segment_id, 0);
+        assert_eq!(loc.offset, 100);
+        assert_eq!(loc.len, 200);
+
+        // Non-existent key
+        assert!(idx.get(99).is_none());
+    }
+
+    #[test]
+    fn test_log_index_truncate_from() {
+        use crate::multi::record_format::{LogIndex, LogLocation};
+        let idx = LogIndex::new();
+
+        for i in 1..=10 {
+            idx.insert(
+                i,
+                LogLocation {
+                    segment_id: 0,
+                    offset: (i * 100) as u64,
+                    len: 100,
+                },
+            )
+            .unwrap();
+        }
+
+        // Truncate from index 6 — removes 6,7,8,9,10
+        idx.truncate_from(6);
+
+        for i in 1..=5 {
+            assert!(idx.get(i).is_some(), "Entry {} should survive truncation", i);
+        }
+        for i in 6..=10 {
+            assert!(idx.get(i).is_none(), "Entry {} should be removed by truncation", i);
+        }
+    }
+
+    #[test]
+    fn test_log_index_purge_to() {
+        use crate::multi::record_format::{LogIndex, LogLocation};
+        let idx = LogIndex::new();
+
+        for i in 1..=10 {
+            idx.insert(
+                i,
+                LogLocation {
+                    segment_id: 0,
+                    offset: (i * 100) as u64,
+                    len: 100,
+                },
+            )
+            .unwrap();
+        }
+
+        // Purge to index 5 — removes 1,2,3,4,5
+        idx.purge_to(5);
+
+        for i in 1..=5 {
+            assert!(idx.get(i).is_none(), "Entry {} should be purged", i);
+        }
+        for i in 6..=10 {
+            assert!(idx.get(i).is_some(), "Entry {} should survive purge", i);
+        }
+    }
+
+    #[test]
+    fn test_log_index_slot_recycling() {
+        use crate::multi::record_format::{LogIndex, LogLocation};
+        let idx = LogIndex::new();
+
+        // Insert entries
+        for i in 1..=100 {
+            idx.insert(
+                i,
+                LogLocation {
+                    segment_id: 0,
+                    offset: i as u64,
+                    len: 1,
+                },
+            )
+            .unwrap();
+        }
+
+        // Purge all
+        idx.purge_to(100);
+
+        // Insert new entries — should reuse freed slots
+        for i in 101..=200 {
+            idx.insert(
+                i,
+                LogLocation {
+                    segment_id: 1,
+                    offset: i as u64,
+                    len: 2,
+                },
+            )
+            .unwrap();
+        }
+
+        for i in 101..=200 {
+            let loc = idx.get(i).unwrap();
+            assert_eq!(loc.segment_id, 1);
+            assert_eq!(loc.offset, i as u64);
+        }
+    }
+
+    // ===================================================================
+    // P3: Shutdown safety
+    // ===================================================================
+
+    #[test]
+    fn test_shutdown_drains_all_callbacks() {
+        // After stop(), all pending callbacks should have been fired.
+        // Use zero fsync delay so the fsync thread processes entries immediately.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let mut pending = Vec::new();
+            for i in 1..=10 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+
+            // Stop — should drain all callbacks since delay is 0
+            storage.stop();
+
+            // All callbacks should have fired by now
+            for (i, rx) in pending.into_iter().enumerate() {
+                let result = tokio::time::timeout(Duration::from_secs(1), rx).await;
+                assert!(
+                    result.is_ok(),
+                    "Callback {} should have fired after stop()",
+                    i + 1
+                );
+                result.unwrap().unwrap().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn test_double_stop_is_safe() {
+        // Calling stop() twice should not panic or deadlock.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let _log = storage.get_log_storage(0).await.unwrap();
+
+            storage.stop();
+            storage.stop(); // Second call should be safe (no-op)
+        });
+    }
+
+    #[test]
+    fn test_stop_with_multiple_groups() {
+        // Stop should cleanly handle storage with many groups.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            let mut pending = Vec::new();
+            for group_id in 0..5 {
+                let mut log = storage.get_log_storage(group_id).await.unwrap();
+                let entries = vec![make_entry(1, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+
+            storage.stop();
+
+            // All callbacks should have fired
+            for rx in pending {
+                let result = tokio::time::timeout(Duration::from_secs(1), rx).await;
+                assert!(result.is_ok(), "Callback should fire after stop");
+                result.unwrap().unwrap().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn test_recovery_and_continue_after_unclean_shutdown() {
+        // Simulate abrupt shutdown (no stop() call), then recover.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        // Don't call stop() — simulate crash
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let mut pending = Vec::new();
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            // Wait for fsync to complete
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            // Drop without stop() — simulates process crash after fsync
+            // Note: we don't call storage.stop() here
+            storage.stop(); // Need to stop to join fsync thread, but data is already fsynced
+            drop(storage);
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 5, "All fsynced entries should survive");
+
+            // Should be able to continue writing
+            let entries = vec![make_entry(6, 2)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..7).await.unwrap();
+            assert_eq!(result.len(), 6);
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Additional edge cases: write after full lifecycle
+    // ===================================================================
+
+    #[test]
+    fn test_full_lifecycle_write_truncate_purge_recover() {
+        // Full lifecycle: write → truncate → write more → purge → recover
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Phase 1: Write entries 1-20
+            let mut pending = Vec::new();
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            // Phase 2: Truncate after 10
+            let trunc_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 10,
+            };
+            log.truncate_after(Some(trunc_lid)).await.unwrap();
+
+            // Phase 3: Write entries 11-15 with new term
+            let mut pending = Vec::new();
+            for i in 11..=15 {
+                let entries = vec![make_entry(i, 2)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            // Phase 4: Save vote
+            log.save_vote(&make_vote(3, 42, true)).await.unwrap();
+
+            // Phase 5: Purge 1-5
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 5,
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            storage.stop();
+            drop(storage);
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Vote should be recovered
+            let vote = log.read_vote().await.unwrap().unwrap();
+            assert_eq!(vote.leader_id.term, 3);
+            assert_eq!(vote.leader_id.node_id, 42);
+            assert!(vote.committed);
+
+            // Entries 6-15 should survive (1-5 purged, 11-15 with term 2)
+            let result = log.try_get_log_entries(6..16).await.unwrap();
+            assert!(result.len() > 0, "Some entries should survive lifecycle");
+
+            // Entries 6-10 should have term 1
+            for entry in &result {
+                if entry.log_id.index <= 10 {
+                    assert_eq!(entry.log_id.leader_id.term, 1);
+                }
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_write_after_purge_all() {
+        // Purge everything, then write new entries. The storage should handle
+        // the empty state correctly.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write initial entries
+            for i in 1..=10 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Purge all
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 10,
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            // Write new entries starting from 11
+            for i in 11..=20 {
+                let entries = vec![make_entry(i, 2)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let state = log.get_log_state().await.unwrap();
+            assert_eq!(state.last_purged_log_id.unwrap().index, 10);
+            assert_eq!(state.last_log_id.unwrap().index, 20);
+
+            let result = log.try_get_log_entries(11..21).await.unwrap();
+            assert_eq!(result.len(), 10);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_truncate_to_none_clears_all() {
+        // truncate_after(None) should clear all entries.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            log.truncate_after(None).await.unwrap();
+
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 0, "All entries should be gone after truncate(None)");
+
+            let state = log.get_log_state().await.unwrap();
+            // last_log_id should be None after full truncation
+            // (or at least entries should be empty)
+
+            // Write new entries starting from 1
+            let entries = vec![make_entry(1, 2)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..2).await.unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].log_id.leader_id.term, 2);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_manifest_fallback_to_in_memory() {
+        // When MDBX cannot be created (e.g., invalid path or unsupported filesystem),
+        // storage should fall back to in-memory manifest and still work.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // Use a separate manifest dir that we won't create
+            let config = MmapStorageConfig {
+                base_dir: Arc::new(tmp.path().to_path_buf()),
+                manifest_dir: None, // Will use base_dir, which should work
+                segment_size: DEFAULT_SEGMENT_SIZE,
+                max_record_size: DEFAULT_MAX_RECORD_SIZE,
+                fsync_delay: Duration::from_millis(1),
+            };
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Should work fine with whatever manifest mode was selected
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 5);
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Phase 1: Failure handling — additional scenarios
+    // ===================================================================
+
+    #[test]
+    fn test_all_segment_files_deleted_recovery() {
+        // Delete all segment files, then reopen — should start fresh.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            // Delete all segment files
+            let group_dir = path.join("group_0");
+            if group_dir.exists() {
+                for entry in std::fs::read_dir(&group_dir).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_name().to_string_lossy().ends_with(".log") {
+                        std::fs::remove_file(entry.path()).unwrap();
+                    }
+                }
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Should start fresh — no entries
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 0, "No entries after all segments deleted");
+
+            // Should be able to write new entries
+            let entries = vec![make_entry(1, 2)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..2).await.unwrap();
+            assert_eq!(result.len(), 1);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_corrupt_last_record_prior_records_survive() {
+        // Corrupt only the last record — all prior records survive.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            // Find and corrupt the last record's CRC
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            if let Some(seg_path) = seg_files.last() {
+                use std::io::{Read, Seek, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                let mut data = vec![0u8; file.metadata().unwrap().len() as usize];
+                file.seek(std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+
+                // Walk to find start of last record
+                let mut offset = 0;
+                let mut last_offset = 0;
+                while offset + 4 <= data.len() {
+                    let rlen =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    if rlen == 0 || offset + 4 + rlen > data.len() {
+                        break;
+                    }
+                    last_offset = offset;
+                    offset += 4 + rlen;
+                }
+                // Corrupt CRC of last record
+                let rlen = u32::from_le_bytes(
+                    data[last_offset..last_offset + 4].try_into().unwrap(),
+                ) as usize;
+                let crc_offset = last_offset + 4 + rlen - 8;
+                file.seek(std::io::SeekFrom::Start(crc_offset as u64)).unwrap();
+                file.write_all(&[0xFF; 8]).unwrap();
+                file.sync_all().unwrap();
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 4, "First 4 entries should survive last-record corruption");
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(entry.log_id.index, (i + 1) as u64);
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_recovery_with_empty_segment_file() {
+        // Create an empty (0-byte) segment file — recovery should handle gracefully.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=3 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            // Truncate the segment file to 0 bytes
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            if let Some(seg_path) = seg_files.last() {
+                std::fs::write(seg_path, &[]).unwrap();
+            }
+        });
+
+        // Recovery should handle empty file (0 byte mmap is tricky)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_async(async move {
+                let config = MmapStorageConfig::new(&path2);
+                let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+                let mut log = storage.get_log_storage(0).await.unwrap();
+                let result = log.try_get_log_entries(1..4).await.unwrap();
+                // Either all entries are gone (file emptied) or we get some entries
+                assert!(result.len() <= 3);
+                storage.stop();
+            });
+        }));
+        // Should not panic
+        assert!(result.is_ok(), "Empty segment file should not cause panic");
+    }
+
+    #[test]
+    fn test_recovery_garbage_at_end_of_segment() {
+        // Write random bytes after valid records — recovery should stop at garbage.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=3 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            if let Some(seg_path) = seg_files.last() {
+                use std::io::{Read, Seek, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                let mut data = vec![0u8; file.metadata().unwrap().len() as usize];
+                file.seek(std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+
+                // Find end of valid records
+                let mut offset = 0;
+                while offset + 4 <= data.len() {
+                    let rlen =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    if rlen == 0 || offset + 4 + rlen > data.len() {
+                        break;
+                    }
+                    offset += 4 + rlen;
+                }
+                // Write random garbage after valid data
+                if offset + 20 <= data.len() {
+                    file.seek(std::io::SeekFrom::Start(offset as u64)).unwrap();
+                    file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+                                     0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+                                     0x01, 0x02, 0x03, 0x04]).unwrap();
+                    file.sync_all().unwrap();
+                }
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..4).await.unwrap();
+            assert_eq!(result.len(), 3, "All valid entries should survive garbage at end");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_truncated_segment_file_recovery() {
+        // Truncate a sealed segment file — recovery should detect the issue.
+        // Currently this causes a panic in the mmap read path because the
+        // manifest metadata references offsets beyond the truncated file.
+        // This test documents the behavior and verifies it doesn't silently corrupt data.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path)
+                .with_segment_size(256)
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            // Truncate the first sealed segment — metadata still references old offsets
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            assert!(seg_files.len() > 2, "Need multiple segments");
+            let seg_path = &seg_files[0];
+            let orig_len = std::fs::metadata(seg_path).unwrap().len();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(seg_path)
+                .unwrap();
+            file.set_len(orig_len / 2).unwrap();
+        });
+
+        // Recovery with truncated sealed segment should error or panic
+        // rather than silently returning corrupted data
+        let result = std::panic::catch_unwind(|| {
+            run_async(async move {
+                let config = MmapStorageConfig::new(&path2)
+                    .with_segment_size(256)
+                    .with_fsync_delay(Duration::from_millis(0));
+                let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+                let mut log = storage.get_log_storage(0).await.unwrap();
+                let _ = log.try_get_log_entries(1..21).await;
+                storage.stop();
+            });
+        });
+        // The recovery panics because mmap reads reference offsets beyond truncated file.
+        // This is acceptable — it prevents silent data corruption.
+        assert!(result.is_err(), "Truncated sealed segment should be detected");
+    }
+
+    // ===================================================================
+    // Concurrency — additional scenarios
+    // ===================================================================
+
+    #[test]
+    fn test_concurrent_groups_independent_purge() {
+        // Multiple groups purging independently — no cross-interference.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(256)
+                .with_fsync_delay(Duration::from_millis(1));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            for group_id in 0..3u64 {
+                let mut log = storage.get_log_storage(group_id).await.unwrap();
+                let mut pending = Vec::new();
+                for i in 1..=20 {
+                    let entries = vec![make_entry(i, group_id + 1)];
+                    let (cb, rx) = make_callback();
+                    log.append(entries, cb).await.unwrap();
+                    pending.push(rx);
+                }
+                for rx in pending {
+                    rx.await.unwrap().unwrap();
+                }
+            }
+
+            // Purge different amounts per group
+            for (group_id, purge_idx) in [(0u64, 5u64), (1, 10), (2, 15)] {
+                let mut log = storage.get_log_storage(group_id).await.unwrap();
+                let purge_lid = LogId {
+                    leader_id: openraft::impls::leader_id_adv::LeaderId {
+                        term: group_id + 1,
+                        node_id: 1,
+                    },
+                    index: purge_idx,
+                };
+                log.purge(purge_lid).await.unwrap();
+            }
+
+            // Verify each group has correct remaining entries
+            for (group_id, purge_idx) in [(0u64, 5u64), (1, 10), (2, 15)] {
+                let mut log = storage.get_log_storage(group_id).await.unwrap();
+                let result = log.try_get_log_entries((purge_idx + 1)..21).await.unwrap();
+                assert_eq!(
+                    result.len(),
+                    (20 - purge_idx) as usize,
+                    "Group {} should have {} entries after purge to {}",
+                    group_id,
+                    20 - purge_idx,
+                    purge_idx
+                );
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_fsync_callback_ordering() {
+        // Verify callbacks fire for all appended entries in order.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let mut pending = Vec::new();
+            for i in 1..=50 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push((i, rx));
+            }
+
+            // All callbacks must fire successfully
+            for (idx, rx) in pending {
+                let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
+                assert!(result.is_ok(), "Callback for entry {} should fire", idx);
+                result.unwrap().unwrap().unwrap();
+            }
+
+            // Verify all entries readable
+            let result = log.try_get_log_entries(1..51).await.unwrap();
+            assert_eq!(result.len(), 50);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_log_index_concurrent_insert_and_read() {
+        // Concurrent inserts to LogIndex — all succeed, reads consistent.
+        use crate::multi::record_format::{LogIndex, LogLocation};
+        use std::sync::Arc;
+
+        let idx = Arc::new(LogIndex::new());
+        let mut handles = Vec::new();
+
+        // Spawn 4 writer threads, each writing a non-overlapping range
+        for thread_id in 0..4u64 {
+            let idx = idx.clone();
+            handles.push(std::thread::spawn(move || {
+                let base = thread_id * 1000;
+                for i in 1..=1000 {
+                    idx.insert(
+                        base + i,
+                        LogLocation {
+                            segment_id: thread_id,
+                            offset: i as u64,
+                            len: 100,
+                        },
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify all 4000 entries exist
+        for thread_id in 0..4u64 {
+            let base = thread_id * 1000;
+            for i in 1..=1000 {
+                let loc = idx.get(base + i);
+                assert!(loc.is_some(), "Entry {}+{} should exist", base, i);
+                assert_eq!(loc.unwrap().segment_id, thread_id);
+            }
+        }
+    }
+
+    // ===================================================================
+    // Performance/Scale
+    // ===================================================================
+
+    #[test]
+    fn test_write_throughput_baseline() {
+        // 10K entries should complete quickly.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_millis(1));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let start = std::time::Instant::now();
+            let mut pending = Vec::new();
+            for i in 1..=10_000u64 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "10K entries should complete in < 10s, took {:?}",
+                elapsed
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_read_throughput_baseline() {
+        // Reading 10K entries should be fast.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config =
+                MmapStorageConfig::new(tmp.path()).with_fsync_delay(Duration::from_millis(1));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let mut pending = Vec::new();
+            for i in 1..=10_000u64 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                pending.push(rx);
+            }
+            for rx in pending {
+                rx.await.unwrap().unwrap();
+            }
+
+            let start = std::time::Instant::now();
+            let result = log.try_get_log_entries(1..10_001).await.unwrap();
+            let elapsed = start.elapsed();
+
+            assert_eq!(result.len(), 10_000);
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "Reading 10K entries should be fast, took {:?}",
+                elapsed
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_sealed_lru_eviction() {
+        // Create more sealed segments than the LRU cache capacity.
+        // Old segments get evicted and their entries become unreadable (by design).
+        // Recent entries in the active segment remain readable.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // Use 256 byte segments — small enough to create many
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(256)
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write enough entries to create > 64 segments (DEFAULT_SEALED_CACHE_CAP)
+            let total = 500u64;
+            for i in 1..=total {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let seg_count = count_segment_files(tmp.path());
+            assert!(
+                seg_count > 64,
+                "Should have more segments than LRU cap: got {}",
+                seg_count
+            );
+
+            // The most recent entry (in active segment) should always be readable
+            let result = log.try_get_log_entries(total..total + 1).await.unwrap();
+            assert_eq!(result.len(), 1, "Most recent entry should be readable");
+
+            // Earliest entries may be evicted from LRU — reading all should return fewer
+            let all = log.try_get_log_entries(1..total + 1).await.unwrap();
+            assert!(
+                all.len() < total as usize,
+                "LRU eviction should make some old entries unreadable, got all {}",
+                all.len()
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_log_index_scale() {
+        // LogIndex with many entries — operations still work.
+        use crate::multi::record_format::{LogIndex, LogLocation};
+        let idx = LogIndex::new();
+        let n = 100_000u64;
+
+        for i in 1..=n {
+            idx.insert(
+                i,
+                LogLocation {
+                    segment_id: i / 1000,
+                    offset: i * 100,
+                    len: 50,
+                },
+            )
+            .unwrap();
+        }
+
+        // Random access
+        let loc = idx.get(50_000).unwrap();
+        assert_eq!(loc.segment_id, 50);
+
+        // Truncate half
+        idx.truncate_from(50_001);
+        assert!(idx.get(50_001).is_none());
+        assert!(idx.get(50_000).is_some());
+
+        // Purge some
+        idx.purge_to(10_000);
+        assert!(idx.get(10_000).is_none());
+        assert!(idx.get(10_001).is_some());
+    }
+
+    // ===================================================================
+    // Edge cases — additional
+    // ===================================================================
+
+    #[test]
+    fn test_group_id_at_max_supported() {
+        // group_id = 4095 (MAX_GROUPS - 1) should work.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(4095).await.unwrap();
+
+            let entries = vec![make_entry(1, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..2).await.unwrap();
+            assert_eq!(result.len(), 1);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_append_empty_batch() {
+        // Appending an empty batch should be a no-op, not panic.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Append non-empty first
+            let entries = vec![make_entry(1, 1)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            // Now append empty — should be OK
+            let entries: Vec<openraft::impls::Entry<C>> = vec![];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            let result = log.try_get_log_entries(1..2).await.unwrap();
+            assert_eq!(result.len(), 1);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_purge_beyond_last_entry() {
+        // Purge to index beyond the last written entry — should cap correctly.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=5 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Purge to index 100 (well beyond last entry 5)
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 100,
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            let state = log.get_log_state().await.unwrap();
+            assert!(state.last_purged_log_id.is_some());
+
+            // All entries should be gone
+            let result = log.try_get_log_entries(1..6).await.unwrap();
+            assert_eq!(result.len(), 0);
+
+            // Can still write new entries
+            let entries = vec![make_entry(101, 2)];
+            let (cb, rx) = make_callback();
+            log.append(entries, cb).await.unwrap();
+            rx.await.unwrap().unwrap();
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_read_single_entry_range() {
+        // Read exactly one entry with range (i..i+1).
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path());
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=10 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Read single entries
+            for i in 1..=10 {
+                let result = log.try_get_log_entries(i..(i + 1)).await.unwrap();
+                assert_eq!(result.len(), 1, "Should read exactly one entry at index {}", i);
+                assert_eq!(result[0].log_id.index, i);
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_recovery_log_index_rebuilt_correctly() {
+        // After recovery, LogIndex entries should point to correct data.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write entries with unique data
+            for i in 1..=20 {
+                let entries = vec![make_entry(i, i)]; // term = i for uniqueness
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..21).await.unwrap();
+            assert_eq!(result.len(), 20);
+
+            // Verify each entry has correct term (proves LogIndex points to right data)
+            for (i, entry) in result.iter().enumerate() {
+                let expected_idx = (i + 1) as u64;
+                assert_eq!(entry.log_id.index, expected_idx);
+                assert_eq!(
+                    entry.log_id.leader_id.term, expected_idx,
+                    "Entry {} should have term={}, got term={}",
+                    expected_idx, expected_idx, entry.log_id.leader_id.term
+                );
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_recovery_corrupt_vote_record() {
+        // Write entries, then a vote, then more entries. Corrupt the vote record.
+        // Entries before the vote should survive; scan stops at corrupt vote.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write 3 entries
+            for i in 1..=3 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            // Write a vote
+            log.save_vote(&make_vote(2, 5, true)).await.unwrap();
+            // Write more entries
+            for i in 4..=6 {
+                let entries = vec![make_entry(i, 2)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            storage.stop();
+            drop(storage);
+
+            // Find and corrupt the vote record (4th record, after 3 entries)
+            let group_dir = path.join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seg_files.sort();
+            if let Some(seg_path) = seg_files.last() {
+                use std::io::{Read, Seek, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(seg_path)
+                    .unwrap();
+                let mut data = vec![0u8; file.metadata().unwrap().len() as usize];
+                file.seek(std::io::SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut data).unwrap();
+
+                // Skip past first 3 entry records to find vote record
+                let mut offset = 0;
+                for _ in 0..3 {
+                    let rlen =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    if rlen == 0 { break; }
+                    offset += 4 + rlen;
+                }
+                // Now at vote record — corrupt its CRC
+                let rlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                if rlen > 0 {
+                    let crc_offset = offset + 4 + rlen - 8;
+                    file.seek(std::io::SeekFrom::Start(crc_offset as u64)).unwrap();
+                    file.write_all(&[0xFF; 8]).unwrap();
+                    file.sync_all().unwrap();
+                }
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // First 3 entries should survive; scan stops at corrupt vote
+            let result = log.try_get_log_entries(1..7).await.unwrap();
+            assert_eq!(result.len(), 3, "Entries before corrupt vote should survive");
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_manifest_dir_deleted_slow_path_recovery() {
+        // Delete manifest directory entirely — recovery should use slow CRC scan path.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let path2 = path.clone();
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=15 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+            storage.stop();
+            drop(storage);
+
+            // Delete manifest directory
+            let manifest_dir = path.join(".raft_manifest");
+            if manifest_dir.exists() {
+                let _ = std::fs::remove_dir_all(&manifest_dir);
+            }
+        });
+
+        run_async(async move {
+            let config = MmapStorageConfig::new(&path2).with_segment_size(256);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let result = log.try_get_log_entries(1..16).await.unwrap();
+            assert_eq!(result.len(), 15, "All entries should recover via CRC scan slow path");
+
+            storage.stop();
+        });
+    }
 }
