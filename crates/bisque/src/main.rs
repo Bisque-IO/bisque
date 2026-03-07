@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long, default_value = "1", env = "BISQUE_NODE_ID")]
     node_id: u64,
 
+    /// Address for the PostgreSQL wire protocol server (disabled if not set).
+    #[arg(long, env = "BISQUE_POSTGRES_ADDR")]
+    postgres_addr: Option<SocketAddr>,
+
     /// Directory containing built UI static files (e.g. `ui/dist`).
     #[arg(long, env = "BISQUE_UI_DIR")]
     ui_dir: Option<PathBuf>,
@@ -61,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_otlp_grpc_addr(cli.otlp_grpc_addr)
         .with_node_id(cli.node_id)
         .with_token_ttl_secs(cli.token_ttl_secs)
+        .with_postgres_addr(cli.postgres_addr)
         .with_ui_dir(cli.ui_dir);
 
     server::run(config).await

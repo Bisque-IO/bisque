@@ -34,6 +34,9 @@ use crate::auth::{AuthState, validate_token};
 pub struct WsState {
     pub s3: Arc<S3ServerState>,
     pub auth: AuthState,
+    pub meta_engine: Arc<bisque_meta::engine::MetaEngine>,
+    pub token_manager: Arc<bisque_meta::token::TokenManager>,
+    pub raft_node: Arc<bisque_lance::LanceRaftNode>,
     /// M5/L5: Per-IP connection tracking for rate limiting.
     pub ip_connections: Arc<dashmap::DashMap<std::net::IpAddr, IpConnectionState>>,
 }
@@ -153,6 +156,9 @@ pub async fn unified_ws_handler(
 
     let state = ws_state.s3.clone();
     let auth_state = ws_state.auth.clone();
+    let meta_engine = ws_state.meta_engine.clone();
+    let token_manager = ws_state.token_manager.clone();
+    let raft_node = ws_state.raft_node.clone();
     let pins = state.version_pins.clone();
     let ip_connections = ws_state.ip_connections.clone();
 
@@ -181,6 +187,9 @@ pub async fn unified_ws_handler(
             ws,
             state,
             auth_state,
+            meta_engine,
+            token_manager,
+            raft_node,
             pins.clone(),
             session_id,
             client_ip,
@@ -235,6 +244,9 @@ async fn handle_unified_ws<S>(
     mut ws: fastwebsockets::WebSocket<S>,
     state: Arc<S3ServerState>,
     auth_state: AuthState,
+    meta_engine: Arc<bisque_meta::engine::MetaEngine>,
+    token_manager: Arc<bisque_meta::token::TokenManager>,
+    raft_node: Arc<bisque_lance::LanceRaftNode>,
     pins: Arc<bisque_lance::version_pins::VersionPinTracker>,
     session_id: u64,
     client_ip: std::net::IpAddr,
@@ -634,7 +646,7 @@ where
                                 // Execute request with timeout.
                                 let result = match tokio::time::timeout(
                                     WS_REQUEST_TIMEOUT,
-                                    handle_ws_request(&state, method),
+                                    handle_ws_request(&state, &meta_engine, &token_manager, &raft_node, &auth_ctx, method),
                                 )
                                 .await
                                 {
@@ -731,7 +743,14 @@ where
 }
 
 /// Route a WebSocket request to the appropriate handler logic.
-async fn handle_ws_request(state: &Arc<S3ServerState>, method: RequestMethod) -> ResponseResult {
+async fn handle_ws_request(
+    state: &Arc<S3ServerState>,
+    meta_engine: &Arc<bisque_meta::engine::MetaEngine>,
+    token_manager: &Arc<bisque_meta::token::TokenManager>,
+    raft_node: &Arc<bisque_lance::LanceRaftNode>,
+    auth_ctx: &crate::auth::AuthContext,
+    method: RequestMethod,
+) -> ResponseResult {
     match method {
         RequestMethod::ListOperations {
             op_type,
@@ -875,15 +894,202 @@ async fn handle_ws_request(state: &Arc<S3ServerState>, method: RequestMethod) ->
             }
         }
 
-        // These methods delegate to the meta engine which will be wired up
-        // when the unified server passes the meta engine reference.
-        RequestMethod::ListCatalogs { .. }
-        | RequestMethod::CreateCatalog { .. }
-        | RequestMethod::GetTenant { .. }
-        | RequestMethod::CreateApiKey { .. }
-        | RequestMethod::GetClusterStatus => ResponseResult::Error {
-            code: 501,
-            message: "Not yet implemented over WebSocket — use HTTP API".into(),
-        },
+        RequestMethod::ListCatalogs { tenant_id } => {
+            if auth_ctx.tenant_id != tenant_id && !auth_ctx.is_super_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "access denied".into(),
+                };
+            }
+            let catalogs = meta_engine.list_catalogs_for_tenant(tenant_id);
+            let catalogs_json: Vec<serde_json::Value> = catalogs
+                .iter()
+                .filter_map(|c| serde_json::to_value(c).ok())
+                .collect();
+            metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "list_catalogs")
+                .increment(1);
+            ResponseResult::Ok {
+                data: ResponseData::ListCatalogs {
+                    catalogs: catalogs_json,
+                },
+            }
+        }
+
+        RequestMethod::CreateCatalog {
+            tenant_id,
+            name,
+            engine,
+            config,
+        } => {
+            if auth_ctx.tenant_id != tenant_id && !auth_ctx.is_tenant_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "access denied".into(),
+                };
+            }
+            if !auth_ctx.is_tenant_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "tenant admin scope required".into(),
+                };
+            }
+            let engine_type = match engine.as_str() {
+                "Lance" | "lance" => bisque_meta::types::EngineType::Lance,
+                "Mq" | "mq" => bisque_meta::types::EngineType::Mq,
+                "LibSql" | "libsql" => bisque_meta::types::EngineType::LibSql,
+                _ => {
+                    return ResponseResult::Error {
+                        code: 400,
+                        message: format!("unknown engine type: {engine}"),
+                    };
+                }
+            };
+            match meta_engine.create_catalog(
+                tenant_id,
+                name.clone(),
+                engine_type,
+                config.unwrap_or_default(),
+            ) {
+                Ok((catalog_id, raft_group_id)) => {
+                    info!(catalog_id, raft_group_id, %name, "catalog created via WS");
+                    metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "create_catalog")
+                        .increment(1);
+                    ResponseResult::Ok {
+                        data: ResponseData::CreateCatalog {
+                            catalog_id,
+                            raft_group_id,
+                        },
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let code = if msg.contains("already exists") {
+                        409
+                    } else if msg.contains("not found") {
+                        404
+                    } else if msg.contains("limit") {
+                        403
+                    } else {
+                        500
+                    };
+                    ResponseResult::Error { code, message: msg }
+                }
+            }
+        }
+
+        RequestMethod::GetTenant { tenant_id } => {
+            if auth_ctx.tenant_id != tenant_id && !auth_ctx.is_tenant_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "access denied".into(),
+                };
+            }
+            match meta_engine.get_tenant(tenant_id) {
+                Some(tenant) => {
+                    metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "get_tenant")
+                        .increment(1);
+                    match serde_json::to_value(&tenant) {
+                        Ok(tenant_json) => ResponseResult::Ok {
+                            data: ResponseData::GetTenant {
+                                tenant: tenant_json,
+                            },
+                        },
+                        Err(e) => ResponseResult::Error {
+                            code: 500,
+                            message: format!("serialization error: {e}"),
+                        },
+                    }
+                }
+                None => ResponseResult::Error {
+                    code: 404,
+                    message: format!("tenant {tenant_id} not found"),
+                },
+            }
+        }
+
+        RequestMethod::CreateApiKey {
+            tenant_id,
+            scopes,
+            ttl_secs,
+        } => {
+            if auth_ctx.tenant_id != tenant_id && !auth_ctx.is_tenant_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "access denied".into(),
+                };
+            }
+            if !auth_ctx.is_tenant_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "tenant admin scope required".into(),
+                };
+            }
+            // Deserialize scopes from JSON values.
+            let parsed_scopes: Vec<bisque_meta::types::Scope> = match scopes
+                .into_iter()
+                .map(|v| serde_json::from_value(v))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    return ResponseResult::Error {
+                        code: 400,
+                        message: format!("invalid scopes: {e}"),
+                    };
+                }
+            };
+            match meta_engine.create_api_key(tenant_id, parsed_scopes.clone()) {
+                Ok((key_id, raw_key)) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let ttl = ttl_secs.unwrap_or(meta_engine.config().token_ttl_secs);
+                    let claims = bisque_meta::token::TokenClaims {
+                        user_id: None,
+                        account_id: None,
+                        tenant_id,
+                        key_id,
+                        scopes: parsed_scopes,
+                        issued_at: now,
+                        expires_at: now + ttl as i64,
+                    };
+                    let token = token_manager.issue(&claims);
+                    info!(key_id, tenant_id, "API key created via WS");
+                    metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "create_api_key")
+                        .increment(1);
+                    ResponseResult::Ok {
+                        data: ResponseData::CreateApiKey {
+                            key_id,
+                            raw_key,
+                            token,
+                        },
+                    }
+                }
+                Err(e) => ResponseResult::Error {
+                    code: 500,
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        RequestMethod::GetClusterStatus => {
+            let node_id = raft_node.node_id();
+            let is_leader = raft_node.is_leader();
+            let current_leader = raft_node.current_leader();
+            let group_id = raft_node.group_id();
+
+            let cluster = serde_json::json!({
+                "node_id": node_id,
+                "group_id": group_id,
+                "is_leader": is_leader,
+                "current_leader": current_leader,
+            });
+            metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "cluster_status")
+                .increment(1);
+            ResponseResult::Ok {
+                data: ResponseData::ClusterStatus { cluster },
+            }
+        }
     }
 }

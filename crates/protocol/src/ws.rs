@@ -124,7 +124,7 @@ pub enum ResponseData {
         token: String,
     },
     #[serde(rename = "cluster_status")]
-    ClusterStatus { status: serde_json::Value },
+    ClusterStatus { cluster: serde_json::Value },
     #[serde(rename = "pinned")]
     Pinned,
     #[serde(rename = "unpinned")]

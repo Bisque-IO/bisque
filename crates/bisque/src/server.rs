@@ -8,6 +8,7 @@
 //! gRPC services (Flight SQL) run on a separate port.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Json;
@@ -21,7 +22,8 @@ use tracing::{info, warn};
 
 use bisque_lance::{
     BisqueLance, BisqueLanceConfig, CatalogEventBus, LanceManifestManager, LanceRaftNode,
-    LanceStateMachine, S3ServerState, WriteBatcherConfig, flight::serve_flight, s3_router,
+    LanceStateMachine, OtlpReceiver, PostgresServerConfig, S3ServerState, WriteBatcherConfig,
+    flight::serve_flight, otel_http_router, s3_router, serve_otlp, serve_postgres,
 };
 use bisque_meta::MetaConfig;
 use bisque_meta::engine::MetaEngine;
@@ -44,8 +46,69 @@ pub struct AppState {
     pub token_manager: Arc<TokenManager>,
 }
 
+type LanceManager = MultiRaftManager<
+    bisque_lance::LanceTypeConfig,
+    BisqueTcpTransport<bisque_lance::LanceTypeConfig>,
+    MultiplexedLogStorage<bisque_lance::LanceTypeConfig>,
+>;
+
+/// Handle to a running bisque server, returned by [`start()`].
+///
+/// Keeps all server resources alive. Call [`shutdown()`](ServerHandle::shutdown)
+/// for graceful teardown, or simply drop to stop.
+pub struct ServerHandle {
+    /// Actual HTTP listen address (resolved from `:0` if used).
+    pub http_addr: SocketAddr,
+    /// Meta engine for direct access in tests.
+    pub meta_engine: Arc<MetaEngine>,
+    /// Token manager for issuing/verifying tokens in tests.
+    pub token_manager: Arc<TokenManager>,
+    /// Raft node for direct access.
+    pub raft_node: Arc<LanceRaftNode>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    join_handle: Option<tokio::task::JoinHandle<()>>,
+    manager: Arc<LanceManager>,
+}
+
+impl ServerHandle {
+    /// Gracefully shut down the server and all background services.
+    pub async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.await;
+        }
+        self.raft_node.shutdown().await;
+        self.manager.storage().stop();
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Start the unified bisque server and return a handle for programmatic control.
+///
+/// Use `127.0.0.1:0` for ports to let the OS assign available ones.
+/// The actual bound addresses are available via the returned [`ServerHandle`].
+pub async fn start(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::error::Error>> {
+    start_inner(config).await
+}
+
 /// Build the unified bisque HTTP server and start listening.
 pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = start(config).await?;
+    shutdown_signal().await;
+    handle.shutdown().await;
+    Ok(())
+}
+
+async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     // 1. Meta engine (control plane)
     // -----------------------------------------------------------------------
@@ -91,13 +154,7 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
     let transport = BisqueTcpTransport::new(BisqueTcpTransportConfig::default(), registry);
 
     // 2d. Create the multi-raft manager.
-    let manager: Arc<
-        MultiRaftManager<
-            bisque_lance::LanceTypeConfig,
-            BisqueTcpTransport<bisque_lance::LanceTypeConfig>,
-            MultiplexedLogStorage<bisque_lance::LanceTypeConfig>,
-        >,
-    > = Arc::new(MultiRaftManager::new(transport, storage));
+    let manager: Arc<LanceManager> = Arc::new(MultiRaftManager::new(transport, storage));
 
     // 2e. MDBX manifest for crash-consistent catalog metadata and WAL.
     let manifest_dir = config.data_dir.join("manifest");
@@ -217,6 +274,9 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
     let ws_state = WsState {
         s3: s3_state.clone(),
         auth: auth_state.clone(),
+        meta_engine: meta_engine.clone(),
+        token_manager: token_manager.clone(),
+        raft_node: raft_node.clone(),
         ip_connections: Arc::new(dashmap::DashMap::new()),
     };
     let ws_route =
@@ -225,12 +285,18 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
     // Lance S3-compatible API routes
     let s3_routes = s3_router(s3_state);
 
-    // Compose: management + WS first (specific paths), then S3 (wildcard catch-all)
+    // OTLP HTTP routes (Tempo, Prometheus/Mimir, Loki, OTLP HTTP ingest)
+    let otel_receiver = Arc::new(OtlpReceiver::new(raft_node.clone()));
+    otel_receiver.ensure_tables().await?;
+    let otel_routes = otel_http_router(raft_node.clone(), otel_receiver);
+
+    // Compose: specific paths first, then OTLP HTTP, then S3 (wildcard catch-all last)
     let mut app = axum::Router::new()
         .nest("/_bisque/v1", public_routes)
         .nest("/_bisque/v1", management_routes)
         .merge(health_route)
         .merge(ws_route)
+        .merge(otel_routes)
         .merge(s3_routes);
 
     // Serve static UI files if ui_dir is configured
@@ -245,6 +311,8 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
     // -----------------------------------------------------------------------
     // 4. Start gRPC services on separate ports
     // -----------------------------------------------------------------------
+
+    // Flight SQL gRPC
     let flight_addr = config.flight_addr;
     let flight_node = raft_node.clone();
     tokio::spawn(async move {
@@ -254,15 +322,86 @@ pub async fn run(config: BisqueConfig) -> Result<(), Box<dyn std::error::Error>>
         }
     });
 
-    // -----------------------------------------------------------------------
-    // 5. Start unified HTTP server
-    // -----------------------------------------------------------------------
-    info!(addr = %config.http_addr, "starting bisque unified HTTP server");
+    // OTLP gRPC (metrics, traces, logs)
+    let otlp_addr = config.otlp_grpc_addr;
+    let otlp_node = raft_node.clone();
+    tokio::spawn(async move {
+        info!(%otlp_addr, "starting OTLP gRPC server");
+        if let Err(e) = serve_otlp(otlp_node, otlp_addr).await {
+            tracing::error!(error = %e, "OTLP gRPC server failed");
+        }
+    });
 
+    // PostgreSQL wire protocol (optional)
+    if let Some(pg_addr) = config.postgres_addr {
+        let pg_node = raft_node.clone();
+        tokio::spawn(async move {
+            let pg_config = PostgresServerConfig {
+                host: pg_addr.ip().to_string(),
+                port: pg_addr.port(),
+            };
+            info!(%pg_addr, "starting PostgreSQL wire protocol server");
+            if let Err(e) = serve_postgres(pg_node, pg_config).await {
+                tracing::error!(error = %e, "PostgreSQL server failed");
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Start unified HTTP server with graceful shutdown
+    // -----------------------------------------------------------------------
     let listener = tokio::net::TcpListener::bind(config.http_addr).await?;
-    axum::serve(listener, app).await?;
+    let http_addr = listener.local_addr()?;
+    info!(addr = %http_addr, "starting bisque unified HTTP server");
 
-    Ok(())
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let join_handle = tokio::spawn(async move {
+        let shutdown_fut = async {
+            let _ = shutdown_rx.await;
+        };
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_fut)
+        .await
+        {
+            tracing::error!(error = %e, "HTTP server error");
+        }
+    });
+
+    Ok(ServerHandle {
+        http_addr,
+        meta_engine,
+        token_manager,
+        raft_node,
+        shutdown_tx: Some(shutdown_tx),
+        join_handle: Some(join_handle),
+        manager,
+    })
+}
+
+/// Wait for SIGINT (Ctrl+C) or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => info!("received SIGINT"),
+            _ = sigterm.recv() => info!("received SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        info!("received SIGINT");
+    }
 }
 
 // ---------------------------------------------------------------------------

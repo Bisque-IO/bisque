@@ -260,10 +260,14 @@ pub async fn serve_otlp(
 /// serve_http(raft_node, addr).await.unwrap();
 /// # }
 /// ```
-pub async fn serve_http(
+/// Build an axum Router for Tempo, Prometheus, Loki, and OTLP HTTP APIs.
+///
+/// Returns a composable Router that can be merged into a larger server.
+/// Call [`OtlpReceiver::ensure_tables`] before calling this function.
+pub fn otel_http_router(
     raft_node: Arc<LanceRaftNode>,
-    addr: std::net::SocketAddr,
-) -> Result<(), Box<dyn std::error::Error>> {
+    receiver: Arc<OtlpReceiver>,
+) -> axum::Router {
     let engine = raft_node.engine().clone();
 
     let session_config = SessionConfig::new()
@@ -274,16 +278,12 @@ pub async fn serve_http(
     let catalog = Arc::new(BisqueLanceCatalogProvider::new(engine));
     ctx.register_catalog("bisque", catalog);
 
-    let receiver = OtlpReceiver::new(raft_node.clone());
-    receiver.ensure_tables().await?;
-    let receiver = Arc::new(receiver);
-
     let state = Arc::new(tempo::HttpQueryState {
         ctx: Arc::new(ctx),
         receiver,
     });
 
-    let app = axum::Router::new()
+    axum::Router::new()
         // --- Tempo endpoints ---
         .route(
             "/api/traces/{traceID}",
@@ -350,7 +350,18 @@ pub async fn serve_http(
         )
         .route("/loki/api/v1/series", axum::routing::get(loki::loki_series))
         .route("/loki/api/v1/push", axum::routing::post(loki::loki_push))
-        .with_state(state);
+        .with_state(state)
+}
+
+pub async fn serve_http(
+    raft_node: Arc<LanceRaftNode>,
+    addr: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let receiver = OtlpReceiver::new(raft_node.clone());
+    receiver.ensure_tables().await?;
+    let receiver = Arc::new(receiver);
+
+    let app = otel_http_router(raft_node, receiver);
 
     info!(%addr, "starting Tempo/Prometheus/Loki HTTP server");
 

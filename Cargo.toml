@@ -100,6 +100,7 @@ hdrhistogram = "7.5"
 hex = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1.8" }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 datafusion = { version = "52.1.0", default-features = false }
 datafusion-expr = { version = "52.1.0", default-features = false }

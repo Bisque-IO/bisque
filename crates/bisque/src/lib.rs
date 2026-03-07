@@ -25,3 +25,4 @@ pub mod ws;
 pub use auth::AuthContext;
 pub use config::BisqueConfig;
 pub use error::ApiError;
+pub use server::ServerHandle;

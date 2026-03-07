@@ -20,6 +20,8 @@ pub struct BisqueConfig {
     pub token_ttl_secs: u64,
     /// Raft node identity.
     pub node_id: u64,
+    /// Optional address for the PostgreSQL wire protocol server.
+    pub postgres_addr: Option<SocketAddr>,
     /// Optional directory containing built UI static files (e.g. `ui/dist`).
     pub ui_dir: Option<PathBuf>,
 }
@@ -34,6 +36,7 @@ impl BisqueConfig {
             token_secret,
             token_ttl_secs: 3600,
             node_id: 1,
+            postgres_addr: None,
             ui_dir: None,
         }
     }
@@ -60,6 +63,11 @@ impl BisqueConfig {
 
     pub fn with_token_ttl_secs(mut self, secs: u64) -> Self {
         self.token_ttl_secs = secs;
+        self
+    }
+
+    pub fn with_postgres_addr(mut self, addr: Option<SocketAddr>) -> Self {
+        self.postgres_addr = addr;
         self
     }
 
