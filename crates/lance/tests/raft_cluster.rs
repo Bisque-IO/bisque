@@ -18,7 +18,7 @@ use bisque_lance::{
     LanceManifestManager, LanceRaftNode, LanceResponse, LanceStateMachine, LanceTypeConfig,
     PersistedTableEntry, VersionPinTracker, WriteError,
 };
-use bisque_raft::multi::{
+use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
     MultiplexedTransport, NodeAddressResolver,
@@ -465,7 +465,7 @@ async fn test_create_table_emits_table_created_event() {
 
     match &event.event {
         CatalogEventKind::TableCreated { table, .. } => {
-            assert_eq!(table, "t1");
+            assert_eq!(&**table, "t1");
         }
         other => panic!("expected TableCreated, got {:?}", other),
     }
@@ -515,7 +515,7 @@ async fn test_drop_table_emits_table_dropped_event() {
 
     match &event.event {
         CatalogEventKind::TableDropped { table } => {
-            assert_eq!(table, "t1");
+            assert_eq!(&**table, "t1");
         }
         other => panic!("expected TableDropped, got {:?}", other),
     }
@@ -597,7 +597,7 @@ async fn test_write_records_emits_active_version_bumped() {
 
     match &event.event {
         CatalogEventKind::ActiveVersionBumped { table, version } => {
-            assert_eq!(table, "t1");
+            assert_eq!(&**table, "t1");
             assert!(*version > 0);
         }
         other => panic!("expected ActiveVersionBumped, got {:?}", other),
@@ -780,7 +780,7 @@ async fn test_delete_emits_data_mutated_event() {
             active_version,
             ..
         } => {
-            assert_eq!(table, "t1");
+            assert_eq!(&**table, "t1");
             assert!(active_version.is_some(), "active_version should be Some");
         }
         other => panic!("expected DataMutated, got {:?}", other),
@@ -941,7 +941,7 @@ async fn test_update_emits_data_mutated_event() {
 
     match &event.event {
         CatalogEventKind::DataMutated { table, .. } => {
-            assert_eq!(table, "t1");
+            assert_eq!(&**table, "t1");
         }
         other => panic!("expected DataMutated, got {:?}", other),
     }
@@ -974,7 +974,7 @@ async fn test_seal_replicates_to_follower() {
 
     // Propose seal command directly
     let seal_cmd = bisque_lance::types::LanceCommand::SealActiveSegment {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         sealed_segment_id: current_active,
         new_active_segment_id: current_active + 1,
         reason: bisque_lance::types::SealReason::MaxAge,
@@ -1024,7 +1024,7 @@ async fn test_seal_emits_segment_sealed_event() {
     let current_active = cat.active_segment;
 
     let seal_cmd = bisque_lance::types::LanceCommand::SealActiveSegment {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         sealed_segment_id: current_active,
         new_active_segment_id: current_active + 1,
         reason: bisque_lance::types::SealReason::MaxSize,
@@ -1042,7 +1042,7 @@ async fn test_seal_emits_segment_sealed_event() {
             active_version,
             sealed_version,
         } => {
-            assert_eq!(table, "t1");
+            assert_eq!(&**table, "t1");
             assert!(*active_version > 0);
             assert!(*sealed_version > 0);
         }
@@ -1449,7 +1449,7 @@ async fn test_begin_flush_replicates_to_followers() {
     let active_seg = cat.active_segment;
 
     let seal_cmd = bisque_lance::types::LanceCommand::SealActiveSegment {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         sealed_segment_id: active_seg,
         new_active_segment_id: active_seg + 1,
         reason: bisque_lance::types::SealReason::MaxAge,
@@ -1459,7 +1459,7 @@ async fn test_begin_flush_replicates_to_followers() {
 
     // Begin flush on the sealed segment
     let flush_cmd = bisque_lance::types::LanceCommand::BeginFlush {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         segment_id: active_seg,
     };
     let flush = cluster.leader().propose(flush_cmd).await.unwrap();
@@ -1503,7 +1503,7 @@ async fn test_promote_to_deep_storage_replicates_and_emits_event() {
     let active_seg = cat.active_segment;
 
     let seal_cmd = bisque_lance::types::LanceCommand::SealActiveSegment {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         sealed_segment_id: active_seg,
         new_active_segment_id: active_seg + 1,
         reason: bisque_lance::types::SealReason::MaxAge,
@@ -1512,7 +1512,7 @@ async fn test_promote_to_deep_storage_replicates_and_emits_event() {
 
     // BeginFlush
     let flush_cmd = bisque_lance::types::LanceCommand::BeginFlush {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         segment_id: active_seg,
     };
     cluster.leader().propose(flush_cmd).await.unwrap();
@@ -1521,7 +1521,7 @@ async fn test_promote_to_deep_storage_replicates_and_emits_event() {
 
     // Promote to deep storage (simulate S3 manifest version = 42)
     let promote_cmd = bisque_lance::types::LanceCommand::PromoteToDeepStorage {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         segment_id: active_seg,
         s3_manifest_version: 42,
     };
@@ -1539,7 +1539,7 @@ async fn test_promote_to_deep_storage_replicates_and_emits_event() {
             table,
             s3_manifest_version,
         } => {
-            assert_eq!(table, "t1");
+            assert_eq!(&**table, "t1");
             assert_eq!(*s3_manifest_version, 42);
         }
         other => panic!("expected SegmentPromoted, got {:?}", other),
@@ -1594,8 +1594,8 @@ async fn test_pin_version_replicates_to_followers() {
     // Pin a version
     let pin_cmd = bisque_lance::types::LanceCommand::PinVersion {
         session_id: 1,
-        table_name: "t1".to_string(),
-        tier: "active".to_string(),
+        table_name: "t1".into(),
+        tier: "active".into(),
         version: 5,
     };
     let p = cluster.leader().propose(pin_cmd).await.unwrap();
@@ -1617,8 +1617,8 @@ async fn test_unpin_version_replicates_to_followers() {
 
     let pin = bisque_lance::types::LanceCommand::PinVersion {
         session_id: 1,
-        table_name: "t1".to_string(),
-        tier: "active".to_string(),
+        table_name: "t1".into(),
+        tier: "active".into(),
         version: 5,
     };
     cluster.leader().propose(pin).await.unwrap();
@@ -1626,8 +1626,8 @@ async fn test_unpin_version_replicates_to_followers() {
     // Unpin
     let unpin = bisque_lance::types::LanceCommand::UnpinVersion {
         session_id: 1,
-        table_name: "t1".to_string(),
-        tier: "active".to_string(),
+        table_name: "t1".into(),
+        tier: "active".into(),
         version: 5,
     };
     let u = cluster.leader().propose(unpin).await.unwrap();
@@ -1650,16 +1650,16 @@ async fn test_expire_session_releases_all_pins() {
     // Pin two versions
     let pin1 = bisque_lance::types::LanceCommand::PinVersion {
         session_id: 1,
-        table_name: "t1".to_string(),
-        tier: "active".to_string(),
+        table_name: "t1".into(),
+        tier: "active".into(),
         version: 5,
     };
     cluster.leader().propose(pin1).await.unwrap();
 
     let pin2 = bisque_lance::types::LanceCommand::PinVersion {
         session_id: 1,
-        table_name: "t1".to_string(),
-        tier: "sealed".to_string(),
+        table_name: "t1".into(),
+        tier: "sealed".into(),
         version: 3,
     };
     let p2 = cluster.leader().propose(pin2).await.unwrap();
@@ -2206,7 +2206,7 @@ async fn test_full_segment_lifecycle_seal_flush_promote() {
 
     // 1. Seal
     let seal = bisque_lance::types::LanceCommand::SealActiveSegment {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         sealed_segment_id: active_seg,
         new_active_segment_id: active_seg + 1,
         reason: bisque_lance::types::SealReason::MaxSize,
@@ -2227,7 +2227,7 @@ async fn test_full_segment_lifecycle_seal_flush_promote() {
 
     // 2. BeginFlush
     let flush = bisque_lance::types::LanceCommand::BeginFlush {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         segment_id: active_seg,
     };
     let f = cluster.leader().propose(flush).await.unwrap();
@@ -2244,7 +2244,7 @@ async fn test_full_segment_lifecycle_seal_flush_promote() {
 
     // 3. Promote
     let promote = bisque_lance::types::LanceCommand::PromoteToDeepStorage {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         segment_id: active_seg,
         s3_manifest_version: 1,
     };
@@ -3011,7 +3011,7 @@ async fn test_delete_with_malformed_sql_filter() {
     let result = cluster
         .leader()
         .propose(bisque_lance::LanceCommand::DeleteRecords {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             filter: "SELECT * FROM ;;;; INVALID SQL".to_string(),
         })
         .await;
@@ -3108,8 +3108,8 @@ async fn test_version_pins_block_cleanup() {
         .leader()
         .propose(bisque_lance::LanceCommand::PinVersion {
             session_id: actual_session_id,
-            table_name: "t1".to_string(),
-            tier: "active".to_string(),
+            table_name: "t1".into(),
+            tier: "active".into(),
             version: 1,
         })
         .await
@@ -3143,8 +3143,8 @@ async fn test_version_pins_block_cleanup() {
         .leader()
         .propose(bisque_lance::LanceCommand::UnpinVersion {
             session_id: actual_session_id,
-            table_name: "t1".to_string(),
-            tier: "active".to_string(),
+            table_name: "t1".into(),
+            tier: "active".into(),
             version: 1,
         })
         .await
@@ -3189,8 +3189,8 @@ async fn test_expire_session_removes_all_pins() {
             .leader()
             .propose(bisque_lance::LanceCommand::PinVersion {
                 session_id: actual_session_id,
-                table_name: "t1".to_string(),
-                tier: "active".to_string(),
+                table_name: "t1".into(),
+                tier: "active".into(),
                 version,
             })
             .await
@@ -3258,8 +3258,8 @@ async fn test_multiple_sessions_pin_same_version() {
         .leader()
         .propose(bisque_lance::LanceCommand::PinVersion {
             session_id: sid1,
-            table_name: "t1".to_string(),
-            tier: "sealed".to_string(),
+            table_name: "t1".into(),
+            tier: "sealed".into(),
             version: 5,
         })
         .await
@@ -3268,8 +3268,8 @@ async fn test_multiple_sessions_pin_same_version() {
         .leader()
         .propose(bisque_lance::LanceCommand::PinVersion {
             session_id: sid2,
-            table_name: "t1".to_string(),
-            tier: "sealed".to_string(),
+            table_name: "t1".into(),
+            tier: "sealed".into(),
             version: 5,
         })
         .await
@@ -3354,7 +3354,6 @@ async fn test_compaction_respects_version_pins_on_table_engine() {
     // Set up version pins on the table engine.
     let pins = cluster.leader_pins().clone();
     table.set_version_pins(pins.clone());
-    table.set_catalog_name("".to_string());
 
     // Register session. Auto-generated session ID is 1.
     let reg = cluster
@@ -3369,8 +3368,8 @@ async fn test_compaction_respects_version_pins_on_table_engine() {
         .leader()
         .propose(bisque_lance::LanceCommand::PinVersion {
             session_id: actual_session_id,
-            table_name: "t1".to_string(),
-            tier: "active".to_string(),
+            table_name: "t1".into(),
+            tier: "active".into(),
             version: 1,
         })
         .await
@@ -4562,7 +4561,7 @@ async fn test_crash_recovery_preserves_segment_catalog() {
 
     // Seal the segment.
     let seal_cmd = bisque_lance::types::LanceCommand::SealActiveSegment {
-        table_name: "t1".to_string(),
+        table_name: "t1".into(),
         sealed_segment_id: active_seg,
         new_active_segment_id: active_seg + 1,
         reason: bisque_lance::types::SealReason::MaxSize,

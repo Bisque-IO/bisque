@@ -2,7 +2,7 @@
 //!
 //! Provides helpers to run async tests inside Tokio runtime and common fixtures.
 
-use crate::multi::codec::{BorrowPayload, CodecError, Decode, Encode};
+use crate::codec::{BorrowPayload, CodecError, Decode, Encode};
 use bytes::Bytes;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};

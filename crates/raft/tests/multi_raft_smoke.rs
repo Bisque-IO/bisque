@@ -11,14 +11,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bisque_raft::multi::NodeAddressResolver;
-use bisque_raft::multi::codec::{Decode, Encode};
-use bisque_raft::multi::network::GroupNetworkFactory;
-use bisque_raft::multi::{
+use bisque_raft::NodeAddressResolver;
+use bisque_raft::codec::{Decode, Encode};
+use bisque_raft::network::GroupNetworkFactory;
+use bisque_raft::{BisqueRaftTypeConfig, multi::codec};
+use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
 };
-use bisque_raft::{BisqueRaftTypeConfig, multi::codec};
 use futures::FutureExt;
 use openraft::async_runtime::watch::WatchReceiver;
 use openraft::network::RaftNetworkFactory;

@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bisque_raft::BisqueRaftTypeConfig;
-use bisque_raft::multi::codec;
-use bisque_raft::multi::network::MultiplexedTransport;
-use bisque_raft::multi::{
+use bisque_raft::codec;
+use bisque_raft::network::MultiplexedTransport;
+use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
     NodeAddressResolver,

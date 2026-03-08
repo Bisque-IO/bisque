@@ -20,9 +20,9 @@
 //!
 //! Plus shared manifest MDBX in `{base_dir}/.raft_manifest/` for fast recovery.
 
-use crate::multi::codec::{BorrowPayload, Decode, Encode};
-use crate::multi::manifest_mdbx::{ManifestManager, SegmentMeta};
-use crate::multi::record_format::{
+use crate::codec::{BorrowPayload, Decode, Encode};
+use crate::manifest_mdbx::{ManifestManager, SegmentMeta};
+use crate::record_format::{
     AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, HEADER_SIZE, LENGTH_SIZE, LogIndex,
     LogLocation, MAX_GROUPS, RecordType, RecordTypeFlags, append_record_into, validate_record,
     write_u24_le,
@@ -2261,7 +2261,7 @@ where
 // MultiRaftLogStorage implementation
 // ---------------------------------------------------------------------------
 
-impl<C> crate::multi::storage::MultiRaftLogStorage<C> for MmapPerGroupLogStorage<C>
+impl<C> crate::storage::MultiRaftLogStorage<C> for MmapPerGroupLogStorage<C>
 where
     C: RaftTypeConfig<
             NodeId = u64,
@@ -2324,7 +2324,7 @@ mod tests {
         fn encode<W: std::io::Write>(
             &self,
             writer: &mut W,
-        ) -> Result<(), crate::multi::codec::CodecError> {
+        ) -> Result<(), crate::codec::CodecError> {
             (self.0.len() as u32).encode(writer)?;
             writer.write_all(&self.0)?;
             Ok(())
@@ -2335,9 +2335,7 @@ mod tests {
     }
 
     impl Decode for TestData {
-        fn decode<R: std::io::Read>(
-            reader: &mut R,
-        ) -> Result<Self, crate::multi::codec::CodecError> {
+        fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, crate::codec::CodecError> {
             let len = u32::decode(reader)? as usize;
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf)?;
@@ -2351,7 +2349,7 @@ mod tests {
         }
     }
 
-    use crate::multi::type_config::ManiacRaftTypeConfig;
+    use crate::type_config::ManiacRaftTypeConfig;
     type C = ManiacRaftTypeConfig<TestData, ()>;
 
     fn make_entry(index: u64, term: u64) -> openraft::impls::Entry<C> {
@@ -4902,7 +4900,7 @@ mod tests {
     #[test]
     fn test_atomic_log_id_term_overflow_panics() {
         // AtomicLogId packs term into 40 bits. Values > MAX_TERM should panic.
-        use crate::multi::record_format::AtomicLogId;
+        use crate::record_format::AtomicLogId;
         let atom = AtomicLogId::new();
         let max_term = (1u64 << 40) - 1; // 2^40 - 1
 
@@ -4933,7 +4931,7 @@ mod tests {
     #[test]
     fn test_atomic_log_id_node_id_overflow_panics() {
         // AtomicLogId packs node_id into 24 bits. Values > 0xFFFFFF should panic.
-        use crate::multi::record_format::AtomicLogId;
+        use crate::record_format::AtomicLogId;
         let atom = AtomicLogId::new();
 
         // Max node_id should succeed
@@ -4963,7 +4961,7 @@ mod tests {
     #[test]
     fn test_atomic_log_id_store_none_then_load() {
         // Storing None should return None on load.
-        use crate::multi::record_format::AtomicLogId;
+        use crate::record_format::AtomicLogId;
         let atom = AtomicLogId::new();
 
         // Initially None
@@ -4991,7 +4989,7 @@ mod tests {
 
     #[test]
     fn test_atomic_vote_store_none_then_load() {
-        use crate::multi::record_format::AtomicVote;
+        use crate::record_format::AtomicVote;
         let atom = AtomicVote::new();
 
         // Initially None
@@ -5411,7 +5409,7 @@ mod tests {
     fn test_seqlock_concurrent_reads_during_writes() {
         // Hammer SeqLock with concurrent writers and readers to verify
         // that readers always see consistent values.
-        use crate::multi::record_format::{AtomicLogId, AtomicVote};
+        use crate::record_format::{AtomicLogId, AtomicVote};
         use std::sync::Arc;
 
         let log_id = Arc::new(AtomicLogId::new());
@@ -5913,7 +5911,7 @@ mod tests {
 
     #[test]
     fn test_record_format_roundtrip() {
-        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        use crate::record_format::{RecordType, encode_record_into, validate_record};
         let mut buf = Vec::new();
         let payload = b"hello world";
 
@@ -5929,7 +5927,7 @@ mod tests {
 
     #[test]
     fn test_record_format_empty_payload() {
-        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        use crate::record_format::{RecordType, encode_record_into, validate_record};
         let mut buf = Vec::new();
         let size = encode_record_into(&mut buf, RecordType::Vote, 0, &[]);
         assert_eq!(buf.len(), size);
@@ -5942,7 +5940,7 @@ mod tests {
 
     #[test]
     fn test_record_format_max_group_id() {
-        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        use crate::record_format::{RecordType, encode_record_into, validate_record};
         let mut buf = Vec::new();
         let max_group_id = 0xFF_FFFFu64; // u24 max
         encode_record_into(&mut buf, RecordType::Entry, max_group_id, b"test");
@@ -5953,7 +5951,7 @@ mod tests {
 
     #[test]
     fn test_record_format_crc_mismatch() {
-        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        use crate::record_format::{RecordType, encode_record_into, validate_record};
         let mut buf = Vec::new();
         encode_record_into(&mut buf, RecordType::Entry, 0, b"payload");
 
@@ -5970,7 +5968,7 @@ mod tests {
 
     #[test]
     fn test_record_format_too_short() {
-        use crate::multi::record_format::validate_record;
+        use crate::record_format::validate_record;
         // Less than minimum record size (type + group_id + crc = 12)
         let short = [0u8; 11];
         let result = validate_record(&short, 1024);
@@ -5979,7 +5977,7 @@ mod tests {
 
     #[test]
     fn test_record_format_exceeds_max_size() {
-        use crate::multi::record_format::{RecordType, encode_record_into, validate_record};
+        use crate::record_format::{RecordType, encode_record_into, validate_record};
         let mut buf = Vec::new();
         let large_payload = vec![0u8; 2000];
         encode_record_into(&mut buf, RecordType::Entry, 0, &large_payload);
@@ -5998,7 +5996,7 @@ mod tests {
 
     #[test]
     fn test_record_format_invalid_type() {
-        use crate::multi::record_format::validate_record;
+        use crate::record_format::validate_record;
         // Build a "record" with invalid type byte (0xFF)
         // [type(1)][group_id(3)][crc(8)] = 12 bytes minimum
         let mut data = vec![0xFF, 0, 0, 0]; // type=0xFF, group_id=0
@@ -6012,7 +6010,7 @@ mod tests {
 
     #[test]
     fn test_record_type_flags_roundtrip() {
-        use crate::multi::record_format::RecordTypeFlags;
+        use crate::record_format::RecordTypeFlags;
 
         let flags = RecordTypeFlags {
             has_vote: true,
@@ -6044,7 +6042,7 @@ mod tests {
 
     #[test]
     fn test_record_type_flags_merge() {
-        use crate::multi::record_format::RecordTypeFlags;
+        use crate::record_format::RecordTypeFlags;
 
         let a = RecordTypeFlags {
             has_vote: true,
@@ -6067,7 +6065,7 @@ mod tests {
 
     #[test]
     fn test_record_type_flags_has_only_entries() {
-        use crate::multi::record_format::RecordTypeFlags;
+        use crate::record_format::RecordTypeFlags;
 
         let entry_only = RecordTypeFlags {
             has_vote: false,
@@ -6091,7 +6089,7 @@ mod tests {
 
     #[test]
     fn test_u24_roundtrip() {
-        use crate::multi::record_format::{read_u24_le, write_u24_le};
+        use crate::record_format::{read_u24_le, write_u24_le};
         let mut buf = [0u8; 3];
 
         // Typical values
@@ -6110,7 +6108,7 @@ mod tests {
 
     #[test]
     fn test_log_index_basic_operations() {
-        use crate::multi::record_format::{LogIndex, LogLocation};
+        use crate::record_format::{LogIndex, LogLocation};
         let idx = LogIndex::new();
 
         // Insert and get
@@ -6149,7 +6147,7 @@ mod tests {
 
     #[test]
     fn test_log_index_truncate_from() {
-        use crate::multi::record_format::{LogIndex, LogLocation};
+        use crate::record_format::{LogIndex, LogLocation};
         let idx = LogIndex::new();
 
         for i in 1..=10 {
@@ -6185,7 +6183,7 @@ mod tests {
 
     #[test]
     fn test_log_index_purge_to() {
-        use crate::multi::record_format::{LogIndex, LogLocation};
+        use crate::record_format::{LogIndex, LogLocation};
         let idx = LogIndex::new();
 
         for i in 1..=10 {
@@ -6213,7 +6211,7 @@ mod tests {
 
     #[test]
     fn test_log_index_slot_recycling() {
-        use crate::multi::record_format::{LogIndex, LogLocation};
+        use crate::record_format::{LogIndex, LogLocation};
         let idx = LogIndex::new();
 
         // Insert entries
@@ -7055,7 +7053,7 @@ mod tests {
     #[test]
     fn test_log_index_concurrent_insert_and_read() {
         // Concurrent inserts to LogIndex — all succeed, reads consistent.
-        use crate::multi::record_format::{LogIndex, LogLocation};
+        use crate::record_format::{LogIndex, LogLocation};
         use std::sync::Arc;
 
         let idx = Arc::new(LogIndex::new());
@@ -7217,7 +7215,7 @@ mod tests {
     #[test]
     fn test_log_index_scale() {
         // LogIndex with many entries — operations still work.
-        use crate::multi::record_format::{LogIndex, LogLocation};
+        use crate::record_format::{LogIndex, LogLocation};
         let idx = LogIndex::new();
         let n = 100_000u64;
 

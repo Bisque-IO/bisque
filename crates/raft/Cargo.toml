@@ -10,8 +10,7 @@ keywords = ["raft", "consensus", "distributed", "async"]
 categories = ["asynchronous", "network-programming"]
 
 [features]
-default = ["multi", "tls"]
-multi = []
+default = ["tls"]
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
 
 [dependencies]

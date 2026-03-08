@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bisque_raft::BisqueRaftTypeConfig;
-use bisque_raft::multi::NodeAddressResolver;
-use bisque_raft::multi::codec::{self, Decode, Encode};
-use bisque_raft::multi::network::GroupNetworkFactory;
-use bisque_raft::multi::{
+use bisque_raft::NodeAddressResolver;
+use bisque_raft::codec::{self, Decode, Encode};
+use bisque_raft::network::GroupNetworkFactory;
+use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiRaftNetworkFactory,
     MultiplexedLogStorage,
@@ -801,7 +801,7 @@ fn test_multiplexed_transport_concurrent_requests() {
             let completed = completed.clone();
             let errors = errors.clone();
             handles.push(tokio::spawn(async move {
-                use bisque_raft::multi::MultiplexedTransport;
+                use bisque_raft::MultiplexedTransport;
                 let result = transport
                     .send_append_entries(
                         2,
@@ -879,7 +879,7 @@ fn test_vote_rpc_stress() {
             let transport = transport.clone();
             let completed = completed.clone();
             handles.push(tokio::spawn(async move {
-                use bisque_raft::multi::MultiplexedTransport;
+                use bisque_raft::MultiplexedTransport;
                 let result = transport
                     .send_vote(
                         2,
@@ -949,7 +949,7 @@ fn test_transport_concurrent_stress() {
             let transport = transport.clone();
             let completed = completed.clone();
             handles.push(tokio::spawn(async move {
-                use bisque_raft::multi::MultiplexedTransport;
+                use bisque_raft::MultiplexedTransport;
                 if transport
                     .send_append_entries(
                         2,
@@ -1511,7 +1511,7 @@ fn test_group_pinned_basic_rpc() {
             registry,
         ));
 
-        use bisque_raft::multi::MultiplexedTransport;
+        use bisque_raft::MultiplexedTransport;
 
         // AppendEntries
         let resp = transport
@@ -1579,7 +1579,7 @@ fn test_group_pinned_concurrent_throughput() {
             let completed = completed.clone();
             let errors = errors.clone();
             handles.push(tokio::spawn(async move {
-                use bisque_raft::multi::MultiplexedTransport;
+                use bisque_raft::MultiplexedTransport;
                 let result = transport
                     .send_append_entries(
                         2,
@@ -1641,7 +1641,7 @@ fn test_group_pinned_multi_group_isolation() {
             registry,
         ));
 
-        use bisque_raft::multi::MultiplexedTransport;
+        use bisque_raft::MultiplexedTransport;
 
         let num_groups = 4u64;
         let requests_per_group = 1_000u64;
@@ -1709,7 +1709,7 @@ fn test_group_pinned_connection_refresh() {
             registry,
         ));
 
-        use bisque_raft::multi::MultiplexedTransport;
+        use bisque_raft::MultiplexedTransport;
 
         let total = 5_000u64;
         let completed = Arc::new(AtomicU64::new(0));
@@ -1781,7 +1781,7 @@ fn test_group_pinned_error_recovery() {
             registry,
         ));
 
-        use bisque_raft::multi::MultiplexedTransport;
+        use bisque_raft::MultiplexedTransport;
 
         // No server running — connection should fail
         let resp = transport

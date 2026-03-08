@@ -43,7 +43,7 @@ use bisque_lance::{
     BisqueLance, BisqueLanceConfig, LanceRaftNode, LanceStateMachine, LanceTypeConfig,
     WriteBatcherConfig,
 };
-use bisque_raft::multi::{
+use bisque_raft::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
     MultiRaftManager, MultiplexedLogStorage, NodeAddressResolver,
 };

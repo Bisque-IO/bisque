@@ -37,8 +37,8 @@
 //! in all groups, demonstrating how multi-raft enables horizontal scaling.
 
 use bisque_raft::BisqueRaftTypeConfig;
-use bisque_raft::multi::codec::{BorrowPayload, CodecError, Decode, Encode};
-use bisque_raft::multi::{
+use bisque_raft::codec::{BorrowPayload, CodecError, Decode, Encode};
+use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
     NodeAddressResolver,

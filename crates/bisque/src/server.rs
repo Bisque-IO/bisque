@@ -29,7 +29,7 @@ use bisque_meta::MetaConfig;
 use bisque_meta::engine::MetaEngine;
 use bisque_meta::token::{self, TokenClaims, TokenManager};
 use bisque_meta::types::{Account, CatalogEntry, EngineType, Scope, Tenant, TenantLimits};
-use bisque_raft::multi::{
+use bisque_raft::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
     MultiRaftManager, MultiplexedLogStorage, NodeAddressResolver,
 };
@@ -37,7 +37,7 @@ use bisque_raft::multi::{
 use crate::auth::{AuthContext, AuthState, auth_middleware};
 use crate::config::BisqueConfig;
 use crate::error::ApiError;
-use crate::ws::{WsState, unified_ws_handler};
+use crate::ws::{WsMetrics, WsState, unified_ws_handler};
 
 /// Shared application state for the unified server.
 #[derive(Clone)]
@@ -138,7 +138,9 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
 
     // 2a. Open the BisqueLance multi-table storage engine.
     let lance_config = BisqueLanceConfig::new(&lance_dir);
-    let engine = Arc::new(BisqueLance::open(lance_config).await?);
+    let catalog_name = "bisque".to_string();
+    let engine =
+        Arc::new(BisqueLance::open_with_catalog(lance_config, catalog_name.clone()).await?);
     info!(data_dir = %lance_dir.display(), "lance engine opened");
 
     // 2b. Set up Raft log storage (memory-mapped).
@@ -208,6 +210,7 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
     let raft_node = Arc::new(
         LanceRaftNode::new(raft, engine.clone(), node_id)
             .with_group_id(group_id)
+            .with_catalog_name(catalog_name.clone())
             .with_write_batcher(WriteBatcherConfig::default()),
     );
     raft_node.start();
@@ -239,6 +242,7 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         Some(catalog_bus),
         Some(manifest),
         group_id,
+        catalog_name,
         None, // ClusterMesh — wire up for multi-node
     );
 
@@ -278,6 +282,7 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         token_manager: token_manager.clone(),
         raft_node: raft_node.clone(),
         ip_connections: Arc::new(dashmap::DashMap::new()),
+        metrics: Arc::new(WsMetrics::new()),
     };
     let ws_route =
         axum::Router::new().route("/_bisque/ws", get(unified_ws_handler).with_state(ws_state));
@@ -350,7 +355,22 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
     // -----------------------------------------------------------------------
     // 5. Start unified HTTP server with graceful shutdown
     // -----------------------------------------------------------------------
-    let listener = tokio::net::TcpListener::bind(config.http_addr).await?;
+    let listener = {
+        let addr = config.http_addr;
+        let domain = if addr.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        };
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.set_tcp_nodelay(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        tokio::net::TcpListener::from_std(std::net::TcpListener::from(socket))?
+    };
     let http_addr = listener.local_addr()?;
     info!(addr = %http_addr, "starting bisque unified HTTP server");
 

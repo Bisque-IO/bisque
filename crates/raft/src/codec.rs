@@ -1388,7 +1388,7 @@ where
 mod tests {
     use super::*;
 
-    type C = crate::multi::test_support::TestConfig;
+    type C = crate::test_support::TestConfig;
 
     fn make_leader_id(term: u64, node_id: u64) -> openraft::impls::leader_id_adv::LeaderId<C> {
         openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id }
@@ -1510,7 +1510,7 @@ mod tests {
             entries: vec![
                 openraft::impls::Entry::<C> {
                     log_id: make_log_id(5, 10, 100),
-                    payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(
+                    payload: openraft::EntryPayload::Normal(crate::test_support::TestBytes(
                         vec![1, 2, 3].into(),
                     )),
                 },
@@ -1796,7 +1796,7 @@ mod tests {
     #[test]
     fn test_codec_many_entries_roundtrip() {
         // AppendEntries with many entries — roundtrip
-        use crate::multi::test_support::TestBytes;
+        use crate::test_support::TestBytes;
 
         let vote = make_vote(5, 2, true);
         let entries: Vec<openraft::impls::Entry<C>> = (1..=100)

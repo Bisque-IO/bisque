@@ -1760,7 +1760,7 @@ mod tests {
 
     #[test]
     fn test_manifest_encode_decode_record_type_flags() {
-        use crate::multi::record_format::RecordTypeFlags;
+        use crate::record_format::RecordTypeFlags;
 
         let meta = SegmentMeta {
             group_id: 1,

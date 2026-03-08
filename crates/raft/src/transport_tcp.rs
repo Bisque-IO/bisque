@@ -9,8 +9,8 @@
 //! uses a lock-free FIFO channel: the writer pushes oneshot senders in request
 //! order, the reader pops them to match responses — no mutex on the hot path.
 
-use crate::multi::codec::{Decode, Encode, RpcMessage};
-use crate::multi::network::MultiplexedTransport;
+use crate::codec::{Decode, Encode, RpcMessage};
+use crate::network::MultiplexedTransport;
 use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use openraft::RaftTypeConfig;
@@ -935,7 +935,7 @@ where
 
         match response {
             RpcMessage::Response {
-                message: crate::multi::codec::ResponseMessage::AppendEntries(resp),
+                message: crate::codec::ResponseMessage::AppendEntries(resp),
                 ..
             } => Ok(resp),
             RpcMessage::Error { error, .. } => {
@@ -974,7 +974,7 @@ where
 
         match response {
             RpcMessage::Response {
-                message: crate::multi::codec::ResponseMessage::Vote(resp),
+                message: crate::codec::ResponseMessage::Vote(resp),
                 ..
             } => Ok(resp),
             RpcMessage::Error { error, .. } => {
@@ -1013,7 +1013,7 @@ where
 
         match response {
             RpcMessage::Response {
-                message: crate::multi::codec::ResponseMessage::InstallSnapshot(resp),
+                message: crate::codec::ResponseMessage::InstallSnapshot(resp),
                 ..
             } => Ok(resp),
             RpcMessage::Error { error, .. } => {
@@ -1027,7 +1027,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi::test_support::run_async;
+    use crate::test_support::run_async;
 
     #[test]
     fn test_transport_config_default() {
@@ -1230,8 +1230,8 @@ mod tests {
     #[test]
     fn test_encode_framed_roundtrip() {
         // encode_framed + read via read_frame — full roundtrip
-        use crate::multi::codec::RpcMessage;
-        use crate::multi::test_support::TestConfig;
+        use crate::codec::RpcMessage;
+        use crate::test_support::TestConfig;
 
         run_async(async {
             let vote = openraft::impls::Vote::<TestConfig> {
@@ -1319,8 +1319,8 @@ mod tests {
 
     #[test]
     fn test_encode_framed_append_multiple() {
-        use crate::multi::codec::RpcMessage;
-        use crate::multi::test_support::TestConfig;
+        use crate::codec::RpcMessage;
+        use crate::test_support::TestConfig;
 
         let vote = openraft::impls::Vote::<TestConfig> {
             leader_id: openraft::impls::leader_id_adv::LeaderId {
@@ -1416,7 +1416,7 @@ mod tests {
 
     #[test]
     fn test_group_connection_basic_lifecycle() {
-        use crate::multi::type_config::ManiacRaftTypeConfig;
+        use crate::type_config::ManiacRaftTypeConfig;
 
         run_async(async {
             // Create a TCP listener

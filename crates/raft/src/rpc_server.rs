@@ -11,13 +11,13 @@
 //! - Each connection has separate reader and writer tasks
 //! - Request IDs correlate responses to their original requests
 
-use crate::multi::codec::{
+use crate::codec::{
     Decode, Encode, ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage,
 };
-use crate::multi::manager::MultiRaftManager;
-use crate::multi::network::MultiplexedTransport;
-use crate::multi::storage::MultiRaftLogStorage;
-use crate::multi::transport_tcp::{BoxedReader, BoxedWriter, FRAME_PREFIX_LEN, encode_framed};
+use crate::manager::MultiRaftManager;
+use crate::network::MultiplexedTransport;
+use crate::storage::MultiRaftLogStorage;
+use crate::transport_tcp::{BoxedReader, BoxedWriter, FRAME_PREFIX_LEN, encode_framed};
 use bytes::{Buf, BytesMut};
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -1076,7 +1076,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    type C = crate::multi::test_support::TestConfig;
+    type C = crate::test_support::TestConfig;
 
     fn test_vote() -> openraft::impls::Vote<C> {
         openraft::impls::Vote {

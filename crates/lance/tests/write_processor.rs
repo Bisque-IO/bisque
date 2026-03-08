@@ -19,7 +19,7 @@ use bisque_lance::{
     BisqueLance, BisqueLanceConfig, CounterAggregator, GaugeAggregator, LanceRaftNode,
     LanceStateMachine, LanceTypeConfig, WriteBatcherConfig, WriteProcessor,
 };
-use bisque_raft::multi::{
+use bisque_raft::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
     MultiRaftManager, MultiplexedLogStorage, NodeAddressResolver,
 };

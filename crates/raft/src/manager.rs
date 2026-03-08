@@ -1,7 +1,7 @@
-use crate::multi::network::GroupNetworkFactory;
-use crate::multi::network::MultiRaftNetworkFactory;
-use crate::multi::network::MultiplexedTransport;
-use crate::multi::storage::MultiRaftLogStorage;
+use crate::network::GroupNetworkFactory;
+use crate::network::MultiRaftNetworkFactory;
+use crate::network::MultiplexedTransport;
+use crate::storage::MultiRaftLogStorage;
 use dashmap::DashMap;
 use openraft::Config;
 use openraft::Raft;
@@ -141,8 +141,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi::test_support::run_async;
-    use crate::multi::type_config::ManiacRaftTypeConfig;
+    use crate::test_support::run_async;
+    use crate::type_config::ManiacRaftTypeConfig;
     use dashmap::DashMap;
     use openraft::error::{InstallSnapshotError, RPCError, RaftError};
     use openraft::raft::{

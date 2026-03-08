@@ -266,8 +266,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi::test_support::run_async;
-    use crate::multi::type_config::ManiacRaftTypeConfig;
+    use crate::test_support::run_async;
+    use crate::type_config::ManiacRaftTypeConfig;
     use dashmap::DashMap;
     use openraft::error::{RPCError, RaftError};
     use openraft::raft::{

@@ -1,40 +1,28 @@
-//! Dual Protocol Example: Arrow Flight SQL + PostgreSQL Wire Protocol
+//! S3 Client-Side Query Example
 //!
-//! Demonstrates running both protocol servers simultaneously:
+//! Demonstrates `BisqueClient` for fully client-side query execution
+//! with automatic catalog sync via WebSocket:
 //!
-//! 1. Start a single-node Raft cluster
-//! 2. Start Arrow Flight SQL server (for writes + reads)
-//! 3. Create tables and ingest data via Flight SQL
-//! 4. Start PostgreSQL wire protocol server (for reads via psql / JDBC)
-//! 5. Keep running until Ctrl+C
+//! 1. Start a single-node Raft cluster with catalog event bus
+//! 2. Start the S3-compatible HTTP server (with WebSocket endpoint)
+//! 3. Ingest initial data via Flight SQL
+//! 4. Connect `BisqueClient` — auto-discovers tables, opens datasets
+//! 5. Run SQL queries locally — client reads data through HTTP/S3
 //!
-//! After the example starts, connect with any PostgreSQL client:
-//!
-//! ```text
-//! psql -h 127.0.0.1 -p 5433
-//!
-//! \dt
-//! SELECT * FROM events;
-//! SELECT event_type, COUNT(*) FROM events GROUP BY event_type;
-//! ```
-//!
-//! Run with: cargo run --example postgres_server -p bisque-lance
+//! Run with: cargo run --example s3_client_query -p bisque-client
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{Float64Array, Int32Array, RecordBatch, StringArray, TimestampMillisecondArray};
-use arrow_flight::Action;
-use arrow_flight::sql::CommandStatementIngest;
-use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use tonic::transport::Channel;
 
+use bisque_client::{BisqueClient, CredentialConfig};
 use bisque_lance::flight::serve_flight;
-use bisque_lance::postgres::{PostgresServerConfig, serve_postgres};
 use bisque_lance::{
-    BisqueLance, BisqueLanceConfig, LanceRaftNode, LanceStateMachine, LanceTypeConfig,
+    BisqueLance, BisqueLanceConfig, CatalogEventBus, LanceRaftNode, LanceStateMachine,
+    LanceTypeConfig, serve_s3,
 };
 use bisque_raft::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
@@ -78,54 +66,33 @@ fn metrics_schema() -> Schema {
 // Test data generation
 // =============================================================================
 
-fn generate_events(schema: &Schema) -> RecordBatch {
-    let base_ts = 1_700_000_000_000i64;
+fn generate_events(schema: &Schema, base_ts: i64, count: usize) -> RecordBatch {
+    let users = ["alice", "bob", "carol", "dave"];
+    let events = ["page_view", "click", "signup", "purchase"];
+    let pages = [
+        Some("/home"),
+        Some("/products"),
+        Some("/about"),
+        None,
+        Some("/checkout"),
+    ];
+
+    let timestamps: Vec<i64> = (0..count).map(|i| base_ts + (i as i64) * 1_000).collect();
+    let user_ids: Vec<&str> = (0..count).map(|i| users[i % users.len()]).collect();
+    let event_types: Vec<&str> = (0..count).map(|i| events[i % events.len()]).collect();
+    let page_list: Vec<Option<&str>> = (0..count).map(|i| pages[i % pages.len()]).collect();
+    let durations: Vec<Option<i32>> = (0..count)
+        .map(|i| Some(30 + (i as i32 * 47) % 500))
+        .collect();
+
     RecordBatch::try_new(
         Arc::new(schema.clone()),
         vec![
-            Arc::new(TimestampMillisecondArray::from(vec![
-                base_ts,
-                base_ts + 1_000,
-                base_ts + 2_000,
-                base_ts + 3_000,
-                base_ts + 4_000,
-                base_ts + 5_000,
-                base_ts + 6_000,
-                base_ts + 7_000,
-            ])),
-            Arc::new(StringArray::from(vec![
-                "alice", "bob", "alice", "carol", "bob", "alice", "dave", "carol",
-            ])),
-            Arc::new(StringArray::from(vec![
-                "page_view",
-                "click",
-                "page_view",
-                "signup",
-                "page_view",
-                "click",
-                "page_view",
-                "purchase",
-            ])),
-            Arc::new(StringArray::from(vec![
-                Some("/home"),
-                Some("/products"),
-                Some("/about"),
-                None,
-                Some("/home"),
-                Some("/checkout"),
-                Some("/products"),
-                None,
-            ])),
-            Arc::new(Int32Array::from(vec![
-                Some(120),
-                Some(45),
-                Some(200),
-                Some(350),
-                Some(90),
-                Some(30),
-                Some(150),
-                Some(500),
-            ])),
+            Arc::new(TimestampMillisecondArray::from(timestamps)),
+            Arc::new(StringArray::from(user_ids)),
+            Arc::new(StringArray::from(event_types)),
+            Arc::new(StringArray::from(page_list)),
+            Arc::new(Int32Array::from(durations)),
         ],
     )
     .expect("failed to create events batch")
@@ -156,14 +123,26 @@ fn generate_metrics(schema: &Schema) -> RecordBatch {
 // Helpers
 // =============================================================================
 
+/// Encode a create_table action body: u16 BE name_len + name + IPC schema
 fn encode_create_table(name: &str, schema: &Schema) -> bytes::Bytes {
     let name_bytes = name.as_bytes();
-    let schema_bytes = bisque_lance::ipc::schema_to_ipc(schema).expect("schema_to_ipc");
+    let schema_bytes = bisque_client::ipc::schema_to_ipc(schema).expect("schema_to_ipc");
     let mut buf = Vec::with_capacity(2 + name_bytes.len() + schema_bytes.len());
     buf.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
     buf.extend_from_slice(name_bytes);
     buf.extend_from_slice(&schema_bytes);
     bytes::Bytes::from(buf)
+}
+
+fn print_batches(batches: &[RecordBatch]) {
+    if batches.is_empty() {
+        println!("    (no results)");
+        return;
+    }
+    let formatted = arrow_cast::pretty::pretty_format_batches(batches).expect("formatting error");
+    for line in formatted.to_string().lines() {
+        println!("    {line}");
+    }
 }
 
 // =============================================================================
@@ -175,30 +154,60 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
 
-    println!("=== bisque-lance: Dual Protocol (Flight SQL + PostgreSQL) ===\n");
+    println!("=== bisque-client: BisqueClient Auto-Sync Example ===\n");
 
     let temp_dir = tempfile::tempdir()?;
 
     // =========================================================================
-    // Step 1: Set up single-node Raft cluster
+    // Step 1: Set up single-node Raft cluster with catalog event bus
     // =========================================================================
-    println!("--- Step 1: Start Raft Node ---\n");
+    println!("--- Step 1: Start Raft Node (with catalog events) ---\n");
 
-    let (raft_node, _manager) = setup_single_node_raft(temp_dir.path()).await?;
+    let catalog_bus = Arc::new(CatalogEventBus::new(0));
+    let (raft_node, _manager) =
+        setup_single_node_raft(temp_dir.path(), catalog_bus.clone()).await?;
     raft_node.start();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..20 {
+        if raft_node.is_leader() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     assert!(raft_node.is_leader(), "single node should be leader");
-    println!("  Raft node is leader");
+    println!("  Raft node is leader (catalog event bus active)");
 
     // =========================================================================
-    // Step 2: Start Flight SQL server
+    // Step 2: Start S3 + WebSocket server
     // =========================================================================
-    println!("\n--- Step 2: Start Flight SQL Server ---\n");
+    println!("\n--- Step 2: Start S3 + WebSocket Server ---\n");
+
+    let s3_addr: std::net::SocketAddr = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        addr
+    };
+
+    let engine = raft_node.engine().clone();
+    let bus_for_s3 = catalog_bus.clone();
+    let s3_addr_clone = s3_addr;
+    tokio::spawn(async move {
+        serve_s3(engine, s3_addr_clone, Some(bus_for_s3), None, 1)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    println!("  S3 + WebSocket server listening on {s3_addr}");
+
+    // =========================================================================
+    // Step 3: Start Flight SQL server and ingest initial data
+    // =========================================================================
+    println!("\n--- Step 3: Create Tables & Ingest Initial Data ---\n");
 
     let flight_addr = {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -206,49 +215,41 @@ async fn main() -> anyhow::Result<()> {
         drop(listener);
         addr
     };
-    println!("  Flight SQL server listening on {flight_addr}");
 
     let raft_for_flight = raft_node.clone();
     tokio::spawn(async move {
         serve_flight(raft_for_flight, flight_addr).await.unwrap();
     });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // =========================================================================
-    // Step 3: Ingest data via Flight SQL client
-    // =========================================================================
-    println!("\n--- Step 3: Create Tables + Ingest Data via Flight SQL ---\n");
+    use arrow_flight::Action;
+    use arrow_flight::sql::CommandStatementIngest;
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+    use tonic::transport::Channel;
 
     let channel = Channel::from_shared(format!("http://{flight_addr}"))
         .unwrap()
         .connect()
         .await?;
-    let mut client = FlightSqlServiceClient::new(channel);
-    client.handshake("anonymous", "").await?;
+    let mut flight_client = FlightSqlServiceClient::new(channel);
+    flight_client.handshake("anonymous", "").await?;
 
     let ev_schema = events_schema();
     let met_schema = metrics_schema();
 
     // Create tables
     let action = Action::new("create_table", encode_create_table("events", &ev_schema));
-    let mut results = client.do_action(action).await?;
-    let result = results.message().await?.expect("expected result");
-    println!(
-        "  Created 'events': {}",
-        String::from_utf8_lossy(&result.body)
-    );
+    let mut results = flight_client.do_action(action).await?;
+    let _ = results.message().await?;
+    println!("  Created 'events' table");
 
     let action = Action::new("create_table", encode_create_table("metrics", &met_schema));
-    let mut results = client.do_action(action).await?;
-    let result = results.message().await?.expect("expected result");
-    println!(
-        "  Created 'metrics': {}",
-        String::from_utf8_lossy(&result.body)
-    );
+    let mut results = flight_client.do_action(action).await?;
+    let _ = results.message().await?;
+    println!("  Created 'metrics' table");
 
-    // Ingest data
-    let events_batch = generate_events(&ev_schema);
+    // Ingest initial data (8 events, 4 metrics)
+    let events_batch = generate_events(&ev_schema, 1_700_000_000_000, 8);
     let cmd = CommandStatementIngest {
         table: "events".to_string(),
         schema: None,
@@ -258,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
         options: Default::default(),
         table_definition_options: Default::default(),
     };
-    let rows = client
+    let rows = flight_client
         .execute_ingest(cmd, futures::stream::iter(vec![Ok(events_batch)]))
         .await?;
     println!("  Ingested {rows} rows into 'events'");
@@ -273,45 +274,84 @@ async fn main() -> anyhow::Result<()> {
         options: Default::default(),
         table_definition_options: Default::default(),
     };
-    let rows = client
+    let rows = flight_client
         .execute_ingest(cmd, futures::stream::iter(vec![Ok(metrics_batch)]))
         .await?;
     println!("  Ingested {rows} rows into 'metrics'");
 
     // =========================================================================
-    // Step 4: Start PostgreSQL wire protocol server
+    // Step 4: Connect BisqueClient — auto-discovers tables
     // =========================================================================
-    println!("\n--- Step 4: Start PostgreSQL Wire Protocol Server ---\n");
+    println!("\n--- Step 4: Connect BisqueClient ---\n");
 
-    let pg_port = 5433u16;
-    let pg_config = PostgresServerConfig {
-        host: "127.0.0.1".to_string(),
-        port: pg_port,
-    };
+    let credentials = Arc::new(CredentialConfig::new());
+    let persist_dir = temp_dir.path().join("bisque-client");
+    let bisque_client = BisqueClient::connect(
+        format!("http://{}", s3_addr),
+        vec!["bisque".to_string()],
+        credentials,
+        Some(&persist_dir),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    println!("  PostgreSQL server starting on 127.0.0.1:{pg_port}");
-    println!();
-    println!("  Connect with:");
-    println!("    psql -h 127.0.0.1 -p {pg_port}");
-    println!();
-    println!("  Try these queries:");
-    println!("    \\dt");
-    println!("    SELECT * FROM events;");
-    println!("    SELECT event_type, COUNT(*) FROM events GROUP BY event_type;");
-    println!("    SELECT host, AVG(cpu_pct) as avg_cpu FROM metrics GROUP BY host;");
-    println!();
-    println!("  Press Ctrl+C to stop.\n");
+    println!("  BisqueClient connected (tables auto-discovered)");
 
-    // This blocks until the server shuts down
-    serve_postgres(raft_node, pg_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // =========================================================================
+    // Step 5: Run SQL queries via BisqueClient
+    // =========================================================================
+    println!("\n--- Step 5: Query via BisqueClient ---\n");
+
+    // Query 1: Count events
+    println!("  >> SELECT COUNT(*) as total FROM events\n");
+    let batches = bisque_client
+        .sql("SELECT COUNT(*) as total FROM events")
+        .await?;
+    print_batches(&batches);
+
+    // Query 2: Events by type
+    println!(
+        "\n  >> SELECT event_type, COUNT(*) as cnt FROM events GROUP BY event_type ORDER BY cnt DESC\n"
+    );
+    let batches = bisque_client
+        .sql("SELECT event_type, COUNT(*) as cnt FROM events GROUP BY event_type ORDER BY cnt DESC")
+        .await?;
+    print_batches(&batches);
+
+    // Query 3: Metrics aggregation
+    println!(
+        "\n  >> SELECT host, AVG(cpu_pct) as avg_cpu, MAX(mem_mb) as max_mem FROM metrics GROUP BY host\n"
+    );
+    let batches = bisque_client
+        .sql("SELECT host, AVG(cpu_pct) as avg_cpu, MAX(mem_mb) as max_mem FROM metrics GROUP BY host")
+        .await?;
+    print_batches(&batches);
+
+    // Query 4: Cross-table summary
+    println!(
+        "\n  >> SELECT 'events' as source, COUNT(*) as rows FROM events UNION ALL SELECT 'metrics', COUNT(*) FROM metrics\n"
+    );
+    let batches = bisque_client
+        .sql("SELECT 'events' as source, COUNT(*) as rows FROM events UNION ALL SELECT 'metrics', COUNT(*) FROM metrics")
+        .await?;
+    print_batches(&batches);
+
+    // =========================================================================
+    // Done
+    // =========================================================================
+    println!("\n--- Shutdown ---\n");
+    flight_client.close().await?;
+    bisque_client.close().await;
+    raft_node.shutdown().await;
+    println!("  All queries executed on the client via BisqueClient");
+    println!("  Shut down gracefully");
+    println!("\n=== Example completed successfully! ===\n");
 
     Ok(())
 }
 
 // =============================================================================
-// Raft bootstrap (single-node cluster)
+// Raft bootstrap (single-node cluster with catalog events)
 // =============================================================================
 
 type NodeRegistry = DefaultNodeRegistry<u64>;
@@ -321,6 +361,7 @@ type Manager = MultiRaftManager<LanceTypeConfig, Transport, Storage>;
 
 async fn setup_single_node_raft(
     base_dir: &std::path::Path,
+    catalog_bus: Arc<CatalogEventBus>,
 ) -> anyhow::Result<(Arc<LanceRaftNode>, Arc<Manager>)> {
     let node_id: u64 = 1;
     let group_id: u64 = 1;
@@ -351,7 +392,9 @@ async fn setup_single_node_raft(
         .expect("invalid raft config"),
     );
 
-    let state_machine = LanceStateMachine::new(engine.clone());
+    let state_machine = LanceStateMachine::new(engine.clone())
+        .with_catalog_events(catalog_bus)
+        .with_catalog_name("bisque".to_string());
     let raft = manager
         .add_group(group_id, node_id, raft_config, state_machine)
         .await

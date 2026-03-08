@@ -36,7 +36,7 @@ use bisque_lance::flight::serve_flight;
 use bisque_lance::{
     BisqueLance, BisqueLanceConfig, LanceRaftNode, LanceStateMachine, LanceTypeConfig,
 };
-use bisque_raft::multi::{
+use bisque_raft::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
     MultiRaftManager, MultiplexedLogStorage, NodeAddressResolver,
 };

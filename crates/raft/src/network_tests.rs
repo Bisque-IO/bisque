@@ -16,10 +16,10 @@
 //! - Server idle timeout
 //! - End-to-end client↔server RPC roundtrips
 
-use crate::multi::codec::{
+use crate::codec::{
     Decode, Encode, ResponseMessage as CodecResponseMessage, RpcMessage as CodecRpcMessage,
 };
-use crate::multi::transport_tcp::{
+use crate::transport_tcp::{
     BisqueTransportError, FRAME_PREFIX_LEN, encode_framed, read_frame, read_frame_into,
     return_encode_buffer, write_frame, write_preframed,
 };
@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-type C = crate::multi::test_support::TestConfig;
+type C = crate::test_support::TestConfig;
 
 // ============================================================================
 // Helpers
@@ -173,7 +173,7 @@ async fn test_read_frame_into_reuses_buffer_capacity() {
                         },
                         index: 1,
                     },
-                    payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(
+                    payload: openraft::EntryPayload::Normal(crate::test_support::TestBytes(
                         vec![0xAB; 4096].into(),
                     )),
                 }],
@@ -415,7 +415,7 @@ async fn test_rolling_buffer_large_frame() {
                     },
                     index: 1,
                 },
-                payload: openraft::EntryPayload::Normal(crate::multi::test_support::TestBytes(
+                payload: openraft::EntryPayload::Normal(crate::test_support::TestBytes(
                     vec![0xDE; 128 * 1024].into(),
                 )),
             }],
@@ -726,7 +726,7 @@ async fn test_rolling_buffer_read_timeout() {
 
 #[tokio::test]
 async fn test_transport_config_basic() {
-    use crate::multi::transport_tcp::BisqueTcpTransportConfig;
+    use crate::transport_tcp::BisqueTcpTransportConfig;
 
     let config = BisqueTcpTransportConfig {
         write_channel_capacity: 128,
@@ -741,7 +741,7 @@ async fn test_transport_config_basic() {
 
 #[tokio::test]
 async fn test_transport_config_ttl() {
-    use crate::multi::transport_tcp::BisqueTcpTransportConfig;
+    use crate::transport_tcp::BisqueTcpTransportConfig;
 
     let config = BisqueTcpTransportConfig {
         connection_ttl: Duration::from_secs(1),
@@ -1172,7 +1172,7 @@ fn test_encode_framed_reuse_reduces_allocations() {
 
 #[test]
 fn test_default_node_registry() {
-    use crate::multi::transport_tcp::{DefaultNodeRegistry, NodeAddressResolver};
+    use crate::transport_tcp::{DefaultNodeRegistry, NodeAddressResolver};
 
     let registry = DefaultNodeRegistry::<u64>::new();
 
@@ -1198,7 +1198,7 @@ fn test_default_node_registry() {
 
 #[test]
 fn test_node_registry_overwrite() {
-    use crate::multi::transport_tcp::{DefaultNodeRegistry, NodeAddressResolver};
+    use crate::transport_tcp::{DefaultNodeRegistry, NodeAddressResolver};
 
     let registry = DefaultNodeRegistry::<u64>::new();
     let addr1: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
@@ -1566,7 +1566,7 @@ async fn test_multiple_connections_to_same_server() {
 
 #[test]
 fn test_rpc_server_config_all_fields() {
-    use crate::multi::rpc_server::BisqueRpcServerConfig;
+    use crate::rpc_server::BisqueRpcServerConfig;
 
     let config = BisqueRpcServerConfig::default();
     assert_eq!(config.max_connections, 1000);
@@ -1581,7 +1581,7 @@ fn test_rpc_server_config_all_fields() {
 
 #[test]
 fn test_transport_config_all_fields() {
-    use crate::multi::transport_tcp::BisqueTcpTransportConfig;
+    use crate::transport_tcp::BisqueTcpTransportConfig;
 
     let config = BisqueTcpTransportConfig::default();
     assert_eq!(config.write_channel_capacity, 256);
@@ -1882,7 +1882,7 @@ async fn test_tls_frame_roundtrip() {
 /// TLS client ↔ server multi-frame exchange using BoxedReader/BoxedWriter
 #[tokio::test]
 async fn test_tls_boxed_stream_split() {
-    use crate::multi::transport_tcp::{BoxedReader, BoxedWriter};
+    use crate::transport_tcp::{BoxedReader, BoxedWriter};
 
     let (server_cert, server_key, ca_cert) = generate_test_certs();
     let server_config = build_server_config(server_cert, server_key);

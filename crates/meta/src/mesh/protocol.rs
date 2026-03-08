@@ -2,11 +2,11 @@
 //!
 //! Uses the same 4-byte LE length-prefixed framing as the Raft transport,
 //! with manual `Encode`/`Decode` implementations matching the codec patterns
-//! in `bisque_raft::multi::codec`.
+//! in `bisque_raft::codec`.
 
 use std::io::{Read, Write};
 
-use bisque_raft::multi::codec::{CodecError, Decode, Encode};
+use bisque_raft::codec::{CodecError, Decode, Encode};
 
 // ============================================================================
 // NodeHealth

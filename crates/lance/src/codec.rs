@@ -6,9 +6,11 @@
 //! The `decode_from_bytes` override enables zero-copy decoding of large
 //! payloads (IPC-encoded RecordBatches) from mmap-backed `Bytes` buffers.
 
-use bisque_raft::multi::codec::{BorrowPayload, CodecError, Decode, Encode};
-use bytes::Bytes;
 use std::io::{Read, Write};
+use std::sync::Arc;
+
+use bisque_raft::codec::{BorrowPayload, CodecError, Decode, Encode};
+use bytes::Bytes;
 
 use crate::types::{LanceCommand, SealReason};
 
@@ -40,24 +42,17 @@ fn encode_table_name<W: Write>(name: &str, writer: &mut W) -> Result<(), CodecEr
 
 /// Decode a table name from a length-prefixed (u16) UTF-8 string.
 #[inline]
-fn decode_table_name<R: Read>(reader: &mut R) -> Result<String, CodecError> {
+fn decode_table_name<R: Read>(reader: &mut R) -> Result<Arc<str>, CodecError> {
     let len = u16::decode(reader)? as usize;
-    // Allocate directly as a String buffer — avoids intermediate Vec + from_utf8.
-    let mut s = String::with_capacity(len);
-    // SAFETY: We fill exactly `len` bytes via read_exact, then validate UTF-8.
-    unsafe {
-        let buf = s.as_mut_vec();
-        buf.set_len(len);
-        reader.read_exact(buf)?;
-    }
-    // Validate UTF-8. On error, `s` is dropped cleanly since it's valid memory.
-    if std::str::from_utf8(s.as_bytes()).is_err() {
-        return Err(CodecError::Io(std::io::Error::new(
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf)?;
+    let s = String::from_utf8(buf).map_err(|_| {
+        CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "table name is not valid UTF-8",
-        )));
-    }
-    Ok(s)
+        ))
+    })?;
+    Ok(Arc::from(s))
 }
 
 /// Decode a table name from a `Bytes` buffer at the given offset.
@@ -66,7 +61,7 @@ fn decode_table_name<R: Read>(reader: &mut R) -> Result<String, CodecError> {
 fn decode_table_name_from_bytes(
     data: &Bytes,
     offset: usize,
-) -> Result<(String, usize), CodecError> {
+) -> Result<(Arc<str>, usize), CodecError> {
     if data.len() < offset + 2 {
         return Err(CodecError::BufferTooSmall {
             needed: offset + 2,
@@ -82,9 +77,8 @@ fn decode_table_name_from_bytes(
         });
     }
     let name = std::str::from_utf8(&data[offset + 2..name_end])
-        .map_err(|e| CodecError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?
-        .to_owned();
-    Ok((name, 2 + len))
+        .map_err(|e| CodecError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    Ok((Arc::from(name), 2 + len))
 }
 
 /// Read a u64 from a `Bytes` buffer at the given offset.
@@ -113,6 +107,21 @@ fn read_u32_at(data: &[u8], offset: usize) -> Result<u32, CodecError> {
     Ok(u32::from_le_bytes(
         data[offset..offset + 4].try_into().unwrap(),
     ))
+}
+
+/// Validate UTF-8 on a byte slice and convert to `String`.
+///
+/// Validates in-place on the borrowed slice; only allocates the `String`
+/// after validation succeeds, avoiding allocation on malformed input.
+#[inline]
+fn validated_utf8_string(data: &[u8], offset: usize, len: usize) -> Result<String, CodecError> {
+    let s = std::str::from_utf8(&data[offset..offset + len]).map_err(|_| {
+        CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "filter is not valid UTF-8",
+        ))
+    })?;
+    Ok(s.to_owned())
 }
 
 /// Encoded size of a table name (2-byte length prefix + UTF-8 bytes).
@@ -560,13 +569,9 @@ impl Decode for LanceCommand {
                         have: data.len(),
                     });
                 }
-                let filter = String::from_utf8(data[offset..offset + filter_len].to_vec())
-                    .map_err(|_| {
-                        CodecError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "filter is not valid UTF-8",
-                        ))
-                    })?;
+                // Validate UTF-8 on the slice, then create String from the
+                // zero-copy Bytes slice to avoid a redundant memcpy.
+                let filter = validated_utf8_string(&data, offset, filter_len)?;
                 Ok(LanceCommand::DeleteRecords { table_name, filter })
             }
             CMD_UPDATE_RECORDS => {
@@ -580,13 +585,7 @@ impl Decode for LanceCommand {
                         have: data.len(),
                     });
                 }
-                let filter = String::from_utf8(data[offset..offset + filter_len].to_vec())
-                    .map_err(|_| {
-                        CodecError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "filter is not valid UTF-8",
-                        ))
-                    })?;
+                let filter = validated_utf8_string(&data, offset, filter_len)?;
                 offset += filter_len;
                 let data_len = read_u32_at(&data, offset)? as usize;
                 offset += 4;
@@ -624,7 +623,7 @@ mod tests {
     #[test]
     fn roundtrip_create_table() {
         let cmd = LanceCommand::CreateTable {
-            table_name: "logs".to_string(),
+            table_name: "logs".into(),
             schema_ipc: Bytes::from_static(&[1, 2, 3, 4]),
         };
         let encoded = cmd.encode_to_vec().unwrap();
@@ -635,7 +634,7 @@ mod tests {
                 table_name,
                 schema_ipc,
             } => {
-                assert_eq!(table_name, "logs");
+                assert_eq!(&*table_name, "logs");
                 assert_eq!(&schema_ipc[..], &[1, 2, 3, 4]);
             }
             _ => panic!("wrong variant"),
@@ -645,14 +644,14 @@ mod tests {
     #[test]
     fn roundtrip_drop_table() {
         let cmd = LanceCommand::DropTable {
-            table_name: "old_logs".to_string(),
+            table_name: "old_logs".into(),
         };
         let encoded = cmd.encode_to_vec().unwrap();
         assert_eq!(encoded.len(), cmd.encoded_size());
         let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
         match decoded {
             LanceCommand::DropTable { table_name } => {
-                assert_eq!(table_name, "old_logs");
+                assert_eq!(&*table_name, "old_logs");
             }
             _ => panic!("wrong variant"),
         }
@@ -661,7 +660,7 @@ mod tests {
     #[test]
     fn roundtrip_append_records() {
         let cmd = LanceCommand::AppendRecords {
-            table_name: "metrics".to_string(),
+            table_name: "metrics".into(),
             data: Bytes::from_static(&[1, 2, 3, 4, 5]),
         };
         let encoded = cmd.encode_to_vec().unwrap();
@@ -669,7 +668,7 @@ mod tests {
         let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
         match decoded {
             LanceCommand::AppendRecords { table_name, data } => {
-                assert_eq!(table_name, "metrics");
+                assert_eq!(&*table_name, "metrics");
                 assert_eq!(&data[..], &[1, 2, 3, 4, 5]);
             }
             _ => panic!("wrong variant"),
@@ -679,7 +678,7 @@ mod tests {
     #[test]
     fn roundtrip_seal() {
         let cmd = LanceCommand::SealActiveSegment {
-            table_name: "events".to_string(),
+            table_name: "events".into(),
             sealed_segment_id: 42,
             new_active_segment_id: 43,
             reason: SealReason::MaxAge,
@@ -694,7 +693,7 @@ mod tests {
                 new_active_segment_id,
                 reason,
             } => {
-                assert_eq!(table_name, "events");
+                assert_eq!(&*table_name, "events");
                 assert_eq!(sealed_segment_id, 42);
                 assert_eq!(new_active_segment_id, 43);
                 assert_eq!(reason, SealReason::MaxAge);
@@ -706,7 +705,7 @@ mod tests {
     #[test]
     fn roundtrip_begin_flush() {
         let cmd = LanceCommand::BeginFlush {
-            table_name: "logs".to_string(),
+            table_name: "logs".into(),
             segment_id: 10,
         };
         let encoded = cmd.encode_to_vec().unwrap();
@@ -717,7 +716,7 @@ mod tests {
                 table_name,
                 segment_id,
             } => {
-                assert_eq!(table_name, "logs");
+                assert_eq!(&*table_name, "logs");
                 assert_eq!(segment_id, 10);
             }
             _ => panic!("wrong variant"),
@@ -727,7 +726,7 @@ mod tests {
     #[test]
     fn roundtrip_promote() {
         let cmd = LanceCommand::PromoteToDeepStorage {
-            table_name: "logs".to_string(),
+            table_name: "logs".into(),
             segment_id: 7,
             s3_manifest_version: 99,
         };
@@ -740,7 +739,7 @@ mod tests {
                 segment_id,
                 s3_manifest_version,
             } => {
-                assert_eq!(table_name, "logs");
+                assert_eq!(&*table_name, "logs");
                 assert_eq!(segment_id, 7);
                 assert_eq!(s3_manifest_version, 99);
             }
@@ -752,7 +751,7 @@ mod tests {
     fn borrow_payload_append() {
         let data = Bytes::from_static(&[10, 20, 30]);
         let cmd = LanceCommand::AppendRecords {
-            table_name: "t".to_string(),
+            table_name: "t".into(),
             data: data.clone(),
         };
         assert_eq!(cmd.payload_bytes(), &[10, 20, 30]);
@@ -761,7 +760,7 @@ mod tests {
     #[test]
     fn borrow_payload_non_append() {
         let cmd = LanceCommand::BeginFlush {
-            table_name: "t".to_string(),
+            table_name: "t".into(),
             segment_id: 1,
         };
         assert!(cmd.payload_bytes().is_empty());
@@ -770,14 +769,14 @@ mod tests {
     #[test]
     fn zero_copy_decode_from_bytes() {
         let cmd = LanceCommand::AppendRecords {
-            table_name: "metrics".to_string(),
+            table_name: "metrics".into(),
             data: Bytes::from(vec![1u8, 2, 3, 4, 5]),
         };
         let encoded = Bytes::from(cmd.encode_to_vec().unwrap());
         let decoded = LanceCommand::decode_from_bytes(encoded).unwrap();
         match decoded {
             LanceCommand::AppendRecords { table_name, data } => {
-                assert_eq!(table_name, "metrics");
+                assert_eq!(&*table_name, "metrics");
                 assert_eq!(&data[..], &[1, 2, 3, 4, 5]);
             }
             _ => panic!("wrong variant"),
@@ -787,7 +786,7 @@ mod tests {
     #[test]
     fn zero_copy_decode_create_table() {
         let cmd = LanceCommand::CreateTable {
-            table_name: "logs".to_string(),
+            table_name: "logs".into(),
             schema_ipc: Bytes::from(vec![10u8, 20, 30]),
         };
         let encoded = Bytes::from(cmd.encode_to_vec().unwrap());
@@ -797,7 +796,7 @@ mod tests {
                 table_name,
                 schema_ipc,
             } => {
-                assert_eq!(table_name, "logs");
+                assert_eq!(&*table_name, "logs");
                 assert_eq!(&schema_ipc[..], &[10, 20, 30]);
             }
             _ => panic!("wrong variant"),
@@ -807,7 +806,7 @@ mod tests {
     #[test]
     fn roundtrip_delete_records() {
         let cmd = LanceCommand::DeleteRecords {
-            table_name: "events".to_string(),
+            table_name: "events".into(),
             filter: "id > 100 AND status = 'inactive'".to_string(),
         };
         let encoded = cmd.encode_to_vec().unwrap();
@@ -815,7 +814,7 @@ mod tests {
         let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
         match decoded {
             LanceCommand::DeleteRecords { table_name, filter } => {
-                assert_eq!(table_name, "events");
+                assert_eq!(&*table_name, "events");
                 assert_eq!(filter, "id > 100 AND status = 'inactive'");
             }
             _ => panic!("wrong variant"),
@@ -825,7 +824,7 @@ mod tests {
     #[test]
     fn roundtrip_delete_records_empty_filter() {
         let cmd = LanceCommand::DeleteRecords {
-            table_name: "t".to_string(),
+            table_name: "t".into(),
             filter: "".to_string(),
         };
         let encoded = cmd.encode_to_vec().unwrap();
@@ -833,7 +832,7 @@ mod tests {
         let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
         match decoded {
             LanceCommand::DeleteRecords { table_name, filter } => {
-                assert_eq!(table_name, "t");
+                assert_eq!(&*table_name, "t");
                 assert_eq!(filter, "");
             }
             _ => panic!("wrong variant"),
@@ -843,7 +842,7 @@ mod tests {
     #[test]
     fn roundtrip_update_records() {
         let cmd = LanceCommand::UpdateRecords {
-            table_name: "metrics".to_string(),
+            table_name: "metrics".into(),
             filter: "ts < '2024-01-01'".to_string(),
             data: Bytes::from_static(&[10, 20, 30, 40, 50]),
         };
@@ -856,7 +855,7 @@ mod tests {
                 filter,
                 data,
             } => {
-                assert_eq!(table_name, "metrics");
+                assert_eq!(&*table_name, "metrics");
                 assert_eq!(filter, "ts < '2024-01-01'");
                 assert_eq!(&data[..], &[10, 20, 30, 40, 50]);
             }
@@ -867,7 +866,7 @@ mod tests {
     #[test]
     fn roundtrip_update_records_empty_data() {
         let cmd = LanceCommand::UpdateRecords {
-            table_name: "t".to_string(),
+            table_name: "t".into(),
             filter: "id = 1".to_string(),
             data: Bytes::new(),
         };
@@ -880,7 +879,7 @@ mod tests {
                 filter,
                 data,
             } => {
-                assert_eq!(table_name, "t");
+                assert_eq!(&*table_name, "t");
                 assert_eq!(filter, "id = 1");
                 assert!(data.is_empty());
             }
@@ -891,7 +890,7 @@ mod tests {
     #[test]
     fn zero_copy_decode_delete_records() {
         let cmd = LanceCommand::DeleteRecords {
-            table_name: "logs".to_string(),
+            table_name: "logs".into(),
             filter: "level = 'DEBUG'".to_string(),
         };
         let encoded = cmd.encode_to_vec().unwrap();
@@ -899,7 +898,7 @@ mod tests {
         let decoded = LanceCommand::decode_from_bytes(bytes).unwrap();
         match decoded {
             LanceCommand::DeleteRecords { table_name, filter } => {
-                assert_eq!(table_name, "logs");
+                assert_eq!(&*table_name, "logs");
                 assert_eq!(filter, "level = 'DEBUG'");
             }
             _ => panic!("wrong variant"),
@@ -909,7 +908,7 @@ mod tests {
     #[test]
     fn zero_copy_decode_update_records() {
         let cmd = LanceCommand::UpdateRecords {
-            table_name: "data".to_string(),
+            table_name: "data".into(),
             filter: "x > 0".to_string(),
             data: Bytes::from_static(&[1, 2, 3, 4, 5, 6, 7, 8]),
         };
@@ -922,7 +921,7 @@ mod tests {
                 filter,
                 data,
             } => {
-                assert_eq!(table_name, "data");
+                assert_eq!(&*table_name, "data");
                 assert_eq!(filter, "x > 0");
                 assert_eq!(&data[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
             }
@@ -933,7 +932,7 @@ mod tests {
     #[test]
     fn borrow_payload_delete_returns_empty() {
         let cmd = LanceCommand::DeleteRecords {
-            table_name: "t".to_string(),
+            table_name: "t".into(),
             filter: "id = 1".to_string(),
         };
         assert!(cmd.payload_bytes().is_empty());
@@ -942,7 +941,7 @@ mod tests {
     #[test]
     fn roundtrip_delete_records_long_table_name() {
         // Table name is u16 length-prefixed, so 65535 bytes is the max.
-        let long_name = "x".repeat(65535);
+        let long_name: Arc<str> = Arc::from("x".repeat(65535));
         let cmd = LanceCommand::DeleteRecords {
             table_name: long_name.clone(),
             filter: "id = 1".to_string(),
@@ -976,7 +975,7 @@ mod tests {
         // Filter is u32 length-prefixed, so very long filters should work fine.
         let long_filter = "id = 1 OR ".repeat(10_000); // 100,000 chars
         let cmd = LanceCommand::DeleteRecords {
-            table_name: "t".to_string(),
+            table_name: "t".into(),
             filter: long_filter.clone(),
         };
         let encoded = cmd.encode_to_vec().unwrap();
@@ -984,7 +983,7 @@ mod tests {
         let decoded = LanceCommand::decode_from_slice(&encoded).unwrap();
         match decoded {
             LanceCommand::DeleteRecords { table_name, filter } => {
-                assert_eq!(table_name, "t");
+                assert_eq!(&*table_name, "t");
                 assert_eq!(filter.len(), long_filter.len());
                 assert_eq!(filter, long_filter);
             }
@@ -996,7 +995,7 @@ mod tests {
         let decoded2 = LanceCommand::decode_from_bytes(bytes).unwrap();
         match decoded2 {
             LanceCommand::DeleteRecords { table_name, filter } => {
-                assert_eq!(table_name, "t");
+                assert_eq!(&*table_name, "t");
                 assert_eq!(filter, long_filter);
             }
             _ => panic!("wrong variant"),
@@ -1006,7 +1005,7 @@ mod tests {
     #[test]
     fn roundtrip_delete_records_unicode_filter() {
         let cmd = LanceCommand::DeleteRecords {
-            table_name: "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30fc}\u{30d6}\u{30eb}".to_string(),
+            table_name: "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30fc}\u{30d6}\u{30eb}".into(),
             filter: "name = '\u{1f3af}'".to_string(),
         };
         let encoded = cmd.encode_to_vec().unwrap();
@@ -1015,7 +1014,7 @@ mod tests {
         match decoded {
             LanceCommand::DeleteRecords { table_name, filter } => {
                 assert_eq!(
-                    table_name,
+                    &*table_name,
                     "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30fc}\u{30d6}\u{30eb}"
                 );
                 assert_eq!(filter, "name = '\u{1f3af}'");

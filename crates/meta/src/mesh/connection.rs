@@ -20,8 +20,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bisque_raft::multi::codec::{Decode, Encode};
-use bisque_raft::multi::transport_tcp::write_frame;
+use bisque_raft::codec::{Decode, Encode};
+use bisque_raft::transport_tcp::write_frame;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -47,9 +47,9 @@ pub enum MeshConnectionError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Codec error: {0}")]
-    Codec(#[from] bisque_raft::multi::codec::CodecError),
+    Codec(#[from] bisque_raft::codec::CodecError),
     #[error("Transport error: {0}")]
-    Transport(#[from] bisque_raft::multi::transport_tcp::BisqueTransportError),
+    Transport(#[from] bisque_raft::transport_tcp::BisqueTransportError),
     #[error("Unexpected message: expected {expected}, got {got}")]
     UnexpectedMessage {
         expected: &'static str,

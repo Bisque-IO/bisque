@@ -78,3 +78,6 @@ where
     type AsyncRuntime = TokioRuntime;
     type ErrorSource = openraft::AnyError;
 }
+
+/// Backwards-compatible alias
+pub type ManiacRaftTypeConfig<D, R> = BisqueRaftTypeConfig<D, R>;

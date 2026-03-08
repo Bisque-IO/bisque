@@ -6,11 +6,9 @@
 //! Run with: cargo run --release --example storage_bench
 //! Options:  cargo run --release --example storage_bench -- --help
 
-use bisque_raft::multi::codec::{BorrowPayload, CodecError, Decode, Encode};
-use bisque_raft::multi::storage_mmap::{
-    MmapGroupLogStorage, MmapPerGroupLogStorage, MmapStorageConfig,
-};
-use bisque_raft::multi::type_config::ManiacRaftTypeConfig;
+use bisque_raft::codec::{BorrowPayload, CodecError, Decode, Encode};
+use bisque_raft::storage_mmap::{MmapGroupLogStorage, MmapPerGroupLogStorage, MmapStorageConfig};
+use bisque_raft::type_config::ManiacRaftTypeConfig;
 use openraft::storage::{IOFlushed, RaftLogReader, RaftLogStorage};
 use openraft::type_config::async_runtime::{AsyncRuntime, Oneshot};
 use openraft::{LogId, RaftTypeConfig};
