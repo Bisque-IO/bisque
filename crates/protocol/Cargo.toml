@@ -10,6 +10,7 @@ keywords = ["protocol", "websocket"]
 categories = ["database-implementations"]
 
 [dependencies]
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }

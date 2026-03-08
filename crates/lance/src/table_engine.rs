@@ -84,10 +84,24 @@ pub struct TableEngine {
     sealed_first_log_index: AtomicU64,
     /// Optional version pin tracker for compaction safety with remote clients.
     version_pins: RwLock<Option<Arc<VersionPinTracker>>>,
-    /// Catalog name (raft group name) for scoping version pins.
-    catalog_name: RwLock<String>,
+    /// Catalog name (raft group name) for scoping version pins and metric labeling.
+    catalog_name: String,
     /// Shared guard that defers file deletion while snapshot transfers are active.
     snapshot_guard: Arc<SnapshotTransferGuard>,
+
+    // ── Pre-built metric handles (avoid per-call string clone + descriptor lookup) ──
+    m_writes_bytes: metrics::Counter,
+    m_writes_rows: metrics::Counter,
+    m_write_latency: metrics::Histogram,
+    m_deletes_rows: metrics::Counter,
+    m_delete_latency: metrics::Histogram,
+    m_updates_rows: metrics::Counter,
+    m_flush_rows: metrics::Counter,
+    m_flush_latency: metrics::Histogram,
+    m_seals_max_age: metrics::Counter,
+    m_seals_max_size: metrics::Counter,
+    m_compact_active_latency: metrics::Histogram,
+    m_compact_sealed_latency: metrics::Histogram,
 }
 
 impl TableEngine {
@@ -101,6 +115,7 @@ impl TableEngine {
         catalog: Option<SegmentCatalog>,
         schema_history: Option<Vec<SchemaVersion>>,
         snapshot_guard: Arc<SnapshotTransferGuard>,
+        catalog_name: String,
     ) -> Result<Self> {
         let segments_dir = config.segments_dir();
         tokio::fs::create_dir_all(&segments_dir).await?;
@@ -178,6 +193,25 @@ impl TableEngine {
             "TableEngine opened"
         );
 
+        // Pre-build metric handles once — avoids per-call string clone + descriptor lookup.
+        let cat = catalog_name.clone();
+        let m_writes_bytes = metrics::counter!("bisque_writes_bytes_total", "catalog" => cat.clone(), "table" => name.clone());
+        let m_writes_rows = metrics::counter!("bisque_writes_rows_total", "catalog" => cat.clone(), "table" => name.clone());
+        let m_write_latency = metrics::histogram!("bisque_write_latency_ms", "catalog" => cat.clone(), "table" => name.clone());
+        let m_deletes_rows = metrics::counter!("bisque_deletes_rows_total", "catalog" => cat.clone(), "table" => name.clone());
+        let m_delete_latency = metrics::histogram!("bisque_delete_latency_ms", "catalog" => cat.clone(), "table" => name.clone());
+        let m_updates_rows = metrics::counter!("bisque_updates_rows_total", "catalog" => cat.clone(), "table" => name.clone());
+        let m_flush_rows = metrics::counter!("bisque_flush_rows_total", "catalog" => cat.clone(), "table" => name.clone());
+        let m_flush_latency = metrics::histogram!("bisque_flush_latency_ms", "catalog" => cat.clone(), "table" => name.clone());
+        let m_seals_max_age = metrics::counter!("bisque_seals_total", "catalog" => cat.clone(), "table" => name.clone(), "reason" => "MaxAge");
+        let m_seals_max_size = metrics::counter!("bisque_seals_total", "catalog" => cat.clone(), "table" => name.clone(), "reason" => "MaxSize");
+        let m_compact_active_latency = metrics::histogram!(
+            "bisque_compaction_latency_ms", "catalog" => cat.clone(), "table" => name.clone(), "tier" => "active"
+        );
+        let m_compact_sealed_latency = metrics::histogram!(
+            "bisque_compaction_latency_ms", "catalog" => cat, "table" => name.clone(), "tier" => "sealed"
+        );
+
         Ok(Self {
             name,
             config,
@@ -195,8 +229,20 @@ impl TableEngine {
             active_created_at: RwLock::new(Instant::now()),
             schema_history: RwLock::new(schema_history),
             version_pins: RwLock::new(None),
-            catalog_name: RwLock::new(String::new()),
+            catalog_name,
             snapshot_guard,
+            m_writes_bytes,
+            m_writes_rows,
+            m_write_latency,
+            m_deletes_rows,
+            m_delete_latency,
+            m_updates_rows,
+            m_flush_rows,
+            m_flush_latency,
+            m_seals_max_age,
+            m_seals_max_size,
+            m_compact_active_latency,
+            m_compact_sealed_latency,
         })
     }
 
@@ -218,9 +264,9 @@ impl TableEngine {
         *self.version_pins.write() = Some(pins);
     }
 
-    /// Set the catalog name used for scoping version pins.
-    pub fn set_catalog_name(&self, name: String) {
-        *self.catalog_name.write() = name;
+    /// Get the catalog name used for scoping version pins and metric labeling.
+    pub fn catalog_name(&self) -> &str {
+        &self.catalog_name
     }
 
     // =========================================================================
@@ -290,12 +336,10 @@ impl TableEngine {
         drop(_guard);
 
         self.active_bytes.fetch_add(append_bytes, Ordering::Relaxed);
-        metrics::counter!("bisque_writes_bytes_total", "table" => self.name.clone())
-            .increment(append_bytes);
-        metrics::counter!("bisque_writes_rows_total", "table" => self.name.clone())
-            .increment(total_rows as u64);
-        metrics::histogram!("bisque_write_latency_seconds", "table" => self.name.clone())
-            .record(start.elapsed().as_secs_f64());
+        self.m_writes_bytes.increment(append_bytes);
+        self.m_writes_rows.increment(total_rows as u64);
+        self.m_write_latency
+            .record(start.elapsed().as_millis() as f64);
         debug!(table = %self.name, bytes = append_bytes, "Appended to active segment");
         Ok(())
     }
@@ -314,10 +358,9 @@ impl TableEngine {
     /// Uses Lance's `DeleteResult.num_deleted_rows` to avoid extra `count_rows` scans.
     pub async fn apply_delete(&self, filter: &str) -> Result<u64> {
         let start = std::time::Instant::now();
-        let mut total_deleted = 0u64;
 
-        // 1. Delete from active segment
-        {
+        // Delete from all three tiers in parallel — each has independent locks.
+        let active_fut = async {
             let _guard = self.active_write.lock().await;
             let maybe_ds = { self.active_dataset.read().clone() };
             if let Some(mut ds) = maybe_ds {
@@ -325,13 +368,15 @@ impl TableEngine {
                     .delete(filter)
                     .await
                     .map_err(|e| Error::DeleteFailed(e.to_string()))?;
-                total_deleted += result.num_deleted_rows;
+                let deleted = result.num_deleted_rows;
                 *self.active_dataset.write() = Some(ds);
+                Ok::<u64, Error>(deleted)
+            } else {
+                Ok(0)
             }
-        }
+        };
 
-        // 2. Delete from sealed segment
-        {
+        let sealed_fut = async {
             let _guard = self.sealed_write.lock().await;
             let maybe_ds = { self.sealed_dataset.read().clone() };
             if let Some(mut ds) = maybe_ds {
@@ -339,13 +384,15 @@ impl TableEngine {
                     .delete(filter)
                     .await
                     .map_err(|e| Error::DeleteFailed(e.to_string()))?;
-                total_deleted += result.num_deleted_rows;
+                let deleted = result.num_deleted_rows;
                 *self.sealed_dataset.write() = Some(ds);
+                Ok::<u64, Error>(deleted)
+            } else {
+                Ok(0)
             }
-        }
+        };
 
-        // 3. Delete from S3 deep storage
-        {
+        let s3_fut = async {
             let _guard = self.s3_write.lock().await;
             let maybe_ds = { self.s3_dataset.read().clone() };
             if let Some(mut ds) = maybe_ds {
@@ -353,15 +400,20 @@ impl TableEngine {
                     .delete(filter)
                     .await
                     .map_err(|e| Error::DeleteFailed(e.to_string()))?;
-                total_deleted += result.num_deleted_rows;
+                let deleted = result.num_deleted_rows;
                 *self.s3_dataset.write() = Some(ds);
+                Ok::<u64, Error>(deleted)
+            } else {
+                Ok(0)
             }
-        }
+        };
 
-        metrics::counter!("bisque_deletes_rows_total", "table" => self.name.clone())
-            .increment(total_deleted);
-        metrics::histogram!("bisque_delete_latency_seconds", "table" => self.name.clone())
-            .record(start.elapsed().as_secs_f64());
+        let (active_del, sealed_del, s3_del) = tokio::try_join!(active_fut, sealed_fut, s3_fut)?;
+        let total_deleted = active_del + sealed_del + s3_del;
+
+        self.m_deletes_rows.increment(total_deleted);
+        self.m_delete_latency
+            .record(start.elapsed().as_millis() as f64);
         debug!(table = %self.name, deleted = total_deleted, filter, "Delete applied across all tiers");
         Ok(total_deleted)
     }
@@ -373,8 +425,7 @@ impl TableEngine {
     pub async fn apply_update(&self, filter: &str, batches: Vec<RecordBatch>) -> Result<u64> {
         let deleted = self.apply_delete(filter).await?;
         self.apply_append(batches).await?;
-        metrics::counter!("bisque_updates_rows_total", "table" => self.name.clone())
-            .increment(deleted);
+        self.m_updates_rows.increment(deleted);
         Ok(deleted)
     }
 
@@ -457,7 +508,10 @@ impl TableEngine {
         // Reset active segment metrics
         self.active_bytes.store(0, Ordering::Relaxed);
         *self.active_created_at.write() = Instant::now();
-        metrics::counter!("bisque_seals_total", "table" => self.name.clone(), "reason" => format!("{:?}", reason)).increment(1);
+        match reason {
+            SealReason::MaxAge => self.m_seals_max_age.increment(1),
+            SealReason::MaxSize => self.m_seals_max_size.increment(1),
+        }
 
         Ok(())
     }
@@ -675,7 +729,7 @@ impl TableEngine {
             .ok_or(Error::NoSealedSegment)?;
 
         Ok(FlushHandle {
-            table_name: self.name.clone(),
+            table_name: Arc::from(self.name.as_str()),
             segment_id,
             started_at: chrono::Utc::now().timestamp_millis(),
         })
@@ -783,10 +837,9 @@ impl TableEngine {
 
         *self.s3_dataset.write() = Some(new_s3);
 
-        metrics::counter!("bisque_flush_rows_total", "table" => self.name.clone())
-            .increment(total_rows as u64);
-        metrics::histogram!("bisque_flush_latency_seconds", "table" => self.name.clone())
-            .record(flush_start.elapsed().as_secs_f64());
+        self.m_flush_rows.increment(total_rows as u64);
+        self.m_flush_latency
+            .record(flush_start.elapsed().as_millis() as f64);
         info!(
             table = %self.name,
             segment_id = handle.segment_id,
@@ -858,7 +911,7 @@ impl TableEngine {
         // Check if any remote client has pinned versions for this table.
         // If so, skip cleanup to avoid deleting files they're still reading.
         if let Some(pins) = self.version_pins.read().as_ref() {
-            let cat = self.catalog_name.read().clone();
+            let cat = &self.catalog_name;
             let has_active_pins = pins
                 .min_pinned_version(&cat, &self.name, PinTier::Active)
                 .is_some();
@@ -957,7 +1010,8 @@ impl TableEngine {
         *self.active_dataset.write() = Some(ds);
 
         let stats = CompactionStats::from_metrics(&metrics);
-        metrics::histogram!("bisque_compaction_latency_seconds", "table" => self.name.clone(), "tier" => "active").record(compact_start.elapsed().as_secs_f64());
+        self.m_compact_active_latency
+            .record(compact_start.elapsed().as_millis() as f64);
         info!(
             table = %self.name,
             fragments_removed = stats.fragments_removed,
@@ -1012,7 +1066,8 @@ impl TableEngine {
         *self.sealed_dataset.write() = Some(ds);
 
         let stats = CompactionStats::from_metrics(&metrics);
-        metrics::histogram!("bisque_compaction_latency_seconds", "table" => self.name.clone(), "tier" => "sealed").record(compact_start.elapsed().as_secs_f64());
+        self.m_compact_sealed_latency
+            .record(compact_start.elapsed().as_millis() as f64);
         info!(
             table = %self.name,
             fragments_removed = stats.fragments_removed,

@@ -92,21 +92,21 @@ impl Default for FlushState {
 pub enum LanceCommand {
     /// Create a new table with the given schema (Arrow IPC-encoded).
     CreateTable {
-        table_name: String,
+        table_name: Arc<str>,
         schema_ipc: Bytes,
     },
 
     /// Drop a table and remove all its data.
-    DropTable { table_name: String },
+    DropTable { table_name: Arc<str> },
 
     /// Replicate raw data to all nodes.
     /// Every node appends this data to its local active Lance dataset.
     /// `data` contains Arrow IPC-encoded RecordBatches.
-    AppendRecords { table_name: String, data: Bytes },
+    AppendRecords { table_name: Arc<str>, data: Bytes },
 
     /// Seal the current active segment and create a new one.
     SealActiveSegment {
-        table_name: String,
+        table_name: Arc<str>,
         sealed_segment_id: SegmentId,
         new_active_segment_id: SegmentId,
         reason: SealReason,
@@ -114,14 +114,14 @@ pub enum LanceCommand {
 
     /// Mark the start of a flush operation (leader only writes to S3).
     BeginFlush {
-        table_name: String,
+        table_name: Arc<str>,
         segment_id: SegmentId,
     },
 
     /// Promote sealed segment data to S3 deep storage.
     /// Applied after successful S3 manifest commit.
     PromoteToDeepStorage {
-        table_name: String,
+        table_name: Arc<str>,
         segment_id: SegmentId,
         s3_manifest_version: u64,
     },
@@ -132,16 +132,16 @@ pub enum LanceCommand {
     /// Pin a dataset version so compaction doesn't delete it.
     PinVersion {
         session_id: u64,
-        table_name: String,
-        tier: String,
+        table_name: Arc<str>,
+        tier: Arc<str>,
         version: u64,
     },
 
     /// Release a previously pinned version.
     UnpinVersion {
         session_id: u64,
-        table_name: String,
-        tier: String,
+        table_name: Arc<str>,
+        tier: Arc<str>,
         version: u64,
     },
 
@@ -151,7 +151,7 @@ pub enum LanceCommand {
     /// Delete rows matching a SQL filter predicate from all tiers.
     /// Uses Lance deletion vectors (soft delete) — no data rewrite.
     DeleteRecords {
-        table_name: String,
+        table_name: Arc<str>,
         /// SQL filter predicate (e.g. "id = 5", "ts < '2024-01-01'").
         filter: String,
     },
@@ -159,7 +159,7 @@ pub enum LanceCommand {
     /// Update rows: soft-delete matching rows across all tiers, then append
     /// replacement data to the active segment.
     UpdateRecords {
-        table_name: String,
+        table_name: Arc<str>,
         /// SQL filter predicate for rows to replace.
         filter: String,
         /// IPC-encoded replacement RecordBatches.
@@ -309,7 +309,7 @@ impl fmt::Display for LanceResponse {
 #[derive(Debug, Clone)]
 pub struct FlushHandle {
     /// The table this flush belongs to.
-    pub table_name: String,
+    pub table_name: Arc<str>,
     /// The segment being flushed.
     pub segment_id: SegmentId,
     /// Timestamp when flush began (millis since epoch).
@@ -346,7 +346,8 @@ pub struct SchemaVersion {
     /// Monotonically increasing version number (1-based).
     pub version: u64,
     /// Arrow IPC-encoded schema bytes.
-    pub schema_ipc: Vec<u8>,
+    #[serde(with = "bisque_protocol::catalog_events::serde_bytes_as_vec")]
+    pub schema_ipc: Bytes,
     /// When this schema version was recorded (millis since epoch).
     pub created_at_millis: i64,
 }
@@ -816,7 +817,7 @@ mod tests {
     #[test]
     fn lance_command_display_create_table() {
         let cmd = LanceCommand::CreateTable {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             schema_ipc: Bytes::from(vec![0u8; 64]),
         };
         assert_eq!(cmd.to_string(), "CreateTable(table=t1, schema=64 bytes)");
@@ -825,7 +826,7 @@ mod tests {
     #[test]
     fn lance_command_display_drop_table() {
         let cmd = LanceCommand::DropTable {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
         };
         assert_eq!(cmd.to_string(), "DropTable(table=t1)");
     }
@@ -833,7 +834,7 @@ mod tests {
     #[test]
     fn lance_command_display_append_records() {
         let cmd = LanceCommand::AppendRecords {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             data: Bytes::from(vec![0u8; 128]),
         };
         assert_eq!(cmd.to_string(), "AppendRecords(table=t1, 128 bytes)");
@@ -842,7 +843,7 @@ mod tests {
     #[test]
     fn lance_command_display_seal_active_segment() {
         let cmd = LanceCommand::SealActiveSegment {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             sealed_segment_id: 2,
             new_active_segment_id: 3,
             reason: SealReason::MaxAge,
@@ -856,7 +857,7 @@ mod tests {
     #[test]
     fn lance_command_display_begin_flush() {
         let cmd = LanceCommand::BeginFlush {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             segment_id: 7,
         };
         assert_eq!(cmd.to_string(), "BeginFlush(table=t1, segment=7)");
@@ -865,7 +866,7 @@ mod tests {
     #[test]
     fn lance_command_display_promote_to_deep_storage() {
         let cmd = LanceCommand::PromoteToDeepStorage {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             segment_id: 7,
             s3_manifest_version: 3,
         };
@@ -885,8 +886,8 @@ mod tests {
     fn lance_command_display_pin_version() {
         let cmd = LanceCommand::PinVersion {
             session_id: 1,
-            table_name: "t1".to_string(),
-            tier: "hot".to_string(),
+            table_name: "t1".into(),
+            tier: "hot".into(),
             version: 5,
         };
         assert_eq!(
@@ -899,8 +900,8 @@ mod tests {
     fn lance_command_display_unpin_version() {
         let cmd = LanceCommand::UnpinVersion {
             session_id: 1,
-            table_name: "t1".to_string(),
-            tier: "cold".to_string(),
+            table_name: "t1".into(),
+            tier: "cold".into(),
             version: 3,
         };
         assert_eq!(
@@ -929,7 +930,7 @@ mod tests {
     #[test]
     fn lance_command_serde_roundtrip_create_table() {
         assert_lance_command_roundtrip(&LanceCommand::CreateTable {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             schema_ipc: Bytes::from(vec![1, 2, 3]),
         });
     }
@@ -937,14 +938,14 @@ mod tests {
     #[test]
     fn lance_command_serde_roundtrip_drop_table() {
         assert_lance_command_roundtrip(&LanceCommand::DropTable {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
         });
     }
 
     #[test]
     fn lance_command_serde_roundtrip_append_records() {
         assert_lance_command_roundtrip(&LanceCommand::AppendRecords {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             data: Bytes::from(vec![10, 20, 30]),
         });
     }
@@ -952,7 +953,7 @@ mod tests {
     #[test]
     fn lance_command_serde_roundtrip_seal_active_segment() {
         assert_lance_command_roundtrip(&LanceCommand::SealActiveSegment {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             sealed_segment_id: 2,
             new_active_segment_id: 3,
             reason: SealReason::MaxSize,
@@ -962,7 +963,7 @@ mod tests {
     #[test]
     fn lance_command_serde_roundtrip_begin_flush() {
         assert_lance_command_roundtrip(&LanceCommand::BeginFlush {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             segment_id: 5,
         });
     }
@@ -970,7 +971,7 @@ mod tests {
     #[test]
     fn lance_command_serde_roundtrip_promote_to_deep_storage() {
         assert_lance_command_roundtrip(&LanceCommand::PromoteToDeepStorage {
-            table_name: "t1".to_string(),
+            table_name: "t1".into(),
             segment_id: 5,
             s3_manifest_version: 10,
         });
@@ -985,8 +986,8 @@ mod tests {
     fn lance_command_serde_roundtrip_pin_version() {
         assert_lance_command_roundtrip(&LanceCommand::PinVersion {
             session_id: 1,
-            table_name: "t1".to_string(),
-            tier: "hot".to_string(),
+            table_name: "t1".into(),
+            tier: "hot".into(),
             version: 5,
         });
     }
@@ -995,8 +996,8 @@ mod tests {
     fn lance_command_serde_roundtrip_unpin_version() {
         assert_lance_command_roundtrip(&LanceCommand::UnpinVersion {
             session_id: 1,
-            table_name: "t1".to_string(),
-            tier: "cold".to_string(),
+            table_name: "t1".into(),
+            tier: "cold".into(),
             version: 3,
         });
     }
@@ -1009,7 +1010,7 @@ mod tests {
     #[test]
     fn lance_command_display_delete_records() {
         let cmd = LanceCommand::DeleteRecords {
-            table_name: "events".to_string(),
+            table_name: "events".into(),
             filter: "id > 100".to_string(),
         };
         assert_eq!(
@@ -1021,7 +1022,7 @@ mod tests {
     #[test]
     fn lance_command_display_update_records() {
         let cmd = LanceCommand::UpdateRecords {
-            table_name: "metrics".to_string(),
+            table_name: "metrics".into(),
             filter: "ts < '2024-01-01'".to_string(),
             data: Bytes::from_static(&[10, 20, 30, 40, 50]),
         };
@@ -1034,7 +1035,7 @@ mod tests {
     #[test]
     fn lance_command_serde_roundtrip_delete_records() {
         assert_lance_command_roundtrip(&LanceCommand::DeleteRecords {
-            table_name: "events".to_string(),
+            table_name: "events".into(),
             filter: "id > 100 AND status = 'inactive'".to_string(),
         });
     }
@@ -1042,7 +1043,7 @@ mod tests {
     #[test]
     fn lance_command_serde_roundtrip_update_records() {
         assert_lance_command_roundtrip(&LanceCommand::UpdateRecords {
-            table_name: "metrics".to_string(),
+            table_name: "metrics".into(),
             filter: "ts < '2024-01-01'".to_string(),
             data: Bytes::from(vec![10, 20, 30, 40, 50]),
         });
@@ -1140,7 +1141,7 @@ mod tests {
         };
         let schema_ver = SchemaVersion {
             version: 1,
-            schema_ipc: vec![0, 1, 2],
+            schema_ipc: Bytes::from_static(&[0, 1, 2]),
             created_at_millis: 1700000000000,
         };
         let entry = PersistedTableEntry {
@@ -1157,7 +1158,10 @@ mod tests {
         assert!(matches!(snap.flush_state, FlushState::Idle));
         assert_eq!(snap.schema_history.len(), 1);
         assert_eq!(snap.schema_history[0].version, 1);
-        assert_eq!(snap.schema_history[0].schema_ipc, vec![0, 1, 2]);
+        assert_eq!(
+            snap.schema_history[0].schema_ipc,
+            Bytes::from_static(&[0, 1, 2])
+        );
     }
 
     // =========================================================================

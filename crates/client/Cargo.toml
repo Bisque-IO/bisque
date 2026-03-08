@@ -1,0 +1,78 @@
+[package]
+name = "bisque-client"
+version = "0.1.0"
+edition = "2024"
+authors = ["Bisque Team"]
+description = "Unified client for connecting to bisque clusters"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bisque-io/bisque"
+keywords = ["client", "lance", "columnar", "analytics"]
+categories = ["database-implementations"]
+
+[dependencies]
+# Bisque
+bisque-protocol = { workspace = true }
+
+# Lance columnar storage
+lance = { workspace = true }
+lance-table = { workspace = true }
+
+# DataFusion query engine
+datafusion = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+
+# Arrow in-memory format
+arrow = { workspace = true, features = ["ipc"] }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+
+# Object store
+object_store = { workspace = true }
+
+# Embedded KV store for client persistence
+libmdbx = { workspace = true }
+
+# WebSocket
+fastwebsockets = { workspace = true }
+
+# HTTP
+hyper = { workspace = true }
+http-body-util = { workspace = true }
+reqwest = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+async-trait = "0.1"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+bincode = { workspace = true, features = ["serde"] }
+bytes = { workspace = true }
+
+# Utilities
+arc-swap = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Server-side deps needed for integration tests
+bisque-lance = { workspace = true }
+bisque-raft = { workspace = true }
+
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-schema = { workspace = true }
+futures = { workspace = true }
+openraft = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tonic = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

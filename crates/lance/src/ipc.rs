@@ -7,17 +7,24 @@ use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::Schema;
+use bytes::Bytes;
 
 use crate::error::{Error, Result};
 
 /// Encode one or more RecordBatches into Arrow IPC streaming format bytes.
-pub fn encode_record_batches(batches: &[RecordBatch]) -> Result<Vec<u8>> {
+///
+/// Returns `Bytes` directly — callers on the hot path always need `Bytes`,
+/// and this avoids an intermediate `Vec<u8>` → `Bytes` conversion.
+/// Pre-allocates based on array memory size to minimize reallocs.
+pub fn encode_record_batches(batches: &[RecordBatch]) -> Result<Bytes> {
     if batches.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Bytes::new());
     }
 
     let schema = batches[0].schema();
-    let mut buf = Vec::new();
+    // Pre-allocate with a size hint from array memory sizes.
+    let size_hint: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    let mut buf = Vec::with_capacity(size_hint);
 
     {
         let mut writer = StreamWriter::try_new(&mut buf, &schema)?;
@@ -27,7 +34,7 @@ pub fn encode_record_batches(batches: &[RecordBatch]) -> Result<Vec<u8>> {
         writer.finish()?;
     }
 
-    Ok(buf)
+    Ok(Bytes::from(buf))
 }
 
 /// Decode Arrow IPC streaming format bytes into RecordBatches.
@@ -39,25 +46,39 @@ pub fn decode_record_batches(data: &[u8]) -> Result<Vec<RecordBatch>> {
     let reader =
         StreamReader::try_new(std::io::Cursor::new(data), None).map_err(|e| Error::Arrow(e))?;
 
-    let mut batches = Vec::new();
-    for batch_result in reader {
-        batches.push(batch_result?);
+    let batches: Result<Vec<_>> = reader.map(|r| r.map_err(Error::Arrow)).collect();
+    batches
+}
+
+/// Decode Arrow IPC streaming format bytes, extending into an existing Vec.
+///
+/// Avoids allocating a second `Vec` when the caller already has one to fill.
+pub fn decode_record_batches_into(data: &[u8], out: &mut Vec<RecordBatch>) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
     }
 
-    Ok(batches)
+    let reader =
+        StreamReader::try_new(std::io::Cursor::new(data), None).map_err(|e| Error::Arrow(e))?;
+
+    for batch_result in reader {
+        out.push(batch_result?);
+    }
+
+    Ok(())
 }
 
 /// Encode an Arrow Schema to IPC streaming format bytes.
 ///
 /// Uses the IPC stream format with zero batches — the schema is embedded
 /// in the stream header.
-pub fn schema_to_ipc(schema: &Schema) -> Result<Vec<u8>> {
+pub fn schema_to_ipc(schema: &Schema) -> Result<Bytes> {
     let mut buf = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut buf, schema)?;
         writer.finish()?;
     }
-    Ok(buf)
+    Ok(Bytes::from(buf))
 }
 
 /// Decode an Arrow Schema from IPC streaming format bytes.

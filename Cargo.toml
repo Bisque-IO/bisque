@@ -14,6 +14,7 @@ members = [
     "crates/maniac",
     "crates/raft",           # maniac-raft: OpenRaft adapter for Maniac runtime
     "crates/protocol",       # bisque-protocol: Shared WebSocket protocol types
+    "crates/client",         # bisque-client: Unified client for bisque clusters
     "crates/lance",          # bisque-lance: Distributed search & analytics storage engine
     "crates/meta",           # bisque-meta: Multi-tenant control plane
     "crates/bisque",         # bisque: Unified server with auth middleware
@@ -107,9 +108,9 @@ datafusion-expr = { version = "52.1.0", default-features = false }
 datafusion-physical-plan = { version = "52.1.0", default-features = false }
 datafusion-common = { version = "52.1.0", default-features = false }
 datafusion-postgres = { version = "0.14", default-features = false }
-lance = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
+lance = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false, features = ["fp16kernels", "aws"] }
 lance-index = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
-lance-linalg = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
+lance-linalg = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false, features = ["fp16kernels"] }
 lance-io = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
 lance-table = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
 lance-core = { git = "https://github.com/lance-format/lance", branch = "main", default-features = false }
@@ -187,6 +188,8 @@ zstd = "0.13"
 # maniac-allocator = { path = "crates/maniac-allocator", version = "0.1.0", default-features = false }
 # maniac-sys = { path = "crates/maniac-sys", version = "0.1.0" }
 # maniac-usockets = { path = "crates/maniac-usockets", version = "0.1.0", default-features = false }
+bisque-client = { path = "crates/client", version = "0.1.0" }
+bisque-lance = { path = "crates/lance", version = "0.1.0" }
 bisque-protocol = { path = "crates/protocol", version = "0.1.0" }
 bisque-raft = { path = "crates/raft", version = "0.1.0" }
 maniac = { path = "crates/bisque-runtime", version = "0.1.0" }
@@ -208,17 +211,18 @@ openraft-macros = { git = "https://github.com/databendlabs/openraft", branch = "
 #sanakirja-core = { path = "crates/sanakirja-core", version = "1.4.1" }
 #sanakirja = { path = "crates/sanakirja", version = "1.4.1" }
 
-# [profile.dev]
-# opt-level = 0
-# debug = true
+[profile.dev]
+opt-level = 0
+debug = true
+panic = "unwind"
+strip = "symbols"
 
-# [profile.release]
-# opt-level = "z"   # Optimize for size
-# lto = true
-# codegen-units = 1
-# panic = "abort"   # Smaller binary size (no unwinding)
-# # strip = "symbols" # Strip debug symbols (more aggressive than `true`)
-# debug = true
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
 
 # Patches for incompatible dependencies
 [patch.crates-io]

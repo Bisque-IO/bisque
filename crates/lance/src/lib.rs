@@ -16,10 +16,7 @@
 
 pub mod async_apply;
 pub mod catalog_events;
-pub mod client;
-pub mod client_store;
 pub mod codec;
-pub mod cold_store;
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -34,7 +31,6 @@ pub mod processors;
 pub mod query;
 pub mod raft;
 pub mod s3_server;
-pub mod s3_store;
 pub mod segment_sync;
 pub mod state_machine;
 pub mod table_engine;
@@ -45,8 +41,6 @@ pub mod write_processor;
 
 pub use async_apply::{AppliedWatermark, AsyncApplyConfig};
 pub use catalog_events::{CatalogEvent, CatalogEventBus, CatalogEventKind};
-pub use client::BisqueClient;
-pub use cold_store::CredentialConfig;
 pub use config::{BisqueLanceConfig, IndexSpec, TableOpenConfig};
 pub use engine::{BisqueLance, SnapshotGuardHandle, SnapshotTransferGuard};
 pub use error::{Error, Result};
@@ -59,7 +53,6 @@ pub use processors::{CounterAggregator, GaugeAggregator, HistogramAggregator};
 pub use query::BisqueLanceTableProvider;
 pub use raft::{LanceRaftNode, WriteError};
 pub use s3_server::{S3ServerState, s3_router, serve_s3};
-pub use s3_store::BisqueRoutingStore;
 pub use segment_sync::{
     SegmentSyncClient, SegmentSyncClientConfig, SegmentSyncServer, SegmentSyncServerConfig,
     SyncResult,

@@ -47,10 +47,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use crate::catalog_events::{CatalogEvent, CatalogEventKind};
 use crate::client_store::{ClientMeta, ClientStore, PersistedCatalogEntry};
 use crate::cold_store::CredentialConfig;
 use crate::s3_store::BisqueRoutingStore;
+use bisque_protocol::catalog_events::{CatalogEvent, CatalogEventKind};
 use bisque_protocol::ws::{ClientMessage, ServerMessage, WS_PROTOCOL_VERSION};
 
 // ---------------------------------------------------------------------------
@@ -1190,7 +1190,7 @@ async fn handle_catalog_event(
     ws_tx: &mpsc::UnboundedSender<ClientMessage>,
     client_store: &Option<Arc<ClientStore>>,
 ) {
-    let catalog_name = event.catalog.clone();
+    let catalog_name = event.catalog.to_string();
     let catalog_state = catalogs.read().get(&catalog_name).cloned();
     let Some(catalog_state) = catalog_state else {
         debug!(catalog = %catalog_name, "Ignoring event for unknown catalog");
@@ -1202,14 +1202,14 @@ async fn handle_catalog_event(
 
     match &event.event {
         CatalogEventKind::ActiveVersionBumped { table, version } => {
-            let provider = catalog_state.tables.read().get(table).cloned();
+            let provider = catalog_state.tables.read().get(&**table).cloned();
             if let Some(provider) = provider {
                 let old_version = provider.active_version();
                 match open_remote_dataset(routing_store, table, "active").await {
                     Ok(ds) => {
                         let _ = ws_tx.send(ClientMessage::Pin {
                             catalog: catalog_name.clone(),
-                            table: table.clone(),
+                            table: table.to_string(),
                             tier: "active".into(),
                             version: *version,
                         });
@@ -1217,7 +1217,7 @@ async fn handle_catalog_event(
                         if let Some(old_v) = old_version {
                             let _ = ws_tx.send(ClientMessage::Unpin {
                                 catalog: catalog_name.clone(),
-                                table: table.clone(),
+                                table: table.to_string(),
                                 tier: "active".into(),
                                 version: old_v,
                             });
@@ -1239,7 +1239,7 @@ async fn handle_catalog_event(
             active_version,
             sealed_version,
         } => {
-            let provider = catalog_state.tables.read().get(table).cloned();
+            let provider = catalog_state.tables.read().get(&**table).cloned();
             if let Some(provider) = provider {
                 let old_active_v = provider.active_version();
                 let old_sealed_v = provider.sealed_version();
@@ -1248,7 +1248,7 @@ async fn handle_catalog_event(
                     Ok(ds) => {
                         let _ = ws_tx.send(ClientMessage::Pin {
                             catalog: catalog_name.clone(),
-                            table: table.clone(),
+                            table: table.to_string(),
                             tier: "active".into(),
                             version: *active_version,
                         });
@@ -1256,7 +1256,7 @@ async fn handle_catalog_event(
                         if let Some(old_v) = old_active_v {
                             let _ = ws_tx.send(ClientMessage::Unpin {
                                 catalog: catalog_name.clone(),
-                                table: table.clone(),
+                                table: table.to_string(),
                                 tier: "active".into(),
                                 version: old_v,
                             });
@@ -1268,7 +1268,7 @@ async fn handle_catalog_event(
                     Ok(ds) => {
                         let _ = ws_tx.send(ClientMessage::Pin {
                             catalog: catalog_name.clone(),
-                            table: table.clone(),
+                            table: table.to_string(),
                             tier: "sealed".into(),
                             version: *sealed_version,
                         });
@@ -1276,7 +1276,7 @@ async fn handle_catalog_event(
                         if let Some(old_v) = old_sealed_v {
                             let _ = ws_tx.send(ClientMessage::Unpin {
                                 catalog: catalog_name.clone(),
-                                table: table.clone(),
+                                table: table.to_string(),
                                 tier: "sealed".into(),
                                 version: old_v,
                             });
@@ -1304,7 +1304,10 @@ async fn handle_catalog_event(
                 }
             };
             let provider = Arc::new(RemoteLanceTableProvider::new(schema.clone(), None, None));
-            catalog_state.tables.write().insert(table.clone(), provider);
+            catalog_state
+                .tables
+                .write()
+                .insert(table.to_string(), provider);
             info!(catalog = %catalog_name, table = %table, seq = event.seq,
                   "Registered new table from event");
 
@@ -1325,12 +1328,12 @@ async fn handle_catalog_event(
             }
         }
         CatalogEventKind::TableDropped { table } => {
-            let provider = catalog_state.tables.read().get(table).cloned();
+            let provider = catalog_state.tables.read().get(&**table).cloned();
             if let Some(provider) = provider {
                 if let Some(v) = provider.active_version() {
                     let _ = ws_tx.send(ClientMessage::Unpin {
                         catalog: catalog_name.clone(),
-                        table: table.clone(),
+                        table: table.to_string(),
                         tier: "active".into(),
                         version: v,
                     });
@@ -1338,13 +1341,13 @@ async fn handle_catalog_event(
                 if let Some(v) = provider.sealed_version() {
                     let _ = ws_tx.send(ClientMessage::Unpin {
                         catalog: catalog_name.clone(),
-                        table: table.clone(),
+                        table: table.to_string(),
                         tier: "sealed".into(),
                         version: v,
                     });
                 }
             }
-            catalog_state.tables.write().remove(table);
+            catalog_state.tables.write().remove(&**table);
             info!(catalog = %catalog_name, table = %table, seq = event.seq,
                   "Removed dropped table");
 
@@ -1356,12 +1359,12 @@ async fn handle_catalog_event(
             }
         }
         CatalogEventKind::SegmentPromoted { table, .. } => {
-            let provider = catalog_state.tables.read().get(table).cloned();
+            let provider = catalog_state.tables.read().get(&**table).cloned();
             if let Some(provider) = provider {
                 if let Some(v) = provider.sealed_version() {
                     let _ = ws_tx.send(ClientMessage::Unpin {
                         catalog: catalog_name.clone(),
-                        table: table.clone(),
+                        table: table.to_string(),
                         tier: "sealed".into(),
                         version: v,
                     });
@@ -1381,7 +1384,7 @@ async fn handle_catalog_event(
             sealed_version,
             ..
         } => {
-            let provider = catalog_state.tables.read().get(table).cloned();
+            let provider = catalog_state.tables.read().get(&**table).cloned();
             if let Some(provider) = provider {
                 // Re-open active dataset to pick up new deletion vectors
                 if let Some(new_v) = active_version {
@@ -1390,7 +1393,7 @@ async fn handle_catalog_event(
                         Ok(ds) => {
                             let _ = ws_tx.send(ClientMessage::Pin {
                                 catalog: catalog_name.clone(),
-                                table: table.clone(),
+                                table: table.to_string(),
                                 tier: "active".into(),
                                 version: *new_v,
                             });
@@ -1398,7 +1401,7 @@ async fn handle_catalog_event(
                             if let Some(old_v) = old_version {
                                 let _ = ws_tx.send(ClientMessage::Unpin {
                                     catalog: catalog_name.clone(),
-                                    table: table.clone(),
+                                    table: table.to_string(),
                                     tier: "active".into(),
                                     version: old_v,
                                 });
@@ -1416,7 +1419,7 @@ async fn handle_catalog_event(
                         Ok(ds) => {
                             let _ = ws_tx.send(ClientMessage::Pin {
                                 catalog: catalog_name.clone(),
-                                table: table.clone(),
+                                table: table.to_string(),
                                 tier: "sealed".into(),
                                 version: *new_v,
                             });
@@ -1424,7 +1427,7 @@ async fn handle_catalog_event(
                             if let Some(old_v) = old_version {
                                 let _ = ws_tx.send(ClientMessage::Unpin {
                                     catalog: catalog_name.clone(),
-                                    table: table.clone(),
+                                    table: table.to_string(),
                                     tier: "sealed".into(),
                                     version: old_v,
                                 });

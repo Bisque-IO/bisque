@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use parking_lot::{Mutex, RwLock};
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use crate::config::{BisqueLanceConfig, TableOpenConfig};
@@ -226,8 +227,9 @@ impl Drop for SnapshotGuardHandle {
 /// [`get_table`](Self::get_table) to access them by name.
 pub struct BisqueLance {
     config: BisqueLanceConfig,
-    tables: RwLock<HashMap<String, Arc<TableEngine>>>,
+    tables: DashMap<String, Arc<TableEngine>>,
     snapshot_guard: Arc<SnapshotTransferGuard>,
+    catalog_name: String,
 }
 
 impl BisqueLance {
@@ -236,6 +238,14 @@ impl BisqueLance {
     /// Tables are added via [`create_table`](Self::create_table) or
     /// restored from a snapshot via [`restore_tables`](Self::restore_tables).
     pub async fn open(config: BisqueLanceConfig) -> Result<Self> {
+        Self::open_with_catalog(config, String::new()).await
+    }
+
+    /// Open the engine with a catalog name for metric labeling.
+    pub async fn open_with_catalog(
+        config: BisqueLanceConfig,
+        catalog_name: String,
+    ) -> Result<Self> {
         // Ensure the base data directory exists
         tokio::fs::create_dir_all(&config.local_data_dir).await?;
 
@@ -246,8 +256,9 @@ impl BisqueLance {
 
         Ok(Self {
             config,
-            tables: RwLock::new(HashMap::new()),
+            tables: DashMap::new(),
             snapshot_guard: Arc::new(SnapshotTransferGuard::new()),
+            catalog_name,
         })
     }
 
@@ -262,13 +273,21 @@ impl BisqueLance {
         let name = config.name.clone();
 
         // Check for existing table
-        if self.tables.read().contains_key(&name) {
+        if self.tables.contains_key(&name) {
             return Err(Error::TableAlreadyExists(name));
         }
 
-        let engine =
-            Arc::new(TableEngine::open(config, catalog, None, self.snapshot_guard.clone()).await?);
-        self.tables.write().insert(name.clone(), engine.clone());
+        let engine = Arc::new(
+            TableEngine::open(
+                config,
+                catalog,
+                None,
+                self.snapshot_guard.clone(),
+                self.catalog_name.clone(),
+            )
+            .await?,
+        );
+        self.tables.insert(name.clone(), engine.clone());
 
         info!(table = %name, "Table created");
         Ok(engine)
@@ -288,10 +307,11 @@ impl BisqueLance {
                 Some(snapshot.catalog.clone()),
                 Some(snapshot.schema_history.clone()),
                 self.snapshot_guard.clone(),
+                self.catalog_name.clone(),
             )
             .await?,
         );
-        self.tables.write().insert(name.clone(), engine.clone());
+        self.tables.insert(name.clone(), engine.clone());
 
         info!(table = %name, "Table restored from snapshot");
         Ok(engine)
@@ -299,7 +319,7 @@ impl BisqueLance {
 
     /// Get a table engine by name.
     pub fn get_table(&self, name: &str) -> Option<Arc<TableEngine>> {
-        self.tables.read().get(name).cloned()
+        self.tables.get(name).map(|r| r.value().clone())
     }
 
     /// Get a table engine by name, returning an error if not found.
@@ -310,12 +330,19 @@ impl BisqueLance {
 
     /// List all table names.
     pub fn list_tables(&self) -> Vec<String> {
-        self.tables.read().keys().cloned().collect()
+        self.tables.iter().map(|r| r.key().clone()).collect()
+    }
+
+    /// Iterate over all tables without allocating a name list.
+    pub fn for_each_table(&self, mut f: impl FnMut(&str, &Arc<TableEngine>)) {
+        for entry in self.tables.iter() {
+            f(entry.key(), entry.value());
+        }
     }
 
     /// Check if a table exists.
     pub fn has_table(&self, name: &str) -> bool {
-        self.tables.read().contains_key(name)
+        self.tables.contains_key(name)
     }
 
     /// Drop a table — shuts it down and removes from registry.
@@ -324,8 +351,8 @@ impl BisqueLance {
     pub async fn drop_table(&self, name: &str) -> Result<()> {
         let engine = self
             .tables
-            .write()
             .remove(name)
+            .map(|(_, v)| v)
             .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
 
         engine.shutdown().await?;
@@ -359,17 +386,16 @@ impl BisqueLance {
     /// Used by the snapshot builder — this is the system-of-record data
     /// that gets serialized into Raft snapshots.
     pub fn table_entries(&self) -> HashMap<String, PersistedTableEntry> {
-        let tables = self.tables.read();
-        tables
+        self.tables
             .iter()
-            .map(|(name, engine)| {
-                let entry = PersistedTableEntry {
-                    config: engine.config().to_persisted(),
-                    catalog: engine.catalog(),
-                    flush_state: engine.flush_state(),
-                    schema_history: engine.schema_history(),
+            .map(|entry| {
+                let pe = PersistedTableEntry {
+                    config: entry.value().config().to_persisted(),
+                    catalog: entry.value().catalog(),
+                    flush_state: entry.value().flush_state(),
+                    schema_history: entry.value().schema_history(),
                 };
-                (name.clone(), entry)
+                (entry.key().clone(), pe)
             })
             .collect()
     }
@@ -412,13 +438,11 @@ impl BisqueLance {
     /// Gracefully shutdown all tables.
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down BisqueLance engine (all tables)");
-        let tables: Vec<(String, Arc<TableEngine>)> = {
-            self.tables
-                .read()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
+        let tables: Vec<(String, Arc<TableEngine>)> = self
+            .tables
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect();
 
         for (name, engine) in tables {
             if let Err(e) = engine.shutdown().await {
@@ -426,7 +450,7 @@ impl BisqueLance {
             }
         }
 
-        self.tables.write().clear();
+        self.tables.clear();
         Ok(())
     }
 }

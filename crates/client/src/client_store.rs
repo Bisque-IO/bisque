@@ -9,6 +9,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use libmdbx::{
     Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, Table, TableFlags, WriteFlags,
 };
@@ -44,7 +45,8 @@ pub(crate) struct PersistedCatalogEntry {
     pub active_version: Option<u64>,
     pub sealed_version: Option<u64>,
     /// Arrow IPC-encoded schema bytes.
-    pub schema_ipc: Vec<u8>,
+    #[serde(with = "bisque_protocol::catalog_events::serde_bytes_as_vec")]
+    pub schema_ipc: Bytes,
 }
 
 /// Client-side MDBX store for persisting catalog state across restarts.
@@ -356,7 +358,7 @@ mod tests {
                 s3_storage_options: HashMap::from([("aws_region".into(), "us-east-1".into())]),
                 active_version: Some(5),
                 sealed_version: Some(3),
-                schema_ipc: vec![1, 2, 3],
+                schema_ipc: Bytes::from_static(&[1, 2, 3]),
             },
         );
 
@@ -370,7 +372,7 @@ mod tests {
         assert_eq!(entry.active_segment, 1);
         assert_eq!(entry.sealed_segment, Some(2));
         assert_eq!(entry.active_version, Some(5));
-        assert_eq!(entry.schema_ipc, vec![1, 2, 3]);
+        assert_eq!(entry.schema_ipc, Bytes::from_static(&[1, 2, 3]));
     }
 
     #[test]
@@ -393,7 +395,7 @@ mod tests {
             s3_storage_options: HashMap::new(),
             active_version: Some(1),
             sealed_version: None,
-            schema_ipc: vec![10, 20],
+            schema_ipc: Bytes::from_static(&[10, 20]),
         };
         store.update_table("data\0logs", &entry).unwrap();
 
@@ -447,7 +449,7 @@ mod tests {
                     s3_storage_options: HashMap::new(),
                     active_version: Some(10),
                     sealed_version: Some(7),
-                    schema_ipc: vec![42],
+                    schema_ipc: Bytes::from_static(&[42]),
                 },
             );
             store.save_state(&meta, &tables).unwrap();

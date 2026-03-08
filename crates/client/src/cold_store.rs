@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use bisque_lance::CredentialConfig;
+//! use bisque_client::CredentialConfig;
 //!
 //! let config = CredentialConfig::new()
 //!     .with_credential("aws_access_key_id", "AKIA...")

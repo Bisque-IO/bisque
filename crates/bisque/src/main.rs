@@ -1,5 +1,8 @@
 //! bisque server CLI entry point.
 
+#[global_allocator]
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -9,7 +12,7 @@ use bisque::BisqueConfig;
 use bisque::server;
 
 #[derive(Parser)]
-#[command(name = "bisque", about = "Bisque unified server")]
+#[command(name = "bisque", about = "bisque data platform")]
 struct Cli {
     /// Address for the unified HTTP server (S3, OTLP HTTP, management API).
     #[arg(long, default_value = "0.0.0.0:3200", env = "BISQUE_HTTP_ADDR")]
@@ -56,6 +59,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    //     println!(
+    //         r#"
+    //                 ()
+    //                /
+    //           |   /
+    //     |     |  /        _     _
+    //     |  |  | |        | |__ (_)___  __ _ _   _  ___
+    //     |  |  | | |      | '_ \| / __|/ _` | | | |/ _ \
+    //    _|__|__|_|_|_     | |_) | \__ \ (_| | |_| |  __/
+    //   /  ~~~~~~~~~~  \   |_.__/|_|___/\__, |\__,_|\___|
+    //   \              /                   |_|
+    //    \____________/
+    //       |______|
+    // "#
+    //     );
+
+    println!(
+        r#"
+ _     _
+| |__ (_)___  __ _ _   _  ___
+| '_ \| / __|/ _` | | | |/ _ \
+| |_) | \__ \ (_| | |_| |  __/
+|_.__/|_|___/\__, |\__,_|\___|
+                |_| v0.1.0
+"#
+    );
 
     let cli = Cli::parse();
 

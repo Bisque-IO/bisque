@@ -59,14 +59,69 @@ use self::processors::{
 /// Implements `MetricsService`, `TraceService`, and `LogsService` from the
 /// OTLP collector protocol, plus the OTel-Arrow streaming services.
 /// Data is written through Raft consensus via [`LanceRaftNode::write_records`].
+/// Pre-built metric handles for a single OTel signal+table combination.
+struct OtelTableMetrics {
+    received: ::metrics::Counter,
+}
+
 pub struct OtlpReceiver {
     raft_node: Arc<LanceRaftNode>,
+    // Pre-built per-table received counters (keyed by table name).
+    table_metrics: std::collections::HashMap<&'static str, OtelTableMetrics>,
+    // Pre-built per-signal latency/error handles.
+    m_metrics_latency: ::metrics::Histogram,
+    m_traces_latency: ::metrics::Histogram,
+    m_logs_latency: ::metrics::Histogram,
+    m_unknown_latency: ::metrics::Histogram,
+    m_metrics_errors: ::metrics::Counter,
+    m_traces_errors: ::metrics::Counter,
+    m_logs_errors: ::metrics::Counter,
+    m_unknown_errors: ::metrics::Counter,
 }
 
 impl OtlpReceiver {
     /// Create a new OTLP receiver wrapping the given Raft node.
     pub fn new(raft_node: Arc<LanceRaftNode>) -> Self {
-        Self { raft_node }
+        let cat = raft_node.catalog_name().to_string();
+        let otel_tables: &[(&str, &str)] = &[
+            (schema::COUNTERS_TABLE, "metrics"),
+            (schema::GAUGES_TABLE, "metrics"),
+            (schema::HISTOGRAMS_TABLE, "metrics"),
+            (schema::EXP_HISTOGRAMS_TABLE, "metrics"),
+            (schema::SUMMARIES_TABLE, "metrics"),
+            (schema::EXEMPLARS_TABLE, "metrics"),
+            (schema::SPANS_TABLE, "traces"),
+            (schema::SPAN_EVENTS_TABLE, "traces"),
+            (schema::SPAN_LINKS_TABLE, "traces"),
+            (schema::LOGS_TABLE, "logs"),
+        ];
+        let mut table_metrics = std::collections::HashMap::new();
+        for &(table, signal) in otel_tables {
+            table_metrics.insert(
+                table,
+                OtelTableMetrics {
+                    received: ::metrics::counter!(
+                        "bisque_otel_received_total",
+                        "catalog" => cat.clone(),
+                        "signal" => signal,
+                        "table" => table.to_string()
+                    ),
+                },
+            );
+        }
+
+        Self {
+            raft_node,
+            table_metrics,
+            m_metrics_latency: ::metrics::histogram!("bisque_otel_ingest_latency_ms", "catalog" => cat.clone(), "signal" => "metrics"),
+            m_traces_latency: ::metrics::histogram!("bisque_otel_ingest_latency_ms", "catalog" => cat.clone(), "signal" => "traces"),
+            m_logs_latency: ::metrics::histogram!("bisque_otel_ingest_latency_ms", "catalog" => cat.clone(), "signal" => "logs"),
+            m_unknown_latency: ::metrics::histogram!("bisque_otel_ingest_latency_ms", "catalog" => cat.clone(), "signal" => "unknown"),
+            m_metrics_errors: ::metrics::counter!("bisque_otel_ingest_errors_total", "catalog" => cat.clone(), "signal" => "metrics"),
+            m_traces_errors: ::metrics::counter!("bisque_otel_ingest_errors_total", "catalog" => cat.clone(), "signal" => "traces"),
+            m_logs_errors: ::metrics::counter!("bisque_otel_ingest_errors_total", "catalog" => cat.clone(), "signal" => "logs"),
+            m_unknown_errors: ::metrics::counter!("bisque_otel_ingest_errors_total", "catalog" => cat, "signal" => "unknown"),
+        }
     }
 
     /// Ensure all OTEL tables exist, creating them if needed.
@@ -142,23 +197,26 @@ impl OtlpReceiver {
     ) -> Result<(), WriteError> {
         let start = std::time::Instant::now();
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-        let signal = match table_name {
+        let result = self.raft_node.write_records(table_name, &batches).await;
+        if let Some(tm) = self.table_metrics.get(table_name) {
+            tm.received.increment(row_count as u64);
+        }
+        let (latency_handle, error_handle) = match table_name {
             "otel_counters"
             | "otel_gauges"
             | "otel_histograms"
             | "otel_exp_histograms"
             | "otel_summaries"
-            | "otel_exemplars" => "metrics",
-            "otel_spans" | "otel_span_events" | "otel_span_links" => "traces",
-            "otel_logs" => "logs",
-            _ => "unknown",
+            | "otel_exemplars" => (&self.m_metrics_latency, &self.m_metrics_errors),
+            "otel_spans" | "otel_span_events" | "otel_span_links" => {
+                (&self.m_traces_latency, &self.m_traces_errors)
+            }
+            "otel_logs" => (&self.m_logs_latency, &self.m_logs_errors),
+            _ => (&self.m_unknown_latency, &self.m_unknown_errors),
         };
-        let result = self.raft_node.write_records(table_name, &batches).await;
-        ::metrics::counter!("bisque_otel_received_total", "signal" => signal, "table" => table_name.to_string()).increment(row_count as u64);
-        ::metrics::histogram!("bisque_otel_ingest_latency_seconds", "signal" => signal)
-            .record(start.elapsed().as_secs_f64());
+        latency_handle.record(start.elapsed().as_millis() as f64);
         if result.is_err() {
-            ::metrics::counter!("bisque_otel_ingest_errors_total", "signal" => signal).increment(1);
+            error_handle.increment(1);
         }
         result?;
         Ok(())

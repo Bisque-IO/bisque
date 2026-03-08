@@ -166,6 +166,7 @@ pub struct WriteBatcher {
     default_config: WriteBatcherConfig,
     table_configs: RwLock<HashMap<String, WriteBatcherConfig>>,
     raft: Raft<LanceTypeConfig>,
+    catalog_name: String,
     tables: RwLock<HashMap<String, Arc<TableBatcherHandle>>>,
 }
 
@@ -173,11 +174,16 @@ impl WriteBatcher {
     /// Create a new `WriteBatcher` with the given default configuration.
     ///
     /// Individual tables can be overridden via [`configure_table`].
-    pub fn new(default_config: WriteBatcherConfig, raft: Raft<LanceTypeConfig>) -> Self {
+    pub fn new(
+        default_config: WriteBatcherConfig,
+        raft: Raft<LanceTypeConfig>,
+        catalog_name: String,
+    ) -> Self {
         Self {
             default_config,
             table_configs: RwLock::new(HashMap::new()),
             raft,
+            catalog_name,
             tables: RwLock::new(HashMap::new()),
         }
     }
@@ -254,10 +260,11 @@ impl WriteBatcher {
         let (tx, rx) = crossfire::mpsc::bounded_async::<BatchWriteRequest>(config.channel_capacity);
 
         let task = tokio::spawn(batcher_loop(
-            table_name.to_string(),
+            Arc::from(table_name),
             rx,
             self.raft.clone(),
             config,
+            self.catalog_name.clone(),
         ));
 
         let handle = Arc::new(TableBatcherHandle { tx, _task: task });
@@ -299,11 +306,19 @@ impl WriteBatcher {
 /// accumulation and IPC encoding. The processor may reduce data (aggregate-only)
 /// or produce additional materialized writes to other tables.
 async fn batcher_loop(
-    table_name: String,
+    table_name: Arc<str>,
     rx: crossfire::AsyncRx<crossfire::mpsc::Array<BatchWriteRequest>>,
     raft: Raft<LanceTypeConfig>,
     config: WriteBatcherConfig,
+    catalog_name: String,
 ) {
+    // Pre-build metric handles once per batcher lifetime.
+    let tname_label = table_name.to_string();
+    let m_flush_size = metrics::counter!("bisque_batcher_flushes_total", "catalog" => catalog_name.clone(), "table" => tname_label.clone(), "reason" => "size");
+    let m_flush_linger = metrics::counter!("bisque_batcher_flushes_total", "catalog" => catalog_name, "table" => tname_label, "reason" => "linger");
+
+    let mut pending: Vec<BatchWriteRequest> = Vec::with_capacity(128);
+
     loop {
         // Step 1: Block until the first request arrives.
         let first = match rx.recv().await {
@@ -319,7 +334,7 @@ async fn batcher_loop(
             }
         };
 
-        let mut pending: Vec<BatchWriteRequest> = Vec::new();
+        pending.clear();
         let mut accumulated_bytes = first.estimated_bytes;
         pending.push(first);
 
@@ -345,10 +360,10 @@ async fn batcher_loop(
 
         let num_requests = pending.len();
 
-        // Step 3: Coalesce all RecordBatches.
+        // Step 3: Coalesce all RecordBatches (move, don't clone — pending is consumed).
         let all_batches: Vec<RecordBatch> = pending
-            .iter()
-            .flat_map(|r| r.batches.iter().cloned())
+            .iter_mut()
+            .flat_map(|r| r.batches.drain(..))
             .collect();
 
         // Step 3a: Apply write processor if configured.
@@ -371,7 +386,7 @@ async fn batcher_loop(
                 Ok(data) => {
                     let cmd = LanceCommand::AppendRecords {
                         table_name: table_name.clone(),
-                        data: data.into(),
+                        data,
                     };
                     match raft.client_write(cmd).await {
                         Ok(resp) => {
@@ -397,12 +412,11 @@ async fn batcher_loop(
             propose_materialized_writes(materialized_writes, &raft, &table_name).await;
         }
 
-        let trigger = if accumulated_bytes >= config.max_batch_bytes {
-            "size"
+        if accumulated_bytes >= config.max_batch_bytes {
+            m_flush_size.increment(1);
         } else {
-            "linger"
-        };
-        metrics::counter!("bisque_batcher_flushes_total", "table" => table_name.clone(), "reason" => trigger).increment(1);
+            m_flush_linger.increment(1);
+        }
         debug!(
             table = %table_name,
             requests = num_requests,
@@ -411,7 +425,7 @@ async fn batcher_loop(
         );
 
         // Step 4: Broadcast the result to all waiting callers.
-        for req in pending {
+        for req in pending.drain(..) {
             let _ = req.response_tx.send(result.clone());
         }
     }
@@ -431,8 +445,8 @@ async fn propose_materialized_writes(
         match ipc::encode_record_batches(&mw.batches) {
             Ok(data) => {
                 let cmd = LanceCommand::AppendRecords {
-                    table_name: mw.table_name.clone(),
-                    data: data.into(),
+                    table_name: Arc::from(mw.table_name.as_str()),
+                    data,
                 };
                 if let Err(e) = raft.client_write(cmd).await {
                     warn!(

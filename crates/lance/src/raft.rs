@@ -40,6 +40,8 @@ pub struct LanceRaftNode {
     node_id: u64,
     /// The Raft group ID (used for per-group MDBX manifest).
     group_id: u64,
+    /// Catalog name (raft group name) for metric labeling.
+    catalog_name: String,
     /// Interval between seal threshold checks.
     seal_check_interval: Duration,
     /// Interval between flush attempts when a sealed segment is pending.
@@ -70,6 +72,7 @@ impl LanceRaftNode {
             engine,
             node_id,
             group_id: 0,
+            catalog_name: String::new(),
             seal_check_interval: Duration::from_secs(5),
             flush_check_interval: Duration::from_secs(10),
             compaction_check_interval: Duration::from_secs(60),
@@ -108,6 +111,17 @@ impl LanceRaftNode {
         self
     }
 
+    /// Set the catalog name (raft group name) used for metric labeling.
+    pub fn with_catalog_name(mut self, name: String) -> Self {
+        self.catalog_name = name;
+        self
+    }
+
+    /// Get the catalog name.
+    pub fn catalog_name(&self) -> &str {
+        &self.catalog_name
+    }
+
     /// Enable write batching with the given default configuration.
     ///
     /// When enabled, `write_records()` routes through a per-table batcher
@@ -115,7 +129,11 @@ impl LanceRaftNode {
     /// a single Raft proposal. Individual tables can be configured with
     /// [`configure_table_batcher`].
     pub fn with_write_batcher(mut self, config: WriteBatcherConfig) -> Self {
-        self.write_batcher = Some(Arc::new(WriteBatcher::new(config, self.raft.clone())));
+        self.write_batcher = Some(Arc::new(WriteBatcher::new(
+            config,
+            self.raft.clone(),
+            self.catalog_name.clone(),
+        )));
         self
     }
 
@@ -172,7 +190,7 @@ impl LanceRaftNode {
                     let update = LanceManifestManager::build_table_only_update(
                         group_id,
                         TableUpdate::Set {
-                            table_name: tname,
+                            table_name: Arc::from(tname.as_str()),
                             entry,
                         },
                     );
@@ -220,11 +238,14 @@ impl LanceRaftNode {
 
         let mut handles = self.task_handles.lock();
 
+        let catalog = self.catalog_name.clone();
+
         // 1. Leader election watcher
         handles.push(tokio::spawn(leader_watcher(
             self.raft.clone(),
             self.engine.clone(),
             self.node_id,
+            catalog.clone(),
             self.shutdown.clone(),
             self.shutdown_flag.clone(),
         )));
@@ -234,6 +255,7 @@ impl LanceRaftNode {
             self.raft.clone(),
             self.engine.clone(),
             self.node_id,
+            catalog.clone(),
             self.seal_check_interval,
             self.shutdown.clone(),
             self.shutdown_flag.clone(),
@@ -275,8 +297,8 @@ impl LanceRaftNode {
             ipc::schema_to_ipc(schema).map_err(|e| WriteError::Encode(e.to_string()))?;
 
         let cmd = LanceCommand::CreateTable {
-            table_name: table_name.to_string(),
-            schema_ipc: schema_ipc.into(),
+            table_name: Arc::from(table_name),
+            schema_ipc,
         };
         self.propose(cmd).await
     }
@@ -284,7 +306,7 @@ impl LanceRaftNode {
     /// Drop a table through Raft consensus.
     pub async fn drop_table(&self, table_name: &str) -> Result<WriteResult, WriteError> {
         let cmd = LanceCommand::DropTable {
-            table_name: table_name.to_string(),
+            table_name: Arc::from(table_name),
         };
         self.propose(cmd).await
     }
@@ -318,8 +340,8 @@ impl LanceRaftNode {
             ipc::encode_record_batches(batches).map_err(|e| WriteError::Encode(e.to_string()))?;
 
         let cmd = LanceCommand::AppendRecords {
-            table_name: table_name.to_string(),
-            data: data.into(),
+            table_name: Arc::from(table_name),
+            data,
         };
         self.propose(cmd).await
     }
@@ -335,7 +357,7 @@ impl LanceRaftNode {
         filter: &str,
     ) -> Result<WriteResult, WriteError> {
         let cmd = LanceCommand::DeleteRecords {
-            table_name: table_name.to_string(),
+            table_name: Arc::from(table_name),
             filter: filter.to_string(),
         };
         self.propose(cmd).await
@@ -354,9 +376,9 @@ impl LanceRaftNode {
         let data =
             ipc::encode_record_batches(batches).map_err(|e| WriteError::Encode(e.to_string()))?;
         let cmd = LanceCommand::UpdateRecords {
-            table_name: table_name.to_string(),
+            table_name: Arc::from(table_name),
             filter: filter.to_string(),
-            data: data.into(),
+            data,
         };
         self.propose(cmd).await
     }
@@ -500,9 +522,11 @@ async fn leader_watcher(
     raft: Raft<LanceTypeConfig>,
     engine: Arc<BisqueLance>,
     node_id: u64,
+    catalog_name: String,
     shutdown: Arc<Notify>,
     shutdown_flag: Arc<AtomicBool>,
 ) {
+    let m_is_leader = metrics::gauge!("bisque_raft_is_leader", "catalog" => catalog_name);
     let mut metrics_rx = raft.metrics();
     let mut was_leader = false;
 
@@ -516,11 +540,11 @@ async fn leader_watcher(
         };
 
         if is_leader && !was_leader {
-            metrics::gauge!("bisque_raft_is_leader").set(1.0);
+            m_is_leader.set(1.0);
             info!(node_id, "This node became leader");
             on_become_leader(&engine).await;
         } else if !is_leader && was_leader {
-            metrics::gauge!("bisque_raft_is_leader").set(0.0);
+            m_is_leader.set(0.0);
             info!(node_id, "This node lost leadership");
         }
 
@@ -558,10 +582,12 @@ async fn seal_check_loop(
     raft: Raft<LanceTypeConfig>,
     engine: Arc<BisqueLance>,
     node_id: u64,
+    catalog_name: String,
     interval: Duration,
     shutdown: Arc<Notify>,
     shutdown_flag: Arc<AtomicBool>,
 ) {
+    let m_applied_index = metrics::gauge!("bisque_raft_applied_index", "catalog" => catalog_name);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -583,7 +609,7 @@ async fn seal_check_loop(
 
         // Emit applied index gauge on each seal check iteration (leader only).
         if let Some(log_id) = raft.metrics().borrow_watched().last_applied {
-            metrics::gauge!("bisque_raft_applied_index").set(log_id.index as f64);
+            m_applied_index.set(log_id.index as f64);
         }
 
         for table_name in engine.list_tables() {
@@ -605,7 +631,7 @@ async fn seal_check_loop(
                 );
 
                 let cmd = LanceCommand::SealActiveSegment {
-                    table_name: table_name.clone(),
+                    table_name: Arc::from(table_name.as_str()),
                     sealed_segment_id: sealed_id,
                     new_active_segment_id: new_id,
                     reason,
@@ -665,8 +691,9 @@ async fn flush_orchestrator(
             info!(table = %table_name, segment_id = handle.segment_id, "Starting flush pipeline");
 
             // Step 1: Propose BeginFlush
+            let tname: Arc<str> = Arc::from(table_name.as_str());
             let begin_cmd = LanceCommand::BeginFlush {
-                table_name: table_name.clone(),
+                table_name: tname.clone(),
                 segment_id: handle.segment_id,
             };
             if let Err(e) = propose_cmd(&raft, begin_cmd).await {
@@ -689,7 +716,7 @@ async fn flush_orchestrator(
 
             // Step 3: Propose PromoteToDeepStorage
             let promote_cmd = LanceCommand::PromoteToDeepStorage {
-                table_name: table_name.clone(),
+                table_name: tname.clone(),
                 segment_id: handle.segment_id,
                 s3_manifest_version: s3_version,
             };

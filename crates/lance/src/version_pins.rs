@@ -15,6 +15,7 @@
 //! The server reaps expired sessions (no heartbeat within `lease_timeout`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -24,8 +25,8 @@ use tracing::{debug, info};
 /// Identifies a pinned dataset version within a specific catalog.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct PinKey {
-    pub catalog: String,
-    pub table: String,
+    pub catalog: Arc<str>,
+    pub table: Arc<str>,
     pub tier: PinTier,
     pub version: u64,
 }
@@ -185,7 +186,7 @@ impl VersionPinTracker {
         let counts = self.pin_counts.lock();
         counts
             .keys()
-            .filter(|k| k.catalog == catalog && k.table == table && k.tier == tier)
+            .filter(|k| &*k.catalog == catalog && &*k.table == table && k.tier == tier)
             .map(|k| k.version)
             .min()
     }

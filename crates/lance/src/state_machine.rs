@@ -41,7 +41,7 @@ pub struct LanceStateMachine {
     /// Optional catalog event bus for real-time push notifications.
     catalog_events: Option<Arc<CatalogEventBus>>,
     /// Catalog name (raft group name) used to tag catalog events.
-    catalog_name: String,
+    catalog_name: Arc<str>,
     /// Optional version pin tracker for Raft-replicated version pins.
     version_pins: Option<Arc<crate::version_pins::VersionPinTracker>>,
     /// Client for streaming segment files from leader during snapshot install.
@@ -66,7 +66,7 @@ impl LanceStateMachine {
             manifest: None,
             group_id: 0,
             catalog_events: None,
-            catalog_name: String::new(),
+            catalog_name: Arc::from(""),
             version_pins: None,
             sync_client: None,
             sync_addr: None,
@@ -81,8 +81,8 @@ impl LanceStateMachine {
     }
 
     /// Set the catalog name used to tag catalog events.
-    pub fn with_catalog_name(mut self, name: String) -> Self {
-        self.catalog_name = name;
+    pub fn with_catalog_name(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.catalog_name = name.into();
         self
     }
 
@@ -128,8 +128,9 @@ impl LanceStateMachine {
     pub fn with_async_apply(
         engine: Arc<BisqueLance>,
         config: AsyncApplyConfig,
+        catalog_name: &str,
     ) -> (Self, AppliedWatermark) {
-        let (async_buffer, watermark) = AsyncApplyBuffer::new(engine.clone(), config);
+        let (async_buffer, watermark) = AsyncApplyBuffer::new(engine.clone(), config, catalog_name);
         let sm = Self {
             engine,
             last_applied: None,
@@ -139,7 +140,7 @@ impl LanceStateMachine {
             manifest: None,
             group_id: 0,
             catalog_events: None,
-            catalog_name: String::new(),
+            catalog_name: Arc::from(""),
             version_pins: None,
             sync_client: None,
             sync_addr: None,
@@ -222,15 +223,17 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                 EntryPayload::Normal(cmd) => {
                     match cmd {
                         LanceCommand::AppendRecords { table_name, data } => {
+                            // Single table lookup — used for skip check, log tracking,
+                            // and manifest update. Avoids 3 redundant HashMap lookups.
+                            let table = self.engine.require_table(&table_name).ok();
+
                             // Skip entries whose data has already been promoted to
                             // deep storage. During recovery replay, per-table
                             // min_safe_log_index tells us the earliest log entry
                             // still in hot/warm storage — anything before it is
                             // already in S3 and must not be re-applied.
-                            let skip = self
-                                .engine
-                                .require_table(&table_name)
-                                .ok()
+                            let skip = table
+                                .as_ref()
                                 .and_then(|t| {
                                     t.min_safe_log_index()
                                         .map(|min_idx| entry.log_id.index < min_idx)
@@ -247,23 +250,21 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                             } else {
                                 // Track the first log index written to the active segment.
                                 // Only update manifest when the value changes (first write).
-                                let changed = self
-                                    .engine
-                                    .require_table(&table_name)
-                                    .ok()
+                                let changed = table
+                                    .as_ref()
                                     .map(|t| t.record_log_index(entry.log_id.index))
                                     .unwrap_or(false);
 
                                 if changed {
-                                    if let Ok(table) = self.engine.require_table(&table_name) {
+                                    if let Some(t) = &table {
                                         manifest_table_update = Some(TableUpdate::Set {
                                             table_name: table_name.clone(),
-                                            entry: LanceManifestManager::build_table_entry(&table),
+                                            entry: LanceManifestManager::build_table_entry(t),
                                         });
                                         catalog_event =
                                             Some(CatalogEventKind::ActiveVersionBumped {
                                                 table: table_name.clone(),
-                                                version: table.catalog().active_segment,
+                                                version: t.catalog().active_segment,
                                             });
                                     }
                                 }
@@ -433,7 +434,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                                         if matches!(response, LanceResponse::Ok) {
                                             catalog_event = Some(CatalogEventKind::TableCreated {
                                                 table: tname,
-                                                schema_ipc: schema_ipc.to_vec(),
+                                                schema_ipc,
                                             });
                                         }
                                     }
@@ -696,7 +697,11 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
             let update = ManifestUpdate::InstallSnapshot {
                 group_id: self.group_id,
                 meta: GroupMeta::from_raft(&self.last_applied, &self.last_membership),
-                tables: data.tables,
+                tables: data
+                    .tables
+                    .into_iter()
+                    .map(|(k, v)| (Arc::<str>::from(k), v))
+                    .collect(),
                 done: None,
             };
             if let Err(e) = manifest.send_update_durable(update).await {

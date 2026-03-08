@@ -86,12 +86,18 @@ pub struct BisqueFlightService {
     /// Cached session context with a dynamic catalog that resolves tables
     /// from the live engine — no per-query rebuild needed.
     ctx: Arc<SessionContext>,
+
+    // ── Pre-built metric handles ──
+    m_req_query: metrics::Counter,
+    m_lat_query: metrics::Histogram,
+    m_req_ingest: metrics::Counter,
 }
 
 impl BisqueFlightService {
     /// Create a new Flight SQL service wrapping the given Raft node.
     pub fn new(raft_node: Arc<LanceRaftNode>) -> Self {
         let engine = raft_node.engine().clone();
+        let cat = raft_node.catalog_name().to_string();
 
         let session_config = SessionConfig::new()
             .with_default_catalog_and_schema("bisque", "public")
@@ -104,6 +110,9 @@ impl BisqueFlightService {
         Self {
             raft_node,
             ctx: Arc::new(ctx),
+            m_req_query: metrics::counter!("bisque_requests_total", "catalog" => cat.clone(), "protocol" => "flight", "op" => "query"),
+            m_lat_query: metrics::histogram!("bisque_request_latency_ms", "catalog" => cat.clone(), "protocol" => "flight", "op" => "query"),
+            m_req_ingest: metrics::counter!("bisque_requests_total", "catalog" => cat, "protocol" => "flight", "op" => "ingest"),
         }
     }
 
@@ -489,9 +498,9 @@ impl FlightSqlService for BisqueFlightService {
             .map_err(|e| Status::internal(format!("execution error: {e}")))?
             .map_err(|e| arrow_flight::error::FlightError::Arrow(e.into()));
 
-        metrics::counter!("bisque_requests_total", "protocol" => "flight", "op" => "query")
-            .increment(1);
-        metrics::histogram!("bisque_request_latency_seconds", "protocol" => "flight", "op" => "query").record(query_start.elapsed().as_secs_f64());
+        self.m_req_query.increment(1);
+        self.m_lat_query
+            .record(query_start.elapsed().as_millis() as f64);
 
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -597,30 +606,46 @@ impl FlightSqlService for BisqueFlightService {
             return Err(Status::not_found(format!("table not found: {table_name}")));
         }
 
-        // Decode the incoming FlightData stream into RecordBatches.
+        // Stream batches through the write pipeline in chunks instead of
+        // buffering the entire ingest in memory.
         let stream = request.into_inner();
-        let record_stream = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+        let mut record_stream = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
             stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
         );
 
-        let batches: Vec<RecordBatch> = record_stream
-            .try_collect()
-            .await
-            .map_err(|e| Status::invalid_argument(format!("failed to decode batches: {e}")))?;
+        let mut num_rows: usize = 0;
+        let mut chunk = Vec::with_capacity(64);
+        let mut chunk_bytes: usize = 0;
+        const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024; // 8 MB
 
-        if batches.is_empty() {
-            return Ok(0);
+        while let Some(batch) = record_stream
+            .try_next()
+            .await
+            .map_err(|e| Status::invalid_argument(format!("failed to decode batch: {e}")))?
+        {
+            num_rows += batch.num_rows();
+            chunk_bytes += batch.get_array_memory_size();
+            chunk.push(batch);
+
+            if chunk_bytes >= CHUNK_THRESHOLD {
+                self.raft_node
+                    .write_records(table_name, &chunk)
+                    .await
+                    .map_err(write_error_to_status)?;
+                chunk.clear();
+                chunk_bytes = 0;
+            }
         }
 
-        let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // Flush remaining batches.
+        if !chunk.is_empty() {
+            self.raft_node
+                .write_records(table_name, &chunk)
+                .await
+                .map_err(write_error_to_status)?;
+        }
 
-        self.raft_node
-            .write_records(table_name, &batches)
-            .await
-            .map_err(write_error_to_status)?;
-
-        metrics::counter!("bisque_requests_total", "protocol" => "flight", "op" => "ingest")
-            .increment(1);
+        self.m_req_ingest.increment(1);
         debug!(table = %table_name, rows = num_rows, "do_put_statement_ingest: complete");
         Ok(num_rows as i64)
     }

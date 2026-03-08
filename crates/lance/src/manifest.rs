@@ -105,11 +105,11 @@ impl GroupMeta {
 pub(crate) enum TableUpdate {
     /// Upsert table metadata.
     Set {
-        table_name: String,
+        table_name: Arc<str>,
         entry: PersistedTableEntry,
     },
     /// Remove table metadata.
-    Remove { table_name: String },
+    Remove { table_name: Arc<str> },
 }
 
 /// Command sent to the manifest worker thread.
@@ -128,7 +128,7 @@ pub(crate) enum ManifestCommand {
     InstallSnapshot {
         group_id: u64,
         meta: GroupMeta,
-        tables: HashMap<String, PersistedTableEntry>,
+        tables: HashMap<Arc<str>, PersistedTableEntry>,
         done: Option<tokio::sync::oneshot::Sender<()>>,
     },
     /// Append catalog WAL events for client sync.
@@ -600,7 +600,7 @@ impl GroupMdbxEnv {
     fn apply_coalesced(
         &self,
         meta: Option<&GroupMeta>,
-        table_updates: &HashMap<String, Option<PersistedTableEntry>>,
+        table_updates: &HashMap<Arc<str>, Option<PersistedTableEntry>>,
     ) -> io::Result<()> {
         let txn = self
             .db
@@ -646,7 +646,7 @@ impl GroupMdbxEnv {
     fn install_snapshot(
         &self,
         meta: &GroupMeta,
-        entries: &HashMap<String, PersistedTableEntry>,
+        entries: &HashMap<Arc<str>, PersistedTableEntry>,
     ) -> io::Result<()> {
         let txn = self
             .db
@@ -1009,13 +1009,14 @@ impl LanceManifestManager {
         // WAL events are accumulated in order (not coalesced).
         struct GroupBatch {
             meta: Option<GroupMeta>,
-            table_updates: HashMap<String, Option<PersistedTableEntry>>,
+            table_updates: HashMap<Arc<str>, Option<PersistedTableEntry>>,
             wal_events: Vec<CatalogEvent>,
             is_snapshot: bool,
         }
 
-        let mut per_group: HashMap<u64, GroupBatch> = HashMap::new();
-        let mut done_senders: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+        let mut per_group: HashMap<u64, GroupBatch> = HashMap::with_capacity(pending.len());
+        let mut done_senders: Vec<tokio::sync::oneshot::Sender<()>> =
+            Vec::with_capacity(pending.len());
 
         for cmd in pending.drain(..) {
             match cmd {
@@ -1211,7 +1212,7 @@ mod tests {
 
         let meta = make_group_meta(10);
         let mut updates = HashMap::new();
-        updates.insert("test_table".to_string(), Some(make_table_entry(1)));
+        updates.insert(Arc::from("test_table"), Some(make_table_entry(1)));
         env.apply_coalesced(Some(&meta), &updates).unwrap();
 
         // Read back
@@ -1235,9 +1236,9 @@ mod tests {
 
         let meta = make_group_meta(20);
         let mut updates = HashMap::new();
-        updates.insert("alpha".to_string(), Some(make_table_entry(1)));
-        updates.insert("beta".to_string(), Some(make_table_entry(2)));
-        updates.insert("gamma".to_string(), Some(make_table_entry(3)));
+        updates.insert(Arc::from("alpha"), Some(make_table_entry(1)));
+        updates.insert(Arc::from("beta"), Some(make_table_entry(2)));
+        updates.insert(Arc::from("gamma"), Some(make_table_entry(3)));
         env.apply_coalesced(Some(&meta), &updates).unwrap();
 
         let tables = env.read_all_tables().unwrap();
@@ -1253,13 +1254,13 @@ mod tests {
         let env = GroupMdbxEnv::open(dir.path()).unwrap();
 
         let mut updates = HashMap::new();
-        updates.insert("to_remove".to_string(), Some(make_table_entry(1)));
+        updates.insert(Arc::from("to_remove"), Some(make_table_entry(1)));
         env.apply_coalesced(Some(&make_group_meta(10)), &updates)
             .unwrap();
         assert!(env.read_table("to_remove").unwrap().is_some());
 
         let mut updates2 = HashMap::new();
-        updates2.insert("to_remove".to_string(), None);
+        updates2.insert(Arc::from("to_remove"), None);
         env.apply_coalesced(None, &updates2).unwrap();
         assert!(env.read_table("to_remove").unwrap().is_none());
         assert!(env.read_all_tables().unwrap().is_empty());
@@ -1272,14 +1273,14 @@ mod tests {
 
         // Write initial data
         let mut updates = HashMap::new();
-        updates.insert("old_table".to_string(), Some(make_table_entry(1)));
+        updates.insert(Arc::from("old_table"), Some(make_table_entry(1)));
         env.apply_coalesced(Some(&make_group_meta(10)), &updates)
             .unwrap();
         assert!(env.read_table("old_table").unwrap().is_some());
 
         // Install snapshot with different tables
         let mut snapshot_entries = HashMap::new();
-        snapshot_entries.insert("new_table".to_string(), make_table_entry(5));
+        snapshot_entries.insert(Arc::from("new_table"), make_table_entry(5));
         env.install_snapshot(&make_group_meta(50), &snapshot_entries)
             .unwrap();
 
@@ -1299,12 +1300,12 @@ mod tests {
         let env = GroupMdbxEnv::open(dir.path()).unwrap();
 
         let mut updates = HashMap::new();
-        updates.insert("table".to_string(), Some(make_table_entry(1)));
+        updates.insert(Arc::from("table"), Some(make_table_entry(1)));
         env.apply_coalesced(Some(&make_group_meta(10)), &updates)
             .unwrap();
 
         // Overwrite
-        updates.insert("table".to_string(), Some(make_table_entry(5)));
+        updates.insert(Arc::from("table"), Some(make_table_entry(5)));
         env.apply_coalesced(Some(&make_group_meta(20)), &updates)
             .unwrap();
 
@@ -1324,7 +1325,7 @@ mod tests {
             group_id: 0,
             meta: Some(make_group_meta(42)),
             table_update: Some(TableUpdate::Set {
-                table_name: "test".to_string(),
+                table_name: Arc::from("test"),
                 entry: make_table_entry(1),
             }),
             done: None,
@@ -1379,7 +1380,7 @@ mod tests {
             group_id: 1,
             meta: Some(make_group_meta(10)),
             table_update: Some(TableUpdate::Set {
-                table_name: "g1_table".to_string(),
+                table_name: Arc::from("g1_table"),
                 entry: make_table_entry(1),
             }),
             done: None,
@@ -1388,7 +1389,7 @@ mod tests {
             group_id: 2,
             meta: Some(make_group_meta(20)),
             table_update: Some(TableUpdate::Set {
-                table_name: "g2_table".to_string(),
+                table_name: Arc::from("g2_table"),
                 entry: make_table_entry(2),
             }),
             done: None,

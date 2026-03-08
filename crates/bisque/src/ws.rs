@@ -39,6 +39,58 @@ pub struct WsState {
     pub raft_node: Arc<bisque_lance::LanceRaftNode>,
     /// M5/L5: Per-IP connection tracking for rate limiting.
     pub ip_connections: Arc<dashmap::DashMap<std::net::IpAddr, IpConnectionState>>,
+    /// Pre-initialized metric handles — avoids inline `metrics::*!()` macro overhead in hot paths.
+    pub metrics: Arc<WsMetrics>,
+}
+
+/// Pre-initialized WebSocket metric handles.
+pub struct WsMetrics {
+    // Connection lifecycle
+    pub connections_active: metrics::Gauge,
+    pub connection_duration: metrics::Histogram,
+    pub handshakes: metrics::Counter,
+
+    // Message counters
+    pub messages_sent: metrics::Counter,
+    pub messages_recv: metrics::Counter,
+
+    // Per-type message counters
+    pub msgs_sent_catalog: metrics::Counter,
+    pub msgs_sent_operation: metrics::Counter,
+    pub lag_catalog: metrics::Counter,
+    pub lag_operations: metrics::Counter,
+
+    // Error/rejection counters
+    pub ip_rate_limited: metrics::Counter,
+    pub auth_blocked: metrics::Counter,
+    pub origin_rejected: metrics::Counter,
+    pub auth_failures: metrics::Counter,
+    pub read_timeouts: metrics::Counter,
+    pub decode_errors: metrics::Counter,
+    pub request_timeouts: metrics::Counter,
+}
+
+impl WsMetrics {
+    pub fn new() -> Self {
+        Self {
+            connections_active: metrics::gauge!("ws_connections_active"),
+            connection_duration: metrics::histogram!("ws_connection_duration_seconds"),
+            handshakes: metrics::counter!("ws_handshakes_total"),
+            messages_sent: metrics::counter!("ws_messages_sent_total"),
+            messages_recv: metrics::counter!("ws_messages_recv_total"),
+            msgs_sent_catalog: metrics::counter!("ws_messages_sent", "type" => "catalog_event"),
+            msgs_sent_operation: metrics::counter!("ws_messages_sent", "type" => "operation_update"),
+            lag_catalog: metrics::counter!("ws_subscriber_lag", "type" => "catalog"),
+            lag_operations: metrics::counter!("ws_subscriber_lag", "type" => "operations"),
+            ip_rate_limited: metrics::counter!("ws_ip_rate_limited"),
+            auth_blocked: metrics::counter!("ws_auth_blocked"),
+            origin_rejected: metrics::counter!("ws_origin_rejected"),
+            auth_failures: metrics::counter!("ws_auth_failures"),
+            read_timeouts: metrics::counter!("ws_read_timeouts"),
+            decode_errors: metrics::counter!("ws_decode_errors"),
+            request_timeouts: metrics::counter!("ws_request_timeouts"),
+        }
+    }
 }
 
 /// Per-IP connection state for rate limiting (M5/L5).
@@ -115,14 +167,14 @@ pub async fn unified_ws_handler(
         if let Some(ref state) = entry {
             if state.active >= WS_MAX_CONNECTIONS_PER_IP {
                 warn!(%client_ip, "WS connection rejected: too many connections from IP");
-                metrics::counter!("ws_ip_rate_limited").increment(1);
+                ws_state.metrics.ip_rate_limited.increment(1);
                 return (StatusCode::TOO_MANY_REQUESTS, "Too many connections").into_response();
             }
             if state.auth_failures >= WS_MAX_AUTH_FAILURES_PER_IP
                 && state.last_auth_failure.elapsed() < WS_AUTH_FAILURE_BLOCK_DURATION
             {
                 warn!(%client_ip, "WS connection rejected: too many auth failures");
-                metrics::counter!("ws_auth_blocked").increment(1);
+                ws_state.metrics.auth_blocked.increment(1);
                 return (StatusCode::TOO_MANY_REQUESTS, "Too many auth failures").into_response();
             }
         }
@@ -137,7 +189,7 @@ pub async fn unified_ws_handler(
                 .unwrap_or(origin);
             if origin_host != host {
                 warn!(origin, host, "WS connection rejected: origin mismatch");
-                metrics::counter!("ws_origin_rejected").increment(1);
+                ws_state.metrics.origin_rejected.increment(1);
                 return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
             }
         }
@@ -159,6 +211,7 @@ pub async fn unified_ws_handler(
     let meta_engine = ws_state.meta_engine.clone();
     let token_manager = ws_state.token_manager.clone();
     let raft_node = ws_state.raft_node.clone();
+    let ws_metrics = ws_state.metrics.clone();
     let pins = state.version_pins.clone();
     let ip_connections = ws_state.ip_connections.clone();
 
@@ -181,7 +234,7 @@ pub async fn unified_ws_handler(
             })
             .active += 1;
         let session_id = pins.create_session();
-        metrics::gauge!("ws_connections_active").increment(1.0);
+        ws_metrics.connections_active.increment(1.0);
 
         if let Err(e) = handle_unified_ws(
             ws,
@@ -194,6 +247,7 @@ pub async fn unified_ws_handler(
             session_id,
             client_ip,
             &ip_connections,
+            &ws_metrics,
         )
         .await
         {
@@ -212,7 +266,7 @@ pub async fn unified_ws_handler(
                 ip_connections.remove(&client_ip);
             }
         }
-        metrics::gauge!("ws_connections_active").decrement(1.0);
+        ws_metrics.connections_active.decrement(1.0);
     });
 
     response.into_response()
@@ -251,6 +305,7 @@ async fn handle_unified_ws<S>(
     session_id: u64,
     client_ip: std::net::IpAddr,
     ip_connections: &dashmap::DashMap<std::net::IpAddr, IpConnectionState>,
+    ws_metrics: &WsMetrics,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -367,7 +422,7 @@ where
                         entry.auth_failures += 1;
                         entry.last_auth_failure = std::time::Instant::now();
                     }
-                    metrics::counter!("ws_auth_failures").increment(1);
+                    ws_metrics.auth_failures.increment(1);
                     return send_close_and_return(&mut ws, reason).await;
                 }
             };
@@ -389,7 +444,7 @@ where
         .collect();
 
     // L4: Track handshake success and connection start time for duration metric.
-    metrics::counter!("ws_handshakes_total").increment(1);
+    ws_metrics.handshakes.increment(1);
     let connection_start = Instant::now();
     info!(session_id, last_seen_seq, "Unified WS handshake complete");
 
@@ -426,10 +481,10 @@ where
                 } else {
                     for event in events {
                         // M8: Apply catalog filter to WAL replay too.
-                        if !catalog_filter.is_empty() && !catalog_filter.contains(&event.catalog) {
+                        if !catalog_filter.is_empty() && !catalog_filter.contains(&*event.catalog) {
                             continue;
                         }
-                        let catalog = event.catalog.clone();
+                        let catalog = event.catalog.to_string();
                         // E2: Skip events that fail to serialize instead of sending null.
                         match serde_json::to_value(&event.event) {
                             Ok(event_val) => {
@@ -502,11 +557,11 @@ where
                 match event_result {
                     Ok(event) => {
                         // R6: Filter by subscribed catalogs (empty = all).
-                        if !catalog_filter.is_empty() && !catalog_filter.contains(&event.catalog) {
+                        if !catalog_filter.is_empty() && !catalog_filter.contains(&*event.catalog) {
                             continue;
                         }
                         // E2: Skip events that fail to serialize instead of sending null.
-                        let catalog = event.catalog.clone();
+                        let catalog = event.catalog.to_string();
                         match serde_json::to_value(&event.event) {
                             Ok(event_val) => {
                                 let msg = ServerMessage::CatalogEvent {
@@ -516,7 +571,7 @@ where
                                 };
                                 ws_write_frame(&mut ws, rmp_serde::to_vec_named(&msg)?).await?;
                                 msgs_sent += 1;
-                                metrics::counter!("ws_messages_sent", "type" => "catalog_event").increment(1);
+                                ws_metrics.msgs_sent_catalog.increment(1);
                             }
                             Err(e) => {
                                 warn!(session_id, error = %e, "Failed to serialize catalog event, skipping");
@@ -525,7 +580,7 @@ where
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(session_id, lagged = n, "Unified WS catalog subscriber lagged");
-                        metrics::counter!("ws_subscriber_lag", "type" => "catalog").increment(n);
+                        ws_metrics.lag_catalog.increment(n);
                         let msg = ServerMessage::SnapshotRequired {
                             seq: next_seq(),
                             catalog: "*".into(),
@@ -550,7 +605,7 @@ where
                                 };
                                 ws_write_frame(&mut ws, rmp_serde::to_vec_named(&msg)?).await?;
                                 msgs_sent += 1;
-                                metrics::counter!("ws_messages_sent", "type" => "operation_update").increment(1);
+                                ws_metrics.msgs_sent_operation.increment(1);
                             }
                             Err(e) => {
                                 warn!(session_id, error = %e, "Failed to serialize operation update, skipping");
@@ -559,7 +614,7 @@ where
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(session_id, lagged = n, "Unified WS operations subscriber lagged");
-                        metrics::counter!("ws_subscriber_lag", "type" => "operations").increment(n);
+                        ws_metrics.lag_operations.increment(n);
                         let all_ops = state.collect_operations(WS_MAX_OPS_SNAPSHOT);
                         let msg = ServerMessage::OperationsSnapshot {
                             seq: next_seq(),
@@ -600,7 +655,7 @@ where
                     Err(_) => {
                         // Read timeout — no client activity for 90s.
                         info!(session_id, "WS read timeout — dead peer detected");
-                        metrics::counter!("ws_read_timeouts").increment(1);
+                        ws_metrics.read_timeouts.increment(1);
                         break;
                     }
                 };
@@ -614,7 +669,7 @@ where
                             Ok(m) => m,
                             Err(e) => {
                                 debug!(session_id, error = %e, "Unrecognized client WS message");
-                                metrics::counter!("ws_decode_errors").increment(1);
+                                ws_metrics.decode_errors.increment(1);
                                 continue;
                             }
                         };
@@ -653,7 +708,7 @@ where
                                     Ok(result) => result,
                                     Err(_) => {
                                         warn!(session_id, request_id, "WS request timed out (30s)");
-                                        metrics::counter!("ws_request_timeouts").increment(1);
+                                        ws_metrics.request_timeouts.increment(1);
                                         // M6: Include session context in error messages.
                                         ResponseResult::Error {
                                             code: 504,
@@ -683,12 +738,12 @@ where
                                         debug!(session_id, %catalog, "Pin denied: no catalog access");
                                         continue;
                                     }
-                                    pins.pin(session_id, PinKey { catalog, table, tier, version });
+                                    pins.pin(session_id, PinKey { catalog: Arc::from(catalog), table: Arc::from(table), tier, version });
                                 }
                             }
                             ClientMessage::Unpin { catalog, table, tier, version } => {
                                 if let Some(tier) = PinTier::from_str(&tier) {
-                                    pins.unpin(session_id, PinKey { catalog, table, tier, version });
+                                    pins.unpin(session_id, PinKey { catalog: Arc::from(catalog), table: Arc::from(table), tier, version });
                                 }
                             }
                             ClientMessage::Heartbeat { .. } => {
@@ -732,9 +787,9 @@ where
 
     // L4: Emit connection duration and message rate metrics.
     let duration_secs = connection_start.elapsed().as_secs_f64();
-    metrics::histogram!("ws_connection_duration_seconds").record(duration_secs);
-    metrics::counter!("ws_messages_sent_total").increment(msgs_sent);
-    metrics::counter!("ws_messages_recv_total").increment(msgs_recv);
+    ws_metrics.connection_duration.record(duration_secs);
+    ws_metrics.messages_sent.increment(msgs_sent);
+    ws_metrics.messages_recv.increment(msgs_recv);
     info!(
         session_id,
         msgs_sent, msgs_recv, duration_secs, "Unified WS connection closed"

@@ -55,6 +55,16 @@ pub struct S3ServerState {
     pub operations: Arc<OperationsManager>,
     /// Optional cluster mesh for cross-node operation visibility.
     pub mesh: Option<ClusterMesh>,
+
+    // ── Pre-built metric handles ──
+    m_req_catalog: metrics::Counter,
+    m_req_reindex: metrics::Counter,
+    m_req_compact: metrics::Counter,
+    m_req_get: metrics::Counter,
+    m_req_head: metrics::Counter,
+    m_req_list: metrics::Counter,
+    m_lat_get: metrics::Histogram,
+    m_lat_head: metrics::Histogram,
 }
 
 impl S3ServerState {
@@ -64,6 +74,7 @@ impl S3ServerState {
         catalog_events: Option<Arc<CatalogEventBus>>,
         manifest: Option<Arc<LanceManifestManager>>,
         group_id: u64,
+        catalog_name: String,
         mesh: Option<ClusterMesh>,
     ) -> Arc<Self> {
         // M3: 60s lease timeout — gives clients enough time between heartbeats (15s interval).
@@ -82,6 +93,7 @@ impl S3ServerState {
         });
 
         let operations = OperationsManager::new(group_id, 4, 2);
+        let cat = catalog_name;
 
         Arc::new(Self {
             engine,
@@ -91,6 +103,14 @@ impl S3ServerState {
             version_pins,
             operations,
             mesh,
+            m_req_catalog: metrics::counter!("bisque_requests_total", "catalog" => cat.clone(), "protocol" => "s3", "op" => "catalog"),
+            m_req_reindex: metrics::counter!("bisque_requests_total", "catalog" => cat.clone(), "protocol" => "s3", "op" => "reindex"),
+            m_req_compact: metrics::counter!("bisque_requests_total", "catalog" => cat.clone(), "protocol" => "s3", "op" => "compact"),
+            m_req_get: metrics::counter!("bisque_requests_total", "catalog" => cat.clone(), "protocol" => "s3", "op" => "get"),
+            m_req_head: metrics::counter!("bisque_requests_total", "catalog" => cat.clone(), "protocol" => "s3", "op" => "head"),
+            m_req_list: metrics::counter!("bisque_requests_total", "catalog" => cat.clone(), "protocol" => "s3", "op" => "list"),
+            m_lat_get: metrics::histogram!("bisque_request_latency_ms", "catalog" => cat.clone(), "protocol" => "s3", "op" => "get"),
+            m_lat_head: metrics::histogram!("bisque_request_latency_ms", "catalog" => cat, "protocol" => "s3", "op" => "head"),
         })
     }
 
@@ -288,7 +308,14 @@ pub async fn serve_s3(
     manifest: Option<Arc<LanceManifestManager>>,
     group_id: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = S3ServerState::new(engine, catalog_events, manifest, group_id, None);
+    let state = S3ServerState::new(
+        engine,
+        catalog_events,
+        manifest,
+        group_id,
+        String::new(),
+        None,
+    );
     let app = s3_router(state);
 
     info!(%addr, "starting S3-compatible HTTP server");
@@ -463,7 +490,7 @@ async fn get_catalog(
         }
     }
 
-    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "catalog").increment(1);
+    state.m_req_catalog.increment(1);
     axum::Json(CatalogResponse { tables: catalog })
 }
 
@@ -553,7 +580,7 @@ async fn reindex_table(
         state.engine.clone(),
     );
 
-    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "reindex").increment(1);
+    state.m_req_reindex.increment(1);
 
     Ok(axum::Json(SubmitResponse {
         op_id,
@@ -582,7 +609,7 @@ async fn compact_table(
         state.engine.clone(),
     );
 
-    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "compact").increment(1);
+    state.m_req_compact.increment(1);
 
     Ok(axum::Json(SubmitResponse {
         op_id,
@@ -883,9 +910,10 @@ async fn get_object(
         builder = builder.status(StatusCode::OK);
     }
 
-    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "get").increment(1);
-    metrics::histogram!("bisque_request_latency_seconds", "protocol" => "s3", "op" => "get")
-        .record(req_start.elapsed().as_secs_f64());
+    state.m_req_get.increment(1);
+    state
+        .m_lat_get
+        .record(req_start.elapsed().as_millis() as f64);
     Ok(builder.body(body).unwrap())
 }
 
@@ -939,9 +967,10 @@ async fn head_object(
     let etag = meta.e_tag.as_deref().unwrap_or("\"unknown\"");
     let last_modified = meta.last_modified.to_rfc2822();
 
-    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "head").increment(1);
-    metrics::histogram!("bisque_request_latency_seconds", "protocol" => "s3", "op" => "head")
-        .record(req_start.elapsed().as_secs_f64());
+    state.m_req_head.increment(1);
+    state
+        .m_lat_head
+        .record(req_start.elapsed().as_millis() as f64);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-length", meta.size.to_string())
@@ -976,14 +1005,14 @@ async fn list_objects(
     AxumPath(bucket): AxumPath<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Response, Response> {
-    metrics::counter!("bisque_requests_total", "protocol" => "s3", "op" => "list").increment(1);
+    state.m_req_list.increment(1);
     let prefix = params.prefix.unwrap_or_default();
     let delimiter = params.delimiter.unwrap_or_default();
     let max_keys = params.max_keys.unwrap_or(1000).min(10000);
 
-    let mut objects = Vec::new();
-    let mut common_prefixes = Vec::new();
-    let mut seen_prefixes = std::collections::HashSet::new();
+    let mut objects = Vec::with_capacity(max_keys.min(256));
+    let mut common_prefixes = Vec::with_capacity(16);
+    let mut seen_prefixes = std::collections::HashSet::with_capacity(16);
 
     // For each table, list files from active and sealed dataset snapshots
     let tables = state.engine.list_tables();

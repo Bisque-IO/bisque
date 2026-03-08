@@ -104,6 +104,7 @@ dashmap = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+bisque-client = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
