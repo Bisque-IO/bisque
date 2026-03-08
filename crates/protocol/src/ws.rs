@@ -384,14 +384,21 @@ mod tests {
 
         // Decode as raw serde_json::Value to see exactly what the JS client would see
         let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
-        println!("Decoded GetCatalog response: {}", serde_json::to_string_pretty(&decoded).unwrap());
+        println!(
+            "Decoded GetCatalog response: {}",
+            serde_json::to_string_pretty(&decoded).unwrap()
+        );
 
         // Verify the shape matches what the JS client expects
         assert_eq!(decoded["type"], "Response");
         assert_eq!(decoded["request_id"], 42);
         assert_eq!(decoded["status"], "ok");
         assert_eq!(decoded["method"], "get_catalog");
-        assert!(decoded["catalog"].is_object(), "catalog field should be an object, got: {:?}", decoded["catalog"]);
+        assert!(
+            decoded["catalog"].is_object(),
+            "catalog field should be an object, got: {:?}",
+            decoded["catalog"]
+        );
     }
 
     #[test]
@@ -409,9 +416,17 @@ mod tests {
         // Try to decode as ClientMessage
         let decoded: Result<ClientMessage, _> = rmp_serde::from_slice(&encoded);
         println!("Decode result: {:?}", decoded);
-        assert!(decoded.is_ok(), "Should decode successfully: {:?}", decoded.err());
+        assert!(
+            decoded.is_ok(),
+            "Should decode successfully: {:?}",
+            decoded.err()
+        );
 
-        if let Ok(ClientMessage::Request { request_id, method: RequestMethod::GetCatalog { bucket } }) = decoded {
+        if let Ok(ClientMessage::Request {
+            request_id,
+            method: RequestMethod::GetCatalog { bucket },
+        }) = decoded
+        {
             assert_eq!(request_id, 1);
             assert_eq!(bucket, "my_catalog");
         } else {
@@ -432,7 +447,10 @@ mod tests {
 
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
-        println!("Decoded ClusterStatus: {}", serde_json::to_string_pretty(&decoded).unwrap());
+        println!(
+            "Decoded ClusterStatus: {}",
+            serde_json::to_string_pretty(&decoded).unwrap()
+        );
 
         assert_eq!(decoded["type"], "Response");
         assert_eq!(decoded["status"], "ok");
@@ -452,7 +470,10 @@ mod tests {
 
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
-        println!("Decoded error: {}", serde_json::to_string_pretty(&decoded).unwrap());
+        println!(
+            "Decoded error: {}",
+            serde_json::to_string_pretty(&decoded).unwrap()
+        );
 
         assert_eq!(decoded["type"], "Response");
         assert_eq!(decoded["request_id"], 5);

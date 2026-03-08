@@ -312,8 +312,7 @@ impl S3ServerState {
             }
         }
 
-        let s3_storage_options =
-            filter_non_credential_options(&table.config().s3_storage_options);
+        let s3_storage_options = filter_non_credential_options(&table.config().s3_storage_options);
 
         CatalogTableInfo {
             active_segment: seg_catalog.active_segment,
@@ -562,11 +561,12 @@ async fn get_catalog(
 ) -> impl IntoResponse {
     state.m_req_catalog.increment(1);
     axum::Json(
-        serde_json::from_value::<CatalogResponse>(state.get_catalog_json().await)
-            .unwrap_or(CatalogResponse {
+        serde_json::from_value::<CatalogResponse>(state.get_catalog_json().await).unwrap_or(
+            CatalogResponse {
                 tables: std::collections::HashMap::new(),
                 otel: None,
-            }),
+            },
+        ),
     )
 }
 

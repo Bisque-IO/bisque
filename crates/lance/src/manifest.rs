@@ -347,9 +347,8 @@ impl GroupMdbxEnv {
     }
 
     fn write_catalog_meta(&self, meta: &CatalogMeta) -> io::Result<()> {
-        let bytes =
-            bincode::serde::encode_to_vec(meta, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let txn = self
             .db
             .begin_rw_txn()
@@ -431,14 +430,12 @@ impl GroupMdbxEnv {
         let iter = cursor.iter_from::<std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>>(&start_key);
         for result in iter {
             match result {
-                Ok((_, v)) => {
-                    match serde_json::from_slice::<CatalogEvent>(v.as_ref()) {
-                        Ok(event) => events.push(event),
-                        Err(e) => {
-                            warn!("Failed to decode WAL event: {}", e);
-                        }
+                Ok((_, v)) => match serde_json::from_slice::<CatalogEvent>(v.as_ref()) {
+                    Ok(event) => events.push(event),
+                    Err(e) => {
+                        warn!("Failed to decode WAL event: {}", e);
                     }
-                }
+                },
                 Err(e) => {
                     warn!("WAL cursor error: {}", e);
                     break;

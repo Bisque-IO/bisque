@@ -1127,8 +1127,7 @@ async fn handle_ws_request(
             let all_tenants = meta_engine.list_tenants();
             let mut total_catalogs = 0u64;
             for t in &all_tenants {
-                total_catalogs +=
-                    meta_engine.list_catalogs_for_tenant(t.tenant_id).len() as u64;
+                total_catalogs += meta_engine.list_catalogs_for_tenant(t.tenant_id).len() as u64;
             }
             let total_tables = state.engine().list_tables().len() as u64;
 
@@ -1319,12 +1318,15 @@ async fn handle_ws_request(
                         "Int32" | "int32" => arrow_schema::DataType::Int32,
                         "Int64" | "int64" => arrow_schema::DataType::Int64,
                         "Float32" | "float32" => arrow_schema::DataType::Float32,
-                        "Float64" | "float64" | "Float" | "float" => arrow_schema::DataType::Float64,
+                        "Float64" | "float64" | "Float" | "float" => {
+                            arrow_schema::DataType::Float64
+                        }
                         "Boolean" | "boolean" | "bool" => arrow_schema::DataType::Boolean,
                         "Date32" | "date" => arrow_schema::DataType::Date32,
-                        "Timestamp" | "timestamp" => {
-                            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-                        }
+                        "Timestamp" | "timestamp" => arrow_schema::DataType::Timestamp(
+                            arrow_schema::TimeUnit::Microsecond,
+                            None,
+                        ),
                         "Binary" | "binary" => arrow_schema::DataType::Binary,
                         _ => arrow_schema::DataType::Utf8,
                     };
@@ -1377,8 +1379,9 @@ async fn handle_ws_request(
             let engine = raft_node.engine().clone();
             let result = tokio::spawn(async move {
                 let ctx = SessionContext::new();
-                let catalog =
-                    Arc::new(bisque_lance::postgres::BisqueLanceCatalogProvider::new(engine));
+                let catalog = Arc::new(bisque_lance::postgres::BisqueLanceCatalogProvider::new(
+                    engine,
+                ));
                 ctx.register_catalog("bisque", catalog);
 
                 let df = ctx.sql(&sql).await?;

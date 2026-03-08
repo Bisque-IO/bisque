@@ -28,7 +28,9 @@ use bisque_lance::{
 use bisque_meta::MetaConfig;
 use bisque_meta::engine::MetaEngine;
 use bisque_meta::token::{self, TokenClaims, TokenManager};
-use bisque_meta::types::{Account, AccountRole, CatalogEntry, EngineType, Scope, Tenant, TenantLimits};
+use bisque_meta::types::{
+    Account, AccountRole, CatalogEntry, EngineType, Scope, Tenant, TenantLimits,
+};
 use bisque_raft::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
     MultiRaftManager, MultiplexedLogStorage, NodeAddressResolver,

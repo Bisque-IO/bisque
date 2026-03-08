@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use base64::Engine as _;
-use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, TableFlags, WriteFlags};
+use libmdbx::{
+    Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, TableFlags, WriteFlags,
+};
 use parking_lot::RwLock;
 use tracing::{info, warn};
 
@@ -1798,8 +1800,7 @@ mod tests {
 
     /// Creates a persistent test engine at the given path with a default account.
     fn persistent_engine(dir: &Path) -> MetaEngine {
-        let engine =
-            MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir).unwrap();
+        let engine = MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir).unwrap();
         // Only create account on first open (persistence means it may already exist).
         if engine.list_accounts().is_empty() {
             engine.create_account("test-org".into()).unwrap();
@@ -1810,11 +1811,8 @@ mod tests {
     #[test]
     fn test_persistent_open_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = MetaEngine::open(
-            MetaConfig::new(b"test-secret".to_vec()),
-            dir.path(),
-        )
-        .unwrap();
+        let engine =
+            MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir.path()).unwrap();
         assert!(engine.list_accounts().is_empty());
         assert!(engine.list_tenants().is_empty());
     }
@@ -1930,9 +1928,7 @@ mod tests {
             assert!(tenant.api_keys.contains(&key_id));
 
             // Deterministic key derivation should produce the same raw key.
-            let (k2, raw2) = engine
-                .create_api_key(1, vec![Scope::TenantAdmin])
-                .unwrap();
+            let (k2, raw2) = engine.create_api_key(1, vec![Scope::TenantAdmin]).unwrap();
             // Different key_id, so different raw key.
             assert_ne!(k2, key_id);
             assert_ne!(raw2, raw_key);
@@ -1974,9 +1970,7 @@ mod tests {
         let (user_id, tenant_id);
         {
             let engine = persistent_engine(dir.path());
-            user_id = engine
-                .create_user("bob".into(), b"hash".to_vec())
-                .unwrap();
+            user_id = engine.create_user("bob".into(), b"hash".to_vec()).unwrap();
             engine
                 .add_membership(user_id, TEST_ACCOUNT, AccountRole::Member)
                 .unwrap();
@@ -2190,9 +2184,7 @@ mod tests {
                 .unwrap();
             cid = result.0;
             gid = result.1;
-            engine
-                .update_catalog_placement(cid, vec![1, 2, 3])
-                .unwrap();
+            engine.update_catalog_placement(cid, vec![1, 2, 3]).unwrap();
         }
 
         {
@@ -2235,9 +2227,7 @@ mod tests {
         let user_id;
         {
             let engine = persistent_engine(dir.path());
-            user_id = engine
-                .create_user("eve".into(), b"hash".to_vec())
-                .unwrap();
+            user_id = engine.create_user("eve".into(), b"hash".to_vec()).unwrap();
             engine
                 .add_membership(user_id, TEST_ACCOUNT, AccountRole::Admin)
                 .unwrap();
@@ -2295,9 +2285,7 @@ mod tests {
             engine
                 .grant_tenant_access(user_id, tenant_id, CatalogAccess::All)
                 .unwrap();
-            engine
-                .revoke_tenant_access(user_id, tenant_id)
-                .unwrap();
+            engine.revoke_tenant_access(user_id, tenant_id).unwrap();
         }
 
         {
@@ -2375,9 +2363,7 @@ mod tests {
             let tid = engine
                 .create_tenant(TEST_ACCOUNT, "default".into(), TenantLimits::default())
                 .unwrap();
-            engine
-                .create_api_key(tid, vec![Scope::SuperAdmin])
-                .unwrap();
+            engine.create_api_key(tid, vec![Scope::SuperAdmin]).unwrap();
         }
 
         // On second open, accounts are not empty so bootstrap should not run.
@@ -2386,9 +2372,7 @@ mod tests {
             // Should still have exactly 1 account, 1 tenant, 1 key.
             assert_eq!(engine.list_accounts().len(), 1);
             assert_eq!(engine.list_tenants().len(), 1);
-            let keys: Vec<_> = (1..=10)
-                .filter_map(|id| engine.get_api_key(id))
-                .collect();
+            let keys: Vec<_> = (1..=10).filter_map(|id| engine.get_api_key(id)).collect();
             assert_eq!(keys.len(), 1);
         }
     }
@@ -2402,11 +2386,7 @@ mod tests {
             // Create 5 tenants with catalogs.
             for i in 1..=5 {
                 let tid = engine
-                    .create_tenant(
-                        TEST_ACCOUNT,
-                        format!("tenant-{i}"),
-                        TenantLimits::default(),
-                    )
+                    .create_tenant(TEST_ACCOUNT, format!("tenant-{i}"), TenantLimits::default())
                     .unwrap();
                 engine
                     .create_catalog(tid, format!("cat-{i}"), EngineType::Lance, "{}".into())
@@ -2630,7 +2610,10 @@ mod tests {
         {
             let engine = persistent_engine(dir.path());
             assert_eq!(engine.get_tenant(tid).unwrap().name, "acme");
-            assert_eq!(engine.get_catalog(cid).unwrap().status, CatalogStatus::Active);
+            assert_eq!(
+                engine.get_catalog(cid).unwrap().status,
+                CatalogStatus::Active
+            );
             assert_eq!(engine.get_catalog(cid2).unwrap().name, "events");
             assert!(!engine.get_api_key(kid).unwrap().revoked);
             let u = engine.get_usage(cid).unwrap();
@@ -2672,9 +2655,7 @@ mod tests {
         {
             let engine = persistent_engine(dir.path());
             let pw_hash = crate::token::hash_password(b"my-secret-pw");
-            engine
-                .create_user("alice".into(), pw_hash)
-                .unwrap();
+            engine.create_user("alice".into(), pw_hash).unwrap();
         }
 
         {
@@ -2688,7 +2669,11 @@ mod tests {
             assert!(engine.verify_user_password("alice", b"wrong").is_none());
 
             // Unknown user should fail.
-            assert!(engine.verify_user_password("bob", b"my-secret-pw").is_none());
+            assert!(
+                engine
+                    .verify_user_password("bob", b"my-secret-pw")
+                    .is_none()
+            );
         }
     }
 
@@ -2714,7 +2699,13 @@ mod tests {
     fn test_persistent_timestamps_preserved() {
         let dir = tempfile::tempdir().unwrap();
 
-        let (account_created_at, tenant_created_at, catalog_created_at, key_created_at, user_created_at);
+        let (
+            account_created_at,
+            tenant_created_at,
+            catalog_created_at,
+            key_created_at,
+            user_created_at,
+        );
         {
             let engine = persistent_engine(dir.path());
             account_created_at = engine.get_account(TEST_ACCOUNT).unwrap().created_at;
@@ -2742,13 +2733,19 @@ mod tests {
 
         {
             let engine = persistent_engine(dir.path());
-            assert_eq!(engine.get_account(TEST_ACCOUNT).unwrap().created_at, account_created_at);
+            assert_eq!(
+                engine.get_account(TEST_ACCOUNT).unwrap().created_at,
+                account_created_at
+            );
             assert_ne!(account_created_at, 0);
 
             assert_eq!(engine.get_tenant(1).unwrap().created_at, tenant_created_at);
             assert_ne!(tenant_created_at, 0);
 
-            assert_eq!(engine.get_catalog(1).unwrap().created_at, catalog_created_at);
+            assert_eq!(
+                engine.get_catalog(1).unwrap().created_at,
+                catalog_created_at
+            );
             assert_ne!(catalog_created_at, 0);
 
             assert_eq!(engine.get_api_key(1).unwrap().created_at, key_created_at);
@@ -2772,14 +2769,10 @@ mod tests {
         engine
             .update_catalog_status(cid, CatalogStatus::Active)
             .unwrap();
-        engine
-            .update_catalog_placement(cid, vec![1, 2])
-            .unwrap();
+        engine.update_catalog_placement(cid, vec![1, 2]).unwrap();
         engine.update_leader(gid, Some(1)).unwrap();
 
-        let uid = engine
-            .create_user("bob".into(), b"hash".to_vec())
-            .unwrap();
+        let uid = engine.create_user("bob".into(), b"hash".to_vec()).unwrap();
         engine
             .add_membership(uid, TEST_ACCOUNT, AccountRole::Admin)
             .unwrap();
@@ -2799,7 +2792,9 @@ mod tests {
         engine.revoke_api_key(kid).unwrap();
 
         engine.report_usage(cid, 100, 200).unwrap();
-        engine.update_tenant_limits(tid, TenantLimits::default()).unwrap();
+        engine
+            .update_tenant_limits(tid, TenantLimits::default())
+            .unwrap();
         engine.update_password(uid, b"new-hash".to_vec()).unwrap();
         engine.disable_user(uid).unwrap();
 
@@ -2844,9 +2839,7 @@ mod tests {
             engine
                 .create_api_key(t1, vec![Scope::Catalog("shared_name".into())])
                 .unwrap();
-            engine
-                .create_api_key(t2, vec![Scope::TenantAdmin])
-                .unwrap();
+            engine.create_api_key(t2, vec![Scope::TenantAdmin]).unwrap();
         }
 
         {
@@ -2929,12 +2922,8 @@ mod tests {
 
         {
             let engine = persistent_engine(dir.path());
-            let u1 = engine
-                .create_user("admin".into(), b"h1".to_vec())
-                .unwrap();
-            let u2 = engine
-                .create_user("member".into(), b"h2".to_vec())
-                .unwrap();
+            let u1 = engine.create_user("admin".into(), b"h1".to_vec()).unwrap();
+            let u2 = engine.create_user("member".into(), b"h2".to_vec()).unwrap();
             engine
                 .add_membership(u1, TEST_ACCOUNT, AccountRole::Admin)
                 .unwrap();
@@ -2951,7 +2940,10 @@ mod tests {
             let admin = members.iter().find(|(u, _)| u.username == "admin").unwrap();
             assert_eq!(admin.1, AccountRole::Admin);
 
-            let member = members.iter().find(|(u, _)| u.username == "member").unwrap();
+            let member = members
+                .iter()
+                .find(|(u, _)| u.username == "member")
+                .unwrap();
             assert_eq!(member.1, AccountRole::Member);
         }
     }
