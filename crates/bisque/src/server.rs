@@ -28,7 +28,7 @@ use bisque_lance::{
 use bisque_meta::MetaConfig;
 use bisque_meta::engine::MetaEngine;
 use bisque_meta::token::{self, TokenClaims, TokenManager};
-use bisque_meta::types::{Account, CatalogEntry, EngineType, Scope, Tenant, TenantLimits};
+use bisque_meta::types::{Account, AccountRole, CatalogEntry, EngineType, Scope, Tenant, TenantLimits};
 use bisque_raft::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
     MultiRaftManager, MultiplexedLogStorage, NodeAddressResolver,
@@ -115,7 +115,8 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
     let meta_config =
         MetaConfig::new(config.token_secret.clone()).with_token_ttl_secs(config.token_ttl_secs);
 
-    let meta_engine = Arc::new(MetaEngine::new(meta_config));
+    let meta_dir = config.data_dir.join("meta");
+    let meta_engine = Arc::new(MetaEngine::open(meta_config, &meta_dir)?);
     let token_manager = Arc::new(TokenManager::new(config.token_secret.clone()));
 
     let app_state = AppState {
@@ -236,7 +237,10 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         }
     }
 
-    // 2j. Build the S3ServerState (used by S3 router and WS handler).
+    // 2j. Bootstrap: create default admin account/user/tenant if DB is empty.
+    bootstrap_admin(&meta_engine, &token_manager);
+
+    // 2k. Build the S3ServerState (used by S3 router and WS handler).
     let s3_state = S3ServerState::new(
         engine.clone(),
         Some(catalog_bus),
@@ -281,6 +285,7 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         meta_engine: meta_engine.clone(),
         token_manager: token_manager.clone(),
         raft_node: raft_node.clone(),
+        http_addr: config.http_addr,
         ip_connections: Arc::new(dashmap::DashMap::new()),
         metrics: Arc::new(WsMetrics::new()),
     };
@@ -291,9 +296,15 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
     let s3_routes = s3_router(s3_state);
 
     // OTLP HTTP routes (Tempo, Prometheus/Mimir, Loki, OTLP HTTP ingest)
+    // Tables are created on-demand via the EnableOtel WS request, not at startup.
     let otel_receiver = Arc::new(OtlpReceiver::new(raft_node.clone()));
-    otel_receiver.ensure_tables().await?;
     let otel_routes = otel_http_router(raft_node.clone(), otel_receiver);
+
+    // CORS — allow any origin so the UI can talk to the server from a different port/host.
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
 
     // Compose: specific paths first, then OTLP HTTP, then S3 (wildcard catch-all last)
     let mut app = axum::Router::new()
@@ -302,7 +313,8 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         .merge(health_route)
         .merge(ws_route)
         .merge(otel_routes)
-        .merge(s3_routes);
+        .merge(s3_routes)
+        .layer(cors);
 
     // Serve static UI files if ui_dir is configured
     if let Some(ref ui_dir) = config.ui_dir {
@@ -446,6 +458,10 @@ struct LoginResponse {
     user_id: u64,
     token: String,
     accounts: Vec<Account>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_tenant_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_tenant_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -502,6 +518,62 @@ struct CreateApiKeyResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Bootstrap — create default admin on first start
+// ---------------------------------------------------------------------------
+
+fn bootstrap_admin(meta_engine: &Arc<MetaEngine>, token_manager: &Arc<TokenManager>) {
+    // Only bootstrap if no accounts exist yet (fresh database).
+    if !meta_engine.list_accounts().is_empty() {
+        return;
+    }
+
+    info!("bootstrapping default admin account (first start)");
+
+    let account_id = meta_engine
+        .create_account("default".into())
+        .expect("bootstrap: create account");
+
+    let password_hash = token::hash_password(b"admin");
+    let user_id = meta_engine
+        .create_user("admin".into(), password_hash)
+        .expect("bootstrap: create user");
+
+    meta_engine
+        .add_membership(user_id, account_id, AccountRole::Admin)
+        .expect("bootstrap: add membership");
+
+    let tenant_id = meta_engine
+        .create_tenant(account_id, "default".into(), TenantLimits::default())
+        .expect("bootstrap: create tenant");
+
+    // Create a SuperAdmin API key so the first login works
+    let (key_id, raw_key) = meta_engine
+        .create_api_key(tenant_id, vec![Scope::SuperAdmin])
+        .expect("bootstrap: create api key");
+
+    let now = chrono::Utc::now().timestamp();
+    let ttl = meta_engine.config().token_ttl_secs;
+    let _token = token_manager.issue(&TokenClaims {
+        user_id: Some(user_id),
+        account_id: Some(account_id),
+        tenant_id,
+        key_id,
+        scopes: vec![Scope::SuperAdmin],
+        issued_at: now,
+        expires_at: now + ttl as i64,
+    });
+
+    info!(
+        account_id,
+        user_id,
+        tenant_id,
+        key_id,
+        "default admin bootstrapped — username: admin, password: admin, raw_key: {}",
+        raw_key,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Handlers — Auth (public)
 // ---------------------------------------------------------------------------
 
@@ -554,6 +626,19 @@ async fn login(
     };
     let jwt = state.token_manager.issue(&claims);
 
+    // Find default tenant for the first account
+    let (default_tenant_id, default_tenant_name) = if let Some(account_id) = first_account_id {
+        state
+            .meta_engine
+            .list_tenants()
+            .into_iter()
+            .find(|t| t.account_id == account_id)
+            .map(|t| (Some(t.tenant_id), Some(t.name)))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
     info!(user_id = user.user_id, username = %req.username, "user logged in");
     Ok((
         StatusCode::OK,
@@ -561,6 +646,8 @@ async fn login(
             user_id: user.user_id,
             token: jwt,
             accounts,
+            default_tenant_id,
+            default_tenant_name,
         }),
     )
         .into_response())

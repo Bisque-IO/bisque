@@ -1,19 +1,27 @@
-//! In-memory control plane state.
+//! Control plane state with optional MDBX persistence.
 //!
 //! `MetaEngine` holds the registries of tenants, catalogs, API keys, and routing
 //! entries that the state machine reads and mutates. Analogous to `BisqueLance`
 //! in the lance crate.
+//!
+//! When opened with a data directory via [`MetaEngine::open`], state is persisted
+//! to MDBX on every mutation. On restart, state is restored from MDBX automatically.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use base64::Engine as _;
+use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, TableFlags, WriteFlags};
 use parking_lot::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::MetaConfig;
 use crate::error::{Error, Result};
 use crate::token;
 use crate::types::*;
+
+const META_TABLE: &str = "bisque_meta";
+const SNAPSHOT_KEY: &[u8] = b"snapshot";
 
 pub struct MetaEngine {
     config: MetaConfig,
@@ -32,9 +40,12 @@ pub struct MetaEngine {
     next_catalog_id: RwLock<u64>,
     next_key_id: RwLock<u64>,
     next_raft_group_id: RwLock<u64>,
+    /// Optional MDBX database for persistent storage.
+    db: Option<Database<NoWriteMap>>,
 }
 
 impl MetaEngine {
+    /// Create an in-memory-only MetaEngine (no persistence). Used in tests.
     pub fn new(config: MetaConfig) -> Self {
         Self {
             config,
@@ -53,6 +64,131 @@ impl MetaEngine {
             next_catalog_id: RwLock::new(1),
             next_key_id: RwLock::new(1),
             next_raft_group_id: RwLock::new(1),
+            db: None,
+        }
+    }
+
+    /// Open a persistent MetaEngine backed by MDBX at `data_dir`.
+    ///
+    /// If the directory contains existing data, state is restored from MDBX.
+    /// All subsequent mutations are persisted to disk.
+    pub fn open(config: MetaConfig, data_dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+
+        let db = Database::<NoWriteMap>::open_with_options(
+            data_dir,
+            DatabaseOptions {
+                mode: Mode::ReadWrite(ReadWriteOptions {
+                    sync_mode: libmdbx::SyncMode::Durable,
+                    ..Default::default()
+                }),
+                max_tables: Some(4),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        // Ensure the table exists.
+        {
+            let txn = db
+                .begin_rw_txn()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let _table = txn
+                .create_table(Some(META_TABLE), TableFlags::empty())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            txn.commit()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        let engine = Self {
+            config,
+            accounts: RwLock::new(HashMap::new()),
+            users: RwLock::new(HashMap::new()),
+            memberships: RwLock::new(Vec::new()),
+            tenant_grants: RwLock::new(Vec::new()),
+            tenants: RwLock::new(HashMap::new()),
+            catalogs: RwLock::new(HashMap::new()),
+            api_keys: RwLock::new(HashMap::new()),
+            routing: RwLock::new(HashMap::new()),
+            usage: RwLock::new(HashMap::new()),
+            next_account_id: RwLock::new(1),
+            next_user_id: RwLock::new(1),
+            next_tenant_id: RwLock::new(1),
+            next_catalog_id: RwLock::new(1),
+            next_key_id: RwLock::new(1),
+            next_raft_group_id: RwLock::new(1),
+            db: Some(db),
+        };
+
+        // Restore from MDBX if data exists.
+        if let Some(snapshot) = engine.load_snapshot()? {
+            engine.restore_from_snapshot(snapshot);
+            info!("meta engine restored from MDBX persistence");
+        } else {
+            info!("meta engine opened with empty state (new database)");
+        }
+
+        Ok(engine)
+    }
+
+    /// Load persisted snapshot from MDBX, if any.
+    fn load_snapshot(&self) -> std::io::Result<Option<MetaSnapshotData>> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(None),
+        };
+
+        let txn = db
+            .begin_ro_txn()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let table = txn
+            .open_table(Some(META_TABLE))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        let bytes: Option<Vec<u8>> = txn
+            .get(&table, SNAPSHOT_KEY)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        match bytes {
+            Some(bytes) => {
+                let (data, _): (MetaSnapshotData, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+                Ok(Some(data))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist current state to MDBX. No-op if no database is configured.
+    fn persist(&self) {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return,
+        };
+
+        let snapshot = self.snapshot_data();
+        let bytes = match bincode::serde::encode_to_vec(&snapshot, bincode::config::standard()) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "failed to encode meta snapshot for persistence");
+                return;
+            }
+        };
+
+        let result = (|| -> std::result::Result<(), libmdbx::Error> {
+            let txn = db.begin_rw_txn()?;
+            let table = txn.open_table(Some(META_TABLE))?;
+            txn.put(&table, SNAPSHOT_KEY, &bytes, WriteFlags::empty())?;
+            drop(table);
+            txn.commit()?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            warn!(error = %e, "failed to persist meta engine state to MDBX");
         }
     }
 
@@ -84,6 +220,7 @@ impl MetaEngine {
             },
         );
         info!(account_id, name = %name, "created account");
+        self.persist();
         Ok(account_id)
     }
 
@@ -114,6 +251,7 @@ impl MetaEngine {
             .remove(&account_id)
             .ok_or(Error::NotFound(format!("account {account_id}")))?;
         info!(account_id, "deleted account");
+        self.persist();
         Ok(())
     }
 
@@ -143,6 +281,7 @@ impl MetaEngine {
             },
         );
         info!(user_id, username = %username, "created user");
+        self.persist();
         Ok(user_id)
     }
 
@@ -164,7 +303,9 @@ impl MetaEngine {
             .get_mut(&user_id)
             .ok_or(Error::NotFound(format!("user {user_id}")))?;
         user.disabled = true;
+        drop(users);
         info!(user_id, "disabled user");
+        self.persist();
         Ok(())
     }
 
@@ -174,7 +315,9 @@ impl MetaEngine {
             .get_mut(&user_id)
             .ok_or(Error::NotFound(format!("user {user_id}")))?;
         user.password_hash = password_hash;
+        drop(users);
         info!(user_id, "updated password");
+        self.persist();
         Ok(())
     }
 
@@ -215,7 +358,9 @@ impl MetaEngine {
             account_id,
             role,
         });
+        drop(memberships);
         info!(user_id, account_id, %role, "added account membership");
+        self.persist();
         Ok(())
     }
 
@@ -228,7 +373,9 @@ impl MetaEngine {
                 "membership user={user_id} account={account_id}"
             )));
         }
+        drop(memberships);
         info!(user_id, account_id, "removed account membership");
+        self.persist();
         Ok(())
     }
 
@@ -241,7 +388,9 @@ impl MetaEngine {
                 "membership user={user_id} account={account_id}"
             )))?;
         m.role = role;
+        drop(memberships);
         info!(user_id, account_id, %role, "set account role");
+        self.persist();
         Ok(())
     }
 
@@ -287,7 +436,9 @@ impl MetaEngine {
             tenant_id,
             catalog_access,
         });
+        drop(grants);
         info!(user_id, tenant_id, "granted tenant access");
+        self.persist();
         Ok(())
     }
 
@@ -300,7 +451,9 @@ impl MetaEngine {
                 "tenant grant user={user_id} tenant={tenant_id}"
             )));
         }
+        drop(grants);
         info!(user_id, tenant_id, "revoked tenant access");
+        self.persist();
         Ok(())
     }
 
@@ -381,6 +534,7 @@ impl MetaEngine {
 
         self.tenants.write().insert(tenant_id, tenant);
         info!(tenant_id, account_id, name = %name, "created tenant");
+        self.persist();
         Ok(tenant_id)
     }
 
@@ -402,6 +556,8 @@ impl MetaEngine {
             .get_mut(&tenant_id)
             .ok_or(Error::TenantNotFound(tenant_id))?;
         tenant.limits = limits;
+        drop(tenants);
+        self.persist();
         Ok(())
     }
 
@@ -424,6 +580,7 @@ impl MetaEngine {
             .remove(&tenant_id)
             .ok_or(Error::TenantNotFound(tenant_id))?;
         info!(tenant_id, "deleted tenant");
+        self.persist();
         Ok(())
     }
 
@@ -513,6 +670,7 @@ impl MetaEngine {
             engine = %engine,
             "created catalog"
         );
+        self.persist();
         Ok((catalog_id, raft_group_id))
     }
 
@@ -545,6 +703,8 @@ impl MetaEngine {
             .get_mut(&catalog_id)
             .ok_or(Error::CatalogNotFound(catalog_id))?;
         entry.status = status;
+        drop(catalogs);
+        self.persist();
         Ok(())
     }
 
@@ -562,6 +722,8 @@ impl MetaEngine {
         if let Some(re) = routing.get_mut(&raft_group_id) {
             re.node_addresses = placement.iter().map(|&nid| (nid, String::new())).collect();
         }
+        drop(routing);
+        self.persist();
         Ok(())
     }
 
@@ -575,6 +737,8 @@ impl MetaEngine {
         }
         entry.status = CatalogStatus::Deleting;
         info!(catalog_id, tenant_id, "marked catalog for deletion");
+        drop(catalogs);
+        self.persist();
         Ok(())
     }
 
@@ -588,6 +752,8 @@ impl MetaEngine {
                 "no routing entry for group {raft_group_id}"
             )))?;
         entry.leader_node_id = leader_node_id;
+        drop(routing);
+        self.persist();
         Ok(())
     }
 
@@ -643,6 +809,7 @@ impl MetaEngine {
         }
 
         info!(key_id, tenant_id, "created API key");
+        self.persist();
         Ok((key_id, raw_key))
     }
 
@@ -650,7 +817,9 @@ impl MetaEngine {
         let mut keys = self.api_keys.write();
         let key = keys.get_mut(&key_id).ok_or(Error::ApiKeyNotFound(key_id))?;
         key.revoked = true;
+        drop(keys);
         info!(key_id, "revoked API key");
+        self.persist();
         Ok(())
     }
 
@@ -678,6 +847,7 @@ impl MetaEngine {
                 deep_storage_bytes,
             },
         );
+        self.persist();
         Ok(())
     }
 
@@ -740,6 +910,7 @@ impl MetaEngine {
         *self.next_catalog_id.write() = data.next_catalog_id;
         *self.next_key_id.write() = data.next_key_id;
         *self.next_raft_group_id.write() = data.next_raft_group_id;
+        self.persist();
         info!("restored meta engine from snapshot");
     }
 }
@@ -1621,5 +1792,1167 @@ mod tests {
         engine
             .create_catalog(tid, "second".into(), EngineType::Lance, "{}".into())
             .unwrap();
+    }
+
+    // ── MDBX persistence tests ──────────────────────────────────────
+
+    /// Creates a persistent test engine at the given path with a default account.
+    fn persistent_engine(dir: &Path) -> MetaEngine {
+        let engine =
+            MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir).unwrap();
+        // Only create account on first open (persistence means it may already exist).
+        if engine.list_accounts().is_empty() {
+            engine.create_account("test-org".into()).unwrap();
+        }
+        engine
+    }
+
+    #[test]
+    fn test_persistent_open_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = MetaEngine::open(
+            MetaConfig::new(b"test-secret".to_vec()),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(engine.list_accounts().is_empty());
+        assert!(engine.list_tenants().is_empty());
+    }
+
+    #[test]
+    fn test_persistent_accounts_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let engine = persistent_engine(dir.path());
+            assert_eq!(engine.list_accounts().len(), 1);
+            assert_eq!(engine.list_accounts()[0].name, "test-org");
+        }
+
+        // Reopen — account should still be there.
+        {
+            let engine = persistent_engine(dir.path());
+            assert_eq!(engine.list_accounts().len(), 1);
+            assert_eq!(engine.list_accounts()[0].name, "test-org");
+        }
+    }
+
+    #[test]
+    fn test_persistent_tenant_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let tenant_id;
+        {
+            let engine = persistent_engine(dir.path());
+            tenant_id = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            assert_eq!(tenant_id, 1);
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let t = engine.get_tenant(tenant_id).unwrap();
+            assert_eq!(t.name, "acme");
+            assert_eq!(t.account_id, TEST_ACCOUNT);
+
+            // ID counter should continue from 2.
+            let t2 = engine
+                .create_tenant(TEST_ACCOUNT, "beta".into(), TenantLimits::default())
+                .unwrap();
+            assert_eq!(t2, 2);
+        }
+    }
+
+    #[test]
+    fn test_persistent_catalog_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (catalog_id, raft_group_id);
+        {
+            let engine = persistent_engine(dir.path());
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            let result = engine
+                .create_catalog(tid, "analytics".into(), EngineType::Lance, "{}".into())
+                .unwrap();
+            catalog_id = result.0;
+            raft_group_id = result.1;
+            engine
+                .update_catalog_status(catalog_id, CatalogStatus::Active)
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let cat = engine.get_catalog(catalog_id).unwrap();
+            assert_eq!(cat.name, "analytics");
+            assert_eq!(cat.engine, EngineType::Lance);
+            assert_eq!(cat.status, CatalogStatus::Active);
+            assert_eq!(cat.raft_group_id, raft_group_id);
+
+            // Routing entry should also persist.
+            let re = engine.get_routing(raft_group_id).unwrap();
+            assert_eq!(re.catalog_id, catalog_id);
+        }
+    }
+
+    #[test]
+    fn test_persistent_api_keys_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (key_id, raw_key);
+        {
+            let engine = persistent_engine(dir.path());
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            let result = engine
+                .create_api_key(tid, vec![Scope::TenantAdmin, Scope::Catalog("db".into())])
+                .unwrap();
+            key_id = result.0;
+            raw_key = result.1;
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let key = engine.get_api_key(key_id).unwrap();
+            assert_eq!(key.tenant_id, 1);
+            assert!(!key.revoked);
+            assert_eq!(
+                key.scopes,
+                vec![Scope::TenantAdmin, Scope::Catalog("db".into())]
+            );
+
+            // Tenant should still reference the key.
+            let tenant = engine.get_tenant(1).unwrap();
+            assert!(tenant.api_keys.contains(&key_id));
+
+            // Deterministic key derivation should produce the same raw key.
+            let (k2, raw2) = engine
+                .create_api_key(1, vec![Scope::TenantAdmin])
+                .unwrap();
+            // Different key_id, so different raw key.
+            assert_ne!(k2, key_id);
+            assert_ne!(raw2, raw_key);
+        }
+    }
+
+    #[test]
+    fn test_persistent_users_and_memberships_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let user_id;
+        {
+            let engine = persistent_engine(dir.path());
+            user_id = engine
+                .create_user("alice".into(), b"hash123".to_vec())
+                .unwrap();
+            engine
+                .add_membership(user_id, TEST_ACCOUNT, AccountRole::Admin)
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let user = engine.get_user(user_id).unwrap();
+            assert_eq!(user.username, "alice");
+            assert!(!user.disabled);
+
+            let memberships = engine.get_user_memberships(user_id);
+            assert_eq!(memberships.len(), 1);
+            assert_eq!(memberships[0].account_id, TEST_ACCOUNT);
+            assert_eq!(memberships[0].role, AccountRole::Admin);
+        }
+    }
+
+    #[test]
+    fn test_persistent_tenant_grants_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (user_id, tenant_id);
+        {
+            let engine = persistent_engine(dir.path());
+            user_id = engine
+                .create_user("bob".into(), b"hash".to_vec())
+                .unwrap();
+            engine
+                .add_membership(user_id, TEST_ACCOUNT, AccountRole::Member)
+                .unwrap();
+            tenant_id = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            engine
+                .grant_tenant_access(user_id, tenant_id, CatalogAccess::All)
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let grants = engine.get_user_tenant_grants(user_id);
+            assert_eq!(grants.len(), 1);
+            assert_eq!(grants[0].tenant_id, tenant_id);
+            assert!(matches!(grants[0].catalog_access, CatalogAccess::All));
+        }
+    }
+
+    #[test]
+    fn test_persistent_usage_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let catalog_id;
+        {
+            let engine = persistent_engine(dir.path());
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            catalog_id = engine
+                .create_catalog(tid, "db".into(), EngineType::Lance, "{}".into())
+                .unwrap()
+                .0;
+            engine.report_usage(catalog_id, 1024, 4096).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let u = engine.get_usage(catalog_id).unwrap();
+            assert_eq!(u.disk_bytes, 1024);
+            assert_eq!(u.deep_storage_bytes, 4096);
+        }
+    }
+
+    #[test]
+    fn test_persistent_id_counters_continue_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let engine = persistent_engine(dir.path());
+            let t1 = engine
+                .create_tenant(TEST_ACCOUNT, "a".into(), TenantLimits::default())
+                .unwrap();
+            let t2 = engine
+                .create_tenant(TEST_ACCOUNT, "b".into(), TenantLimits::default())
+                .unwrap();
+            assert_eq!(t1, 1);
+            assert_eq!(t2, 2);
+
+            engine
+                .create_catalog(t1, "x".into(), EngineType::Lance, "{}".into())
+                .unwrap();
+            engine
+                .create_catalog(t1, "y".into(), EngineType::Mq, "{}".into())
+                .unwrap();
+            engine.create_api_key(t1, vec![]).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            // Tenant IDs should continue from 3.
+            let t3 = engine
+                .create_tenant(TEST_ACCOUNT, "c".into(), TenantLimits::default())
+                .unwrap();
+            assert_eq!(t3, 3);
+
+            // Catalog IDs from 3, raft group IDs from 3.
+            let (c3, g3) = engine
+                .create_catalog(t3, "z".into(), EngineType::LibSql, "{}".into())
+                .unwrap();
+            assert_eq!(c3, 3);
+            assert_eq!(g3, 3);
+
+            // API key IDs from 2.
+            let (k2, _) = engine.create_api_key(1, vec![]).unwrap();
+            assert_eq!(k2, 2);
+        }
+    }
+
+    #[test]
+    fn test_persistent_delete_operations_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let engine = persistent_engine(dir.path());
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            let (cid, _) = engine
+                .create_catalog(tid, "db".into(), EngineType::Lance, "{}".into())
+                .unwrap();
+            let (kid, _) = engine
+                .create_api_key(tid, vec![Scope::TenantAdmin])
+                .unwrap();
+
+            // Delete catalog, revoke key, then delete tenant.
+            engine
+                .update_catalog_status(cid, CatalogStatus::Deleted)
+                .unwrap();
+            engine.revoke_api_key(kid).unwrap();
+            engine.delete_tenant(tid).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            // Tenant should be gone.
+            assert!(engine.get_tenant(1).is_none());
+            assert!(engine.list_tenants().is_empty());
+
+            // Catalog should be marked Deleted (not removed from map).
+            let cat = engine.get_catalog(1).unwrap();
+            assert_eq!(cat.status, CatalogStatus::Deleted);
+
+            // API key should be revoked.
+            let key = engine.get_api_key(1).unwrap();
+            assert!(key.revoked);
+        }
+    }
+
+    #[test]
+    fn test_persistent_disable_user_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let user_id;
+        {
+            let engine = persistent_engine(dir.path());
+            user_id = engine
+                .create_user("carol".into(), b"hash".to_vec())
+                .unwrap();
+            engine.disable_user(user_id).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let user = engine.get_user(user_id).unwrap();
+            assert!(user.disabled);
+        }
+    }
+
+    #[test]
+    fn test_persistent_update_password_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let user_id;
+        {
+            let engine = persistent_engine(dir.path());
+            user_id = engine
+                .create_user("dave".into(), b"old-hash".to_vec())
+                .unwrap();
+            engine
+                .update_password(user_id, b"new-hash".to_vec())
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let user = engine.get_user(user_id).unwrap();
+            assert_eq!(user.password_hash, b"new-hash");
+        }
+    }
+
+    #[test]
+    fn test_persistent_update_tenant_limits_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let tid;
+        {
+            let engine = persistent_engine(dir.path());
+            tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            let new_limits = TenantLimits {
+                max_catalogs: 256,
+                max_concurrent_queries: 128,
+                ..TenantLimits::default()
+            };
+            engine.update_tenant_limits(tid, new_limits).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let t = engine.get_tenant(tid).unwrap();
+            assert_eq!(t.limits.max_catalogs, 256);
+            assert_eq!(t.limits.max_concurrent_queries, 128);
+        }
+    }
+
+    #[test]
+    fn test_persistent_catalog_placement_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (cid, gid);
+        {
+            let engine = persistent_engine(dir.path());
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            let result = engine
+                .create_catalog(tid, "db".into(), EngineType::Lance, "{}".into())
+                .unwrap();
+            cid = result.0;
+            gid = result.1;
+            engine
+                .update_catalog_placement(cid, vec![1, 2, 3])
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let cat = engine.get_catalog(cid).unwrap();
+            assert_eq!(cat.placement, vec![1, 2, 3]);
+
+            let re = engine.get_routing(gid).unwrap();
+            assert_eq!(re.node_addresses.len(), 3);
+        }
+    }
+
+    #[test]
+    fn test_persistent_leader_update_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let gid;
+        {
+            let engine = persistent_engine(dir.path());
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            gid = engine
+                .create_catalog(tid, "db".into(), EngineType::Lance, "{}".into())
+                .unwrap()
+                .1;
+            engine.update_leader(gid, Some(42)).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            assert_eq!(engine.get_routing(gid).unwrap().leader_node_id, Some(42));
+        }
+    }
+
+    #[test]
+    fn test_persistent_remove_membership_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let user_id;
+        {
+            let engine = persistent_engine(dir.path());
+            user_id = engine
+                .create_user("eve".into(), b"hash".to_vec())
+                .unwrap();
+            engine
+                .add_membership(user_id, TEST_ACCOUNT, AccountRole::Admin)
+                .unwrap();
+            engine.remove_membership(user_id, TEST_ACCOUNT).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            assert!(engine.get_user_memberships(user_id).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_persistent_set_account_role_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let user_id;
+        {
+            let engine = persistent_engine(dir.path());
+            user_id = engine
+                .create_user("frank".into(), b"hash".to_vec())
+                .unwrap();
+            engine
+                .add_membership(user_id, TEST_ACCOUNT, AccountRole::Member)
+                .unwrap();
+            engine
+                .set_account_role(user_id, TEST_ACCOUNT, AccountRole::Admin)
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let memberships = engine.get_user_memberships(user_id);
+            assert_eq!(memberships.len(), 1);
+            assert_eq!(memberships[0].role, AccountRole::Admin);
+        }
+    }
+
+    #[test]
+    fn test_persistent_revoke_tenant_access_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (user_id, tenant_id);
+        {
+            let engine = persistent_engine(dir.path());
+            user_id = engine
+                .create_user("grace".into(), b"hash".to_vec())
+                .unwrap();
+            engine
+                .add_membership(user_id, TEST_ACCOUNT, AccountRole::Member)
+                .unwrap();
+            tenant_id = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            engine
+                .grant_tenant_access(user_id, tenant_id, CatalogAccess::All)
+                .unwrap();
+            engine
+                .revoke_tenant_access(user_id, tenant_id)
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            assert!(engine.get_user_tenant_grants(user_id).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_persistent_delete_account_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let account_id;
+        {
+            let engine =
+                MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir.path()).unwrap();
+            account_id = engine.create_account("ephemeral".into()).unwrap();
+            engine.delete_account(account_id).unwrap();
+        }
+
+        {
+            let engine =
+                MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir.path()).unwrap();
+            assert!(engine.get_account(account_id).is_none());
+            assert!(engine.list_accounts().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_persistent_restore_from_snapshot_persists() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let engine = persistent_engine(dir.path());
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            engine
+                .create_catalog(tid, "db".into(), EngineType::Lance, "{}".into())
+                .unwrap();
+        }
+
+        // Take a snapshot, open a new engine, restore, verify persistence.
+        let snapshot;
+        {
+            let engine = persistent_engine(dir.path());
+            snapshot = engine.snapshot_data();
+        }
+
+        let dir2 = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir2.path()).unwrap();
+            engine.restore_from_snapshot(snapshot);
+        }
+
+        {
+            let engine =
+                MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir2.path()).unwrap();
+            assert_eq!(engine.list_accounts().len(), 1);
+            assert_eq!(engine.list_tenants().len(), 1);
+            let cats = engine.list_catalogs_for_tenant(1);
+            assert_eq!(cats.len(), 1);
+            assert_eq!(cats[0].name, "db");
+        }
+    }
+
+    #[test]
+    fn test_persistent_bootstrap_only_runs_once() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Simulate bootstrap: create account + tenant + key.
+        {
+            let engine = persistent_engine(dir.path());
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "default".into(), TenantLimits::default())
+                .unwrap();
+            engine
+                .create_api_key(tid, vec![Scope::SuperAdmin])
+                .unwrap();
+        }
+
+        // On second open, accounts are not empty so bootstrap should not run.
+        {
+            let engine = persistent_engine(dir.path());
+            // Should still have exactly 1 account, 1 tenant, 1 key.
+            assert_eq!(engine.list_accounts().len(), 1);
+            assert_eq!(engine.list_tenants().len(), 1);
+            let keys: Vec<_> = (1..=10)
+                .filter_map(|id| engine.get_api_key(id))
+                .collect();
+            assert_eq!(keys.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_persistent_multiple_mutations_between_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let engine = persistent_engine(dir.path());
+            // Create 5 tenants with catalogs.
+            for i in 1..=5 {
+                let tid = engine
+                    .create_tenant(
+                        TEST_ACCOUNT,
+                        format!("tenant-{i}"),
+                        TenantLimits::default(),
+                    )
+                    .unwrap();
+                engine
+                    .create_catalog(tid, format!("cat-{i}"), EngineType::Lance, "{}".into())
+                    .unwrap();
+                engine
+                    .create_api_key(tid, vec![Scope::TenantAdmin])
+                    .unwrap();
+            }
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            assert_eq!(engine.list_tenants().len(), 5);
+            for i in 1..=5u64 {
+                let t = engine.get_tenant(i).unwrap();
+                assert_eq!(t.name, format!("tenant-{i}"));
+                let cats = engine.list_catalogs_for_tenant(i);
+                assert_eq!(cats.len(), 1);
+                assert_eq!(cats[0].name, format!("cat-{i}"));
+            }
+
+            // Delete tenant 3's catalog and tenant.
+            engine
+                .update_catalog_status(3, CatalogStatus::Deleted)
+                .unwrap();
+            engine.delete_tenant(3).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            assert_eq!(engine.list_tenants().len(), 4);
+            assert!(engine.get_tenant(3).is_none());
+            // Catalog is still in the map but marked deleted.
+            assert_eq!(
+                engine.get_catalog(3).unwrap().status,
+                CatalogStatus::Deleted
+            );
+
+            // ID counters should continue from 6.
+            let t6 = engine
+                .create_tenant(TEST_ACCOUNT, "tenant-6".into(), TenantLimits::default())
+                .unwrap();
+            assert_eq!(t6, 6);
+        }
+    }
+
+    #[test]
+    fn test_persistent_specific_catalog_grants() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (user_id, tenant_id);
+        {
+            let engine = persistent_engine(dir.path());
+            user_id = engine
+                .create_user("henry".into(), b"hash".to_vec())
+                .unwrap();
+            engine
+                .add_membership(user_id, TEST_ACCOUNT, AccountRole::Member)
+                .unwrap();
+            tenant_id = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            let access = CatalogAccess::Specific(vec![
+                CatalogGrant {
+                    catalog_name: "analytics".into(),
+                    read_only: false,
+                },
+                CatalogGrant {
+                    catalog_name: "events".into(),
+                    read_only: true,
+                },
+            ]);
+            engine
+                .grant_tenant_access(user_id, tenant_id, access)
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let grants = engine.get_user_tenant_grants(user_id);
+            assert_eq!(grants.len(), 1);
+            match &grants[0].catalog_access {
+                CatalogAccess::Specific(list) => {
+                    assert_eq!(list.len(), 2);
+                    assert_eq!(list[0].catalog_name, "analytics");
+                    assert!(!list[0].read_only);
+                    assert_eq!(list[1].catalog_name, "events");
+                    assert!(list[1].read_only);
+                }
+                CatalogAccess::All => panic!("expected Specific access"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_persistent_user_accessible_tenants() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (admin_id, member_id, t1);
+        {
+            let engine = persistent_engine(dir.path());
+            admin_id = engine
+                .create_user("admin".into(), b"hash".to_vec())
+                .unwrap();
+            engine
+                .add_membership(admin_id, TEST_ACCOUNT, AccountRole::Admin)
+                .unwrap();
+
+            member_id = engine
+                .create_user("member".into(), b"hash".to_vec())
+                .unwrap();
+            engine
+                .add_membership(member_id, TEST_ACCOUNT, AccountRole::Member)
+                .unwrap();
+
+            t1 = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            engine
+                .create_tenant(TEST_ACCOUNT, "beta".into(), TenantLimits::default())
+                .unwrap();
+
+            // Grant member access only to t1.
+            engine
+                .grant_tenant_access(member_id, t1, CatalogAccess::All)
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            // Admin sees all tenants in the account.
+            let admin_tenants = engine.get_user_accessible_tenants(admin_id);
+            assert_eq!(admin_tenants.len(), 2);
+
+            // Member sees only granted tenant.
+            let member_tenants = engine.get_user_accessible_tenants(member_id);
+            assert_eq!(member_tenants.len(), 1);
+            assert_eq!(member_tenants[0].tenant_id, t1);
+        }
+    }
+
+    #[test]
+    fn test_persistent_multi_engine_type_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let engine = persistent_engine(dir.path());
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            engine
+                .create_catalog(tid, "lance_cat".into(), EngineType::Lance, "{}".into())
+                .unwrap();
+            engine
+                .create_catalog(tid, "mq_cat".into(), EngineType::Mq, "{}".into())
+                .unwrap();
+            engine
+                .create_catalog(
+                    tid,
+                    "sql_cat".into(),
+                    EngineType::LibSql,
+                    r#"{"path":"test.db"}"#.into(),
+                )
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let cats = engine.list_catalogs_for_tenant(1);
+            assert_eq!(cats.len(), 3);
+            let lance = engine.find_catalog_by_name(1, "lance_cat").unwrap();
+            assert_eq!(lance.engine, EngineType::Lance);
+            let mq = engine.find_catalog_by_name(1, "mq_cat").unwrap();
+            assert_eq!(mq.engine, EngineType::Mq);
+            let sql = engine.find_catalog_by_name(1, "sql_cat").unwrap();
+            assert_eq!(sql.engine, EngineType::LibSql);
+            assert_eq!(sql.config, r#"{"path":"test.db"}"#);
+        }
+    }
+
+    #[test]
+    fn test_persistent_triple_reopen_with_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: Create account + tenant + catalog.
+        let (tid, cid);
+        {
+            let engine = persistent_engine(dir.path());
+            tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            cid = engine
+                .create_catalog(tid, "db".into(), EngineType::Lance, "{}".into())
+                .unwrap()
+                .0;
+        }
+
+        // Phase 2: Reopen, mutate further (add key, update status, create second catalog).
+        let (kid, cid2);
+        {
+            let engine = persistent_engine(dir.path());
+            // Verify phase 1 data survived.
+            assert_eq!(engine.get_tenant(tid).unwrap().name, "acme");
+            assert_eq!(engine.get_catalog(cid).unwrap().name, "db");
+
+            engine
+                .update_catalog_status(cid, CatalogStatus::Active)
+                .unwrap();
+            kid = engine
+                .create_api_key(tid, vec![Scope::TenantAdmin])
+                .unwrap()
+                .0;
+            cid2 = engine
+                .create_catalog(tid, "events".into(), EngineType::Mq, "{}".into())
+                .unwrap()
+                .0;
+            engine.report_usage(cid, 1024, 2048).unwrap();
+        }
+
+        // Phase 3: Reopen again, verify all mutations from both phases.
+        {
+            let engine = persistent_engine(dir.path());
+            assert_eq!(engine.get_tenant(tid).unwrap().name, "acme");
+            assert_eq!(engine.get_catalog(cid).unwrap().status, CatalogStatus::Active);
+            assert_eq!(engine.get_catalog(cid2).unwrap().name, "events");
+            assert!(!engine.get_api_key(kid).unwrap().revoked);
+            let u = engine.get_usage(cid).unwrap();
+            assert_eq!(u.disk_bytes, 1024);
+            assert_eq!(u.deep_storage_bytes, 2048);
+
+            // Mutate in phase 3.
+            engine.revoke_api_key(kid).unwrap();
+            engine
+                .update_catalog_status(cid2, CatalogStatus::Deleted)
+                .unwrap();
+        }
+
+        // Phase 4: Final reopen — verify phase 3 mutations.
+        {
+            let engine = persistent_engine(dir.path());
+            assert!(engine.get_api_key(kid).unwrap().revoked);
+            assert_eq!(
+                engine.get_catalog(cid2).unwrap().status,
+                CatalogStatus::Deleted
+            );
+            // ID counters should continue correctly.
+            let t2 = engine
+                .create_tenant(TEST_ACCOUNT, "beta".into(), TenantLimits::default())
+                .unwrap();
+            assert_eq!(t2, 2);
+            let (c3, g3) = engine
+                .create_catalog(t2, "logs".into(), EngineType::LibSql, "{}".into())
+                .unwrap();
+            assert_eq!(c3, 3);
+            assert_eq!(g3, 3);
+        }
+    }
+
+    #[test]
+    fn test_persistent_verify_user_password_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let engine = persistent_engine(dir.path());
+            let pw_hash = crate::token::hash_password(b"my-secret-pw");
+            engine
+                .create_user("alice".into(), pw_hash)
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            // Correct password should verify.
+            let user = engine.verify_user_password("alice", b"my-secret-pw");
+            assert!(user.is_some());
+            assert_eq!(user.unwrap().username, "alice");
+
+            // Wrong password should fail.
+            assert!(engine.verify_user_password("alice", b"wrong").is_none());
+
+            // Unknown user should fail.
+            assert!(engine.verify_user_password("bob", b"my-secret-pw").is_none());
+        }
+    }
+
+    #[test]
+    fn test_persistent_disabled_user_password_rejected_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let engine = persistent_engine(dir.path());
+            let pw_hash = crate::token::hash_password(b"secret");
+            let uid = engine.create_user("carol".into(), pw_hash).unwrap();
+            engine.disable_user(uid).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            // Disabled user should not verify even with correct password.
+            assert!(engine.verify_user_password("carol", b"secret").is_none());
+        }
+    }
+
+    #[test]
+    fn test_persistent_timestamps_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (account_created_at, tenant_created_at, catalog_created_at, key_created_at, user_created_at);
+        {
+            let engine = persistent_engine(dir.path());
+            account_created_at = engine.get_account(TEST_ACCOUNT).unwrap().created_at;
+
+            let tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            tenant_created_at = engine.get_tenant(tid).unwrap().created_at;
+
+            let (cid, _) = engine
+                .create_catalog(tid, "db".into(), EngineType::Lance, "{}".into())
+                .unwrap();
+            catalog_created_at = engine.get_catalog(cid).unwrap().created_at;
+
+            let (kid, _) = engine
+                .create_api_key(tid, vec![Scope::TenantAdmin])
+                .unwrap();
+            key_created_at = engine.get_api_key(kid).unwrap().created_at;
+
+            let uid = engine
+                .create_user("alice".into(), b"hash".to_vec())
+                .unwrap();
+            user_created_at = engine.get_user(uid).unwrap().created_at;
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            assert_eq!(engine.get_account(TEST_ACCOUNT).unwrap().created_at, account_created_at);
+            assert_ne!(account_created_at, 0);
+
+            assert_eq!(engine.get_tenant(1).unwrap().created_at, tenant_created_at);
+            assert_ne!(tenant_created_at, 0);
+
+            assert_eq!(engine.get_catalog(1).unwrap().created_at, catalog_created_at);
+            assert_ne!(catalog_created_at, 0);
+
+            assert_eq!(engine.get_api_key(1).unwrap().created_at, key_created_at);
+            assert_ne!(key_created_at, 0);
+
+            assert_eq!(engine.get_user(1).unwrap().created_at, user_created_at);
+            assert_ne!(user_created_at, 0);
+        }
+    }
+
+    #[test]
+    fn test_in_memory_engine_persist_is_noop() {
+        // Ensure `new()` engine doesn't panic on any mutation.
+        let engine = test_engine();
+        let tid = engine
+            .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+            .unwrap();
+        let (cid, gid) = engine
+            .create_catalog(tid, "db".into(), EngineType::Lance, "{}".into())
+            .unwrap();
+        engine
+            .update_catalog_status(cid, CatalogStatus::Active)
+            .unwrap();
+        engine
+            .update_catalog_placement(cid, vec![1, 2])
+            .unwrap();
+        engine.update_leader(gid, Some(1)).unwrap();
+
+        let uid = engine
+            .create_user("bob".into(), b"hash".to_vec())
+            .unwrap();
+        engine
+            .add_membership(uid, TEST_ACCOUNT, AccountRole::Admin)
+            .unwrap();
+        engine
+            .set_account_role(uid, TEST_ACCOUNT, AccountRole::Member)
+            .unwrap();
+        engine.remove_membership(uid, TEST_ACCOUNT).unwrap();
+
+        engine
+            .grant_tenant_access(uid, tid, CatalogAccess::All)
+            .unwrap();
+        engine.revoke_tenant_access(uid, tid).unwrap();
+
+        let (kid, _) = engine
+            .create_api_key(tid, vec![Scope::TenantAdmin])
+            .unwrap();
+        engine.revoke_api_key(kid).unwrap();
+
+        engine.report_usage(cid, 100, 200).unwrap();
+        engine.update_tenant_limits(tid, TenantLimits::default()).unwrap();
+        engine.update_password(uid, b"new-hash".to_vec()).unwrap();
+        engine.disable_user(uid).unwrap();
+
+        // delete_catalog marks as Deleting; need Deleted status to allow tenant deletion.
+        engine.delete_catalog(tid, cid).unwrap();
+        engine
+            .update_catalog_status(cid, CatalogStatus::Deleted)
+            .unwrap();
+        engine.delete_tenant(tid).unwrap();
+        engine.delete_account(TEST_ACCOUNT).unwrap();
+
+        // Restore from snapshot should also be fine.
+        let snap = engine.snapshot_data();
+        engine.restore_from_snapshot(snap);
+    }
+
+    #[test]
+    fn test_persistent_multi_account_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (acct1, acct2);
+        {
+            let engine =
+                MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir.path()).unwrap();
+            acct1 = engine.create_account("org-alpha".into()).unwrap();
+            acct2 = engine.create_account("org-beta".into()).unwrap();
+
+            let t1 = engine
+                .create_tenant(acct1, "alpha-tenant".into(), TenantLimits::default())
+                .unwrap();
+            let t2 = engine
+                .create_tenant(acct2, "beta-tenant".into(), TenantLimits::default())
+                .unwrap();
+
+            engine
+                .create_catalog(t1, "shared_name".into(), EngineType::Lance, "{}".into())
+                .unwrap();
+            engine
+                .create_catalog(t2, "shared_name".into(), EngineType::Mq, "{}".into())
+                .unwrap();
+
+            engine
+                .create_api_key(t1, vec![Scope::Catalog("shared_name".into())])
+                .unwrap();
+            engine
+                .create_api_key(t2, vec![Scope::TenantAdmin])
+                .unwrap();
+        }
+
+        {
+            let engine =
+                MetaEngine::open(MetaConfig::new(b"test-secret".to_vec()), dir.path()).unwrap();
+            assert_eq!(engine.list_accounts().len(), 2);
+
+            // Each account has one tenant.
+            let a1_tenants: Vec<_> = engine
+                .list_tenants()
+                .into_iter()
+                .filter(|t| t.account_id == acct1)
+                .collect();
+            let a2_tenants: Vec<_> = engine
+                .list_tenants()
+                .into_iter()
+                .filter(|t| t.account_id == acct2)
+                .collect();
+            assert_eq!(a1_tenants.len(), 1);
+            assert_eq!(a2_tenants.len(), 1);
+            assert_eq!(a1_tenants[0].name, "alpha-tenant");
+            assert_eq!(a2_tenants[0].name, "beta-tenant");
+
+            // Same catalog name, different tenants, different engines.
+            let c1 = engine
+                .find_catalog_by_name(a1_tenants[0].tenant_id, "shared_name")
+                .unwrap();
+            let c2 = engine
+                .find_catalog_by_name(a2_tenants[0].tenant_id, "shared_name")
+                .unwrap();
+            assert_eq!(c1.engine, EngineType::Lance);
+            assert_eq!(c2.engine, EngineType::Mq);
+            assert_ne!(c1.catalog_id, c2.catalog_id);
+
+            // API keys belong to correct tenants.
+            let k1 = engine.get_api_key(1).unwrap();
+            let k2 = engine.get_api_key(2).unwrap();
+            assert_eq!(k1.tenant_id, a1_tenants[0].tenant_id);
+            assert_eq!(k2.tenant_id, a2_tenants[0].tenant_id);
+            assert_eq!(k1.scopes, vec![Scope::Catalog("shared_name".into())]);
+            assert_eq!(k2.scopes, vec![Scope::TenantAdmin]);
+        }
+    }
+
+    #[test]
+    fn test_persistent_aggregate_usage_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let tid;
+        {
+            let engine = persistent_engine(dir.path());
+            tid = engine
+                .create_tenant(TEST_ACCOUNT, "acme".into(), TenantLimits::default())
+                .unwrap();
+            let (c1, _) = engine
+                .create_catalog(tid, "a".into(), EngineType::Lance, "{}".into())
+                .unwrap();
+            let (c2, _) = engine
+                .create_catalog(tid, "b".into(), EngineType::Mq, "{}".into())
+                .unwrap();
+            let (c3, _) = engine
+                .create_catalog(tid, "c".into(), EngineType::LibSql, "{}".into())
+                .unwrap();
+            engine.report_usage(c1, 100, 200).unwrap();
+            engine.report_usage(c2, 300, 400).unwrap();
+            engine.report_usage(c3, 500, 600).unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let (disk, deep) = engine.get_tenant_usage(tid);
+            assert_eq!(disk, 900);
+            assert_eq!(deep, 1200);
+        }
+    }
+
+    #[test]
+    fn test_persistent_account_members_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let engine = persistent_engine(dir.path());
+            let u1 = engine
+                .create_user("admin".into(), b"h1".to_vec())
+                .unwrap();
+            let u2 = engine
+                .create_user("member".into(), b"h2".to_vec())
+                .unwrap();
+            engine
+                .add_membership(u1, TEST_ACCOUNT, AccountRole::Admin)
+                .unwrap();
+            engine
+                .add_membership(u2, TEST_ACCOUNT, AccountRole::Member)
+                .unwrap();
+        }
+
+        {
+            let engine = persistent_engine(dir.path());
+            let members = engine.get_account_members(TEST_ACCOUNT);
+            assert_eq!(members.len(), 2);
+
+            let admin = members.iter().find(|(u, _)| u.username == "admin").unwrap();
+            assert_eq!(admin.1, AccountRole::Admin);
+
+            let member = members.iter().find(|(u, _)| u.username == "member").unwrap();
+            assert_eq!(member.1, AccountRole::Member);
+        }
     }
 }

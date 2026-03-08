@@ -97,8 +97,8 @@ export const useAuthStore = create<AuthState>((set) => ({
     setStored("user_id", String(userId))
     setStored("username", username)
 
-    const selectedAccountId = accountId ?? accounts[0]?.id ?? null
-    const selectedAccountName = accounts.find((a) => a.id === selectedAccountId)?.name ?? null
+    const selectedAccountId = accountId ?? accounts[0]?.account_id ?? null
+    const selectedAccountName = accounts.find((a) => a.account_id === selectedAccountId)?.name ?? null
 
     if (selectedAccountId != null) {
       setStored("account_id", String(selectedAccountId))

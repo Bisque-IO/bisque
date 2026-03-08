@@ -20,10 +20,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Plus, Database } from "lucide-react"
+import { Plus, Database, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import { Link } from "react-router"
 import { HeaderActions } from "@/components/layout/header-actions"
+import { wsClient } from "@/lib/ws"
 
 export function CatalogListPage() {
   const tenantId = useAuthStore((s) => s.tenantId)
@@ -40,6 +41,18 @@ export function CatalogListPage() {
   }
 
   useEffect(fetchCatalogs, [tenantId])
+
+  const handleDelete = async (catalogId: number) => {
+    if (!tenantId) return
+    if (!confirm("Delete this catalog? This cannot be undone.")) return
+    try {
+      await wsClient.deleteCatalog(tenantId, catalogId)
+      toast.success("Catalog deleted")
+      fetchCatalogs()
+    } catch {
+      toast.error("Failed to delete catalog")
+    }
+  }
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -110,20 +123,30 @@ export function CatalogListPage() {
         ) : (
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {catalogs.map((c) => (
-              <Link key={c.id} to={`/catalogs/${c.name}`}>
-                <Card className="hover:border-primary/50 transition-colors">
-                  <CardHeader>
-                    <CardTitle className="flex items-center justify-between">
-                      {c.name}
-                      <Badge variant="secondary">{c.engine}</Badge>
-                    </CardTitle>
-                    <CardDescription>Raft group #{c.raft_group_id}</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <p className="text-xs text-muted-foreground">Catalog ID: {c.id}</p>
-                  </CardContent>
-                </Card>
-              </Link>
+              <div key={c.catalog_id} className="relative group">
+                <Link to={`/catalogs/${c.name}`}>
+                  <Card className="hover:border-primary/50 transition-colors">
+                    <CardHeader>
+                      <CardTitle className="flex items-center justify-between">
+                        {c.name}
+                        <Badge variant="secondary">{c.engine}</Badge>
+                      </CardTitle>
+                      <CardDescription>Raft group #{c.raft_group_id}</CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <p className="text-xs text-muted-foreground">Catalog ID: {c.catalog_id}</p>
+                    </CardContent>
+                  </Card>
+                </Link>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
+                  onClick={() => handleDelete(c.catalog_id)}
+                >
+                  <Trash2 className="h-4 w-4 text-destructive" />
+                </Button>
+              </div>
             ))}
           </div>
         )}

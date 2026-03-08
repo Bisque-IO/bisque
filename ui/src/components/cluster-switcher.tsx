@@ -18,6 +18,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Server, Plus, Check } from "lucide-react"
+import { useConnectionStore } from "@/stores/connection"
 
 export function ClusterSwitcher() {
   const { clusters, activeId, setActive, addCluster } = useClusterStore()
@@ -27,6 +28,7 @@ export function ClusterSwitcher() {
   const [url, setUrl] = useState("")
 
   const activeCluster = clusters.find((c) => c.id === activeId) ?? clusters[0]
+  const connState = useConnectionStore((s) => s.state)
 
   const handleAdd = (e: React.FormEvent) => {
     e.preventDefault()
@@ -52,7 +54,11 @@ export function ClusterSwitcher() {
             <Server className="h-3.5 w-3.5" />
             <span className="max-w-[120px] truncate">{activeCluster.name}</span>
             {token && (
-              <span className="h-2 w-2 rounded-full bg-green-500" />
+              <span className={`h-2 w-2 rounded-full ${
+                connState === "connected" ? "bg-green-500" :
+                connState === "connecting" ? "bg-yellow-500 animate-pulse" :
+                "bg-red-500"
+              }`} />
             )}
           </Button>
         </DropdownMenuTrigger>

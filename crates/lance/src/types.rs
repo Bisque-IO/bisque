@@ -360,6 +360,23 @@ pub struct TableSnapshot {
     pub schema_history: Vec<SchemaVersion>,
 }
 
+/// Catalog-level metadata stored alongside per-group Raft state.
+///
+/// Tracks catalog-wide configuration such as whether OpenTelemetry
+/// ingestion tables have been enabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogMeta {
+    /// Whether OTel tables have been created in this catalog.
+    #[serde(default)]
+    pub otel_enabled: bool,
+    /// Unix timestamp (seconds) when OTel was enabled.
+    #[serde(default)]
+    pub otel_enabled_at: Option<u64>,
+    /// Identity of the user who enabled OTel (e.g. "tenant:42" or email).
+    #[serde(default)]
+    pub otel_enabled_by: Option<String>,
+}
+
 /// Snapshot payload for the state machine.
 /// Contains metadata for all tables — actual data lives in Lance datasets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +397,9 @@ pub struct SnapshotData {
     /// the metadata snapshot.
     #[serde(default)]
     pub sync_addr: Option<String>,
+    /// Catalog-level metadata (OTel config, etc.).
+    #[serde(default)]
+    pub catalog_meta: Option<CatalogMeta>,
 }
 
 /// Entry in the snapshot file manifest describing a single file to transfer.

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import { useParams } from "react-router"
-import { s3Api, MOCK, type TableIndex } from "@/lib/api"
+import { s3Api, isMock, type TableIndex } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -16,18 +16,19 @@ import {
 import { RefreshCw } from "lucide-react"
 import { toast } from "sonner"
 import { HeaderActions } from "@/components/layout/header-actions"
-import type { StorageTierInfo, IngestionMetrics } from "@/lib/mock-data"
 
 interface TableInfo {
-  active_version: number
-  sealed_version: number
+  active_version: number | null
+  sealed_version: number | null
+  s3_version: number
+  active_segment: number
+  sealed_segment: number | null
+  s3_dataset_uri: string
+  active_rows: number
+  sealed_rows: number
+  s3_rows: number
+  num_columns: number
   schema?: SchemaField[]
-  storage?: {
-    hot: StorageTierInfo
-    warm: StorageTierInfo
-    cold: StorageTierInfo
-  }
-  metrics?: IngestionMetrics
   indexes?: TableIndex[]
 }
 
@@ -37,23 +38,11 @@ interface SchemaField {
   nullable: boolean
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  const i = Math.floor(Math.log(bytes) / Math.log(1024))
-  const val = bytes / Math.pow(1024, i)
-  return `${val < 10 ? val.toFixed(1) : Math.round(val)} ${units[i]}`
-}
-
 function formatNumber(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
   return String(n)
-}
-
-function formatRate(n: number): string {
-  return `${formatNumber(n)}/s`
 }
 
 function indexBadgeVariant(indexType: string): "default" | "secondary" | "outline" {
@@ -67,12 +56,13 @@ export function TableDetailPage() {
   const [tableInfo, setTableInfo] = useState<TableInfo | null>(null)
   const [files, setFiles] = useState<string[]>([])
   const [reindexing, setReindexing] = useState(false)
+  const [compacting, setCompacting] = useState(false)
 
   const handleReindex = async () => {
     if (!catalogName || !tableName) return
     setReindexing(true)
     try {
-      const result = MOCK
+      const result = isMock()
         ? await s3Api.reindexTable(catalogName, tableName)
         : await wsClient.submitReindex(catalogName, tableName)
       toast.success(result.message)
@@ -83,16 +73,31 @@ export function TableDetailPage() {
     }
   }
 
+  const handleCompact = async () => {
+    if (!catalogName || !tableName) return
+    setCompacting(true)
+    try {
+      const result = isMock()
+        ? await s3Api.compactTable(catalogName, tableName)
+        : await wsClient.submitCompact(catalogName, tableName)
+      toast.success(result.message)
+    } catch {
+      toast.error("Compact failed")
+    } finally {
+      setCompacting(false)
+    }
+  }
+
   useEffect(() => {
     if (!catalogName || !tableName) return
 
-    s3Api
+    wsClient
       .getCatalog(catalogName)
       .then((data) => {
         const tables = (data as { tables?: Record<string, TableInfo> }).tables ?? {}
         setTableInfo(tables[tableName] ?? null)
       })
-      .catch(() => {})
+      .catch((err) => console.error("Failed to load table info:", err))
 
     s3Api
       .listObjects(catalogName, `${tableName}/`)
@@ -107,18 +112,10 @@ export function TableDetailPage() {
       .catch(() => {})
   }, [catalogName, tableName])
 
-  const storage = tableInfo?.storage
-  const metrics = tableInfo?.metrics
-
-  const totalSize = storage
-    ? storage.hot.size_bytes + storage.warm.size_bytes + storage.cold.size_bytes
-    : 0
-  const totalRows = storage
-    ? storage.hot.row_count + storage.warm.row_count + storage.cold.row_count
-    : 0
-  const totalSegments = storage
-    ? storage.hot.segment_count + storage.warm.segment_count + storage.cold.segment_count
-    : 0
+  const activeRows = tableInfo?.active_rows ?? 0
+  const sealedRows = tableInfo?.sealed_rows ?? 0
+  const s3Rows = tableInfo?.s3_rows ?? 0
+  const totalRows = activeRows + sealedRows + s3Rows
 
   return (
     <div className="space-y-6">
@@ -126,11 +123,20 @@ export function TableDetailPage() {
         <Button
           size="sm"
           variant="secondary"
+          disabled={compacting}
+          onClick={handleCompact}
+        >
+          <RefreshCw className={`h-4 w-4 mr-2 ${compacting ? "animate-spin" : ""}`} />
+          {compacting ? "Compacting..." : "Compact"}
+        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
           disabled={reindexing}
           onClick={handleReindex}
         >
           <RefreshCw className={`h-4 w-4 mr-2 ${reindexing ? "animate-spin" : ""}`} />
-          {reindexing ? "Reindexing..." : "Reindex Cold Storage"}
+          {reindexing ? "Reindexing..." : "Reindex"}
         </Button>
       </HeaderActions>
 
@@ -141,33 +147,37 @@ export function TableDetailPage() {
         <div className="grid gap-4 md:grid-cols-4">
           <Card>
             <CardContent className="pt-6">
-              <p className="text-sm text-muted-foreground">Total Size</p>
-              <p className="text-2xl font-bold">{formatBytes(totalSize)}</p>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent className="pt-6">
               <p className="text-sm text-muted-foreground">Total Rows</p>
               <p className="text-2xl font-bold">{formatNumber(totalRows)}</p>
             </CardContent>
           </Card>
           <Card>
             <CardContent className="pt-6">
-              <p className="text-sm text-muted-foreground">Active Version</p>
-              <p className="text-2xl font-bold">{tableInfo.active_version}</p>
+              <p className="text-sm text-muted-foreground">Columns</p>
+              <p className="text-2xl font-bold">{tableInfo.num_columns ?? tableInfo.schema?.length ?? 0}</p>
             </CardContent>
           </Card>
           <Card>
             <CardContent className="pt-6">
-              <p className="text-sm text-muted-foreground">Sealed Version</p>
-              <p className="text-2xl font-bold">{tableInfo.sealed_version}</p>
+              <p className="text-sm text-muted-foreground">Indexes</p>
+              <p className="text-2xl font-bold">{tableInfo.indexes?.length ?? 0}</p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="pt-6">
+              <p className="text-sm text-muted-foreground">S3 Dataset</p>
+              {tableInfo.s3_dataset_uri ? (
+                <p className="text-xs font-mono text-muted-foreground mt-1 break-all">{tableInfo.s3_dataset_uri}</p>
+              ) : (
+                <p className="text-sm text-muted-foreground">Not configured</p>
+              )}
             </CardContent>
           </Card>
         </div>
       )}
 
-      {/* Storage tiers */}
-      {storage && (
+      {/* Storage Tiers */}
+      {tableInfo && (
         <Card>
           <CardHeader>
             <CardTitle>Storage Tiers</CardTitle>
@@ -177,20 +187,18 @@ export function TableDetailPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Tier</TableHead>
-                  <TableHead className="text-right">Size</TableHead>
                   <TableHead className="text-right">Rows</TableHead>
-                  <TableHead className="text-right">Segments</TableHead>
+                  <TableHead className="text-right">Version</TableHead>
+                  <TableHead className="text-right">Segment</TableHead>
                   <TableHead className="text-right">% of Total</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {(
-                  [
-                    ["Hot", storage.hot, "text-orange-500"],
-                    ["Warm", storage.warm, "text-yellow-500"],
-                    ["Cold", storage.cold, "text-blue-500"],
-                  ] as [string, StorageTierInfo, string][]
-                ).map(([name, tier, color]) => (
+                {([
+                  ["Active", activeRows, tableInfo.active_version, tableInfo.active_segment, "text-orange-500"],
+                  ["Sealed", sealedRows, tableInfo.sealed_version, tableInfo.sealed_segment, "text-yellow-500"],
+                  ["S3", s3Rows, tableInfo.s3_version || null, null, "text-blue-500"],
+                ] as [string, number, number | null, number | null, string][]).map(([name, rows, version, segment, color]) => (
                   <TableRow key={name}>
                     <TableCell>
                       <div className="flex items-center gap-2">
@@ -199,100 +207,48 @@ export function TableDetailPage() {
                       </div>
                     </TableCell>
                     <TableCell className="text-right font-mono text-sm">
-                      {formatBytes(tier.size_bytes)}
+                      {formatNumber(rows)}
                     </TableCell>
                     <TableCell className="text-right font-mono text-sm">
-                      {formatNumber(tier.row_count)}
+                      {version != null ? `v${version}` : "\u2014"}
                     </TableCell>
                     <TableCell className="text-right font-mono text-sm">
-                      {tier.segment_count}
+                      {segment != null ? `#${segment}` : "\u2014"}
                     </TableCell>
                     <TableCell className="text-right font-mono text-sm">
-                      {totalSize > 0 ? `${((tier.size_bytes / totalSize) * 100).toFixed(1)}%` : "0%"}
+                      {totalRows > 0 ? `${((rows / totalRows) * 100).toFixed(1)}%` : "0%"}
                     </TableCell>
                   </TableRow>
                 ))}
                 <TableRow className="font-semibold">
                   <TableCell>Total</TableCell>
                   <TableCell className="text-right font-mono text-sm">
-                    {formatBytes(totalSize)}
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-sm">
                     {formatNumber(totalRows)}
                   </TableCell>
-                  <TableCell className="text-right font-mono text-sm">
-                    {totalSegments}
-                  </TableCell>
+                  <TableCell />
+                  <TableCell />
                   <TableCell className="text-right font-mono text-sm">100%</TableCell>
                 </TableRow>
               </TableBody>
             </Table>
 
             {/* Visual bar */}
-            {totalSize > 0 && (
-              <div className="mt-4 flex h-3 w-full overflow-hidden rounded-full">
+            {totalRows > 0 && (
+              <div className="mt-4 flex h-3 w-full overflow-hidden rounded-full bg-muted">
                 <div
                   className="bg-orange-500"
-                  style={{ width: `${(storage.hot.size_bytes / totalSize) * 100}%` }}
+                  style={{ width: `${(activeRows / totalRows) * 100}%` }}
                 />
                 <div
                   className="bg-yellow-500"
-                  style={{ width: `${(storage.warm.size_bytes / totalSize) * 100}%` }}
+                  style={{ width: `${(sealedRows / totalRows) * 100}%` }}
                 />
                 <div
                   className="bg-blue-500"
-                  style={{ width: `${(storage.cold.size_bytes / totalSize) * 100}%` }}
+                  style={{ width: `${(s3Rows / totalRows) * 100}%` }}
                 />
               </div>
             )}
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Ingestion Metrics */}
-      {metrics && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Ingestion Metrics</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-              <div>
-                <p className="text-sm text-muted-foreground">Ingest Rate</p>
-                <p className="text-xl font-bold font-mono">
-                  {formatRate(metrics.ingest_rate_rows_sec)}
-                </p>
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Latency (p50 / p99)</p>
-                <p className="text-xl font-bold font-mono">
-                  {metrics.ingest_latency_p50_ms}ms{" "}
-                  <span className="text-muted-foreground">/</span>{" "}
-                  {metrics.ingest_latency_p99_ms}ms
-                </p>
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Async Lag</p>
-                <p className="text-xl font-bold font-mono">
-                  {formatNumber(metrics.async_lag_rows)} rows
-                  <span className="text-sm text-muted-foreground ml-1">
-                    ({metrics.async_lag_ms}ms)
-                  </span>
-                </p>
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Compaction</p>
-                <p className="text-xl font-bold font-mono">
-                  {metrics.compaction_pending} pending
-                  <span className="text-sm text-muted-foreground ml-1">
-                    (last: {metrics.last_compaction_ms}ms)
-                  </span>
-                </p>
-              </div>
-            </div>
-            <div className="mt-4 text-xs text-muted-foreground">
-              Last ingest: {new Date(metrics.last_ingest_at).toLocaleString()}
-            </div>
           </CardContent>
         </Card>
       )}
@@ -362,7 +318,7 @@ export function TableDetailPage() {
                     <TableCell className="text-right font-mono text-sm">
                       {idx.total_fragments > 0
                         ? `${idx.fragment_count}/${idx.total_fragments} (${Math.round((idx.fragment_count / idx.total_fragments) * 100)}%)`
-                        : "—"}
+                        : "\u2014"}
                     </TableCell>
                     <TableCell className="text-right font-mono text-sm">
                       v{idx.dataset_version}
@@ -371,9 +327,6 @@ export function TableDetailPage() {
                 ))}
               </TableBody>
             </Table>
-            <p className="mt-3 text-xs text-muted-foreground">
-              Indexes are built on sealed (warm) segments and carried over to cold storage.
-            </p>
           </CardContent>
         </Card>
       )}

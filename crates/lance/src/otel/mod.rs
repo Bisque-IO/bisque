@@ -247,10 +247,7 @@ pub async fn serve_otlp(
     raft_node: Arc<LanceRaftNode>,
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let receiver = OtlpReceiver::new(raft_node);
-    receiver.ensure_tables().await?;
-
-    let receiver = Arc::new(receiver);
+    let receiver = Arc::new(OtlpReceiver::new(raft_node));
 
     info!(%addr, "starting OTLP gRPC server (with OTel-Arrow support)");
 

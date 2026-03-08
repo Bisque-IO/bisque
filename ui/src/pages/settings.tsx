@@ -12,7 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Trash2, Pencil, Plus } from "lucide-react"
+import { Trash2, Pencil, Plus, ToggleLeft, ToggleRight } from "lucide-react"
 import { toast } from "sonner"
 
 export function SettingsPage() {
@@ -50,10 +50,17 @@ export function SettingsPage() {
     } else {
       if (!url.trim()) return
       const id = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-")
-      addCluster({ id, name: name.trim(), url: url.trim().replace(/\/+$/, "") })
+      addCluster({ id, name: name.trim(), url: url.trim().replace(/\/+$/, ""), mock: false })
       toast.success("Cluster added")
     }
     setDialogOpen(false)
+  }
+
+  const toggleMock = (clusterId: string) => {
+    const cluster = clusters.find((c) => c.id === clusterId)
+    if (!cluster) return
+    updateCluster(clusterId, { mock: !cluster.mock })
+    toast.success(cluster.mock ? "Switched to live mode" : "Switched to mock mode")
   }
 
   const handleRemove = (id: string) => {
@@ -125,9 +132,24 @@ export function SettingsPage() {
                   </p>
                   <p className="text-xs text-muted-foreground font-mono truncate">
                     {cluster.url || "local (same origin)"}
+                    {cluster.mock && (
+                      <Badge variant="secondary" className="ml-2 text-[10px]">mock</Badge>
+                    )}
                   </p>
                 </div>
                 <div className="flex gap-1">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => toggleMock(cluster.id)}
+                    title={cluster.mock ? "Switch to live" : "Switch to mock"}
+                  >
+                    {cluster.mock ? (
+                      <ToggleLeft className="h-4 w-4 text-muted-foreground" />
+                    ) : (
+                      <ToggleRight className="h-4 w-4 text-green-500" />
+                    )}
+                  </Button>
                   {cluster.id !== activeId && (
                     <Button
                       variant="outline"

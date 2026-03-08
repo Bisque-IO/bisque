@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react"
 import { useAuthStore } from "@/stores/auth"
-import { catalogApi, s3Api, type CatalogEntry } from "@/lib/api"
+import { catalogApi, type CatalogEntry } from "@/lib/api"
+import { wsClient } from "@/lib/ws"
+import { useConnectionStore } from "@/stores/connection"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Table2 } from "lucide-react"
@@ -18,11 +20,12 @@ interface CatalogTables {
 
 export function TableListPage() {
   const tenantId = useAuthStore((s) => s.tenantId)
+  const connState = useConnectionStore((s) => s.state)
   const [catalogs, setCatalogs] = useState<CatalogTables[]>([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    if (!tenantId) return
+    if (!tenantId || connState !== "connected") return
 
     catalogApi
       .list(tenantId)
@@ -30,7 +33,7 @@ export function TableListPage() {
         const results: CatalogTables[] = []
         for (const entry of entries) {
           try {
-            const data = await s3Api.getCatalog(entry.name)
+            const data = await wsClient.getCatalog(entry.name)
             results.push({
               catalogName: entry.name,
               tables: (data as { tables?: Record<string, TableInfo> }).tables ?? {},
@@ -41,9 +44,9 @@ export function TableListPage() {
         }
         setCatalogs(results)
       })
-      .catch(() => {})
+      .catch((err) => console.error("Failed to load tables:", err))
       .finally(() => setLoading(false))
-  }, [tenantId])
+  }, [tenantId, connState])
 
   if (loading) {
     return <p className="text-muted-foreground">Loading tables...</p>

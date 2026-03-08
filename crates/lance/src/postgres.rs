@@ -51,7 +51,7 @@ pub(crate) struct BisqueLanceSchemaProvider {
 }
 
 impl BisqueLanceSchemaProvider {
-    pub(crate) fn new(engine: Arc<BisqueLance>) -> Self {
+    pub fn new(engine: Arc<BisqueLance>) -> Self {
         Self { engine }
     }
 }
@@ -103,13 +103,13 @@ impl SchemaProvider for BisqueLanceSchemaProvider {
 /// A DataFusion [`CatalogProvider`] that exposes a `"public"` schema backed
 /// by the live [`BisqueLance`] engine, plus any additional schemas registered
 /// at runtime (e.g. `pg_catalog` for PostgreSQL compatibility).
-pub(crate) struct BisqueLanceCatalogProvider {
+pub struct BisqueLanceCatalogProvider {
     public: Arc<BisqueLanceSchemaProvider>,
     extra: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
 }
 
 impl BisqueLanceCatalogProvider {
-    pub(crate) fn new(engine: Arc<BisqueLance>) -> Self {
+    pub fn new(engine: Arc<BisqueLance>) -> Self {
         Self {
             public: Arc::new(BisqueLanceSchemaProvider::new(engine)),
             extra: RwLock::new(HashMap::new()),

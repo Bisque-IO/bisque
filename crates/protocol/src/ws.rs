@@ -129,6 +129,32 @@ pub enum ResponseData {
     Pinned,
     #[serde(rename = "unpinned")]
     Unpinned,
+    #[serde(rename = "list_tenants")]
+    ListTenants { tenants: Vec<serde_json::Value> },
+    #[serde(rename = "update_tenant_limits")]
+    UpdateTenantLimits,
+    #[serde(rename = "delete_tenant")]
+    DeleteTenant,
+    #[serde(rename = "delete_catalog")]
+    DeleteCatalog,
+    #[serde(rename = "list_api_keys")]
+    ListApiKeys { api_keys: Vec<serde_json::Value> },
+    #[serde(rename = "revoke_api_key")]
+    RevokeApiKey,
+    #[serde(rename = "create_table")]
+    CreateTable { table: String },
+    #[serde(rename = "drop_table")]
+    DropTable { table: String },
+    #[serde(rename = "execute_sql")]
+    ExecuteSql {
+        columns: Vec<serde_json::Value>,
+        rows: Vec<serde_json::Value>,
+        row_count: u64,
+    },
+    #[serde(rename = "list_accounts")]
+    ListAccounts { accounts: Vec<serde_json::Value> },
+    #[serde(rename = "enable_otel")]
+    EnableOtel { tables_created: Vec<String> },
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +261,46 @@ pub enum RequestMethod {
 
     #[serde(rename = "cluster_status")]
     GetClusterStatus,
+
+    #[serde(rename = "list_tenants")]
+    ListTenants { account_id: u64 },
+
+    #[serde(rename = "update_tenant_limits")]
+    UpdateTenantLimits {
+        tenant_id: u64,
+        limits: serde_json::Value,
+    },
+
+    #[serde(rename = "delete_tenant")]
+    DeleteTenant { tenant_id: u64 },
+
+    #[serde(rename = "delete_catalog")]
+    DeleteCatalog { tenant_id: u64, catalog_id: u64 },
+
+    #[serde(rename = "list_api_keys")]
+    ListApiKeys { tenant_id: u64 },
+
+    #[serde(rename = "revoke_api_key")]
+    RevokeApiKey { key_id: u64 },
+
+    #[serde(rename = "create_table")]
+    CreateTable {
+        catalog: String,
+        table: String,
+        schema_json: String,
+    },
+
+    #[serde(rename = "drop_table")]
+    DropTable { catalog: String, table: String },
+
+    #[serde(rename = "execute_sql")]
+    ExecuteSql { catalog: String, sql: String },
+
+    #[serde(rename = "list_accounts")]
+    ListAccounts,
+
+    #[serde(rename = "enable_otel")]
+    EnableOtel,
 }
 
 impl RequestMethod {
@@ -252,6 +318,17 @@ impl RequestMethod {
             Self::SubmitCompact { .. } => "submit_compact",
             Self::CreateApiKey { .. } => "create_api_key",
             Self::GetClusterStatus => "cluster_status",
+            Self::ListTenants { .. } => "list_tenants",
+            Self::UpdateTenantLimits { .. } => "update_tenant_limits",
+            Self::DeleteTenant { .. } => "delete_tenant",
+            Self::DeleteCatalog { .. } => "delete_catalog",
+            Self::ListApiKeys { .. } => "list_api_keys",
+            Self::RevokeApiKey { .. } => "revoke_api_key",
+            Self::CreateTable { .. } => "create_table",
+            Self::DropTable { .. } => "drop_table",
+            Self::ExecuteSql { .. } => "execute_sql",
+            Self::ListAccounts => "list_accounts",
+            Self::EnableOtel => "enable_otel",
         }
     }
 
@@ -264,6 +341,11 @@ impl RequestMethod {
                 | Self::ListOperations { .. }
                 | Self::GetCatalog { .. }
                 | Self::GetClusterStatus
+                | Self::ListTenants { .. }
+                | Self::ListApiKeys { .. }
+                | Self::ListAccounts
+                | Self::ExecuteSql { .. }
+                | Self::EnableOtel
         )
     }
 }
@@ -280,4 +362,101 @@ pub fn encode_server_msg(msg: &ServerMessage) -> Result<Vec<u8>, rmp_serde::enco
 /// Decode a client message from MessagePack bytes.
 pub fn decode_client_msg(data: &[u8]) -> Result<ClientMessage, rmp_serde::decode::Error> {
     rmp_serde::from_slice(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_response_msgpack_roundtrip() {
+        let msg = ServerMessage::Response {
+            request_id: 42,
+            result: ResponseResult::Ok {
+                data: ResponseData::GetCatalog {
+                    catalog: json!({"tables": {"t1": {"active_version": 1}}}),
+                },
+            },
+        };
+
+        let encoded = encode_server_msg(&msg).unwrap();
+
+        // Decode as raw serde_json::Value to see exactly what the JS client would see
+        let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
+        println!("Decoded GetCatalog response: {}", serde_json::to_string_pretty(&decoded).unwrap());
+
+        // Verify the shape matches what the JS client expects
+        assert_eq!(decoded["type"], "Response");
+        assert_eq!(decoded["request_id"], 42);
+        assert_eq!(decoded["status"], "ok");
+        assert_eq!(decoded["method"], "get_catalog");
+        assert!(decoded["catalog"].is_object(), "catalog field should be an object, got: {:?}", decoded["catalog"]);
+    }
+
+    #[test]
+    fn test_request_msgpack_roundtrip() {
+        // Simulate what the JS client sends
+        let js_request = json!({
+            "type": "Request",
+            "request_id": 1,
+            "method": "get_catalog",
+            "bucket": "my_catalog"
+        });
+
+        let encoded = rmp_serde::to_vec_named(&js_request).unwrap();
+
+        // Try to decode as ClientMessage
+        let decoded: Result<ClientMessage, _> = rmp_serde::from_slice(&encoded);
+        println!("Decode result: {:?}", decoded);
+        assert!(decoded.is_ok(), "Should decode successfully: {:?}", decoded.err());
+
+        if let Ok(ClientMessage::Request { request_id, method: RequestMethod::GetCatalog { bucket } }) = decoded {
+            assert_eq!(request_id, 1);
+            assert_eq!(bucket, "my_catalog");
+        } else {
+            panic!("Expected Request/GetCatalog, got: {:?}", decoded);
+        }
+    }
+
+    #[test]
+    fn test_cluster_status_response() {
+        let msg = ServerMessage::Response {
+            request_id: 1,
+            result: ResponseResult::Ok {
+                data: ResponseData::ClusterStatus {
+                    cluster: json!({"cluster_name": "bisque", "nodes": []}),
+                },
+            },
+        };
+
+        let encoded = encode_server_msg(&msg).unwrap();
+        let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
+        println!("Decoded ClusterStatus: {}", serde_json::to_string_pretty(&decoded).unwrap());
+
+        assert_eq!(decoded["type"], "Response");
+        assert_eq!(decoded["status"], "ok");
+        assert_eq!(decoded["method"], "cluster_status");
+        assert!(decoded["cluster"].is_object());
+    }
+
+    #[test]
+    fn test_error_response() {
+        let msg = ServerMessage::Response {
+            request_id: 5,
+            result: ResponseResult::Error {
+                code: 429,
+                message: "Rate limited".into(),
+            },
+        };
+
+        let encoded = encode_server_msg(&msg).unwrap();
+        let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
+        println!("Decoded error: {}", serde_json::to_string_pretty(&decoded).unwrap());
+
+        assert_eq!(decoded["type"], "Response");
+        assert_eq!(decoded["request_id"], 5);
+        assert_eq!(decoded["status"], "error");
+        assert_eq!(decoded["code"], 429);
+    }
 }

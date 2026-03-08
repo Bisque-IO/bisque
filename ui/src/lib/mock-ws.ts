@@ -1,7 +1,7 @@
 import type { ServerMessage, CatalogEventKind } from "./ws-protocol"
 import { WS_PROTOCOL_VERSION } from "./ws-protocol"
-import { MOCK_CATALOG_TABLES } from "./mock-data"
-import type { Operation } from "./api"
+import { MOCK_CATALOG_TABLES, MOCK_TENANT, MOCK_API_KEYS, MOCK_CLUSTER_STATUS, MOCK_ACCOUNTS } from "./mock-data"
+import type { Operation, Tenant, ApiKeyEntry, TenantLimits, Account, SqlResult, ClusterStatus } from "./api"
 
 type PushHandler = (message: ServerMessage) => void
 
@@ -139,14 +139,96 @@ export class MockBisqueWsClient {
     return { op_id: `mock-${Date.now()}`, message: `Compact queued for '${table}'` }
   }
 
-  async getCatalog(_bucket: string): Promise<Record<string, unknown>> {
+  async getCatalog(bucket: string): Promise<Record<string, unknown>> {
     await delay()
-    return {}
+    const tables = MOCK_CATALOG_TABLES[bucket] ?? {}
+    return { tables }
   }
 
-  async getClusterStatus(): Promise<unknown> {
+  async getClusterStatus(): Promise<ClusterStatus> {
     await delay()
-    return { cluster_name: "mock", nodes: [], total_catalogs: 0, total_tables: 0, total_raft_groups: 0 }
+    return MOCK_CLUSTER_STATUS
+  }
+
+  async listTenants(_accountId: number): Promise<Tenant[]> {
+    await delay()
+    return [MOCK_TENANT as Tenant]
+  }
+
+  async updateTenantLimits(_tenantId: number, _limits: TenantLimits): Promise<void> {
+    await delay()
+  }
+
+  async deleteTenant(_tenantId: number): Promise<void> {
+    await delay()
+  }
+
+  async deleteCatalog(_tenantId: number, _catalogId: number): Promise<void> {
+    await delay()
+  }
+
+  async listApiKeys(_tenantId: number): Promise<ApiKeyEntry[]> {
+    await delay()
+    return MOCK_API_KEYS.map((k) => ({
+      key_id: k.key_id,
+      tenant_id: k.tenant_id,
+      scopes: k.scopes,
+      revoked: k.revoked,
+      created_at: Date.parse(k.created_at),
+    }))
+  }
+
+  async revokeApiKey(_keyId: number): Promise<void> {
+    await delay()
+  }
+
+  async createTable(_catalog: string, table: string, _schemaJson: string): Promise<{ table: string }> {
+    await delay()
+    return { table }
+  }
+
+  async dropTable(_catalog: string, table: string): Promise<{ table: string }> {
+    await delay()
+    return { table }
+  }
+
+  async executeSql(_catalog: string, sql: string): Promise<SqlResult> {
+    await delay(200)
+    // Parse table name from SQL for mock data generation
+    const match = sql.match(/FROM\s+(\w+)/i)
+    const tableName = match?.[1] ?? "unknown"
+    const limitMatch = sql.match(/LIMIT\s+(\d+)/i)
+    const limit = limitMatch ? parseInt(limitMatch[1]) : 10
+
+    const columns = [
+      { name: "id", type: "Int64", nullable: false },
+      { name: "name", type: "Utf8", nullable: true },
+      { name: "value", type: "Float64", nullable: true },
+      { name: "created_at", type: "Timestamp", nullable: false },
+    ]
+    const rows = Array.from({ length: Math.min(limit, 25) }, (_, i) => ({
+      id: i + 1,
+      name: `${tableName}_row_${i + 1}`,
+      value: Math.round(Math.random() * 10000) / 100,
+      created_at: new Date(Date.now() - i * 86400000).toISOString(),
+    }))
+    return { columns, rows, row_count: rows.length }
+  }
+
+  async enableOtel(_catalog: string): Promise<{ tables_created: string[] }> {
+    await delay()
+    return {
+      tables_created: [
+        "otel_counters", "otel_gauges", "otel_histograms", "otel_exp_histograms",
+        "otel_summaries", "otel_exemplars", "otel_spans", "otel_span_events",
+        "otel_span_links", "otel_logs",
+      ],
+    }
+  }
+
+  async listAccounts(): Promise<Account[]> {
+    await delay()
+    return MOCK_ACCOUNTS
   }
 }
 

@@ -13,15 +13,11 @@ let connectionRefCount = 0
 export function useWsConnection() {
   const token = useAuthStore((s) => s.token)
   const activeId = useClusterStore((s) => s.activeId)
-  const addEvent = useCatalogsStore((s) => s.addEvent)
-  const clearEvents = useCatalogsStore((s) => s.clearEvents)
-  const setOperations = useOperationsStore((s) => s.setOperations)
-  const upsertOperation = useOperationsStore((s) => s.upsertOperation)
 
   useEffect(() => {
     if (!token) return
 
-    clearEvents()
+    useCatalogsStore.getState().clearEvents()
     connectionRefCount++
     if (connectionRefCount === 1) {
       wsClient.connect()
@@ -33,18 +29,19 @@ export function useWsConnection() {
       try {
         switch (msg.type) {
           case "CatalogEvent":
-            addEvent(msg as unknown as { type: string; catalog: string; table?: string; [key: string]: unknown })
+            useCatalogsStore.getState().addEvent(
+              msg as unknown as { type: string; catalog: string; table?: string; [key: string]: unknown },
+            )
             break
           case "OperationsSnapshot":
-            setOperations(msg.operations)
+            useOperationsStore.getState().setOperations(msg.operations)
             break
           case "OperationUpdate":
-            upsertOperation(msg.operation)
+            useOperationsStore.getState().upsertOperation(msg.operation)
             break
           case "SnapshotRequired":
-            // Client fell behind on catalog events — clear and let push refill
             console.warn(`[bisque-ws] SnapshotRequired for catalog="${msg.catalog}". Clearing events.`)
-            clearEvents()
+            useCatalogsStore.getState().clearEvents()
             break
         }
       } catch (err) {
@@ -59,5 +56,5 @@ export function useWsConnection() {
         wsClient.disconnect()
       }
     }
-  }, [token, activeId, addEvent, clearEvents, setOperations, upsertOperation])
+  }, [token, activeId])
 }

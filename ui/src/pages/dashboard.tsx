@@ -34,8 +34,8 @@ export function DashboardPage() {
         />
         <StatCard
           icon={<Key className="h-4 w-4" />}
-          title="Max API Keys"
-          value={tenant?.limits.max_api_keys ?? "-"}
+          title="Max Queries"
+          value={tenant?.limits.max_concurrent_queries ?? "-"}
         />
         <StatCard
           icon={<Activity className="h-4 w-4" />}
@@ -57,13 +57,13 @@ export function DashboardPage() {
               <div className="space-y-2">
                 {catalogs.map((c) => (
                   <Link
-                    key={c.id}
+                    key={c.catalog_id}
                     to={`/catalogs/${c.name}`}
                     className="flex items-center justify-between rounded-md border p-3 hover:bg-accent/50 transition-colors"
                   >
                     <div>
                       <span className="font-medium">{c.name}</span>
-                      <span className="ml-2 text-xs text-muted-foreground">#{c.id}</span>
+                      <span className="ml-2 text-xs text-muted-foreground">#{c.catalog_id}</span>
                     </div>
                     <Badge variant="secondary">{c.engine}</Badge>
                   </Link>

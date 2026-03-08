@@ -29,13 +29,15 @@ use tracing::{debug, error, info, warn};
 
 use crate::LanceTypeConfig;
 use crate::catalog_events::CatalogEvent;
-use crate::types::PersistedTableEntry;
+use crate::types::{CatalogMeta, PersistedTableEntry};
 
 const META_TABLE: &str = "lance_meta";
 const TABLES_TABLE: &str = "lance_tables";
 const WAL_TABLE: &str = "catalog_wal";
 /// Key for the group meta record within the per-group MDBX.
 const META_KEY: &[u8] = b"raft";
+/// Key for catalog-level metadata (OTel config, etc.) within the per-group MDBX.
+const CATALOG_META_KEY: &[u8] = b"catalog";
 /// Maximum WAL size in bytes before compaction trims oldest entries.
 const WAL_MAX_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 
@@ -123,12 +125,13 @@ pub(crate) enum ManifestCommand {
         table_update: Option<TableUpdate>,
         done: Option<tokio::sync::oneshot::Sender<()>>,
     },
-    /// Bulk write for snapshot install: group meta + all tables.
+    /// Bulk write for snapshot install: group meta + all tables + catalog meta.
     /// Clears existing table data for this group before writing.
     InstallSnapshot {
         group_id: u64,
         meta: GroupMeta,
         tables: HashMap<Arc<str>, PersistedTableEntry>,
+        catalog_meta: Option<CatalogMeta>,
         done: Option<tokio::sync::oneshot::Sender<()>>,
     },
     /// Append catalog WAL events for client sync.
@@ -325,6 +328,41 @@ impl GroupMdbxEnv {
         }
     }
 
+    fn read_catalog_meta(&self) -> io::Result<Option<CatalogMeta>> {
+        let txn = self
+            .db
+            .begin_ro_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let table = unsafe { self.meta_table_ro(&txn) };
+        match txn.get::<std::borrow::Cow<[u8]>>(&table, CATALOG_META_KEY) {
+            Ok(Some(bytes)) => {
+                let (meta, _): (CatalogMeta, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                Ok(Some(meta))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
+        }
+    }
+
+    fn write_catalog_meta(&self, meta: &CatalogMeta) -> io::Result<()> {
+        let bytes =
+            bincode::serde::encode_to_vec(meta, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let txn = self
+            .db
+            .begin_rw_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let table = unsafe { self.meta_table_rw(&txn) };
+        txn.put(&table, CATALOG_META_KEY, &bytes, WriteFlags::default())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        drop(table);
+        txn.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
     fn read_all_tables(&self) -> io::Result<HashMap<String, PersistedTableEntry>> {
         let txn = self
             .db
@@ -394,11 +432,8 @@ impl GroupMdbxEnv {
         for result in iter {
             match result {
                 Ok((_, v)) => {
-                    match bincode::serde::decode_from_slice::<CatalogEvent, _>(
-                        v.as_ref(),
-                        bincode::config::standard(),
-                    ) {
-                        Ok((event, _)) => events.push(event),
+                    match serde_json::from_slice::<CatalogEvent>(v.as_ref()) {
+                        Ok(event) => events.push(event),
                         Err(e) => {
                             warn!("Failed to decode WAL event: {}", e);
                         }
@@ -451,7 +486,7 @@ impl GroupMdbxEnv {
         let table = unsafe { self.wal_table_rw(txn) };
         for event in events {
             let key = event.seq.to_be_bytes();
-            let value = bincode::serde::encode_to_vec(event, bincode::config::standard())
+            let value = serde_json::to_vec(event)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             txn.put(&table, &key[..], &value, WriteFlags::empty())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -647,6 +682,7 @@ impl GroupMdbxEnv {
         &self,
         meta: &GroupMeta,
         entries: &HashMap<Arc<str>, PersistedTableEntry>,
+        catalog_meta: Option<&CatalogMeta>,
     ) -> io::Result<()> {
         let txn = self
             .db
@@ -659,6 +695,14 @@ impl GroupMdbxEnv {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         txn.put(&meta_tbl, META_KEY, &meta_value, WriteFlags::empty())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        // Write catalog meta if present
+        if let Some(cm) = catalog_meta {
+            let cm_value = bincode::serde::encode_to_vec(cm, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            txn.put(&meta_tbl, CATALOG_META_KEY, &cm_value, WriteFlags::empty())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
 
         // Clear existing tables
         let tables_tbl = unsafe { self.tables_table_rw(&txn) };
@@ -808,6 +852,18 @@ impl LanceManifestManager {
         }
     }
 
+    /// Read catalog-level metadata for a group.
+    pub fn read_catalog_meta(&self, group_id: u64) -> io::Result<Option<CatalogMeta>> {
+        let env = self.get_env(group_id)?;
+        env.read_catalog_meta()
+    }
+
+    /// Write catalog-level metadata for a group (direct MDBX write, not batched).
+    pub fn write_catalog_meta(&self, group_id: u64, meta: &CatalogMeta) -> io::Result<()> {
+        let env = self.get_env(group_id)?;
+        env.write_catalog_meta(meta)
+    }
+
     /// Read all table entries for a group.
     pub fn read_all_tables(
         &self,
@@ -874,11 +930,13 @@ impl LanceManifestManager {
                 group_id,
                 meta,
                 tables,
+                catalog_meta,
                 ..
             } => ManifestCommand::InstallSnapshot {
                 group_id,
                 meta,
                 tables,
+                catalog_meta,
                 done: Some(done_tx),
             },
             // WAL events are fire-and-forget only; durable not needed.
@@ -1011,6 +1069,7 @@ impl LanceManifestManager {
             meta: Option<GroupMeta>,
             table_updates: HashMap<Arc<str>, Option<PersistedTableEntry>>,
             wal_events: Vec<CatalogEvent>,
+            catalog_meta: Option<CatalogMeta>,
             is_snapshot: bool,
         }
 
@@ -1030,6 +1089,7 @@ impl LanceManifestManager {
                         meta: None,
                         table_updates: HashMap::new(),
                         wal_events: Vec::new(),
+                        catalog_meta: None,
                         is_snapshot: false,
                     });
                     if let Some(m) = meta {
@@ -1053,12 +1113,14 @@ impl LanceManifestManager {
                     group_id,
                     meta,
                     tables,
+                    catalog_meta,
                     done,
                 } => {
                     let batch = per_group.entry(group_id).or_insert_with(|| GroupBatch {
                         meta: None,
                         table_updates: HashMap::new(),
                         wal_events: Vec::new(),
+                        catalog_meta: None,
                         is_snapshot: false,
                     });
                     batch.meta = Some(meta);
@@ -1066,6 +1128,7 @@ impl LanceManifestManager {
                     for (name, entry) in tables {
                         batch.table_updates.insert(name, Some(entry));
                     }
+                    batch.catalog_meta = catalog_meta;
                     batch.is_snapshot = true;
                     if let Some(d) = done {
                         done_senders.push(d);
@@ -1076,6 +1139,7 @@ impl LanceManifestManager {
                         meta: None,
                         table_updates: HashMap::new(),
                         wal_events: Vec::new(),
+                        catalog_meta: None,
                         is_snapshot: false,
                     });
                     batch.wal_events.extend(events);
@@ -1102,6 +1166,7 @@ impl LanceManifestManager {
                         .iter()
                         .filter_map(|(k, v)| v.as_ref().map(|e| (k.clone(), e.clone())))
                         .collect(),
+                    batch.catalog_meta.as_ref(),
                 )
             } else {
                 env.apply_coalesced(batch.meta.as_ref(), &batch.table_updates)

@@ -3,9 +3,18 @@ import Editor, { type OnMount, type Monaco } from "@monaco-editor/react"
 import type { editor as monacoEditor, IDisposable } from "monaco-editor"
 import { ResizablePanels } from "@/components/resizable-panels"
 import { useAuthStore } from "@/stores/auth"
-import { catalogApi, s3Api, type CatalogEntry } from "@/lib/api"
+import { catalogApi, type CatalogEntry } from "@/lib/api"
+import { wsClient } from "@/lib/ws"
+import { useConnectionStore } from "@/stores/connection"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { ResultsTable } from "@/components/results-table"
 import { Play, Loader2, PanelLeftClose, PanelLeftOpen } from "lucide-react"
 import {
@@ -29,19 +38,26 @@ export function QueryPage() {
   const monacoRef = useRef<Monaco | null>(null)
   const completionDisposable = useRef<IDisposable | null>(null)
   const tenantId = useAuthStore((s) => s.tenantId)
+  const connState = useConnectionStore((s) => s.state)
   const [schemaCollapsed, setSchemaCollapsed] = useState(false)
+  const [catalogs, setCatalogs] = useState<CatalogEntry[]>([])
+  const [selectedCatalog, setSelectedCatalog] = useState<string>("")
 
-  // Load schema for intellisense
+  // Load catalogs and schema for intellisense
   useEffect(() => {
-    if (!tenantId) return
+    if (!tenantId || connState !== "connected") return
 
     catalogApi
       .list(tenantId)
       .then(async (entries: CatalogEntry[]) => {
+        setCatalogs(entries)
+        if (entries.length > 0 && !selectedCatalog) {
+          setSelectedCatalog(entries[0].name)
+        }
         const catalogTables: Record<string, Record<string, MockTableInfo>> = {}
         for (const entry of entries) {
           try {
-            const data = await s3Api.getCatalog(entry.name)
+            const data = await wsClient.getCatalog(entry.name)
             catalogTables[entry.name] =
               (data as { tables?: Record<string, MockTableInfo> }).tables ?? {}
           } catch {
@@ -50,8 +66,8 @@ export function QueryPage() {
         }
         setSchema(buildSchemaFromMockData(catalogTables))
       })
-      .catch(() => {})
-  }, [tenantId])
+      .catch((err) => console.error("Failed to load catalogs:", err))
+  }, [tenantId, connState])
 
   const runQuery = useCallback(
     async (query: string) => {
@@ -62,60 +78,22 @@ export function QueryPage() {
       setColumns([])
 
       try {
-        const match = query.match(
-          /SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+.*?)?(?:\s+LIMIT\s+(\d+))?$/is,
-        )
-        if (!match) {
-          setError(
-            "Could not parse query. Currently supports: SELECT ... FROM <table> [LIMIT n]",
-          )
+        const catalog = selectedCatalog || catalogs[0]?.name
+        if (!catalog) {
+          setError("No catalog selected. Create a catalog first.")
           return
         }
 
-        const [, selectCols, tableName, limitStr] = match
-        const limit = limitStr ? parseInt(limitStr) : 20
-
-        if (!schema) {
-          setError("Schema not loaded yet. Please wait...")
-          return
-        }
-
-        let tableSchema: { name: string; type: string }[] | null = null
-        for (const catalog of schema.catalogs) {
-          const table = catalog.tables.find((t) => t.name === tableName)
-          if (table) {
-            tableSchema = table.columns
-            break
-          }
-        }
-
-        if (!tableSchema) {
-          setError(`Table '${tableName}' not found in any catalog`)
-          return
-        }
-
-        const isSelectStar = selectCols.trim() === "*"
-        const selectedCols = isSelectStar
-          ? tableSchema.map((c) => c.name)
-          : selectCols.split(",").map((c) => c.trim())
-
-        setColumns(selectedCols)
-
-        const rows: Record<string, unknown>[] = []
-        for (let i = 0; i < limit; i++) {
-          const row: Record<string, unknown> = {}
-          for (const col of selectedCols) {
-            const colInfo = tableSchema.find((c) => c.name === col)
-            row[col] = generateMockValue(col, colInfo?.type ?? "Utf8", i)
-          }
-          rows.push(row)
-        }
-        setResults(rows)
+        const result = await wsClient.executeSql(catalog, query)
+        setColumns(result.columns.map((c) => c.name))
+        setResults(result.rows as Record<string, unknown>[])
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Query failed")
       } finally {
         setRunning(false)
       }
     },
-    [schema],
+    [selectedCatalog, catalogs],
   )
 
   // Register (or re-register) the completion provider using the real monaco instance
@@ -135,34 +113,23 @@ export function QueryPage() {
       editorRef.current = editor
       monacoRef.current = monaco
 
-      // Register a custom SQL-friendly dark theme
-      // vs-dark has hardcoded .sql-suffixed rules (string.sql=red, predefined.sql=magenta,
-      // operator.sql=muted gray) that override generic rules. We must use .sql suffixes.
       monaco.editor.defineTheme("bisque-sql-dark", {
         base: "vs-dark",
         inherit: true,
         rules: [
-          // Keywords (SELECT, FROM, WHERE): bright blue bold
           { token: "keyword.sql", foreground: "569cd6", fontStyle: "bold" },
           { token: "keyword.block.sql", foreground: "569cd6", fontStyle: "bold" },
           { token: "keyword.choice.sql", foreground: "569cd6", fontStyle: "bold" },
           { token: "keyword.try.sql", foreground: "569cd6", fontStyle: "bold" },
           { token: "keyword.catch.sql", foreground: "569cd6", fontStyle: "bold" },
-          // Operators (AND, OR, NOT, IN, etc.): bright blue (same as keywords for SQL)
           { token: "operator.sql", foreground: "569cd6", fontStyle: "bold" },
-          // Built-in functions (AVG, COUNT, etc.): yellow/gold
           { token: "predefined.sql", foreground: "dcdcaa" },
-          // Strings: green (standard for SQL IDEs)
           { token: "string.sql", foreground: "6a9955" },
-          // Numbers: light green
           { token: "number.sql", foreground: "b5cea8" },
-          // Identifiers (column names, table names): light gray
           { token: "identifier.sql", foreground: "e0e0e0" },
           { token: "identifier.quote.sql", foreground: "e0e0e0" },
-          // Comments: muted green italic
           { token: "comment.sql", foreground: "608b4e", fontStyle: "italic" },
           { token: "comment.quote.sql", foreground: "608b4e", fontStyle: "italic" },
-          // Delimiters
           { token: "delimiter.sql", foreground: "d4d4d4" },
         ],
         colors: {},
@@ -217,7 +184,21 @@ export function QueryPage() {
       {/* Editor panel */}
       <div className="h-full flex flex-col">
         <div className="flex items-center justify-between px-3 h-10 border-b shrink-0">
-          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Query</span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Query</span>
+            {catalogs.length > 0 && (
+              <Select value={selectedCatalog} onValueChange={setSelectedCatalog}>
+                <SelectTrigger className="w-[150px] h-7 text-xs">
+                  <SelectValue placeholder="Catalog" />
+                </SelectTrigger>
+                <SelectContent>
+                  {catalogs.map((c) => (
+                    <SelectItem key={c.catalog_id} value={c.name}>{c.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
           <Button
             onClick={() => runQuery(editorRef.current?.getValue() ?? sql)}
             disabled={running}
@@ -344,106 +325,4 @@ export function QueryPage() {
       )}
     </div>
   )
-}
-
-function generateMockValue(
-  colName: string,
-  colType: string,
-  rowIndex: number,
-): unknown {
-  const now = Date.now()
-
-  if (colType.includes("Timestamp")) {
-    return new Date(now - rowIndex * 60_000).toISOString()
-  }
-  if (colType === "Date32") {
-    return new Date(now - rowIndex * 86_400_000).toISOString().slice(0, 10)
-  }
-  if (colType === "Int32" || colType === "Int64") {
-    if (colName.includes("duration") || colName.includes("latency"))
-      return 50 + Math.floor(Math.random() * 500)
-    if (colName.includes("cents") || colName.includes("revenue"))
-      return 100 + Math.floor(Math.random() * 10000)
-    if (colName.includes("version")) return rowIndex + 1
-    if (colName.includes("status"))
-      return [200, 201, 400, 404, 500][rowIndex % 5]
-    if (colName === "x" || colName === "y")
-      return Math.floor(Math.random() * 1920)
-    return Math.floor(Math.random() * 1000)
-  }
-  if (colType === "Float32" || colType === "Float64") {
-    return +(Math.random() * 100).toFixed(4)
-  }
-  if (colType === "Boolean") {
-    return rowIndex % 2 === 0
-  }
-  if (colType.includes("List") && !colType.includes("FixedSize")) {
-    return `["item_${rowIndex}_a", "item_${rowIndex}_b"]`
-  }
-  if (colType.includes("FixedSizeList")) {
-    return "[0.123, -0.456, 0.789, ...]"
-  }
-
-  // String types
-  if (colName === "user_id")
-    return `usr_${String(1000 + rowIndex).padStart(6, "0")}`
-  if (colName === "session_id")
-    return `sess_${Math.random().toString(36).slice(2, 10)}`
-  if (colName === "order_id")
-    return `ord_${String(5000 + rowIndex).padStart(6, "0")}`
-  if (colName === "trace_id")
-    return Array.from({ length: 32 }, () =>
-      Math.floor(Math.random() * 16).toString(16),
-    ).join("")
-  if (colName === "span_id")
-    return Array.from({ length: 16 }, () =>
-      Math.floor(Math.random() * 16).toString(16),
-    ).join("")
-  if (colName === "parent_span_id")
-    return rowIndex === 0
-      ? null
-      : Array.from({ length: 16 }, () =>
-          Math.floor(Math.random() * 16).toString(16),
-        ).join("")
-  if (colName === "email") return `user${rowIndex}@example.com`
-  if (colName === "page_url")
-    return `/products/${["electronics", "clothing", "books", "home"][rowIndex % 4]}`
-  if (colName === "referrer")
-    return rowIndex % 3 === 0 ? null : "https://google.com"
-  if (colName === "country")
-    return ["US", "GB", "DE", "JP", "BR", "IN"][rowIndex % 6]
-  if (colName === "campaign")
-    return rowIndex % 2 === 0
-      ? null
-      : ["summer-sale", "winter-promo", "launch"][rowIndex % 3]
-  if (colName === "plan") return ["free", "pro", "enterprise"][rowIndex % 3]
-  if (colName === "severity")
-    return ["info", "info", "warn", "error", "debug"][rowIndex % 5]
-  if (colName === "service_name" || colName === "operation_name")
-    return ["api-gateway", "user-service", "order-service", "payment-service"][
-      rowIndex % 4
-    ]
-  if (colName === "metric_name")
-    return ["http_requests_total", "process_cpu_seconds", "memory_bytes"][
-      rowIndex % 3
-    ]
-  if (colName === "element_id")
-    return `btn-${["submit", "cancel", "next", "prev", "menu"][rowIndex % 5]}`
-  if (colName === "ad_id") return `ad_${1000 + rowIndex}`
-  if (colName === "placement")
-    return ["header", "sidebar", "footer", "inline"][rowIndex % 4]
-  if (colName === "event_name")
-    return ["signup", "purchase", "add_to_cart", "page_view"][rowIndex % 4]
-  if (colName === "body")
-    return [
-      "Request completed",
-      "Connection established",
-      "Segment sealed",
-      "Query executed",
-    ][rowIndex % 4]
-  if (colName === "attributes") return `{"key_${rowIndex}": "val_${rowIndex}"}`
-  if (colName === "labels")
-    return `{"instance": "bisque:3200", "job": "bisque"}`
-
-  return `value_${rowIndex}`
 }

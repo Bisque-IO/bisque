@@ -44,7 +44,7 @@ function delay<T>(value: T, ms = 80 + Math.random() * 120): Promise<T> {
 
 // In-memory mutable state so mutations feel real
 let nextAccountId = MOCK_ACCOUNTS.length + 1
-const accounts = new Map<number, Account>(MOCK_ACCOUNTS.map((a) => [a.id, { ...a }]))
+const accounts = new Map<number, Account>(MOCK_ACCOUNTS.map((a) => [a.account_id, { ...a }]))
 let nextTenantId = 2
 const tenants = new Map<number, Tenant>([[1, { ...MOCK_TENANT }]])
 let nextCatalogId = MOCK_CATALOGS.length + 1
@@ -62,13 +62,15 @@ export const mockAuthApi = {
       const user = MOCK_USERS.find((u) => u.username === username)
       if (!user) throw new Error("invalid credentials")
       const userAccounts = MOCK_MEMBERSHIPS
-        .filter((m) => m.user_id === user.id)
+        .filter((m) => m.user_id === user.user_id)
         .map((m) => accounts.get(m.account_id)!)
         .filter(Boolean)
       return {
-        user_id: user.id,
-        token: `eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.mock.user${user.id}`,
+        user_id: user.user_id,
+        token: `eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.mock.user${user.user_id}`,
         accounts: userAccounts,
+        default_tenant_id: 1,
+        default_tenant_name: "Acme Corp",
       }
     })()),
 }
@@ -90,7 +92,7 @@ export const mockAccountApi = {
   create: (name: string) =>
     delay((() => {
       const id = nextAccountId++
-      accounts.set(id, { id, name, created_at: new Date().toISOString() })
+      accounts.set(id, { account_id: id, name, created_at: Date.now() })
       return { account_id: id }
     })()),
 }
@@ -104,11 +106,12 @@ export const mockTenantApi = {
     delay((() => {
       const id = nextTenantId++
       tenants.set(id, {
-        id,
+        tenant_id: id,
         account_id: accountId,
         name,
-        limits: { max_catalogs: limits?.max_catalogs ?? 10, max_api_keys: limits?.max_api_keys ?? 50 },
-        created_at: new Date().toISOString(),
+        limits: { max_catalogs: limits?.max_catalogs ?? 10, max_disk_bytes: limits?.max_disk_bytes ?? 10737418240, max_deep_storage_bytes: limits?.max_deep_storage_bytes ?? 107374182400, max_concurrent_queries: limits?.max_concurrent_queries ?? 10, max_query_memory_bytes: limits?.max_query_memory_bytes ?? 1073741824 },
+        api_keys: [],
+        created_at: Date.now(),
       })
       return { tenant_id: id }
     })()),
@@ -133,7 +136,7 @@ export const mockCatalogApi = {
     delay((() => {
       const id = nextCatalogId++
       const raft_group_id = 100 + id
-      catalogs.push({ id, tenant_id: tenantId, name, engine, config: _config, raft_group_id })
+      catalogs.push({ catalog_id: id, tenant_id: tenantId, name, engine, config: _config, raft_group_id })
       // Seed empty tables for new catalog
       MOCK_CATALOG_TABLES[name] = {}
       return { catalog_id: id, raft_group_id }
@@ -149,7 +152,7 @@ export const mockApiKeyApi = {
     delay((() => {
       const id = nextKeyId++
       const key: MockApiKey = {
-        id,
+        key_id: id,
         tenant_id: tenantId,
         scopes,
         revoked: false,
@@ -165,7 +168,7 @@ export const mockApiKeyApi = {
 
   revoke: (keyId: number) =>
     delay((() => {
-      const key = apiKeys.find((k) => k.id === keyId)
+      const key = apiKeys.find((k) => k.key_id === keyId)
       if (key) key.revoked = true
     })()),
 }

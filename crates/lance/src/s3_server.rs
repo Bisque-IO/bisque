@@ -127,6 +127,10 @@ impl S3ServerState {
     }
 
     /// Subscribe to the catalog event broadcast channel.
+    pub fn engine(&self) -> &Arc<BisqueLance> {
+        &self.engine
+    }
+
     pub fn subscribe_catalog_events(
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<CatalogEvent>> {
@@ -223,37 +227,109 @@ impl S3ServerState {
 
         for name in &tables {
             if let Some(table) = self.engine.get_table(name) {
-                let seg_catalog = table.catalog();
-                let active_version = table
-                    .active_dataset_snapshot()
-                    .await
-                    .map(|ds| ds.manifest.version);
-                let sealed_ds = table.sealed_dataset_snapshot().await;
-                let sealed_version = sealed_ds.as_ref().map(|ds| ds.manifest.version);
-                let indexes = if let Some(ds) = &sealed_ds {
-                    collect_index_info(ds).await
-                } else {
-                    Vec::new()
-                };
-                let s3_storage_options =
-                    filter_non_credential_options(&table.config().s3_storage_options);
-
-                catalog.insert(
-                    name.clone(),
-                    CatalogTableInfo {
-                        active_segment: seg_catalog.active_segment,
-                        sealed_segment: seg_catalog.sealed_segment,
-                        s3_dataset_uri: seg_catalog.s3_dataset_uri.clone(),
-                        active_version,
-                        sealed_version,
-                        s3_storage_options,
-                        indexes,
-                    },
-                );
+                let info = Self::build_table_info(&table).await;
+                catalog.insert(name.clone(), info);
             }
         }
 
-        serde_json::to_value(CatalogResponse { tables: catalog }).unwrap_or_default()
+        let otel = self
+            .manifest
+            .as_ref()
+            .and_then(|m| m.read_catalog_meta(self.group_id).ok().flatten())
+            .filter(|cm| cm.otel_enabled)
+            .map(|cm| CatalogOtelInfo {
+                enabled: true,
+                enabled_at: cm.otel_enabled_at,
+                enabled_by: cm.otel_enabled_by,
+            });
+
+        serde_json::to_value(CatalogResponse {
+            tables: catalog,
+            otel,
+        })
+        .unwrap_or_default()
+    }
+
+    /// Build detailed table info for a single table.
+    async fn build_table_info(table: &crate::table_engine::TableEngine) -> CatalogTableInfo {
+        let seg_catalog = table.catalog();
+
+        // Try active, then sealed, then S3 dataset for schema
+        fn schema_from_ds(ds: &lance::dataset::Dataset) -> Vec<CatalogColumnInfo> {
+            let s = ds.schema();
+            s.fields
+                .iter()
+                .map(|f| CatalogColumnInfo {
+                    name: f.name.clone(),
+                    data_type: format!("{}", f.data_type()),
+                    nullable: f.nullable,
+                })
+                .collect()
+        }
+
+        let active_ds = table.active_dataset_snapshot().await;
+        let active_version = active_ds.as_ref().map(|ds| ds.manifest.version);
+        let active_rows = match &active_ds {
+            Some(ds) => ds.count_rows(None).await.unwrap_or(0) as u64,
+            None => 0,
+        };
+
+        let sealed_ds = table.sealed_dataset_snapshot().await;
+        let sealed_version = sealed_ds.as_ref().map(|ds| ds.manifest.version);
+        let sealed_rows = match &sealed_ds {
+            Some(ds) => ds.count_rows(None).await.unwrap_or(0) as u64,
+            None => 0,
+        };
+
+        let s3_ds = table.s3_dataset_snapshot().await;
+        let s3_rows = match &s3_ds {
+            Some(ds) => ds.count_rows(None).await.unwrap_or(0) as u64,
+            None => 0,
+        };
+
+        // Schema: prefer active, then sealed, then S3
+        let schema = if let Some(ds) = &active_ds {
+            schema_from_ds(ds)
+        } else if let Some(ds) = &sealed_ds {
+            schema_from_ds(ds)
+        } else if let Some(ds) = &s3_ds {
+            schema_from_ds(ds)
+        } else {
+            Vec::new()
+        };
+        let num_columns = schema.len();
+
+        // Indexes from sealed dataset (primary index tier)
+        let mut indexes = if let Some(ds) = &sealed_ds {
+            collect_index_info(ds).await
+        } else {
+            Vec::new()
+        };
+        // Also check S3 dataset for indexes if sealed has none
+        if indexes.is_empty() {
+            if let Some(ds) = &s3_ds {
+                indexes = collect_index_info(ds).await;
+            }
+        }
+
+        let s3_storage_options =
+            filter_non_credential_options(&table.config().s3_storage_options);
+
+        CatalogTableInfo {
+            active_segment: seg_catalog.active_segment,
+            sealed_segment: seg_catalog.sealed_segment,
+            s3_dataset_uri: seg_catalog.s3_dataset_uri.clone(),
+            active_version,
+            sealed_version,
+            s3_version: seg_catalog.s3_manifest_version,
+            s3_storage_options,
+            indexes,
+            schema,
+            active_rows,
+            sealed_rows,
+            s3_rows,
+            num_columns,
+        }
     }
 }
 
@@ -410,12 +486,23 @@ async fn resolve_to_object_store(
 // Catalog endpoint
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct CatalogResponse {
     tables: std::collections::HashMap<String, CatalogTableInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    otel: Option<CatalogOtelInfo>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+struct CatalogOtelInfo {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled_by: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct CatalogTableInfo {
     active_segment: u64,
     sealed_segment: Option<u64>,
@@ -426,6 +513,9 @@ struct CatalogTableInfo {
     /// Lance dataset version for the sealed segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     sealed_version: Option<u64>,
+    /// S3 deep storage manifest version.
+    #[serde(default)]
+    s3_version: u64,
     /// Non-credential S3 storage options (region, endpoint, etc.) so clients
     /// only need to supply their own credentials.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -433,9 +523,30 @@ struct CatalogTableInfo {
     /// Index metadata for the sealed segment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     indexes: Vec<CatalogIndexInfo>,
+    /// Table schema (column names, types, nullability).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    schema: Vec<CatalogColumnInfo>,
+    /// Row counts per storage tier.
+    #[serde(default)]
+    active_rows: u64,
+    #[serde(default)]
+    sealed_rows: u64,
+    #[serde(default)]
+    s3_rows: u64,
+    /// Number of columns in the schema.
+    #[serde(default)]
+    num_columns: usize,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
+struct CatalogColumnInfo {
+    name: String,
+    #[serde(rename = "type")]
+    data_type: String,
+    nullable: bool,
+}
+
+#[derive(Serialize, Deserialize, Default)]
 struct CatalogIndexInfo {
     name: String,
     columns: Vec<String>,
@@ -449,49 +560,14 @@ async fn get_catalog(
     State(state): State<Arc<S3ServerState>>,
     AxumPath(_bucket): AxumPath<String>,
 ) -> impl IntoResponse {
-    let tables = state.engine.list_tables();
-    let mut catalog = std::collections::HashMap::new();
-
-    for name in &tables {
-        if let Some(table) = state.engine.get_table(name) {
-            let seg_catalog = table.catalog();
-
-            let active_version = table
-                .active_dataset_snapshot()
-                .await
-                .map(|ds| ds.manifest.version);
-
-            let sealed_ds = table.sealed_dataset_snapshot().await;
-            let sealed_version = sealed_ds.as_ref().map(|ds| ds.manifest.version);
-
-            // Collect index metadata from the sealed dataset.
-            let indexes = if let Some(ds) = &sealed_ds {
-                collect_index_info(ds).await
-            } else {
-                Vec::new()
-            };
-
-            // Include non-credential S3 storage options from the table config.
-            let s3_storage_options =
-                filter_non_credential_options(&table.config().s3_storage_options);
-
-            catalog.insert(
-                name.clone(),
-                CatalogTableInfo {
-                    active_segment: seg_catalog.active_segment,
-                    sealed_segment: seg_catalog.sealed_segment,
-                    s3_dataset_uri: seg_catalog.s3_dataset_uri.clone(),
-                    active_version,
-                    sealed_version,
-                    s3_storage_options,
-                    indexes,
-                },
-            );
-        }
-    }
-
     state.m_req_catalog.increment(1);
-    axum::Json(CatalogResponse { tables: catalog })
+    axum::Json(
+        serde_json::from_value::<CatalogResponse>(state.get_catalog_json().await)
+            .unwrap_or(CatalogResponse {
+                tables: std::collections::HashMap::new(),
+                otel: None,
+            }),
+    )
 }
 
 /// Collect index metadata from a Lance dataset.

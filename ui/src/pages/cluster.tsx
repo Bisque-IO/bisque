@@ -8,7 +8,9 @@ import {
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
-import { clusterApi, type ClusterNode, type ClusterStatus } from "@/lib/api"
+import { type ClusterNode, type ClusterStatus } from "@/lib/api"
+import { wsClient } from "@/lib/ws"
+import { useConnectionStore } from "@/stores/connection"
 import {
   Server,
   Crown,
@@ -30,14 +32,16 @@ import {
 export function ClusterPage() {
   const [status, setStatus] = useState<ClusterStatus | null>(null)
   const [loading, setLoading] = useState(true)
+  const connState = useConnectionStore((s) => s.state)
 
   useEffect(() => {
-    clusterApi
-      .getStatus()
+    if (connState !== "connected") return
+    wsClient
+      .getClusterStatus()
       .then(setStatus)
-      .catch(() => {})
+      .catch((err) => console.error("Failed to load cluster status:", err))
       .finally(() => setLoading(false))
-  }, [])
+  }, [connState])
 
   if (loading) {
     return (

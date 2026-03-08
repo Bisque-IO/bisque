@@ -3,9 +3,15 @@ import { useAuthStore } from "@/stores/auth"
 import { useClusterStore } from "@/stores/cluster"
 
 // ---------------------------------------------------------------------------
-// Mock mode flag — set VITE_MOCK=true to use fake data without a server
+// Mock mode — runtime toggle based on active cluster config
 // ---------------------------------------------------------------------------
 
+/** Check if mock mode is active for the current cluster. */
+export function isMock(): boolean {
+  return useClusterStore.getState().activeCluster.mock ?? false
+}
+
+/** @deprecated Use isMock() for runtime checks. Kept for backwards compat. */
 export const MOCK = import.meta.env.VITE_MOCK === "true"
 
 // ---------------------------------------------------------------------------
@@ -48,16 +54,16 @@ export const api = new Proxy({} as ReturnType<typeof ky.create>, {
 // ---------------------------------------------------------------------------
 
 export interface Account {
-  id: u64
+  account_id: u64
   name: string
-  created_at: string
+  created_at: number
 }
 
 export interface User {
-  id: u64
+  user_id: u64
   username: string
   disabled: boolean
-  created_at: string
+  created_at: number
 }
 
 export interface AccountMembership {
@@ -70,23 +76,41 @@ export interface LoginResponse {
   user_id: number
   token: string
   accounts: Account[]
+  default_tenant_id?: number
+  default_tenant_name?: string
 }
 
 export interface Tenant {
-  id: u64
+  tenant_id: u64
   account_id: u64
   name: string
   limits: TenantLimits
-  created_at: string
+  api_keys: u64[]
+  created_at: number
 }
 
 export interface TenantLimits {
+  max_disk_bytes: number
+  max_deep_storage_bytes: number
+  max_concurrent_queries: number
+  max_query_memory_bytes: number
   max_catalogs: number
-  max_api_keys: number
+}
+
+export interface SqlColumn {
+  name: string
+  type: string
+  nullable: boolean
+}
+
+export interface SqlResult {
+  columns: SqlColumn[]
+  rows: Record<string, unknown>[]
+  row_count: number
 }
 
 export interface CatalogEntry {
-  id: u64
+  catalog_id: u64
   tenant_id: u64
   name: string
   engine: string
@@ -95,11 +119,11 @@ export interface CatalogEntry {
 }
 
 export interface ApiKeyEntry {
-  id: u64
+  key_id: u64
   tenant_id: u64
   scopes: Scope[]
   revoked: boolean
-  created_at: string
+  created_at: number
 }
 
 export type Scope =
@@ -276,7 +300,7 @@ const realApiKeyApi = {
       })
       .json<{ key_id: number; raw_key: string; token: string }>(),
 
-  revoke: (keyId: number) => api.delete(`_bisque/v1/api-keys/${keyId}`),
+  revoke: async (keyId: number) => { await api.delete(`_bisque/v1/api-keys/${keyId}`) },
 }
 
 const realTempoApi = {
@@ -400,7 +424,7 @@ const realOperationsApi = {
 }
 
 // ---------------------------------------------------------------------------
-// Conditional exports — mock or real depending on VITE_MOCK
+// Conditional exports — runtime proxy that delegates to mock or real
 // ---------------------------------------------------------------------------
 
 import {
@@ -417,14 +441,23 @@ import {
   mockOperationsApi,
 } from "./mock-api"
 
-export const authApi = MOCK ? mockAuthApi : realAuthApi
-export const accountApi = MOCK ? mockAccountApi : realAccountApi
-export const tenantApi = MOCK ? mockTenantApi : realTenantApi
-export const catalogApi = MOCK ? mockCatalogApi : realCatalogApi
-export const apiKeyApi = MOCK ? mockApiKeyApi : realApiKeyApi
-export const tempoApi = MOCK ? mockTempoApi : realTempoApi
-export const promApi = MOCK ? mockPromApi : realPromApi
-export const lokiApi = MOCK ? mockLokiApi : realLokiApi
-export const s3Api = MOCK ? mockS3Api : realS3Api
-export const clusterApi = MOCK ? mockClusterApi : realClusterApi
-export const operationsApi = MOCK ? mockOperationsApi : realOperationsApi
+function runtimeProxy<T extends object>(real: T, mock: T): T {
+  return new Proxy(real, {
+    get(_target, prop, receiver) {
+      const target = isMock() ? mock : real
+      return Reflect.get(target, prop, receiver)
+    },
+  }) as T
+}
+
+export const authApi = runtimeProxy(realAuthApi, mockAuthApi)
+export const accountApi = runtimeProxy(realAccountApi, mockAccountApi)
+export const tenantApi = runtimeProxy(realTenantApi, mockTenantApi)
+export const catalogApi = runtimeProxy(realCatalogApi, mockCatalogApi)
+export const apiKeyApi = runtimeProxy(realApiKeyApi, mockApiKeyApi)
+export const tempoApi = runtimeProxy(realTempoApi, mockTempoApi)
+export const promApi = runtimeProxy(realPromApi, mockPromApi)
+export const lokiApi = runtimeProxy(realLokiApi, mockLokiApi)
+export const s3Api = runtimeProxy(realS3Api, mockS3Api)
+export const clusterApi = runtimeProxy(realClusterApi, mockClusterApi)
+export const operationsApi = runtimeProxy(realOperationsApi, mockOperationsApi)

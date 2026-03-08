@@ -4,12 +4,14 @@ export interface ClusterConfig {
   id: string
   name: string
   url: string // "" = local (relative paths)
+  mock?: boolean // true = use mock data, false = connect to real server
 }
 
 const LOCAL_CLUSTER: ClusterConfig = {
   id: "local",
   name: "Local",
   url: "",
+  mock: false,
 }
 
 const STORAGE_KEY = "bisque_clusters"

@@ -12,6 +12,10 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      "/_bisque/ws": {
+        target: "ws://localhost:3200",
+        ws: true,
+      },
       "/_bisque": "http://localhost:3200",
       "/api": "http://localhost:3200",
       "/loki": "http://localhost:3200",

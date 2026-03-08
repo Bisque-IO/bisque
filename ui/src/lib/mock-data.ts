@@ -18,8 +18,8 @@ import type {
 // ---------------------------------------------------------------------------
 
 export const MOCK_ACCOUNTS: Account[] = [
-  { id: 1, name: "Acme Corp", created_at: "2025-11-01T00:00:00Z" },
-  { id: 2, name: "Globex Inc", created_at: "2025-12-15T00:00:00Z" },
+  { account_id: 1, name: "Acme Corp", created_at: Date.parse("2025-11-01T00:00:00Z") },
+  { account_id: 2, name: "Globex Inc", created_at: Date.parse("2025-12-15T00:00:00Z") },
 ]
 
 // ---------------------------------------------------------------------------
@@ -27,9 +27,9 @@ export const MOCK_ACCOUNTS: Account[] = [
 // ---------------------------------------------------------------------------
 
 export const MOCK_USERS: User[] = [
-  { id: 1, username: "admin", disabled: false, created_at: "2025-11-01T00:00:00Z" },
-  { id: 2, username: "alice", disabled: false, created_at: "2025-12-01T00:00:00Z" },
-  { id: 3, username: "bob", disabled: false, created_at: "2026-01-10T00:00:00Z" },
+  { user_id: 1, username: "admin", disabled: false, created_at: Date.parse("2025-11-01T00:00:00Z") },
+  { user_id: 2, username: "alice", disabled: false, created_at: Date.parse("2025-12-01T00:00:00Z") },
+  { user_id: 3, username: "bob", disabled: false, created_at: Date.parse("2026-01-10T00:00:00Z") },
 ]
 
 // ---------------------------------------------------------------------------
@@ -48,11 +48,12 @@ export const MOCK_MEMBERSHIPS: AccountMembership[] = [
 // ---------------------------------------------------------------------------
 
 export const MOCK_TENANT: Tenant = {
-  id: 1,
+  tenant_id: 1,
   account_id: 1,
   name: "Acme Corp",
-  limits: { max_catalogs: 10, max_api_keys: 50 },
-  created_at: "2025-12-01T00:00:00Z",
+  limits: { max_catalogs: 10, max_disk_bytes: 10737418240, max_deep_storage_bytes: 107374182400, max_concurrent_queries: 10, max_query_memory_bytes: 1073741824 },
+  api_keys: [1, 2],
+  created_at: Date.parse("2025-12-01T00:00:00Z"),
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +62,7 @@ export const MOCK_TENANT: Tenant = {
 
 export const MOCK_CATALOGS: CatalogEntry[] = [
   {
-    id: 1,
+    catalog_id: 1,
     tenant_id: 1,
     name: "analytics",
     engine: "Lance",
@@ -69,7 +70,7 @@ export const MOCK_CATALOGS: CatalogEntry[] = [
     raft_group_id: 100,
   },
   {
-    id: 2,
+    catalog_id: 2,
     tenant_id: 1,
     name: "events",
     engine: "Lance",
@@ -77,7 +78,7 @@ export const MOCK_CATALOGS: CatalogEntry[] = [
     raft_group_id: 101,
   },
   {
-    id: 3,
+    catalog_id: 3,
     tenant_id: 1,
     name: "otel",
     engine: "Lance",
@@ -542,7 +543,7 @@ export function generateMockLogs(count: number): LokiStream[] {
 // ---------------------------------------------------------------------------
 
 export interface MockApiKey {
-  id: number
+  key_id: number
   tenant_id: number
   scopes: ("SuperAdmin" | "TenantAdmin" | { AccountAdmin: number } | { Catalog: string } | { CatalogRead: string })[]
   revoked: boolean
@@ -623,11 +624,11 @@ export const MOCK_CLUSTER_STATUS: ClusterStatus = {
 // ---------------------------------------------------------------------------
 
 export const MOCK_API_KEYS: MockApiKey[] = [
-  { id: 1, tenant_id: 1, scopes: ["TenantAdmin"], revoked: false, created_at: "2025-12-01T00:00:00Z" },
-  { id: 2, tenant_id: 1, scopes: ["TenantAdmin"], revoked: false, created_at: "2025-12-05T10:30:00Z" },
-  { id: 3, tenant_id: 1, scopes: [{ Catalog: "analytics" }], revoked: false, created_at: "2026-01-10T14:00:00Z" },
-  { id: 4, tenant_id: 1, scopes: [{ CatalogRead: "events" }], revoked: false, created_at: "2026-02-01T09:00:00Z" },
-  { id: 5, tenant_id: 1, scopes: [{ Catalog: "otel" }], revoked: true, created_at: "2026-01-20T16:45:00Z" },
+  { key_id: 1, tenant_id: 1, scopes: ["TenantAdmin"], revoked: false, created_at: "2025-12-01T00:00:00Z" },
+  { key_id: 2, tenant_id: 1, scopes: ["TenantAdmin"], revoked: false, created_at: "2025-12-05T10:30:00Z" },
+  { key_id: 3, tenant_id: 1, scopes: [{ Catalog: "analytics" }], revoked: false, created_at: "2026-01-10T14:00:00Z" },
+  { key_id: 4, tenant_id: 1, scopes: [{ CatalogRead: "events" }], revoked: false, created_at: "2026-02-01T09:00:00Z" },
+  { key_id: 5, tenant_id: 1, scopes: [{ Catalog: "otel" }], revoked: true, created_at: "2026-01-20T16:45:00Z" },
 ]
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,11 @@
-import { useState } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { useAuthStore } from "@/stores/auth"
-import { apiKeyApi } from "@/lib/api"
+import { apiKeyApi, type ApiKeyEntry } from "@/lib/api"
 import type { Scope } from "@/lib/api"
+import { wsClient } from "@/lib/ws"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -20,18 +22,49 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Plus, Copy, Key } from "lucide-react"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import { Plus, Copy, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import { HeaderActions } from "@/components/layout/header-actions"
 
+function formatScope(scope: Scope): string {
+  if (typeof scope === "string") return scope
+  if ("AccountAdmin" in scope) return `AccountAdmin(${scope.AccountAdmin})`
+  if ("Catalog" in scope) return `Catalog(${scope.Catalog})`
+  if ("CatalogRead" in scope) return `CatalogRead(${scope.CatalogRead})`
+  return JSON.stringify(scope)
+}
+
 export function ApiKeyListPage() {
   const tenantId = useAuthStore((s) => s.tenantId)
+  const [keys, setKeys] = useState<ApiKeyEntry[]>([])
   const [open, setOpen] = useState(false)
   const [scopeType, setScopeType] = useState<string>("TenantAdmin")
   const [scopeValue, setScopeValue] = useState("")
   const [ttl, setTtl] = useState("")
   const [creating, setCreating] = useState(false)
   const [createdKey, setCreatedKey] = useState<{ key_id: number; raw_key: string; token: string } | null>(null)
+
+  const fetchKeys = useCallback(async () => {
+    if (!tenantId) return
+    try {
+      const list = await wsClient.listApiKeys(tenantId)
+      setKeys(list)
+    } catch {
+      // ignore
+    }
+  }, [tenantId])
+
+  useEffect(() => {
+    fetchKeys()
+  }, [fetchKeys])
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -55,10 +88,22 @@ export function ApiKeyListPage() {
       )
       setCreatedKey(result)
       toast.success(`API key #${result.key_id} created`)
+      fetchKeys()
     } catch {
       toast.error("Failed to create API key")
     } finally {
       setCreating(false)
+    }
+  }
+
+  const handleRevoke = async (keyId: number) => {
+    if (!confirm("Revoke this API key? This cannot be undone.")) return
+    try {
+      await wsClient.revokeApiKey(keyId)
+      toast.success("API key revoked")
+      fetchKeys()
+    } catch {
+      toast.error("Failed to revoke API key")
     }
   }
 
@@ -170,19 +215,63 @@ export function ApiKeyListPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>API Key Management</CardTitle>
+          <CardTitle>API Keys ({keys.length})</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="flex items-center gap-4 p-8 text-center justify-center text-muted-foreground">
-            <Key className="h-8 w-8" />
-            <p className="text-sm">
-              Create and manage API keys for your tenant. Use the button above to create a new key.
-              <br />
-              <span className="text-xs">
-                Note: The API key list endpoint is not yet available. Keys can be created and revoked.
-              </span>
+          {keys.length === 0 ? (
+            <p className="text-sm text-muted-foreground text-center py-8">
+              No API keys found. Create one to get started.
             </p>
-          </div>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>ID</TableHead>
+                  <TableHead>Scopes</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Created</TableHead>
+                  <TableHead className="w-[50px]" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {keys.map((k) => (
+                  <TableRow key={k.key_id}>
+                    <TableCell className="font-mono text-sm">{k.key_id}</TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap gap-1">
+                        {k.scopes.map((s, i) => (
+                          <Badge key={i} variant="secondary" className="text-xs">
+                            {formatScope(s)}
+                          </Badge>
+                        ))}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      {k.revoked ? (
+                        <Badge variant="destructive">Revoked</Badge>
+                      ) : (
+                        <Badge className="bg-green-500/15 text-green-600 border-green-500/30">Active</Badge>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {new Date(k.created_at).toLocaleDateString()}
+                    </TableCell>
+                    <TableCell>
+                      {!k.revoked && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => handleRevoke(k.key_id)}
+                        >
+                          <Trash2 className="h-4 w-4 text-destructive" />
+                        </Button>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
         </CardContent>
       </Card>
     </div>

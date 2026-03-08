@@ -443,6 +443,11 @@ impl LanceRaftNode {
         &self.engine
     }
 
+    /// Get a reference to the manifest manager (if configured).
+    pub fn manifest(&self) -> Option<&Arc<LanceManifestManager>> {
+        self.manifest.as_ref()
+    }
+
     /// Shutdown background tasks and the engine.
     pub async fn shutdown(&self) {
         info!(node_id = self.node_id, "Shutting down LanceRaftNode");

@@ -552,6 +552,11 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
             self.snapshot_guards.push(handle);
         }
 
+        let catalog_meta = self
+            .manifest
+            .as_ref()
+            .and_then(|m| m.read_catalog_meta(self.group_id).ok().flatten());
+
         LanceSnapshotBuilder {
             table_entries: self.engine.table_entries(),
             last_applied: self.last_applied.clone(),
@@ -559,6 +564,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
             min_safe_log_index: watermark,
             file_manifest,
             sync_addr: self.sync_addr.clone(),
+            catalog_meta,
         }
     }
 
@@ -702,6 +708,7 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                     .into_iter()
                     .map(|(k, v)| (Arc::<str>::from(k), v))
                     .collect(),
+                catalog_meta: data.catalog_meta,
                 done: None,
             };
             if let Err(e) = manifest.send_update_durable(update).await {
@@ -1027,6 +1034,7 @@ pub struct LanceSnapshotBuilder {
     min_safe_log_index: Option<u64>,
     file_manifest: Vec<crate::types::SnapshotFileEntry>,
     sync_addr: Option<String>,
+    catalog_meta: Option<crate::types::CatalogMeta>,
 }
 
 impl RaftSnapshotBuilder<LanceTypeConfig> for LanceSnapshotBuilder {
@@ -1036,6 +1044,7 @@ impl RaftSnapshotBuilder<LanceTypeConfig> for LanceSnapshotBuilder {
             min_safe_log_index: self.min_safe_log_index,
             file_manifest: self.file_manifest.clone(),
             sync_addr: self.sync_addr.clone(),
+            catalog_meta: self.catalog_meta.clone(),
         };
 
         let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard())

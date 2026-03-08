@@ -60,6 +60,11 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 
+# Arrow / DataFusion (for SQL execution via WS)
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 reqwest = { workspace = true, features = ["json"] }

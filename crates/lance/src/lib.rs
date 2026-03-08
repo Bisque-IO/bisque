@@ -60,10 +60,10 @@ pub use segment_sync::{
 pub use state_machine::LanceStateMachine;
 pub use table_engine::TableEngine;
 pub use types::{
-    CleanupStats, CompactionStats, FlushHandle, FlushState, LanceCommand, LanceResponse,
-    PersistedBatcherConfig, PersistedIndexSpec, PersistedTableConfig, PersistedTableEntry,
-    ProcessorDescriptor, SchemaVersion, SealReason, SegmentCatalog, SegmentId, SnapshotData,
-    SnapshotFileEntry, TableSnapshot, WriteResult,
+    CatalogMeta, CleanupStats, CompactionStats, FlushHandle, FlushState, LanceCommand,
+    LanceResponse, PersistedBatcherConfig, PersistedIndexSpec, PersistedTableConfig,
+    PersistedTableEntry, ProcessorDescriptor, SchemaVersion, SealReason, SegmentCatalog, SegmentId,
+    SnapshotData, SnapshotFileEntry, TableSnapshot, WriteResult,
 };
 pub use version_pins::VersionPinTracker;
 pub use write_batcher::WriteBatcherConfig;

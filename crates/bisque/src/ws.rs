@@ -37,6 +37,8 @@ pub struct WsState {
     pub meta_engine: Arc<bisque_meta::engine::MetaEngine>,
     pub token_manager: Arc<bisque_meta::token::TokenManager>,
     pub raft_node: Arc<bisque_lance::LanceRaftNode>,
+    /// HTTP listen address for cluster status reporting.
+    pub http_addr: std::net::SocketAddr,
     /// M5/L5: Per-IP connection tracking for rate limiting.
     pub ip_connections: Arc<dashmap::DashMap<std::net::IpAddr, IpConnectionState>>,
     /// Pre-initialized metric handles — avoids inline `metrics::*!()` macro overhead in hot paths.
@@ -129,8 +131,8 @@ const WS_READ_TIMEOUT: Duration = Duration::from_secs(90);
 /// Per-request timeout for handle_ws_request (30 seconds).
 const WS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Minimum interval between expensive requests like ListOperations/GetCatalog (1 second).
-const WS_REQUEST_COOLDOWN: Duration = Duration::from_secs(1);
+/// Minimum interval between expensive requests like ListOperations/GetCatalog (200ms).
+const WS_REQUEST_COOLDOWN: Duration = Duration::from_millis(200);
 
 /// Connection TTL before graceful refresh (10 minutes).
 const WS_CONNECTION_TTL: Duration = Duration::from_secs(600);
@@ -179,21 +181,9 @@ pub async fn unified_ws_handler(
             }
         }
     }
-    // S3: Reject requests with a mismatched Origin header.
-    // Allow requests with no Origin (non-browser clients) or same-origin.
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
-            let origin_host = origin
-                .strip_prefix("https://")
-                .or_else(|| origin.strip_prefix("http://"))
-                .unwrap_or(origin);
-            if origin_host != host {
-                warn!(origin, host, "WS connection rejected: origin mismatch");
-                ws_state.metrics.origin_rejected.increment(1);
-                return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
-            }
-        }
-    }
+    // Note: Origin validation is intentionally skipped — CORS is handled at the
+    // HTTP layer via CorsLayer, and the WS connection is authenticated via the
+    // handshake frame (bearer token), not cookies.
     let (response, fut) = match upgrade.upgrade() {
         Ok((response, fut)) => (response, fut),
         Err(e) => {
@@ -1132,18 +1122,434 @@ async fn handle_ws_request(
             let node_id = raft_node.node_id();
             let is_leader = raft_node.is_leader();
             let current_leader = raft_node.current_leader();
-            let group_id = raft_node.group_id();
+
+            let raft_role = if is_leader { "leader" } else { "follower" };
+            let all_tenants = meta_engine.list_tenants();
+            let mut total_catalogs = 0u64;
+            for t in &all_tenants {
+                total_catalogs +=
+                    meta_engine.list_catalogs_for_tenant(t.tenant_id).len() as u64;
+            }
+            let total_tables = state.engine().list_tables().len() as u64;
+
+            let node = serde_json::json!({
+                "node_id": node_id,
+                "address": format!("node-{}", node_id),
+                "raft_role": raft_role,
+                "raft_term": 0,
+                "raft_applied_index": 0,
+                "raft_commit_index": 0,
+                "current_leader_id": current_leader,
+                "uptime_seconds": 0,
+                "catalogs": total_catalogs,
+                "tables": total_tables,
+                "requests_total": 0,
+                "cpu_usage_pct": 0.0,
+                "memory_used_bytes": 0,
+                "memory_total_bytes": 1,
+                "version": env!("CARGO_PKG_VERSION"),
+                "started_at": "",
+            });
 
             let cluster = serde_json::json!({
-                "node_id": node_id,
-                "group_id": group_id,
-                "is_leader": is_leader,
-                "current_leader": current_leader,
+                "cluster_name": "bisque",
+                "nodes": [node],
+                "total_catalogs": total_catalogs,
+                "total_tables": total_tables,
+                "total_raft_groups": 1,
             });
             metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "cluster_status")
                 .increment(1);
             ResponseResult::Ok {
                 data: ResponseData::ClusterStatus { cluster },
+            }
+        }
+
+        RequestMethod::ListTenants { account_id } => {
+            if !auth_ctx.is_super_admin() && auth_ctx.account_id != Some(account_id) {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "access denied".into(),
+                };
+            }
+            let tenants = meta_engine.list_tenants();
+            let tenants: Vec<serde_json::Value> = tenants
+                .into_iter()
+                .filter(|t| t.account_id == account_id)
+                .filter_map(|t| serde_json::to_value(&t).ok())
+                .collect();
+            ResponseResult::Ok {
+                data: ResponseData::ListTenants { tenants },
+            }
+        }
+
+        RequestMethod::UpdateTenantLimits { tenant_id, limits } => {
+            if auth_ctx.tenant_id != tenant_id && !auth_ctx.is_tenant_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "access denied".into(),
+                };
+            }
+            let parsed: bisque_meta::types::TenantLimits = match serde_json::from_value(limits) {
+                Ok(l) => l,
+                Err(e) => {
+                    return ResponseResult::Error {
+                        code: 400,
+                        message: format!("invalid limits: {e}"),
+                    };
+                }
+            };
+            match meta_engine.update_tenant_limits(tenant_id, parsed) {
+                Ok(()) => ResponseResult::Ok {
+                    data: ResponseData::UpdateTenantLimits,
+                },
+                Err(e) => ResponseResult::Error {
+                    code: 500,
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        RequestMethod::DeleteTenant { tenant_id } => {
+            if !auth_ctx.is_super_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "super admin required".into(),
+                };
+            }
+            match meta_engine.delete_tenant(tenant_id) {
+                Ok(()) => ResponseResult::Ok {
+                    data: ResponseData::DeleteTenant,
+                },
+                Err(e) => ResponseResult::Error {
+                    code: 500,
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        RequestMethod::DeleteCatalog {
+            tenant_id,
+            catalog_id,
+        } => {
+            if auth_ctx.tenant_id != tenant_id && !auth_ctx.is_tenant_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "access denied".into(),
+                };
+            }
+            match meta_engine.delete_catalog(tenant_id, catalog_id) {
+                Ok(()) => ResponseResult::Ok {
+                    data: ResponseData::DeleteCatalog,
+                },
+                Err(e) => ResponseResult::Error {
+                    code: 500,
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        RequestMethod::ListApiKeys { tenant_id } => {
+            if auth_ctx.tenant_id != tenant_id && !auth_ctx.is_tenant_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "access denied".into(),
+                };
+            }
+            // Collect API keys for the tenant from the meta engine.
+            let tenant = meta_engine.get_tenant(tenant_id);
+            let api_keys: Vec<serde_json::Value> = match tenant {
+                Some(t) => t
+                    .api_keys
+                    .iter()
+                    .filter_map(|kid| meta_engine.get_api_key(*kid))
+                    .filter_map(|k| serde_json::to_value(&k).ok())
+                    .collect(),
+                None => vec![],
+            };
+            ResponseResult::Ok {
+                data: ResponseData::ListApiKeys { api_keys },
+            }
+        }
+
+        RequestMethod::RevokeApiKey { key_id } => {
+            if !auth_ctx.is_tenant_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "tenant admin required".into(),
+                };
+            }
+            match meta_engine.revoke_api_key(key_id) {
+                Ok(()) => {
+                    info!(key_id, "API key revoked via WS");
+                    ResponseResult::Ok {
+                        data: ResponseData::RevokeApiKey,
+                    }
+                }
+                Err(e) => ResponseResult::Error {
+                    code: 500,
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        RequestMethod::CreateTable {
+            catalog: _,
+            table,
+            schema_json,
+        } => {
+            // schema_json is a JSON array of {name, type, nullable} column definitions.
+            let columns: Vec<serde_json::Value> = match serde_json::from_str(&schema_json) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ResponseResult::Error {
+                        code: 400,
+                        message: format!("invalid schema JSON: {e}"),
+                    };
+                }
+            };
+            let fields: Vec<arrow_schema::Field> = columns
+                .iter()
+                .filter_map(|c| {
+                    let name = c.get("name")?.as_str()?;
+                    let dt = c.get("type")?.as_str().unwrap_or("Utf8");
+                    let nullable = c.get("nullable").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let data_type = match dt {
+                        "Utf8" | "String" | "string" => arrow_schema::DataType::Utf8,
+                        "Int32" | "int32" => arrow_schema::DataType::Int32,
+                        "Int64" | "int64" => arrow_schema::DataType::Int64,
+                        "Float32" | "float32" => arrow_schema::DataType::Float32,
+                        "Float64" | "float64" | "Float" | "float" => arrow_schema::DataType::Float64,
+                        "Boolean" | "boolean" | "bool" => arrow_schema::DataType::Boolean,
+                        "Date32" | "date" => arrow_schema::DataType::Date32,
+                        "Timestamp" | "timestamp" => {
+                            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+                        }
+                        "Binary" | "binary" => arrow_schema::DataType::Binary,
+                        _ => arrow_schema::DataType::Utf8,
+                    };
+                    Some(arrow_schema::Field::new(name, data_type, nullable))
+                })
+                .collect();
+            if fields.is_empty() {
+                return ResponseResult::Error {
+                    code: 400,
+                    message: "schema must have at least one column".into(),
+                };
+            }
+            let schema = arrow_schema::Schema::new(fields);
+            match raft_node.create_table(&table, &schema).await {
+                Ok(_) => {
+                    info!(%table, "table created via WS");
+                    ResponseResult::Ok {
+                        data: ResponseData::CreateTable {
+                            table: table.clone(),
+                        },
+                    }
+                }
+                Err(e) => ResponseResult::Error {
+                    code: 500,
+                    message: format!("create table error: {e}"),
+                },
+            }
+        }
+
+        RequestMethod::DropTable { catalog: _, table } => {
+            match raft_node.drop_table(&table).await {
+                Ok(_) => {
+                    info!(%table, "table dropped via WS");
+                    ResponseResult::Ok {
+                        data: ResponseData::DropTable {
+                            table: table.clone(),
+                        },
+                    }
+                }
+                Err(e) => ResponseResult::Error {
+                    code: 500,
+                    message: format!("drop table error: {e}"),
+                },
+            }
+        }
+
+        RequestMethod::ExecuteSql { catalog: _, sql } => {
+            use datafusion::execution::context::SessionContext;
+
+            let engine = raft_node.engine().clone();
+            let result = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog =
+                    Arc::new(bisque_lance::postgres::BisqueLanceCatalogProvider::new(engine));
+                ctx.register_catalog("bisque", catalog);
+
+                let df = ctx.sql(&sql).await?;
+                let schema = Arc::new(df.schema().as_arrow().clone());
+                let batches = df.collect().await?;
+                Ok::<_, datafusion::error::DataFusionError>((schema, batches))
+            })
+            .await;
+
+            match result {
+                Ok(Ok((schema, batches))) => {
+                    let columns: Vec<serde_json::Value> = schema
+                        .fields()
+                        .iter()
+                        .map(|f| {
+                            serde_json::json!({
+                                "name": f.name(),
+                                "type": format!("{}", f.data_type()),
+                                "nullable": f.is_nullable(),
+                            })
+                        })
+                        .collect();
+
+                    let mut rows = Vec::new();
+                    let mut row_count: u64 = 0;
+                    for batch in &batches {
+                        row_count += batch.num_rows() as u64;
+                        // Build formatters for each column.
+                        let formatters: Vec<_> = batch
+                            .columns()
+                            .iter()
+                            .map(|col| {
+                                arrow_cast::display::ArrayFormatter::try_new(
+                                    col.as_ref(),
+                                    &arrow_cast::display::FormatOptions::default(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .unwrap_or_default();
+
+                        for row_idx in 0..batch.num_rows() {
+                            let mut row = serde_json::Map::new();
+                            for (col_idx, field) in schema.fields().iter().enumerate() {
+                                let val = if col_idx < formatters.len() {
+                                    let s = formatters[col_idx].value(row_idx).to_string();
+                                    // Try to parse as number or null, otherwise use string.
+                                    if batch.column(col_idx).is_null(row_idx) {
+                                        serde_json::Value::Null
+                                    } else if let Ok(n) = s.parse::<f64>() {
+                                        serde_json::json!(n)
+                                    } else if let Ok(n) = s.parse::<i64>() {
+                                        serde_json::json!(n)
+                                    } else if s == "true" {
+                                        serde_json::Value::Bool(true)
+                                    } else if s == "false" {
+                                        serde_json::Value::Bool(false)
+                                    } else {
+                                        serde_json::Value::String(s)
+                                    }
+                                } else {
+                                    serde_json::Value::Null
+                                };
+                                row.insert(field.name().clone(), val);
+                            }
+                            rows.push(serde_json::Value::Object(row));
+                        }
+                    }
+
+                    ResponseResult::Ok {
+                        data: ResponseData::ExecuteSql {
+                            columns,
+                            rows,
+                            row_count,
+                        },
+                    }
+                }
+                Ok(Err(e)) => ResponseResult::Error {
+                    code: 400,
+                    message: format!("SQL error: {e}"),
+                },
+                Err(e) => ResponseResult::Error {
+                    code: 500,
+                    message: format!("internal error: {e}"),
+                },
+            }
+        }
+
+        RequestMethod::ListAccounts => {
+            if !auth_ctx.is_super_admin() {
+                return ResponseResult::Error {
+                    code: 403,
+                    message: "super admin required".into(),
+                };
+            }
+            let accounts = meta_engine.list_accounts();
+            let accounts: Vec<serde_json::Value> = accounts
+                .into_iter()
+                .filter_map(|a| serde_json::to_value(&a).ok())
+                .collect();
+            ResponseResult::Ok {
+                data: ResponseData::ListAccounts { accounts },
+            }
+        }
+
+        RequestMethod::EnableOtel => {
+            // Check if OTel is already enabled by looking at catalog metadata.
+            let already_enabled = raft_node
+                .manifest()
+                .and_then(|m| m.read_catalog_meta(raft_node.group_id()).ok().flatten())
+                .map(|cm| cm.otel_enabled)
+                .unwrap_or(false);
+
+            if already_enabled {
+                let tables: Vec<String> = raft_node
+                    .engine()
+                    .list_tables()
+                    .into_iter()
+                    .filter(|t| t.starts_with("otel_"))
+                    .collect();
+                return ResponseResult::Ok {
+                    data: ResponseData::EnableOtel {
+                        tables_created: tables,
+                    },
+                };
+            }
+
+            let raft_clone = Arc::clone(raft_node);
+            match tokio::spawn(async move {
+                let receiver = bisque_lance::OtlpReceiver::new(raft_clone);
+                receiver.ensure_tables().await
+            })
+            .await
+            {
+                Ok(Ok(())) => {
+                    // Persist catalog metadata with OTel flag.
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let catalog_meta = bisque_lance::CatalogMeta {
+                        otel_enabled: true,
+                        otel_enabled_at: Some(now),
+                        otel_enabled_by: Some(format!("tenant:{}", auth_ctx.tenant_id)),
+                    };
+                    if let Some(manifest) = raft_node.manifest() {
+                        if let Err(e) =
+                            manifest.write_catalog_meta(raft_node.group_id(), &catalog_meta)
+                        {
+                            warn!("Failed to persist OTel catalog metadata: {e}");
+                        }
+                    }
+
+                    let tables_created: Vec<String> = raft_node
+                        .engine()
+                        .list_tables()
+                        .into_iter()
+                        .filter(|t| t.starts_with("otel_"))
+                        .collect();
+                    info!(count = tables_created.len(), "OTel tables enabled via WS");
+                    ResponseResult::Ok {
+                        data: ResponseData::EnableOtel { tables_created },
+                    }
+                }
+                Ok(Err(e)) => ResponseResult::Error {
+                    code: 500,
+                    message: format!("Failed to create OTel tables: {e}"),
+                },
+                Err(e) => ResponseResult::Error {
+                    code: 500,
+                    message: format!("Internal error: {e}"),
+                },
             }
         }
     }

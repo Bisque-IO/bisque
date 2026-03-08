@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react"
-import { MOCK, type OpType, type OpTier, type OpStatus } from "@/lib/api"
+import { isMock, type OpType, type OpTier, type OpStatus } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { useOperationsStore } from "@/stores/operations"
 import { Badge } from "@/components/ui/badge"
@@ -97,7 +97,7 @@ export function OperationsPage() {
   const handleRefresh = useCallback(async () => {
     setRefreshing(true)
     try {
-      if (!MOCK && wsClient.connected) {
+      if (!isMock() && wsClient.connected) {
         const ops = await wsClient.listOperations({
           type: filterType !== "all" ? filterType : undefined,
           tier: filterTier !== "all" ? filterTier : undefined,
@@ -114,7 +114,7 @@ export function OperationsPage() {
 
   const handleCancel = async (opId: string) => {
     try {
-      if (MOCK) {
+      if (isMock()) {
         toast.success("Operation cancelled")
         return
       }

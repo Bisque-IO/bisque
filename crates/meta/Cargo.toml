@@ -29,6 +29,9 @@ base64 = { workspace = true }
 # Password hashing
 argon2 = { workspace = true }
 
+# Storage
+libmdbx = { workspace = true }
+
 # Utilities
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -45,3 +48,4 @@ rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }

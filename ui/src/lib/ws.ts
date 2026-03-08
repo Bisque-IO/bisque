@@ -12,9 +12,10 @@
 import { encode, decode } from "@msgpack/msgpack"
 import { useAuthStore } from "@/stores/auth"
 import { useClusterStore } from "@/stores/cluster"
+import { useConnectionStore } from "@/stores/connection"
 import type { ServerMessage, ClientMessage, CatalogEventKind } from "./ws-protocol"
 import { WS_PROTOCOL_VERSION } from "./ws-protocol"
-import type { Operation, CatalogEntry, ClusterStatus, Tenant } from "./api"
+import type { Operation, ClusterStatus, Tenant, ApiKeyEntry, TenantLimits, Account, SqlResult } from "./api"
 
 // Re-export for backward compat
 export type { ServerMessage, CatalogEventKind as CatalogEvent }
@@ -44,7 +45,6 @@ export class BisqueWsClient {
   private _connected = false
   private _handshakeComplete = false
   private lastSeenSeq = 0 // preserved across reconnects for WAL replay
-  private sessionId = 0
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private heartbeatTimeoutTimer: ReturnType<typeof setTimeout> | null = null
   private handshakeTimeoutTimer: ReturnType<typeof setTimeout> | null = null
@@ -95,6 +95,7 @@ export class BisqueWsClient {
 
     this.intentionalClose = false
     this.authToken = token
+    useConnectionStore.getState().setState("connecting")
     const cluster = useClusterStore.getState().activeCluster
     let url: string
 
@@ -140,9 +141,11 @@ export class BisqueWsClient {
       this.clearHandshakeTimeout()
       this.stopHeartbeat()
       this.stopHeartbeatTimeout()
+      useConnectionStore.getState().setState("disconnected")
       if (!this.intentionalClose) {
         // C6: Only retry pending requests on unintentional close — prevents retry leak.
         this.handlePendingOnDisconnect()
+        useConnectionStore.getState().incrementReconnectAttempts()
         console.warn(`[bisque-ws] Connection closed (code=${event.code}, reason=${event.reason || "none"}). Reconnecting...`)
         this.scheduleReconnect()
       } else {
@@ -263,7 +266,122 @@ export class BisqueWsClient {
       request_id: 0,
       method: "cluster_status",
     })
-    return resp.status as ClusterStatus
+    return resp.cluster as ClusterStatus
+  }
+
+  async listTenants(accountId: number): Promise<Tenant[]> {
+    const resp = await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "list_tenants",
+      account_id: accountId,
+    })
+    return resp.tenants as Tenant[]
+  }
+
+  async updateTenantLimits(tenantId: number, limits: TenantLimits): Promise<void> {
+    await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "update_tenant_limits",
+      tenant_id: tenantId,
+      limits,
+    })
+  }
+
+  async deleteTenant(tenantId: number): Promise<void> {
+    await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "delete_tenant",
+      tenant_id: tenantId,
+    })
+  }
+
+  async deleteCatalog(tenantId: number, catalogId: number): Promise<void> {
+    await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "delete_catalog",
+      tenant_id: tenantId,
+      catalog_id: catalogId,
+    })
+  }
+
+  async listApiKeys(tenantId: number): Promise<ApiKeyEntry[]> {
+    const resp = await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "list_api_keys",
+      tenant_id: tenantId,
+    })
+    return resp.api_keys as ApiKeyEntry[]
+  }
+
+  async revokeApiKey(keyId: number): Promise<void> {
+    await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "revoke_api_key",
+      key_id: keyId,
+    })
+  }
+
+  async createTable(
+    catalog: string,
+    table: string,
+    schemaJson: string,
+  ): Promise<{ table: string }> {
+    const resp = await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "create_table",
+      catalog,
+      table,
+      schema_json: schemaJson,
+    })
+    return resp as unknown as { table: string }
+  }
+
+  async dropTable(catalog: string, table: string): Promise<{ table: string }> {
+    const resp = await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "drop_table",
+      catalog,
+      table,
+    })
+    return resp as unknown as { table: string }
+  }
+
+  async executeSql(catalog: string, sql: string): Promise<SqlResult> {
+    const resp = await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "execute_sql",
+      catalog,
+      sql,
+    })
+    return resp as unknown as SqlResult
+  }
+
+  async enableOtel(catalog: string): Promise<{ tables_created: string[] }> {
+    const resp = await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "enable_otel",
+      catalog,
+    })
+    return resp as unknown as { tables_created: string[] }
+  }
+
+  async listAccounts(): Promise<Account[]> {
+    const resp = await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "list_accounts",
+    })
+    return resp.accounts as Account[]
   }
 
   // ---------------------------------------------------------------------------
@@ -330,7 +448,7 @@ export class BisqueWsClient {
           this.ws?.close()
           return
         }
-        this.sessionId = msg.session_id
+        // session_id preserved for future use (reconnect correlation)
         // M17: Reset backoff on successful handshake, not TCP open.
         this.reconnectDelay = 1000
         // Respond with client handshake — include lastSeenSeq for WAL replay
@@ -345,6 +463,8 @@ export class BisqueWsClient {
         this._handshakeComplete = true
         this.startHeartbeat()
         this.resetHeartbeatTimeout()
+        useConnectionStore.getState().setState("connected")
+        useConnectionStore.getState().resetReconnectAttempts()
         // Dispatch to handlers so they know the connection is ready
         for (const handler of this.handlers) {
           handler(msg)
@@ -360,10 +480,26 @@ export class BisqueWsClient {
           if (msg.status === "ok") {
             pending.resolve(msg as unknown as Record<string, unknown>)
           } else if (msg.status === "error") {
-            pending.reject(new Error(`[${msg.code}] ${msg.message}`))
+            // Auto-retry on 429 rate limit (up to 3 times with backoff)
+            if (msg.code === 429 && pending.retries < 3) {
+              pending.retries++
+              const delay = pending.retries * 250
+              const newId = this.allocRequestId()
+              const newMsg = { ...pending.msg, request_id: newId } as ClientMessage & { request_id: number }
+              const timer = setTimeout(() => {
+                this.pendingRequests.delete(newId)
+                pending.reject(new Error(`[429] Rate limited after ${pending.retries} retries`))
+              }, this.requestTimeoutMs)
+              setTimeout(() => {
+                this.pendingRequests.set(newId, { ...pending, timer, msg: newMsg })
+                this.sendClientMsg(newMsg)
+              }, delay)
+            } else {
+              pending.reject(new Error(`[${msg.code}] ${msg.message}`))
+            }
           } else {
             // C7: Unknown status — reject instead of leaking the promise.
-            pending.reject(new Error(`Unknown response status: ${msg.status}`))
+            pending.reject(new Error(`Unknown response status: ${(msg as Record<string, unknown>).status}`))
           }
         } else {
           console.warn(`[bisque-ws] Received response for unknown request_id=${msg.request_id}`)
@@ -532,9 +668,20 @@ export class BisqueWsClient {
   }
 }
 
-import { MOCK } from "./api"
+import { isMock } from "./api"
 import { mockWsClient } from "./mock-ws"
 
 const realWsClient = new BisqueWsClient()
 
-export const wsClient = MOCK ? mockWsClient : realWsClient
+/** Returns the active WS client (mock or real) based on the active cluster config. */
+export function getWsClient(): BisqueWsClient | typeof mockWsClient {
+  return isMock() ? mockWsClient : realWsClient
+}
+
+/** @deprecated Use getWsClient() for runtime switching. */
+export const wsClient = new Proxy(realWsClient, {
+  get(_target, prop, receiver) {
+    const target = isMock() ? mockWsClient : realWsClient
+    return Reflect.get(target, prop, receiver)
+  },
+}) as BisqueWsClient

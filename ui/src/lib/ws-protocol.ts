@@ -5,7 +5,7 @@
  * All messages are MessagePack-encoded binary frames.
  */
 
-import type { Operation, CatalogEntry, ClusterStatus, Tenant } from "./api"
+import type { Operation } from "./api"
 
 export const WS_PROTOCOL_VERSION = 1
 
