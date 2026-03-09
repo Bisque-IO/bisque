@@ -949,9 +949,7 @@ async fn ws_connect_and_listen(
     let server_handshake: ServerMessage = rmp_serde::from_slice(&frame.payload)?;
     match &server_handshake {
         ServerMessage::Handshake {
-            protocol_version,
-            session_id,
-            ..
+            protocol_version, ..
         } => {
             if *protocol_version != WS_PROTOCOL_VERSION {
                 return Err(format!(
@@ -960,7 +958,7 @@ async fn ws_connect_and_listen(
                 )
                 .into());
             }
-            debug!(session_id, "Received server handshake");
+            debug!("Received server handshake");
         }
         _ => {
             return Err("Expected Handshake message from server".into());
@@ -971,6 +969,8 @@ async fn ws_connect_and_listen(
     let client_handshake = ClientMessage::Handshake {
         protocol_version: WS_PROTOCOL_VERSION,
         token: auth_token.to_string(),
+        username: String::new(),
+        password: String::new(),
         last_seen_seq: since,
         subscribe_catalogs: catalog_names.to_vec(),
     };
@@ -1148,11 +1148,8 @@ async fn handle_ws_message(
     };
 
     match msg {
-        ServerMessage::Handshake { session_id, .. } => {
-            debug!(
-                session_id,
-                "Received server handshake (unexpected in message loop)"
-            );
+        ServerMessage::Handshake { .. } => {
+            debug!("Received server handshake (unexpected in message loop)");
         }
         ServerMessage::CatalogEvent { event, .. } => {
             match serde_json::from_value::<CatalogEvent>(event) {

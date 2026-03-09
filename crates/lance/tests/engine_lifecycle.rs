@@ -116,24 +116,18 @@ async fn test_require_table_returns_err_for_missing() {
 }
 
 #[tokio::test]
-async fn test_create_duplicate_table_fails() {
+async fn test_create_duplicate_table_is_idempotent() {
     let tmp = tempdir().unwrap();
     let engine = new_engine(tmp.path()).await;
 
     let cfg1 = table_config(&engine, "dupes");
-    engine.create_table(cfg1, None).await.unwrap();
+    let t1 = engine.create_table(cfg1, None).await.unwrap();
 
     let cfg2 = table_config(&engine, "dupes");
-    let result = engine.create_table(cfg2, None).await;
-    assert!(result.is_err());
+    let t2 = engine.create_table(cfg2, None).await.unwrap();
 
-    let err = result.err().unwrap();
-    let msg = format!("{}", err);
-    assert!(
-        msg.contains("already exists") || msg.contains("dupes"),
-        "Error should indicate duplicate table, got: {}",
-        msg
-    );
+    // Idempotent: returns the same Arc<TableEngine>.
+    assert!(Arc::ptr_eq(&t1, &t2));
 }
 
 #[tokio::test]
@@ -151,18 +145,14 @@ async fn test_drop_table() {
 }
 
 #[tokio::test]
-async fn test_drop_nonexistent_table_fails() {
+async fn test_drop_nonexistent_table_is_idempotent() {
     let tmp = tempdir().unwrap();
     let engine = new_engine(tmp.path()).await;
 
-    let result = engine.drop_table("phantom").await;
-    assert!(result.is_err());
-    let msg = format!("{}", result.err().unwrap());
-    assert!(
-        msg.contains("not found") || msg.contains("phantom"),
-        "Error should mention the missing table, got: {}",
-        msg
-    );
+    // Idempotent: dropping a non-existent table succeeds.
+    engine.drop_table("phantom").await.unwrap();
+    // Dropping again still succeeds.
+    engine.drop_table("phantom").await.unwrap();
 }
 
 #[tokio::test]

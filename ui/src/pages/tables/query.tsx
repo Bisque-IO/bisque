@@ -3,18 +3,10 @@ import Editor, { type OnMount, type Monaco } from "@monaco-editor/react"
 import type { editor as monacoEditor, IDisposable } from "monaco-editor"
 import { ResizablePanels } from "@/components/resizable-panels"
 import { useAuthStore } from "@/stores/auth"
-import { catalogApi, type CatalogEntry } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { useConnectionStore } from "@/stores/connection"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
 import { ResultsTable } from "@/components/results-table"
 import { Play, Loader2, PanelLeftClose, PanelLeftOpen } from "lucide-react"
 import {
@@ -40,33 +32,38 @@ export function QueryPage() {
   const tenantId = useAuthStore((s) => s.tenantId)
   const connState = useConnectionStore((s) => s.state)
   const [schemaCollapsed, setSchemaCollapsed] = useState(false)
-  const [catalogs, setCatalogs] = useState<CatalogEntry[]>([])
-  const [selectedCatalog, setSelectedCatalog] = useState<string>("")
+  const defaultCatalogRef = useRef<string>("")
 
   // Load catalogs and schema for intellisense
   useEffect(() => {
     if (!tenantId || connState !== "connected") return
 
-    catalogApi
-      .list(tenantId)
-      .then(async (entries: CatalogEntry[]) => {
-        setCatalogs(entries)
-        if (entries.length > 0 && !selectedCatalog) {
-          setSelectedCatalog(entries[0].name)
-        }
+    const load = async () => {
+      try {
+        const entries = await wsClient.listCatalogs(tenantId)
+        const userCatalog = entries.find((e) => e.name !== "sys")
+        defaultCatalogRef.current = userCatalog?.name ?? entries[0]?.name ?? ""
+
         const catalogTables: Record<string, Record<string, MockTableInfo>> = {}
-        for (const entry of entries) {
-          try {
-            const data = await wsClient.getCatalog(entry.name)
-            catalogTables[entry.name] =
-              (data as { tables?: Record<string, MockTableInfo> }).tables ?? {}
-          } catch {
-            catalogTables[entry.name] = {}
-          }
-        }
+        await Promise.all(
+          entries.map(async (entry) => {
+            try {
+              const data = await wsClient.getCatalog(entry.name)
+              catalogTables[entry.name] =
+                (data as { tables?: Record<string, MockTableInfo> }).tables ?? {}
+            } catch {
+              catalogTables[entry.name] = {}
+            }
+          }),
+        )
         setSchema(buildSchemaFromMockData(catalogTables))
-      })
-      .catch((err) => console.error("Failed to load catalogs:", err))
+      } catch (err) {
+        console.error("Failed to load schema:", err)
+        // Set empty schema so the tree shows "No tables" instead of stuck loading
+        setSchema({ catalogs: [] })
+      }
+    }
+    load()
   }, [tenantId, connState])
 
   const runQuery = useCallback(
@@ -78,14 +75,17 @@ export function QueryPage() {
       setColumns([])
 
       try {
-        const catalog = selectedCatalog || catalogs[0]?.name
+        const catalog = defaultCatalogRef.current
         if (!catalog) {
-          setError("No catalog selected. Create a catalog first.")
+          setError("No catalog available. Create a catalog first.")
           return
         }
 
-        const result = await wsClient.executeSql(catalog, query)
-        setColumns(result.columns.map((c) => c.name))
+        const result = await wsClient.executeSql(catalog, query, {
+          onHeader: (cols) => setColumns(cols.map((c) => c.name)),
+          onChunk: (rows) => setResults([...rows]),
+        })
+        setColumns(result.columns.map((c: { name: string }) => c.name))
         setResults(result.rows as Record<string, unknown>[])
       } catch (err) {
         setError(err instanceof Error ? err.message : "Query failed")
@@ -93,7 +93,7 @@ export function QueryPage() {
         setRunning(false)
       }
     },
-    [selectedCatalog, catalogs],
+    [],
   )
 
   // Register (or re-register) the completion provider using the real monaco instance
@@ -184,21 +184,7 @@ export function QueryPage() {
       {/* Editor panel */}
       <div className="h-full flex flex-col">
         <div className="flex items-center justify-between px-3 h-10 border-b shrink-0">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Query</span>
-            {catalogs.length > 0 && (
-              <Select value={selectedCatalog} onValueChange={setSelectedCatalog}>
-                <SelectTrigger className="w-[150px] h-7 text-xs">
-                  <SelectValue placeholder="Catalog" />
-                </SelectTrigger>
-                <SelectContent>
-                  {catalogs.map((c) => (
-                    <SelectItem key={c.catalog_id} value={c.name}>{c.name}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-          </div>
+          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Query</span>
           <Button
             onClick={() => runQuery(editorRef.current?.getValue() ?? sql)}
             disabled={running}

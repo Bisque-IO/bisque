@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use crate::MetaTypeConfig;
 use crate::engine::MetaEngine;
-use crate::types::{EngineType, MetaCommand, MetaResponse, MetaSnapshotData};
+use crate::types::{MetaCommand, MetaResponse, MetaSnapshotData};
 
 /// Raft state machine that drives the MetaEngine control plane.
 pub struct MetaStateMachine {
@@ -125,24 +125,7 @@ impl MetaStateMachine {
                     .engine
                     .create_tenant(account_id, name.clone(), limits.clone())
                 {
-                    Ok(tenant_id) => {
-                        // Auto-create _otel catalog if configured
-                        if self.engine.config().auto_create_otel_catalog {
-                            if let Err(e) = self.engine.create_catalog(
-                                tenant_id,
-                                "_otel".to_string(),
-                                EngineType::Lance,
-                                "{}".into(),
-                            ) {
-                                warn!(
-                                    tenant_id,
-                                    error = %e,
-                                    "failed to auto-create _otel catalog"
-                                );
-                            }
-                        }
-                        MetaResponse::TenantCreated { tenant_id }
-                    }
+                    Ok(tenant_id) => MetaResponse::TenantCreated { tenant_id },
                     Err(e) => MetaResponse::Error(e.to_string()),
                 }
             }
@@ -367,7 +350,7 @@ impl RaftSnapshotBuilder<MetaTypeConfig> for MetaSnapshotBuilder {
 mod tests {
     use super::*;
     use crate::config::MetaConfig;
-    use crate::types::{CatalogStatus, Scope, TenantLimits};
+    use crate::types::{CatalogStatus, EngineType, Scope, TenantLimits};
 
     fn test_engine() -> Arc<MetaEngine> {
         let engine = Arc::new(MetaEngine::new(MetaConfig::new(b"test-secret".to_vec())));
@@ -396,24 +379,6 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_apply_create_tenant_auto_otel() {
-        let engine = test_engine();
-        let sm = MetaStateMachine::new(engine.clone());
-
-        sm.apply_command(MetaCommand::CreateTenant {
-            account_id: TEST_ACCOUNT,
-            name: "acme".into(),
-            limits: TenantLimits::default(),
-        });
-
-        // _otel catalog should be auto-created
-        let catalogs = engine.list_catalogs_for_tenant(1);
-        assert_eq!(catalogs.len(), 1);
-        assert_eq!(catalogs[0].name, "_otel");
-        assert_eq!(catalogs[0].engine, EngineType::Lance);
     }
 
     #[test]
@@ -534,8 +499,8 @@ mod tests {
         engine2.restore_from_snapshot(data);
 
         assert_eq!(engine2.list_tenants().len(), 1);
-        // _otel + analytics = 2 catalogs
-        assert_eq!(engine2.list_catalogs_for_tenant(1).len(), 2);
+        // analytics only (OTel is per-node in sys catalog)
+        assert_eq!(engine2.list_catalogs_for_tenant(1).len(), 1);
     }
 
     // ── Error dispatch tests ─────────────────────────────────────────
@@ -605,7 +570,7 @@ mod tests {
             limits: TenantLimits::default(),
         });
 
-        // Must mark all catalogs as deleted first (_otel was auto-created)
+        // Must mark all catalogs as deleted first
         let catalogs = engine.list_catalogs_for_tenant(1);
         for c in &catalogs {
             sm.apply_command(MetaCommand::UpdateCatalogStatus {
@@ -630,7 +595,15 @@ mod tests {
             limits: TenantLimits::default(),
         });
 
-        // Tenant has auto-created _otel, can't delete
+        // Create a catalog so tenant has active catalogs
+        sm.apply_command(MetaCommand::CreateCatalog {
+            tenant_id: 1,
+            name: "analytics".into(),
+            engine: EngineType::Lance,
+            config: "{}".into(),
+        });
+
+        // Tenant has active catalog, can't delete
         let resp = sm.apply_command(MetaCommand::DeleteTenant { tenant_id: 1 });
         assert!(matches!(resp, MetaResponse::Error(_)));
     }
@@ -876,26 +849,6 @@ mod tests {
         assert!(matches!(resp, MetaResponse::Error(_)));
     }
 
-    // ── Auto _otel disabled ──────────────────────────────────────────
-
-    #[test]
-    fn test_apply_create_tenant_no_auto_otel() {
-        let config = MetaConfig::new(b"test-secret".to_vec()).with_auto_create_otel_catalog(false);
-        let engine = Arc::new(MetaEngine::new(config));
-        engine.create_account("test-org".into()).unwrap();
-        let sm = MetaStateMachine::new(engine.clone());
-
-        sm.apply_command(MetaCommand::CreateTenant {
-            account_id: TEST_ACCOUNT,
-            name: "acme".into(),
-            limits: TenantLimits::default(),
-        });
-
-        // No _otel catalog should exist
-        let catalogs = engine.list_catalogs_for_tenant(1);
-        assert_eq!(catalogs.len(), 0);
-    }
-
     // ── Multi-tenant through state machine ───────────────────────────
 
     #[test]
@@ -1022,9 +975,9 @@ mod tests {
         assert!(engine2.get_tenant(t1).is_some());
         assert!(engine2.get_tenant(t2).is_some());
 
-        // _otel + analytics per tenant
-        assert_eq!(engine2.list_catalogs_for_tenant(t1).len(), 2);
-        assert_eq!(engine2.list_catalogs_for_tenant(t2).len(), 2);
+        // analytics per tenant (OTel is per-node, not per-tenant)
+        assert_eq!(engine2.list_catalogs_for_tenant(t1).len(), 1);
+        assert_eq!(engine2.list_catalogs_for_tenant(t2).len(), 1);
 
         assert!(engine2.get_api_key(k1).is_some());
         assert!(engine2.get_api_key(k2).is_some());

@@ -21,6 +21,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod flight;
+pub mod fts;
 pub mod internal_metrics;
 pub mod ipc;
 pub mod manifest;
@@ -33,6 +34,7 @@ pub mod raft;
 pub mod s3_server;
 pub mod segment_sync;
 pub mod state_machine;
+pub mod sys_catalog;
 pub mod table_engine;
 pub mod types;
 pub mod version_pins;
@@ -58,12 +60,15 @@ pub use segment_sync::{
     SyncResult,
 };
 pub use state_machine::LanceStateMachine;
+pub use sys_catalog::SysSchemaProvider;
+pub use table_engine::DatasetSnapshot;
 pub use table_engine::TableEngine;
 pub use types::{
     CatalogMeta, CleanupStats, CompactionStats, FlushHandle, FlushState, LanceCommand,
-    LanceResponse, PersistedBatcherConfig, PersistedIndexSpec, PersistedTableConfig,
-    PersistedTableEntry, ProcessorDescriptor, SchemaVersion, SealReason, SegmentCatalog, SegmentId,
-    SnapshotData, SnapshotFileEntry, TableSnapshot, WriteResult,
+    LanceResponse, PendingTxn, PendingTxns, PersistedBatcherConfig, PersistedIndexSpec,
+    PersistedTableConfig, PersistedTableEntry, ProcessorDescriptor, SchemaVersion, SealReason,
+    SegmentCatalog, SegmentId, SnapshotData, SnapshotFileEntry, TableSnapshot, TxnConfig, TxnId,
+    TxnOp, WriteResult,
 };
 pub use version_pins::VersionPinTracker;
 pub use write_batcher::WriteBatcherConfig;

@@ -6,10 +6,6 @@ import { useAuthStore } from "@/stores/auth"
 import { useClusterStore } from "@/stores/cluster"
 import type { ServerMessage } from "@/lib/ws-protocol"
 
-// H12: Ref-count the singleton connection so multiple hook consumers
-// don't disconnect each other during cleanup.
-let connectionRefCount = 0
-
 export function useWsConnection() {
   const token = useAuthStore((s) => s.token)
   const activeId = useClusterStore((s) => s.activeId)
@@ -18,10 +14,10 @@ export function useWsConnection() {
     if (!token) return
 
     useCatalogsStore.getState().clearEvents()
-    connectionRefCount++
-    if (connectionRefCount === 1) {
-      wsClient.connect()
-    }
+
+    // Safety net: if not already connected (e.g. page refresh with stored token),
+    // initiate connection. loginAndConnect() handles the initial login flow.
+    wsClient.connect()
 
     // L4: Wrap message handler in try-catch to prevent unhandled exceptions
     // from breaking the WebSocket subscription.
@@ -51,10 +47,6 @@ export function useWsConnection() {
 
     return () => {
       unsub()
-      connectionRefCount--
-      if (connectionRefCount === 0) {
-        wsClient.disconnect()
-      }
     }
   }, [token, activeId])
 }

@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/dialog"
 import { Plus, ToggleLeft, ToggleRight } from "lucide-react"
 import { toast } from "sonner"
+import { wsClient } from "@/lib/ws"
 
 export function LoginPage() {
   const [username, setUsername] = useState("")
@@ -40,7 +41,7 @@ export function LoginPage() {
   const [newName, setNewName] = useState("")
   const [newUrl, setNewUrl] = useState("")
 
-  // Auto-login in mock mode
+  // Auto-login in mock mode (no real server, so use HTTP mock API)
   useEffect(() => {
     if (mock) {
       authApi.login("admin", "admin").then((res) => {
@@ -68,18 +69,18 @@ export function LoginPage() {
         return
       }
 
-      const res = await authApi.login(username.trim(), password.trim())
+      const result = await wsClient.loginAndConnect(username.trim(), password.trim())
       login({
-        token: res.token,
-        userId: res.user_id,
-        username: username.trim(),
-        accounts: res.accounts,
-        tenantId: res.default_tenant_id,
-        tenantName: res.default_tenant_name,
+        token: result.token,
+        userId: result.user_id,
+        username: result.username || username.trim(),
+        accounts: result.accounts,
+        tenantId: result.default_tenant_id,
+        tenantName: result.default_tenant_name,
       })
       navigate("/")
-    } catch {
-      setError("Invalid username or password")
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed")
     } finally {
       setLoading(false)
     }

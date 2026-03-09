@@ -22,7 +22,11 @@ export function buildSchemaFromMockData(
     name: catName,
     tables: Object.entries(tables).map(([tableName, info]) => ({
       name: tableName,
-      columns: info.schema.map((col) => ({ name: col.name, type: col.type })),
+      columns: (info.schema ?? []).map((col) => ({
+        name: col.name,
+        // Server sends `data_type`, mock uses `type`
+        type: col.type ?? (col as Record<string, unknown>).data_type as string ?? "Unknown",
+      })),
     })),
   }))
   return { catalogs }

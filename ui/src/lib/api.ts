@@ -116,6 +116,7 @@ export interface CatalogEntry {
   engine: string
   config: string
   raft_group_id: u64
+  status: string
 }
 
 export interface ApiKeyEntry {

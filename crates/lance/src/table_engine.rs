@@ -104,7 +104,36 @@ pub struct TableEngine {
     m_compact_sealed_latency: metrics::Histogram,
 }
 
+/// Snapshot of all three dataset tier handles for transaction rollback.
+///
+/// Captures cheap `Arc` clones of the `Dataset` handles. Restoring a snapshot
+/// swaps the handles back without touching disk — orphaned fragments from the
+/// failed transaction are cleaned up by `cleanup_old_versions()`.
+pub struct DatasetSnapshot {
+    pub active: Option<Dataset>,
+    pub sealed: Option<Dataset>,
+    pub s3: Option<Dataset>,
+}
+
 impl TableEngine {
+    /// Capture all three tier dataset handles (cheap Arc clones).
+    /// Used by multi-table transaction commit to create rollback points.
+    pub fn dataset_snapshot(&self) -> DatasetSnapshot {
+        DatasetSnapshot {
+            active: self.active_dataset.read().clone(),
+            sealed: self.sealed_dataset.read().clone(),
+            s3: self.s3_dataset.read().clone(),
+        }
+    }
+
+    /// Restore all three tier dataset handles from a previous snapshot.
+    /// Used by multi-table transaction rollback on failure.
+    pub fn restore_datasets(&self, snapshot: DatasetSnapshot) {
+        *self.active_dataset.write() = snapshot.active;
+        *self.sealed_dataset.write() = snapshot.sealed;
+        *self.s3_dataset.write() = snapshot.s3;
+    }
+
     /// Open or create a table engine for a single table.
     ///
     /// Creates the segments directory if needed and opens the active segment dataset.

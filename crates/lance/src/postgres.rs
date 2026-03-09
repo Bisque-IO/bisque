@@ -46,7 +46,7 @@ use crate::raft::LanceRaftNode;
 /// Every call to [`table_names`], [`table_exist`], or [`table`] reads the
 /// current engine state, so newly created or dropped tables are reflected
 /// immediately without any cache refresh.
-pub(crate) struct BisqueLanceSchemaProvider {
+pub struct BisqueLanceSchemaProvider {
     engine: Arc<BisqueLance>,
 }
 
@@ -113,6 +113,17 @@ impl BisqueLanceCatalogProvider {
         Self {
             public: Arc::new(BisqueLanceSchemaProvider::new(engine)),
             extra: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Create a catalog provider that registers the given schema provider under
+    /// both `"public"` and `alias` so that `SELECT * FROM alias.table` works.
+    pub fn new_with_schema(schema: Arc<BisqueLanceSchemaProvider>, alias: &str) -> Self {
+        let mut extra = HashMap::new();
+        extra.insert(alias.to_string(), schema.clone() as Arc<dyn SchemaProvider>);
+        Self {
+            public: schema,
+            extra: RwLock::new(extra),
         }
     }
 }

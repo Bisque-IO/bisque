@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{BisqueLanceConfig, TableOpenConfig};
 use crate::error::{Error, Result};
@@ -272,9 +272,10 @@ impl BisqueLance {
     ) -> Result<Arc<TableEngine>> {
         let name = config.name.clone();
 
-        // Check for existing table
-        if self.tables.contains_key(&name) {
-            return Err(Error::TableAlreadyExists(name));
+        // Idempotent: return existing table if it already exists.
+        if let Some(existing) = self.tables.get(&name) {
+            debug!(table = %name, "create_table: already exists (idempotent)");
+            return Ok(existing.clone());
         }
 
         let engine = Arc::new(
@@ -349,11 +350,21 @@ impl BisqueLance {
     ///
     /// Also deletes the table's local data directory.
     pub async fn drop_table(&self, name: &str) -> Result<()> {
-        let engine = self
-            .tables
-            .remove(name)
-            .map(|(_, v)| v)
-            .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
+        let engine = match self.tables.remove(name) {
+            Some((_, v)) => v,
+            None => {
+                debug!(table = %name, "drop_table: already dropped (idempotent)");
+                // Clean up orphaned data directory if it exists (crash recovery).
+                let table_dir = self.config.table_data_dir(name);
+                if table_dir.exists() {
+                    if !self.snapshot_guard.defer_or_delete(table_dir.clone()) {
+                        tokio::fs::remove_dir_all(&table_dir).await?;
+                        debug!(table = %name, path = %table_dir.display(), "Removed orphaned table data directory");
+                    }
+                }
+                return Ok(());
+            }
+        };
 
         engine.shutdown().await?;
 

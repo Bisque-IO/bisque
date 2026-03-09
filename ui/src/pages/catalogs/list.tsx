@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import { useAuthStore } from "@/stores/auth"
-import { catalogApi, type CatalogEntry } from "@/lib/api"
+import type { CatalogEntry } from "@/lib/api"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -25,10 +25,12 @@ import { toast } from "sonner"
 import { Link } from "react-router"
 import { HeaderActions } from "@/components/layout/header-actions"
 import { wsClient } from "@/lib/ws"
+import { useConnectionStore } from "@/stores/connection"
 
 export function CatalogListPage() {
   const tenantId = useAuthStore((s) => s.tenantId)
   const tenantName = useAuthStore((s) => s.tenantName)
+  const connState = useConnectionStore((s) => s.state)
   const [catalogs, setCatalogs] = useState<CatalogEntry[]>([])
   const [open, setOpen] = useState(false)
   const [name, setName] = useState("")
@@ -36,11 +38,11 @@ export function CatalogListPage() {
   const [creating, setCreating] = useState(false)
 
   const fetchCatalogs = () => {
-    if (!tenantId) return
-    catalogApi.list(tenantId).then(setCatalogs).catch(() => {})
+    if (!tenantId || connState !== "connected") return
+    wsClient.listCatalogs(tenantId).then(setCatalogs).catch(() => {})
   }
 
-  useEffect(fetchCatalogs, [tenantId])
+  useEffect(fetchCatalogs, [tenantId, connState])
 
   const handleDelete = async (catalogId: number) => {
     if (!tenantId) return
@@ -59,7 +61,7 @@ export function CatalogListPage() {
     if (!tenantId || !name.trim()) return
     setCreating(true)
     try {
-      await catalogApi.create(tenantId, name.trim(), engine)
+      await wsClient.createCatalog(tenantId, name.trim(), engine)
       toast.success(`Catalog "${name}" created`)
       setOpen(false)
       setName("")
@@ -124,7 +126,7 @@ export function CatalogListPage() {
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {catalogs.map((c) => (
               <div key={c.catalog_id} className="relative group">
-                <Link to={`/catalogs/${c.name}`}>
+                <Link to={`/catalogs/${c.name}`} state={{ engine: c.engine }}>
                   <Card className="hover:border-primary/50 transition-colors">
                     <CardHeader>
                       <CardTitle className="flex items-center justify-between">

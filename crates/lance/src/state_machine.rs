@@ -22,7 +22,9 @@ use crate::manifest::{
     GroupMeta, LanceManifestManager, ManifestCommand, ManifestUpdate, TableUpdate,
 };
 use crate::segment_sync::SegmentSyncClient;
-use crate::types::{LanceCommand, LanceResponse, PersistedTableEntry, SnapshotData};
+use crate::types::{
+    LanceCommand, LanceResponse, PendingTxns, PersistedTableEntry, SnapshotData, TxnConfig,
+};
 
 /// Raft state machine that drives the BisqueLance multi-table storage engine.
 pub struct LanceStateMachine {
@@ -53,6 +55,12 @@ pub struct LanceStateMachine {
     /// deferred until it is dropped (via timeout or explicit release).
     /// Supports multiple concurrent transfers (e.g., multiple nodes joining).
     snapshot_guards: Vec<SnapshotGuardHandle>,
+    /// Staging area for in-flight multi-table transactions.
+    pending_txns: PendingTxns,
+    /// Configuration for multi-table transaction handling.
+    txn_config: TxnConfig,
+    /// Counter for GC check interval.
+    txn_gc_counter: u64,
 }
 
 impl LanceStateMachine {
@@ -71,6 +79,9 @@ impl LanceStateMachine {
             sync_client: None,
             sync_addr: None,
             snapshot_guards: Vec::new(),
+            pending_txns: PendingTxns::default(),
+            txn_config: TxnConfig::default(),
+            txn_gc_counter: 0,
         }
     }
 
@@ -145,8 +156,17 @@ impl LanceStateMachine {
             sync_client: None,
             sync_addr: None,
             snapshot_guards: Vec::new(),
+            pending_txns: PendingTxns::default(),
+            txn_config: TxnConfig::default(),
+            txn_gc_counter: 0,
         };
         (sm, watermark)
+    }
+
+    /// Set configuration for multi-table transaction handling.
+    pub fn with_txn_config(mut self, config: TxnConfig) -> Self {
+        self.txn_config = config;
+        self
     }
 
     /// Access the underlying engine.
@@ -321,10 +341,10 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                             }
                             let response = self.apply_command(cmd).await;
 
-                            manifest_table_update = Some(TableUpdate::Remove {
-                                table_name: tname.clone(),
-                            });
                             if matches!(response, LanceResponse::Ok) {
+                                manifest_table_update = Some(TableUpdate::Remove {
+                                    table_name: tname.clone(),
+                                });
                                 catalog_event =
                                     Some(CatalogEventKind::TableDropped { table: tname });
                             }
@@ -407,6 +427,39 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                             }
                             response
                         }
+                        LanceCommand::TxnChunk { txn_id, seq, ops } => {
+                            match self.pending_txns.insert_chunk(
+                                txn_id,
+                                seq,
+                                ops,
+                                entry.log_id.index,
+                                &self.txn_config,
+                            ) {
+                                Ok(()) => LanceResponse::Ok,
+                                Err(msg) => {
+                                    warn!(txn = %txn_id, seq, "TxnChunk rejected: {}", msg);
+                                    LanceResponse::Error(msg)
+                                }
+                            }
+                        }
+
+                        LanceCommand::TxnCommit {
+                            txn_id,
+                            total_chunks,
+                        } => {
+                            // Txn commit handles its own manifest persistence (ApplyBatch).
+                            self.apply_txn_commit(txn_id, total_chunks).await
+                        }
+
+                        LanceCommand::TxnAbort { txn_id } => {
+                            if self.pending_txns.remove(&txn_id).is_some() {
+                                debug!(txn = %txn_id, "Transaction aborted");
+                            } else {
+                                debug!(txn = %txn_id, "TxnAbort for unknown transaction (already committed or GC'd)");
+                            }
+                            LanceResponse::Ok
+                        }
+
                         other => {
                             // Extract table_name + schema_ipc before moving the command.
                             let (tname, schema_ipc) = match &other {
@@ -450,6 +503,18 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
                     LanceResponse::Ok
                 }
             };
+
+            // Periodic GC of abandoned transactions.
+            self.txn_gc_counter += 1;
+            if self.txn_gc_counter >= self.txn_config.gc_check_interval {
+                self.txn_gc_counter = 0;
+                let evicted = self
+                    .pending_txns
+                    .gc(entry.log_id.index, self.txn_config.gc_log_index_timeout);
+                if evicted > 0 {
+                    info!(evicted, "GC'd abandoned transactions");
+                }
+            }
 
             // Emit catalog event + persist to WAL.
             if let Some(event_kind) = catalog_event {
@@ -695,6 +760,9 @@ impl RaftStateMachine<LanceTypeConfig> for LanceStateMachine {
         self.last_applied = meta.last_log_id.clone();
         self.last_membership = meta.last_membership.clone();
 
+        // Clear pending transactions — in-flight txns are lost on snapshot install.
+        self.pending_txns.clear();
+
         // Restore normal purge floor computation now that sync is complete.
         self.update_purge_floor();
 
@@ -786,6 +854,296 @@ impl LanceStateMachine {
             floor.store(value, Ordering::Release);
             if value > 0 {
                 info!(min_safe_log_index = value, "Updated purge floor");
+            }
+        }
+    }
+}
+
+/// Lightweight tag tracking what kind of TxnOp was applied, used for catalog event emission.
+enum AppliedTxnOpKind {
+    Append,
+    Delete,
+    Update,
+    CreateTable { schema_ipc: bytes::Bytes },
+    DropTable,
+}
+
+impl From<&crate::types::TxnOp> for AppliedTxnOpKind {
+    fn from(op: &crate::types::TxnOp) -> Self {
+        match op {
+            crate::types::TxnOp::Append { .. } => Self::Append,
+            crate::types::TxnOp::Delete { .. } => Self::Delete,
+            crate::types::TxnOp::Update { .. } => Self::Update,
+            crate::types::TxnOp::CreateTable { schema_ipc, .. } => Self::CreateTable {
+                schema_ipc: schema_ipc.clone(),
+            },
+            crate::types::TxnOp::DropTable { .. } => Self::DropTable,
+        }
+    }
+}
+
+impl LanceStateMachine {
+    /// Apply a committed multi-table transaction.
+    ///
+    /// Reassembles chunks, groups ops by table, applies per-table sequentially,
+    /// and rolls back all tables on failure.
+    async fn apply_txn_commit(
+        &mut self,
+        txn_id: crate::types::TxnId,
+        total_chunks: u32,
+    ) -> LanceResponse {
+        use std::collections::HashMap;
+
+        // 1. Remove pending txn from staging area.
+        let pending = match self.pending_txns.remove(&txn_id) {
+            Some(p) => p,
+            None => {
+                error!(txn = %txn_id, "TxnCommit for unknown transaction");
+                return LanceResponse::Error(format!(
+                    "transaction {} not found (expired, aborted, or never started)",
+                    txn_id
+                ));
+            }
+        };
+
+        // 2. Validate all chunks present.
+        for seq in 0..total_chunks {
+            if !pending.chunks.contains_key(&seq) {
+                error!(txn = %txn_id, missing_seq = seq, "Missing chunk in transaction");
+                return LanceResponse::Error(format!(
+                    "transaction {}: missing chunk seq {}",
+                    txn_id, seq
+                ));
+            }
+        }
+
+        // 3. Flatten all ops in sequence order.
+        let all_ops: Vec<crate::types::TxnOp> = pending
+            .chunks
+            .into_values()
+            .flat_map(|ops| ops.into_iter())
+            .collect();
+
+        if all_ops.is_empty() {
+            return LanceResponse::Ok;
+        }
+
+        // 4. Collect affected table names.
+        let mut affected_tables: Vec<Arc<str>> = Vec::new();
+        for op in &all_ops {
+            let name: Arc<str> = Arc::from(op.table_name());
+            if !affected_tables.iter().any(|t| **t == *name) {
+                affected_tables.push(name);
+            }
+        }
+
+        // 5. Drain async apply buffers for all affected tables.
+        if let Some(buf) = &self.async_buffer {
+            for tname in &affected_tables {
+                buf.drain_table(tname).await;
+            }
+        }
+
+        // 6. Snapshot dataset handles for all existing tables.
+        let mut snapshots: HashMap<Arc<str>, crate::table_engine::DatasetSnapshot> = HashMap::new();
+        for tname in &affected_tables {
+            if let Ok(table) = self.engine.require_table(tname) {
+                snapshots.insert(tname.clone(), table.dataset_snapshot());
+            }
+        }
+
+        // 7. Split ops: apply non-destructive ops first, defer DropTable until after.
+        let mut non_drop_ops: Vec<crate::types::TxnOp> = Vec::new();
+        let mut drop_ops: Vec<crate::types::TxnOp> = Vec::new();
+        for op in all_ops {
+            if matches!(op, crate::types::TxnOp::DropTable { .. }) {
+                drop_ops.push(op);
+            } else {
+                non_drop_ops.push(op);
+            }
+        }
+
+        // 7a. Apply non-destructive ops, tracking event kinds and created tables.
+        let mut applied_ops: Vec<(Arc<str>, AppliedTxnOpKind)> = Vec::new();
+        let mut tables_created: Vec<Arc<str>> = Vec::new();
+        for op in non_drop_ops {
+            let table_name: Arc<str> = Arc::from(op.table_name());
+            let op_kind = AppliedTxnOpKind::from(&op);
+            let is_create = matches!(op, crate::types::TxnOp::CreateTable { .. });
+            let result = self.apply_txn_op(op).await;
+            if let LanceResponse::Error(ref msg) = result {
+                // Rollback: restore existing table snapshots + drop newly created tables.
+                warn!(txn = %txn_id, error = %msg, "Transaction failed, rolling back");
+                for (tname, snapshot) in snapshots {
+                    if let Ok(table) = self.engine.require_table(&tname) {
+                        table.restore_datasets(snapshot);
+                    }
+                }
+                for tname in &tables_created {
+                    if let Err(e) = self.engine.drop_table(tname).await {
+                        warn!(table = %tname, "Failed to rollback created table: {}", e);
+                    }
+                }
+                return result;
+            }
+            if is_create {
+                tables_created.push(table_name.clone());
+            }
+            applied_ops.push((table_name, op_kind));
+        }
+
+        // 7b. Apply DropTable ops last (destructive, cannot be rolled back).
+        // All non-drop ops have already succeeded, so the only remaining failure
+        // mode is the drop itself (e.g., table was already dropped by another op).
+        for op in drop_ops {
+            let table_name: Arc<str> = Arc::from(op.table_name());
+            let op_kind = AppliedTxnOpKind::from(&op);
+            let result = self.apply_txn_op(op).await;
+            if let LanceResponse::Error(ref msg) = result {
+                // DropTable failed after non-destructive ops already committed.
+                // We cannot roll back the prior ops cleanly, so log and return error.
+                // In practice this should be rare (table not found).
+                warn!(txn = %txn_id, error = %msg, "DropTable failed in transaction (prior ops committed)");
+                // Still restore snapshots for tables that were modified (not dropped).
+                for (tname, snapshot) in snapshots {
+                    if let Ok(table) = self.engine.require_table(&tname) {
+                        table.restore_datasets(snapshot);
+                    }
+                }
+                for tname in &tables_created {
+                    if let Err(e) = self.engine.drop_table(tname).await {
+                        warn!(table = %tname, "Failed to rollback created table: {}", e);
+                    }
+                }
+                return result;
+            }
+            applied_ops.push((table_name, op_kind));
+        }
+
+        // 8. Build table updates + catalog events, then persist atomically.
+        let dropped_tables: std::collections::HashSet<&str> = applied_ops
+            .iter()
+            .filter_map(|(name, kind)| {
+                if matches!(kind, AppliedTxnOpKind::DropTable) {
+                    Some(name.as_ref())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut table_updates: Vec<TableUpdate> = Vec::new();
+        for tname in &affected_tables {
+            let update = if dropped_tables.contains(tname.as_ref()) {
+                TableUpdate::Remove {
+                    table_name: tname.clone(),
+                }
+            } else if let Ok(table) = self.engine.require_table(tname) {
+                TableUpdate::Set {
+                    table_name: tname.clone(),
+                    entry: LanceManifestManager::build_table_entry(&table),
+                }
+            } else {
+                continue;
+            };
+            table_updates.push(update);
+        }
+
+        // 9. Emit catalog events for each applied op.
+        let mut wal_events = Vec::new();
+        if let Some(bus) = &self.catalog_events {
+            for (table_name, op_kind) in applied_ops {
+                let event_kind = match op_kind {
+                    AppliedTxnOpKind::Append
+                    | AppliedTxnOpKind::Delete
+                    | AppliedTxnOpKind::Update => {
+                        if let Ok(table) = self.engine.require_table(&table_name) {
+                            let (av, sv, s3v) = table.tier_versions();
+                            Some(CatalogEventKind::DataMutated {
+                                table: table_name,
+                                active_version: av,
+                                sealed_version: sv,
+                                s3_version: s3v,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    AppliedTxnOpKind::CreateTable { schema_ipc } => {
+                        Some(CatalogEventKind::TableCreated {
+                            table: table_name,
+                            schema_ipc,
+                        })
+                    }
+                    AppliedTxnOpKind::DropTable => {
+                        Some(CatalogEventKind::TableDropped { table: table_name })
+                    }
+                };
+                if let Some(kind) = event_kind {
+                    let event = bus.publish(self.catalog_name.clone(), kind);
+                    wal_events.push(event);
+                }
+            }
+        }
+
+        // 10. Persist all table updates + WAL events in a single durable MDBX write.
+        if let Some(manifest) = &self.manifest {
+            let cmd = LanceManifestManager::build_apply_batch(
+                self.group_id,
+                &self.last_applied,
+                &self.last_membership,
+                table_updates,
+                wal_events,
+            );
+            if let Err(e) = manifest.send_update_durable(cmd).await {
+                error!(txn = %txn_id, "Failed to durably persist txn manifest: {}", e);
+            }
+        }
+
+        info!(txn = %txn_id, tables = affected_tables.len(), "Transaction committed");
+        LanceResponse::Ok
+    }
+
+    /// Apply a single TxnOp using the existing apply_command dispatch.
+    async fn apply_txn_op(&self, op: crate::types::TxnOp) -> LanceResponse {
+        use crate::types::TxnOp;
+        match op {
+            TxnOp::Append { table, data } => {
+                self.apply_command(LanceCommand::AppendRecords {
+                    table_name: table,
+                    data,
+                })
+                .await
+            }
+            TxnOp::Delete { table, filter } => {
+                self.apply_command(LanceCommand::DeleteRecords {
+                    table_name: table,
+                    filter,
+                })
+                .await
+            }
+            TxnOp::Update {
+                table,
+                filter,
+                data,
+            } => {
+                self.apply_command(LanceCommand::UpdateRecords {
+                    table_name: table,
+                    filter,
+                    data,
+                })
+                .await
+            }
+            TxnOp::CreateTable { table, schema_ipc } => {
+                self.apply_command(LanceCommand::CreateTable {
+                    table_name: table,
+                    schema_ipc,
+                })
+                .await
+            }
+            TxnOp::DropTable { table } => {
+                self.apply_command(LanceCommand::DropTable { table_name: table })
+                    .await
             }
         }
     }
@@ -1021,6 +1379,16 @@ impl LanceStateMachine {
                         LanceResponse::Error(e.to_string())
                     }
                 }
+            }
+
+            // Transaction commands are handled directly in apply(), not here.
+            LanceCommand::TxnChunk { .. }
+            | LanceCommand::TxnCommit { .. }
+            | LanceCommand::TxnAbort { .. } => {
+                error!("Transaction commands must not be routed through apply_command()");
+                LanceResponse::Error(
+                    "internal error: transaction command routed to apply_command".to_string(),
+                )
             }
         }
     }

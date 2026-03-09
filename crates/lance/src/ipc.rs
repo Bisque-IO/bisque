@@ -37,6 +37,33 @@ pub fn encode_record_batches(batches: &[RecordBatch]) -> Result<Bytes> {
     Ok(Bytes::from(buf))
 }
 
+/// Encode RecordBatches into a WebSocket binary frame with a header prefix.
+///
+/// Frame format: `[header bytes] ++ [Arrow IPC stream bytes]`
+/// Single allocation — the header is written first, then IPC data is appended
+/// directly into the same buffer. Returns `Vec<u8>` to avoid a copy when the
+/// caller needs an owned `Vec` (e.g. for `fastwebsockets::Payload::Owned`).
+pub fn encode_record_batches_framed(header: &[u8], batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    if batches.is_empty() {
+        return Ok(header.to_vec());
+    }
+
+    let schema = batches[0].schema();
+    let size_hint: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    let mut buf = Vec::with_capacity(header.len() + size_hint);
+    buf.extend_from_slice(header);
+
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema)?;
+        for batch in batches {
+            writer.write(batch)?;
+        }
+        writer.finish()?;
+    }
+
+    Ok(buf)
+}
+
 /// Decode Arrow IPC streaming format bytes into RecordBatches.
 pub fn decode_record_batches(data: &[u8]) -> Result<Vec<RecordBatch>> {
     if data.is_empty() {
@@ -142,6 +169,72 @@ mod tests {
         assert!(encoded.is_empty());
         let decoded = decode_record_batches(&encoded).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn ws_binary_frame_roundtrip() {
+        // Simulates the WebSocket binary frame protocol:
+        // [4-byte request_id (big-endian)] ++ [Arrow IPC stream bytes]
+        let batch = make_test_batch(5);
+        let request_id: u32 = 42;
+
+        // Encode (server-side)
+        let ipc_bytes = encode_record_batches(&[batch.clone()]).unwrap();
+        let mut frame = Vec::with_capacity(4 + ipc_bytes.len());
+        frame.extend_from_slice(&request_id.to_be_bytes());
+        frame.extend_from_slice(&ipc_bytes);
+
+        // Decode (client-side)
+        assert!(frame.len() > 4);
+        let decoded_request_id = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+        assert_eq!(decoded_request_id, request_id);
+
+        let ipc_payload = &frame[4..];
+        let decoded = decode_record_batches(ipc_payload).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0], batch);
+    }
+
+    #[test]
+    fn encode_framed_empty_batches() {
+        let header = 42u32.to_be_bytes();
+        let result = encode_record_batches_framed(&header, &[]).unwrap();
+        assert_eq!(result, header);
+    }
+
+    #[test]
+    fn encode_framed_roundtrip() {
+        let header = 0xCAFEu32.to_be_bytes();
+        let batch = make_test_batch(5);
+        let frame = encode_record_batches_framed(&header, &[batch.clone()]).unwrap();
+
+        // Header preserved
+        assert_eq!(&frame[..4], &header);
+        // IPC payload decodes correctly
+        let decoded = decode_record_batches(&frame[4..]).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0], batch);
+    }
+
+    #[test]
+    fn ws_binary_frame_multiple_batches() {
+        // Multiple batches in a single IPC stream frame
+        let batch1 = make_test_batch(3);
+        let batch2 = make_test_batch(7);
+        let request_id: u32 = 0xDEAD_BEEF;
+
+        let ipc_bytes = encode_record_batches(&[batch1.clone(), batch2.clone()]).unwrap();
+        let mut frame = Vec::with_capacity(4 + ipc_bytes.len());
+        frame.extend_from_slice(&request_id.to_be_bytes());
+        frame.extend_from_slice(&ipc_bytes);
+
+        let decoded_request_id = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+        assert_eq!(decoded_request_id, 0xDEAD_BEEF);
+
+        let decoded = decode_record_batches(&frame[4..]).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0], batch1);
+        assert_eq!(decoded[1], batch2);
     }
 
     #[test]

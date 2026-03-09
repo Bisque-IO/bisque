@@ -1,5 +1,6 @@
 //! Server configuration for the bisque unified server.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -24,6 +25,12 @@ pub struct BisqueConfig {
     pub postgres_addr: Option<SocketAddr>,
     /// Optional directory containing built UI static files (e.g. `ui/dist`).
     pub ui_dir: Option<PathBuf>,
+    /// Optional S3 URI for per-node OTel deep storage (e.g. `s3://bucket/otel/node-1/`).
+    pub otel_s3_uri: Option<String>,
+    /// S3 credentials/options for OTel deep storage.
+    pub otel_s3_storage_options: HashMap<String, String>,
+    /// Peer nodes for federated sys catalog queries: `(node_id, http_addr)`.
+    pub peers: Vec<(u64, SocketAddr)>,
 }
 
 impl BisqueConfig {
@@ -38,6 +45,9 @@ impl BisqueConfig {
             node_id: 1,
             postgres_addr: None,
             ui_dir: None,
+            otel_s3_uri: None,
+            otel_s3_storage_options: HashMap::new(),
+            peers: Vec::new(),
         }
     }
 
@@ -73,6 +83,21 @@ impl BisqueConfig {
 
     pub fn with_ui_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.ui_dir = dir;
+        self
+    }
+
+    pub fn with_otel_s3_uri(mut self, uri: Option<String>) -> Self {
+        self.otel_s3_uri = uri;
+        self
+    }
+
+    pub fn with_otel_s3_storage_options(mut self, opts: HashMap<String, String>) -> Self {
+        self.otel_s3_storage_options = opts;
+        self
+    }
+
+    pub fn with_peers(mut self, peers: Vec<(u64, SocketAddr)>) -> Self {
+        self.peers = peers;
         self
     }
 }

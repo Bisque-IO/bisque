@@ -41,14 +41,11 @@ fn test_full_tenant_lifecycle() {
         panic!("expected TenantCreated");
     };
 
-    // 2. Verify auto-created _otel catalog
+    // 2. No auto-created catalogs (OTel is per-node, not per-tenant)
     let catalogs = engine.list_catalogs_for_tenant(tenant_id);
-    assert_eq!(catalogs.len(), 1);
-    assert_eq!(catalogs[0].name, "_otel");
-    assert_eq!(catalogs[0].engine, EngineType::Lance);
-    assert_eq!(catalogs[0].status, CatalogStatus::Creating);
+    assert_eq!(catalogs.len(), 0);
 
-    // 3. Create additional catalogs
+    // 3. Create catalogs
     let MetaResponse::CatalogCreated {
         catalog_id: analytics_id,
         raft_group_id: analytics_group,
@@ -88,8 +85,8 @@ fn test_full_tenant_lifecycle() {
         panic!("expected CatalogCreated");
     };
 
-    // _otel + 3 user catalogs
-    assert_eq!(engine.list_catalogs_for_tenant(tenant_id).len(), 4);
+    // 3 user catalogs
+    assert_eq!(engine.list_catalogs_for_tenant(tenant_id).len(), 3);
 
     // 4. Activate catalogs
     for cid in [analytics_id, events_id, app_db_id] {
@@ -162,21 +159,12 @@ fn test_full_tenant_lifecycle() {
         });
     }
 
-    // Mark _otel and user catalogs as Deleted
+    // Mark remaining catalogs as Deleted
     let all_catalogs = engine.list_catalogs_for_tenant(tenant_id);
     // list_catalogs_for_tenant excludes Deleted but includes Deleting
     for c in &all_catalogs {
         sm.apply_command(MetaCommand::UpdateCatalogStatus {
             catalog_id: c.catalog_id,
-            status: CatalogStatus::Deleted,
-        });
-    }
-
-    // Mark _otel too
-    let otel = engine.find_catalog_by_name(tenant_id, "_otel");
-    if let Some(otel_cat) = otel {
-        sm.apply_command(MetaCommand::UpdateCatalogStatus {
-            catalog_id: otel_cat.catalog_id,
             status: CatalogStatus::Deleted,
         });
     }
@@ -229,10 +217,10 @@ fn test_multi_tenant_isolation() {
     let unique: std::collections::HashSet<u64> = catalog_ids.iter().copied().collect();
     assert_eq!(unique.len(), 3);
 
-    // Each tenant sees only their own catalogs (_otel + logs = 2)
+    // Each tenant sees only their own catalog (logs)
     for &tid in &tenant_ids {
         let cats = engine.list_catalogs_for_tenant(tid);
-        assert_eq!(cats.len(), 2);
+        assert_eq!(cats.len(), 1);
     }
 
     // Usage is isolated
@@ -421,17 +409,16 @@ fn test_catalog_limit_enforcement_through_state_machine() {
     let sm = new_sm(&engine);
 
     // Create tenant with very low catalog limit
-    // Note: auto_create_otel_catalog is true, so _otel takes 1 slot
     sm.apply_command(MetaCommand::CreateTenant {
         account_id: TEST_ACCOUNT,
         name: "limited".into(),
         limits: TenantLimits {
-            max_catalogs: 2, // _otel + 1 more
+            max_catalogs: 1,
             ..TenantLimits::default()
         },
     });
 
-    // First user catalog should succeed
+    // First catalog should succeed
     let resp = sm.apply_command(MetaCommand::CreateCatalog {
         tenant_id: 1,
         name: "first".into(),
@@ -440,7 +427,7 @@ fn test_catalog_limit_enforcement_through_state_machine() {
     });
     assert!(matches!(resp, MetaResponse::CatalogCreated { .. }));
 
-    // Second should fail (limit is 2: _otel + first = 2)
+    // Second should fail (limit is 1: first = 1)
     let resp = sm.apply_command(MetaCommand::CreateCatalog {
         tenant_id: 1,
         name: "second".into(),
@@ -480,15 +467,15 @@ fn test_routing_table_across_tenants() {
     });
 
     // Routing table should have entries for all catalogs:
-    // t1: _otel + a = 2
-    // t2: _otel + b = 2
-    // Total: 4 routing entries
+    // t1: a = 1
+    // t2: b = 1
+    // Total: 2 routing entries
     let table = engine.get_routing_table();
-    assert_eq!(table.len(), 4);
+    assert_eq!(table.len(), 2);
 
     // Each routing entry should have a unique raft_group_id
     let group_ids: std::collections::HashSet<u64> = table.iter().map(|r| r.raft_group_id).collect();
-    assert_eq!(group_ids.len(), 4);
+    assert_eq!(group_ids.len(), 2);
 }
 
 // ── Deterministic replay ─────────────────────────────────────────────
@@ -510,7 +497,7 @@ fn test_deterministic_replay() {
             config: "{}".into(),
         },
         MetaCommand::UpdateCatalogStatus {
-            catalog_id: 2, // analytics (1 is _otel)
+            catalog_id: 1, // analytics
             status: CatalogStatus::Active,
         },
         MetaCommand::CreateApiKey {
@@ -518,7 +505,7 @@ fn test_deterministic_replay() {
             scopes: vec![Scope::TenantAdmin],
         },
         MetaCommand::ReportUsage {
-            catalog_id: 2,
+            catalog_id: 1,
             disk_bytes: 1234,
             deep_storage_bytes: 5678,
         },

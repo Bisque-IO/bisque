@@ -1062,6 +1062,7 @@ dependencies = [
  "dashmap",
  "datafusion",
  "fastwebsockets",
+ "futures",
  "http-body-util",
  "hyper",
  "hyper-util",

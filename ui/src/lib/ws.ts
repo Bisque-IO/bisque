@@ -10,12 +10,13 @@
  */
 
 import { encode, decode } from "@msgpack/msgpack"
+import { tableFromIPC } from "apache-arrow"
 import { useAuthStore } from "@/stores/auth"
 import { useClusterStore } from "@/stores/cluster"
 import { useConnectionStore } from "@/stores/connection"
 import type { ServerMessage, ClientMessage, CatalogEventKind } from "./ws-protocol"
 import { WS_PROTOCOL_VERSION } from "./ws-protocol"
-import type { Operation, ClusterStatus, Tenant, ApiKeyEntry, TenantLimits, Account, SqlResult } from "./api"
+import type { Operation, ClusterStatus, Tenant, ApiKeyEntry, TenantLimits, Account, SqlResult, CatalogEntry } from "./api"
 
 // Re-export for backward compat
 export type { ServerMessage, CatalogEventKind as CatalogEvent }
@@ -31,6 +32,22 @@ interface PendingRequest {
   retries: number
 }
 
+interface PendingSqlStream {
+  resolve: (result: SqlResult) => void
+  reject: (err: Error) => void
+  timer: ReturnType<typeof setTimeout>
+  columns: { name: string; type: string }[]
+  rows: Record<string, unknown>[]
+  headerReceived: boolean
+  onHeader?: (columns: { name: string; type: string }[]) => void
+  onChunk?: (rows: Record<string, unknown>[], rowsSoFar: number) => void
+}
+
+export interface SqlStreamOptions {
+  onHeader?: (columns: { name: string; type: string }[]) => void
+  onChunk?: (rows: Record<string, unknown>[], rowsSoFar: number) => void
+}
+
 // Request ID wraps at 2^31 to stay safely within JS integer precision
 const MAX_REQUEST_ID = 0x7fffffff
 
@@ -38,6 +55,7 @@ export class BisqueWsClient {
   private ws: WebSocket | null = null
   private handlers: Set<PushHandler> = new Set()
   private pendingRequests: Map<number, PendingRequest> = new Map()
+  private pendingSqlStreams: Map<number, PendingSqlStream> = new Map()
   private nextRequestId = 1
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectDelay = 1000
@@ -59,6 +77,10 @@ export class BisqueWsClient {
   private intentionalClose = false
   // R3: Track retry handler subscriptions so they can be cleaned up on disconnect.
   private retryUnsubs: Array<() => void> = []
+  // Pending credentials for login-via-WS flow (cleared after use).
+  private pendingCredentials: { username: string; password: string } | null = null
+  // Close reason from server Close message (captured for login error reporting).
+  private serverCloseReason = ""
 
   get connected(): boolean {
     return this._connected && this._handshakeComplete
@@ -81,8 +103,11 @@ export class BisqueWsClient {
   }
 
   connect(): void {
+    if (this.connected) return // already handshaked, skip
+
+    // For reconnects, require a stored token. For login flow, pendingCredentials is set.
     const token = useAuthStore.getState().token
-    if (!token) return
+    if (!token && !this.pendingCredentials) return
 
     // C5: Guard against re-entry — close any existing socket before connecting.
     if (this.ws) {
@@ -94,7 +119,7 @@ export class BisqueWsClient {
     }
 
     this.intentionalClose = false
-    this.authToken = token
+    this.authToken = token || ""
     useConnectionStore.getState().setState("connecting")
     const cluster = useClusterStore.getState().activeCluster
     let url: string
@@ -123,12 +148,43 @@ export class BisqueWsClient {
     this.ws.onmessage = (event) => {
 
       try {
-        // L1: Only accept MessagePack binary frames — no JSON fallback.
+        // L1: Only accept binary frames — no JSON fallback.
         if (!(event.data instanceof ArrayBuffer)) {
-          console.warn("[bisque-ws] Ignoring non-binary message (expected MessagePack)")
+          console.warn("[bisque-ws] Ignoring non-binary message (expected binary)")
           return
         }
-        const msg = decode(new Uint8Array(event.data)) as ServerMessage
+        const bytes = new Uint8Array(event.data)
+
+        // Check for Arrow IPC binary frame: [4-byte request_id BE] ++ [Arrow IPC bytes]
+        // If the first 4 bytes match a pending SQL stream that has received its header,
+        // treat as Arrow IPC data frame.
+        if (bytes.byteLength > 4) {
+          const view = new DataView(event.data)
+          const possibleReqId = view.getUint32(0, false) // big-endian
+          const stream = this.pendingSqlStreams.get(possibleReqId)
+          if (stream && stream.headerReceived) {
+            // Arrow IPC binary frame — decode and convert to rows
+            const ipcBytes = bytes.subarray(4) // zero-copy view, not a copy
+            try {
+              const table = tableFromIPC(ipcBytes)
+              const rows = arrowTableToRows(table)
+              stream.rows.push(...rows)
+              stream.onChunk?.(stream.rows, stream.rows.length)
+              // Reset timeout
+              clearTimeout(stream.timer)
+              stream.timer = setTimeout(() => {
+                this.pendingSqlStreams.delete(possibleReqId)
+                stream.reject(new Error("SQL stream timed out"))
+              }, this.requestTimeoutMs)
+            } catch (ipcErr) {
+              console.error("[bisque-ws] Failed to decode Arrow IPC:", ipcErr)
+            }
+            return
+          }
+        }
+
+        // MessagePack control frame
+        const msg = decode(bytes) as ServerMessage
         this.handleMessage(msg)
       } catch (err) {
         console.error("[bisque-ws] Failed to decode message:", err)
@@ -158,6 +214,37 @@ export class BisqueWsClient {
       // L12: Don't call ws.close() — browser fires onclose automatically after onerror.
       console.error("[bisque-ws] WebSocket error:", event)
     }
+  }
+
+  /** Login via WS handshake: connect, send credentials, wait for HandshakeComplete. */
+  async loginAndConnect(
+    username: string,
+    password: string,
+  ): Promise<ServerMessage & { type: "HandshakeComplete" }> {
+    this.pendingCredentials = { username, password }
+
+    return new Promise((resolve, reject) => {
+      const unsub = this.onPush((msg) => {
+        if (msg.type === "HandshakeComplete") {
+          unsub()
+          resolve(msg)
+        }
+      })
+
+      this.connect()
+
+      // If socket closes before HandshakeComplete (auth failure, timeout), reject
+      if (this.ws) {
+        const savedOnClose = this.ws.onclose
+        this.ws.onclose = (event) => {
+          unsub()
+          const reason = this.serverCloseReason || event.reason || "Login failed"
+          this.serverCloseReason = ""
+          reject(new Error(reason))
+          if (savedOnClose) (savedOnClose as (ev: CloseEvent) => void).call(this.ws, event)
+        }
+      }
+    })
   }
 
   disconnect(): void {
@@ -248,6 +335,34 @@ export class BisqueWsClient {
       table,
     })
     return resp as unknown as { op_id: string; message: string }
+  }
+
+  async listCatalogs(tenantId: number): Promise<CatalogEntry[]> {
+    const resp = await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "list_catalogs",
+      tenant_id: tenantId,
+    })
+    return resp.catalogs as CatalogEntry[]
+  }
+
+  async createCatalog(
+    tenantId: number,
+    name: string,
+    engine: string,
+    config = "",
+  ): Promise<{ catalog_id: number; raft_group_id: number }> {
+    const resp = await this.request({
+      type: "Request",
+      request_id: 0,
+      method: "create_catalog",
+      tenant_id: tenantId,
+      name,
+      engine,
+      config,
+    })
+    return resp as unknown as { catalog_id: number; raft_group_id: number }
   }
 
   async getCatalog(bucket: string): Promise<Record<string, unknown>> {
@@ -354,15 +469,60 @@ export class BisqueWsClient {
     return resp as unknown as { table: string }
   }
 
-  async executeSql(catalog: string, sql: string): Promise<SqlResult> {
-    const resp = await this.request({
+  async executeSql(
+    catalog: string,
+    sql: string,
+    options?: SqlStreamOptions,
+  ): Promise<SqlResult> {
+    if (!this.connected) {
+      throw new Error("WebSocket not connected")
+    }
+    const requestId = this.allocRequestId()
+    const msg: ClientMessage & { request_id: number } = {
       type: "Request",
-      request_id: 0,
+      request_id: requestId,
       method: "execute_sql",
       catalog,
       sql,
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(requestId)
+        this.pendingSqlStreams.delete(requestId)
+        reject(new Error(`SQL request ${requestId} timed out after ${this.requestTimeoutMs}ms`))
+      }, this.requestTimeoutMs)
+
+      // Register in pendingRequests for fast-path (single-frame Response)
+      this.pendingRequests.set(requestId, {
+        resolve: (data) => {
+          // Fast path hit — clean up stream entry and resolve
+          this.pendingSqlStreams.delete(requestId)
+          resolve(data as unknown as SqlResult)
+        },
+        reject: (err) => {
+          this.pendingSqlStreams.delete(requestId)
+          reject(err)
+        },
+        timer,
+        msg,
+        retries: 0,
+      })
+
+      // Also register in pendingSqlStreams for chunked/Arrow IPC path
+      this.pendingSqlStreams.set(requestId, {
+        resolve,
+        reject,
+        timer,
+        columns: [],
+        rows: [],
+        headerReceived: false,
+        onHeader: options?.onHeader,
+        onChunk: options?.onChunk,
+      })
+
+      this.sendClientMsg(msg)
     })
-    return resp as unknown as SqlResult
   }
 
   async enableOtel(catalog: string): Promise<{ tables_created: string[] }> {
@@ -448,18 +608,27 @@ export class BisqueWsClient {
           this.ws?.close()
           return
         }
-        // session_id preserved for future use (reconnect correlation)
-        // M17: Reset backoff on successful handshake, not TCP open.
-        this.reconnectDelay = 1000
-        // Respond with client handshake — include lastSeenSeq for WAL replay
-        // and auth token (S2: moved from URL to handshake frame)
+        // Send client handshake with credentials (login) or token (reconnect).
+        const creds = this.pendingCredentials
+        this.pendingCredentials = null
         this.sendClientMsg({
           type: "Handshake",
           protocol_version: WS_PROTOCOL_VERSION,
           token: this.authToken,
+          username: creds?.username ?? "",
+          password: creds?.password ?? "",
           last_seen_seq: this.lastSeenSeq,
           subscribe_catalogs: this.subscribeCatalogs,
         })
+        // Don't mark connected yet — wait for HandshakeComplete from server.
+        break
+      }
+
+      case "HandshakeComplete": {
+        // M17: Reset backoff on successful handshake, not TCP open.
+        this.reconnectDelay = 1000
+        // Store the token for future reconnects.
+        this.authToken = msg.token
         this._handshakeComplete = true
         this.startHeartbeat()
         this.resetHeartbeatTimeout()
@@ -523,7 +692,54 @@ export class BisqueWsClient {
         break
       }
 
+      case "SqlResultHeader": {
+        const stream = this.pendingSqlStreams.get(msg.request_id)
+        if (stream) {
+          // Streaming path — remove from pendingRequests so fast-path doesn't interfere
+          this.pendingRequests.delete(msg.request_id)
+          stream.columns = msg.columns
+          stream.headerReceived = true
+          stream.onHeader?.(msg.columns)
+          // Reset timeout since we're receiving data
+          clearTimeout(stream.timer)
+          stream.timer = setTimeout(() => {
+            this.pendingSqlStreams.delete(msg.request_id)
+            stream.reject(new Error("SQL stream timed out"))
+          }, this.requestTimeoutMs)
+        }
+        break
+      }
+
+      case "SqlResultChunk": {
+        const stream = this.pendingSqlStreams.get(msg.request_id)
+        if (stream) {
+          stream.rows.push(...msg.rows)
+          stream.onChunk?.(stream.rows, msg.rows_so_far)
+          // Reset timeout
+          clearTimeout(stream.timer)
+          stream.timer = setTimeout(() => {
+            this.pendingSqlStreams.delete(msg.request_id)
+            stream.reject(new Error("SQL stream timed out"))
+          }, this.requestTimeoutMs)
+        }
+        break
+      }
+
+      case "SqlResultComplete": {
+        const stream = this.pendingSqlStreams.get(msg.request_id)
+        if (stream) {
+          this.pendingSqlStreams.delete(msg.request_id)
+          clearTimeout(stream.timer)
+          stream.resolve({
+            columns: stream.columns,
+            rows: stream.rows,
+          })
+        }
+        break
+      }
+
       case "Close": {
+        this.serverCloseReason = msg.reason
         if (msg.reason === "ttl_refresh") {
           // Transparent TTL refresh — reconnect immediately with short delay
           // lastSeenSeq is preserved so server can replay from WAL
@@ -637,7 +853,7 @@ export class BisqueWsClient {
     // so it can be cleaned up if disconnect() is called before reconnect.
     if (retryable.length > 0) {
       const unsub = this.onPush((msg) => {
-        if (msg.type === "Handshake") {
+        if (msg.type === "HandshakeComplete") {
           unsub()
           // Remove from tracked unsubs since it fired successfully
           this.retryUnsubs = this.retryUnsubs.filter((u) => u !== unsub)
@@ -665,7 +881,31 @@ export class BisqueWsClient {
       pending.reject(new Error(reason))
     }
     this.pendingRequests.clear()
+    for (const [, stream] of this.pendingSqlStreams) {
+      clearTimeout(stream.timer)
+      stream.reject(new Error(reason))
+    }
+    this.pendingSqlStreams.clear()
   }
+}
+
+/** Convert an Apache Arrow Table to an array of plain JS row objects. */
+function arrowTableToRows(table: import("apache-arrow").Table): Record<string, unknown>[] {
+  const numRows = table.numRows
+  const fields = table.schema.fields
+  // Pre-fetch column vectors once — avoids O(n*m) getChild lookups
+  const columns = fields.map(f => table.getChild(f.name))
+  const names = fields.map(f => f.name)
+  const rows: Record<string, unknown>[] = new Array(numRows)
+  for (let i = 0; i < numRows; i++) {
+    const row: Record<string, unknown> = {}
+    for (let c = 0; c < columns.length; c++) {
+      const col = columns[c]
+      row[names[c]] = col ? col.get(i) : null
+    }
+    rows[i] = row
+  }
+  return rows
 }
 
 import { isMock } from "./api"

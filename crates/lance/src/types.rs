@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,6 +84,75 @@ impl Default for FlushState {
     }
 }
 
+/// 128-bit transaction identifier for multi-table transactions.
+///
+/// Generated client-side via `uuid::Uuid::new_v4()`. Correlates all chunks
+/// belonging to the same transaction across Raft log entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TxnId(pub u128);
+
+impl TxnId {
+    /// Create a new random transaction ID.
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().as_u128())
+    }
+}
+
+impl Default for TxnId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for TxnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+/// Individual operation within a multi-table transaction chunk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TxnOp {
+    /// Append IPC-encoded RecordBatches to a table.
+    Append { table: Arc<str>, data: Bytes },
+    /// Soft-delete rows matching a SQL filter predicate.
+    Delete { table: Arc<str>, filter: String },
+    /// Delete matching rows then append replacement data.
+    Update {
+        table: Arc<str>,
+        filter: String,
+        data: Bytes,
+    },
+    /// Create a new table with the given IPC-encoded schema.
+    CreateTable { table: Arc<str>, schema_ipc: Bytes },
+    /// Drop a table and all its data.
+    DropTable { table: Arc<str> },
+}
+
+impl TxnOp {
+    /// Returns the table name this operation targets.
+    pub fn table_name(&self) -> &str {
+        match self {
+            TxnOp::Append { table, .. }
+            | TxnOp::Delete { table, .. }
+            | TxnOp::Update { table, .. }
+            | TxnOp::CreateTable { table, .. }
+            | TxnOp::DropTable { table } => table,
+        }
+    }
+
+    /// Approximate byte size of this operation's payload (for memory tracking).
+    pub fn payload_bytes(&self) -> usize {
+        match self {
+            TxnOp::Append { data, .. } => data.len(),
+            TxnOp::Delete { filter, .. } => filter.len(),
+            TxnOp::Update { filter, data, .. } => filter.len() + data.len(),
+            TxnOp::CreateTable { schema_ipc, .. } => schema_ipc.len(),
+            TxnOp::DropTable { .. } => 0,
+        }
+    }
+}
+
 /// Raft log entry command type for bisque-lance.
 ///
 /// Each variant is replicated via Raft and applied to all nodes' state machines.
@@ -165,6 +234,21 @@ pub enum LanceCommand {
         /// IPC-encoded replacement RecordBatches.
         data: Bytes,
     },
+
+    /// Accumulate a chunk of multi-table transaction data.
+    /// Inert on apply — the state machine buffers the ops without writing to Lance.
+    TxnChunk {
+        txn_id: TxnId,
+        seq: u32,
+        ops: Vec<TxnOp>,
+    },
+
+    /// Commit a multi-table transaction. Triggers reassembly of all chunks
+    /// and atomic apply across all affected tables.
+    TxnCommit { txn_id: TxnId, total_chunks: u32 },
+
+    /// Abort a multi-table transaction. Discards buffered chunks.
+    TxnAbort { txn_id: TxnId },
 }
 
 impl fmt::Display for LanceCommand {
@@ -262,6 +346,28 @@ impl fmt::Display for LanceCommand {
                     filter,
                     data.len()
                 )
+            }
+            LanceCommand::TxnChunk { txn_id, seq, ops } => {
+                write!(
+                    f,
+                    "TxnChunk(txn={}, seq={}, {} ops)",
+                    txn_id,
+                    seq,
+                    ops.len()
+                )
+            }
+            LanceCommand::TxnCommit {
+                txn_id,
+                total_chunks,
+            } => {
+                write!(
+                    f,
+                    "TxnCommit(txn={}, total_chunks={})",
+                    txn_id, total_chunks
+                )
+            }
+            LanceCommand::TxnAbort { txn_id } => {
+                write!(f, "TxnAbort(txn={})", txn_id)
             }
         }
     }
@@ -375,6 +481,132 @@ pub struct CatalogMeta {
     /// Identity of the user who enabled OTel (e.g. "tenant:42" or email).
     #[serde(default)]
     pub otel_enabled_by: Option<String>,
+}
+
+// =============================================================================
+// Multi-Table Transaction Types
+// =============================================================================
+
+/// A pending multi-table transaction being accumulated via `TxnChunk` commands.
+pub struct PendingTxn {
+    /// Chunks indexed by sequence number.
+    pub chunks: BTreeMap<u32, Vec<TxnOp>>,
+    /// Raft log index of the first chunk (for GC).
+    pub first_log_index: u64,
+    /// Total buffered payload bytes across all chunks.
+    pub total_bytes: usize,
+}
+
+/// Staging area for in-flight multi-table transactions.
+#[derive(Default)]
+pub struct PendingTxns {
+    /// Map from transaction ID to its accumulated chunks.
+    pub txns: HashMap<TxnId, PendingTxn>,
+    /// Total bytes across all pending transactions (for global memory cap).
+    pub total_bytes: usize,
+}
+
+impl PendingTxns {
+    /// Insert a chunk into a pending transaction. Returns an error message
+    /// if memory limits are exceeded.
+    pub fn insert_chunk(
+        &mut self,
+        txn_id: TxnId,
+        seq: u32,
+        ops: Vec<TxnOp>,
+        log_index: u64,
+        config: &TxnConfig,
+    ) -> Result<(), String> {
+        let chunk_bytes: usize = ops.iter().map(|op| op.payload_bytes()).sum();
+
+        // Check global cap.
+        if self.total_bytes + chunk_bytes > config.max_total_pending_bytes {
+            return Err(format!(
+                "transaction {} rejected: global pending bytes ({} + {}) exceeds limit {}",
+                txn_id, self.total_bytes, chunk_bytes, config.max_total_pending_bytes
+            ));
+        }
+
+        let pending = self.txns.entry(txn_id).or_insert_with(|| PendingTxn {
+            chunks: BTreeMap::new(),
+            first_log_index: log_index,
+            total_bytes: 0,
+        });
+
+        // Check per-txn cap.
+        if pending.total_bytes + chunk_bytes > config.max_txn_bytes {
+            return Err(format!(
+                "transaction {} rejected: txn bytes ({} + {}) exceeds limit {}",
+                txn_id, pending.total_bytes, chunk_bytes, config.max_txn_bytes
+            ));
+        }
+
+        // If overwriting an existing chunk at this seq, subtract old bytes first.
+        if let Some(old_ops) = pending.chunks.insert(seq, ops) {
+            let old_bytes: usize = old_ops.iter().map(|op| op.payload_bytes()).sum();
+            pending.total_bytes = pending.total_bytes.saturating_sub(old_bytes);
+            self.total_bytes = self.total_bytes.saturating_sub(old_bytes);
+        }
+        pending.total_bytes += chunk_bytes;
+        self.total_bytes += chunk_bytes;
+        Ok(())
+    }
+
+    /// Remove and return a pending transaction.
+    pub fn remove(&mut self, txn_id: &TxnId) -> Option<PendingTxn> {
+        if let Some(pending) = self.txns.remove(txn_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(pending.total_bytes);
+            Some(pending)
+        } else {
+            None
+        }
+    }
+
+    /// Garbage-collect abandoned transactions whose first chunk is older than
+    /// `max_log_age` entries before `current_log_index`.
+    pub fn gc(&mut self, current_log_index: u64, max_log_age: u64) -> usize {
+        let before = self.txns.len();
+        self.txns.retain(|_, pending| {
+            current_log_index.saturating_sub(pending.first_log_index) <= max_log_age
+        });
+        let evicted = before - self.txns.len();
+        if evicted > 0 {
+            // Recalculate total_bytes after eviction.
+            self.total_bytes = self.txns.values().map(|p| p.total_bytes).sum();
+        }
+        evicted
+    }
+
+    /// Clear all pending transactions (e.g., on snapshot install).
+    pub fn clear(&mut self) {
+        self.txns.clear();
+        self.total_bytes = 0;
+    }
+}
+
+/// Configuration for multi-table transaction handling.
+#[derive(Debug, Clone)]
+pub struct TxnConfig {
+    /// Maximum payload bytes per individual transaction (default: 256 MB).
+    pub max_txn_bytes: usize,
+    /// Maximum total payload bytes across all pending transactions (default: 1 GB).
+    pub max_total_pending_bytes: usize,
+    /// GC timeout: evict pending transactions whose first chunk is this many
+    /// log entries behind the current apply index (default: 100,000).
+    pub gc_log_index_timeout: u64,
+    /// How often (in applied log entries) to run GC (default: 1,000).
+    pub gc_check_interval: u64,
+}
+
+impl Default for TxnConfig {
+    fn default() -> Self {
+        Self {
+            max_txn_bytes: 256 * 1024 * 1024,
+            max_total_pending_bytes: 1024 * 1024 * 1024,
+            gc_log_index_timeout: 100_000,
+            gc_check_interval: 1_000,
+        }
+    }
 }
 
 /// Snapshot payload for the state machine.
@@ -1238,6 +1470,7 @@ mod tests {
                 size: 4096,
             }],
             sync_addr: Some("127.0.0.1:9090".to_string()),
+            catalog_meta: None,
         };
 
         let json = serde_json::to_string(&snap).unwrap();
@@ -1445,5 +1678,678 @@ mod tests {
             "Debug output should contain response variant: {:?}",
             dbg
         );
+    }
+
+    // =========================================================================
+    // 20. TxnId
+    // =========================================================================
+
+    #[test]
+    fn txn_id_new_is_unique() {
+        let a = TxnId::new();
+        let b = TxnId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn txn_id_display() {
+        let id = TxnId(0x0123456789abcdef_fedcba9876543210);
+        let s = format!("{}", id);
+        assert_eq!(s, "0123456789abcdeffedcba9876543210");
+    }
+
+    #[test]
+    fn txn_id_default_is_random() {
+        let a = TxnId::default();
+        let b = TxnId::default();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn txn_id_hash_works() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        let id = TxnId::new();
+        set.insert(id);
+        assert!(set.contains(&id));
+    }
+
+    #[test]
+    fn txn_id_serde_roundtrip() {
+        let id = TxnId::new();
+        let json = serde_json::to_string(&id).unwrap();
+        let back: TxnId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, back);
+    }
+
+    // =========================================================================
+    // 21. TxnOp helpers
+    // =========================================================================
+
+    #[test]
+    fn txn_op_table_name_all_variants() {
+        let ops = vec![
+            TxnOp::Append {
+                table: "a".into(),
+                data: Bytes::new(),
+            },
+            TxnOp::Delete {
+                table: "b".into(),
+                filter: String::new(),
+            },
+            TxnOp::Update {
+                table: "c".into(),
+                filter: String::new(),
+                data: Bytes::new(),
+            },
+            TxnOp::CreateTable {
+                table: "d".into(),
+                schema_ipc: Bytes::new(),
+            },
+            TxnOp::DropTable { table: "e".into() },
+        ];
+        let names: Vec<&str> = ops.iter().map(|op| op.table_name()).collect();
+        assert_eq!(names, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn txn_op_payload_bytes_all_variants() {
+        assert_eq!(
+            TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from_static(&[1, 2, 3]),
+            }
+            .payload_bytes(),
+            3
+        );
+        assert_eq!(
+            TxnOp::Delete {
+                table: "t".into(),
+                filter: "id > 0".to_string(),
+            }
+            .payload_bytes(),
+            6
+        );
+        assert_eq!(
+            TxnOp::Update {
+                table: "t".into(),
+                filter: "x=1".to_string(),
+                data: Bytes::from_static(&[1, 2]),
+            }
+            .payload_bytes(),
+            5 // 3 (filter) + 2 (data)
+        );
+        assert_eq!(
+            TxnOp::CreateTable {
+                table: "t".into(),
+                schema_ipc: Bytes::from_static(&[0xDE, 0xAD]),
+            }
+            .payload_bytes(),
+            2
+        );
+        assert_eq!(TxnOp::DropTable { table: "t".into() }.payload_bytes(), 0);
+    }
+
+    // =========================================================================
+    // 22. PendingTxns
+    // =========================================================================
+
+    fn small_txn_config() -> TxnConfig {
+        TxnConfig {
+            max_txn_bytes: 1024,
+            max_total_pending_bytes: 2048,
+            gc_log_index_timeout: 100,
+            gc_check_interval: 10,
+        }
+    }
+
+    #[test]
+    fn pending_txns_insert_and_remove() {
+        let mut pt = PendingTxns::default();
+        let config = small_txn_config();
+        let id = TxnId::new();
+
+        let ops = vec![TxnOp::Append {
+            table: "t".into(),
+            data: Bytes::from(vec![0u8; 100]),
+        }];
+
+        pt.insert_chunk(id, 0, ops, 1, &config).unwrap();
+        assert_eq!(pt.txns.len(), 1);
+        assert_eq!(pt.total_bytes, 100);
+
+        let pending = pt.remove(&id).unwrap();
+        assert_eq!(pending.chunks.len(), 1);
+        assert_eq!(pending.total_bytes, 100);
+        assert_eq!(pending.first_log_index, 1);
+
+        assert_eq!(pt.txns.len(), 0);
+        assert_eq!(pt.total_bytes, 0);
+    }
+
+    #[test]
+    fn pending_txns_multiple_chunks_same_txn() {
+        let mut pt = PendingTxns::default();
+        let config = small_txn_config();
+        let id = TxnId::new();
+
+        pt.insert_chunk(
+            id,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 50]),
+            }],
+            10,
+            &config,
+        )
+        .unwrap();
+
+        pt.insert_chunk(
+            id,
+            1,
+            vec![TxnOp::Delete {
+                table: "t".into(),
+                filter: "id > 0".to_string(),
+            }],
+            11,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(pt.txns.len(), 1);
+        let pending = pt.txns.get(&id).unwrap();
+        assert_eq!(pending.chunks.len(), 2);
+        assert_eq!(pending.first_log_index, 10); // first chunk's log index
+        assert_eq!(pending.total_bytes, 56); // 50 + 6
+        assert_eq!(pt.total_bytes, 56);
+    }
+
+    #[test]
+    fn pending_txns_per_txn_cap() {
+        let mut pt = PendingTxns::default();
+        let config = TxnConfig {
+            max_txn_bytes: 100,
+            max_total_pending_bytes: 10_000,
+            ..small_txn_config()
+        };
+        let id = TxnId::new();
+
+        // First chunk fits.
+        pt.insert_chunk(
+            id,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 80]),
+            }],
+            1,
+            &config,
+        )
+        .unwrap();
+
+        // Second chunk exceeds per-txn limit.
+        let err = pt
+            .insert_chunk(
+                id,
+                1,
+                vec![TxnOp::Append {
+                    table: "t".into(),
+                    data: Bytes::from(vec![0u8; 30]),
+                }],
+                2,
+                &config,
+            )
+            .unwrap_err();
+
+        assert!(err.contains("txn bytes"));
+        assert!(err.contains("exceeds limit"));
+    }
+
+    #[test]
+    fn pending_txns_global_cap() {
+        let mut pt = PendingTxns::default();
+        let config = TxnConfig {
+            max_txn_bytes: 10_000,
+            max_total_pending_bytes: 150,
+            ..small_txn_config()
+        };
+
+        let id1 = TxnId::new();
+        let id2 = TxnId::new();
+
+        pt.insert_chunk(
+            id1,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 100]),
+            }],
+            1,
+            &config,
+        )
+        .unwrap();
+
+        // Second txn exceeds global limit.
+        let err = pt
+            .insert_chunk(
+                id2,
+                0,
+                vec![TxnOp::Append {
+                    table: "t".into(),
+                    data: Bytes::from(vec![0u8; 60]),
+                }],
+                2,
+                &config,
+            )
+            .unwrap_err();
+
+        assert!(err.contains("global pending bytes"));
+        assert!(err.contains("exceeds limit"));
+    }
+
+    #[test]
+    fn pending_txns_remove_nonexistent_returns_none() {
+        let mut pt = PendingTxns::default();
+        assert!(pt.remove(&TxnId::new()).is_none());
+    }
+
+    #[test]
+    fn pending_txns_gc_evicts_old_transactions() {
+        let mut pt = PendingTxns::default();
+        let config = small_txn_config();
+        let id_old = TxnId::new();
+        let id_new = TxnId::new();
+
+        // Old txn at log index 10.
+        pt.insert_chunk(
+            id_old,
+            0,
+            vec![TxnOp::DropTable { table: "t".into() }],
+            10,
+            &config,
+        )
+        .unwrap();
+
+        // New txn at log index 200.
+        pt.insert_chunk(
+            id_new,
+            0,
+            vec![TxnOp::DropTable { table: "t".into() }],
+            200,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(pt.txns.len(), 2);
+
+        // GC at log index 250 with timeout 100: old (250-10=240 > 100) evicted.
+        let evicted = pt.gc(250, 100);
+        assert_eq!(evicted, 1);
+        assert_eq!(pt.txns.len(), 1);
+        assert!(pt.txns.contains_key(&id_new));
+        assert!(!pt.txns.contains_key(&id_old));
+    }
+
+    #[test]
+    fn pending_txns_gc_keeps_recent() {
+        let mut pt = PendingTxns::default();
+        let config = small_txn_config();
+        let id = TxnId::new();
+
+        pt.insert_chunk(
+            id,
+            0,
+            vec![TxnOp::DropTable { table: "t".into() }],
+            100,
+            &config,
+        )
+        .unwrap();
+
+        // GC at log index 150 with timeout 100: (150-100=50 <= 100) kept.
+        let evicted = pt.gc(150, 100);
+        assert_eq!(evicted, 0);
+        assert_eq!(pt.txns.len(), 1);
+    }
+
+    #[test]
+    fn pending_txns_gc_recalculates_total_bytes() {
+        let mut pt = PendingTxns::default();
+        let config = small_txn_config();
+
+        let id1 = TxnId::new();
+        let id2 = TxnId::new();
+
+        pt.insert_chunk(
+            id1,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 100]),
+            }],
+            10,
+            &config,
+        )
+        .unwrap();
+
+        pt.insert_chunk(
+            id2,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 200]),
+            }],
+            500,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(pt.total_bytes, 300);
+
+        // Evict id1 (log 10), keep id2 (log 500).
+        pt.gc(600, 100);
+        assert_eq!(pt.total_bytes, 200);
+    }
+
+    #[test]
+    fn pending_txns_clear() {
+        let mut pt = PendingTxns::default();
+        let config = small_txn_config();
+
+        for _ in 0..5 {
+            pt.insert_chunk(
+                TxnId::new(),
+                0,
+                vec![TxnOp::Append {
+                    table: "t".into(),
+                    data: Bytes::from(vec![0u8; 50]),
+                }],
+                1,
+                &config,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(pt.txns.len(), 5);
+        assert_eq!(pt.total_bytes, 250);
+
+        pt.clear();
+        assert_eq!(pt.txns.len(), 0);
+        assert_eq!(pt.total_bytes, 0);
+    }
+
+    // =========================================================================
+    // 22b. PendingTxns: chunk overwrite corrects memory accounting
+    // =========================================================================
+
+    #[test]
+    fn pending_txns_overwrite_chunk_preserves_memory_accounting() {
+        let mut pt = PendingTxns::default();
+        let config = small_txn_config();
+        let id = TxnId::new();
+
+        // Insert chunk seq=0 with 100 bytes.
+        pt.insert_chunk(
+            id,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 100]),
+            }],
+            1,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(pt.total_bytes, 100);
+        assert_eq!(pt.txns[&id].total_bytes, 100);
+
+        // Overwrite chunk seq=0 with 150 bytes.
+        pt.insert_chunk(
+            id,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 150]),
+            }],
+            2,
+            &config,
+        )
+        .unwrap();
+        // Should be 150, not 250 (old 100 subtracted).
+        assert_eq!(pt.total_bytes, 150);
+        assert_eq!(pt.txns[&id].total_bytes, 150);
+        assert_eq!(pt.txns[&id].chunks.len(), 1);
+    }
+
+    #[test]
+    fn pending_txns_overwrite_within_per_txn_cap() {
+        let config = TxnConfig {
+            max_txn_bytes: 500,
+            max_total_pending_bytes: 10_000,
+            ..small_txn_config()
+        };
+        let mut pt = PendingTxns::default();
+        let id = TxnId::new();
+
+        // Insert chunk seq=0 with 100 bytes.
+        pt.insert_chunk(
+            id,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 100]),
+            }],
+            1,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(pt.txns[&id].total_bytes, 100);
+
+        // Overwrite seq=0 with 200 bytes. Cap check: 100 + 200 = 300 <= 500.
+        // After overwrite, net bytes = 200 (old 100 subtracted).
+        pt.insert_chunk(
+            id,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 200]),
+            }],
+            2,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(pt.txns[&id].total_bytes, 200);
+        assert_eq!(pt.total_bytes, 200);
+    }
+
+    #[test]
+    fn pending_txns_overwrite_rejected_by_per_txn_cap() {
+        // Cap check is conservative: old_bytes + new_bytes checked before subtraction.
+        let config = TxnConfig {
+            max_txn_bytes: 200,
+            max_total_pending_bytes: 10_000,
+            ..small_txn_config()
+        };
+        let mut pt = PendingTxns::default();
+        let id = TxnId::new();
+
+        pt.insert_chunk(
+            id,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 100]),
+            }],
+            1,
+            &config,
+        )
+        .unwrap();
+
+        // Overwrite with 150 bytes. Cap check: 100 + 150 = 250 > 200.
+        // Rejected because cap check is pre-subtraction.
+        let err = pt
+            .insert_chunk(
+                id,
+                0,
+                vec![TxnOp::Append {
+                    table: "t".into(),
+                    data: Bytes::from(vec![0u8; 150]),
+                }],
+                2,
+                &config,
+            )
+            .unwrap_err();
+        assert!(err.contains("txn bytes"));
+        // Original chunk should still be intact.
+        assert_eq!(pt.txns[&id].total_bytes, 100);
+        assert_eq!(pt.total_bytes, 100);
+    }
+
+    #[test]
+    fn pending_txns_overwrite_global_cap_check_uses_net_bytes() {
+        let config = TxnConfig {
+            max_txn_bytes: 10_000,
+            max_total_pending_bytes: 300,
+            ..small_txn_config()
+        };
+        let mut pt = PendingTxns::default();
+
+        // Txn1: 200 bytes.
+        let id1 = TxnId::new();
+        pt.insert_chunk(
+            id1,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 200]),
+            }],
+            1,
+            &config,
+        )
+        .unwrap();
+
+        // Txn2: 50 bytes. Total = 250, under 300 cap.
+        let id2 = TxnId::new();
+        pt.insert_chunk(
+            id2,
+            0,
+            vec![TxnOp::Append {
+                table: "t".into(),
+                data: Bytes::from(vec![0u8; 50]),
+            }],
+            2,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(pt.total_bytes, 250);
+
+        // Txn2: overwrite with 100 bytes. Net change: +50.
+        // New total would be 200 + 100 = 300 (exactly at limit).
+        // The check is `total_bytes + chunk_bytes > cap` which is
+        // 250 + 100 = 350 > 300, so it should be rejected BEFORE the
+        // overwrite subtraction. This is the current behavior.
+        let err = pt
+            .insert_chunk(
+                id2,
+                0,
+                vec![TxnOp::Append {
+                    table: "t".into(),
+                    data: Bytes::from(vec![0u8; 100]),
+                }],
+                3,
+                &config,
+            )
+            .unwrap_err();
+        assert!(err.contains("global pending bytes"));
+    }
+
+    // =========================================================================
+    // 23. TxnConfig defaults
+    // =========================================================================
+
+    #[test]
+    fn txn_config_defaults() {
+        let cfg = TxnConfig::default();
+        assert_eq!(cfg.max_txn_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.max_total_pending_bytes, 1024 * 1024 * 1024);
+        assert_eq!(cfg.gc_log_index_timeout, 100_000);
+        assert_eq!(cfg.gc_check_interval, 1_000);
+    }
+
+    // =========================================================================
+    // 24. LanceCommand Display for transaction variants
+    // =========================================================================
+
+    #[test]
+    fn lance_command_display_txn_chunk() {
+        let cmd = LanceCommand::TxnChunk {
+            txn_id: TxnId(0x0123456789abcdef_fedcba9876543210),
+            seq: 3,
+            ops: vec![
+                TxnOp::Append {
+                    table: "t".into(),
+                    data: Bytes::new(),
+                },
+                TxnOp::Delete {
+                    table: "t".into(),
+                    filter: String::new(),
+                },
+            ],
+        };
+        let s = cmd.to_string();
+        assert!(s.contains("TxnChunk"));
+        assert!(s.contains("seq=3"));
+        assert!(s.contains("2 ops"));
+    }
+
+    #[test]
+    fn lance_command_display_txn_commit() {
+        let cmd = LanceCommand::TxnCommit {
+            txn_id: TxnId(42),
+            total_chunks: 5,
+        };
+        let s = cmd.to_string();
+        assert!(s.contains("TxnCommit"));
+        assert!(s.contains("total_chunks=5"));
+    }
+
+    #[test]
+    fn lance_command_display_txn_abort() {
+        let cmd = LanceCommand::TxnAbort { txn_id: TxnId(42) };
+        let s = cmd.to_string();
+        assert!(s.contains("TxnAbort"));
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_txn_chunk() {
+        assert_lance_command_roundtrip(&LanceCommand::TxnChunk {
+            txn_id: TxnId::new(),
+            seq: 7,
+            ops: vec![
+                TxnOp::Append {
+                    table: "orders".into(),
+                    data: Bytes::from_static(&[1, 2, 3]),
+                },
+                TxnOp::Delete {
+                    table: "inventory".into(),
+                    filter: "product_id = 42".to_string(),
+                },
+            ],
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_txn_commit() {
+        assert_lance_command_roundtrip(&LanceCommand::TxnCommit {
+            txn_id: TxnId::new(),
+            total_chunks: 3,
+        });
+    }
+
+    #[test]
+    fn lance_command_serde_roundtrip_txn_abort() {
+        assert_lance_command_roundtrip(&LanceCommand::TxnAbort {
+            txn_id: TxnId::new(),
+        });
     }
 }

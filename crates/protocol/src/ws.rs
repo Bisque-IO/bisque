@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Protocol version — bump on breaking changes.
-pub const WS_PROTOCOL_VERSION: u8 = 1;
+pub const WS_PROTOCOL_VERSION: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Server → Client messages
@@ -34,14 +34,21 @@ pub const WS_PROTOCOL_VERSION: u8 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
-    /// First message after WebSocket upgrade. Confirms protocol compatibility.
-    Handshake {
-        protocol_version: u8,
+    /// First message after WebSocket upgrade. Protocol hello — no auth data yet.
+    Handshake { protocol_version: u8 },
+
+    /// Sent after successful authentication. Contains session + login data.
+    HandshakeComplete {
         session_id: u64,
-        /// Current catalog event bus seq (global, WAL-backed).
         catalog_seq: u64,
-        /// Starting push seq for this connection (always 0).
-        server_seq: u64,
+        token: String,
+        user_id: u64,
+        username: String,
+        accounts: Vec<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_tenant_id: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_tenant_name: Option<String>,
     },
 
     /// Response to a client `Request`.
@@ -78,6 +85,23 @@ pub enum ServerMessage {
 
     /// Graceful close notification. Client should reconnect if reason is `ttl_refresh`.
     Close { reason: String },
+
+    /// SQL streaming: column metadata (sent before any row chunks).
+    SqlResultHeader {
+        request_id: u32,
+        columns: Vec<serde_json::Value>,
+    },
+
+    /// SQL streaming: a chunk of rows.
+    SqlResultChunk {
+        request_id: u32,
+        rows: Vec<serde_json::Value>,
+        /// Running total of rows sent so far (including this chunk).
+        rows_so_far: u64,
+    },
+
+    /// SQL streaming: final marker indicating the stream is complete.
+    SqlResultComplete { request_id: u32, row_count: u64 },
 }
 
 /// Result wrapper for request/response.
@@ -165,12 +189,18 @@ pub enum ResponseData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    /// Client handshake response with resume state and auth token.
+    /// Client handshake response with auth credentials or token for reconnect.
     Handshake {
         protocol_version: u8,
-        /// Bearer token for authentication (moved from URL to avoid log exposure).
+        /// Bearer token for reconnect authentication.
         #[serde(default)]
         token: String,
+        /// Username for credential-based login (alternative to token).
+        #[serde(default)]
+        username: String,
+        /// Password for credential-based login (alternative to token).
+        #[serde(default)]
+        password: String,
         /// Last seq the client successfully processed. Server replays from here.
         last_seen_seq: u64,
         /// Catalogs to subscribe to for push events.
@@ -337,9 +367,7 @@ impl RequestMethod {
     pub fn is_expensive(&self) -> bool {
         matches!(
             self,
-            Self::ListCatalogs { .. }
-                | Self::ListOperations { .. }
-                | Self::GetCatalog { .. }
+            Self::ListOperations { .. }
                 | Self::GetClusterStatus
                 | Self::ListTenants { .. }
                 | Self::ListApiKeys { .. }
@@ -399,6 +427,33 @@ mod tests {
             "catalog field should be an object, got: {:?}",
             decoded["catalog"]
         );
+    }
+
+    #[test]
+    fn test_get_catalog_with_otel_roundtrip() {
+        let msg = ServerMessage::Response {
+            request_id: 10,
+            result: ResponseResult::Ok {
+                data: ResponseData::GetCatalog {
+                    catalog: json!({
+                        "tables": {"events": {"active_version": 3}},
+                        "otel": {"enabled": true, "enabled_at": 1700000000, "enabled_by": "tenant:1"}
+                    }),
+                },
+            },
+        };
+
+        let encoded = encode_server_msg(&msg).unwrap();
+        let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
+        println!(
+            "Decoded GetCatalog+OTel response: {}",
+            serde_json::to_string_pretty(&decoded).unwrap()
+        );
+
+        assert_eq!(decoded["status"], "ok");
+        assert_eq!(decoded["catalog"]["otel"]["enabled"], true);
+        assert_eq!(decoded["catalog"]["otel"]["enabled_at"], 1700000000);
+        assert_eq!(decoded["catalog"]["otel"]["enabled_by"], "tenant:1");
     }
 
     #[test]

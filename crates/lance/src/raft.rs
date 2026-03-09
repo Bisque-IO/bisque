@@ -23,7 +23,7 @@ use crate::async_apply::AppliedWatermark;
 use crate::engine::BisqueLance;
 use crate::ipc;
 use crate::manifest::{LanceManifestManager, TableUpdate};
-use crate::types::{LanceCommand, LanceResponse, WriteResult};
+use crate::types::{LanceCommand, LanceResponse, TxnId, TxnOp, WriteResult};
 use crate::write_batcher::{WriteBatcher, WriteBatcherConfig};
 
 /// Raft-integrated node for bisque-lance.
@@ -380,6 +380,49 @@ impl LanceRaftNode {
             filter: filter.to_string(),
             data,
         };
+        self.propose(cmd).await
+    }
+
+    // =========================================================================
+    // Multi-table transaction API
+    // =========================================================================
+
+    /// Generate a new transaction ID. Local only — no Raft round-trip.
+    pub fn begin_txn(&self) -> TxnId {
+        TxnId::new()
+    }
+
+    /// Send a chunk of transaction operations through Raft.
+    ///
+    /// Chunks are buffered in the state machine and not applied until
+    /// [`txn_commit`] is called.
+    pub async fn txn_chunk(
+        &self,
+        txn_id: TxnId,
+        seq: u32,
+        ops: Vec<TxnOp>,
+    ) -> Result<WriteResult, WriteError> {
+        let cmd = LanceCommand::TxnChunk { txn_id, seq, ops };
+        self.propose(cmd).await
+    }
+
+    /// Commit a multi-table transaction. Triggers reassembly of all buffered
+    /// chunks and atomic apply across all affected tables.
+    pub async fn txn_commit(
+        &self,
+        txn_id: TxnId,
+        total_chunks: u32,
+    ) -> Result<WriteResult, WriteError> {
+        let cmd = LanceCommand::TxnCommit {
+            txn_id,
+            total_chunks,
+        };
+        self.propose(cmd).await
+    }
+
+    /// Abort a multi-table transaction. Discards all buffered chunks.
+    pub async fn txn_abort(&self, txn_id: TxnId) -> Result<WriteResult, WriteError> {
+        let cmd = LanceCommand::TxnAbort { txn_id };
         self.propose(cmd).await
     }
 

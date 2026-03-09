@@ -12,10 +12,11 @@
 //! ```text
 //! Cluster
 //!  └─ Tenant
-//!      ├─ Catalog "_otel"      (bisque-lance, auto-created)
 //!      ├─ Catalog "analytics"  (bisque-lance)
 //!      ├─ Catalog "events"     (bisque-mq)
 //!      └─ Catalog "app_db"     (bisque-libsql)
+//!  └─ Tenant "bisque" (system)
+//!      └─ Catalog "sys"        (bisque-lance, per-node OTel)
 //! ```
 //!
 //! Clients connect directly to engine nodes using scoped tokens issued

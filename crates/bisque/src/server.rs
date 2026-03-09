@@ -67,6 +67,8 @@ pub struct ServerHandle {
     pub token_manager: Arc<TokenManager>,
     /// Raft node for direct access.
     pub raft_node: Arc<LanceRaftNode>,
+    /// Per-node OTel raft node (single-node group, local telemetry).
+    pub otel_raft_node: Arc<LanceRaftNode>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     join_handle: Option<tokio::task::JoinHandle<()>>,
     manager: Arc<LanceManager>,
@@ -82,6 +84,7 @@ impl ServerHandle {
             let _ = handle.await;
         }
         self.raft_node.shutdown().await;
+        self.otel_raft_node.shutdown().await;
         self.manager.storage().stop();
     }
 }
@@ -239,6 +242,93 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 2-otel. Per-node OTel engine (single-node Raft group, local telemetry)
+    // -----------------------------------------------------------------------
+    // Group 0 is reserved for per-node OTel (meta engine starts at 1).
+    let otel_group_id: u64 = 0;
+
+    // 2-otel-a. Open separate BisqueLance engine for OTel data.
+    let otel_dir = config.data_dir.join("otel");
+    let mut otel_lance_config =
+        BisqueLanceConfig::new(&otel_dir).with_seal_index(bisque_lance::IndexSpec::fts("body"));
+    if let Some(ref uri) = config.otel_s3_uri {
+        otel_lance_config.s3_uri = Some(uri.clone());
+        otel_lance_config.s3_storage_options = config.otel_s3_storage_options.clone();
+    }
+    let otel_engine =
+        Arc::new(BisqueLance::open_with_catalog(otel_lance_config, "sys".into()).await?);
+    info!(data_dir = %otel_dir.display(), "OTel lance engine opened");
+
+    // 2-otel-b. MDBX manifest for the OTel group.
+    manifest.open_group(otel_group_id)?;
+
+    // 2-otel-c. State machine (no catalog event bus — system-level, no push events).
+    let otel_state_machine = LanceStateMachine::new(otel_engine.clone())
+        .with_catalog_name("sys")
+        .with_manifest(manifest.clone(), otel_group_id);
+
+    // 2-otel-d. Tight Raft config for single-node (fast election).
+    let otel_raft_config = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 200,
+            election_timeout_max: 400,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+
+    // 2-otel-e. Add OTel group to the shared multi-raft manager.
+    let otel_raft = manager
+        .add_group(otel_group_id, node_id, otel_raft_config, otel_state_machine)
+        .await?;
+
+    // 2-otel-f. Initialize single-node membership.
+    let mut otel_members = BTreeMap::new();
+    otel_members.insert(node_id, BasicNode::default());
+    match otel_raft.initialize(otel_members).await {
+        Ok(_) => info!(node_id, otel_group_id, "OTel raft group initialized"),
+        Err(_) if otel_raft.is_initialized().await.unwrap_or(false) => {
+            info!(
+                node_id,
+                otel_group_id, "OTel raft group already initialized"
+            );
+        }
+        Err(e) => return Err(Box::new(e)),
+    }
+
+    // 2-otel-g. Create OTel LanceRaftNode and start background tasks.
+    let otel_raft_node = Arc::new(
+        LanceRaftNode::new(otel_raft, otel_engine.clone(), node_id)
+            .with_group_id(otel_group_id)
+            .with_catalog_name("sys".into())
+            .with_write_batcher(WriteBatcherConfig::default()),
+    );
+    otel_raft_node.start();
+
+    // 2-otel-h. Wait for OTel leadership (near-instant for single-node).
+    {
+        let mut elected = false;
+        for _ in 0..20 {
+            if otel_raft_node.is_leader() {
+                elected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if elected {
+            info!(node_id, "OTel raft node is leader");
+        } else {
+            warn!(node_id, "OTel raft node is NOT leader after 1s");
+        }
+    }
+
+    // 2-otel-i. Auto-create OTel tables (system-level, always on).
+    let otel_receiver = Arc::new(OtlpReceiver::new(otel_raft_node.clone()));
+    otel_receiver.ensure_tables().await?;
+    info!("OTel tables created on per-node engine");
+
     // 2j. Bootstrap: create default admin account/user/tenant if DB is empty.
     bootstrap_admin(&meta_engine, &token_manager);
 
@@ -287,7 +377,9 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         meta_engine: meta_engine.clone(),
         token_manager: token_manager.clone(),
         raft_node: raft_node.clone(),
+        otel_raft_node: otel_raft_node.clone(),
         http_addr: config.http_addr,
+        peers: Arc::new(config.peers.clone()),
         ip_connections: Arc::new(dashmap::DashMap::new()),
         metrics: Arc::new(WsMetrics::new()),
     };
@@ -297,10 +389,8 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
     // Lance S3-compatible API routes
     let s3_routes = s3_router(s3_state);
 
-    // OTLP HTTP routes (Tempo, Prometheus/Mimir, Loki, OTLP HTTP ingest)
-    // Tables are created on-demand via the EnableOtel WS request, not at startup.
-    let otel_receiver = Arc::new(OtlpReceiver::new(raft_node.clone()));
-    let otel_routes = otel_http_router(raft_node.clone(), otel_receiver);
+    // OTLP HTTP routes — use the per-node OTel raft node (single-node group).
+    let otel_routes = otel_http_router(otel_raft_node.clone(), otel_receiver);
 
     // CORS — allow any origin so the UI can talk to the server from a different port/host.
     let cors = tower_http::cors::CorsLayer::new()
@@ -341,9 +431,9 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         }
     });
 
-    // OTLP gRPC (metrics, traces, logs)
+    // OTLP gRPC (metrics, traces, logs) — use the per-node OTel raft node.
     let otlp_addr = config.otlp_grpc_addr;
-    let otlp_node = raft_node.clone();
+    let otlp_node = otel_raft_node.clone();
     tokio::spawn(async move {
         info!(%otlp_addr, "starting OTLP gRPC server");
         if let Err(e) = serve_otlp(otlp_node, otlp_addr).await {
@@ -410,6 +500,7 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         meta_engine,
         token_manager,
         raft_node,
+        otel_raft_node,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join_handle),
         manager,
@@ -532,7 +623,7 @@ fn bootstrap_admin(meta_engine: &Arc<MetaEngine>, token_manager: &Arc<TokenManag
     info!("bootstrapping default admin account (first start)");
 
     let account_id = meta_engine
-        .create_account("default".into())
+        .create_account("bisque".into())
         .expect("bootstrap: create account");
 
     let password_hash = token::hash_password(b"admin");
@@ -545,7 +636,7 @@ fn bootstrap_admin(meta_engine: &Arc<MetaEngine>, token_manager: &Arc<TokenManag
         .expect("bootstrap: add membership");
 
     let tenant_id = meta_engine
-        .create_tenant(account_id, "default".into(), TenantLimits::default())
+        .create_tenant(account_id, "bisque".into(), TenantLimits::default())
         .expect("bootstrap: create tenant");
 
     // Create a SuperAdmin API key so the first login works
@@ -829,7 +920,19 @@ async fn list_catalogs(
         return Err(ApiError::Forbidden("access denied".into()));
     }
 
-    let catalogs = state.meta_engine.list_catalogs_for_tenant(tenant_id);
+    let mut catalogs = state.meta_engine.list_catalogs_for_tenant(tenant_id);
+    // Append synthetic sys catalog (per-node OTel)
+    catalogs.push(bisque_meta::types::CatalogEntry {
+        catalog_id: 0,
+        tenant_id,
+        name: "sys".into(),
+        engine: bisque_meta::types::EngineType::Lance,
+        raft_group_id: 0,
+        placement: vec![],
+        config: String::new(),
+        status: bisque_meta::types::CatalogStatus::Active,
+        created_at: 0,
+    });
     Ok(Json(catalogs))
 }
 

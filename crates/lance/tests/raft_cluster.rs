@@ -11,6 +11,13 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Limits the number of Raft clusters running concurrently within this test
+/// binary. Each 3-node cluster spawns heartbeat timers and election timeouts;
+/// too many in parallel starves the tokio runtime and triggers spurious
+/// elections that violate openraft debug assertions.
+static CLUSTER_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
+
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bisque_lance::{
@@ -95,10 +102,15 @@ struct TestCluster {
     pins3: Arc<VersionPinTracker>,
     flight_addr: Option<SocketAddr>,
     _dirs: Vec<tempfile::TempDir>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl TestCluster {
     async fn new() -> Self {
+        let permit = Arc::clone(&CLUSTER_SEMAPHORE)
+            .acquire_owned()
+            .await
+            .unwrap();
         let addr1 = pick_unused_local_addr();
         let addr2 = pick_unused_local_addr();
         let addr3 = pick_unused_local_addr();
@@ -335,6 +347,7 @@ impl TestCluster {
             _dirs: vec![
                 lance_dir1, lance_dir2, lance_dir3, raft_dir1, raft_dir2, raft_dir3,
             ],
+            _permit: permit,
         }
     }
 
@@ -522,7 +535,7 @@ async fn test_drop_table_emits_table_dropped_event() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_create_duplicate_table_returns_error() {
+async fn test_create_duplicate_table_is_idempotent() {
     let cluster = TestCluster::new().await;
 
     cluster
@@ -531,9 +544,12 @@ async fn test_create_duplicate_table_returns_error() {
         .await
         .unwrap();
 
-    // Second create should fail
-    let result = cluster.leader().create_table("t1", &test_schema()).await;
-    assert!(result.is_err(), "duplicate create should fail");
+    // Second create succeeds (idempotent for Raft replay safety).
+    cluster
+        .leader()
+        .create_table("t1", &test_schema())
+        .await
+        .unwrap();
 }
 
 // =============================================================================
@@ -2012,11 +2028,11 @@ async fn test_flight_sql_get_sql_info() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_drop_nonexistent_table_returns_error() {
+async fn test_drop_nonexistent_table_is_idempotent() {
     let cluster = TestCluster::new().await;
 
-    let result = cluster.leader().drop_table("nonexistent").await;
-    assert!(result.is_err(), "dropping nonexistent table should fail");
+    // Dropping a non-existent table succeeds (idempotent for Raft replay safety).
+    cluster.leader().drop_table("nonexistent").await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3505,10 +3521,15 @@ struct PartitionCluster {
     /// Shared blocked-routes set: insert (from, to) to block RPCs.
     blocked: Arc<DashSet<(u64, u64)>>,
     _dirs: Vec<tempfile::TempDir>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl PartitionCluster {
     async fn new() -> Self {
+        let permit = Arc::clone(&CLUSTER_SEMAPHORE)
+            .acquire_owned()
+            .await
+            .unwrap();
         let addr1 = pick_unused_local_addr();
         let addr2 = pick_unused_local_addr();
         let addr3 = pick_unused_local_addr();
@@ -3720,6 +3741,7 @@ impl PartitionCluster {
             _dirs: vec![
                 lance_dir1, lance_dir2, lance_dir3, raft_dir1, raft_dir2, raft_dir3,
             ],
+            _permit: permit,
         }
     }
 
@@ -4295,10 +4317,15 @@ struct ManifestCluster {
     lance_dir1: tempfile::TempDir,
     manifest_dir: tempfile::TempDir,
     _dirs: Vec<tempfile::TempDir>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl ManifestCluster {
     async fn new() -> Self {
+        let permit = Arc::clone(&CLUSTER_SEMAPHORE)
+            .acquire_owned()
+            .await
+            .unwrap();
         let addr1 = pick_unused_local_addr();
         let addr2 = pick_unused_local_addr();
 
@@ -4444,6 +4471,7 @@ impl ManifestCluster {
             lance_dir1,
             manifest_dir,
             _dirs: vec![lance_dir2, raft_dir1, raft_dir2],
+            _permit: permit,
         }
     }
 

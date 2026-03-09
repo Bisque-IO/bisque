@@ -15,6 +15,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::stream::StreamExt;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -37,8 +39,12 @@ pub struct WsState {
     pub meta_engine: Arc<bisque_meta::engine::MetaEngine>,
     pub token_manager: Arc<bisque_meta::token::TokenManager>,
     pub raft_node: Arc<bisque_lance::LanceRaftNode>,
+    /// Per-node OTel raft node (single-node group, local telemetry).
+    pub otel_raft_node: Arc<bisque_lance::LanceRaftNode>,
     /// HTTP listen address for cluster status reporting.
     pub http_addr: std::net::SocketAddr,
+    /// Peer nodes for federated sys catalog queries.
+    pub peers: Arc<Vec<(u64, std::net::SocketAddr)>>,
     /// M5/L5: Per-IP connection tracking for rate limiting.
     pub ip_connections: Arc<dashmap::DashMap<std::net::IpAddr, IpConnectionState>>,
     /// Pre-initialized metric handles — avoids inline `metrics::*!()` macro overhead in hot paths.
@@ -201,7 +207,9 @@ pub async fn unified_ws_handler(
     let meta_engine = ws_state.meta_engine.clone();
     let token_manager = ws_state.token_manager.clone();
     let raft_node = ws_state.raft_node.clone();
+    let otel_raft_node = ws_state.otel_raft_node.clone();
     let ws_metrics = ws_state.metrics.clone();
+    let peers = ws_state.peers.clone();
     let pins = state.version_pins.clone();
     let ip_connections = ws_state.ip_connections.clone();
 
@@ -233,6 +241,8 @@ pub async fn unified_ws_handler(
             meta_engine,
             token_manager,
             raft_node,
+            otel_raft_node,
+            peers,
             pins.clone(),
             session_id,
             client_ip,
@@ -280,6 +290,109 @@ where
     Ok(())
 }
 
+/// Authenticate via username/password credentials during WS handshake.
+/// Returns (AuthContext, issued_token, user_id, username, accounts_json, default_tenant_id, default_tenant_name).
+fn ws_credential_login(
+    meta_engine: &bisque_meta::engine::MetaEngine,
+    token_manager: &bisque_meta::token::TokenManager,
+    username: &str,
+    password: &str,
+) -> Result<
+    (
+        crate::auth::AuthContext,
+        String,
+        u64,
+        String,
+        Vec<serde_json::Value>,
+        Option<u64>,
+        Option<String>,
+    ),
+    String,
+> {
+    use bisque_meta::token::TokenClaims;
+    use bisque_meta::types::Scope;
+
+    let user = meta_engine
+        .find_user_by_username(username)
+        .ok_or_else(|| "invalid credentials".to_string())?;
+
+    if user.disabled {
+        return Err("account disabled".into());
+    }
+
+    if !bisque_meta::token::verify_password(&user.password_hash, password.as_bytes()) {
+        return Err("invalid credentials".into());
+    }
+
+    // Gather account memberships
+    let memberships = meta_engine.get_user_memberships(user.user_id);
+    let accounts: Vec<bisque_meta::types::Account> = memberships
+        .iter()
+        .filter_map(|m| meta_engine.get_account(m.account_id))
+        .collect();
+
+    let scopes: Vec<Scope> = memberships
+        .iter()
+        .map(|m| match m.role {
+            bisque_meta::types::AccountRole::Admin => Scope::AccountAdmin(m.account_id),
+            bisque_meta::types::AccountRole::Member => Scope::CatalogRead("*".into()),
+        })
+        .collect();
+
+    let first_account_id = accounts.first().map(|a| a.account_id);
+    let now = chrono::Utc::now().timestamp();
+    let ttl = meta_engine.config().token_ttl_secs;
+
+    // Find default tenant (needed before building claims)
+    let (default_tenant_id, default_tenant_name) = if let Some(account_id) = first_account_id {
+        meta_engine
+            .list_tenants()
+            .into_iter()
+            .find(|t| t.account_id == account_id)
+            .map(|t| (Some(t.tenant_id), Some(t.name)))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
+    let claims = TokenClaims {
+        user_id: Some(user.user_id),
+        account_id: first_account_id,
+        tenant_id: default_tenant_id.unwrap_or(0),
+        key_id: 0,
+        scopes: scopes.clone(),
+        issued_at: now,
+        expires_at: now + ttl as i64,
+    };
+    let jwt = token_manager.issue(&claims);
+
+    // Serialize accounts as JSON values (protocol uses serde_json::Value).
+    let accounts_json: Vec<serde_json::Value> = accounts
+        .iter()
+        .filter_map(|a| serde_json::to_value(a).ok())
+        .collect();
+
+    let auth_ctx = crate::auth::AuthContext {
+        user_id: Some(user.user_id),
+        account_id: first_account_id,
+        tenant_id: default_tenant_id.unwrap_or(0),
+        key_id: 0,
+        scopes,
+    };
+
+    info!(user_id = user.user_id, %username, "user logged in via WS");
+
+    Ok((
+        auth_ctx,
+        jwt,
+        user.user_id,
+        username.to_string(),
+        accounts_json,
+        default_tenant_id,
+        default_tenant_name,
+    ))
+}
+
 /// Maximum number of WAL events to replay on reconnect (R7: prevent unbounded replay).
 const WS_MAX_WAL_REPLAY: usize = 10_000;
 
@@ -291,6 +404,8 @@ async fn handle_unified_ws<S>(
     meta_engine: Arc<bisque_meta::engine::MetaEngine>,
     token_manager: Arc<bisque_meta::token::TokenManager>,
     raft_node: Arc<bisque_lance::LanceRaftNode>,
+    otel_raft_node: Arc<bisque_lance::LanceRaftNode>,
+    peers: Arc<Vec<(u64, std::net::SocketAddr)>>,
     pins: Arc<bisque_lance::version_pins::VersionPinTracker>,
     session_id: u64,
     client_ip: std::net::IpAddr,
@@ -347,13 +462,9 @@ where
 
     // --- Phase 1: Handshake ---
 
-    // 1. Send server handshake (with write timeout).
-    let catalog_seq = state.catalog_seq();
+    // 1. Send server hello (protocol version only — no auth data yet).
     let handshake_msg = ServerMessage::Handshake {
         protocol_version: WS_PROTOCOL_VERSION,
-        session_id,
-        catalog_seq,
-        server_seq: 0,
     };
     ws_write_frame(&mut ws, rmp_serde::to_vec_named(&handshake_msg)?).await?;
 
@@ -381,6 +492,8 @@ where
         ClientMessage::Handshake {
             protocol_version,
             token,
+            username,
+            password,
             last_seen_seq,
             subscribe_catalogs,
         } => {
@@ -396,26 +509,71 @@ where
                 .await;
             }
 
-            // S1/S4: Validate auth token from handshake frame.
-            let auth_ctx = match validate_token(&auth_state, &token) {
-                Ok(ctx) => {
-                    // M5: Reset auth failure counter on success.
-                    if let Some(mut entry) = ip_connections.get_mut(&client_ip) {
-                        entry.auth_failures = 0;
+            // Authenticate: credential-based login OR token-based reconnect.
+            let (
+                auth_ctx,
+                issued_token,
+                login_user_id,
+                login_username,
+                login_accounts,
+                default_tenant_id,
+                default_tenant_name,
+            ) = if !username.is_empty() && !password.is_empty() {
+                // Credential-based login — same logic as HTTP login handler.
+                match ws_credential_login(&meta_engine, &token_manager, &username, &password) {
+                    Ok(result) => {
+                        if let Some(mut entry) = ip_connections.get_mut(&client_ip) {
+                            entry.auth_failures = 0;
+                        }
+                        result
                     }
-                    ctx
-                }
-                Err(reason) => {
-                    // M5: Track auth failures per IP.
-                    warn!(session_id, %client_ip, reason, "WS auth failed");
-                    if let Some(mut entry) = ip_connections.get_mut(&client_ip) {
-                        entry.auth_failures += 1;
-                        entry.last_auth_failure = std::time::Instant::now();
+                    Err(reason) => {
+                        warn!(session_id, %client_ip, %reason, "WS credential auth failed");
+                        if let Some(mut entry) = ip_connections.get_mut(&client_ip) {
+                            entry.auth_failures += 1;
+                            entry.last_auth_failure = std::time::Instant::now();
+                        }
+                        ws_metrics.auth_failures.increment(1);
+                        return send_close_and_return(&mut ws, &reason).await;
                     }
-                    ws_metrics.auth_failures.increment(1);
-                    return send_close_and_return(&mut ws, reason).await;
                 }
+            } else if !token.is_empty() {
+                // Token-based reconnect.
+                match validate_token(&auth_state, &token) {
+                    Ok(ctx) => {
+                        if let Some(mut entry) = ip_connections.get_mut(&client_ip) {
+                            entry.auth_failures = 0;
+                        }
+                        let user_id = ctx.user_id.unwrap_or(0);
+                        (ctx, token, user_id, String::new(), vec![], None, None)
+                    }
+                    Err(reason) => {
+                        warn!(session_id, %client_ip, reason, "WS token auth failed");
+                        if let Some(mut entry) = ip_connections.get_mut(&client_ip) {
+                            entry.auth_failures += 1;
+                            entry.last_auth_failure = std::time::Instant::now();
+                        }
+                        ws_metrics.auth_failures.increment(1);
+                        return send_close_and_return(&mut ws, reason).await;
+                    }
+                }
+            } else {
+                return send_close_and_return(&mut ws, "no credentials or token provided").await;
             };
+
+            // 3. Send HandshakeComplete with session + auth data.
+            let catalog_seq = state.catalog_seq();
+            let complete_msg = ServerMessage::HandshakeComplete {
+                session_id,
+                catalog_seq,
+                token: issued_token,
+                user_id: login_user_id,
+                username: login_username,
+                accounts: login_accounts,
+                default_tenant_id,
+                default_tenant_name,
+            };
+            ws_write_frame(&mut ws, rmp_serde::to_vec_named(&complete_msg)?).await?;
 
             (last_seen_seq, auth_ctx, subscribe_catalogs)
         }
@@ -668,6 +826,36 @@ where
                             ClientMessage::Request { request_id, method } => {
                                 metrics::counter!("ws_requests", "method" => method.method_name()).increment(1);
 
+                                // ExecuteSql uses the streaming path (needs &mut ws).
+                                if let RequestMethod::ExecuteSql { catalog, sql } = method {
+                                    if let Err(e) = handle_execute_sql_streaming(
+                                        &mut ws,
+                                        request_id,
+                                        &state,
+                                        &meta_engine,
+                                        &raft_node,
+                                        &otel_raft_node,
+                                        &auth_ctx,
+                                        &catalog,
+                                        &sql,
+                                        otel_raft_node.node_id(),
+                                        &peers,
+                                    )
+                                    .await
+                                    {
+                                        let resp = ServerMessage::Response {
+                                            request_id,
+                                            result: ResponseResult::Error {
+                                                code: 500,
+                                                message: format!("SQL streaming error: {e}"),
+                                            },
+                                        };
+                                        ws_write_frame(&mut ws, rmp_serde::to_vec_named(&resp)?).await?;
+                                    }
+                                    msgs_sent += 1;
+                                    continue;
+                                }
+
                                 // Rate limit expensive requests.
                                 if method.is_expensive() {
                                     let elapsed = last_expensive_request.elapsed();
@@ -691,7 +879,7 @@ where
                                 // Execute request with timeout.
                                 let result = match tokio::time::timeout(
                                     WS_REQUEST_TIMEOUT,
-                                    handle_ws_request(&state, &meta_engine, &token_manager, &raft_node, &auth_ctx, method),
+                                    handle_ws_request(&state, &meta_engine, &token_manager, &raft_node, &otel_raft_node, &auth_ctx, method),
                                 )
                                 .await
                                 {
@@ -793,6 +981,7 @@ async fn handle_ws_request(
     meta_engine: &Arc<bisque_meta::engine::MetaEngine>,
     token_manager: &Arc<bisque_meta::token::TokenManager>,
     raft_node: &Arc<bisque_lance::LanceRaftNode>,
+    otel_raft_node: &Arc<bisque_lance::LanceRaftNode>,
     auth_ctx: &crate::auth::AuthContext,
     method: RequestMethod,
 ) -> ResponseResult {
@@ -916,11 +1105,61 @@ async fn handle_ws_request(
             }
         }
 
-        RequestMethod::GetCatalog { bucket: _ } => {
-            // PERF4: Spawn on a separate task to avoid blocking the select! loop,
-            // since get_catalog_json may do blocking I/O.
-            let state_clone = Arc::clone(state);
-            let catalog_json =
+        RequestMethod::GetCatalog { bucket } => {
+            let catalog_json = if bucket == "sys" {
+                // Route to the per-node OTel engine.
+                let otel_engine = otel_raft_node.engine().clone();
+                match tokio::spawn(async move {
+                    let tables = otel_engine.list_tables();
+                    let mut table_map = serde_json::Map::new();
+                    for name in tables {
+                        // Include schema from the table's Arrow schema
+                        let schema_json = if let Some(te) = otel_engine.get_table(&name) {
+                            if let Some(s) = te.schema().await {
+                                s.fields()
+                                    .iter()
+                                    .map(|f| {
+                                        serde_json::json!({
+                                            "name": f.name(),
+                                            "data_type": format!("{}", f.data_type()),
+                                            "nullable": f.is_nullable(),
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        table_map.insert(
+                            name,
+                            serde_json::json!({
+                                "active_version": 0,
+                                "sealed_version": 0,
+                                "schema": schema_json,
+                            }),
+                        );
+                    }
+                    serde_json::json!({
+                        "tables": table_map,
+                        "otel": { "enabled": true },
+                    })
+                })
+                .await
+                {
+                    Ok(json) => json,
+                    Err(e) => {
+                        return ResponseResult::Error {
+                            code: 500,
+                            message: format!("Internal error: {}", e),
+                        };
+                    }
+                }
+            } else {
+                // PERF4: Spawn on a separate task to avoid blocking the select! loop,
+                // since get_catalog_json may do blocking I/O.
+                let state_clone = Arc::clone(state);
                 match tokio::spawn(async move { state_clone.get_catalog_json().await }).await {
                     Ok(json) => json,
                     Err(e) => {
@@ -929,7 +1168,8 @@ async fn handle_ws_request(
                             message: format!("Internal error: {}", e),
                         };
                     }
-                };
+                }
+            };
             metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "catalog")
                 .increment(1);
             ResponseResult::Ok {
@@ -940,17 +1180,29 @@ async fn handle_ws_request(
         }
 
         RequestMethod::ListCatalogs { tenant_id } => {
-            if auth_ctx.tenant_id != tenant_id && !auth_ctx.is_super_admin() {
+            if auth_ctx.tenant_id != tenant_id && !auth_ctx.is_tenant_admin() {
                 return ResponseResult::Error {
                     code: 403,
                     message: "access denied".into(),
                 };
             }
             let catalogs = meta_engine.list_catalogs_for_tenant(tenant_id);
-            let catalogs_json: Vec<serde_json::Value> = catalogs
+            let mut catalogs_json: Vec<serde_json::Value> = catalogs
                 .iter()
                 .filter_map(|c| serde_json::to_value(c).ok())
                 .collect();
+            // Append synthetic sys catalog (per-node OTel)
+            catalogs_json.push(serde_json::json!({
+                "catalog_id": 0,
+                "tenant_id": tenant_id,
+                "name": "sys",
+                "engine": "Lance",
+                "raft_group_id": 0,
+                "placement": [],
+                "config": "",
+                "status": "active",
+                "created_at": 0
+            }));
             metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "list_catalogs")
                 .increment(1);
             ResponseResult::Ok {
@@ -1373,101 +1625,11 @@ async fn handle_ws_request(
             }
         }
 
-        RequestMethod::ExecuteSql { catalog: _, sql } => {
-            use datafusion::execution::context::SessionContext;
-
-            let engine = raft_node.engine().clone();
-            let result = tokio::spawn(async move {
-                let ctx = SessionContext::new();
-                let catalog = Arc::new(bisque_lance::postgres::BisqueLanceCatalogProvider::new(
-                    engine,
-                ));
-                ctx.register_catalog("bisque", catalog);
-
-                let df = ctx.sql(&sql).await?;
-                let schema = Arc::new(df.schema().as_arrow().clone());
-                let batches = df.collect().await?;
-                Ok::<_, datafusion::error::DataFusionError>((schema, batches))
-            })
-            .await;
-
-            match result {
-                Ok(Ok((schema, batches))) => {
-                    let columns: Vec<serde_json::Value> = schema
-                        .fields()
-                        .iter()
-                        .map(|f| {
-                            serde_json::json!({
-                                "name": f.name(),
-                                "type": format!("{}", f.data_type()),
-                                "nullable": f.is_nullable(),
-                            })
-                        })
-                        .collect();
-
-                    let mut rows = Vec::new();
-                    let mut row_count: u64 = 0;
-                    for batch in &batches {
-                        row_count += batch.num_rows() as u64;
-                        // Build formatters for each column.
-                        let formatters: Vec<_> = batch
-                            .columns()
-                            .iter()
-                            .map(|col| {
-                                arrow_cast::display::ArrayFormatter::try_new(
-                                    col.as_ref(),
-                                    &arrow_cast::display::FormatOptions::default(),
-                                )
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                            .unwrap_or_default();
-
-                        for row_idx in 0..batch.num_rows() {
-                            let mut row = serde_json::Map::new();
-                            for (col_idx, field) in schema.fields().iter().enumerate() {
-                                let val = if col_idx < formatters.len() {
-                                    let s = formatters[col_idx].value(row_idx).to_string();
-                                    // Try to parse as number or null, otherwise use string.
-                                    if batch.column(col_idx).is_null(row_idx) {
-                                        serde_json::Value::Null
-                                    } else if let Ok(n) = s.parse::<f64>() {
-                                        serde_json::json!(n)
-                                    } else if let Ok(n) = s.parse::<i64>() {
-                                        serde_json::json!(n)
-                                    } else if s == "true" {
-                                        serde_json::Value::Bool(true)
-                                    } else if s == "false" {
-                                        serde_json::Value::Bool(false)
-                                    } else {
-                                        serde_json::Value::String(s)
-                                    }
-                                } else {
-                                    serde_json::Value::Null
-                                };
-                                row.insert(field.name().clone(), val);
-                            }
-                            rows.push(serde_json::Value::Object(row));
-                        }
-                    }
-
-                    ResponseResult::Ok {
-                        data: ResponseData::ExecuteSql {
-                            columns,
-                            rows,
-                            row_count,
-                        },
-                    }
-                }
-                Ok(Err(e)) => ResponseResult::Error {
-                    code: 400,
-                    message: format!("SQL error: {e}"),
-                },
-                Err(e) => ResponseResult::Error {
-                    code: 500,
-                    message: format!("internal error: {e}"),
-                },
-            }
-        }
+        // ExecuteSql is handled directly in the message loop (streaming path).
+        RequestMethod::ExecuteSql { .. } => ResponseResult::Error {
+            code: 500,
+            message: "ExecuteSql should be handled via streaming path".into(),
+        },
 
         RequestMethod::ListAccounts => {
             if !auth_ctx.is_super_admin() {
@@ -1487,73 +1649,198 @@ async fn handle_ws_request(
         }
 
         RequestMethod::EnableOtel => {
-            // Check if OTel is already enabled by looking at catalog metadata.
-            let already_enabled = raft_node
-                .manifest()
-                .and_then(|m| m.read_catalog_meta(raft_node.group_id()).ok().flatten())
-                .map(|cm| cm.otel_enabled)
-                .unwrap_or(false);
-
-            if already_enabled {
-                let tables: Vec<String> = raft_node
-                    .engine()
-                    .list_tables()
-                    .into_iter()
-                    .filter(|t| t.starts_with("otel_"))
-                    .collect();
-                return ResponseResult::Ok {
-                    data: ResponseData::EnableOtel {
-                        tables_created: tables,
-                    },
-                };
-            }
-
-            let raft_clone = Arc::clone(raft_node);
-            match tokio::spawn(async move {
-                let receiver = bisque_lance::OtlpReceiver::new(raft_clone);
-                receiver.ensure_tables().await
-            })
-            .await
-            {
-                Ok(Ok(())) => {
-                    // Persist catalog metadata with OTel flag.
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let catalog_meta = bisque_lance::CatalogMeta {
-                        otel_enabled: true,
-                        otel_enabled_at: Some(now),
-                        otel_enabled_by: Some(format!("tenant:{}", auth_ctx.tenant_id)),
-                    };
-                    if let Some(manifest) = raft_node.manifest() {
-                        if let Err(e) =
-                            manifest.write_catalog_meta(raft_node.group_id(), &catalog_meta)
-                        {
-                            warn!("Failed to persist OTel catalog metadata: {e}");
-                        }
-                    }
-
-                    let tables_created: Vec<String> = raft_node
-                        .engine()
-                        .list_tables()
-                        .into_iter()
-                        .filter(|t| t.starts_with("otel_"))
-                        .collect();
-                    info!(count = tables_created.len(), "OTel tables enabled via WS");
-                    ResponseResult::Ok {
-                        data: ResponseData::EnableOtel { tables_created },
-                    }
-                }
-                Ok(Err(e)) => ResponseResult::Error {
-                    code: 500,
-                    message: format!("Failed to create OTel tables: {e}"),
-                },
-                Err(e) => ResponseResult::Error {
-                    code: 500,
-                    message: format!("Internal error: {e}"),
-                },
+            // OTel is always-on at the system level (per-node engine).
+            // Return the list of OTel tables from the dedicated OTel engine.
+            let tables_created: Vec<String> = otel_raft_node.engine().list_tables();
+            ResponseResult::Ok {
+                data: ResponseData::EnableOtel { tables_created },
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming SQL execution
+// ---------------------------------------------------------------------------
+
+/// Maximum serialized row data per chunk (~512 KiB).
+const SQL_CHUNK_BYTE_BUDGET: usize = 512 * 1024;
+
+/// Results smaller than this use the single-frame fast path (~1 MiB).
+/// Build column metadata JSON from an Arrow schema.
+fn build_columns_json(schema: &arrow_schema::Schema) -> Vec<serde_json::Value> {
+    schema
+        .fields()
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.name(),
+                "type": format!("{}", f.data_type()),
+                "nullable": f.is_nullable(),
+            })
+        })
+        .collect()
+}
+
+/// Execute a SQL query and stream results over the WebSocket.
+///
+/// Small results (< 1 MiB) use the existing single-frame `ExecuteSql` response.
+/// Streams via `SqlResultHeader` (columns), Arrow IPC binary frames (data), `SqlResultComplete`.
+async fn handle_execute_sql_streaming<S>(
+    ws: &mut fastwebsockets::WebSocket<S>,
+    request_id: u32,
+    state: &Arc<bisque_lance::s3_server::S3ServerState>,
+    meta_engine: &Arc<bisque_meta::engine::MetaEngine>,
+    raft_node: &Arc<bisque_lance::LanceRaftNode>,
+    otel_raft_node: &Arc<bisque_lance::LanceRaftNode>,
+    auth_ctx: &crate::auth::AuthContext,
+    catalog_name: &str,
+    sql: &str,
+    node_id: u64,
+    peers: &Arc<Vec<(u64, std::net::SocketAddr)>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    use datafusion::catalog::CatalogProvider;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::prelude::SessionConfig;
+
+    let engine = raft_node.engine().clone();
+    let otel_engine = otel_raft_node.engine().clone();
+    let tenant_name = meta_engine
+        .get_tenant(auth_ctx.tenant_id)
+        .map(|t| t.name)
+        .unwrap_or_else(|| format!("tenant_{}", auth_ctx.tenant_id));
+
+    let catalog_name = catalog_name.to_string();
+    let sql = sql.to_string();
+    let peers = peers.clone();
+
+    // Build the DataFusion context in a spawned task.
+    let ctx_result = tokio::spawn({
+        let tenant_name = tenant_name.clone();
+        let catalog_name = catalog_name.clone();
+        async move {
+            let session_config = SessionConfig::new()
+                .with_default_catalog_and_schema(&tenant_name, &catalog_name)
+                .with_create_default_catalog_and_schema(false);
+            let ctx = SessionContext::new_with_config(session_config);
+
+            let schema_provider = Arc::new(bisque_lance::postgres::BisqueLanceSchemaProvider::new(
+                engine,
+            ));
+            let catalog = Arc::new(
+                bisque_lance::postgres::BisqueLanceCatalogProvider::new_with_schema(
+                    Arc::clone(&schema_provider),
+                    &catalog_name,
+                ),
+            );
+            // Register federated sys schema (OTel engine + node_id + peers).
+            let otel_inner = Arc::new(bisque_lance::postgres::BisqueLanceSchemaProvider::new(
+                otel_engine,
+            ));
+            let sys_schema = Arc::new(bisque_lance::SysSchemaProvider::new(
+                otel_inner, node_id, peers,
+            ));
+            catalog.register_schema("sys", sys_schema)?;
+            ctx.register_catalog(&tenant_name, catalog);
+            ctx.register_udf(bisque_lance::fts::fts_match_udf());
+
+            let df = ctx.sql(&sql).await?;
+            let schema = Arc::new(df.schema().as_arrow().clone());
+            let stream = df.execute_stream().await?;
+            Ok::<_, datafusion::error::DataFusionError>((schema, stream))
+        }
+    })
+    .await;
+
+    let (schema, mut stream) = match ctx_result {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            let resp = ServerMessage::Response {
+                request_id,
+                result: ResponseResult::Error {
+                    code: 400,
+                    message: format!("SQL error: {e}"),
+                },
+            };
+            ws_write_frame(ws, rmp_serde::to_vec_named(&resp)?).await?;
+            return Ok(());
+        }
+        Err(e) => {
+            let resp = ServerMessage::Response {
+                request_id,
+                result: ResponseResult::Error {
+                    code: 500,
+                    message: format!("internal error: {e}"),
+                },
+            };
+            ws_write_frame(ws, rmp_serde::to_vec_named(&resp)?).await?;
+            return Ok(());
+        }
+    };
+
+    let columns = build_columns_json(&schema);
+
+    // Send header with column metadata (MessagePack control frame).
+    let header = ServerMessage::SqlResultHeader {
+        request_id,
+        columns,
+    };
+    ws_write_frame(ws, rmp_serde::to_vec_named(&header)?).await?;
+
+    let mut rows_so_far: u64 = 0;
+
+    /// Send a RecordBatch as an Arrow IPC binary frame.
+    /// Frame format: [4-byte request_id big-endian] ++ [Arrow IPC stream bytes]
+    macro_rules! send_arrow_batch {
+        ($ws:expr, $batch:expr) => {{
+            // Single allocation: [4-byte request_id BE] ++ [Arrow IPC stream]
+            let frame = bisque_lance::ipc::encode_record_batches_framed(
+                &request_id.to_be_bytes(),
+                &[$batch],
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            ws_write_frame($ws, frame).await?;
+        }};
+    }
+
+    /// Send error and return.
+    macro_rules! send_error {
+        ($ws:expr, $msg:expr) => {{
+            let resp = ServerMessage::Response {
+                request_id,
+                result: ResponseResult::Error {
+                    code: 400,
+                    message: $msg,
+                },
+            };
+            ws_write_frame($ws, rmp_serde::to_vec_named(&resp)?).await?;
+            return Ok(());
+        }};
+    }
+
+    // Stream all batches as Arrow IPC binary frames.
+    while let Some(batch_result) = stream.next().await {
+        match batch_result {
+            Ok(batch) => {
+                rows_so_far += batch.num_rows() as u64;
+                send_arrow_batch!(ws, batch);
+            }
+            Err(e) => send_error!(ws, format!("SQL error: {e}")),
+        }
+    }
+
+    // Send completion marker (MessagePack control frame).
+    let complete = ServerMessage::SqlResultComplete {
+        request_id,
+        row_count: rows_so_far,
+    };
+    ws_write_frame(ws, rmp_serde::to_vec_named(&complete)?).await?;
+
+    metrics::counter!("bisque_requests_total", "protocol" => "ws", "op" => "execute_sql")
+        .increment(1);
+
+    Ok(())
 }

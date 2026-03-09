@@ -134,6 +134,16 @@ pub(crate) enum ManifestCommand {
         catalog_meta: Option<CatalogMeta>,
         done: Option<tokio::sync::oneshot::Sender<()>>,
     },
+    /// Batch apply: group meta + multiple table updates + WAL events in one command.
+    /// Used by multi-table transaction commits to ensure all metadata lands in a
+    /// single MDBX write transaction.
+    ApplyBatch {
+        group_id: u64,
+        meta: GroupMeta,
+        table_updates: Vec<TableUpdate>,
+        wal_events: Vec<CatalogEvent>,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
     /// Append catalog WAL events for client sync.
     AppendWalEvents {
         group_id: u64,
@@ -936,6 +946,19 @@ impl LanceManifestManager {
                 catalog_meta,
                 done: Some(done_tx),
             },
+            ManifestCommand::ApplyBatch {
+                group_id,
+                meta,
+                table_updates,
+                wal_events,
+                ..
+            } => ManifestCommand::ApplyBatch {
+                group_id,
+                meta,
+                table_updates,
+                wal_events,
+                done: Some(done_tx),
+            },
             // WAL events are fire-and-forget only; durable not needed.
             other @ ManifestCommand::AppendWalEvents { .. } => {
                 let _ = done_tx.send(());
@@ -964,6 +987,26 @@ impl LanceManifestManager {
             group_id,
             meta: Some(GroupMeta::from_raft(last_applied, last_membership)),
             table_update,
+            done: None,
+        }
+    }
+
+    /// Build a batch manifest command for multi-table transaction commits.
+    ///
+    /// Bundles group meta, multiple table updates, and WAL events into a single
+    /// command so they land in one MDBX write transaction.
+    pub(crate) fn build_apply_batch(
+        group_id: u64,
+        last_applied: &Option<LogId<LanceTypeConfig>>,
+        last_membership: &StoredMembership<LanceTypeConfig>,
+        table_updates: Vec<TableUpdate>,
+        wal_events: Vec<CatalogEvent>,
+    ) -> ManifestCommand {
+        ManifestCommand::ApplyBatch {
+            group_id,
+            meta: GroupMeta::from_raft(last_applied, last_membership),
+            table_updates,
+            wal_events,
             done: None,
         }
     }
@@ -1020,7 +1063,7 @@ impl LanceManifestManager {
 
         loop {
             // 1. Blocking recv with timeout
-            let first = match rx.recv_timeout(Duration::from_millis(50)) {
+            let first = match rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(v) => Some(v),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => {
@@ -1127,6 +1170,36 @@ impl LanceManifestManager {
                     }
                     batch.catalog_meta = catalog_meta;
                     batch.is_snapshot = true;
+                    if let Some(d) = done {
+                        done_senders.push(d);
+                    }
+                }
+                ManifestCommand::ApplyBatch {
+                    group_id,
+                    meta,
+                    table_updates,
+                    wal_events,
+                    done,
+                } => {
+                    let batch = per_group.entry(group_id).or_insert_with(|| GroupBatch {
+                        meta: None,
+                        table_updates: HashMap::new(),
+                        wal_events: Vec::new(),
+                        catalog_meta: None,
+                        is_snapshot: false,
+                    });
+                    batch.meta = Some(meta);
+                    for tu in table_updates {
+                        match tu {
+                            TableUpdate::Set { table_name, entry } => {
+                                batch.table_updates.insert(table_name, Some(entry));
+                            }
+                            TableUpdate::Remove { table_name } => {
+                                batch.table_updates.insert(table_name, None);
+                            }
+                        }
+                    }
+                    batch.wal_events.extend(wal_events);
                     if let Some(d) = done {
                         done_senders.push(d);
                     }
@@ -1343,7 +1416,7 @@ mod tests {
         // Install snapshot with different tables
         let mut snapshot_entries = HashMap::new();
         snapshot_entries.insert(Arc::from("new_table"), make_table_entry(5));
-        env.install_snapshot(&make_group_meta(50), &snapshot_entries)
+        env.install_snapshot(&make_group_meta(50), &snapshot_entries, None)
             .unwrap();
 
         // Old table should be gone, new table present

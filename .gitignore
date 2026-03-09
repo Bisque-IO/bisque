@@ -27,6 +27,8 @@ build/
 !**/src/test/**/build/
 !**/build.gradle.kts
 
+scratch
+
 .kotlin
 web/starter
 node_modules

@@ -1,5 +1,6 @@
 import { create } from "zustand"
 import type { Account } from "@/lib/api"
+import { wsClient } from "@/lib/ws"
 import { useClusterStore } from "./cluster"
 
 interface AuthState {
@@ -140,6 +141,7 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   logout: () => {
+    wsClient.disconnect()
     for (const field of FIELDS) {
       removeStored(field)
     }
