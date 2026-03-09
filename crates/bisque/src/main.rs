@@ -54,6 +54,10 @@ struct Cli {
     /// Format: `node_id=host:port` (e.g. `2=10.0.0.2:3200,3=10.0.0.3:3200`).
     #[arg(long, value_delimiter = ',', env = "BISQUE_PEERS")]
     peers: Vec<String>,
+
+    /// Address for the MQ consumer TCP protocol server (disabled if not set).
+    #[arg(long, default_value = "0.0.0.0:4222", env = "BISQUE_MQ_ADDR")]
+    mq_addr: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -113,7 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_token_ttl_secs(cli.token_ttl_secs)
         .with_postgres_addr(cli.postgres_addr)
         .with_ui_dir(cli.ui_dir)
-        .with_peers(peers);
+        .with_peers(peers)
+        .with_mq_addr(cli.mq_addr);
 
     server::run(config).await
 }

@@ -1,0 +1,33 @@
+[package]
+name = "bisque-mq"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Distributed messaging engine for bisque: topics, queues, actors, and jobs"
+license.workspace = true
+
+[dependencies]
+bisque-raft = { workspace = true }
+openraft = { workspace = true, features = ["tokio-rt"] }
+tokio = { workspace = true, features = ["full"] }
+libmdbx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+metrics = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+crossfire = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+smallvec = { version = "1", features = ["serde"] }
+crc64fast-nvme = { workspace = true }
+cron = "0.15"
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

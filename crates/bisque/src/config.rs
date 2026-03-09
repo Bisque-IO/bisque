@@ -31,6 +31,8 @@ pub struct BisqueConfig {
     pub otel_s3_storage_options: HashMap<String, String>,
     /// Peer nodes for federated sys catalog queries: `(node_id, http_addr)`.
     pub peers: Vec<(u64, SocketAddr)>,
+    /// Optional address for the MQ consumer TCP protocol server.
+    pub mq_addr: Option<SocketAddr>,
 }
 
 impl BisqueConfig {
@@ -48,6 +50,7 @@ impl BisqueConfig {
             otel_s3_uri: None,
             otel_s3_storage_options: HashMap::new(),
             peers: Vec::new(),
+            mq_addr: None,
         }
     }
 
@@ -98,6 +101,11 @@ impl BisqueConfig {
 
     pub fn with_peers(mut self, peers: Vec<(u64, SocketAddr)>) -> Self {
         self.peers = peers;
+        self
+    }
+
+    pub fn with_mq_addr(mut self, addr: Option<SocketAddr>) -> Self {
+        self.mq_addr = addr;
         self
     }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "bisque-mq-server"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Server-side consumer handler for bisque-mq"
+license.workspace = true
+
+[dependencies]
+bisque-mq = { workspace = true }
+bisque-mq-protocol = { workspace = true }
+bytes = { workspace = true }
+metrics = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

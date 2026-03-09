@@ -29,7 +29,7 @@ use bisque_meta::MetaConfig;
 use bisque_meta::engine::MetaEngine;
 use bisque_meta::token::{self, TokenClaims, TokenManager};
 use bisque_meta::types::{
-    Account, AccountRole, CatalogEntry, EngineType, Scope, Tenant, TenantLimits,
+    Account, AccountRole, CatalogEntry, CatalogStatus, EngineType, Scope, Tenant, TenantLimits,
 };
 use bisque_raft::{
     BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
@@ -39,6 +39,7 @@ use bisque_raft::{
 use crate::auth::{AuthContext, AuthState, auth_middleware};
 use crate::config::BisqueConfig;
 use crate::error::ApiError;
+use crate::mq::MqState;
 use crate::ws::{WsMetrics, WsState, unified_ws_handler};
 
 /// Shared application state for the unified server.
@@ -46,6 +47,7 @@ use crate::ws::{WsMetrics, WsState, unified_ws_handler};
 pub struct AppState {
     pub meta_engine: Arc<MetaEngine>,
     pub token_manager: Arc<TokenManager>,
+    pub mq_state: Arc<MqState>,
 }
 
 type LanceManager = MultiRaftManager<
@@ -69,6 +71,8 @@ pub struct ServerHandle {
     pub raft_node: Arc<LanceRaftNode>,
     /// Per-node OTel raft node (single-node group, local telemetry).
     pub otel_raft_node: Arc<LanceRaftNode>,
+    /// MQ engine state (lazily provisioned via catalog).
+    pub mq_state: Arc<MqState>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     join_handle: Option<tokio::task::JoinHandle<()>>,
     manager: Arc<LanceManager>,
@@ -85,6 +89,7 @@ impl ServerHandle {
         }
         self.raft_node.shutdown().await;
         self.otel_raft_node.shutdown().await;
+        self.mq_state.shutdown().await;
         self.manager.storage().stop();
     }
 }
@@ -123,11 +128,6 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
     let meta_dir = config.data_dir.join("meta");
     let meta_engine = Arc::new(MetaEngine::open(meta_config, &meta_dir)?);
     let token_manager = Arc::new(TokenManager::new(config.token_secret.clone()));
-
-    let app_state = AppState {
-        meta_engine: meta_engine.clone(),
-        token_manager: token_manager.clone(),
-    };
 
     let auth_state = AuthState {
         token_manager: token_manager.clone(),
@@ -329,6 +329,36 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
     otel_receiver.ensure_tables().await?;
     info!("OTel tables created on per-node engine");
 
+    // -----------------------------------------------------------------------
+    // 3. MQ engine (lazily provisioned via catalog)
+    // -----------------------------------------------------------------------
+    let mq_state = Arc::new(MqState::new(
+        config.data_dir.clone(),
+        node_id,
+        config.http_addr,
+        config.mq_addr,
+        token_manager.clone(),
+        meta_engine.clone(),
+    ));
+
+    // Re-provision MQ if an Mq catalog already exists (restart path).
+    if let Some(mq_group_id) = mq_state.find_mq_group_id() {
+        mq_state
+            .ensure_provisioned(mq_group_id)
+            .await
+            .map_err(|e| e as Box<dyn std::error::Error>)?;
+    }
+
+    // -----------------------------------------------------------------------
+    // Bootstrap + S3 state
+    // -----------------------------------------------------------------------
+
+    let app_state = AppState {
+        meta_engine: meta_engine.clone(),
+        token_manager: token_manager.clone(),
+        mq_state: mq_state.clone(),
+    };
+
     // 2j. Bootstrap: create default admin account/user/tenant if DB is empty.
     bootstrap_admin(&meta_engine, &token_manager);
 
@@ -378,6 +408,7 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         token_manager: token_manager.clone(),
         raft_node: raft_node.clone(),
         otel_raft_node: otel_raft_node.clone(),
+        mq_state: mq_state.clone(),
         http_addr: config.http_addr,
         peers: Arc::new(config.peers.clone()),
         ip_connections: Arc::new(dashmap::DashMap::new()),
@@ -501,6 +532,7 @@ async fn start_inner(config: BisqueConfig) -> Result<ServerHandle, Box<dyn std::
         token_manager,
         raft_node,
         otel_raft_node,
+        mq_state,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join_handle),
         manager,
@@ -877,6 +909,13 @@ async fn create_catalog(
         return Err(ApiError::Forbidden("tenant admin scope required".into()));
     }
 
+    // For MQ catalogs, reuse existing MQ group if one exists.
+    let existing_mq_group = if req.engine == EngineType::Mq {
+        state.mq_state.find_mq_group_id()
+    } else {
+        None
+    };
+
     let result = state.meta_engine.create_catalog(
         tenant_id,
         req.name.clone(),
@@ -885,7 +924,26 @@ async fn create_catalog(
     );
 
     match result {
-        Ok((catalog_id, raft_group_id)) => {
+        Ok((catalog_id, mut raft_group_id)) => {
+            // If an MQ group already exists, update the catalog to reuse it.
+            if let Some(existing_gid) = existing_mq_group {
+                raft_group_id = existing_gid;
+            }
+
+            // Provision MQ engine on first Mq catalog creation.
+            if req.engine == EngineType::Mq {
+                if let Err(e) = state.mq_state.ensure_provisioned(raft_group_id).await {
+                    warn!(error = %e, "failed to provision MQ engine");
+                    return Err(ApiError::Internal(format!(
+                        "MQ engine provisioning failed: {e}"
+                    )));
+                }
+                // Mark catalog as active after successful provisioning.
+                let _ = state
+                    .meta_engine
+                    .update_catalog_status(catalog_id, CatalogStatus::Active);
+            }
+
             info!(catalog_id, raft_group_id, name = %req.name, "catalog created");
             Ok((
                 StatusCode::CREATED,

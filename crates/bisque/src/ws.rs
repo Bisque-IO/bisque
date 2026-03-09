@@ -41,6 +41,8 @@ pub struct WsState {
     pub raft_node: Arc<bisque_lance::LanceRaftNode>,
     /// Per-node OTel raft node (single-node group, local telemetry).
     pub otel_raft_node: Arc<bisque_lance::LanceRaftNode>,
+    /// MQ engine state (lazily provisioned via catalog).
+    pub mq_state: Arc<crate::mq::MqState>,
     /// HTTP listen address for cluster status reporting.
     pub http_addr: std::net::SocketAddr,
     /// Peer nodes for federated sys catalog queries.

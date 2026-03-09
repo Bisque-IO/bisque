@@ -9,7 +9,7 @@ use libmdbx::{
     Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, Table, TableFlags, WriteFlags,
 };
 
-const RAFT_SEGMENTS_META_TABLE: &str = "raft_segments_meta_v2";
+const RAFT_SEGMENTS_META_TABLE: &str = "raft_segments_meta_v3";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SegmentMeta {
@@ -30,6 +30,10 @@ pub(crate) struct SegmentMeta {
     /// Record types present in this segment (entries, votes, truncates, purges).
     /// Used for fast-path recovery: entry-only segments skip full CRC decode.
     pub(crate) record_type_flags: RecordTypeFlags,
+    /// Number of Entry records (vs total record_count which includes votes, etc.)
+    pub(crate) entry_count: u64,
+    /// Byte offset of the first Entry record in the segment.
+    pub(crate) first_entry_offset: u64,
 }
 
 impl SegmentMeta {
@@ -41,6 +45,12 @@ impl SegmentMeta {
         self.sealed |= other.sealed;
         self.record_count = self.record_count.max(other.record_count);
         self.record_type_flags = self.record_type_flags.merge(other.record_type_flags);
+        self.entry_count = self.entry_count.max(other.entry_count);
+        if other.first_entry_offset > 0
+            && (self.first_entry_offset == 0 || other.first_entry_offset < self.first_entry_offset)
+        {
+            self.first_entry_offset = other.first_entry_offset;
+        }
 
         match (self.min_index, other.min_index) {
             (None, x) => self.min_index = x,
@@ -71,9 +81,9 @@ impl SegmentMeta {
         k
     }
 
-    fn encode_value(&self) -> [u8; 56] {
-        // [flags:1][record_type_flags:1][pad:6][valid:8][min_i:8][max_i:8][min_ts:8][max_ts:8][record_count:8]
-        let mut v = [0u8; 56];
+    fn encode_value(&self) -> [u8; 72] {
+        // [flags:1][record_type_flags:1][pad:6][valid:8][min_i:8][max_i:8][min_ts:8][max_ts:8][record_count:8][entry_count:8][first_entry_offset:8]
+        let mut v = [0u8; 72];
         let mut flags = 0u8;
         if self.min_index.is_some() && self.max_index.is_some() {
             flags |= 1 << 0;
@@ -96,11 +106,13 @@ impl SegmentMeta {
         v[32..40].copy_from_slice(&min_ts.to_be_bytes());
         v[40..48].copy_from_slice(&max_ts.to_be_bytes());
         v[48..56].copy_from_slice(&self.record_count.to_be_bytes());
+        v[56..64].copy_from_slice(&self.entry_count.to_be_bytes());
+        v[64..72].copy_from_slice(&self.first_entry_offset.to_be_bytes());
         v
     }
 
     fn decode_value(group_id: u64, segment_id: u64, bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 56 {
+        if bytes.len() != 72 {
             return None;
         }
         let flags = bytes[0];
@@ -111,6 +123,8 @@ impl SegmentMeta {
         let min_ts = u64::from_be_bytes(bytes[32..40].try_into().ok()?);
         let max_ts = u64::from_be_bytes(bytes[40..48].try_into().ok()?);
         let record_count = u64::from_be_bytes(bytes[48..56].try_into().ok()?);
+        let entry_count = u64::from_be_bytes(bytes[56..64].try_into().ok()?);
+        let first_entry_offset = u64::from_be_bytes(bytes[64..72].try_into().ok()?);
 
         let has_idx = (flags & (1 << 0)) != 0;
         let has_ts = (flags & (1 << 1)) != 0;
@@ -127,6 +141,8 @@ impl SegmentMeta {
             sealed,
             record_count,
             record_type_flags,
+            entry_count,
+            first_entry_offset,
         })
     }
 }
@@ -442,6 +458,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         }
     }
 
@@ -458,6 +476,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         let key = meta.key_bytes();
@@ -486,6 +506,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         let encoded = meta.encode_value();
@@ -514,6 +536,8 @@ mod tests {
             sealed: true,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         let encoded = meta.encode_value();
@@ -543,6 +567,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         let encoded = meta.encode_value();
@@ -568,6 +594,8 @@ mod tests {
             sealed: true,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         let encoded = meta.encode_value();
@@ -602,6 +630,8 @@ mod tests {
             sealed: true,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         let encoded = meta.encode_value();
@@ -798,6 +828,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             };
             manifest
                 .apply_segment_updates(std::iter::once(meta))
@@ -832,6 +864,8 @@ mod tests {
             sealed: true,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         manifest
@@ -869,6 +903,8 @@ mod tests {
                 sealed: true,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
             SegmentMeta {
                 group_id: 1,
@@ -881,6 +917,8 @@ mod tests {
                 sealed: true,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
             SegmentMeta {
                 group_id: 1,
@@ -893,6 +931,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
         ];
 
@@ -928,6 +968,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
             SegmentMeta {
                 group_id: 2,
@@ -940,6 +982,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
             SegmentMeta {
                 group_id: 3,
@@ -952,6 +996,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
         ];
 
@@ -992,6 +1038,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
         manifest
             .apply_segment_updates(std::iter::once(meta1))
@@ -1009,6 +1057,8 @@ mod tests {
             sealed: true,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
         manifest
             .apply_segment_updates(std::iter::once(meta2))
@@ -1040,6 +1090,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
             SegmentMeta {
                 group_id: 1,
@@ -1052,6 +1104,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
             SegmentMeta {
                 group_id: 1,
@@ -1064,6 +1118,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
         ];
 
@@ -1094,6 +1150,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
             SegmentMeta {
                 group_id: 1,
@@ -1106,6 +1164,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
             SegmentMeta {
                 group_id: 1,
@@ -1118,6 +1178,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             },
         ];
 
@@ -1166,6 +1228,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         // Send async (try_send for test since send() is async)
@@ -1198,6 +1262,8 @@ mod tests {
                 sealed: i == 10,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             };
             sender.try_send(meta).unwrap();
         }
@@ -1236,6 +1302,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             };
             sender.try_send(meta).unwrap();
         }
@@ -1268,6 +1336,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
         sender1.try_send(meta).unwrap();
 
@@ -1303,6 +1373,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             };
             sender.try_send(meta).unwrap();
         }
@@ -1349,6 +1421,8 @@ mod tests {
             sealed: true,
             record_count: 5,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
         sender.try_send(meta).unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -1380,6 +1454,8 @@ mod tests {
                 sealed: true,
                 record_count: 50,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             };
             sender.try_send(meta).unwrap();
             std::thread::sleep(Duration::from_millis(200));
@@ -1430,6 +1506,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
         let encoded = meta.encode_value();
         let decoded = SegmentMeta::decode_value(0, 0, &encoded).unwrap();
@@ -1489,6 +1567,8 @@ mod tests {
             sealed: false,
             record_count: 5,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         let other = SegmentMeta {
@@ -1502,6 +1582,8 @@ mod tests {
             sealed: true,
             record_count: 10,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         base.merge_from(other);
@@ -1552,6 +1634,8 @@ mod tests {
                 sealed: true,
                 record_count: 10,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             })
             .collect();
 
@@ -1582,6 +1666,8 @@ mod tests {
                     sealed: false,
                     record_count: 0,
                     record_type_flags: RecordTypeFlags::default(),
+                    entry_count: 0,
+                    first_entry_offset: 0,
                 })
             })
             .collect();
@@ -1624,6 +1710,8 @@ mod tests {
                         sealed: false,
                         record_count: 0,
                         record_type_flags: RecordTypeFlags::default(),
+                        entry_count: 0,
+                        first_entry_offset: 0,
                     };
                     let _ = s.try_send(meta);
                 }
@@ -1678,6 +1766,8 @@ mod tests {
                 sealed: false,
                 record_count: 0,
                 record_type_flags: RecordTypeFlags::default(),
+                entry_count: 0,
+                first_entry_offset: 0,
             };
             sender.try_send(meta).unwrap();
         }
@@ -1715,6 +1805,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
         sender.try_send(meta).unwrap();
         drop(sender);
@@ -1745,6 +1837,8 @@ mod tests {
                     sealed: false,
                     record_count: 0,
                     record_type_flags: RecordTypeFlags::default(),
+                    entry_count: 0,
+                    first_entry_offset: 0,
                 };
                 if s.try_send(meta).is_err() {
                     break; // Channel closed
@@ -1773,6 +1867,8 @@ mod tests {
             sealed: false,
             record_count: 0,
             record_type_flags: RecordTypeFlags::from_u8(0b1111), // all flags set
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         let encoded = meta.encode_value();
@@ -1793,6 +1889,8 @@ mod tests {
             sealed: false,
             record_count: 999_999,
             record_type_flags: RecordTypeFlags::default(),
+            entry_count: 0,
+            first_entry_offset: 0,
         };
 
         let encoded = meta.encode_value();

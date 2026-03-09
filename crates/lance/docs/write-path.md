@@ -14,10 +14,10 @@ Client                WriteBatcher              Raft              State Machine
   │                       │── coalesce IPC ──    │                      │
   │                       │── processor? ──      │                      │
   │                       │── propose ──────────►│                      │
-  │                       │                      │── replicate ──────► │
-  │                       │                      │                     │── apply_append()
-  │                       │                      │◄── response ───────│
-  │◄── WriteResult ──────│◄── ack ──────────────│                      │
+  │                       │                      │── replicate ───────► │
+  │                       │                      │                      │── apply_append()
+  │                       │                      │◄── response ─────────│
+  │◄── WriteResult ───────│◄── ack ──────────────│                      │
 ```
 
 Every write returns a `WriteResult { log_index }` — the Raft log index where
@@ -222,7 +222,7 @@ Raft apply()              AsyncApplyBuffer              Lance I/O
      │── enqueue(...) ────►     │                           │
      │                          │── flush threshold ──────► │
      │                          │                      apply_append()
-     │                          │◄── done ─────────────────│
+     │                          │◄── done ──────────────────│
      │                          │── update watermark ──     │
      │                          │                           │
 ```

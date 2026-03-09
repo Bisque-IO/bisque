@@ -1,0 +1,15 @@
+[package]
+name = "bisque-mq-protocol"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Binary wire protocol for bisque-mq consumer connections"
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

@@ -1055,8 +1055,12 @@ dependencies = [
  "axum",
  "bisque-lance",
  "bisque-meta",
+ "bisque-mq",
+ "bisque-mq-protocol",
+ "bisque-mq-server",
  "bisque-protocol",
  "bisque-raft",
+ "bytes",
  "chrono",
  "clap",
  "dashmap",
@@ -1221,6 +1225,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "bisque-mq"
+version = "0.1.0"
+dependencies = [
+ "bincode 2.0.1",
+ "bisque-raft",
+ "bytes",
+ "chrono",
+ "crc64fast-nvme",
+ "cron",
+ "crossfire",
+ "dashmap",
+ "futures",
+ "libmdbx",
+ "metrics",
+ "openraft",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "bisque-mq-protocol"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "bisque-mq-server"
+version = "0.1.0"
+dependencies = [
+ "bisque-mq",
+ "bisque-mq-protocol",
+ "bytes",
+ "metrics",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bisque-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1245,7 +1298,6 @@ dependencies = [
  "futures",
  "futures-lite",
  "libmdbx",
- "lru 0.14.0",
  "memmap2",
  "openraft",
  "parking_lot",
@@ -1774,6 +1826,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38fe9239af6a04e140c7424d36d1615f37f1804700c17d5339af162add9022e0"
 dependencies = [
  "crc",
+]
+
+[[package]]
+name = "cron"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5877d3fbf742507b66bc2a1945106bd30dd8504019d596901ddd012a4dd01740"
+dependencies = [
+ "chrono",
+ "once_cell",
+ "winnow 0.6.26",
 ]
 
 [[package]]
@@ -4449,15 +4512,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lru"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f8cc7106155f10bdf99a6f379688f543ad6596a415375b36a59a054ceda1198"
-dependencies = [
- "hashbrown 0.15.5",
-]
-
-[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6431,6 +6485,9 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "smol_str"
@@ -6690,7 +6747,7 @@ dependencies = [
  "itertools 0.14.0",
  "levenshtein_automata",
  "log",
- "lru 0.12.5",
+ "lru",
  "lz4_flex 0.11.5",
  "measure_time",
  "memmap2",
@@ -7036,7 +7093,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
- "winnow",
+ "winnow 0.7.14",
 ]
 
 [[package]]
@@ -7045,7 +7102,7 @@ version = "1.0.9+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "702d4415e08923e7e1ef96cd5727c0dfed80b4d2fa25db9647fe5eb6f7c5a4c4"
 dependencies = [
- "winnow",
+ "winnow 0.7.14",
 ]
 
 [[package]]
@@ -7852,6 +7909,15 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
+
+[[package]]
+name = "winnow"
+version = "0.6.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e90edd2ac1aa278a5c4599b1d89cf03074b610800f866d4026dc199d7929a28"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "winnow"

@@ -19,13 +19,13 @@ futures = { workspace = true }
 openraft = { workspace = true, features = ["tokio-rt"] }
 
 # Other dependencies
+bincode = { workspace = true, features = ["serde"] }
 bytes = { workspace = true }
 crc64fast-nvme = { workspace = true }
 congee = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
 crossfire = { workspace = true }
-lru = { workspace = true }
 libmdbx = { workspace = true }
 memmap2 = { workspace = true }
 parking_lot = { workspace = true }

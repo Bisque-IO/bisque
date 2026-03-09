@@ -16,6 +16,9 @@ members = [
     "crates/protocol",       # bisque-protocol: Shared WebSocket protocol types
     "crates/client",         # bisque-client: Unified client for bisque clusters
     "crates/lance",          # bisque-lance: Distributed search & analytics storage engine
+    "crates/mq",             # bisque-mq: Distributed messaging engine (topics, queues, actors, jobs)
+    "crates/mq-protocol",    # bisque-mq-protocol: Binary wire protocol for MQ consumers
+    "crates/mq-server",      # bisque-mq-server: Server-side consumer handler for MQ
     "crates/meta",           # bisque-meta: Multi-tenant control plane
     "crates/bisque",         # bisque: Unified server with auth middleware
     # "moon/rapp",
@@ -190,6 +193,9 @@ zstd = "0.13"
 # maniac-usockets = { path = "crates/maniac-usockets", version = "0.1.0", default-features = false }
 bisque-client = { path = "crates/client", version = "0.1.0" }
 bisque-lance = { path = "crates/lance", version = "0.1.0" }
+bisque-mq = { path = "crates/mq", version = "0.1.0" }
+bisque-mq-protocol = { path = "crates/mq-protocol", version = "0.1.0" }
+bisque-mq-server = { path = "crates/mq-server", version = "0.1.0" }
 bisque-protocol = { path = "crates/protocol", version = "0.1.0" }
 bisque-raft = { path = "crates/raft", version = "0.1.0" }
 maniac = { path = "crates/bisque-runtime", version = "0.1.0" }

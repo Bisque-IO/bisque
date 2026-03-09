@@ -340,6 +340,10 @@ mod tests {
         fn get_purge_floor(&self, _group_id: u64) -> Option<Arc<AtomicU64>> {
             None
         }
+
+        fn get_pin_ceiling(&self, _group_id: u64) -> Option<Arc<AtomicU64>> {
+            None
+        }
     }
 
     // Simple state machine for testing

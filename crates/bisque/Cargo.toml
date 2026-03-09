@@ -17,9 +17,15 @@ path = "src/main.rs"
 # Bisque engines
 bisque-lance = { workspace = true }
 bisque-meta = { path = "../meta" }
+bisque-mq = { workspace = true }
+bisque-mq-protocol = { workspace = true }
+bisque-mq-server = { workspace = true }
 bisque-protocol = { workspace = true }
 bisque-raft = { workspace = true }
 openraft = { workspace = true, features = ["tokio-rt"] }
+
+# Protocol
+bytes = { workspace = true }
 
 # Web framework
 axum = { workspace = true }

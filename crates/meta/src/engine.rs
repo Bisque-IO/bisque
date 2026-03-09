@@ -65,7 +65,7 @@ impl MetaEngine {
             next_tenant_id: RwLock::new(1),
             next_catalog_id: RwLock::new(1),
             next_key_id: RwLock::new(1),
-            next_raft_group_id: RwLock::new(1),
+            next_raft_group_id: RwLock::new(3), // 0=OTel, 1=Lance are reserved
             db: None,
         }
     }
@@ -118,7 +118,7 @@ impl MetaEngine {
             next_tenant_id: RwLock::new(1),
             next_catalog_id: RwLock::new(1),
             next_key_id: RwLock::new(1),
-            next_raft_group_id: RwLock::new(1),
+            next_raft_group_id: RwLock::new(3), // 0=OTel, 1=Lance are reserved
             db: Some(db),
         };
 
@@ -699,6 +699,15 @@ impl MetaEngine {
             .collect()
     }
 
+    pub fn list_all_catalogs(&self) -> Vec<CatalogEntry> {
+        self.catalogs
+            .read()
+            .values()
+            .filter(|c| c.status != CatalogStatus::Deleted)
+            .cloned()
+            .collect()
+    }
+
     pub fn update_catalog_status(&self, catalog_id: u64, status: CatalogStatus) -> Result<()> {
         let mut catalogs = self.catalogs.write();
         let entry = catalogs
@@ -1002,7 +1011,7 @@ mod tests {
             .create_catalog(tid, "analytics".into(), EngineType::Lance, "{}".into())
             .unwrap();
         assert_eq!(cid, 1);
-        assert_eq!(gid, 1);
+        assert_eq!(gid, 3); // groups 0 (OTel) and 1 (Lance) are reserved
 
         let cat = engine.get_catalog(cid).unwrap();
         assert_eq!(cat.name, "analytics");
@@ -1246,7 +1255,7 @@ mod tests {
             next_tenant_id: 1,
             next_catalog_id: 1,
             next_key_id: 1,
-            next_raft_group_id: 1,
+            next_raft_group_id: 3,
         };
         engine.restore_from_snapshot(empty_snap);
         assert!(engine.list_tenants().is_empty());
@@ -1540,8 +1549,8 @@ mod tests {
             .unwrap();
         assert_eq!(c1, 1);
         assert_eq!(c2, 2);
-        assert_eq!(g1, 1);
-        assert_eq!(g2, 2);
+        assert_eq!(g1, 3); // groups 0,1 reserved
+        assert_eq!(g2, 4);
 
         let (k1, _) = engine.create_api_key(t1, vec![]).unwrap();
         let (k2, _) = engine.create_api_key(t1, vec![]).unwrap();
@@ -1569,7 +1578,7 @@ mod tests {
         assert_eq!(snap.next_tenant_id, 2);
         assert_eq!(snap.next_catalog_id, 3);
         assert_eq!(snap.next_key_id, 2);
-        assert_eq!(snap.next_raft_group_id, 3);
+        assert_eq!(snap.next_raft_group_id, 5); // started at 3, created 2 catalogs
 
         // Restore and verify new IDs continue from where we left off
         let engine2 = test_engine();
@@ -1584,7 +1593,7 @@ mod tests {
             .create_catalog(t2, "c".into(), EngineType::LibSql, "{}".into())
             .unwrap();
         assert_eq!(c3, 3);
-        assert_eq!(g3, 3);
+        assert_eq!(g3, 5); // restored counter was 5, so next allocation is 5
     }
 
     // ── Deterministic key generation ─────────────────────────────────
@@ -2048,12 +2057,12 @@ mod tests {
                 .unwrap();
             assert_eq!(t3, 3);
 
-            // Catalog IDs from 3, raft group IDs from 3.
+            // Catalog IDs from 3, raft group IDs from 5 (started at 3, created 2).
             let (c3, g3) = engine
                 .create_catalog(t3, "z".into(), EngineType::LibSql, "{}".into())
                 .unwrap();
             assert_eq!(c3, 3);
-            assert_eq!(g3, 3);
+            assert_eq!(g3, 5);
 
             // API key IDs from 2.
             let (k2, _) = engine.create_api_key(1, vec![]).unwrap();
@@ -2644,7 +2653,7 @@ mod tests {
                 .create_catalog(t2, "logs".into(), EngineType::LibSql, "{}".into())
                 .unwrap();
             assert_eq!(c3, 3);
-            assert_eq!(g3, 3);
+            assert_eq!(g3, 5); // started at 3, 2 catalogs created in phases 1+2
         }
     }
 

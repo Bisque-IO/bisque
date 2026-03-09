@@ -52,6 +52,13 @@ where
     /// group has not been initialized yet.
     fn get_purge_floor(&self, group_id: u64) -> Option<Arc<AtomicU64>>;
 
+    /// Get the pin ceiling handle for a specific group.
+    ///
+    /// The state machine layer updates this to its last applied index,
+    /// controlling which sealed segments stay pinned in memory.
+    /// Returns `None` if the group has not been initialized yet.
+    fn get_pin_ceiling(&self, group_id: u64) -> Option<Arc<AtomicU64>>;
+
     /// Stop background threads and release resources.
     ///
     /// Implementations with background threads (fsync, manifest workers)

@@ -29,15 +29,14 @@ use crate::record_format::{
 };
 use arc_swap::ArcSwap;
 use crossfire::{MAsyncTx, mpsc::Array};
-use lru::LruCache;
 use memmap2::{Mmap, MmapRaw};
 use openraft::{
     LogId, LogState, RaftTypeConfig,
     storage::{IOFlushed, RaftLogReader, RaftLogStorage},
 };
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::io;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
@@ -137,7 +136,7 @@ fn group_dir_path(base_dir: &Path, group_id: u64) -> PathBuf {
 }
 
 /// Scan a group directory for segment files, returning sorted segment IDs
-fn scan_segment_ids(group_dir: &Path) -> io::Result<Vec<u64>> {
+pub fn scan_segment_ids(group_dir: &Path) -> io::Result<Vec<u64>> {
     let mut ids = Vec::new();
     if !group_dir.exists() {
         return Ok(ids);
@@ -163,7 +162,6 @@ fn scan_segment_ids(group_dir: &Path) -> io::Result<Vec<u64>> {
 // ---------------------------------------------------------------------------
 
 /// Default maximum number of sealed segments to cache in the LRU.
-const DEFAULT_SEALED_CACHE_CAP: usize = 64;
 
 /// A single mmap'd segment file. ONE mmap per segment, used for both reading and writing.
 /// Size tracking is done via atomics — no locks on the read path.
@@ -302,11 +300,80 @@ fn bytes_from_segment(segment: &Arc<Segment>, offset: usize, len: usize) -> byte
 // MmapSegmentMap — in-memory segment tracking shared between writer and readers
 // ---------------------------------------------------------------------------
 
+/// A sealed segment pinned in memory with its entry index range.
+/// Per-segment entry location table. Built once when a segment is pinned.
+/// Enables O(1) direct Vec index lookup for entry reads — no LogIndex (Congee)
+/// or segment map (HashMap mutex) lookups needed.
+struct SegmentEntryIndex {
+    /// First entry's log index in this segment
+    base_index: u64,
+    /// (byte_offset, total_record_len) for each entry, indexed by (log_index - base_index)
+    offsets: Vec<(u64, u32)>,
+}
+
+impl SegmentEntryIndex {
+    /// O(1) direct Vec index — no locks, no hash, no concurrent data structure.
+    #[inline]
+    fn lookup(&self, log_index: u64) -> Option<(u64, u32)> {
+        let i = log_index.checked_sub(self.base_index)? as usize;
+        self.offsets.get(i).copied()
+    }
+}
+
+/// Build a SegmentEntryIndex by scanning length prefixes in a segment's mmap data.
+/// Same linear walk as recovery fast path — collects all entry offsets.
+fn build_entry_index(mmap: &[u8], valid_bytes: usize) -> SegmentEntryIndex {
+    let mut offsets = Vec::new();
+    let mut base_index = None;
+    let mut offset = 0usize;
+
+    while offset + LENGTH_SIZE <= valid_bytes {
+        let record_len =
+            u32::from_le_bytes(mmap[offset..offset + LENGTH_SIZE].try_into().unwrap()) as usize;
+        if record_len == 0 || offset + LENGTH_SIZE + record_len > valid_bytes {
+            break;
+        }
+        let total = LENGTH_SIZE + record_len;
+        let data = &mmap[offset + LENGTH_SIZE..offset + total];
+        if data.len() >= 1 + GROUP_ID_SIZE + CRC64_SIZE {
+            if let Ok(RecordType::Entry) = RecordType::try_from(data[0]) {
+                let payload = &data[1 + GROUP_ID_SIZE..data.len() - CRC64_SIZE];
+                if let Some(idx) = extract_entry_index(payload) {
+                    if base_index.is_none() {
+                        base_index = Some(idx);
+                    }
+                    offsets.push((offset as u64, total as u32));
+                }
+            }
+        }
+        offset += total;
+    }
+
+    SegmentEntryIndex {
+        base_index: base_index.unwrap_or(0),
+        offsets,
+    }
+}
+
+struct PinnedEntry {
+    segment: Arc<Segment>,
+    min_index: u64,
+    max_index: u64,
+    entry_index: Arc<SegmentEntryIndex>,
+}
+
 struct MmapSegmentMap {
-    /// Sealed segments: LRU cache indexed by segment_id. O(1) lookup, bounded memory.
-    sealed: Mutex<LruCache<u64, Arc<Segment>>>,
+    /// Segments pinned by the state machine. No eviction — explicit unpin only.
+    /// Arc'd so prefetch tasks can capture it without borrowing self.
+    pinned: Arc<Mutex<HashMap<u64, PinnedEntry>>>,
     /// Active segment: atomically swapped on rotation. No lock on read path.
     active: ArcSwap<Segment>,
+    /// Group directory for reopening segments from disk.
+    group_dir: PathBuf,
+    /// State machine's minimum required index. Segments fully below this can be purged.
+    purge_floor: Arc<AtomicU64>,
+    /// State machine's last applied index. Segments fully above this are not needed yet.
+    pin_ceiling: Arc<AtomicU64>,
 }
 
 /// Sentinel segment used as initial placeholder before the first real segment is set.
@@ -328,36 +395,159 @@ fn sentinel_segment() -> Arc<Segment> {
 }
 
 impl MmapSegmentMap {
-    fn new() -> Self {
+    fn new(group_dir: PathBuf, purge_floor: Arc<AtomicU64>, pin_ceiling: Arc<AtomicU64>) -> Self {
         Self {
-            sealed: Mutex::new(LruCache::new(
-                NonZeroUsize::new(DEFAULT_SEALED_CACHE_CAP).unwrap(),
-            )),
+            pinned: Arc::new(Mutex::new(HashMap::new())),
             active: ArcSwap::new(sentinel_segment()),
+            group_dir,
+            purge_floor,
+            pin_ceiling,
         }
     }
 
-    /// Find the segment for a given segment_id. Lock-free for active, O(1) for sealed.
+    /// Pin a sealed segment with its entry index range and entry index.
+    fn pin(
+        &self,
+        segment: Arc<Segment>,
+        min_index: u64,
+        max_index: u64,
+        entry_index: Arc<SegmentEntryIndex>,
+    ) {
+        let mut pinned = self.pinned.lock();
+        pinned.insert(
+            segment.segment_id,
+            PinnedEntry {
+                segment,
+                min_index,
+                max_index,
+                entry_index,
+            },
+        );
+    }
+
+    /// Find the segment for a given segment_id. Lock-free for active, O(1) for pinned.
+    /// Returns None if the segment is not pinned — caller must use async reopen.
     fn find_segment(&self, segment_id: u64) -> Option<Arc<Segment>> {
         // Check active first (most recent writes) — no lock
         let active = self.active.load();
         if active.segment_id == segment_id {
             return Some(Arc::clone(&active));
         }
-        // Check sealed LRU — O(1) hash lookup, brief mutex
-        {
-            let mut sealed = self.sealed.lock();
-            if let Some(seg) = sealed.get(&segment_id) {
-                return Some(Arc::clone(seg));
-            }
-        }
-        None
+        // Check pinned — O(1) hash lookup, brief mutex
+        let pinned = self.pinned.lock();
+        pinned.get(&segment_id).map(|e| Arc::clone(&e.segment))
     }
 
-    /// Add a sealed segment to the LRU cache.
-    fn add_sealed(&self, segment: Arc<Segment>) {
-        let mut sealed = self.sealed.lock();
-        sealed.put(segment.segment_id, segment);
+    /// Get segment + entry index for cached reads. Brief mutex lock.
+    /// Returns None if not pinned (active segments don't have entry indexes).
+    fn find_segment_indexed(
+        &self,
+        segment_id: u64,
+    ) -> Option<(Arc<Segment>, Arc<SegmentEntryIndex>)> {
+        let pinned = self.pinned.lock();
+        pinned
+            .get(&segment_id)
+            .map(|e| (Arc::clone(&e.segment), Arc::clone(&e.entry_index)))
+    }
+
+    /// Async reopen a sealed segment from disk via spawn_blocking.
+    /// Auto-pins if the segment falls within [purge_floor, pin_ceiling].
+    /// Builds a SegmentEntryIndex for O(1) entry lookups.
+    async fn reopen_segment(&self, segment_id: u64) -> Option<Arc<Segment>> {
+        let group_dir = self.group_dir.clone();
+        let purge_floor = Arc::clone(&self.purge_floor);
+        let pin_ceiling = Arc::clone(&self.pin_ceiling);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let path = segment_path(&group_dir, segment_id);
+            let file = std::fs::File::open(&path).ok()?;
+            let mmap = memmap2::MmapOptions::new().map_raw_read_only(&file).ok()?;
+            let file_len = file.metadata().ok()?.len();
+            let seg = Arc::new(Segment::new(segment_id, mmap, file_len, None, path));
+
+            let floor = purge_floor.load(Ordering::Acquire);
+            let ceiling = pin_ceiling.load(Ordering::Acquire);
+
+            let valid = file_len as usize;
+            let entry_index = Arc::new(build_entry_index(seg.as_slice(valid), valid));
+            let min_idx = scan_first_entry_index(seg.as_slice(valid), valid);
+            let max_idx = scan_last_entry_index(seg.as_slice(valid), valid);
+
+            let pin_info = min_idx.zip(max_idx).and_then(|(min, max)| {
+                let in_range = max >= floor && (ceiling == 0 || min <= ceiling);
+                in_range.then_some((min, max))
+            });
+
+            Some((seg, pin_info, entry_index))
+        })
+        .await
+        .ok()??;
+
+        let (seg, pin_info, entry_index) = result;
+        if let Some((min, max)) = pin_info {
+            let mut guard = self.pinned.lock();
+            guard.insert(
+                segment_id,
+                PinnedEntry {
+                    segment: Arc::clone(&seg),
+                    min_index: min,
+                    max_index: max,
+                    entry_index,
+                },
+            );
+        }
+        Some(seg)
+    }
+
+    /// Fire-and-forget prefetch: spawn a background task to reopen and pin a segment.
+    /// Builds a SegmentEntryIndex for O(1) entry lookups.
+    fn prefetch_segment(&self, segment_id: u64) {
+        // Skip if already available
+        if self.active.load().segment_id == segment_id {
+            return;
+        }
+        {
+            let pinned = self.pinned.lock();
+            if pinned.contains_key(&segment_id) {
+                return;
+            }
+        }
+
+        let group_dir = self.group_dir.clone();
+        let pinned = Arc::clone(&self.pinned);
+
+        tokio::task::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let path = segment_path(&group_dir, segment_id);
+                let file = std::fs::File::open(&path).ok()?;
+                let mmap = memmap2::MmapOptions::new().map_raw_read_only(&file).ok()?;
+                let file_len = file.metadata().ok()?.len();
+                let seg = Arc::new(Segment::new(segment_id, mmap, file_len, None, path));
+                let valid = file_len as usize;
+                let entry_index = Arc::new(build_entry_index(seg.as_slice(valid), valid));
+                let min_idx = scan_first_entry_index(seg.as_slice(valid), valid);
+                let max_idx = scan_last_entry_index(seg.as_slice(valid), valid);
+                min_idx
+                    .zip(max_idx)
+                    .map(|(min, max)| (seg, min, max, entry_index))
+            })
+            .await
+            .ok()?;
+
+            if let Some((seg, min, max, entry_index)) = result {
+                let mut guard = pinned.lock();
+                guard.insert(
+                    segment_id,
+                    PinnedEntry {
+                        segment: seg,
+                        min_index: min,
+                        max_index: max,
+                        entry_index,
+                    },
+                );
+            }
+            Some(())
+        });
     }
 
     /// Atomically swap the active segment. Returns the previous active segment.
@@ -370,45 +560,44 @@ impl MmapSegmentMap {
         self.active.store(segment);
     }
 
-    /// Remove sealed segments where their entire range is purged.
-    /// Returns paths of removed segments for file deletion.
-    fn remove_purged_segments(&self, purge_index: u64, log_index: &LogIndex) -> Vec<PathBuf> {
-        let mut sealed = self.sealed.lock();
-        let mut removed = Vec::new();
-        let ids_to_check: Vec<u64> = sealed.iter().map(|(&id, _)| id).collect();
-        for seg_id in ids_to_check {
-            if let Some(seg) = sealed.peek(&seg_id) {
-                let valid = seg.logical_size.load(Ordering::Acquire) as usize;
-                let last_idx = scan_last_entry_index(seg.as_slice(valid), valid);
-                if let Some(last) = last_idx {
-                    if last <= purge_index {
-                        removed.push(seg.path.clone());
-                        sealed.pop(&seg_id);
-                    }
-                }
+    /// Update pins: remove segments fully below `purge_up_to` (delete files)
+    /// and unpin segments fully above pin_ceiling (close but keep files).
+    fn update_pins(&self, purge_up_to: u64) -> Vec<PathBuf> {
+        let ceiling = self.pin_ceiling.load(Ordering::Acquire);
+        let mut pinned = self.pinned.lock();
+        let mut removed_paths = Vec::new();
+
+        pinned.retain(|_seg_id, entry| {
+            if entry.max_index <= purge_up_to {
+                // Fully purged — unpin and delete
+                removed_paths.push(entry.segment.path.clone());
+                false
+            } else if ceiling > 0 && entry.min_index > ceiling {
+                // Fully above pin ceiling — unpin but keep file
+                false
+            } else {
+                true
             }
-        }
-        let _ = log_index;
-        removed
+        });
+
+        removed_paths
     }
 
-    /// Remove sealed segments with first_index > after_index for truncation
+    /// Remove pinned segments with min_index > after_index for truncation.
+    /// Returns paths of removed segments for file deletion.
     fn remove_after(&self, after_index: u64) -> Vec<PathBuf> {
-        let mut sealed = self.sealed.lock();
+        let mut pinned = self.pinned.lock();
         let mut removed = Vec::new();
-        let ids_to_check: Vec<u64> = sealed.iter().map(|(&id, _)| id).collect();
-        for seg_id in ids_to_check {
-            if let Some(seg) = sealed.peek(&seg_id) {
-                let valid = seg.logical_size.load(Ordering::Acquire) as usize;
-                let first_idx = scan_first_entry_index(seg.as_slice(valid), valid);
-                if let Some(first) = first_idx {
-                    if first > after_index {
-                        removed.push(seg.path.clone());
-                        sealed.pop(&seg_id);
-                    }
-                }
+
+        pinned.retain(|_seg_id, entry| {
+            if entry.min_index > after_index {
+                removed.push(entry.segment.path.clone());
+                false
+            } else {
+                true
             }
-        }
+        });
+
         removed
     }
 }
@@ -485,6 +674,8 @@ struct SealRequest {
     record_count: u64,
     record_type_flags: RecordTypeFlags,
     manifest_tx: MAsyncTx<Array<SegmentMeta>>,
+    entry_count: u64,
+    first_entry_offset: u64,
 }
 
 /// Result of a background pre-allocation: pending, completed, or failed.
@@ -766,6 +957,8 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
                 sealed: true,
                 record_count: req.record_count,
                 record_type_flags: req.record_type_flags,
+                entry_count: req.entry_count,
+                first_entry_offset: req.first_entry_offset,
             });
         }
 
@@ -869,6 +1062,11 @@ struct WriterState {
     record_count: u64,
     group_dir: PathBuf,
     group_id: u64,
+    /// Accumulated entry offsets in the active segment.
+    /// Moved into PinnedEntry on rotation — no scanning needed.
+    entry_offsets: Vec<(u64, u32)>,
+    /// Number of entry records written to the active segment.
+    entry_count: u64,
 }
 
 impl WriterState {
@@ -986,6 +1184,10 @@ impl WriterState {
             .logical_size
             .store(valid_bytes, Ordering::Release);
 
+        // Compute first_entry_offset from collected offsets
+        let first_entry_offset = self.entry_offsets.first().map_or(0, |&(off, _)| off);
+        let entry_count = self.entry_count;
+
         // Enqueue background sealing: fsync + truncate + manifest update
         fsync_state.enqueue_seal(SealRequest {
             segment: old_active.clone(),
@@ -996,10 +1198,19 @@ impl WriterState {
             record_count,
             record_type_flags: flags,
             manifest_tx: manifest_tx.clone(),
+            entry_count,
+            first_entry_offset,
         });
 
-        // Move old segment into the sealed LRU
-        segment_map.add_sealed(old_active);
+        // Build entry index from collected offsets — zero scanning cost
+        let min_idx = self.active.min_entry_index.unwrap_or(0);
+        let max_idx = self.active.max_entry_index.unwrap_or(0);
+        let entry_index = Arc::new(SegmentEntryIndex {
+            base_index: min_idx,
+            offsets: std::mem::take(&mut self.entry_offsets),
+        });
+        self.entry_count = 0;
+        segment_map.pin(old_active, min_idx, max_idx, entry_index);
 
         self.active = new_seg;
         Ok(())
@@ -1166,6 +1377,9 @@ struct MmapGroupState<C: RaftTypeConfig> {
     /// Floor below which purge() will not remove log entries.
     /// Set externally by the state machine layer. 0 = no constraint.
     purge_floor: Arc<AtomicU64>,
+    /// Last applied index from the state machine.
+    /// Segments fully above this are not needed yet. 0 = unconstrained.
+    pin_ceiling: Arc<AtomicU64>,
 }
 
 impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
@@ -1191,7 +1405,13 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         std::fs::create_dir_all(group_dir)?;
 
         let log_index = Arc::new(LogIndex::new());
-        let segment_map = Arc::new(MmapSegmentMap::new());
+        let purge_floor = Arc::new(AtomicU64::new(0));
+        let pin_ceiling = Arc::new(AtomicU64::new(0));
+        let segment_map = Arc::new(MmapSegmentMap::new(
+            group_dir.to_path_buf(),
+            Arc::clone(&purge_floor),
+            Arc::clone(&pin_ceiling),
+        ));
 
         // Load manifest data for this group
         let manifest_segments = manifest.read_group_segments(group_id).unwrap_or_default();
@@ -1238,6 +1458,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                 if m.sealed && m.record_type_flags.has_only_entries() {
                     let mut offset = 0usize;
                     let mut entry_index = m.min_index.unwrap_or(0);
+                    let mut entry_offsets = Vec::new();
                     while offset + LENGTH_SIZE <= valid {
                         let record_len = u32::from_le_bytes(
                             mmap_ro[offset..offset + LENGTH_SIZE].try_into().unwrap(),
@@ -1254,6 +1475,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                                 len: total as u32,
                             },
                         );
+                        entry_offsets.push((offset as u64, total as u32));
                         entry_index += 1;
                         offset += total;
                     }
@@ -1289,13 +1511,18 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                     }
 
                     let mmap_raw = memmap2::MmapOptions::new().map_raw_read_only(&file)?;
-                    segment_map.add_sealed(Arc::new(Segment::new(
-                        seg_id,
-                        mmap_raw,
-                        valid as u64,
-                        None,
-                        path,
-                    )));
+                    let seg_min = m.min_index.unwrap_or(0);
+                    let seg_max = m.max_index.unwrap_or(0);
+                    let entry_index = Arc::new(SegmentEntryIndex {
+                        base_index: seg_min,
+                        offsets: entry_offsets,
+                    });
+                    segment_map.pin(
+                        Arc::new(Segment::new(seg_id, mmap_raw, valid as u64, None, path)),
+                        seg_min,
+                        seg_max,
+                        entry_index,
+                    );
                     continue;
                 }
             }
@@ -1333,17 +1560,21 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                     sealed: true,
                     record_count: scan.record_count,
                     record_type_flags: scan.record_type_flags,
+                    entry_count: 0,
+                    first_entry_offset: 0,
                 });
             }
 
             let mmap_raw = memmap2::MmapOptions::new().map_raw_read_only(&file)?;
-            segment_map.add_sealed(Arc::new(Segment::new(
-                seg_id,
-                mmap_raw,
-                valid as u64,
-                None,
-                path,
-            )));
+            let seg_min = scan.min_entry_index.unwrap_or(0);
+            let seg_max = scan.max_entry_index.unwrap_or(0);
+            let entry_index = Arc::new(build_entry_index(&mmap_ro[..valid], valid));
+            segment_map.pin(
+                Arc::new(Segment::new(seg_id, mmap_raw, valid as u64, None, path)),
+                seg_min,
+                seg_max,
+                entry_index,
+            );
         }
 
         // Open or create active (tail) segment
@@ -1431,6 +1662,8 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             record_count: 0,
             group_dir: group_dir.to_path_buf(),
             group_id,
+            entry_offsets: Vec::new(),
+            entry_count: 0,
         };
 
         let manifest_tx = manifest.sender();
@@ -1447,7 +1680,8 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             config: config.clone(),
             manifest_tx,
             fsync_state,
-            purge_floor: Arc::new(AtomicU64::new(0)),
+            purge_floor,
+            pin_ceiling,
         })
     }
 
@@ -1764,6 +1998,50 @@ impl<C: RaftTypeConfig> MmapPerGroupLogStorage<C> {
             .get(group_id)
             .map(|state| state.purge_floor.clone())
     }
+
+    /// Get the pin ceiling handle for a specific group.
+    /// Returns `None` if the group has not been initialized yet.
+    pub fn get_pin_ceiling(&self, group_id: u64) -> Option<Arc<AtomicU64>> {
+        self.groups
+            .get(group_id)
+            .map(|state| state.pin_ceiling.clone())
+    }
+
+    /// Get a segment prefetcher handle for a specific group.
+    /// Returns `None` if the group has not been initialized yet.
+    pub fn get_prefetcher(&self, group_id: u64) -> Option<SegmentPrefetcher> {
+        self.groups.get(group_id).map(|state| SegmentPrefetcher {
+            log_index: Arc::clone(&state.log_index),
+            segment_map: Arc::clone(&state.segment_map),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SegmentPrefetcher — lightweight handle for state machine prefetching
+// ---------------------------------------------------------------------------
+
+/// Handle given to the state machine for speculatively prefetching the next segment.
+/// Call `prefetch_next(applied_index)` after each apply batch to open the next
+/// segment in the background before the state machine needs it.
+pub struct SegmentPrefetcher {
+    log_index: Arc<LogIndex>,
+    segment_map: Arc<MmapSegmentMap>,
+}
+
+impl SegmentPrefetcher {
+    /// Prefetch the segment after the one containing `applied_index`.
+    /// Fire-and-forget: spawns a background task, does not block.
+    pub fn prefetch_next(&self, applied_index: u64) {
+        if let Some(loc) = self.log_index.get(applied_index) {
+            self.segment_map.prefetch_segment(loc.segment_id + 1);
+        }
+    }
+
+    /// Return the segment ID that contains the given log index, if known.
+    pub fn segment_id_for(&self, log_index: u64) -> Option<u64> {
+        self.log_index.get(log_index).map(|loc| loc.segment_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1806,8 +2084,29 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
         self.state.purge_floor.clone()
     }
 
-    /// Read an entry from mmap by index
-    fn read_entry_from_mmap(&self, index: u64) -> io::Result<Option<C::Entry>>
+    /// Get the pin ceiling handle.
+    /// The state machine layer updates this to its last applied index,
+    /// controlling which segments stay pinned in memory.
+    pub fn pin_ceiling(&self) -> Arc<AtomicU64> {
+        self.state.pin_ceiling.clone()
+    }
+
+    /// Get a prefetcher handle for the state machine.
+    /// The state machine calls `prefetch_next(applied_index)` after each apply
+    /// batch to speculatively open the next segment before it's needed.
+    pub fn prefetcher(&self) -> SegmentPrefetcher {
+        SegmentPrefetcher {
+            log_index: Arc::clone(&self.state.log_index),
+            segment_map: Arc::clone(&self.state.segment_map),
+        }
+    }
+
+    /// Decode an entry from a segment at the given location.
+    fn decode_entry_from_segment(
+        &self,
+        segment: &Segment,
+        loc: &LogLocation,
+    ) -> io::Result<Option<C::Entry>>
     where
         C: RaftTypeConfig<
                 NodeId = u64,
@@ -1819,16 +2118,6 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
             >,
         C::D: Decode,
     {
-        let loc = match self.state.log_index.get(index) {
-            Some(loc) => loc,
-            None => return Ok(None),
-        };
-
-        let segment = match self.state.segment_map.find_segment(loc.segment_id) {
-            Some(seg) => seg,
-            None => return Ok(None),
-        };
-
         let valid_bytes = segment.logical_size.load(Ordering::Acquire) as usize;
         let start = loc.offset as usize;
         let end = start + loc.len as usize;
@@ -1941,11 +2230,55 @@ where
             Bound::Unbounded => u64::MAX,
         };
 
+        // Clamp end to last_index+1 so the cached fast path doesn't read
+        // beyond truncation boundaries (entry index has stale offsets).
+        let last = self.state.last_index.load(Ordering::Acquire);
+        let end = end.min(last + 1);
+
         let expected_len = end.saturating_sub(start).min(1024) as usize;
         let mut entries = Vec::with_capacity(expected_len);
 
+        // Cache: (segment_id, segment_ref, entry_index) — avoids per-entry
+        // LogIndex + segment map lookups for entries in the same segment.
+        let mut cached: Option<(u64, Arc<Segment>, Arc<SegmentEntryIndex>)> = None;
+
         for idx in start..end {
-            if let Some(entry) = self.read_entry_from_mmap(idx)? {
+            // Fast path: use cached segment's local entry index (direct Vec lookup)
+            if let Some((_, ref seg, ref entry_idx)) = cached {
+                if let Some((offset, len)) = entry_idx.lookup(idx) {
+                    let loc = LogLocation {
+                        segment_id: 0, // unused — we have the segment already
+                        offset,
+                        len,
+                    };
+                    if let Some(entry) = self.decode_entry_from_segment(seg, &loc)? {
+                        entries.push(entry);
+                        continue;
+                    }
+                }
+            }
+
+            // Slow path: entry not in cached segment — look up via LogIndex + segment map
+            let loc = match self.state.log_index.get(idx) {
+                Some(loc) => loc,
+                None => break,
+            };
+
+            let segment = match self.state.segment_map.find_segment(loc.segment_id) {
+                Some(seg) => seg,
+                None => match self.state.segment_map.reopen_segment(loc.segment_id).await {
+                    Some(seg) => seg,
+                    None => break,
+                },
+            };
+
+            if let Some(entry) = self.decode_entry_from_segment(&segment, &loc)? {
+                // Update cache to this entry's segment (if pinned with an entry index)
+                cached = self
+                    .state
+                    .segment_map
+                    .find_segment_indexed(loc.segment_id)
+                    .map(|(seg, idx)| (loc.segment_id, seg, idx));
                 entries.push(entry);
             } else {
                 break;
@@ -2139,6 +2472,8 @@ where
                 writer.active.max_entry_index = Some(entry_index);
                 writer.record_type_flags.has_entry = true;
                 writer.record_count += 1;
+                writer.entry_offsets.push((abs_offset, record_len));
+                writer.entry_count += 1;
             }
 
             writer.update_read_view();
@@ -2243,12 +2578,9 @@ where
         };
         self.state.last_purged_log_id.store(Some(&effective_log_id));
 
-        // Purge from LogIndex and remove old segments
+        // Purge from LogIndex and update pins (removes segments below purge index)
         self.state.log_index.purge_to(index);
-        let removed = self
-            .state
-            .segment_map
-            .remove_purged_segments(index, &self.state.log_index);
+        let removed = self.state.segment_map.update_pins(index);
         for path in &removed {
             let _ = std::fs::remove_file(path);
         }
@@ -2292,6 +2624,10 @@ where
 
     fn get_purge_floor(&self, group_id: u64) -> Option<Arc<AtomicU64>> {
         MmapPerGroupLogStorage::get_purge_floor(self, group_id)
+    }
+
+    fn get_pin_ceiling(&self, group_id: u64) -> Option<Arc<AtomicU64>> {
+        MmapPerGroupLogStorage::get_pin_ceiling(self, group_id)
     }
 
     fn stop(&self) {
@@ -7167,21 +7503,19 @@ mod tests {
     }
 
     #[test]
-    fn test_sealed_lru_eviction() {
-        // Create more sealed segments than the LRU cache capacity.
-        // Old segments get evicted and their entries become unreadable (by design).
-        // Recent entries in the active segment remain readable.
+    fn test_segment_pinning_and_reopen() {
+        // Segments within pin range stay pinned; unpinned segments
+        // are reopened from disk on demand via async reopen.
         run_async(async {
             let tmp = TempDir::new().unwrap();
-            // Use 256 byte segments — small enough to create many
             let config = MmapStorageConfig::new(tmp.path())
                 .with_segment_size(256)
                 .with_fsync_delay(Duration::from_millis(0));
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
             let mut log = storage.get_log_storage(0).await.unwrap();
 
-            // Write enough entries to create > 64 segments (DEFAULT_SEALED_CACHE_CAP)
-            let total = 500u64;
+            // Write enough entries to create many segments
+            let total = 100u64;
             for i in 1..=total {
                 let entries = vec![make_entry(i, 1)];
                 let (cb, rx) = make_callback();
@@ -7191,21 +7525,40 @@ mod tests {
 
             let seg_count = count_segment_files(tmp.path());
             assert!(
-                seg_count > 64,
-                "Should have more segments than LRU cap: got {}",
+                seg_count > 4,
+                "Should have many segments: got {}",
                 seg_count
             );
 
-            // The most recent entry (in active segment) should always be readable
-            let result = log.try_get_log_entries(total..total + 1).await.unwrap();
-            assert_eq!(result.len(), 1, "Most recent entry should be readable");
-
-            // Earliest entries may be evicted from LRU — reading all should return fewer
+            // All entries should be readable (all segments pinned after rotation)
             let all = log.try_get_log_entries(1..total + 1).await.unwrap();
-            assert!(
-                all.len() < total as usize,
-                "LRU eviction should make some old entries unreadable, got all {}",
+            assert_eq!(
+                all.len(),
+                total as usize,
+                "All entries should be readable, got {}",
                 all.len()
+            );
+
+            // Set pin_ceiling to a low value so segments above it get unpinned
+            let ceiling = log.pin_ceiling();
+            ceiling.store(10, Ordering::Release);
+            // Manually call update_pins with purge_up_to=4 (purge entries <= 4)
+            let removed = log.state.segment_map.update_pins(4);
+            // Segments fully below floor=5 may be removed
+            // Segments fully above ceiling=10 should be unpinned (not deleted)
+            // Either way, all entries in range should still be readable via reopen
+            let _ = removed;
+
+            // Entries in [5, 10] range should be readable directly (pinned)
+            let mid = log.try_get_log_entries(5..11).await.unwrap();
+            assert!(mid.len() > 0, "Entries in pin range should be readable");
+
+            // Entries above pin ceiling should still be readable via async reopen
+            let high = log.try_get_log_entries(50..51).await.unwrap();
+            assert_eq!(
+                high.len(),
+                1,
+                "Entry above pin ceiling should be readable via reopen"
             );
 
             storage.stop();
@@ -7731,6 +8084,421 @@ mod tests {
             // All 100 entries should be readable
             let result = log.try_get_log_entries(1..101).await.unwrap();
             assert_eq!(result.len(), 100, "all 100 entries should be readable");
+
+            storage.stop();
+        });
+    }
+
+    // ===================================================================
+    // Pinning & caching — comprehensive tests
+    // ===================================================================
+
+    #[test]
+    fn test_pin_ceiling_retains_segments_in_range() {
+        // Segments with entries up to pin_ceiling stay pinned;
+        // segments above ceiling are unpinned (but remain on disk).
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(256)
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let total = 100u64;
+            for i in 1..=total {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Set pin ceiling to 50, purge nothing
+            let ceiling = log.pin_ceiling();
+            ceiling.store(50, Ordering::Release);
+            log.state.segment_map.update_pins(0);
+
+            // Verify pinned map only contains segments within ceiling
+            {
+                let pinned = log.state.segment_map.pinned.lock();
+                for (_seg_id, entry) in pinned.iter() {
+                    assert!(
+                        entry.min_index <= 50,
+                        "Pinned segment should have min_index <= 50, got min={}",
+                        entry.min_index
+                    );
+                }
+            }
+
+            // Entries 1..=50 should be readable (pinned)
+            let low = log.try_get_log_entries(1..51).await.unwrap();
+            assert_eq!(low.len(), 50, "Entries in pin range should be readable");
+
+            // Entries 51..=100 should still be readable via async reopen
+            let high = log.try_get_log_entries(51..101).await.unwrap();
+            assert_eq!(
+                high.len(),
+                50,
+                "Entries above pin ceiling should be readable via reopen"
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_prefetch_loads_next_segment() {
+        // prefetch_next should load the next segment into the pinned map.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(256)
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write enough to create several segments
+            for i in 1..=50 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Pick an entry and find the next segment
+            let loc = log.state.log_index.get(5).expect("entry 5 should exist");
+            let current_seg_id = loc.segment_id;
+            let next_seg_id = current_seg_id + 1;
+
+            // Manually remove the next segment from pinned map
+            {
+                let mut pinned = log.state.segment_map.pinned.lock();
+                pinned.remove(&next_seg_id);
+            }
+
+            // Verify next segment is NOT currently pinned
+            assert!(
+                log.state
+                    .segment_map
+                    .find_segment_indexed(next_seg_id)
+                    .is_none(),
+                "Next segment should not be pinned after manual removal"
+            );
+
+            // Prefetch next segment (prefetch_next loads segment_id+1 from the segment containing the given index)
+            let prefetcher = log.prefetcher();
+            prefetcher.prefetch_next(5);
+
+            // Give background task time to complete
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                if log
+                    .state
+                    .segment_map
+                    .find_segment_indexed(next_seg_id)
+                    .is_some()
+                {
+                    break;
+                }
+            }
+
+            // Verify next segment is now pinned via prefetch
+            assert!(
+                log.state
+                    .segment_map
+                    .find_segment_indexed(next_seg_id)
+                    .is_some(),
+                "Next segment should be pinned after prefetch"
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_entry_index_correctness_multi_segment() {
+        // Verify SegmentEntryIndex returns correct results across pinned segments.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(256)
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let total = 50u64;
+            for i in 1..=total {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // All sealed segments should be pinned — check each entry index
+            let pinned = log.state.segment_map.pinned.lock();
+            for (_seg_id, entry) in pinned.iter() {
+                let idx = &entry.entry_index;
+
+                // base_index should match min_index
+                assert_eq!(
+                    idx.base_index, entry.min_index,
+                    "base_index should match min_index"
+                );
+
+                // Every index in [min, max] should return Some
+                for log_idx in entry.min_index..=entry.max_index {
+                    assert!(
+                        idx.lookup(log_idx).is_some(),
+                        "lookup({}) should return Some for segment with range [{}, {}]",
+                        log_idx,
+                        entry.min_index,
+                        entry.max_index
+                    );
+                }
+
+                // Index below min should return None
+                if entry.min_index > 0 {
+                    assert!(
+                        idx.lookup(entry.min_index - 1).is_none(),
+                        "lookup below min_index should return None"
+                    );
+                }
+
+                // Index above max should return None
+                assert!(
+                    idx.lookup(entry.max_index + 1).is_none(),
+                    "lookup above max_index should return None"
+                );
+            }
+
+            drop(pinned);
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_pin_and_truncate_interaction() {
+        // Truncation should remove pinned segments above the truncation point.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(256)
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=100 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            log.pin_ceiling().store(80, Ordering::Release);
+
+            // Truncate after index 50
+            let lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 50,
+            };
+            log.truncate_after(Some(lid)).await.unwrap();
+
+            // Entries 1..=50 should be readable
+            let low = log.try_get_log_entries(1..51).await.unwrap();
+            assert_eq!(
+                low.len(),
+                50,
+                "Entries up to truncation point should survive"
+            );
+
+            // Entries above 50 should be gone
+            let high = log.try_get_log_entries(51..52).await.unwrap();
+            assert_eq!(
+                high.len(),
+                0,
+                "Entries above truncation point should be gone"
+            );
+
+            // Verify no pinned segments have min_index > 50
+            {
+                let pinned = log.state.segment_map.pinned.lock();
+                for (_seg_id, entry) in pinned.iter() {
+                    assert!(
+                        entry.min_index <= 50,
+                        "No pinned segment should have min_index > 50 after truncate, got {}",
+                        entry.min_index
+                    );
+                }
+            }
+
+            // Write new entries after truncation point
+            for i in 51..=60 {
+                let entries = vec![make_entry(i, 2)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let result = log.try_get_log_entries(51..61).await.unwrap();
+            assert_eq!(
+                result.len(),
+                10,
+                "New entries after truncation should be readable"
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_pin_and_purge_interaction() {
+        // Purge should remove pinned segments AND their files for fully-purged segments.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(256)
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=100 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let seg_count_before = count_segment_files(tmp.path());
+            log.pin_ceiling().store(80, Ordering::Release);
+
+            // Purge up to index 30
+            let purge_lid = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 30,
+            };
+            log.purge(purge_lid).await.unwrap();
+
+            // Some segment files should have been deleted
+            let seg_count_after = count_segment_files(tmp.path());
+            assert!(
+                seg_count_after < seg_count_before,
+                "Purge should delete segment files: before={}, after={}",
+                seg_count_before,
+                seg_count_after
+            );
+
+            // Verify no pinned segment has max_index <= 30
+            {
+                let pinned = log.state.segment_map.pinned.lock();
+                for (_seg_id, entry) in pinned.iter() {
+                    assert!(
+                        entry.max_index > 30,
+                        "Purged segment should not be pinned, got max_index={}",
+                        entry.max_index
+                    );
+                }
+            }
+
+            // Entries 31..=100 should still be readable
+            let result = log.try_get_log_entries(31..101).await.unwrap();
+            assert_eq!(
+                result.len(),
+                70,
+                "Entries after purge point should be readable"
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_cached_reads_same_segment() {
+        // Reading many entries from a single large segment exercises the
+        // try_get_log_entries cache hit (same segment) fast path.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(1024 * 1024) // 1 MB — all entries fit in one segment
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let total = 50u64;
+            for i in 1..=total {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Should have only 1 segment (active) — no rotations
+            let seg_count = count_segment_files(tmp.path());
+            assert_eq!(seg_count, 1, "All entries should fit in one segment");
+
+            // Read all entries — exercises cache hit path
+            let result = log.try_get_log_entries(1..total + 1).await.unwrap();
+            assert_eq!(result.len(), total as usize);
+
+            // Verify data integrity
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(entry.log_id.index, (i + 1) as u64);
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_cached_reads_across_segment_boundaries() {
+        // Reading entries spanning multiple segments exercises the
+        // cache miss / segment transition path in try_get_log_entries.
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(256) // Small segments — many transitions
+                .with_fsync_delay(Duration::from_millis(0));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            let total = 100u64;
+            for i in 1..=total {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let seg_count = count_segment_files(tmp.path());
+            assert!(
+                seg_count >= 3,
+                "Should span multiple segments, got {}",
+                seg_count
+            );
+
+            // Read ALL entries in one call — crosses segment boundaries
+            let result = log.try_get_log_entries(1..total + 1).await.unwrap();
+            assert_eq!(
+                result.len(),
+                total as usize,
+                "All entries should be readable across segment boundaries"
+            );
+
+            // Verify data integrity across transitions
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(
+                    entry.log_id.index,
+                    (i + 1) as u64,
+                    "Entry {} should have correct index",
+                    i + 1
+                );
+            }
 
             storage.stop();
         });
