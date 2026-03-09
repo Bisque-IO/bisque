@@ -583,6 +583,8 @@ mod tests {
             value: Bytes::from_static(b"test"),
             headers: Vec::new(),
             timestamp: 1000,
+            ttl_ms: None,
+            routing_key: None,
         }
     }
 

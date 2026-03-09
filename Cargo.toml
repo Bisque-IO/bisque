@@ -19,6 +19,10 @@ members = [
     "crates/mq",             # bisque-mq: Distributed messaging engine (topics, queues, actors, jobs)
     "crates/mq-protocol",    # bisque-mq-protocol: Binary wire protocol for MQ consumers
     "crates/mq-server",      # bisque-mq-server: Server-side consumer handler for MQ
+    "crates/mq-sqs",         # bisque-mq-sqs: SQS-compatible HTTP API adapter
+    "crates/mq-mqtt",        # bisque-mq-mqtt: MQTT 3.1.1/5.0 protocol adapter
+    "crates/mq-amqp",        # bisque-mq-amqp: AMQP 0-9-1 protocol adapter
+    "crates/mq-kafka",       # bisque-mq-kafka: Kafka binary protocol adapter
     "crates/meta",           # bisque-meta: Multi-tenant control plane
     "crates/bisque",         # bisque: Unified server with auth middleware
     # "moon/rapp",
@@ -196,6 +200,10 @@ bisque-lance = { path = "crates/lance", version = "0.1.0" }
 bisque-mq = { path = "crates/mq", version = "0.1.0" }
 bisque-mq-protocol = { path = "crates/mq-protocol", version = "0.1.0" }
 bisque-mq-server = { path = "crates/mq-server", version = "0.1.0" }
+bisque-mq-sqs = { path = "crates/mq-sqs", version = "0.1.0" }
+bisque-mq-mqtt = { path = "crates/mq-mqtt", version = "0.1.0" }
+bisque-mq-amqp = { path = "crates/mq-amqp", version = "0.1.0" }
+bisque-mq-kafka = { path = "crates/mq-kafka", version = "0.1.0" }
 bisque-protocol = { path = "crates/protocol", version = "0.1.0" }
 bisque-raft = { path = "crates/raft", version = "0.1.0" }
 maniac = { path = "crates/bisque-runtime", version = "0.1.0" }

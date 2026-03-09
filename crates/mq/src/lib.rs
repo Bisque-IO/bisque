@@ -3,6 +3,7 @@ pub mod codec;
 pub mod config;
 pub mod consumer;
 pub mod engine;
+pub mod exchange;
 pub mod job;
 pub mod manifest;
 pub mod producer;

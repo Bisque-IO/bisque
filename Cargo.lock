@@ -1252,6 +1252,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "bisque-mq-amqp"
+version = "0.1.0"
+dependencies = [
+ "bisque-mq",
+ "bytes",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bisque-mq-kafka"
+version = "0.1.0"
+dependencies = [
+ "bisque-mq",
+ "bytes",
+ "crc32fast",
+ "metrics",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bisque-mq-mqtt"
+version = "0.1.0"
+dependencies = [
+ "bisque-mq",
+ "bytes",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bisque-mq-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1271,6 +1318,26 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "bisque-mq-sqs"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "bisque-mq",
+ "bytes",
+ "chrono",
+ "metrics",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

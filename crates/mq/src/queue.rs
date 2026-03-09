@@ -492,6 +492,8 @@ mod tests {
             value: Bytes::from(value.to_vec()),
             headers: Vec::new(),
             timestamp: 1000,
+            ttl_ms: None,
+            routing_key: None,
         }
     }
 

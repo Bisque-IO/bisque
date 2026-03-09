@@ -25,6 +25,13 @@ pub struct MessagePayload {
     #[serde(default)]
     pub headers: Vec<(String, Bytes)>,
     pub timestamp: u64,
+    /// Per-message time-to-live in milliseconds.
+    /// If set, the message expires at `timestamp + ttl_ms`.
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    /// Routing key for exchange-based routing (AMQP/MQTT topic patterns).
+    #[serde(default)]
+    pub routing_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +53,41 @@ pub enum EntityType {
     Queue,
     ActorNamespace,
     Job,
+    Exchange,
+}
+
+// =============================================================================
+// Exchange Types (for AMQP/MQTT routing)
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExchangeType {
+    /// Delivers to all bound queues (fanout).
+    Fanout,
+    /// Delivers to queues whose binding key exactly matches the routing key.
+    Direct,
+    /// Delivers to queues whose binding pattern matches the routing key
+    /// using AMQP-style wildcards (`*` = one word, `#` = zero or more words).
+    /// Also supports MQTT-style (`+` = one level, `#` = multi-level).
+    Topic,
+}
+
+impl Default for ExchangeType {
+    fn default() -> Self {
+        Self::Fanout
+    }
+}
+
+/// A binding from an exchange to a queue with an optional routing key pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Binding {
+    pub binding_id: u64,
+    pub exchange_id: u64,
+    pub queue_id: u64,
+    /// Routing key pattern. For direct exchanges this is a literal match.
+    /// For topic exchanges this supports `*` and `#` wildcards.
+    #[serde(default)]
+    pub routing_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +317,36 @@ pub enum MqCommand {
         queue_id: u64,
         before_timestamp: u64,
     },
+    /// Purge all messages from a queue.
+    PurgeQueue {
+        queue_id: u64,
+    },
+    /// Get queue attributes (read-only, does not go through Raft).
+    GetQueueAttributes {
+        queue_id: u64,
+    },
+
+    // -- Exchanges --
+    CreateExchange {
+        name: String,
+        exchange_type: ExchangeType,
+    },
+    DeleteExchange {
+        exchange_id: u64,
+    },
+    CreateBinding {
+        exchange_id: u64,
+        queue_id: u64,
+        routing_key: Option<String>,
+    },
+    DeleteBinding {
+        binding_id: u64,
+    },
+    /// Publish to an exchange — routes to bound queues based on exchange type.
+    PublishToExchange {
+        exchange_id: u64,
+        messages: Vec<MessagePayload>,
+    },
 
     // -- Actors --
     CreateActorNamespace {
@@ -450,6 +522,27 @@ impl fmt::Display for MqCommand {
             Self::PruneDedupWindow { queue_id, .. } => {
                 write!(f, "PruneDedupWindow(queue={})", queue_id)
             }
+            Self::PurgeQueue { queue_id } => write!(f, "PurgeQueue({})", queue_id),
+            Self::GetQueueAttributes { queue_id } => {
+                write!(f, "GetQueueAttributes({})", queue_id)
+            }
+            Self::CreateExchange { name, .. } => write!(f, "CreateExchange({})", name),
+            Self::DeleteExchange { exchange_id } => write!(f, "DeleteExchange({})", exchange_id),
+            Self::CreateBinding {
+                exchange_id,
+                queue_id,
+                ..
+            } => write!(f, "CreateBinding(ex={}, q={})", exchange_id, queue_id),
+            Self::DeleteBinding { binding_id } => write!(f, "DeleteBinding({})", binding_id),
+            Self::PublishToExchange {
+                exchange_id,
+                messages,
+            } => write!(
+                f,
+                "PublishToExchange(ex={}, count={})",
+                exchange_id,
+                messages.len()
+            ),
             Self::CreateActorNamespace { name, .. } => write!(f, "CreateActorNamespace({})", name),
             Self::DeleteActorNamespace { namespace_id } => {
                 write!(f, "DeleteActorNamespace({})", namespace_id)
@@ -575,6 +668,8 @@ pub enum EntityKind {
     ActorNamespace,
     Job,
     Consumer,
+    Exchange,
+    Binding,
 }
 
 impl fmt::Display for EntityKind {
@@ -585,6 +680,8 @@ impl fmt::Display for EntityKind {
             Self::ActorNamespace => f.write_str("actor namespace"),
             Self::Job => f.write_str("job"),
             Self::Consumer => f.write_str("consumer"),
+            Self::Exchange => f.write_str("exchange"),
+            Self::Binding => f.write_str("binding"),
         }
     }
 }
@@ -653,6 +750,8 @@ pub struct MqSnapshotData {
     pub jobs: Vec<JobSnapshot>,
     pub consumers: Vec<ConsumerSnapshot>,
     pub producers: Vec<ProducerSnapshot>,
+    #[serde(default)]
+    pub exchanges: Vec<ExchangeSnapshot>,
     pub next_id: u64,
     /// Manifest of raft log segment files the follower needs to sync.
     #[serde(default)]
@@ -696,6 +795,12 @@ pub struct ProducerSnapshot {
     pub meta: crate::producer::ProducerMeta,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeSnapshot {
+    pub meta: crate::exchange::ExchangeMeta,
+    pub bindings: Vec<Binding>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +829,8 @@ mod tests {
                         value: Bytes::from_static(b"x"),
                         headers: Vec::new(),
                         timestamp: 0,
+                        ttl_ms: None,
+                        routing_key: None,
                     }],
                 },
                 "Publish(topic=1, count=1)",
@@ -776,6 +883,8 @@ mod tests {
                             value: Bytes::new(),
                             headers: Vec::new(),
                             timestamp: 0,
+                            ttl_ms: None,
+                            routing_key: None,
                         },
                         attempt: 1,
                         original_timestamp: 0,
@@ -806,6 +915,8 @@ mod tests {
             value: Bytes::from_static(b"value"),
             headers: vec![("h1".to_string(), Bytes::from_static(b"v1"))],
             timestamp: 12345,
+            ttl_ms: None,
+            routing_key: None,
         };
         let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         let (decoded, _): (MessagePayload, _) =
@@ -903,6 +1014,8 @@ mod tests {
                 value: Bytes::from_static(b"v"),
                 headers: Vec::new(),
                 timestamp: 999,
+                ttl_ms: None,
+                routing_key: None,
             }],
             dedup_keys: vec![Some(Bytes::from_static(b"dk"))],
         };
@@ -934,6 +1047,8 @@ mod tests {
                     value: Bytes::from_static(b"data"),
                     headers: Vec::new(),
                     timestamp: 1000,
+                    ttl_ms: None,
+                    routing_key: None,
                 },
                 attempt: 2,
                 original_timestamp: 500,
@@ -973,6 +1088,7 @@ mod tests {
             next_id: 42,
             file_manifest: Vec::new(),
             sync_addr: None,
+            exchanges: Vec::new(),
         };
         let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
         let (decoded, _): (MqSnapshotData, _) =
@@ -1025,6 +1141,8 @@ mod tests {
                     value: Bytes::from_static(b"data"),
                     headers: Vec::new(),
                     timestamp: 100,
+                    ttl_ms: None,
+                    routing_key: None,
                 }],
             },
         ]);

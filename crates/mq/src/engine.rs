@@ -6,6 +6,7 @@ use tracing::{debug, info, warn};
 use crate::actor::ActorNamespaceState;
 use crate::config::MqConfig;
 use crate::consumer::ConsumerState;
+use crate::exchange::ExchangeState;
 use crate::job::JobInstance;
 use crate::producer::ProducerMeta;
 use crate::queue::QueueState;
@@ -24,6 +25,7 @@ pub struct MqEngine {
     pub(crate) queues: HashMap<u64, QueueState>,
     pub(crate) actor_namespaces: HashMap<u64, ActorNamespaceState>,
     pub(crate) jobs: HashMap<u64, JobInstance>,
+    pub(crate) exchanges: HashMap<u64, ExchangeState>,
 
     // Session stores
     pub(crate) consumers: HashMap<u64, ConsumerState>,
@@ -34,6 +36,7 @@ pub struct MqEngine {
     pub(crate) queue_names: HashMap<u64, u64>,
     pub(crate) namespace_names: HashMap<u64, u64>,
     pub(crate) job_names: HashMap<u64, u64>,
+    pub(crate) exchange_names: HashMap<u64, u64>,
 
     // Monotonic ID generator
     pub(crate) next_id: u64,
@@ -51,12 +54,14 @@ impl MqEngine {
             queues: HashMap::new(),
             actor_namespaces: HashMap::new(),
             jobs: HashMap::new(),
+            exchanges: HashMap::new(),
             consumers: HashMap::new(),
             producers: HashMap::new(),
             topic_names: HashMap::new(),
             queue_names: HashMap::new(),
             namespace_names: HashMap::new(),
             job_names: HashMap::new(),
+            exchange_names: HashMap::new(),
             next_id: 1,
             cached_purge_floor: 0,
             purge_floor_dirty: true,
@@ -230,6 +235,8 @@ impl MqEngine {
                                     value: Bytes::new(),
                                     headers: Vec::new(),
                                     timestamp: current_time,
+                                    ttl_ms: None,
+                                    routing_key: None,
                                 },
                                 attempt: meta.attempts,
                                 original_timestamp: current_time,
@@ -327,6 +334,159 @@ impl MqEngine {
                 }
             }
 
+            MqCommand::PurgeQueue { queue_id } => {
+                if let Some(queue) = self.queues.get_mut(&queue_id) {
+                    let had_messages = !queue.messages.is_empty();
+                    queue.messages.clear();
+                    queue.pending.clear();
+                    queue.in_flight_deadlines.clear();
+                    queue.consumer_in_flight.clear();
+                    queue.meta.pending_count = 0;
+                    queue.meta.in_flight_count = 0;
+                    if had_messages {
+                        self.mark_purge_floor_dirty();
+                    }
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Queue,
+                        id: queue_id,
+                    })
+                }
+            }
+
+            MqCommand::GetQueueAttributes { queue_id } => {
+                if let Some(queue) = self.queues.get(&queue_id) {
+                    MqResponse::Stats(EntityStats::Queue {
+                        queue_id,
+                        pending_count: queue.meta.pending_count,
+                        in_flight_count: queue.meta.in_flight_count,
+                        dlq_count: queue.meta.dlq_count,
+                    })
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Queue,
+                        id: queue_id,
+                    })
+                }
+            }
+
+            // =================================================================
+            // Exchanges
+            // =================================================================
+            MqCommand::CreateExchange {
+                name,
+                exchange_type,
+            } => {
+                let hash = name_hash(&name);
+                if self.exchange_names.contains_key(&hash) {
+                    return MqResponse::Error(MqError::AlreadyExists {
+                        entity: EntityKind::Exchange,
+                    });
+                }
+                let id = self.alloc_id();
+                let meta = crate::exchange::ExchangeMeta::new(id, name, log_index, exchange_type);
+                self.exchanges.insert(id, ExchangeState::new(meta));
+                self.exchange_names.insert(hash, id);
+                info!(exchange_id = id, "exchange created");
+                MqResponse::EntityCreated { id }
+            }
+
+            MqCommand::DeleteExchange { exchange_id } => {
+                if let Some(state) = self.exchanges.remove(&exchange_id) {
+                    self.exchange_names.remove(&state.meta.name_hash);
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Exchange,
+                        id: exchange_id,
+                    })
+                }
+            }
+
+            MqCommand::CreateBinding {
+                exchange_id,
+                queue_id,
+                routing_key,
+            } => {
+                // Verify both exchange and queue exist
+                if !self.exchanges.contains_key(&exchange_id) {
+                    return MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Exchange,
+                        id: exchange_id,
+                    });
+                }
+                if !self.queues.contains_key(&queue_id) {
+                    return MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Queue,
+                        id: queue_id,
+                    });
+                }
+                let binding_id = self.alloc_id();
+                let binding = Binding {
+                    binding_id,
+                    exchange_id,
+                    queue_id,
+                    routing_key,
+                };
+                if let Some(exchange) = self.exchanges.get_mut(&exchange_id) {
+                    exchange.add_binding(binding);
+                }
+                MqResponse::EntityCreated { id: binding_id }
+            }
+
+            MqCommand::DeleteBinding { binding_id } => {
+                // Find which exchange owns this binding
+                let mut found = false;
+                for exchange in self.exchanges.values_mut() {
+                    if exchange.bindings.contains_key(&binding_id) {
+                        exchange.remove_binding(binding_id);
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Binding,
+                        id: binding_id,
+                    })
+                }
+            }
+
+            MqCommand::PublishToExchange {
+                exchange_id,
+                messages,
+            } => {
+                // Route messages to bound queues
+                let target_queue_ids = if let Some(exchange) = self.exchanges.get(&exchange_id) {
+                    // Use first message's routing key for routing
+                    let routing_key = messages.first().and_then(|m| m.routing_key.as_deref());
+                    exchange.route(routing_key)
+                } else {
+                    return MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Exchange,
+                        id: exchange_id,
+                    });
+                };
+
+                // Enqueue to each target queue
+                let mut total_enqueued = 0u64;
+                for qid in target_queue_ids {
+                    if let Some(queue) = self.queues.get_mut(&qid) {
+                        let dedup_keys: Vec<Option<Bytes>> =
+                            messages.iter().map(|_| None).collect();
+                        queue.apply_enqueue(log_index, &messages, &dedup_keys, current_time);
+                        total_enqueued += messages.len() as u64;
+                    }
+                }
+                if total_enqueued > 0 {
+                    self.on_message_added(log_index);
+                }
+                MqResponse::Ok
+            }
+
             // =================================================================
             // Actors
             // =================================================================
@@ -397,6 +557,8 @@ impl MqEngine {
                                     value: Bytes::new(),
                                     headers: Vec::new(),
                                     timestamp: current_time,
+                                    ttl_ms: None,
+                                    routing_key: None,
                                 },
                                 attempt: 1,
                                 original_timestamp: current_time,
@@ -732,6 +894,7 @@ impl MqEngine {
             1 => self.queue_names.get(&name_hash).copied(), // ENTITY_TYPE_QUEUE
             2 => self.namespace_names.get(&name_hash).copied(), // ENTITY_TYPE_ACTOR_NAMESPACE
             3 => self.job_names.get(&name_hash).copied(),   // ENTITY_TYPE_JOB
+            4 => self.exchange_names.get(&name_hash).copied(), // ENTITY_TYPE_EXCHANGE
             _ => None,
         }
     }
@@ -796,6 +959,15 @@ impl MqEngine {
             .map(|p| ProducerSnapshot { meta: p.clone() })
             .collect();
 
+        let exchanges = self
+            .exchanges
+            .values()
+            .map(|e| ExchangeSnapshot {
+                meta: e.meta.clone(),
+                bindings: e.bindings.values().cloned().collect(),
+            })
+            .collect();
+
         MqSnapshotData {
             topics,
             queues,
@@ -803,6 +975,7 @@ impl MqEngine {
             jobs,
             consumers,
             producers,
+            exchanges,
             next_id: self.next_id,
             file_manifest: Vec::new(),
             sync_addr: None,
@@ -822,16 +995,20 @@ impl MqEngine {
         let n_consumers = data.consumers.len();
         let n_producers = data.producers.len();
 
+        let n_exchanges = data.exchanges.len();
+
         self.topics = HashMap::with_capacity(n_topics);
         self.queues = HashMap::with_capacity(n_queues);
         self.actor_namespaces = HashMap::with_capacity(n_ns);
         self.jobs = HashMap::with_capacity(n_jobs);
+        self.exchanges = HashMap::with_capacity(n_exchanges);
         self.consumers = HashMap::with_capacity(n_consumers);
         self.producers = HashMap::with_capacity(n_producers);
         self.topic_names = HashMap::with_capacity(n_topics);
         self.queue_names = HashMap::with_capacity(n_queues);
         self.namespace_names = HashMap::with_capacity(n_ns);
         self.job_names = HashMap::with_capacity(n_jobs);
+        self.exchange_names = HashMap::with_capacity(n_exchanges);
 
         // Restore topics
         for ts in data.topics {
@@ -925,11 +1102,26 @@ impl MqEngine {
             self.producers.insert(id, ps.meta);
         }
 
+        // Restore exchanges
+        for es in data.exchanges {
+            let id = es.meta.exchange_id;
+            let mut meta = es.meta;
+            meta.ensure_name_hash();
+            let hash = meta.name_hash;
+            let mut state = ExchangeState::new(meta);
+            for binding in es.bindings {
+                state.add_binding(binding);
+            }
+            self.exchange_names.insert(hash, id);
+            self.exchanges.insert(id, state);
+        }
+
         info!(
             topics = self.topics.len(),
             queues = self.queues.len(),
             actor_namespaces = self.actor_namespaces.len(),
             jobs = self.jobs.len(),
+            exchanges = self.exchanges.len(),
             consumers = self.consumers.len(),
             "MQ engine restored from snapshot"
         );
@@ -1015,6 +1207,8 @@ mod tests {
             value: Bytes::from(value.to_vec()),
             headers: Vec::new(),
             timestamp: 1000,
+            ttl_ms: None,
+            routing_key: None,
         }
     }
 

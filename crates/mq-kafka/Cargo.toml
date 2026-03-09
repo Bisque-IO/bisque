@@ -1,0 +1,23 @@
+[package]
+name = "bisque-mq-kafka"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Kafka binary protocol adapter for bisque-mq"
+license.workspace = true
+
+[dependencies]
+bisque-mq = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+metrics = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }

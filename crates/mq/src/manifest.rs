@@ -444,6 +444,7 @@ impl GroupMdbxEnv {
             jobs,
             consumers,
             producers,
+            exchanges: Vec::new(),
             next_id,
             file_manifest: Vec::new(),
             sync_addr: None,
@@ -941,6 +942,8 @@ mod tests {
             value: bytes::Bytes::from(value.to_vec()),
             headers: Vec::new(),
             timestamp: 1000,
+            ttl_ms: None,
+            routing_key: None,
         }
     }
 
