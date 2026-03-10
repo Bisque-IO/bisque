@@ -168,7 +168,7 @@ fn test_queue_enqueue_ttl_from_flat_header() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("ttl-queue", &QueueConfig::default()),
+        &MqCommand::create_queue("ttl-queue", &QueueConfig::default()),
         1,
         1000,
     ) {
@@ -183,7 +183,7 @@ fn test_queue_enqueue_ttl_from_flat_header() {
         .build();
 
     engine.apply_command(
-        MqCommand::enqueue(queue_id, &[msg], &[None]),
+        &MqCommand::enqueue(queue_id, &[msg], &[None]),
         2,
         5000, // current_time = 5000
     );
@@ -191,7 +191,7 @@ fn test_queue_enqueue_ttl_from_flat_header() {
     let snap = engine.snapshot();
     assert_eq!(snap.queues[0].meta.pending_count, 1);
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 3, 6000);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 3, 6000);
     match resp {
         MqResponse::Messages { messages } => assert_eq!(messages.len(), 1),
         other => panic!("expected Messages, got {:?}", other),
@@ -203,7 +203,7 @@ fn test_queue_enqueue_delay_from_flat_header() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("delay-queue", &QueueConfig::default()),
+        &MqCommand::create_queue("delay-queue", &QueueConfig::default()),
         1,
         1000,
     ) {
@@ -216,9 +216,9 @@ fn test_queue_enqueue_delay_from_flat_header() {
         .delay_ms(10_000)
         .build();
 
-    engine.apply_command(MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 5000);
+    engine.apply_command(&MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 5000);
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 3, 6000);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 3, 6000);
     match resp {
         MqResponse::Messages { messages } => assert_eq!(
             messages.len(),
@@ -228,7 +228,7 @@ fn test_queue_enqueue_delay_from_flat_header() {
         other => panic!("expected Messages, got {:?}", other),
     }
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 4, 16000);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 4, 16000);
     match resp {
         MqResponse::Messages { messages } => assert_eq!(messages.len(), 1),
         other => panic!("expected Messages, got {:?}", other),
@@ -240,7 +240,7 @@ fn test_queue_enqueue_no_ttl_no_delay() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("plain-queue", &QueueConfig::default()),
+        &MqCommand::create_queue("plain-queue", &QueueConfig::default()),
         1,
         1000,
     ) {
@@ -252,9 +252,9 @@ fn test_queue_enqueue_no_ttl_no_delay() {
         .timestamp(1000)
         .build();
 
-    engine.apply_command(MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 5000);
+    engine.apply_command(&MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 5000);
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 3, 5001);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 3, 5001);
     match resp {
         MqResponse::Messages { messages } => assert_eq!(messages.len(), 1),
         other => panic!("expected Messages, got {:?}", other),
@@ -266,7 +266,7 @@ fn test_queue_enqueue_delay_clamped_by_ttl() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("clamped-queue", &QueueConfig::default()),
+        &MqCommand::create_queue("clamped-queue", &QueueConfig::default()),
         1,
         1000,
     ) {
@@ -280,9 +280,9 @@ fn test_queue_enqueue_delay_clamped_by_ttl() {
         .delay_ms(60_000)
         .build();
 
-    engine.apply_command(MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 5000);
+    engine.apply_command(&MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 5000);
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 3, 15001);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 3, 15001);
     match resp {
         MqResponse::Messages { messages } => {
             assert!(messages.len() <= 1);
@@ -300,7 +300,7 @@ fn test_topic_publish_flat_messages() {
     let mut engine = make_engine();
 
     let topic_id = match engine.apply_command(
-        MqCommand::create_topic("events", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
         1,
         1000,
     ) {
@@ -325,7 +325,7 @@ fn test_topic_publish_flat_messages() {
             .build(),
     ];
 
-    let resp = engine.apply_command(MqCommand::publish(topic_id, &messages), 2, 1000);
+    let resp = engine.apply_command(&MqCommand::publish(topic_id, &messages), 2, 1000);
     match resp {
         MqResponse::Published { offsets } => assert_eq!(offsets.len(), 3),
         other => panic!("expected Published, got {:?}", other),
@@ -344,7 +344,7 @@ fn test_exchange_fanout_with_flat_messages() {
     let mut engine = make_engine();
 
     let ex_id = match engine.apply_command(
-        MqCommand::create_exchange("fanout-ex", ExchangeType::Fanout),
+        &MqCommand::create_exchange("fanout-ex", ExchangeType::Fanout),
         1,
         1000,
     ) {
@@ -353,7 +353,7 @@ fn test_exchange_fanout_with_flat_messages() {
     };
 
     let q1_id = match engine.apply_command(
-        MqCommand::create_queue("q1", &QueueConfig::default()),
+        &MqCommand::create_queue("q1", &QueueConfig::default()),
         2,
         1000,
     ) {
@@ -361,7 +361,7 @@ fn test_exchange_fanout_with_flat_messages() {
         _ => panic!(),
     };
     let q2_id = match engine.apply_command(
-        MqCommand::create_queue("q2", &QueueConfig::default()),
+        &MqCommand::create_queue("q2", &QueueConfig::default()),
         3,
         1000,
     ) {
@@ -369,15 +369,15 @@ fn test_exchange_fanout_with_flat_messages() {
         _ => panic!(),
     };
 
-    engine.apply_command(MqCommand::create_binding(ex_id, q1_id, None), 4, 1000);
-    engine.apply_command(MqCommand::create_binding(ex_id, q2_id, None), 5, 1000);
+    engine.apply_command(&MqCommand::create_binding(ex_id, q1_id, None), 4, 1000);
+    engine.apply_command(&MqCommand::create_binding(ex_id, q2_id, None), 5, 1000);
 
     let msg = FlatMessageBuilder::new(Bytes::from_static(b"fanout-data"))
         .timestamp(2000)
         .key(Bytes::from_static(b"some-key"))
         .build();
 
-    let resp = engine.apply_command(MqCommand::publish_to_exchange(ex_id, &[msg]), 6, 2000);
+    let resp = engine.apply_command(&MqCommand::publish_to_exchange(ex_id, &[msg]), 6, 2000);
     assert!(matches!(resp, MqResponse::Ok));
 
     let snap = engine.snapshot();
@@ -396,7 +396,7 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
     let mut engine = make_engine();
 
     let ex_id = match engine.apply_command(
-        MqCommand::create_exchange("direct-ex", ExchangeType::Direct),
+        &MqCommand::create_exchange("direct-ex", ExchangeType::Direct),
         1,
         1000,
     ) {
@@ -405,7 +405,7 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
     };
 
     let q_us = match engine.apply_command(
-        MqCommand::create_queue("orders-us", &QueueConfig::default()),
+        &MqCommand::create_queue("orders-us", &QueueConfig::default()),
         2,
         1000,
     ) {
@@ -413,7 +413,7 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
         _ => panic!(),
     };
     let q_eu = match engine.apply_command(
-        MqCommand::create_queue("orders-eu", &QueueConfig::default()),
+        &MqCommand::create_queue("orders-eu", &QueueConfig::default()),
         3,
         1000,
     ) {
@@ -421,15 +421,15 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
         _ => panic!(),
     };
 
-    engine.apply_command(MqCommand::create_binding(ex_id, q_us, Some("us")), 4, 1000);
-    engine.apply_command(MqCommand::create_binding(ex_id, q_eu, Some("eu")), 5, 1000);
+    engine.apply_command(&MqCommand::create_binding(ex_id, q_us, Some("us")), 4, 1000);
+    engine.apply_command(&MqCommand::create_binding(ex_id, q_eu, Some("eu")), 5, 1000);
 
     let msg_us = FlatMessageBuilder::new(Bytes::from_static(b"order-data-us"))
         .timestamp(2000)
         .routing_key(Bytes::from_static(b"us"))
         .build();
 
-    engine.apply_command(MqCommand::publish_to_exchange(ex_id, &[msg_us]), 6, 2000);
+    engine.apply_command(&MqCommand::publish_to_exchange(ex_id, &[msg_us]), 6, 2000);
 
     let snap = engine.snapshot();
     let us_queue = snap
@@ -450,7 +450,7 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
         .routing_key(Bytes::from_static(b"eu"))
         .build();
 
-    engine.apply_command(MqCommand::publish_to_exchange(ex_id, &[msg_eu]), 7, 2001);
+    engine.apply_command(&MqCommand::publish_to_exchange(ex_id, &[msg_eu]), 7, 2001);
 
     let snap = engine.snapshot();
     let us_queue = snap
@@ -472,7 +472,7 @@ fn test_exchange_no_routing_key_in_flat_message() {
     let mut engine = make_engine();
 
     let ex_id = match engine.apply_command(
-        MqCommand::create_exchange("direct-ex-2", ExchangeType::Direct),
+        &MqCommand::create_exchange("direct-ex-2", ExchangeType::Direct),
         1,
         1000,
     ) {
@@ -481,7 +481,7 @@ fn test_exchange_no_routing_key_in_flat_message() {
     };
 
     let q_id = match engine.apply_command(
-        MqCommand::create_queue("bound-q", &QueueConfig::default()),
+        &MqCommand::create_queue("bound-q", &QueueConfig::default()),
         2,
         1000,
     ) {
@@ -490,7 +490,7 @@ fn test_exchange_no_routing_key_in_flat_message() {
     };
 
     engine.apply_command(
-        MqCommand::create_binding(ex_id, q_id, Some("specific")),
+        &MqCommand::create_binding(ex_id, q_id, Some("specific")),
         3,
         1000,
     );
@@ -499,7 +499,7 @@ fn test_exchange_no_routing_key_in_flat_message() {
         .timestamp(2000)
         .build();
 
-    engine.apply_command(MqCommand::publish_to_exchange(ex_id, &[msg]), 4, 2000);
+    engine.apply_command(&MqCommand::publish_to_exchange(ex_id, &[msg]), 4, 2000);
 
     let snap = engine.snapshot();
     let q = snap
@@ -522,7 +522,7 @@ fn test_actor_send_flat_message() {
     let mut engine = make_engine();
 
     let ns_id = match engine.apply_command(
-        MqCommand::create_actor_namespace("workers", &ActorConfig::default()),
+        &MqCommand::create_actor_namespace("workers", &ActorConfig::default()),
         1,
         1000,
     ) {
@@ -540,7 +540,7 @@ fn test_actor_send_flat_message() {
         .header("priority", &b"high"[..])
         .build();
 
-    engine.apply_command(MqCommand::send_to_actor(ns_id, &actor_id, &msg), 2, 5000);
+    engine.apply_command(&MqCommand::send_to_actor(ns_id, &actor_id, &msg), 2, 5000);
 
     let snap = engine.snapshot();
     assert_eq!(snap.actor_namespaces[0].actors.len(), 1);
@@ -556,7 +556,7 @@ fn test_batch_enqueue_mixed_flat_messages() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("mixed-q", &QueueConfig::default()),
+        &MqCommand::create_queue("mixed-q", &QueueConfig::default()),
         1,
         1000,
     ) {
@@ -594,7 +594,7 @@ fn test_batch_enqueue_mixed_flat_messages() {
 
     let dedup_keys: Vec<Option<Bytes>> = vec![None, None, None, None, None];
     engine.apply_command(
-        MqCommand::enqueue(queue_id, &messages, &dedup_keys),
+        &MqCommand::enqueue(queue_id, &messages, &dedup_keys),
         2,
         1000,
     );
@@ -696,7 +696,7 @@ fn test_snapshot_restore_with_flat_messages() {
     let mut engine = make_engine();
 
     engine.apply_command(
-        MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
         1,
         1000,
     );
@@ -710,10 +710,10 @@ fn test_snapshot_restore_with_flat_messages() {
             .ttl_ms(5000)
             .build(),
     ];
-    engine.apply_command(MqCommand::publish(1, &messages), 2, 1001);
+    engine.apply_command(&MqCommand::publish(1, &messages), 2, 1001);
 
     engine.apply_command(
-        MqCommand::create_queue("q1", &QueueConfig::default()),
+        &MqCommand::create_queue("q1", &QueueConfig::default()),
         3,
         1000,
     );
@@ -721,7 +721,7 @@ fn test_snapshot_restore_with_flat_messages() {
         .timestamp(2000)
         .delay_ms(1000)
         .build();
-    engine.apply_command(MqCommand::enqueue(2, &[enqueue_msg], &[None]), 4, 2000);
+    engine.apply_command(&MqCommand::enqueue(2, &[enqueue_msg], &[None]), 4, 2000);
 
     let snap = engine.snapshot();
     let snap_bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
@@ -738,7 +738,7 @@ fn test_snapshot_restore_with_flat_messages() {
     let post_restore_msg = FlatMessageBuilder::new(Bytes::from_static(b"post-restore"))
         .timestamp(3000)
         .build();
-    let resp = engine2.apply_command(MqCommand::publish(1, &[post_restore_msg]), 5, 3000);
+    let resp = engine2.apply_command(&MqCommand::publish(1, &[post_restore_msg]), 5, 3000);
     assert!(matches!(resp, MqResponse::Published { .. }));
 }
 
@@ -854,7 +854,7 @@ fn test_queue_ack_with_response_publishes_to_reply_topic() {
     let mut engine = make_engine();
 
     let reply_topic_id = match engine.apply_command(
-        MqCommand::create_topic("responses", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("responses", RetentionPolicy::default(), 0),
         1,
         1000,
     ) {
@@ -863,7 +863,7 @@ fn test_queue_ack_with_response_publishes_to_reply_topic() {
     };
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("requests", &QueueConfig::default()),
+        &MqCommand::create_queue("requests", &QueueConfig::default()),
         2,
         1000,
     ) {
@@ -878,12 +878,12 @@ fn test_queue_ack_with_response_publishes_to_reply_topic() {
         .build();
 
     engine.apply_command(
-        MqCommand::enqueue(queue_id, &[request_msg], &[None]),
+        &MqCommand::enqueue(queue_id, &[request_msg], &[None]),
         3,
         2000,
     );
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 4, 3000);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 4, 3000);
     let msg_id = match resp {
         MqResponse::Messages { messages } => {
             assert_eq!(messages.len(), 1);
@@ -898,7 +898,7 @@ fn test_queue_ack_with_response_publishes_to_reply_topic() {
         .build();
 
     let resp = engine.apply_command(
-        MqCommand::ack(queue_id, &[msg_id], Some(&response_msg)),
+        &MqCommand::ack(queue_id, &[msg_id], Some(&response_msg)),
         5,
         4000,
     );
@@ -921,7 +921,7 @@ fn test_queue_ack_without_response_is_normal_ack() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("normal-q", &QueueConfig::default()),
+        &MqCommand::create_queue("normal-q", &QueueConfig::default()),
         1,
         1000,
     ) {
@@ -934,15 +934,15 @@ fn test_queue_ack_without_response_is_normal_ack() {
         .reply_to(Bytes::from_static(b"some-topic"))
         .build();
 
-    engine.apply_command(MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 1000);
+    engine.apply_command(&MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 1000);
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 3, 2000);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 3, 2000);
     let msg_id = match resp {
         MqResponse::Messages { messages } => messages[0].message_id,
         _ => panic!(),
     };
 
-    let resp = engine.apply_command(MqCommand::ack(queue_id, &[msg_id], None), 4, 3000);
+    let resp = engine.apply_command(&MqCommand::ack(queue_id, &[msg_id], None), 4, 3000);
     assert!(matches!(resp, MqResponse::Ok));
 
     let snap = engine.snapshot();
@@ -955,7 +955,7 @@ fn test_queue_ack_response_without_reply_to_drops_silently() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("no-reply-q", &QueueConfig::default()),
+        &MqCommand::create_queue("no-reply-q", &QueueConfig::default()),
         1,
         1000,
     ) {
@@ -967,9 +967,9 @@ fn test_queue_ack_response_without_reply_to_drops_silently() {
         .timestamp(1000)
         .build();
 
-    engine.apply_command(MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 1000);
+    engine.apply_command(&MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 1000);
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 3, 2000);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 3, 2000);
     let msg_id = match resp {
         MqResponse::Messages { messages } => messages[0].message_id,
         _ => panic!(),
@@ -980,7 +980,7 @@ fn test_queue_ack_response_without_reply_to_drops_silently() {
         .build();
 
     let resp = engine.apply_command(
-        MqCommand::ack(queue_id, &[msg_id], Some(&response)),
+        &MqCommand::ack(queue_id, &[msg_id], Some(&response)),
         4,
         3000,
     );
@@ -995,7 +995,7 @@ fn test_queue_ack_response_reply_topic_missing_drops_silently() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("q-missing-topic", &QueueConfig::default()),
+        &MqCommand::create_queue("q-missing-topic", &QueueConfig::default()),
         1,
         1000,
     ) {
@@ -1008,9 +1008,9 @@ fn test_queue_ack_response_reply_topic_missing_drops_silently() {
         .reply_to(Bytes::from_static(b"nonexistent-topic"))
         .build();
 
-    engine.apply_command(MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 1000);
+    engine.apply_command(&MqCommand::enqueue(queue_id, &[msg], &[None]), 2, 1000);
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 3, 2000);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 3, 2000);
     let msg_id = match resp {
         MqResponse::Messages { messages } => messages[0].message_id,
         _ => panic!(),
@@ -1021,7 +1021,7 @@ fn test_queue_ack_response_reply_topic_missing_drops_silently() {
         .build();
 
     let resp = engine.apply_command(
-        MqCommand::ack(queue_id, &[msg_id], Some(&response)),
+        &MqCommand::ack(queue_id, &[msg_id], Some(&response)),
         4,
         3000,
     );
@@ -1033,13 +1033,13 @@ fn test_queue_ack_multiple_messages_first_has_reply_to() {
     let mut engine = make_engine();
 
     engine.apply_command(
-        MqCommand::create_topic("multi-replies", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("multi-replies", RetentionPolicy::default(), 0),
         1,
         1000,
     );
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("multi-q", &QueueConfig::default()),
+        &MqCommand::create_queue("multi-q", &QueueConfig::default()),
         2,
         1000,
     ) {
@@ -1052,14 +1052,14 @@ fn test_queue_ack_multiple_messages_first_has_reply_to() {
         .reply_to(Bytes::from_static(b"multi-replies"))
         .correlation_id(Bytes::from_static(b"corr-1"))
         .build();
-    engine.apply_command(MqCommand::enqueue(queue_id, &[msg1], &[None]), 3, 1000);
+    engine.apply_command(&MqCommand::enqueue(queue_id, &[msg1], &[None]), 3, 1000);
 
     let msg2 = FlatMessageBuilder::new(Bytes::from_static(b"req-2"))
         .timestamp(1001)
         .build();
-    engine.apply_command(MqCommand::enqueue(queue_id, &[msg2], &[None]), 4, 1001);
+    engine.apply_command(&MqCommand::enqueue(queue_id, &[msg2], &[None]), 4, 1001);
 
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 2), 5, 2000);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 2), 5, 2000);
     let msg_ids: Vec<u64> = match resp {
         MqResponse::Messages { messages } => messages.iter().map(|m| m.message_id).collect(),
         other => panic!("expected Messages, got {:?}", other),
@@ -1070,7 +1070,11 @@ fn test_queue_ack_multiple_messages_first_has_reply_to() {
         .timestamp(3000)
         .build();
 
-    engine.apply_command(MqCommand::ack(queue_id, &msg_ids, Some(&response)), 6, 3000);
+    engine.apply_command(
+        &MqCommand::ack(queue_id, &msg_ids, Some(&response)),
+        6,
+        3000,
+    );
 
     let snap = engine.snapshot();
     let reply_topic = snap
@@ -1090,7 +1094,7 @@ fn test_actor_ack_with_response_publishes_to_reply_topic() {
     let mut engine = make_engine();
 
     let reply_topic_id = match engine.apply_command(
-        MqCommand::create_topic("actor-responses", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("actor-responses", RetentionPolicy::default(), 0),
         1,
         1000,
     ) {
@@ -1099,7 +1103,7 @@ fn test_actor_ack_with_response_publishes_to_reply_topic() {
     };
 
     let ns_id = match engine.apply_command(
-        MqCommand::create_actor_namespace("rpc-actors", &ActorConfig::default()),
+        &MqCommand::create_actor_namespace("rpc-actors", &ActorConfig::default()),
         2,
         1000,
     ) {
@@ -1116,19 +1120,19 @@ fn test_actor_ack_with_response_publishes_to_reply_topic() {
         .build();
 
     engine.apply_command(
-        MqCommand::send_to_actor(ns_id, &actor_id, &request),
+        &MqCommand::send_to_actor(ns_id, &actor_id, &request),
         3,
         2000,
     );
 
     engine.apply_command(
-        MqCommand::assign_actors(ns_id, 100, &[actor_id.clone()]),
+        &MqCommand::assign_actors(ns_id, 100, &[actor_id.clone()]),
         4,
         2001,
     );
 
     let resp = engine.apply_command(
-        MqCommand::deliver_actor_message(ns_id, &actor_id, 100),
+        &MqCommand::deliver_actor_message(ns_id, &actor_id, 100),
         5,
         2002,
     );
@@ -1146,7 +1150,7 @@ fn test_actor_ack_with_response_publishes_to_reply_topic() {
         .build();
 
     let resp = engine.apply_command(
-        MqCommand::ack_actor_message(ns_id, &actor_id, msg_id, Some(&response)),
+        &MqCommand::ack_actor_message(ns_id, &actor_id, msg_id, Some(&response)),
         6,
         3000,
     );
@@ -1169,7 +1173,7 @@ fn test_actor_ack_without_response_normal() {
     let mut engine = make_engine();
 
     let ns_id = match engine.apply_command(
-        MqCommand::create_actor_namespace("normal-actors", &ActorConfig::default()),
+        &MqCommand::create_actor_namespace("normal-actors", &ActorConfig::default()),
         1,
         1000,
     ) {
@@ -1183,16 +1187,16 @@ fn test_actor_ack_without_response_normal() {
         .timestamp(2000)
         .build();
 
-    engine.apply_command(MqCommand::send_to_actor(ns_id, &actor_id, &msg), 2, 2000);
+    engine.apply_command(&MqCommand::send_to_actor(ns_id, &actor_id, &msg), 2, 2000);
 
     engine.apply_command(
-        MqCommand::assign_actors(ns_id, 100, &[actor_id.clone()]),
+        &MqCommand::assign_actors(ns_id, 100, &[actor_id.clone()]),
         3,
         2001,
     );
 
     let resp = engine.apply_command(
-        MqCommand::deliver_actor_message(ns_id, &actor_id, 100),
+        &MqCommand::deliver_actor_message(ns_id, &actor_id, 100),
         4,
         2002,
     );
@@ -1202,7 +1206,7 @@ fn test_actor_ack_without_response_normal() {
     };
 
     let resp = engine.apply_command(
-        MqCommand::ack_actor_message(ns_id, &actor_id, msg_id, None),
+        &MqCommand::ack_actor_message(ns_id, &actor_id, msg_id, None),
         5,
         3000,
     );
@@ -1214,7 +1218,7 @@ fn test_actor_ack_response_no_reply_to_drops_silently() {
     let mut engine = make_engine();
 
     let ns_id = match engine.apply_command(
-        MqCommand::create_actor_namespace("no-reply-actors", &ActorConfig::default()),
+        &MqCommand::create_actor_namespace("no-reply-actors", &ActorConfig::default()),
         1,
         1000,
     ) {
@@ -1228,16 +1232,16 @@ fn test_actor_ack_response_no_reply_to_drops_silently() {
         .timestamp(2000)
         .build();
 
-    engine.apply_command(MqCommand::send_to_actor(ns_id, &actor_id, &msg), 2, 2000);
+    engine.apply_command(&MqCommand::send_to_actor(ns_id, &actor_id, &msg), 2, 2000);
 
     engine.apply_command(
-        MqCommand::assign_actors(ns_id, 100, &[actor_id.clone()]),
+        &MqCommand::assign_actors(ns_id, 100, &[actor_id.clone()]),
         3,
         2001,
     );
 
     let resp = engine.apply_command(
-        MqCommand::deliver_actor_message(ns_id, &actor_id, 100),
+        &MqCommand::deliver_actor_message(ns_id, &actor_id, 100),
         4,
         2002,
     );
@@ -1251,7 +1255,7 @@ fn test_actor_ack_response_no_reply_to_drops_silently() {
         .build();
 
     let resp = engine.apply_command(
-        MqCommand::ack_actor_message(ns_id, &actor_id, msg_id, Some(&response)),
+        &MqCommand::ack_actor_message(ns_id, &actor_id, msg_id, Some(&response)),
         5,
         3000,
     );
@@ -1292,12 +1296,12 @@ fn test_snapshot_restore_preserves_reply_to() {
     let mut engine = make_engine();
 
     engine.apply_command(
-        MqCommand::create_topic("replies", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("replies", RetentionPolicy::default(), 0),
         1,
         1000,
     );
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("rpc-queue", &QueueConfig::default()),
+        &MqCommand::create_queue("rpc-queue", &QueueConfig::default()),
         2,
         1000,
     ) {
@@ -1311,7 +1315,7 @@ fn test_snapshot_restore_preserves_reply_to() {
         .correlation_id(Bytes::from_static(b"corr-snap"))
         .build();
 
-    engine.apply_command(MqCommand::enqueue(queue_id, &[msg], &[None]), 3, 2000);
+    engine.apply_command(&MqCommand::enqueue(queue_id, &[msg], &[None]), 3, 2000);
 
     let snap = engine.snapshot();
     let snap_bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
@@ -1321,7 +1325,7 @@ fn test_snapshot_restore_preserves_reply_to() {
     let mut engine2 = make_engine();
     engine2.restore(snap_restored);
 
-    let resp = engine2.apply_command(MqCommand::deliver(queue_id, 100, 1), 4, 3000);
+    let resp = engine2.apply_command(&MqCommand::deliver(queue_id, 100, 1), 4, 3000);
     let msg_id = match resp {
         MqResponse::Messages { messages } => {
             assert_eq!(messages.len(), 1);
@@ -1335,7 +1339,7 @@ fn test_snapshot_restore_preserves_reply_to() {
         .build();
 
     engine2.apply_command(
-        MqCommand::ack(queue_id, &[msg_id], Some(&response)),
+        &MqCommand::ack(queue_id, &[msg_id], Some(&response)),
         5,
         4000,
     );

@@ -1,12 +1,20 @@
-use std::collections::HashMap;
+use std::cell::UnsafeCell;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use smallvec::SmallVec;
 
 use crate::flat::FlatMessageMeta;
-use crate::types::{PartitionInfo, RetentionPolicy, SegmentRange, name_hash};
+use crate::types::{PartitionInfo, RetentionPolicy, name_hash};
+
+/// Sentinel: cached min needs full recompute.
+const MIN_DIRTY: u64 = u64::MAX;
+/// Sentinel: computed result is u64::MAX (no consumers).
+const MIN_NONE: u64 = u64::MAX - 1;
 
 // =============================================================================
 // Topic Metadata (persisted to MDBX)
@@ -21,8 +29,6 @@ pub struct TopicMeta {
     pub head_index: u64,
     pub tail_index: u64,
     pub message_count: u64,
-    #[serde(default)]
-    pub segment_index: Vec<SegmentRange>,
     #[serde(default)]
     pub name_hash: u64,
     /// Number of partitions. 0 or 1 means unpartitioned (data in coordinator group).
@@ -46,7 +52,7 @@ impl TopicMeta {
             head_index: 0,
             tail_index: 0,
             message_count: 0,
-            segment_index: Vec::new(),
+
             name_hash: hash,
             partition_count: 0,
             partitions: Vec::new(),
@@ -71,7 +77,7 @@ impl TopicMeta {
             head_index: 0,
             tail_index: 0,
             message_count: 0,
-            segment_index: Vec::new(),
+
             name_hash: hash,
             partition_count,
             partitions,
@@ -122,22 +128,32 @@ pub struct TopicLogEntry {
 // In-memory Topic State
 // =============================================================================
 
+/// Lock-free topic state.
+///
+/// All inner collections use interior mutability so methods take `&self`.
+/// The Raft apply path (single writer) and leader tasks (readers) can
+/// operate without contention on the outer DashMap.
 pub struct TopicState {
-    pub meta: TopicMeta,
-    pub consumer_offsets: HashMap<u64, TopicConsumerOffset>,
-    /// Cached minimum consumer offset. None means needs recomputation.
-    cached_min_consumer_offset: Option<u64>,
+    meta: UnsafeCell<TopicMeta>,
+    pub(crate) consumer_offsets: DashMap<u64, TopicConsumerOffset>,
+    /// Cached minimum consumer offset.
+    /// `MIN_DIRTY` = needs recompute, `MIN_NONE` = no consumers, else = cached value.
+    cached_min_consumer_offset: AtomicU64,
 
     /// Compact log entry index: one entry per `apply_publish` call.
     ///
     /// Maps dense topic offsets to raft log indexes. To find the log_index
     /// for topic offset N, binary search `log_entries` by `base_offset`.
-    log_entries: Vec<TopicLogEntry>,
+    log_entries: Mutex<Vec<TopicLogEntry>>,
 
     // Pre-initialized metrics handles
     m_publish_count: metrics::Counter,
     m_publish_bytes: metrics::Counter,
 }
+
+// SAFETY: Single-writer (Raft apply path) guarantees no concurrent mutation.
+unsafe impl Send for TopicState {}
+unsafe impl Sync for TopicState {}
 
 impl TopicState {
     pub fn new(meta: TopicMeta) -> Self {
@@ -146,39 +162,66 @@ impl TopicState {
         let m_publish_bytes = metrics::counter!("mq.topic.publish.bytes", &labels);
 
         Self {
-            meta,
-            consumer_offsets: HashMap::new(),
-            cached_min_consumer_offset: None,
-            log_entries: Vec::new(),
+            meta: UnsafeCell::new(meta),
+            consumer_offsets: DashMap::new(),
+            cached_min_consumer_offset: AtomicU64::new(MIN_NONE),
+            log_entries: Mutex::new(Vec::new()),
             m_publish_count,
             m_publish_bytes,
         }
+    }
+
+    /// Read-only access to meta.
+    #[inline]
+    pub fn meta(&self) -> &TopicMeta {
+        unsafe { &*self.meta.get() }
+    }
+
+    /// Mutable access to meta. SAFETY: only called from single-writer Raft apply path.
+    #[inline]
+    pub(crate) fn meta_mut(&self) -> &mut TopicMeta {
+        unsafe { &mut *self.meta.get() }
+    }
+
+    /// Snapshot consumer offsets as a Vec (for serialization).
+    pub fn consumer_offsets_snapshot(&self) -> Vec<TopicConsumerOffset> {
+        self.consumer_offsets
+            .iter()
+            .map(|e| e.value().clone())
+            .collect()
     }
 
     /// Apply a batch of pre-encoded flat messages to this topic.
     ///
     /// Assigns dense per-topic offsets (0, 1, 2, …) and records which raft
     /// log entry contains these messages.
-    pub fn apply_publish(&mut self, log_index: u64, messages: &[Bytes]) -> SmallVec<[u64; 16]> {
+    ///
+    /// NOTE: `meta.head_index`, `meta.tail_index`, and `meta.message_count`
+    /// are mutated here. Since only the single-writer Raft apply path calls
+    /// this, and the outer DashMap only requires a read guard (`get()`),
+    /// these plain field mutations are safe.
+    pub fn apply_publish(&self, log_index: u64, messages: &[Bytes]) -> SmallVec<[u64; 16]> {
         let mut offsets = SmallVec::with_capacity(messages.len());
-        let base_offset = self.meta.head_index;
+        let base_offset = self.meta().head_index;
         let total_bytes: u64 = messages
             .iter()
             .map(|m| FlatMessageMeta::value_len(m).unwrap_or(0) as u64)
             .sum();
 
         // Record which raft log entry contains these messages.
-        self.log_entries.push(TopicLogEntry {
+        self.log_entries.lock().unwrap().push(TopicLogEntry {
             base_offset,
             log_index,
             msg_count: messages.len() as u32,
         });
 
-        if self.meta.message_count == 0 {
-            self.meta.tail_index = base_offset;
+        // SAFETY: single-writer Raft apply path — these fields are only written here.
+        let meta = self.meta_mut();
+        if meta.message_count == 0 {
+            meta.tail_index = base_offset;
         }
-        self.meta.message_count += messages.len() as u64;
-        self.meta.head_index = base_offset + messages.len() as u64;
+        meta.message_count += messages.len() as u64;
+        meta.head_index = base_offset + messages.len() as u64;
 
         for i in 0..messages.len() {
             offsets.push(base_offset + i as u64);
@@ -195,14 +238,12 @@ impl TopicState {
     /// Returns `(log_index, msg_index_within_batch)`.
     #[inline]
     pub fn get_log_entry(&self, offset: u64) -> Option<(u64, usize)> {
-        if offset < self.meta.tail_index || offset >= self.meta.head_index {
+        if offset < self.meta().tail_index || offset >= self.meta().head_index {
             return None;
         }
+        let log_entries = self.log_entries.lock().unwrap();
         // Binary search log_entries by base_offset
-        let idx = match self
-            .log_entries
-            .binary_search_by_key(&offset, |e| e.base_offset)
-        {
+        let idx = match log_entries.binary_search_by_key(&offset, |e| e.base_offset) {
             Ok(i) => i,
             Err(i) => {
                 if i == 0 {
@@ -211,7 +252,7 @@ impl TopicState {
                 i - 1
             }
         };
-        let entry = &self.log_entries[idx];
+        let entry = &log_entries[idx];
         let pos = (offset - entry.base_offset) as usize;
         if pos < entry.msg_count as usize {
             Some((entry.log_index, pos))
@@ -220,58 +261,72 @@ impl TopicState {
         }
     }
 
-    pub fn apply_commit_offset(&mut self, consumer_id: u64, offset: u64) {
-        let is_new = !self.consumer_offsets.contains_key(&consumer_id);
-        let entry =
+    pub fn apply_commit_offset(&self, consumer_id: u64, offset: u64) {
+        let is_new_consumer = !self.consumer_offsets.contains_key(&consumer_id);
+        let mut entry =
             self.consumer_offsets
                 .entry(consumer_id)
                 .or_insert_with(|| TopicConsumerOffset {
-                    topic_id: self.meta.topic_id,
+                    topic_id: self.meta().topic_id,
                     consumer_id,
                     committed_offset: 0,
                     pending_offset: 0,
                 });
         if offset > entry.committed_offset {
             entry.committed_offset = offset;
-            self.cached_min_consumer_offset = None;
-        } else if is_new {
-            self.cached_min_consumer_offset = None;
+            self.cached_min_consumer_offset
+                .store(MIN_DIRTY, Ordering::Relaxed);
+        } else if is_new_consumer {
+            self.cached_min_consumer_offset
+                .store(MIN_DIRTY, Ordering::Relaxed);
         }
     }
 
-    pub fn apply_purge(&mut self, before_index: u64) {
-        if before_index > self.meta.tail_index {
-            let old_tail = self.meta.tail_index;
-            self.meta.tail_index = before_index;
-            // Approximate message count reduction
-            if self.meta.message_count > 0 {
+    pub fn apply_purge(&self, before_index: u64) {
+        if before_index > self.meta().tail_index {
+            let old_tail = self.meta().tail_index;
+            // SAFETY: single-writer Raft apply path
+            let meta = self.meta_mut();
+            meta.tail_index = before_index;
+            if meta.message_count > 0 {
                 let purged = before_index.saturating_sub(old_tail);
-                self.meta.message_count = self.meta.message_count.saturating_sub(purged);
-                // Remove log entries that are fully before the new tail
-                let first_kept = self
-                    .log_entries
-                    .partition_point(|e| e.base_offset + e.msg_count as u64 <= before_index);
-                if first_kept > 0 {
-                    self.log_entries.drain(..first_kept);
-                }
+                meta.message_count = meta.message_count.saturating_sub(purged);
             }
-            // Remove segments that are fully below the new tail
-            self.meta
-                .segment_index
-                .retain(|s| s.max_index >= before_index);
+            // Remove log entries that are fully before the new tail
+            let mut log_entries = self.log_entries.lock().unwrap();
+            let first_kept =
+                log_entries.partition_point(|e| e.base_offset + e.msg_count as u64 <= before_index);
+            if first_kept > 0 {
+                log_entries.drain(..first_kept);
+            }
         }
     }
 
     /// Returns the minimum log index required by this topic (for purge floor).
-    pub fn min_required_index(&mut self) -> u64 {
-        let consumer_min = *self.cached_min_consumer_offset.get_or_insert_with(|| {
-            self.consumer_offsets
-                .values()
-                .map(|o| o.committed_offset)
+    pub fn min_required_index(&self) -> u64 {
+        let cached = self.cached_min_consumer_offset.load(Ordering::Relaxed);
+        let consumer_min = if cached == MIN_NONE {
+            u64::MAX
+        } else if cached != MIN_DIRTY {
+            cached
+        } else {
+            // Recompute
+            let min = self
+                .consumer_offsets
+                .iter()
+                .map(|e| e.committed_offset)
                 .min()
-                .unwrap_or(u64::MAX)
-        });
-        self.meta.tail_index.min(consumer_min)
+                .unwrap_or(u64::MAX);
+            if min == u64::MAX {
+                self.cached_min_consumer_offset
+                    .store(MIN_NONE, Ordering::Relaxed);
+            } else {
+                self.cached_min_consumer_offset
+                    .store(min, Ordering::Relaxed);
+            }
+            min
+        };
+        self.meta().tail_index.min(consumer_min)
     }
 }
 
@@ -299,55 +354,55 @@ mod tests {
         assert_eq!(meta.head_index, 0);
         assert_eq!(meta.tail_index, 0);
         assert_eq!(meta.message_count, 0);
-        assert!(meta.segment_index.is_empty());
     }
 
     #[test]
     fn test_publish_single_message() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         let msgs = vec![make_msg(b"hello")];
         let offsets = topic.apply_publish(10, &msgs);
 
         // Dense offset starts at 0
         assert_eq!(offsets.as_slice(), &[0u64]);
-        assert_eq!(topic.meta.head_index, 1);
-        assert_eq!(topic.meta.tail_index, 0);
-        assert_eq!(topic.meta.message_count, 1);
+        assert_eq!(topic.meta().head_index, 1);
+        assert_eq!(topic.meta().tail_index, 0);
+        assert_eq!(topic.meta().message_count, 1);
         // Log entry recorded
-        assert_eq!(topic.log_entries.len(), 1);
-        assert_eq!(topic.log_entries[0].log_index, 10);
-        assert_eq!(topic.log_entries[0].base_offset, 0);
-        assert_eq!(topic.log_entries[0].msg_count, 1);
+        let entries = topic.log_entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_index, 10);
+        assert_eq!(entries[0].base_offset, 0);
+        assert_eq!(entries[0].msg_count, 1);
     }
 
     #[test]
     fn test_publish_batch() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         let msgs = vec![make_msg(b"a"), make_msg(b"b"), make_msg(b"c")];
         let offsets = topic.apply_publish(100, &msgs);
 
         assert_eq!(offsets.len(), 3);
         assert_eq!(offsets.as_slice(), &[0, 1, 2]);
-        assert_eq!(topic.meta.message_count, 3);
-        assert_eq!(topic.meta.head_index, 3);
-        assert_eq!(topic.log_entries[0].msg_count, 3);
+        assert_eq!(topic.meta().message_count, 3);
+        assert_eq!(topic.meta().head_index, 3);
+        assert_eq!(topic.log_entries.lock().unwrap()[0].msg_count, 3);
     }
 
     #[test]
     fn test_publish_multiple_batches() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         topic.apply_publish(10, &[make_msg(b"first")]);
         topic.apply_publish(20, &[make_msg(b"second")]);
 
-        assert_eq!(topic.meta.head_index, 2);
-        assert_eq!(topic.meta.tail_index, 0);
-        assert_eq!(topic.meta.message_count, 2);
-        assert_eq!(topic.log_entries.len(), 2);
+        assert_eq!(topic.meta().head_index, 2);
+        assert_eq!(topic.meta().tail_index, 0);
+        assert_eq!(topic.meta().message_count, 2);
+        assert_eq!(topic.log_entries.lock().unwrap().len(), 2);
     }
 
     #[test]
     fn test_get_log_entry() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         topic.apply_publish(10, &[make_msg(b"a"), make_msg(b"b")]);
         topic.apply_publish(20, &[make_msg(b"c")]);
 
@@ -363,68 +418,67 @@ mod tests {
 
     #[test]
     fn test_commit_offset() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         topic.apply_publish(10, &[make_msg(b"msg")]);
 
         topic.apply_commit_offset(100, 0);
-        assert_eq!(topic.consumer_offsets[&100].committed_offset, 0);
+        assert_eq!(
+            topic.consumer_offsets.get(&100).unwrap().committed_offset,
+            0
+        );
 
         // Advance offset
         topic.apply_commit_offset(100, 15);
-        assert_eq!(topic.consumer_offsets[&100].committed_offset, 15);
+        assert_eq!(
+            topic.consumer_offsets.get(&100).unwrap().committed_offset,
+            15
+        );
 
         // Cannot go backwards
         topic.apply_commit_offset(100, 5);
-        assert_eq!(topic.consumer_offsets[&100].committed_offset, 15);
+        assert_eq!(
+            topic.consumer_offsets.get(&100).unwrap().committed_offset,
+            15
+        );
     }
 
     #[test]
     fn test_commit_offset_multiple_consumers() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         topic.apply_commit_offset(1, 10);
         topic.apply_commit_offset(2, 20);
 
         assert_eq!(topic.consumer_offsets.len(), 2);
-        assert_eq!(topic.consumer_offsets[&1].committed_offset, 10);
-        assert_eq!(topic.consumer_offsets[&2].committed_offset, 20);
+        assert_eq!(topic.consumer_offsets.get(&1).unwrap().committed_offset, 10);
+        assert_eq!(topic.consumer_offsets.get(&2).unwrap().committed_offset, 20);
     }
 
     #[test]
     fn test_purge() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         topic.apply_publish(10, &[make_msg(b"a")]);
         topic.apply_publish(20, &[make_msg(b"b")]);
-        topic.meta.segment_index.push(SegmentRange {
-            segment_id: 1,
-            min_index: 5,
-            max_index: 12,
-        });
-        topic.meta.segment_index.push(SegmentRange {
-            segment_id: 2,
-            min_index: 13,
-            max_index: 25,
-        });
-
         // Purge offsets below 1 (second message)
         topic.apply_purge(1);
-        assert_eq!(topic.meta.tail_index, 1);
+        assert_eq!(topic.meta().tail_index, 1);
         // First log entry (base_offset=0, count=1) is fully purged
-        assert_eq!(topic.log_entries.len(), 1);
-        assert_eq!(topic.log_entries[0].log_index, 20);
+        let entries = topic.log_entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_index, 20);
     }
 
     #[test]
     fn test_purge_no_op_if_before_tail() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         topic.apply_publish(20, &[make_msg(b"a")]);
         // tail_index is 0 (first dense offset), purge at 0 is no-op (not > tail)
         topic.apply_purge(0);
-        assert_eq!(topic.meta.tail_index, 0);
+        assert_eq!(topic.meta().tail_index, 0);
     }
 
     #[test]
     fn test_min_required_index() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         topic.apply_publish(10, &[make_msg(b"a")]);
         topic.apply_publish(20, &[make_msg(b"b")]);
         assert_eq!(topic.min_required_index(), 0); // tail is 0
@@ -441,9 +495,9 @@ mod tests {
 
     #[test]
     fn test_consumer_offset_defaults() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         topic.apply_commit_offset(42, 100);
-        let offset = &topic.consumer_offsets[&42];
+        let offset = topic.consumer_offsets.get(&42).unwrap();
         assert_eq!(offset.topic_id, 1);
         assert_eq!(offset.consumer_id, 42);
         assert_eq!(offset.pending_offset, 0);
@@ -534,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_get_log_entry_after_purge() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         // Batch 1: offsets 0,1 at log_index 10
         topic.apply_publish(10, &[make_msg(b"a"), make_msg(b"b")]);
         // Batch 2: offsets 2,3,4 at log_index 20
@@ -544,7 +598,7 @@ mod tests {
         topic.apply_purge(2);
 
         // Batch 1 entries removed
-        assert_eq!(topic.log_entries.len(), 1);
+        assert_eq!(topic.log_entries.lock().unwrap().len(), 1);
         // Offset 2 still findable
         assert_eq!(topic.get_log_entry(2), Some((20, 0)));
         assert_eq!(topic.get_log_entry(4), Some((20, 2)));
@@ -555,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_get_log_entry_partial_purge() {
-        let mut topic = make_topic("test");
+        let topic = make_topic("test");
         // Batch with 3 messages at offsets 0,1,2
         topic.apply_publish(10, &[make_msg(b"a"), make_msg(b"b"), make_msg(b"c")]);
 
@@ -563,7 +617,7 @@ mod tests {
         topic.apply_purge(1);
 
         // The batch is not fully purged (base_offset=0 + count=3 > before_index=1)
-        assert_eq!(topic.log_entries.len(), 1);
+        assert_eq!(topic.log_entries.lock().unwrap().len(), 1);
         // Offset 1 still findable (even though offset 0 is purged, tail guards it)
         assert_eq!(topic.get_log_entry(1), Some((10, 1)));
         assert_eq!(topic.get_log_entry(2), Some((10, 2)));

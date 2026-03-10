@@ -2223,7 +2223,11 @@ impl Encode for MqResponse {
             }
             MqResponse::Messages { messages } => {
                 TAG_RESP_MESSAGES.encode(w)?;
-                messages.encode(w)
+                (messages.len() as u32).encode(w)?;
+                for msg in messages.iter() {
+                    msg.encode(w)?;
+                }
+                Ok(())
             }
             MqResponse::Published { offsets } => {
                 TAG_RESP_PUBLISHED.encode(w)?;
@@ -2261,7 +2265,9 @@ impl Encode for MqResponse {
             MqResponse::Ok => 0,
             MqResponse::Error(err) => err.encoded_size(),
             MqResponse::EntityCreated { .. } => 8,
-            MqResponse::Messages { messages } => messages.encoded_size(),
+            MqResponse::Messages { messages } => {
+                4 + messages.iter().map(|m| m.encoded_size()).sum::<usize>()
+            }
             MqResponse::Published { offsets } => 4 + offsets.len() * 8,
             MqResponse::Stats(stats) => stats.encoded_size(),
             MqResponse::BatchResponse(resps) => {
@@ -2282,9 +2288,14 @@ impl Decode for MqResponse {
             TAG_RESP_ENTITY_CREATED => Ok(MqResponse::EntityCreated {
                 id: u64::decode(r)?,
             }),
-            TAG_RESP_MESSAGES => Ok(MqResponse::Messages {
-                messages: Vec::decode(r)?,
-            }),
+            TAG_RESP_MESSAGES => {
+                let count = u32::decode(r)? as usize;
+                let mut messages = SmallVec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    messages.push(DeliveredMessage::decode(r)?);
+                }
+                Ok(MqResponse::Messages { messages })
+            }
             TAG_RESP_PUBLISHED => {
                 let count = u32::decode(r)? as usize;
                 let mut offsets = SmallVec::with_capacity(count.min(256));

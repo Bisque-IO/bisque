@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -56,8 +57,13 @@ impl JobMeta {
 // In-memory Job State
 // =============================================================================
 
+/// Lock-free job instance.
+///
+/// All apply methods take `&self` using interior mutability (unsafe single-writer
+/// pointer cast). The Raft apply path is the only writer; readers access
+/// immutable fields like `should_trigger()` and `is_execution_timed_out()`.
 pub struct JobInstance {
-    pub meta: JobMeta,
+    meta: UnsafeCell<JobMeta>,
 
     // Pre-initialized metrics
     m_trigger_count: metrics::Counter,
@@ -65,6 +71,10 @@ pub struct JobInstance {
     m_fail_count: metrics::Counter,
     m_timeout_count: metrics::Counter,
 }
+
+// SAFETY: Single-writer (Raft apply path) guarantees no concurrent mutation.
+unsafe impl Send for JobInstance {}
+unsafe impl Sync for JobInstance {}
 
 impl JobInstance {
     pub fn new(meta: JobMeta) -> Self {
@@ -75,7 +85,7 @@ impl JobInstance {
         let m_timeout_count = metrics::counter!("mq.job.timeout.count", &labels);
 
         Self {
-            meta,
+            meta: UnsafeCell::new(meta),
             m_trigger_count,
             m_complete_count,
             m_fail_count,
@@ -83,69 +93,99 @@ impl JobInstance {
         }
     }
 
-    pub fn apply_trigger(&mut self, execution_id: u64, triggered_at: u64) {
-        self.meta.state.current_execution_id = Some(execution_id);
-        self.meta.state.last_triggered_at = Some(triggered_at);
+    /// Read-only access to meta.
+    #[inline]
+    pub fn meta(&self) -> &JobMeta {
+        unsafe { &*self.meta.get() }
+    }
+
+    /// Get a mutable reference to meta. SAFETY: only called from single-writer Raft apply path.
+    #[inline]
+    pub(crate) fn meta_mut(&self) -> &mut JobMeta {
+        unsafe { &mut *self.meta.get() }
+    }
+
+    pub fn apply_trigger(&self, execution_id: u64, triggered_at: u64) {
+        let meta = self.meta_mut();
+        meta.state.current_execution_id = Some(execution_id);
+        meta.state.last_triggered_at = Some(triggered_at);
         // Compute next trigger time
-        self.meta.state.next_trigger_at =
-            compute_next_trigger(&self.meta.config.cron_expression, triggered_at);
+        meta.state.next_trigger_at =
+            compute_next_trigger(&meta.config.cron_expression, triggered_at);
         self.m_trigger_count.increment(1);
     }
 
-    pub fn apply_assign(&mut self, consumer_id: u64) {
-        self.meta.state.assigned_consumer_id = Some(consumer_id);
+    pub fn apply_assign(&self, consumer_id: u64) {
+        self.meta_mut().state.assigned_consumer_id = Some(consumer_id);
     }
 
-    pub fn apply_complete(&mut self, execution_id: u64, current_time: u64) {
-        if self.meta.state.current_execution_id == Some(execution_id) {
-            self.meta.state.current_execution_id = None;
-            self.meta.state.last_completed_at = Some(current_time);
-            self.meta.state.consecutive_failures = 0;
+    pub fn apply_unassign(&self) {
+        self.meta_mut().state.assigned_consumer_id = None;
+    }
+
+    pub fn apply_complete(&self, execution_id: u64, current_time: u64) {
+        let meta = self.meta_mut();
+        if meta.state.current_execution_id == Some(execution_id) {
+            meta.state.current_execution_id = None;
+            meta.state.last_completed_at = Some(current_time);
+            meta.state.consecutive_failures = 0;
             self.m_complete_count.increment(1);
 
             // Dequeue a queued trigger if any
-            if self.meta.state.queued_triggers > 0 {
-                self.meta.state.queued_triggers -= 1;
+            if meta.state.queued_triggers > 0 {
+                meta.state.queued_triggers -= 1;
             }
         }
     }
 
-    pub fn apply_fail(&mut self, execution_id: u64) {
-        if self.meta.state.current_execution_id == Some(execution_id) {
-            self.meta.state.current_execution_id = None;
-            self.meta.state.consecutive_failures += 1;
+    pub fn apply_fail(&self, execution_id: u64) {
+        let meta = self.meta_mut();
+        if meta.state.current_execution_id == Some(execution_id) {
+            meta.state.current_execution_id = None;
+            meta.state.consecutive_failures += 1;
             self.m_fail_count.increment(1);
         }
     }
 
-    pub fn apply_timeout(&mut self, execution_id: u64) {
-        if self.meta.state.current_execution_id == Some(execution_id) {
-            self.meta.state.current_execution_id = None;
-            self.meta.state.consecutive_failures += 1;
-            self.meta.state.assigned_consumer_id = None;
+    pub fn apply_timeout(&self, execution_id: u64) {
+        let meta = self.meta_mut();
+        if meta.state.current_execution_id == Some(execution_id) {
+            meta.state.current_execution_id = None;
+            meta.state.consecutive_failures += 1;
+            meta.state.assigned_consumer_id = None;
             self.m_timeout_count.increment(1);
         }
     }
 
+    pub fn apply_set_enabled(&self, enabled: bool) {
+        self.meta_mut().enabled = enabled;
+    }
+
+    pub fn apply_set_config(&self, config: JobConfig) {
+        self.meta_mut().config = config;
+    }
+
     /// Check if this job should be triggered now.
     pub fn should_trigger(&self, current_time: u64) -> bool {
-        if !self.meta.enabled {
+        let meta = self.meta();
+        if !meta.enabled {
             return false;
         }
-        if current_time < self.meta.state.next_trigger_at {
+        if current_time < meta.state.next_trigger_at {
             return false;
         }
-        match self.meta.config.overlap_policy {
-            OverlapPolicy::Skip => self.meta.state.current_execution_id.is_none(),
-            OverlapPolicy::Queue => self.meta.state.queued_triggers < self.meta.config.max_queued,
+        match meta.config.overlap_policy {
+            OverlapPolicy::Skip => meta.state.current_execution_id.is_none(),
+            OverlapPolicy::Queue => meta.state.queued_triggers < meta.config.max_queued,
         }
     }
 
     /// Check if the current execution has timed out.
     pub fn is_execution_timed_out(&self, current_time: u64) -> bool {
-        if let Some(triggered_at) = self.meta.state.last_triggered_at {
-            if self.meta.state.current_execution_id.is_some() {
-                return current_time > triggered_at + self.meta.config.execution_timeout_ms;
+        let meta = self.meta();
+        if let Some(triggered_at) = meta.state.last_triggered_at {
+            if meta.state.current_execution_id.is_some() {
+                return current_time > triggered_at + meta.config.execution_timeout_ms;
             }
         }
         false
@@ -197,96 +237,96 @@ mod tests {
     #[test]
     fn test_job_meta_defaults() {
         let job = make_job("test-job");
-        assert_eq!(job.meta.job_id, 1);
-        assert_eq!(job.meta.name, "test-job");
-        assert!(job.meta.enabled);
-        assert!(job.meta.state.current_execution_id.is_none());
-        assert_eq!(job.meta.state.consecutive_failures, 0);
+        assert_eq!(job.meta().job_id, 1);
+        assert_eq!(job.meta().name, "test-job");
+        assert!(job.meta().enabled);
+        assert!(job.meta().state.current_execution_id.is_none());
+        assert_eq!(job.meta().state.consecutive_failures, 0);
     }
 
     #[test]
     fn test_trigger() {
-        let mut job = make_job("test-job");
+        let job = make_job("test-job");
         job.apply_trigger(100, 5000);
 
-        assert_eq!(job.meta.state.current_execution_id, Some(100));
-        assert_eq!(job.meta.state.last_triggered_at, Some(5000));
-        assert!(job.meta.state.next_trigger_at > 5000);
+        assert_eq!(job.meta().state.current_execution_id, Some(100));
+        assert_eq!(job.meta().state.last_triggered_at, Some(5000));
+        assert!(job.meta().state.next_trigger_at > 5000);
     }
 
     #[test]
     fn test_assign() {
-        let mut job = make_job("test-job");
+        let job = make_job("test-job");
         job.apply_assign(42);
-        assert_eq!(job.meta.state.assigned_consumer_id, Some(42));
+        assert_eq!(job.meta().state.assigned_consumer_id, Some(42));
     }
 
     #[test]
     fn test_complete() {
-        let mut job = make_job("test-job");
+        let job = make_job("test-job");
         job.apply_trigger(100, 5000);
         job.apply_complete(100, 6000);
 
-        assert!(job.meta.state.current_execution_id.is_none());
-        assert_eq!(job.meta.state.last_completed_at, Some(6000));
-        assert_eq!(job.meta.state.consecutive_failures, 0);
+        assert!(job.meta().state.current_execution_id.is_none());
+        assert_eq!(job.meta().state.last_completed_at, Some(6000));
+        assert_eq!(job.meta().state.consecutive_failures, 0);
     }
 
     #[test]
     fn test_complete_wrong_execution_id() {
-        let mut job = make_job("test-job");
+        let job = make_job("test-job");
         job.apply_trigger(100, 5000);
         job.apply_complete(999, 6000); // wrong ID
 
         // Should not change state
-        assert_eq!(job.meta.state.current_execution_id, Some(100));
-        assert!(job.meta.state.last_completed_at.is_none());
+        assert_eq!(job.meta().state.current_execution_id, Some(100));
+        assert!(job.meta().state.last_completed_at.is_none());
     }
 
     #[test]
     fn test_fail() {
-        let mut job = make_job("test-job");
+        let job = make_job("test-job");
         job.apply_trigger(100, 5000);
         job.apply_fail(100);
 
-        assert!(job.meta.state.current_execution_id.is_none());
-        assert_eq!(job.meta.state.consecutive_failures, 1);
+        assert!(job.meta().state.current_execution_id.is_none());
+        assert_eq!(job.meta().state.consecutive_failures, 1);
     }
 
     #[test]
     fn test_consecutive_failures() {
-        let mut job = make_job("test-job");
+        let job = make_job("test-job");
 
         job.apply_trigger(1, 5000);
         job.apply_fail(1);
-        assert_eq!(job.meta.state.consecutive_failures, 1);
+        assert_eq!(job.meta().state.consecutive_failures, 1);
 
         job.apply_trigger(2, 6000);
         job.apply_fail(2);
-        assert_eq!(job.meta.state.consecutive_failures, 2);
+        assert_eq!(job.meta().state.consecutive_failures, 2);
 
         // Successful completion resets
         job.apply_trigger(3, 7000);
         job.apply_complete(3, 8000);
-        assert_eq!(job.meta.state.consecutive_failures, 0);
+        assert_eq!(job.meta().state.consecutive_failures, 0);
     }
 
     #[test]
     fn test_timeout() {
-        let mut job = make_job("test-job");
+        let job = make_job("test-job");
         job.apply_assign(42);
         job.apply_trigger(100, 5000);
         job.apply_timeout(100);
 
-        assert!(job.meta.state.current_execution_id.is_none());
-        assert_eq!(job.meta.state.consecutive_failures, 1);
-        assert!(job.meta.state.assigned_consumer_id.is_none());
+        assert!(job.meta().state.current_execution_id.is_none());
+        assert_eq!(job.meta().state.consecutive_failures, 1);
+        assert!(job.meta().state.assigned_consumer_id.is_none());
     }
 
     #[test]
     fn test_should_trigger_disabled() {
-        let mut job = make_job("test-job");
-        job.meta.enabled = false;
+        let job = make_job("test-job");
+        job.apply_set_enabled(false);
         assert!(!job.should_trigger(999999));
     }
 
@@ -299,13 +339,13 @@ mod tests {
 
     #[test]
     fn test_should_trigger_skip_policy() {
-        let mut job = make_job("test-job");
-        job.meta.state.next_trigger_at = 5000;
+        let job = make_job("test-job");
+        job.meta_mut().state.next_trigger_at = 5000;
 
         assert!(job.should_trigger(6000));
 
         // With active execution, skip policy prevents trigger
-        job.meta.state.current_execution_id = Some(1);
+        job.meta_mut().state.current_execution_id = Some(1);
         assert!(!job.should_trigger(6000));
     }
 
@@ -317,20 +357,20 @@ mod tests {
             max_queued: 2,
             ..Default::default()
         };
-        let mut job = make_job_with_config("test-job", config);
-        job.meta.state.next_trigger_at = 5000;
-        job.meta.state.current_execution_id = Some(1);
+        let job = make_job_with_config("test-job", config);
+        job.meta_mut().state.next_trigger_at = 5000;
+        job.meta_mut().state.current_execution_id = Some(1);
 
         // Can queue up to max_queued
         assert!(job.should_trigger(6000));
 
-        job.meta.state.queued_triggers = 2;
+        job.meta_mut().state.queued_triggers = 2;
         assert!(!job.should_trigger(6000));
     }
 
     #[test]
     fn test_is_execution_timed_out() {
-        let mut job = make_job("test-job");
+        let job = make_job("test-job");
         assert!(!job.is_execution_timed_out(999999));
 
         job.apply_trigger(100, 5000);
@@ -341,12 +381,12 @@ mod tests {
 
     #[test]
     fn test_queued_triggers_decrement_on_complete() {
-        let mut job = make_job("test-job");
-        job.meta.state.queued_triggers = 3;
+        let job = make_job("test-job");
+        job.meta_mut().state.queued_triggers = 3;
         job.apply_trigger(100, 5000);
         job.apply_complete(100, 6000);
 
-        assert_eq!(job.meta.state.queued_triggers, 2);
+        assert_eq!(job.meta().state.queued_triggers, 2);
     }
 
     #[test]

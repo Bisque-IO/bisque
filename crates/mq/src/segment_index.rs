@@ -699,6 +699,23 @@ impl SegmentIndexBuilder {
         let buf = self.serialize();
         writer.write_all(&buf)
     }
+
+    /// Extract per-entity summaries: `(entity_type, entity_id, record_count, total_bytes)`.
+    ///
+    /// Used to populate the MDBX segment_ranges multimap table when a segment
+    /// is sealed.
+    pub fn entity_summaries(&self) -> Vec<(u8, u64, u64, u64)> {
+        self.map
+            .iter()
+            .map(|(packed, vec)| {
+                let (entity_type, entity_id) = unpack_key(packed);
+                let records: Vec<RecordLoc> = vec.iter().collect();
+                let record_count = records.len() as u64;
+                let total_bytes: u64 = records.iter().map(|r| r.len as u64).sum();
+                (entity_type, entity_id, record_count, total_bytes)
+            })
+            .collect()
+    }
 }
 
 impl SegmentIndex for SegmentIndexBuilder {

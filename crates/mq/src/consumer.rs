@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::types::Subscription;
@@ -10,9 +11,9 @@ pub struct ConsumerMeta {
     pub group_name: String,
     pub connected_at: u64,
     pub last_heartbeat_at: u64,
-    pub subscriptions: Vec<Subscription>,
+    pub subscriptions: HashSet<Subscription>,
     #[serde(default)]
-    pub assigned_jobs: Vec<u64>,
+    pub assigned_jobs: HashSet<u64>,
 }
 
 impl ConsumerMeta {
@@ -20,7 +21,7 @@ impl ConsumerMeta {
         consumer_id: u64,
         group_name: String,
         connected_at: u64,
-        subscriptions: Vec<Subscription>,
+        subscriptions: HashSet<Subscription>,
     ) -> Self {
         Self {
             consumer_id,
@@ -28,7 +29,7 @@ impl ConsumerMeta {
             connected_at,
             last_heartbeat_at: connected_at,
             subscriptions,
-            assigned_jobs: Vec::new(),
+            assigned_jobs: HashSet::new(),
         }
     }
 }
@@ -37,14 +38,14 @@ impl ConsumerMeta {
 pub struct ConsumerState {
     pub meta: ConsumerMeta,
     /// entity_id → list of in-flight message_ids
-    pub in_flight: HashMap<u64, Vec<u64>>,
+    pub in_flight: DashMap<u64, Vec<u64>>,
 }
 
 impl ConsumerState {
     pub fn new(meta: ConsumerMeta) -> Self {
         Self {
             meta,
-            in_flight: HashMap::new(),
+            in_flight: DashMap::new(),
         }
     }
 
@@ -67,17 +68,19 @@ mod tests {
             id,
             "test-group".to_string(),
             connected_at,
-            vec![Subscription {
+            [Subscription {
                 entity_type: EntityType::Queue,
                 entity_id: 1,
-            }],
+            }]
+            .into_iter()
+            .collect(),
         );
         ConsumerState::new(meta)
     }
 
     #[test]
     fn test_consumer_meta_defaults() {
-        let meta = ConsumerMeta::new(42, "workers".to_string(), 1000, Vec::new());
+        let meta = ConsumerMeta::new(42, "workers".to_string(), 1000, HashSet::new());
         assert_eq!(meta.consumer_id, 42);
         assert_eq!(meta.group_name, "workers");
         assert_eq!(meta.connected_at, 1000);
@@ -125,10 +128,12 @@ mod tests {
             42,
             "workers".to_string(),
             1000,
-            vec![Subscription {
+            [Subscription {
                 entity_type: EntityType::Topic,
                 entity_id: 5,
-            }],
+            }]
+            .into_iter()
+            .collect(),
         );
         let bytes = bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap();
         let (decoded, _): (ConsumerMeta, _) =
@@ -137,6 +142,6 @@ mod tests {
         assert_eq!(decoded.consumer_id, 42);
         assert_eq!(decoded.group_name, "workers");
         assert_eq!(decoded.subscriptions.len(), 1);
-        assert_eq!(decoded.subscriptions[0].entity_id, 5);
+        assert!(decoded.subscriptions.iter().any(|s| s.entity_id == 5));
     }
 }

@@ -1,23 +1,32 @@
 //! Lock-free concurrent metadata for MQ engine state.
 //!
-//! Protocol adapters need topic/queue metadata (names, IDs, head/tail offsets)
-//! for routing and retained message delivery. This module provides a fully
-//! lock-free metadata store using `DashMap` for structural lookups and atomics
-//! for hot fields.
+//! All entity stores, name→ID indexes, and scalar counters live here behind
+//! `DashMap` and atomics — eliminating the global `RwLock<MqEngine>` that
+//! previously serialised readers and the writer.
 //!
-//! **Callers cache `Arc<TopicMeta>`** after the first lookup and then read
-//! atomics directly — no map lookup, no locking, no contention on the hot path.
+//! **Protocol adapters** cache `Arc<TopicMeta>` after the first lookup and
+//! read atomics directly — zero-cost after the initial lookup.
 //!
-//! **Writer (engine)** does `AtomicU64::store` for hot-field updates (every
-//! publish) and `DashMap::insert`/`remove` only for structural changes
-//! (create/delete topic — rare).
+//! **Raft apply path** (single writer) uses `DashMap::get_mut` for per-entry
+//! mutations. Readers on other shards proceed without contention.
+//!
+//! **Periodic leader tasks** iterate `DashMap` without blocking the writer.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+
+use crate::actor::ActorNamespaceState;
+use crate::consumer::ConsumerState;
+use crate::exchange::ExchangeState;
+use crate::job::JobInstance;
+use crate::producer::ProducerMeta;
+use crate::queue::QueueState;
+use crate::topic::TopicState;
 
 // ---------------------------------------------------------------------------
 // Atomic metadata entities
@@ -197,17 +206,52 @@ impl fmt::Debug for QueueMeta {
 
 /// Lock-free concurrent metadata store.
 ///
-/// - **Readers** call `get_topic(id)` once to obtain `Arc<TopicMeta>`, then
-///   cache it and read atomics directly on subsequent accesses.
-/// - **Writer** (engine) calls `insert_topic` / `remove_topic` for structural
-///   changes, and `Arc<TopicMeta>::set_*` for hot-field updates.
+/// Holds **all** MQ entity state behind `DashMap` (sharded concurrent maps)
+/// and `AtomicU64`/`AtomicBool` for scalar counters. This replaces the
+/// previous `HashMap` fields inside `MqEngine` that were behind a global
+/// `RwLock`.
 ///
-/// No cloning, no snapshot rebuilds, no `ArcSwap` swaps.
+/// - **Readers** can iterate or lookup any entity without blocking the writer.
+/// - **Writer** (Raft apply, single-threaded) uses `DashMap::get_mut` for
+///   per-entry mutations — only the target shard is locked.
+/// - **Protocol adapters** cache `Arc<TopicMeta>` for zero-cost atomic reads.
 pub struct MqMetadata {
+    // -- Protocol adapter caches (lightweight, with atomics for hot fields) --
     topics_by_id: DashMap<u64, Arc<TopicMeta>>,
     topics_by_name: DashMap<String, u64>,
     queues_by_id: DashMap<u64, Arc<QueueMeta>>,
     queues_by_name: DashMap<String, u64>,
+
+    // -- Full entity stores (DashMap replaces HashMap behind RwLock) --
+    pub(crate) topics: DashMap<u64, TopicState>,
+    pub(crate) queues: DashMap<u64, QueueState>,
+    pub(crate) actor_namespaces: DashMap<u64, ActorNamespaceState>,
+    pub(crate) jobs: DashMap<u64, JobInstance>,
+    pub(crate) exchanges: DashMap<u64, ExchangeState>,
+
+    // -- Session stores --
+    pub(crate) consumers: DashMap<u64, ConsumerState>,
+    pub(crate) producers: DashMap<u64, ProducerMeta>,
+
+    // -- Name hash (CRC64-NVME) → ID lookup indexes --
+    pub(crate) topic_names: DashMap<u64, u64>,
+    pub(crate) queue_names: DashMap<u64, u64>,
+    pub(crate) namespace_names: DashMap<u64, u64>,
+    pub(crate) job_names: DashMap<u64, u64>,
+    pub(crate) exchange_names: DashMap<u64, u64>,
+
+    // -- Consumer reverse indexes for O(1) disconnect --
+    /// consumer_id → set of queue_ids where the consumer has in-flight messages.
+    pub(crate) consumer_queue_index: DashMap<u64, HashSet<u64>>,
+    /// consumer_id → set of namespace_ids where the consumer has actor assignments.
+    pub(crate) consumer_actor_ns_index: DashMap<u64, HashSet<u64>>,
+    /// consumer_id → set of job_ids assigned to the consumer.
+    pub(crate) consumer_job_index: DashMap<u64, HashSet<u64>>,
+
+    // -- Atomic scalars --
+    pub(crate) next_id: AtomicU64,
+    pub(crate) cached_purge_floor: AtomicU64,
+    pub(crate) purge_floor_dirty: AtomicBool,
 }
 
 impl MqMetadata {
@@ -217,7 +261,59 @@ impl MqMetadata {
             topics_by_name: DashMap::new(),
             queues_by_id: DashMap::new(),
             queues_by_name: DashMap::new(),
+            topics: DashMap::new(),
+            queues: DashMap::new(),
+            actor_namespaces: DashMap::new(),
+            jobs: DashMap::new(),
+            exchanges: DashMap::new(),
+            consumers: DashMap::new(),
+            producers: DashMap::new(),
+            topic_names: DashMap::new(),
+            queue_names: DashMap::new(),
+            namespace_names: DashMap::new(),
+            job_names: DashMap::new(),
+            exchange_names: DashMap::new(),
+            consumer_queue_index: DashMap::new(),
+            consumer_actor_ns_index: DashMap::new(),
+            consumer_job_index: DashMap::new(),
+            next_id: AtomicU64::new(1),
+            cached_purge_floor: AtomicU64::new(0),
+            purge_floor_dirty: AtomicBool::new(true),
         }
+    }
+
+    /// Allocate a monotonically increasing entity ID.
+    /// Safe with single-writer (Raft apply) — Relaxed ordering suffices.
+    #[inline]
+    pub(crate) fn alloc_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Resolve an entity by type and name hash. Returns the entity ID if found.
+    pub fn resolve_entity(&self, entity_type: u8, name_hash: u64) -> Option<u64> {
+        match entity_type {
+            0 => self.topic_names.get(&name_hash).map(|r| *r),
+            1 => self.queue_names.get(&name_hash).map(|r| *r),
+            2 => self.namespace_names.get(&name_hash).map(|r| *r),
+            3 => self.job_names.get(&name_hash).map(|r| *r),
+            4 => self.exchange_names.get(&name_hash).map(|r| *r),
+            _ => None,
+        }
+    }
+
+    /// Get the current head index for a topic.
+    pub fn get_topic_head_from_state(&self, topic_id: u64) -> u64 {
+        self.topics
+            .get(&topic_id)
+            .map(|t| t.meta().head_index)
+            .unwrap_or(0)
+    }
+
+    /// Get the partition map for a topic.
+    pub fn get_topic_partitions(&self, topic_id: u64) -> Option<Vec<crate::types::PartitionInfo>> {
+        self.topics
+            .get(&topic_id)
+            .map(|t| t.meta().partitions.clone())
     }
 
     // -- Topic operations --
@@ -358,6 +454,63 @@ impl MqMetadata {
     /// Collect all queue IDs (for sync/removal checks).
     pub fn queue_ids(&self) -> Vec<u64> {
         self.queues_by_id.iter().map(|e| *e.key()).collect()
+    }
+
+    // -- Consumer reverse index operations --
+
+    /// Track that a consumer has in-flight messages in a queue.
+    #[inline]
+    pub(crate) fn track_consumer_queue(&self, consumer_id: u64, queue_id: u64) {
+        self.consumer_queue_index
+            .entry(consumer_id)
+            .or_default()
+            .insert(queue_id);
+    }
+
+    /// Track that a consumer has actor assignments in a namespace.
+    #[inline]
+    pub(crate) fn track_consumer_actor_ns(&self, consumer_id: u64, namespace_id: u64) {
+        self.consumer_actor_ns_index
+            .entry(consumer_id)
+            .or_default()
+            .insert(namespace_id);
+    }
+
+    /// Track that a consumer has a job assignment.
+    #[inline]
+    pub(crate) fn track_consumer_job(&self, consumer_id: u64, job_id: u64) {
+        self.consumer_job_index
+            .entry(consumer_id)
+            .or_default()
+            .insert(job_id);
+    }
+
+    /// Remove a consumer from all reverse indexes. Returns the tracked sets.
+    pub(crate) fn remove_consumer_indexes(
+        &self,
+        consumer_id: u64,
+    ) -> (
+        Option<HashSet<u64>>,
+        Option<HashSet<u64>>,
+        Option<HashSet<u64>>,
+    ) {
+        let queues = self
+            .consumer_queue_index
+            .remove(&consumer_id)
+            .map(|(_, v)| v);
+        let actor_ns = self
+            .consumer_actor_ns_index
+            .remove(&consumer_id)
+            .map(|(_, v)| v);
+        let jobs = self.consumer_job_index.remove(&consumer_id).map(|(_, v)| v);
+        (queues, actor_ns, jobs)
+    }
+
+    /// Clear all consumer reverse indexes (used during snapshot restore).
+    pub(crate) fn clear_consumer_indexes(&self) {
+        self.consumer_queue_index.clear();
+        self.consumer_actor_ns_index.clear();
+        self.consumer_job_index.clear();
     }
 }
 

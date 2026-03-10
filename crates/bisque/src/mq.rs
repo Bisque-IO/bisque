@@ -14,12 +14,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::BytesMut;
 use dashmap::DashMap;
 use openraft::BasicNode;
-use parking_lot::RwLock;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use bisque_mq::MqEngine;
+use bisque_mq::MqMetadata;
 use bisque_mq::write_batcher::MqWriteBatcher;
 use bisque_mq_protocol::frame::{
     decode_client_frame_bytes, encode_server_frame_prefixed, read_tcp_frame_bytes,
@@ -127,7 +126,7 @@ impl MqState {
         // State machine
         let mq_state_machine =
             bisque_mq::MqStateMachine::new(mq_engine).with_manifest(mq_manifest.clone(), group_id);
-        let mq_shared_engine = mq_state_machine.shared_engine();
+        let mq_shared_metadata = mq_state_machine.shared_metadata();
 
         // Raft group
         let mq_raft_config = Arc::new(
@@ -165,7 +164,7 @@ impl MqState {
         let mq_raft_node = Arc::new(
             bisque_mq::MqRaftNode::new(mq_raft.clone(), self.node_id, mq_config)
                 .with_group_id(group_id)
-                .with_engine(mq_shared_engine.clone())
+                .with_metadata(mq_shared_metadata.clone())
                 .with_manifest(mq_manifest),
         );
         mq_raft_node.start();
@@ -200,7 +199,7 @@ impl MqState {
         // Router
         let mq_router = Arc::new(
             BisqueMqRouter::new(
-                mq_shared_engine,
+                mq_shared_metadata,
                 self.token_manager.clone(),
                 self.meta_engine.clone(),
             )
@@ -274,14 +273,14 @@ impl MqState {
 /// MQ router implementation that bridges the bisque auth + engine layer
 /// to the transport-agnostic consumer handler.
 ///
-/// Hot-path methods avoid the engine `RwLock` by using lock-free caches:
+/// Hot-path methods use lock-free `DashMap` and atomics via `MqMetadata`:
 /// - Entity name→id lookups go through a `DashMap` cache (populated on miss)
 /// - Topic heads use `AtomicU64` for lock-free reads
 /// - Topic watchers use `DashMap` instead of `RwLock<HashMap>`
 /// - Batcher lookup uses a direct `Arc` (single-group) with `DashMap` fallback
 pub struct BisqueMqRouter {
-    /// Shared MQ engine — only used for cache misses and cold paths.
-    engine: Arc<RwLock<MqEngine>>,
+    /// Lock-free MQ metadata — all lookups are DashMap/atomic reads.
+    metadata: Arc<MqMetadata>,
     /// Primary batcher (single-group fast path).
     primary_batcher: Option<(u64, Arc<MqWriteBatcher>)>,
     /// Partition group batchers: partition_group_id → batcher.
@@ -302,12 +301,12 @@ pub struct BisqueMqRouter {
 
 impl BisqueMqRouter {
     pub fn new(
-        engine: Arc<RwLock<MqEngine>>,
+        metadata: Arc<MqMetadata>,
         token_manager: Arc<TokenManager>,
         _meta_engine: Arc<MetaEngine>,
     ) -> Self {
         Self {
-            engine,
+            metadata,
             primary_batcher: None,
             partition_batchers: DashMap::new(),
             token_manager,
@@ -335,10 +334,8 @@ impl MqRouter for BisqueMqRouter {
         if let Some(entry) = self.entity_cache.get(&key) {
             return Some(*entry);
         }
-        // Slow path: acquire engine read lock, populate cache.
-        let engine = self.engine.read();
-        let entity_id = engine.resolve_entity(entity_type, name_hash)?;
-        drop(engine);
+        // Slow path: lock-free DashMap lookup on metadata, populate cache.
+        let entity_id = self.metadata.resolve_entity(entity_type, name_hash)?;
         self.entity_cache.insert(key, entity_id);
         Some(entity_id)
     }
@@ -374,10 +371,8 @@ impl MqRouter for BisqueMqRouter {
         if let Some(entry) = self.topic_head_cache.get(&entity_id) {
             return entry.load(Ordering::Relaxed);
         }
-        // Slow path: acquire engine read lock, populate cache.
-        let engine = self.engine.read();
-        let head = engine.get_topic_head(entity_id);
-        drop(engine);
+        // Slow path: lock-free DashMap read from metadata, populate cache.
+        let head = self.metadata.get_topic_head_from_state(entity_id);
         self.topic_head_cache
             .insert(entity_id, AtomicU64::new(head));
         head
@@ -396,10 +391,7 @@ impl MqRouter for BisqueMqRouter {
         // Slow path: create new watcher — DashMap per-shard write lock (not global).
         // Use entry API to avoid TOCTOU race between get and insert.
         let entry = self.topic_watchers.entry(key).or_insert_with(|| {
-            let head = {
-                let engine = self.engine.read();
-                engine.get_topic_head(entity_id)
-            };
+            let head = self.metadata.get_topic_head_from_state(entity_id);
             let (tx, _) = tokio::sync::watch::channel(head);
             tx
         });
@@ -415,8 +407,7 @@ impl MqRouter for BisqueMqRouter {
         _group_id: u64,
         entity_id: u64,
     ) -> Option<Vec<bisque_mq::types::PartitionInfo>> {
-        let engine = self.engine.read();
-        engine.get_topic_partitions(entity_id).map(|s| s.to_vec())
+        self.metadata.get_topic_partitions(entity_id)
     }
 
     fn get_partition_batcher(&self, partition_group_id: u64) -> Option<Arc<MqWriteBatcher>> {

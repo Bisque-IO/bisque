@@ -6,15 +6,14 @@ use std::time::Duration;
 
 use openraft::Raft;
 use openraft::async_runtime::WatchReceiver;
-use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::MqTypeConfig;
 use crate::config::MqConfig;
-use crate::engine::MqEngine;
 use crate::manifest::MqManifestManager;
+use crate::metadata::MqMetadata;
 use crate::types::MqCommand;
 
 /// Raft node wrapper for bisque-mq.
@@ -32,7 +31,7 @@ pub struct MqRaftNode {
     node_id: u64,
     group_id: u64,
     config: MqConfig,
-    engine: Option<Arc<RwLock<MqEngine>>>,
+    metadata: Option<Arc<MqMetadata>>,
     manifest: Option<Arc<MqManifestManager>>,
     shutdown: Arc<Notify>,
     shutdown_flag: Arc<AtomicBool>,
@@ -47,7 +46,7 @@ impl MqRaftNode {
             node_id,
             group_id: 0,
             config,
-            engine: None,
+            metadata: None,
             manifest: None,
             shutdown: Arc::new(Notify::new()),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
@@ -66,8 +65,8 @@ impl MqRaftNode {
         self
     }
 
-    pub fn with_engine(mut self, engine: Arc<RwLock<MqEngine>>) -> Self {
-        self.engine = Some(engine);
+    pub fn with_metadata(mut self, metadata: Arc<MqMetadata>) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 
@@ -77,10 +76,10 @@ impl MqRaftNode {
 
     /// Start leader-driven background tasks.
     pub fn start(&self) {
-        let engine = match &self.engine {
-            Some(e) => Arc::clone(e),
+        let metadata = match &self.metadata {
+            Some(m) => Arc::clone(m),
             None => {
-                warn!("MqRaftNode::start() called without engine — leader tasks disabled");
+                warn!("MqRaftNode::start() called without metadata — leader tasks disabled");
                 return;
             }
         };
@@ -89,14 +88,14 @@ impl MqRaftNode {
 
         // 1. Visibility timeout scanner
         {
-            let engine = Arc::clone(&engine);
+            let meta = Arc::clone(&metadata);
             handles.push(self.spawn_leader_task(
                 "mq-visibility-scan",
                 self.config.visibility_scan_interval,
                 move |raft, _node_id| {
-                    let engine = Arc::clone(&engine);
+                    let meta = Arc::clone(&meta);
                     Box::pin(async move {
-                        Self::scan_visibility_timeouts(&raft, &engine).await;
+                        Self::scan_visibility_timeouts(&raft, &meta).await;
                     })
                 },
             ));
@@ -104,16 +103,16 @@ impl MqRaftNode {
 
         // 2. Cron job evaluator
         {
-            let engine = Arc::clone(&engine);
+            let meta = Arc::clone(&metadata);
             let counter = Arc::clone(&self.execution_counter);
             handles.push(self.spawn_leader_task(
                 "mq-cron-eval",
                 self.config.cron_eval_interval,
                 move |raft, _node_id| {
-                    let engine = Arc::clone(&engine);
+                    let meta = Arc::clone(&meta);
                     let counter = Arc::clone(&counter);
                     Box::pin(async move {
-                        Self::evaluate_cron_jobs(&raft, &engine, &counter).await;
+                        Self::evaluate_cron_jobs(&raft, &meta, &counter).await;
                     })
                 },
             ));
@@ -121,15 +120,15 @@ impl MqRaftNode {
 
         // 3. Consumer heartbeat monitor
         {
-            let engine = Arc::clone(&engine);
+            let meta = Arc::clone(&metadata);
             let timeout = self.config.heartbeat_timeout;
             handles.push(self.spawn_leader_task(
                 "mq-heartbeat-monitor",
                 Duration::from_secs(5),
                 move |raft, _node_id| {
-                    let engine = Arc::clone(&engine);
+                    let meta = Arc::clone(&meta);
                     Box::pin(async move {
-                        Self::check_consumer_heartbeats(&raft, &engine, timeout).await;
+                        Self::check_consumer_heartbeats(&raft, &meta, timeout).await;
                     })
                 },
             ));
@@ -137,14 +136,14 @@ impl MqRaftNode {
 
         // 4. Job execution timeout
         {
-            let engine = Arc::clone(&engine);
+            let meta = Arc::clone(&metadata);
             handles.push(self.spawn_leader_task(
                 "mq-job-timeout",
                 self.config.job_timeout_interval,
                 move |raft, _node_id| {
-                    let engine = Arc::clone(&engine);
+                    let meta = Arc::clone(&meta);
                     Box::pin(async move {
-                        Self::check_job_timeouts(&raft, &engine).await;
+                        Self::check_job_timeouts(&raft, &meta).await;
                     })
                 },
             ));
@@ -152,14 +151,14 @@ impl MqRaftNode {
 
         // 5. Dedup window pruning
         {
-            let engine = Arc::clone(&engine);
+            let meta = Arc::clone(&metadata);
             handles.push(self.spawn_leader_task(
                 "mq-dedup-prune",
                 self.config.dedup_prune_interval,
                 move |raft, _node_id| {
-                    let engine = Arc::clone(&engine);
+                    let meta = Arc::clone(&meta);
                     Box::pin(async move {
-                        Self::prune_dedup_windows(&raft, &engine).await;
+                        Self::prune_dedup_windows(&raft, &meta).await;
                     })
                 },
             ));
@@ -167,14 +166,14 @@ impl MqRaftNode {
 
         // 6. Actor idle eviction
         {
-            let engine = Arc::clone(&engine);
+            let meta = Arc::clone(&metadata);
             handles.push(self.spawn_leader_task(
                 "mq-actor-eviction",
                 self.config.actor_eviction_interval,
                 move |raft, _node_id| {
-                    let engine = Arc::clone(&engine);
+                    let meta = Arc::clone(&meta);
                     Box::pin(async move {
-                        Self::evict_idle_actors(&raft, &engine).await;
+                        Self::evict_idle_actors(&raft, &meta).await;
                     })
                 },
             ));
@@ -182,14 +181,14 @@ impl MqRaftNode {
 
         // 7. Actor rebalancing
         {
-            let engine = Arc::clone(&engine);
+            let meta = Arc::clone(&metadata);
             handles.push(self.spawn_leader_task(
                 "mq-actor-rebalance",
                 self.config.actor_rebalance_interval,
                 move |raft, _node_id| {
-                    let engine = Arc::clone(&engine);
+                    let meta = Arc::clone(&meta);
                     Box::pin(async move {
-                        Self::rebalance_actors(&raft, &engine).await;
+                        Self::rebalance_actors(&raft, &meta).await;
                     })
                 },
             ));
@@ -274,17 +273,10 @@ impl MqRaftNode {
     // Leader task implementations
     // =========================================================================
 
-    async fn scan_visibility_timeouts(raft: &Raft<MqTypeConfig>, engine: &Arc<RwLock<MqEngine>>) {
+    async fn scan_visibility_timeouts(raft: &Raft<MqTypeConfig>, meta: &Arc<MqMetadata>) {
         let now = unix_ms();
-        let (timeout_cmds, expire_cmds) = {
-            let eng = engine.read();
-            (
-                collect_visibility_timeouts(&eng, now),
-                collect_expired_pending_messages(&eng, now),
-            )
-        };
-        let mut commands = timeout_cmds;
-        commands.extend(expire_cmds);
+        let mut commands = collect_visibility_timeouts(meta, now);
+        commands.extend(collect_expired_pending_messages(meta, now));
         if !commands.is_empty() {
             debug!(
                 count = commands.len(),
@@ -296,13 +288,10 @@ impl MqRaftNode {
 
     async fn evaluate_cron_jobs(
         raft: &Raft<MqTypeConfig>,
-        engine: &Arc<RwLock<MqEngine>>,
+        meta: &Arc<MqMetadata>,
         counter: &AtomicU64,
     ) {
-        let commands = {
-            let eng = engine.read();
-            collect_due_jobs(&eng, unix_ms(), counter)
-        };
+        let commands = collect_due_jobs(meta, unix_ms(), counter);
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing cron trigger commands");
             let _ = raft.client_write(MqCommand::batch(&commands)).await;
@@ -311,57 +300,42 @@ impl MqRaftNode {
 
     async fn check_consumer_heartbeats(
         raft: &Raft<MqTypeConfig>,
-        engine: &Arc<RwLock<MqEngine>>,
+        meta: &Arc<MqMetadata>,
         timeout: Duration,
     ) {
-        let commands = {
-            let eng = engine.read();
-            collect_dead_consumers(&eng, unix_ms(), timeout.as_millis() as u64)
-        };
+        let commands = collect_dead_consumers(meta, unix_ms(), timeout.as_millis() as u64);
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing dead consumer commands");
             let _ = raft.client_write(MqCommand::batch(&commands)).await;
         }
     }
 
-    async fn check_job_timeouts(raft: &Raft<MqTypeConfig>, engine: &Arc<RwLock<MqEngine>>) {
-        let commands = {
-            let eng = engine.read();
-            collect_timed_out_jobs(&eng, unix_ms())
-        };
+    async fn check_job_timeouts(raft: &Raft<MqTypeConfig>, meta: &Arc<MqMetadata>) {
+        let commands = collect_timed_out_jobs(meta, unix_ms());
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing job timeout commands");
             let _ = raft.client_write(MqCommand::batch(&commands)).await;
         }
     }
 
-    async fn prune_dedup_windows(raft: &Raft<MqTypeConfig>, engine: &Arc<RwLock<MqEngine>>) {
-        let commands = {
-            let eng = engine.read();
-            collect_dedup_prune_commands(&eng, unix_ms())
-        };
+    async fn prune_dedup_windows(raft: &Raft<MqTypeConfig>, meta: &Arc<MqMetadata>) {
+        let commands = collect_dedup_prune_commands(meta, unix_ms());
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing dedup prune commands");
             let _ = raft.client_write(MqCommand::batch(&commands)).await;
         }
     }
 
-    async fn evict_idle_actors(raft: &Raft<MqTypeConfig>, engine: &Arc<RwLock<MqEngine>>) {
-        let commands = {
-            let eng = engine.read();
-            collect_idle_actor_evictions(&eng, unix_ms())
-        };
+    async fn evict_idle_actors(raft: &Raft<MqTypeConfig>, meta: &Arc<MqMetadata>) {
+        let commands = collect_idle_actor_evictions(meta, unix_ms());
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing actor eviction commands");
             let _ = raft.client_write(MqCommand::batch(&commands)).await;
         }
     }
 
-    async fn rebalance_actors(raft: &Raft<MqTypeConfig>, engine: &Arc<RwLock<MqEngine>>) {
-        let commands = {
-            let eng = engine.read();
-            collect_actor_rebalance(&eng)
-        };
+    async fn rebalance_actors(raft: &Raft<MqTypeConfig>, meta: &Arc<MqMetadata>) {
+        let commands = collect_actor_rebalance(meta);
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing actor rebalance commands");
             let _ = raft.client_write(MqCommand::batch(&commands)).await;
@@ -388,10 +362,11 @@ fn unix_ms() -> u64 {
 }
 
 /// Collect TimeoutExpired commands for all queues with expired in-flight messages.
-pub(crate) fn collect_visibility_timeouts(engine: &MqEngine, now_ms: u64) -> Vec<MqCommand> {
+pub(crate) fn collect_visibility_timeouts(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for (&queue_id, queue) in &engine.queues {
-        let expired = queue.find_expired_messages(now_ms);
+    for entry in meta.queues.iter() {
+        let queue_id = *entry.key();
+        let expired = entry.value().find_expired_messages(now_ms);
         if !expired.is_empty() {
             commands.push(MqCommand::timeout_expired(queue_id, &expired.into_vec()));
         }
@@ -400,12 +375,14 @@ pub(crate) fn collect_visibility_timeouts(engine: &MqEngine, now_ms: u64) -> Vec
 }
 
 /// Collect ExpirePendingMessages commands for queues with pending messages past their TTL.
-pub(crate) fn collect_expired_pending_messages(engine: &MqEngine, now_ms: u64) -> Vec<MqCommand> {
+pub(crate) fn collect_expired_pending_messages(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for (&queue_id, queue) in &engine.queues {
-        if queue.expires_at_deadlines.is_empty() {
+    for entry in meta.queues.iter() {
+        let queue = entry.value();
+        if !queue.has_expiry_deadlines() {
             continue;
         }
+        let queue_id = *entry.key();
         let expired = queue.find_expired_pending(now_ms);
         if !expired.is_empty() {
             commands.push(MqCommand::expire_pending_messages(
@@ -419,13 +396,14 @@ pub(crate) fn collect_expired_pending_messages(engine: &MqEngine, now_ms: u64) -
 
 /// Collect TriggerJob commands for all due jobs.
 pub(crate) fn collect_due_jobs(
-    engine: &MqEngine,
+    meta: &MqMetadata,
     now_ms: u64,
     counter: &AtomicU64,
 ) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for (&job_id, job) in &engine.jobs {
-        if job.should_trigger(now_ms) {
+    for entry in meta.jobs.iter() {
+        let job_id = *entry.key();
+        if entry.value().should_trigger(now_ms) {
             let execution_id = counter.fetch_add(1, Ordering::Relaxed);
             commands.push(MqCommand::trigger_job(job_id, execution_id, now_ms));
         }
@@ -436,19 +414,22 @@ pub(crate) fn collect_due_jobs(
 /// Collect commands for dead consumers: timeout their in-flight messages,
 /// timeout their assigned jobs, then disconnect them.
 pub(crate) fn collect_dead_consumers(
-    engine: &MqEngine,
+    meta: &MqMetadata,
     now_ms: u64,
     timeout_ms: u64,
 ) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for (&consumer_id, consumer) in &engine.consumers {
+    for entry in meta.consumers.iter() {
+        let consumer_id = *entry.key();
+        let consumer = entry.value();
         if !consumer.is_dead(now_ms, timeout_ms) {
             continue;
         }
 
         // Timeout in-flight queue messages for this consumer
-        for (&queue_id, queue) in &engine.queues {
-            let in_flight = queue.consumer_in_flight_ids(consumer_id);
+        for q_entry in meta.queues.iter() {
+            let queue_id = *q_entry.key();
+            let in_flight = q_entry.value().consumer_in_flight_ids(consumer_id);
             if !in_flight.is_empty() {
                 commands.push(MqCommand::timeout_expired(queue_id, &in_flight.into_vec()));
             }
@@ -456,16 +437,21 @@ pub(crate) fn collect_dead_consumers(
 
         // Timeout assigned jobs
         for &job_id in &consumer.meta.assigned_jobs {
-            if let Some(job) = engine.jobs.get(&job_id) {
-                if let Some(execution_id) = job.meta.state.current_execution_id {
+            if let Some(job) = meta.jobs.get(&job_id) {
+                if let Some(execution_id) = job.meta().state.current_execution_id {
                     commands.push(MqCommand::timeout_job(job_id, execution_id));
                 }
             }
         }
 
         // Release actors assigned to this consumer
-        for (&namespace_id, ns) in &engine.actor_namespaces {
-            if ns.consumer_assignments.contains_key(&consumer_id) {
+        for ns_entry in meta.actor_namespaces.iter() {
+            let namespace_id = *ns_entry.key();
+            if ns_entry
+                .value()
+                .consumer_assignments
+                .contains_key(&consumer_id)
+            {
                 commands.push(MqCommand::release_actors(namespace_id, consumer_id));
             }
         }
@@ -477,11 +463,13 @@ pub(crate) fn collect_dead_consumers(
 }
 
 /// Collect TimeoutJob commands for jobs whose execution has timed out.
-pub(crate) fn collect_timed_out_jobs(engine: &MqEngine, now_ms: u64) -> Vec<MqCommand> {
+pub(crate) fn collect_timed_out_jobs(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for (&job_id, job) in &engine.jobs {
+    for entry in meta.jobs.iter() {
+        let job_id = *entry.key();
+        let job = entry.value();
         if job.is_execution_timed_out(now_ms) {
-            if let Some(execution_id) = job.meta.state.current_execution_id {
+            if let Some(execution_id) = job.meta().state.current_execution_id {
                 commands.push(MqCommand::timeout_job(job_id, execution_id));
             }
         }
@@ -490,11 +478,13 @@ pub(crate) fn collect_timed_out_jobs(engine: &MqEngine, now_ms: u64) -> Vec<MqCo
 }
 
 /// Collect PruneDedupWindow commands for queues with active dedup windows.
-pub(crate) fn collect_dedup_prune_commands(engine: &MqEngine, now_ms: u64) -> Vec<MqCommand> {
+pub(crate) fn collect_dedup_prune_commands(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for (&queue_id, queue) in &engine.queues {
-        let window_secs = queue.dedup.window_secs;
-        if window_secs > 0 && !queue.dedup.buckets.is_empty() {
+    for entry in meta.queues.iter() {
+        let queue = entry.value();
+        if queue.has_dedup_entries() {
+            let queue_id = *entry.key();
+            let window_secs = queue.dedup_window_secs();
             let before_timestamp = now_ms.saturating_sub(window_secs * 1000);
             commands.push(MqCommand::prune_dedup_window(queue_id, before_timestamp));
         }
@@ -503,11 +493,13 @@ pub(crate) fn collect_dedup_prune_commands(engine: &MqEngine, now_ms: u64) -> Ve
 }
 
 /// Collect EvictIdleActors commands for all actor namespaces.
-pub(crate) fn collect_idle_actor_evictions(engine: &MqEngine, now_ms: u64) -> Vec<MqCommand> {
+pub(crate) fn collect_idle_actor_evictions(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for (&namespace_id, ns) in &engine.actor_namespaces {
+    for entry in meta.actor_namespaces.iter() {
+        let ns = entry.value();
         let eviction_secs = ns.meta.config.idle_eviction_secs;
         if eviction_secs > 0 {
+            let namespace_id = *entry.key();
             let before_timestamp = now_ms.saturating_sub(eviction_secs * 1000);
             commands.push(MqCommand::evict_idle_actors(namespace_id, before_timestamp));
         }
@@ -516,26 +508,28 @@ pub(crate) fn collect_idle_actor_evictions(engine: &MqEngine, now_ms: u64) -> Ve
 }
 
 /// Collect AssignActors commands to distribute unassigned actors among subscribed consumers.
-pub(crate) fn collect_actor_rebalance(engine: &MqEngine) -> Vec<MqCommand> {
+pub(crate) fn collect_actor_rebalance(meta: &MqMetadata) -> Vec<MqCommand> {
     use crate::types::EntityType;
 
     let mut commands = Vec::new();
-    for (&namespace_id, ns) in &engine.actor_namespaces {
+    for entry in meta.actor_namespaces.iter() {
+        let namespace_id = *entry.key();
+        let ns = entry.value();
         let unassigned = ns.unassigned_actors_with_messages();
         if unassigned.is_empty() {
             continue;
         }
 
         // Find consumers subscribed to this actor namespace
-        let subscribed_consumers: Vec<u64> = engine
+        let subscribed_consumers: Vec<u64> = meta
             .consumers
             .iter()
-            .filter(|(_, c)| {
-                c.meta.subscriptions.iter().any(|s| {
+            .filter(|c| {
+                c.value().meta.subscriptions.iter().any(|s| {
                     s.entity_type == EntityType::ActorNamespace && s.entity_id == namespace_id
                 })
             })
-            .map(|(&id, _)| id)
+            .map(|c| *c.key())
             .collect();
 
         if subscribed_consumers.is_empty() {
@@ -543,7 +537,7 @@ pub(crate) fn collect_actor_rebalance(engine: &MqEngine) -> Vec<MqCommand> {
         }
 
         // Round-robin distribute unassigned actors among consumers
-        let actor_ids: Vec<_> = unassigned.into_iter().cloned().collect();
+        let actor_ids = unassigned;
         let num_consumers = subscribed_consumers.len();
 
         // Group by target consumer
@@ -569,6 +563,7 @@ pub(crate) fn collect_actor_rebalance(engine: &MqEngine) -> Vec<MqCommand> {
 mod tests {
     use super::*;
     use crate::config::{ActorConfig, JobConfig, MqConfig, QueueConfig};
+    use crate::engine::MqEngine;
     use crate::flat::FlatMessageBuilder;
     use crate::types::{EntityType, OverlapPolicy, Subscription};
     use bytes::Bytes;
@@ -591,15 +586,15 @@ mod tests {
     fn test_visibility_scan_no_expired() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_queue("q1", &QueueConfig::default()),
+            &MqCommand::create_queue("q1", &QueueConfig::default()),
             1,
             1000,
         );
-        engine.apply_command(MqCommand::enqueue(1, &[make_msg()], &[None]), 2, 1000);
-        engine.apply_command(MqCommand::deliver(1, 100, 10), 3, 1000);
+        engine.apply_command(&MqCommand::enqueue(1, &[make_msg()], &[None]), 2, 1000);
+        engine.apply_command(&MqCommand::deliver(1, 100, 10), 3, 1000);
 
         // Not expired yet (visibility_timeout_ms = 30_000)
-        let cmds = collect_visibility_timeouts(&engine, 2000);
+        let cmds = collect_visibility_timeouts(&engine.meta, 2000);
         assert!(cmds.is_empty());
     }
 
@@ -607,15 +602,15 @@ mod tests {
     fn test_visibility_scan_with_expired() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_queue("q1", &QueueConfig::default()),
+            &MqCommand::create_queue("q1", &QueueConfig::default()),
             1,
             1000,
         );
-        engine.apply_command(MqCommand::enqueue(1, &[make_msg()], &[None]), 2, 1000);
-        engine.apply_command(MqCommand::deliver(1, 100, 10), 3, 1000);
+        engine.apply_command(&MqCommand::enqueue(1, &[make_msg()], &[None]), 2, 1000);
+        engine.apply_command(&MqCommand::deliver(1, 100, 10), 3, 1000);
 
         // Expired (deadline = 1000 + 30000 = 31000)
-        let cmds = collect_visibility_timeouts(&engine, 32000);
+        let cmds = collect_visibility_timeouts(&engine.meta, 32000);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].tag(), MqCommand::TAG_TIMEOUT_EXPIRED);
         let v = cmds[0].as_timeout_expired();
@@ -628,23 +623,23 @@ mod tests {
         let mut engine = make_engine();
         // Create two queues
         engine.apply_command(
-            MqCommand::create_queue("q1", &QueueConfig::default()),
+            &MqCommand::create_queue("q1", &QueueConfig::default()),
             1,
             1000,
         );
         engine.apply_command(
-            MqCommand::create_queue("q2", &QueueConfig::default()),
+            &MqCommand::create_queue("q2", &QueueConfig::default()),
             2,
             1000,
         );
 
         // Enqueue and deliver in both
-        engine.apply_command(MqCommand::enqueue(1, &[make_msg()], &[None]), 3, 1000);
-        engine.apply_command(MqCommand::deliver(1, 100, 10), 4, 1000);
-        engine.apply_command(MqCommand::enqueue(2, &[make_msg()], &[None]), 5, 1000);
-        engine.apply_command(MqCommand::deliver(2, 100, 10), 6, 1000);
+        engine.apply_command(&MqCommand::enqueue(1, &[make_msg()], &[None]), 3, 1000);
+        engine.apply_command(&MqCommand::deliver(1, 100, 10), 4, 1000);
+        engine.apply_command(&MqCommand::enqueue(2, &[make_msg()], &[None]), 5, 1000);
+        engine.apply_command(&MqCommand::deliver(2, 100, 10), 6, 1000);
 
-        let cmds = collect_visibility_timeouts(&engine, 32000);
+        let cmds = collect_visibility_timeouts(&engine.meta, 32000);
         assert_eq!(cmds.len(), 2);
     }
 
@@ -656,7 +651,7 @@ mod tests {
     fn test_cron_eval_not_due() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_job(
+            &MqCommand::create_job(
                 "job1",
                 &JobConfig {
                     cron_expression: "0 * * * * *".to_string(),
@@ -669,7 +664,7 @@ mod tests {
 
         // not due yet (next_trigger_at computed from cron, far in the future from epoch 1000ms)
         let counter = AtomicU64::new(1);
-        let cmds = collect_due_jobs(&engine, 1000, &counter);
+        let cmds = collect_due_jobs(&engine.meta, 1000, &counter);
         assert!(cmds.is_empty());
     }
 
@@ -677,7 +672,7 @@ mod tests {
     fn test_cron_eval_due() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_job(
+            &MqCommand::create_job(
                 "job1",
                 &JobConfig {
                     cron_expression: "0 * * * * *".to_string(),
@@ -689,12 +684,12 @@ mod tests {
         );
 
         // Force the job to be due by setting next_trigger_at
-        if let Some(job) = engine.jobs.get_mut(&1) {
-            job.meta.state.next_trigger_at = 5000;
+        if let Some(job) = engine.meta.jobs.get(&1) {
+            job.meta_mut().state.next_trigger_at = 5000;
         }
 
         let counter = AtomicU64::new(100);
-        let cmds = collect_due_jobs(&engine, 6000, &counter);
+        let cmds = collect_due_jobs(&engine.meta, 6000, &counter);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].tag(), MqCommand::TAG_TRIGGER_JOB);
         assert_eq!(cmds[0].field_u64(1), 1); // job_id
@@ -708,7 +703,7 @@ mod tests {
     fn test_cron_eval_skip_policy_blocks() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_job(
+            &MqCommand::create_job(
                 "job1",
                 &JobConfig {
                     cron_expression: "0 * * * * *".to_string(),
@@ -721,13 +716,14 @@ mod tests {
         );
 
         // Set due and currently executing
-        if let Some(job) = engine.jobs.get_mut(&1) {
-            job.meta.state.next_trigger_at = 5000;
-            job.meta.state.current_execution_id = Some(42);
+        if let Some(job) = engine.meta.jobs.get(&1) {
+            let m = job.meta_mut();
+            m.state.next_trigger_at = 5000;
+            m.state.current_execution_id = Some(42);
         }
 
         let counter = AtomicU64::new(1);
-        let cmds = collect_due_jobs(&engine, 6000, &counter);
+        let cmds = collect_due_jobs(&engine.meta, 6000, &counter);
         assert!(cmds.is_empty());
     }
 
@@ -738,19 +734,19 @@ mod tests {
     #[test]
     fn test_heartbeat_alive() {
         let mut engine = make_engine();
-        engine.apply_command(MqCommand::register_consumer(100, "group1", &[]), 1, 1000);
+        engine.apply_command(&MqCommand::register_consumer(100, "group1", &[]), 1, 1000);
 
-        let cmds = collect_dead_consumers(&engine, 2000, 30_000);
+        let cmds = collect_dead_consumers(&engine.meta, 2000, 30_000);
         assert!(cmds.is_empty());
     }
 
     #[test]
     fn test_heartbeat_dead_consumer() {
         let mut engine = make_engine();
-        engine.apply_command(MqCommand::register_consumer(100, "group1", &[]), 1, 1000);
+        engine.apply_command(&MqCommand::register_consumer(100, "group1", &[]), 1, 1000);
 
         // Dead after timeout (connected_at=1000, timeout=30_000)
-        let cmds = collect_dead_consumers(&engine, 32000, 30_000);
+        let cmds = collect_dead_consumers(&engine.meta, 32000, 30_000);
         assert!(!cmds.is_empty());
         // Last command should be DisconnectConsumer
         assert!(matches!(
@@ -764,12 +760,12 @@ mod tests {
         let mut engine = make_engine();
         // Create queue and register consumer
         engine.apply_command(
-            MqCommand::create_queue("q1", &QueueConfig::default()),
+            &MqCommand::create_queue("q1", &QueueConfig::default()),
             1,
             1000,
         );
         engine.apply_command(
-            MqCommand::register_consumer(
+            &MqCommand::register_consumer(
                 100,
                 "group1",
                 &[Subscription {
@@ -780,10 +776,10 @@ mod tests {
             2,
             1000,
         );
-        engine.apply_command(MqCommand::enqueue(1, &[make_msg()], &[None]), 3, 1000);
-        engine.apply_command(MqCommand::deliver(1, 100, 10), 4, 1000);
+        engine.apply_command(&MqCommand::enqueue(1, &[make_msg()], &[None]), 3, 1000);
+        engine.apply_command(&MqCommand::deliver(1, 100, 10), 4, 1000);
 
-        let cmds = collect_dead_consumers(&engine, 32000, 30_000);
+        let cmds = collect_dead_consumers(&engine.meta, 32000, 30_000);
         // Should have: TimeoutExpired for queue messages + DisconnectConsumer
         assert!(cmds.len() >= 2);
         assert!(
@@ -801,13 +797,13 @@ mod tests {
         let mut engine = make_engine();
         // Create job
         engine.apply_command(
-            MqCommand::create_job("job1", &JobConfig::default()),
+            &MqCommand::create_job("job1", &JobConfig::default()),
             1,
             1000,
         );
         // Register consumer with job assignment
         engine.apply_command(
-            MqCommand::register_consumer(
+            &MqCommand::register_consumer(
                 100,
                 "group1",
                 &[Subscription {
@@ -819,14 +815,14 @@ mod tests {
             1000,
         );
         // Assign and trigger job
-        engine.apply_command(MqCommand::assign_job(1, 100), 3, 1000);
-        engine.apply_command(MqCommand::trigger_job(1, 42, 1000), 4, 1000);
+        engine.apply_command(&MqCommand::assign_job(1, 100), 3, 1000);
+        engine.apply_command(&MqCommand::trigger_job(1, 42, 1000), 4, 1000);
         // Add assigned job to consumer
-        if let Some(consumer) = engine.consumers.get_mut(&100) {
-            consumer.meta.assigned_jobs.push(1);
+        if let Some(mut consumer) = engine.meta.consumers.get_mut(&100) {
+            consumer.meta.assigned_jobs.insert(1);
         }
 
-        let cmds = collect_dead_consumers(&engine, 32000, 30_000);
+        let cmds = collect_dead_consumers(&engine.meta, 32000, 30_000);
         assert!(cmds.iter().any(|c| c.tag() == MqCommand::TAG_TIMEOUT_JOB));
         assert!(
             cmds.iter()
@@ -842,14 +838,14 @@ mod tests {
     fn test_job_timeout_not_expired() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_job("job1", &JobConfig::default()),
+            &MqCommand::create_job("job1", &JobConfig::default()),
             1,
             1000,
         );
-        engine.apply_command(MqCommand::trigger_job(1, 42, 1000), 2, 1000);
+        engine.apply_command(&MqCommand::trigger_job(1, 42, 1000), 2, 1000);
 
         // execution_timeout_ms = 300_000, not expired
-        let cmds = collect_timed_out_jobs(&engine, 100_000);
+        let cmds = collect_timed_out_jobs(&engine.meta, 100_000);
         assert!(cmds.is_empty());
     }
 
@@ -857,14 +853,14 @@ mod tests {
     fn test_job_timeout_expired() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_job("job1", &JobConfig::default()),
+            &MqCommand::create_job("job1", &JobConfig::default()),
             1,
             1000,
         );
-        engine.apply_command(MqCommand::trigger_job(1, 42, 1000), 2, 1000);
+        engine.apply_command(&MqCommand::trigger_job(1, 42, 1000), 2, 1000);
 
         // execution_timeout_ms = 300_000, triggered_at = 1000
-        let cmds = collect_timed_out_jobs(&engine, 302_000);
+        let cmds = collect_timed_out_jobs(&engine.meta, 302_000);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].tag(), MqCommand::TAG_TIMEOUT_JOB);
         assert_eq!(cmds[0].field_u64(1), 1); // job_id
@@ -879,12 +875,12 @@ mod tests {
     fn test_dedup_prune_no_dedup() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_queue("q1", &QueueConfig::default()), // no dedup
+            &MqCommand::create_queue("q1", &QueueConfig::default()), // no dedup
             1,
             1000,
         );
 
-        let cmds = collect_dedup_prune_commands(&engine, 100_000);
+        let cmds = collect_dedup_prune_commands(&engine.meta, 100_000);
         assert!(cmds.is_empty());
     }
 
@@ -892,7 +888,7 @@ mod tests {
     fn test_dedup_prune() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_queue(
+            &MqCommand::create_queue(
                 "q1",
                 &QueueConfig {
                     dedup_window_secs: Some(60),
@@ -904,12 +900,12 @@ mod tests {
         );
         // Insert a dedup key
         engine.apply_command(
-            MqCommand::enqueue(1, &[make_msg()], &[Some(Bytes::from_static(b"key1"))]),
+            &MqCommand::enqueue(1, &[make_msg()], &[Some(Bytes::from_static(b"key1"))]),
             2,
             1000,
         );
 
-        let cmds = collect_dedup_prune_commands(&engine, 100_000);
+        let cmds = collect_dedup_prune_commands(&engine.meta, 100_000);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].tag(), MqCommand::TAG_PRUNE_DEDUP_WINDOW);
         assert_eq!(cmds[0].field_u64(1), 1); // queue_id
@@ -925,7 +921,7 @@ mod tests {
     fn test_actor_eviction() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_actor_namespace(
+            &MqCommand::create_actor_namespace(
                 "ns1",
                 &ActorConfig {
                     idle_eviction_secs: 3600,
@@ -936,7 +932,7 @@ mod tests {
             1000,
         );
 
-        let cmds = collect_idle_actor_evictions(&engine, 5_000_000);
+        let cmds = collect_idle_actor_evictions(&engine.meta, 5_000_000);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].tag(), MqCommand::TAG_EVICT_IDLE_ACTORS);
         assert_eq!(cmds[0].field_u64(1), 1); // namespace_id
@@ -947,7 +943,7 @@ mod tests {
     fn test_actor_eviction_zero_window() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_actor_namespace(
+            &MqCommand::create_actor_namespace(
                 "ns1",
                 &ActorConfig {
                     idle_eviction_secs: 0,
@@ -958,7 +954,7 @@ mod tests {
             1000,
         );
 
-        let cmds = collect_idle_actor_evictions(&engine, 5_000_000);
+        let cmds = collect_idle_actor_evictions(&engine.meta, 5_000_000);
         assert!(cmds.is_empty());
     }
 
@@ -970,13 +966,17 @@ mod tests {
     fn test_actor_rebalance_no_consumers() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
+            &MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
             1,
             1000,
         );
-        engine.apply_command(MqCommand::send_to_actor(1, b"actor1", &make_msg()), 2, 1000);
+        engine.apply_command(
+            &MqCommand::send_to_actor(1, b"actor1", &make_msg()),
+            2,
+            1000,
+        );
 
-        let cmds = collect_actor_rebalance(&engine);
+        let cmds = collect_actor_rebalance(&engine.meta);
         // No consumers subscribed, so no rebalance
         assert!(cmds.is_empty());
     }
@@ -985,13 +985,17 @@ mod tests {
     fn test_actor_rebalance_with_consumer() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
+            &MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
             1,
             1000,
         );
-        engine.apply_command(MqCommand::send_to_actor(1, b"actor1", &make_msg()), 2, 1000);
         engine.apply_command(
-            MqCommand::register_consumer(
+            &MqCommand::send_to_actor(1, b"actor1", &make_msg()),
+            2,
+            1000,
+        );
+        engine.apply_command(
+            &MqCommand::register_consumer(
                 100,
                 "workers",
                 &[Subscription {
@@ -1003,7 +1007,7 @@ mod tests {
             1000,
         );
 
-        let cmds = collect_actor_rebalance(&engine);
+        let cmds = collect_actor_rebalance(&engine.meta);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].tag(), MqCommand::TAG_ASSIGN_ACTORS);
         let v = cmds[0].as_assign_actors();
@@ -1018,21 +1022,21 @@ mod tests {
     fn test_actor_rebalance_multiple_consumers() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
+            &MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
             1,
             1000,
         );
         // Send to 4 actors
         for i in 0..4 {
             engine.apply_command(
-                MqCommand::send_to_actor(1, format!("actor{}", i).as_bytes(), &make_msg()),
+                &MqCommand::send_to_actor(1, format!("actor{}", i).as_bytes(), &make_msg()),
                 10 + i,
                 1000,
             );
         }
         // Register 2 consumers
         engine.apply_command(
-            MqCommand::register_consumer(
+            &MqCommand::register_consumer(
                 100,
                 "workers",
                 &[Subscription {
@@ -1044,7 +1048,7 @@ mod tests {
             1000,
         );
         engine.apply_command(
-            MqCommand::register_consumer(
+            &MqCommand::register_consumer(
                 200,
                 "workers",
                 &[Subscription {
@@ -1056,7 +1060,7 @@ mod tests {
             1000,
         );
 
-        let cmds = collect_actor_rebalance(&engine);
+        let cmds = collect_actor_rebalance(&engine.meta);
         // Should produce AssignActors commands for both consumers
         assert!(cmds.len() >= 1);
         let total_actors: usize = cmds
@@ -1076,13 +1080,17 @@ mod tests {
     fn test_actor_rebalance_no_unassigned() {
         let mut engine = make_engine();
         engine.apply_command(
-            MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
+            &MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
             1,
             1000,
         );
-        engine.apply_command(MqCommand::send_to_actor(1, b"actor1", &make_msg()), 2, 1000);
         engine.apply_command(
-            MqCommand::register_consumer(
+            &MqCommand::send_to_actor(1, b"actor1", &make_msg()),
+            2,
+            1000,
+        );
+        engine.apply_command(
+            &MqCommand::register_consumer(
                 100,
                 "workers",
                 &[Subscription {
@@ -1095,12 +1103,12 @@ mod tests {
         );
         // Assign the actor
         engine.apply_command(
-            MqCommand::assign_actors(1, 100, &[Bytes::from_static(b"actor1")]),
+            &MqCommand::assign_actors(1, 100, &[Bytes::from_static(b"actor1")]),
             4,
             1000,
         );
 
-        let cmds = collect_actor_rebalance(&engine);
+        let cmds = collect_actor_rebalance(&engine.meta);
         assert!(cmds.is_empty());
     }
 }

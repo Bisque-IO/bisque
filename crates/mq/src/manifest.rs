@@ -45,6 +45,7 @@ use crate::types::MqSnapshotData;
 const META_TABLE: &str = "mq_meta";
 const ENTITIES_TABLE: &str = "mq_entities";
 const SNAPSHOT_TABLE: &str = "mq_snapshot";
+const SEGMENT_RANGES_TABLE: &str = "mq_segment_ranges";
 const META_KEY: &[u8] = b"raft";
 const STRUCTURAL_FLOOR_KEY: &[u8] = b"structural_floor";
 const NEXT_ID_KEY: &[u8] = b"next_id";
@@ -134,6 +135,15 @@ pub(crate) enum ManifestCommand {
         snapshot_data: MqSnapshotData,
         done: Option<tokio::sync::oneshot::Sender<()>>,
     },
+    /// Fire-and-forget segment range write when a segment is sealed.
+    SealedSegment {
+        group_id: u64,
+        segment_id: u64,
+        /// `(entity_type, entity_id, record_count, total_bytes)`
+        entity_summaries: Vec<(u8, u64, u64, u64)>,
+    },
+    /// Fire-and-forget segment range deletion when a segment is purged.
+    PurgeSegment { group_id: u64, segment_id: u64 },
 }
 
 /// Entity key prefixes for MDBX entities table.
@@ -170,6 +180,7 @@ pub(crate) struct GroupMdbxEnv {
     meta_dbi: u32,
     entities_dbi: u32,
     snapshot_dbi: u32,
+    segment_ranges_dbi: u32,
 }
 
 impl GroupMdbxEnv {
@@ -212,6 +223,19 @@ impl GroupMdbxEnv {
         let snapshot_dbi = snapshot_table.dbi();
         drop(snapshot_table);
 
+        // DUP_SORT | DUP_FIXED: entity key → multiple fixed-size segment range values.
+        // Key: [entity_type:1][entity_id:8 BE] (9 bytes)
+        // Value: [segment_id:8 LE][record_count:8 LE][total_bytes:8 LE] (24 bytes)
+        // Values sorted by raw bytes (segment_id LE is the sort prefix).
+        let segment_ranges_table = txn
+            .create_table(
+                Some(SEGMENT_RANGES_TABLE),
+                TableFlags::DUP_SORT | TableFlags::DUP_FIXED,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let segment_ranges_dbi = segment_ranges_table.dbi();
+        drop(segment_ranges_table);
+
         txn.commit()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -220,6 +244,7 @@ impl GroupMdbxEnv {
             meta_dbi,
             entities_dbi,
             snapshot_dbi,
+            segment_ranges_dbi,
         })
     }
 
@@ -314,6 +339,38 @@ impl GroupMdbxEnv {
         }
         let raw = RawTable {
             dbi: self.snapshot_dbi,
+            _marker: std::marker::PhantomData,
+        };
+        unsafe { std::mem::transmute(raw) }
+    }
+
+    unsafe fn segment_ranges_table_ro<'txn>(
+        &self,
+        _txn: &libmdbx::Transaction<'txn, libmdbx::RO, NoWriteMap>,
+    ) -> Table<'txn> {
+        #[repr(C)]
+        struct RawTable<'txn> {
+            dbi: u32,
+            _marker: std::marker::PhantomData<&'txn ()>,
+        }
+        let raw = RawTable {
+            dbi: self.segment_ranges_dbi,
+            _marker: std::marker::PhantomData,
+        };
+        unsafe { std::mem::transmute(raw) }
+    }
+
+    unsafe fn segment_ranges_table_rw<'txn>(
+        &self,
+        _txn: &libmdbx::Transaction<'txn, libmdbx::RW, NoWriteMap>,
+    ) -> Table<'txn> {
+        #[repr(C)]
+        struct RawTable<'txn> {
+            dbi: u32,
+            _marker: std::marker::PhantomData<&'txn ()>,
+        }
+        let raw = RawTable {
+            dbi: self.segment_ranges_dbi,
             _marker: std::marker::PhantomData,
         };
         unsafe { std::mem::transmute(raw) }
@@ -715,10 +772,195 @@ impl GroupMdbxEnv {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         }
 
+        // Clear segment ranges — snapshot replaces all state
+        let sr_tbl = unsafe { self.segment_ranges_table_rw(&txn) };
+        txn.clear_table(&sr_tbl)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
         txn.commit()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
     }
+
+    // -- Segment range operations --
+
+    /// Write segment range entries for a sealed segment.
+    ///
+    /// Each entry is `(entity_type, entity_id, record_count, total_bytes)` for
+    /// the given `segment_id`. Uses the DUP_SORT multimap: one key per entity,
+    /// multiple segment range values sorted by segment_id.
+    fn write_segment_ranges(
+        &self,
+        segment_id: u64,
+        entries: &[(u8, u64, u64, u64)],
+    ) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self
+            .db
+            .begin_rw_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let tbl = unsafe { self.segment_ranges_table_rw(&txn) };
+
+        for &(entity_type, entity_id, record_count, total_bytes) in entries {
+            let key = segment_range_key(entity_type, entity_id);
+            let val = segment_range_value(segment_id, record_count, total_bytes);
+            txn.put(&tbl, &key[..], &val[..], WriteFlags::empty())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        txn.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read all segment ranges for a given entity.
+    ///
+    /// Returns `Vec<(segment_id, record_count, total_bytes)>` sorted by segment_id.
+    fn read_segment_ranges(
+        &self,
+        entity_type: u8,
+        entity_id: u64,
+    ) -> io::Result<Vec<(u64, u64, u64)>> {
+        let txn = self
+            .db
+            .begin_ro_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let tbl = unsafe { self.segment_ranges_table_ro(&txn) };
+
+        let key = segment_range_key(entity_type, entity_id);
+        let mut cursor = txn
+            .cursor(&tbl)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let mut results = Vec::new();
+
+        // Position at the first dup value for this key
+        let first: Option<std::borrow::Cow<[u8]>> = match cursor.set(&key[..]) {
+            Ok(v) => v,
+            Err(_) => return Ok(results),
+        };
+
+        if let Some(val) = first {
+            if val.len() == SEGMENT_RANGE_VALUE_SIZE {
+                results.push(decode_segment_range_value(&val));
+            }
+        }
+
+        // Iterate remaining dups
+        loop {
+            match cursor.next_dup::<std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>>() {
+                Ok(Some((_k, val))) => {
+                    if val.len() == SEGMENT_RANGE_VALUE_SIZE {
+                        results.push(decode_segment_range_value(&val));
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Delete all segment range entries for a specific segment_id across all entities.
+    ///
+    /// Used during segment purge/GC when a raft segment is removed.
+    fn delete_segment_ranges_by_segment(&self, segment_id: u64) -> io::Result<usize> {
+        let txn = self
+            .db
+            .begin_rw_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let tbl = unsafe { self.segment_ranges_table_rw(&txn) };
+
+        let mut cursor = txn
+            .cursor(&tbl)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        // For DUP_FIXED tables, get_both_range requires a full-size value.
+        // Build a 24-byte search value with segment_id and zeros for the rest,
+        // which seeks to the first value with this segment_id.
+        let target_val = segment_range_value(segment_id, 0, 0);
+        let mut deleted = 0usize;
+
+        // Collect distinct keys first to avoid cursor invalidation during delete
+        let mut keys_to_check: Vec<[u8; 9]> = Vec::new();
+        {
+            let iter = cursor.iter::<std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>>();
+            let mut last_key = [0u8; 9];
+            for item in iter {
+                let (k, _) = match item {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                if k.len() == 9 {
+                    let mut key = [0u8; 9];
+                    key.copy_from_slice(&k);
+                    if key != last_key {
+                        keys_to_check.push(key);
+                        last_key = key;
+                    }
+                }
+            }
+        }
+
+        // Re-open cursor for deletion pass
+        drop(cursor);
+        let mut cursor = txn
+            .cursor(&tbl)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        for key in &keys_to_check {
+            // Seek to first value >= target_val for this key
+            let found: Option<std::borrow::Cow<[u8]>> =
+                match cursor.get_both_range(&key[..], &target_val) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+            if let Some(val) = found {
+                if val.len() == SEGMENT_RANGE_VALUE_SIZE {
+                    let found_seg_id = u64::from_le_bytes(val[..8].try_into().unwrap());
+                    if found_seg_id == segment_id {
+                        let _ = cursor.del(WriteFlags::empty());
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(deleted)
+    }
+}
+
+/// Key for segment_ranges multimap: `[entity_type:1][entity_id:8 BE]`.
+fn segment_range_key(entity_type: u8, entity_id: u64) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = entity_type;
+    key[1..9].copy_from_slice(&entity_id.to_be_bytes());
+    key
+}
+
+const SEGMENT_RANGE_VALUE_SIZE: usize = 24;
+
+/// Value for segment_ranges multimap: `[segment_id:8 LE][record_count:8 LE][total_bytes:8 LE]`.
+fn segment_range_value(segment_id: u64, record_count: u64, total_bytes: u64) -> [u8; 24] {
+    let mut val = [0u8; 24];
+    val[0..8].copy_from_slice(&segment_id.to_le_bytes());
+    val[8..16].copy_from_slice(&record_count.to_le_bytes());
+    val[16..24].copy_from_slice(&total_bytes.to_le_bytes());
+    val
+}
+
+/// Decode a segment_ranges value into `(segment_id, record_count, total_bytes)`.
+fn decode_segment_range_value(val: &[u8]) -> (u64, u64, u64) {
+    let segment_id = u64::from_le_bytes(val[0..8].try_into().unwrap());
+    let record_count = u64::from_le_bytes(val[8..16].try_into().unwrap());
+    let total_bytes = u64::from_le_bytes(val[16..24].try_into().unwrap());
+    (segment_id, record_count, total_bytes)
 }
 
 // =============================================================================
@@ -804,6 +1046,45 @@ impl MqManifestManager {
             next_id,
             write,
         });
+    }
+
+    /// Fire-and-forget write of segment ranges when a segment is sealed.
+    pub(crate) fn sealed_segment_fire_and_forget(
+        &self,
+        group_id: u64,
+        segment_id: u64,
+        entity_summaries: Vec<(u8, u64, u64, u64)>,
+    ) {
+        let _ = self.tx.try_send(ManifestCommand::SealedSegment {
+            group_id,
+            segment_id,
+            entity_summaries,
+        });
+    }
+
+    /// Fire-and-forget deletion of segment ranges when a segment is purged.
+    pub(crate) fn purge_segment_fire_and_forget(&self, group_id: u64, segment_id: u64) {
+        let _ = self.tx.try_send(ManifestCommand::PurgeSegment {
+            group_id,
+            segment_id,
+        });
+    }
+
+    /// Read all segment ranges for a given entity (concurrent reader-safe).
+    ///
+    /// Returns `Vec<(segment_id, record_count, total_bytes)>` sorted by segment_id.
+    pub fn read_segment_ranges(
+        &self,
+        group_id: u64,
+        entity_type: u8,
+        entity_id: u64,
+    ) -> io::Result<Vec<(u64, u64, u64)>> {
+        let envs = self.read_envs.read();
+        let env = match envs.get(&group_id) {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+        env.read_segment_ranges(entity_type, entity_id)
     }
 
     /// Read persisted raft state for a group.
@@ -915,6 +1196,40 @@ impl MqManifestManager {
                             let _ = done.send(());
                         }
                     }
+                    ManifestCommand::SealedSegment {
+                        group_id,
+                        segment_id,
+                        entity_summaries,
+                    } => {
+                        let envs_read = envs.read();
+                        if let Some(env) = envs_read.get(&group_id) {
+                            if let Err(e) = env.write_segment_ranges(segment_id, &entity_summaries)
+                            {
+                                error!(
+                                    group_id,
+                                    segment_id,
+                                    error = %e,
+                                    "MQ manifest segment range write failed"
+                                );
+                            }
+                        }
+                    }
+                    ManifestCommand::PurgeSegment {
+                        group_id,
+                        segment_id,
+                    } => {
+                        let envs_read = envs.read();
+                        if let Some(env) = envs_read.get(&group_id) {
+                            if let Err(e) = env.delete_segment_ranges_by_segment(segment_id) {
+                                error!(
+                                    group_id,
+                                    segment_id,
+                                    error = %e,
+                                    "MQ manifest segment range delete failed"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -936,6 +1251,7 @@ mod tests {
     use crate::engine::MqEngine;
     use crate::flat::FlatMessageBuilder;
     use crate::types::{MqCommand, RetentionPolicy};
+    use std::sync::atomic::Ordering;
 
     fn make_msg(value: &[u8]) -> bytes::Bytes {
         FlatMessageBuilder::new(bytes::Bytes::from(value.to_vec()))
@@ -967,7 +1283,7 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::create_topic(&"t1".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"t1".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -980,7 +1296,10 @@ mod tests {
         let read_snap = env.read_snapshot_data().unwrap().unwrap();
         assert_eq!(read_snap.topics.len(), 1);
         assert_eq!(read_snap.topics[0].meta.name, "t1");
-        assert_eq!(read_snap.next_id, engine.next_id);
+        assert_eq!(
+            read_snap.next_id,
+            engine.meta.next_id.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
@@ -997,7 +1316,7 @@ mod tests {
         };
         let mut engine1 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine1.apply_command(
-            MqCommand::create_topic(&"old_topic".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"old_topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1012,12 +1331,12 @@ mod tests {
         };
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine2.apply_command(
-            MqCommand::create_topic(&"new_topic".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"new_topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
         engine2.apply_command(
-            MqCommand::create_queue(&"q1".to_string(), &crate::config::QueueConfig::default()),
+            &MqCommand::create_queue(&"q1".to_string(), &crate::config::QueueConfig::default()),
             2,
             1001,
         );
@@ -1090,11 +1409,11 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
-        engine.apply_command(MqCommand::publish(1, &vec![make_msg(b"hello")]), 2, 1001);
+        engine.apply_command(&MqCommand::publish(1, &vec![make_msg(b"hello")]), 2, 1001);
 
         let snap = engine.snapshot();
 
@@ -1165,24 +1484,24 @@ mod tests {
 
         // Topic
         engine.apply_command(
-            MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
         engine.apply_command(
-            MqCommand::publish(1, &vec![make_msg(b"m1"), make_msg(b"m2")]),
+            &MqCommand::publish(1, &vec![make_msg(b"m1"), make_msg(b"m2")]),
             2,
             1001,
         );
 
         // Queue with messages
         engine.apply_command(
-            MqCommand::create_queue(&"tasks".to_string(), &crate::config::QueueConfig::default()),
+            &MqCommand::create_queue(&"tasks".to_string(), &crate::config::QueueConfig::default()),
             3,
             1002,
         );
         engine.apply_command(
-            MqCommand::enqueue(
+            &MqCommand::enqueue(
                 2,
                 &vec![make_msg(b"q1"), make_msg(b"q2"), make_msg(b"q3")],
                 &vec![None, None, None],
@@ -1193,7 +1512,7 @@ mod tests {
 
         // Actor namespace
         engine.apply_command(
-            MqCommand::create_actor_namespace(
+            &MqCommand::create_actor_namespace(
                 &"actors".to_string(),
                 &crate::config::ActorConfig::default(),
             ),
@@ -1203,7 +1522,7 @@ mod tests {
 
         // Job
         engine.apply_command(
-            MqCommand::create_job(
+            &MqCommand::create_job(
                 &"cron-job".to_string(),
                 &crate::config::JobConfig {
                     cron_expression: "0 * * * *".to_string(),
@@ -1216,7 +1535,7 @@ mod tests {
 
         // Consumer
         engine.apply_command(
-            MqCommand::register_consumer(
+            &MqCommand::register_consumer(
                 100,
                 &"group-1".to_string(),
                 &vec![crate::types::Subscription {
@@ -1230,7 +1549,7 @@ mod tests {
 
         // Producer
         engine.apply_command(
-            MqCommand::register_producer(200, Some(&"my-producer".to_string())),
+            &MqCommand::register_producer(200, Some(&"my-producer".to_string())),
             8,
             1007,
         );
@@ -1272,7 +1591,7 @@ mod tests {
         assert_eq!(read.producers[0].meta.producer_id, 200);
         assert_eq!(read.producers[0].meta.name, Some("my-producer".to_string()));
 
-        assert_eq!(read.next_id, engine.next_id);
+        assert_eq!(read.next_id, engine.meta.next_id.load(Ordering::Relaxed));
     }
 
     /// Queue dedup entries survive the MDBX roundtrip.
@@ -1283,7 +1602,7 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::create_queue(
+            &MqCommand::create_queue(
                 &"dedup-q".to_string(),
                 &crate::config::QueueConfig {
                     dedup_window_secs: Some(60),
@@ -1295,7 +1614,7 @@ mod tests {
         );
         // Enqueue with dedup key
         engine.apply_command(
-            MqCommand::enqueue(
+            &MqCommand::enqueue(
                 1,
                 &vec![make_msg(b"d1")],
                 &vec![Some(bytes::Bytes::from_static(b"key-1"))],
@@ -1305,7 +1624,7 @@ mod tests {
         );
         // Second enqueue with same key (should be deduped)
         engine.apply_command(
-            MqCommand::enqueue(
+            &MqCommand::enqueue(
                 1,
                 &vec![make_msg(b"d1-dup")],
                 &vec![Some(bytes::Bytes::from_static(b"key-1"))],
@@ -1344,7 +1663,7 @@ mod tests {
         // Write structural data first
         let mut tmp_engine = MqEngine::new(MqConfig::new("/tmp/test"));
         tmp_engine.apply_command(
-            MqCommand::create_topic(
+            &MqCommand::create_topic(
                 &"structural-topic".to_string(),
                 RetentionPolicy::default(),
                 0,
@@ -1352,7 +1671,7 @@ mod tests {
             1,
             1000,
         );
-        let topic_meta = tmp_engine.topics.get(&1).unwrap().meta.clone();
+        let topic_meta = tmp_engine.meta.topics.get(&1).unwrap().meta().clone();
         env.apply_structural_write(1, 2, &StructuralWrite::CreateTopic(topic_meta))
             .unwrap();
 
@@ -1363,7 +1682,7 @@ mod tests {
         // Install snapshot — should clear the entities table
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::create_queue(
+            &MqCommand::create_queue(
                 &"snap-queue".to_string(),
                 &crate::config::QueueConfig::default(),
             ),
@@ -1394,7 +1713,7 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::create_topic(&"snap-topic".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"snap-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1404,14 +1723,22 @@ mod tests {
         // Now apply structural writes (simulates post-snapshot operation)
         let mut tmp_engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         tmp_engine2.apply_command(
-            MqCommand::create_queue(
+            &MqCommand::create_queue(
                 &"new-queue".to_string(),
                 &crate::config::QueueConfig::default(),
             ),
             1,
             1000,
         );
-        let queue_meta = tmp_engine2.queues.values().next().unwrap().meta.clone();
+        let queue_meta = tmp_engine2
+            .meta
+            .queues
+            .iter()
+            .next()
+            .unwrap()
+            .value()
+            .meta
+            .clone();
         env.apply_structural_write(2, 100, &StructuralWrite::CreateQueue(queue_meta))
             .unwrap();
 
@@ -1450,7 +1777,7 @@ mod tests {
         // Create 5 entities to advance next_id
         for i in 0..5 {
             engine.apply_command(
-                MqCommand::create_topic(&format!("t{}", i), RetentionPolicy::default(), 0),
+                &MqCommand::create_topic(&format!("t{}", i), RetentionPolicy::default(), 0),
                 i + 1,
                 1000,
             );
@@ -1478,7 +1805,7 @@ mod tests {
 
         let mut engine1 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine1.apply_command(
-            MqCommand::create_topic(&"group1-topic".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"group1-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1488,7 +1815,7 @@ mod tests {
 
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine2.apply_command(
-            MqCommand::create_queue(
+            &MqCommand::create_queue(
                 &"group2-queue".to_string(),
                 &crate::config::QueueConfig::default(),
             ),
@@ -1522,14 +1849,14 @@ mod tests {
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         for i in 0..50 {
             engine.apply_command(
-                MqCommand::create_topic(&format!("topic-{}", i), RetentionPolicy::default(), 0),
+                &MqCommand::create_topic(&format!("topic-{}", i), RetentionPolicy::default(), 0),
                 i + 1,
                 1000,
             );
         }
         for i in 0..30 {
             engine.apply_command(
-                MqCommand::create_queue(
+                &MqCommand::create_queue(
                     &format!("queue-{}", i),
                     &crate::config::QueueConfig::default(),
                 ),
@@ -1556,7 +1883,7 @@ mod tests {
         let mut engine1 = MqEngine::new(MqConfig::new("/tmp/test"));
         for i in 0..3 {
             engine1.apply_command(
-                MqCommand::create_topic(&format!("old-{}", i), RetentionPolicy::default(), 0),
+                &MqCommand::create_topic(&format!("old-{}", i), RetentionPolicy::default(), 0),
                 i + 1,
                 1000,
             );
@@ -1569,7 +1896,7 @@ mod tests {
         // Second snapshot: 1 queue (no topics)
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine2.apply_command(
-            MqCommand::create_queue(
+            &MqCommand::create_queue(
                 &"replacement-q".to_string(),
                 &crate::config::QueueConfig::default(),
             ),
@@ -1593,18 +1920,18 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
         engine.apply_command(
-            MqCommand::publish(1, &vec![make_msg(b"a"), make_msg(b"b"), make_msg(b"c")]),
+            &MqCommand::publish(1, &vec![make_msg(b"a"), make_msg(b"b"), make_msg(b"c")]),
             2,
             1001,
         );
         // Register a consumer and commit an offset
         engine.apply_command(
-            MqCommand::register_consumer(
+            &MqCommand::register_consumer(
                 42,
                 &"g1".to_string(),
                 &vec![crate::types::Subscription {
@@ -1615,7 +1942,7 @@ mod tests {
             3,
             1002,
         );
-        engine.apply_command(MqCommand::commit_offset(1, 42, 2), 4, 1003);
+        engine.apply_command(&MqCommand::commit_offset(1, 42, 2), 4, 1003);
 
         let snap = engine.snapshot();
         assert!(!snap.topics[0].consumer_offsets.is_empty());
@@ -1636,18 +1963,18 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
-        engine.apply_command(MqCommand::publish(1, &vec![make_msg(b"a")]), 2, 1001);
+        engine.apply_command(&MqCommand::publish(1, &vec![make_msg(b"a")]), 2, 1001);
         engine.apply_command(
-            MqCommand::create_queue(&"q".to_string(), &crate::config::QueueConfig::default()),
+            &MqCommand::create_queue(&"q".to_string(), &crate::config::QueueConfig::default()),
             3,
             1002,
         );
         engine.apply_command(
-            MqCommand::enqueue(2, &vec![make_msg(b"b")], &vec![None]),
+            &MqCommand::enqueue(2, &vec![make_msg(b"b")], &vec![None]),
             4,
             1003,
         );
@@ -1696,7 +2023,7 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1735,7 +2062,7 @@ mod tests {
         for gid in 1..=5u64 {
             let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
             engine.apply_command(
-                MqCommand::create_topic(
+                &MqCommand::create_topic(
                     &format!("group-{}-topic", gid),
                     RetentionPolicy::default(),
                     0,
@@ -1769,7 +2096,7 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
+            &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1787,6 +2114,205 @@ mod tests {
         assert_eq!(la.index, 100);
         assert_eq!(la.leader_id.term, 3);
         assert_eq!(la.leader_id.node_id, 2);
+
+        mgr.shutdown();
+    }
+
+    // =========================================================================
+    // Segment range MDBX multimap tests
+    // =========================================================================
+
+    #[test]
+    fn test_segment_range_key_encoding() {
+        let key = segment_range_key(0, 42);
+        assert_eq!(key[0], 0); // entity_type
+        assert_eq!(u64::from_be_bytes(key[1..9].try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn test_segment_range_value_roundtrip() {
+        let val = segment_range_value(100, 500, 65536);
+        let (seg, rec, bytes) = decode_segment_range_value(&val);
+        assert_eq!(seg, 100);
+        assert_eq!(rec, 500);
+        assert_eq!(bytes, 65536);
+    }
+
+    #[test]
+    fn test_segment_ranges_write_and_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = GroupMdbxEnv::open(tmp.path()).unwrap();
+
+        // Write ranges for segment 1: topic 10 has 100 records / 4096 bytes
+        env.write_segment_ranges(1, &[(0, 10, 100, 4096)]).unwrap();
+
+        // Write ranges for segment 2: topic 10 has 50 records / 2048 bytes
+        env.write_segment_ranges(2, &[(0, 10, 50, 2048)]).unwrap();
+
+        let ranges = env.read_segment_ranges(0, 10).unwrap();
+        assert_eq!(ranges.len(), 2);
+        // Values sorted by segment_id (LE bytes)
+        assert_eq!(ranges[0], (1, 100, 4096));
+        assert_eq!(ranges[1], (2, 50, 2048));
+    }
+
+    #[test]
+    fn test_segment_ranges_multiple_entities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = GroupMdbxEnv::open(tmp.path()).unwrap();
+
+        // Segment 1 has data for topic 1 and queue 2
+        env.write_segment_ranges(1, &[(0, 1, 10, 1000), (1, 2, 5, 500)])
+            .unwrap();
+
+        let topic_ranges = env.read_segment_ranges(0, 1).unwrap();
+        assert_eq!(topic_ranges.len(), 1);
+        assert_eq!(topic_ranges[0], (1, 10, 1000));
+
+        let queue_ranges = env.read_segment_ranges(1, 2).unwrap();
+        assert_eq!(queue_ranges.len(), 1);
+        assert_eq!(queue_ranges[0], (1, 5, 500));
+
+        // Non-existent entity
+        let empty = env.read_segment_ranges(0, 999).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_segment_ranges_delete_by_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = GroupMdbxEnv::open(tmp.path()).unwrap();
+
+        // Two segments with data for topic 1
+        env.write_segment_ranges(1, &[(0, 1, 10, 1000)]).unwrap();
+        env.write_segment_ranges(2, &[(0, 1, 20, 2000)]).unwrap();
+        // Segment 1 also has data for queue 2
+        env.write_segment_ranges(1, &[(1, 2, 5, 500)]).unwrap();
+
+        // Delete segment 1
+        let deleted = env.delete_segment_ranges_by_segment(1).unwrap();
+        assert_eq!(deleted, 2); // topic 1 + queue 2
+
+        // Topic 1 should only have segment 2 left
+        let ranges = env.read_segment_ranges(0, 1).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], (2, 20, 2000));
+
+        // Queue 2 should be empty
+        let ranges = env.read_segment_ranges(1, 2).unwrap();
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_segment_ranges_cleared_on_snapshot_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = GroupMdbxEnv::open(tmp.path()).unwrap();
+
+        // Write some segment ranges
+        env.write_segment_ranges(1, &[(0, 1, 10, 1000)]).unwrap();
+        env.write_segment_ranges(2, &[(0, 1, 20, 2000)]).unwrap();
+
+        assert_eq!(env.read_segment_ranges(0, 1).unwrap().len(), 2);
+
+        // Install snapshot — should clear segment ranges
+        let engine = MqEngine::new(MqConfig::new("/tmp/test"));
+        env.install_snapshot(&make_meta(0), &engine.snapshot())
+            .unwrap();
+
+        let ranges = env.read_segment_ranges(0, 1).unwrap();
+        assert!(
+            ranges.is_empty(),
+            "segment ranges should be cleared after snapshot install"
+        );
+    }
+
+    #[test]
+    fn test_segment_ranges_many_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = GroupMdbxEnv::open(tmp.path()).unwrap();
+
+        // Write 100 segments worth of data for a single entity
+        for seg in 1..=100u64 {
+            env.write_segment_ranges(seg, &[(0, 1, seg * 10, seg * 100)])
+                .unwrap();
+        }
+
+        let ranges = env.read_segment_ranges(0, 1).unwrap();
+        assert_eq!(ranges.len(), 100);
+
+        // Should be sorted by segment_id
+        for (i, &(seg_id, rec_count, total_bytes)) in ranges.iter().enumerate() {
+            let expected_seg = (i + 1) as u64;
+            assert_eq!(seg_id, expected_seg);
+            assert_eq!(rec_count, expected_seg * 10);
+            assert_eq!(total_bytes, expected_seg * 100);
+        }
+    }
+
+    #[test]
+    fn test_segment_ranges_empty_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = GroupMdbxEnv::open(tmp.path()).unwrap();
+
+        // Empty write is a no-op
+        env.write_segment_ranges(1, &[]).unwrap();
+        let ranges = env.read_segment_ranges(0, 1).unwrap();
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_segment_ranges_delete_nonexistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = GroupMdbxEnv::open(tmp.path()).unwrap();
+
+        // Delete from empty table
+        let deleted = env.delete_segment_ranges_by_segment(999).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_manager_sealed_segment_fire_and_forget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MqManifestManager::new(tmp.path()).unwrap();
+        mgr.open_group(1).unwrap();
+
+        // Fire sealed segment update
+        mgr.sealed_segment_fire_and_forget(1, 100, vec![(0, 1, 50, 4096), (1, 2, 30, 2048)]);
+
+        // Give worker thread time to process
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let topic_ranges = mgr.read_segment_ranges(1, 0, 1).unwrap();
+        assert_eq!(topic_ranges.len(), 1);
+        assert_eq!(topic_ranges[0], (100, 50, 4096));
+
+        let queue_ranges = mgr.read_segment_ranges(1, 1, 2).unwrap();
+        assert_eq!(queue_ranges.len(), 1);
+        assert_eq!(queue_ranges[0], (100, 30, 2048));
+
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_manifest_manager_purge_segment_fire_and_forget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MqManifestManager::new(tmp.path()).unwrap();
+        mgr.open_group(1).unwrap();
+
+        // Write two segments
+        mgr.sealed_segment_fire_and_forget(1, 1, vec![(0, 1, 10, 1000)]);
+        mgr.sealed_segment_fire_and_forget(1, 2, vec![(0, 1, 20, 2000)]);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(mgr.read_segment_ranges(1, 0, 1).unwrap().len(), 2);
+
+        // Purge segment 1
+        mgr.purge_segment_fire_and_forget(1, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let ranges = mgr.read_segment_ranges(1, 0, 1).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], (2, 20, 2000));
 
         mgr.shutdown();
     }

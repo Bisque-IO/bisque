@@ -40,7 +40,7 @@ fn test_topic_publish_consume_commit_purge() {
 
     // Create topic
     let topic_id = match engine.apply_command(
-        MqCommand::create_topic(
+        &MqCommand::create_topic(
             "orders",
             RetentionPolicy {
                 max_age_secs: Some(3600),
@@ -57,7 +57,7 @@ fn test_topic_publish_consume_commit_purge() {
 
     // Register consumer
     engine.apply_command(
-        MqCommand::register_consumer(
+        &MqCommand::register_consumer(
             100,
             "order-processor",
             &[Subscription {
@@ -73,18 +73,18 @@ fn test_topic_publish_consume_commit_purge() {
     let messages: Vec<Bytes> = (0..10)
         .map(|i| make_flat_msg_with_key(format!("order-{}", i).as_bytes(), b"order-data"))
         .collect();
-    let resp = engine.apply_command(MqCommand::publish(topic_id, &messages), 3, 1002);
+    let resp = engine.apply_command(&MqCommand::publish(topic_id, &messages), 3, 1002);
     match resp {
         MqResponse::Published { offsets } => assert_eq!(offsets.len(), 10),
         other => panic!("expected Published, got {:?}", other),
     }
 
     // Commit offset
-    let resp = engine.apply_command(MqCommand::commit_offset(topic_id, 100, 3), 4, 1003);
+    let resp = engine.apply_command(&MqCommand::commit_offset(topic_id, 100, 3), 4, 1003);
     assert!(matches!(resp, MqResponse::Ok));
 
     // Purge old messages
-    let resp = engine.apply_command(MqCommand::purge_topic(topic_id, 3), 5, 1004);
+    let resp = engine.apply_command(&MqCommand::purge_topic(topic_id, 3), 5, 1004);
     assert!(matches!(resp, MqResponse::Ok));
 
     // Verify via snapshot
@@ -107,29 +107,29 @@ fn test_queue_message_lifecycle_with_retries() {
     };
     let mut engine = make_engine();
 
-    let queue_id = match engine.apply_command(MqCommand::create_queue("tasks", &config), 1, 1000) {
+    let queue_id = match engine.apply_command(&MqCommand::create_queue("tasks", &config), 1, 1000) {
         MqResponse::EntityCreated { id } => id,
         other => panic!("expected EntityCreated, got {:?}", other),
     };
 
     // Enqueue
     engine.apply_command(
-        MqCommand::enqueue(queue_id, &[make_flat_msg(b"process-payment")], &[None]),
+        &MqCommand::enqueue(queue_id, &[make_flat_msg(b"process-payment")], &[None]),
         2,
         1001,
     );
 
     // First delivery
-    engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 3, 2000);
+    engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 3, 2000);
 
     // Timeout expired (attempt 1) -> re-enqueue
-    engine.apply_command(MqCommand::timeout_expired(queue_id, &[2]), 4, 8000);
+    engine.apply_command(&MqCommand::timeout_expired(queue_id, &[2]), 4, 8000);
 
     // Second delivery
-    engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 5, 9000);
+    engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 5, 9000);
 
     // Timeout expired (attempt 2 >= max_retries) -> dead letter
-    engine.apply_command(MqCommand::timeout_expired(queue_id, &[2]), 6, 15000);
+    engine.apply_command(&MqCommand::timeout_expired(queue_id, &[2]), 6, 15000);
 
     let snap = engine.snapshot();
     assert_eq!(snap.queues[0].meta.dlq_count, 1);
@@ -150,7 +150,7 @@ fn test_queue_deduplication() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("idempotent-queue", &config),
+        &MqCommand::create_queue("idempotent-queue", &config),
         1,
         1000,
     ) {
@@ -162,7 +162,7 @@ fn test_queue_deduplication() {
 
     // First enqueue
     engine.apply_command(
-        MqCommand::enqueue(
+        &MqCommand::enqueue(
             queue_id,
             &[make_flat_msg(b"payment")],
             &[Some(dedup_key.clone())],
@@ -173,7 +173,7 @@ fn test_queue_deduplication() {
 
     // Duplicate within window -- silent skip
     engine.apply_command(
-        MqCommand::enqueue(
+        &MqCommand::enqueue(
             queue_id,
             &[make_flat_msg(b"payment-retry")],
             &[Some(dedup_key.clone())],
@@ -186,11 +186,11 @@ fn test_queue_deduplication() {
     assert_eq!(snap.queues[0].meta.pending_count, 1);
 
     // Prune dedup window
-    engine.apply_command(MqCommand::prune_dedup_window(queue_id, 1005), 4, 1100);
+    engine.apply_command(&MqCommand::prune_dedup_window(queue_id, 1005), 4, 1100);
 
     // After pruning, same key accepted
     engine.apply_command(
-        MqCommand::enqueue(
+        &MqCommand::enqueue(
             queue_id,
             &[make_flat_msg(b"payment-new")],
             &[Some(dedup_key.clone())],
@@ -211,7 +211,7 @@ fn test_actor_full_lifecycle() {
     let mut engine = make_engine();
 
     let ns_id = match engine.apply_command(
-        MqCommand::create_actor_namespace("users", &ActorConfig::default()),
+        &MqCommand::create_actor_namespace("users", &ActorConfig::default()),
         1,
         1000,
     ) {
@@ -226,7 +226,7 @@ fn test_actor_full_lifecycle() {
     for (i, actor_id) in [&actor_a, &actor_b, &actor_a, &actor_b].iter().enumerate() {
         let flat_msg = make_flat_msg(format!("msg-{}", i).as_bytes());
         engine.apply_command(
-            MqCommand::send_to_actor(ns_id, actor_id, &flat_msg),
+            &MqCommand::send_to_actor(ns_id, actor_id, &flat_msg),
             (i + 2) as u64,
             1000 + i as u64,
         );
@@ -238,14 +238,14 @@ fn test_actor_full_lifecycle() {
 
     // Assign actors
     engine.apply_command(
-        MqCommand::assign_actors(ns_id, 100, &[actor_a.clone()]),
+        &MqCommand::assign_actors(ns_id, 100, &[actor_a.clone()]),
         10,
         2000,
     );
 
     // Deliver (serialized)
     let resp = engine.apply_command(
-        MqCommand::deliver_actor_message(ns_id, &actor_a, 100),
+        &MqCommand::deliver_actor_message(ns_id, &actor_a, 100),
         12,
         2002,
     );
@@ -259,7 +259,7 @@ fn test_actor_full_lifecycle() {
 
     // Second deliver blocked (serialized)
     let resp = engine.apply_command(
-        MqCommand::deliver_actor_message(ns_id, &actor_a, 100),
+        &MqCommand::deliver_actor_message(ns_id, &actor_a, 100),
         13,
         2003,
     );
@@ -270,14 +270,14 @@ fn test_actor_full_lifecycle() {
 
     // Ack
     engine.apply_command(
-        MqCommand::ack_actor_message(ns_id, &actor_a, msg_id, None),
+        &MqCommand::ack_actor_message(ns_id, &actor_a, msg_id, None),
         14,
         2004,
     );
 
     // Now can deliver next
     let resp = engine.apply_command(
-        MqCommand::deliver_actor_message(ns_id, &actor_a, 100),
+        &MqCommand::deliver_actor_message(ns_id, &actor_a, 100),
         15,
         2005,
     );
@@ -301,21 +301,21 @@ fn test_job_scheduling_workflow() {
         ..Default::default()
     };
 
-    let job_id = match engine.apply_command(MqCommand::create_job("daily-report", &config), 1, 1000)
-    {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    let job_id =
+        match engine.apply_command(&MqCommand::create_job("daily-report", &config), 1, 1000) {
+            MqResponse::EntityCreated { id } => id,
+            other => panic!("expected EntityCreated, got {:?}", other),
+        };
 
     // Assign and trigger
-    engine.apply_command(MqCommand::assign_job(job_id, 100), 2, 1001);
-    engine.apply_command(MqCommand::trigger_job(job_id, 1000, 5000), 3, 5000);
+    engine.apply_command(&MqCommand::assign_job(job_id, 100), 2, 1001);
+    engine.apply_command(&MqCommand::trigger_job(job_id, 1000, 5000), 3, 5000);
 
     let snap = engine.snapshot();
     assert_eq!(snap.jobs[0].meta.state.current_execution_id, Some(1000));
 
     // Complete
-    engine.apply_command(MqCommand::complete_job(job_id, 1000), 4, 6000);
+    engine.apply_command(&MqCommand::complete_job(job_id, 1000), 4, 6000);
 
     let snap = engine.snapshot();
     assert!(snap.jobs[0].meta.state.current_execution_id.is_none());
@@ -331,7 +331,7 @@ fn test_job_failure_tracking() {
     let mut engine = make_engine();
 
     let job_id = match engine.apply_command(
-        MqCommand::create_job("flaky-job", &JobConfig::default()),
+        &MqCommand::create_job("flaky-job", &JobConfig::default()),
         1,
         1000,
     ) {
@@ -343,9 +343,9 @@ fn test_job_failure_tracking() {
     for i in 0..3u64 {
         let exec_id = 100 + i;
         let t = 5000 + i * 1000;
-        engine.apply_command(MqCommand::trigger_job(job_id, exec_id, t), i + 2, t);
+        engine.apply_command(&MqCommand::trigger_job(job_id, exec_id, t), i + 2, t);
         engine.apply_command(
-            MqCommand::fail_job(job_id, exec_id, &format!("error {}", i)),
+            &MqCommand::fail_job(job_id, exec_id, &format!("error {}", i)),
             i + 10,
             t + 500,
         );
@@ -355,8 +355,8 @@ fn test_job_failure_tracking() {
     assert_eq!(snap.jobs[0].meta.state.consecutive_failures, 3);
 
     // Success resets counter
-    engine.apply_command(MqCommand::trigger_job(job_id, 999, 10000), 20, 10000);
-    engine.apply_command(MqCommand::complete_job(job_id, 999), 21, 11000);
+    engine.apply_command(&MqCommand::trigger_job(job_id, 999, 10000), 20, 10000);
+    engine.apply_command(&MqCommand::complete_job(job_id, 999), 21, 11000);
     let snap = engine.snapshot();
     assert_eq!(snap.jobs[0].meta.state.consecutive_failures, 0);
 }
@@ -371,7 +371,7 @@ fn test_consumer_disconnect_cascading_cleanup() {
 
     // Create all entity types
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue("q", &QueueConfig::default()),
+        &MqCommand::create_queue("q", &QueueConfig::default()),
         1,
         1000,
     ) {
@@ -380,7 +380,7 @@ fn test_consumer_disconnect_cascading_cleanup() {
     };
 
     let ns_id = match engine.apply_command(
-        MqCommand::create_actor_namespace("ns", &ActorConfig::default()),
+        &MqCommand::create_actor_namespace("ns", &ActorConfig::default()),
         2,
         1000,
     ) {
@@ -389,38 +389,38 @@ fn test_consumer_disconnect_cascading_cleanup() {
     };
 
     let job_id =
-        match engine.apply_command(MqCommand::create_job("j", &JobConfig::default()), 3, 1000) {
+        match engine.apply_command(&MqCommand::create_job("j", &JobConfig::default()), 3, 1000) {
             MqResponse::EntityCreated { id } => id,
             _ => panic!(),
         };
 
     // Register consumer
-    engine.apply_command(MqCommand::register_consumer(100, "g", &[]), 4, 1000);
+    engine.apply_command(&MqCommand::register_consumer(100, "g", &[]), 4, 1000);
 
     // Enqueue, deliver (queue in-flight)
     engine.apply_command(
-        MqCommand::enqueue(queue_id, &[make_flat_msg(b"task")], &[None]),
+        &MqCommand::enqueue(queue_id, &[make_flat_msg(b"task")], &[None]),
         5,
         1001,
     );
-    engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 6, 1002);
+    engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 6, 1002);
 
     // Send to actor, assign
     let actor_id = Bytes::from_static(b"actor-1");
     let flat_msg = make_flat_msg(b"msg");
     engine.apply_command(
-        MqCommand::send_to_actor(ns_id, &actor_id, &flat_msg),
+        &MqCommand::send_to_actor(ns_id, &actor_id, &flat_msg),
         7,
         1003,
     );
     engine.apply_command(
-        MqCommand::assign_actors(ns_id, 100, &[actor_id.clone()]),
+        &MqCommand::assign_actors(ns_id, 100, &[actor_id.clone()]),
         8,
         1004,
     );
 
     // Assign job
-    engine.apply_command(MqCommand::assign_job(job_id, 100), 9, 1005);
+    engine.apply_command(&MqCommand::assign_job(job_id, 100), 9, 1005);
 
     // Verify assigned state via snapshot
     let snap = engine.snapshot();
@@ -428,7 +428,7 @@ fn test_consumer_disconnect_cascading_cleanup() {
     assert_eq!(snap.jobs[0].meta.state.assigned_consumer_id, Some(100));
 
     // Disconnect consumer -- cascading cleanup
-    engine.apply_command(MqCommand::disconnect_consumer(100), 10, 2000);
+    engine.apply_command(&MqCommand::disconnect_consumer(100), 10, 2000);
 
     let snap = engine.snapshot();
 
@@ -458,19 +458,19 @@ fn test_full_snapshot_restore_roundtrip() {
 
     // Build diverse state
     engine.apply_command(
-        MqCommand::create_topic("events", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
         1,
         1000,
     );
     engine.apply_command(
-        MqCommand::publish(1, &[make_flat_msg(b"e1"), make_flat_msg(b"e2")]),
+        &MqCommand::publish(1, &[make_flat_msg(b"e1"), make_flat_msg(b"e2")]),
         2,
         1001,
     );
-    engine.apply_command(MqCommand::commit_offset(1, 100, 2), 3, 1002);
+    engine.apply_command(&MqCommand::commit_offset(1, 100, 2), 3, 1002);
 
     engine.apply_command(
-        MqCommand::create_queue(
+        &MqCommand::create_queue(
             "tasks",
             &QueueConfig {
                 dedup_window_secs: Some(60),
@@ -481,7 +481,7 @@ fn test_full_snapshot_restore_roundtrip() {
         1003,
     );
     engine.apply_command(
-        MqCommand::enqueue(
+        &MqCommand::enqueue(
             2,
             &[make_flat_msg(b"t1")],
             &[Some(Bytes::from_static(b"k1"))],
@@ -491,19 +491,19 @@ fn test_full_snapshot_restore_roundtrip() {
     );
 
     engine.apply_command(
-        MqCommand::create_actor_namespace("actors", &ActorConfig::default()),
+        &MqCommand::create_actor_namespace("actors", &ActorConfig::default()),
         6,
         1005,
     );
     let flat_hello = make_flat_msg(b"hello");
     engine.apply_command(
-        MqCommand::send_to_actor(3, b"actor-1", &flat_hello),
+        &MqCommand::send_to_actor(3, b"actor-1", &flat_hello),
         7,
         1006,
     );
 
     engine.apply_command(
-        MqCommand::create_job(
+        &MqCommand::create_job(
             "cron-job",
             &JobConfig {
                 cron_expression: "0 * * * * *".to_string(),
@@ -514,10 +514,10 @@ fn test_full_snapshot_restore_roundtrip() {
         1007,
     );
 
-    engine.apply_command(MqCommand::register_consumer(100, "workers", &[]), 9, 1008);
+    engine.apply_command(&MqCommand::register_consumer(100, "workers", &[]), 9, 1008);
 
     engine.apply_command(
-        MqCommand::register_producer(200, Some("producer-1")),
+        &MqCommand::register_producer(200, Some("producer-1")),
         10,
         1009,
     );
@@ -563,7 +563,7 @@ fn test_full_snapshot_restore_roundtrip() {
 
     // Engine continues to work after restore
     let resp = engine2.apply_command(
-        MqCommand::publish(1, &[make_flat_msg(b"post-restore")]),
+        &MqCommand::publish(1, &[make_flat_msg(b"post-restore")]),
         11,
         2000,
     );
@@ -579,30 +579,30 @@ fn test_purge_floor_across_entities() {
     let mut engine = make_engine();
 
     engine.apply_command(
-        MqCommand::create_topic("t", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("t", RetentionPolicy::default(), 0),
         1,
         1000,
     );
-    engine.apply_command(MqCommand::publish(1, &[make_flat_msg(b"msg")]), 20, 1001);
+    engine.apply_command(&MqCommand::publish(1, &[make_flat_msg(b"msg")]), 20, 1001);
 
     engine.apply_command(
-        MqCommand::create_queue("q", &QueueConfig::default()),
+        &MqCommand::create_queue("q", &QueueConfig::default()),
         2,
         1000,
     );
     engine.apply_command(
-        MqCommand::enqueue(2, &[make_flat_msg(b"task")], &[None]),
+        &MqCommand::enqueue(2, &[make_flat_msg(b"task")], &[None]),
         10,
         1001,
     );
 
     engine.apply_command(
-        MqCommand::create_actor_namespace("ns", &ActorConfig::default()),
+        &MqCommand::create_actor_namespace("ns", &ActorConfig::default()),
         3,
         1000,
     );
     let flat_msg = make_flat_msg(b"msg");
-    engine.apply_command(MqCommand::send_to_actor(3, b"a1", &flat_msg), 5, 1001);
+    engine.apply_command(&MqCommand::send_to_actor(3, b"a1", &flat_msg), 5, 1001);
 
     // Purge floor = min of message indices only (creation indices tracked
     // separately via structural purge floor in MDBX).
@@ -622,22 +622,22 @@ fn test_id_allocation_across_entity_types() {
     for (i, name) in ["t1", "q1", "ns1", "j1"].iter().enumerate() {
         let resp = match i {
             0 => engine.apply_command(
-                MqCommand::create_topic(name, RetentionPolicy::default(), 0),
+                &MqCommand::create_topic(name, RetentionPolicy::default(), 0),
                 (i + 1) as u64,
                 1000,
             ),
             1 => engine.apply_command(
-                MqCommand::create_queue(name, &QueueConfig::default()),
+                &MqCommand::create_queue(name, &QueueConfig::default()),
                 (i + 1) as u64,
                 1001,
             ),
             2 => engine.apply_command(
-                MqCommand::create_actor_namespace(name, &ActorConfig::default()),
+                &MqCommand::create_actor_namespace(name, &ActorConfig::default()),
                 (i + 1) as u64,
                 1002,
             ),
             3 => engine.apply_command(
-                MqCommand::create_job(name, &JobConfig::default()),
+                &MqCommand::create_job(name, &JobConfig::default()),
                 (i + 1) as u64,
                 1003,
             ),
@@ -662,21 +662,21 @@ fn test_operations_on_nonexistent_entities() {
     let mut engine = make_engine();
 
     let cases = vec![
-        engine.apply_command(MqCommand::delete_topic(999), 1, 1000),
-        engine.apply_command(MqCommand::delete_queue(999), 2, 1000),
-        engine.apply_command(MqCommand::publish(999, &[]), 3, 1000),
-        engine.apply_command(MqCommand::deliver(999, 1, 1), 4, 1000),
-        engine.apply_command(MqCommand::ack(999, &[1], None), 5, 1000),
+        engine.apply_command(&MqCommand::delete_topic(999), 1, 1000),
+        engine.apply_command(&MqCommand::delete_queue(999), 2, 1000),
+        engine.apply_command(&MqCommand::publish(999, &[]), 3, 1000),
+        engine.apply_command(&MqCommand::deliver(999, 1, 1), 4, 1000),
+        engine.apply_command(&MqCommand::ack(999, &[1], None), 5, 1000),
         engine.apply_command(
-            {
+            &{
                 let flat_msg = make_flat_msg(b"x");
                 MqCommand::send_to_actor(999, b"a", &flat_msg)
             },
             6,
             1000,
         ),
-        engine.apply_command(MqCommand::trigger_job(999, 1, 1000), 7, 1000),
-        engine.apply_command(MqCommand::heartbeat(999), 8, 1000),
+        engine.apply_command(&MqCommand::trigger_job(999, 1, 1000), 7, 1000),
+        engine.apply_command(&MqCommand::heartbeat(999), 8, 1000),
     ];
 
     for resp in cases {
@@ -693,24 +693,24 @@ fn test_duplicate_entity_names() {
     let mut engine = make_engine();
 
     engine.apply_command(
-        MqCommand::create_topic("dup", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("dup", RetentionPolicy::default(), 0),
         1,
         1000,
     );
     let resp = engine.apply_command(
-        MqCommand::create_topic("dup", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("dup", RetentionPolicy::default(), 0),
         2,
         1001,
     );
     assert!(matches!(resp, MqResponse::Error(_)));
 
     engine.apply_command(
-        MqCommand::create_queue("dup", &QueueConfig::default()),
+        &MqCommand::create_queue("dup", &QueueConfig::default()),
         3,
         1002,
     );
     let resp = engine.apply_command(
-        MqCommand::create_queue("dup", &QueueConfig::default()),
+        &MqCommand::create_queue("dup", &QueueConfig::default()),
         4,
         1003,
     );
@@ -726,7 +726,7 @@ fn test_extend_visibility_workflow() {
     let mut engine = make_engine();
 
     let queue_id = match engine.apply_command(
-        MqCommand::create_queue(
+        &MqCommand::create_queue(
             "long-tasks",
             &QueueConfig {
                 visibility_timeout_ms: 5000,
@@ -741,13 +741,13 @@ fn test_extend_visibility_workflow() {
     };
 
     engine.apply_command(
-        MqCommand::enqueue(queue_id, &[make_flat_msg(b"big-task")], &[None]),
+        &MqCommand::enqueue(queue_id, &[make_flat_msg(b"big-task")], &[None]),
         2,
         1001,
     );
 
     // Deliver
-    let resp = engine.apply_command(MqCommand::deliver(queue_id, 100, 1), 3, 2000);
+    let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 1), 3, 2000);
     let msg_id = match resp {
         MqResponse::Messages { messages } => messages[0].message_id,
         _ => panic!(),
@@ -755,14 +755,14 @@ fn test_extend_visibility_workflow() {
 
     // Extend visibility
     let resp = engine.apply_command(
-        MqCommand::extend_visibility(queue_id, &[msg_id], 10_000),
+        &MqCommand::extend_visibility(queue_id, &[msg_id], 10_000),
         4,
         4000,
     );
     assert!(matches!(resp, MqResponse::Ok));
 
     // Ack
-    let resp = engine.apply_command(MqCommand::ack(queue_id, &[msg_id], None), 5, 5000);
+    let resp = engine.apply_command(&MqCommand::ack(queue_id, &[msg_id], None), 5, 5000);
     assert!(matches!(resp, MqResponse::Ok));
 }
 
@@ -776,15 +776,15 @@ fn test_delete_and_recreate_entity() {
 
     // Create and delete topic
     engine.apply_command(
-        MqCommand::create_topic("ephemeral", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("ephemeral", RetentionPolicy::default(), 0),
         1,
         1000,
     );
-    engine.apply_command(MqCommand::delete_topic(1), 2, 1001);
+    engine.apply_command(&MqCommand::delete_topic(1), 2, 1001);
 
     // Recreate with same name
     let resp = engine.apply_command(
-        MqCommand::create_topic("ephemeral", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("ephemeral", RetentionPolicy::default(), 0),
         3,
         1002,
     );
@@ -794,11 +794,15 @@ fn test_delete_and_recreate_entity() {
     }
 
     // New entity works
-    let resp = engine.apply_command(MqCommand::publish(2, &[make_flat_msg(b"new-msg")]), 4, 1003);
+    let resp = engine.apply_command(
+        &MqCommand::publish(2, &[make_flat_msg(b"new-msg")]),
+        4,
+        1003,
+    );
     assert!(matches!(resp, MqResponse::Published { .. }));
 
     // Old ID doesn't work
-    let resp = engine.apply_command(MqCommand::publish(1, &[make_flat_msg(b"x")]), 5, 1004);
+    let resp = engine.apply_command(&MqCommand::publish(1, &[make_flat_msg(b"x")]), 5, 1004);
     assert!(matches!(resp, MqResponse::Error(_)));
 }
 
@@ -816,7 +820,7 @@ fn test_batch_mixed_creates_and_publishes() {
         MqCommand::publish(1, &[make_flat_msg(b"hello")]),
     ]);
 
-    let resp = engine.apply_command(batch, 1, 1000);
+    let resp = engine.apply_command(&batch, 1, 1000);
     match resp {
         MqResponse::BatchResponse(resps) => {
             assert_eq!(resps.len(), 3);
@@ -854,7 +858,7 @@ fn test_batch_partial_errors() {
         MqCommand::create_topic("ok", RetentionPolicy::default(), 0),
     ]);
 
-    let resp = engine.apply_command(batch, 1, 1000);
+    let resp = engine.apply_command(&batch, 1, 1000);
     match resp {
         MqResponse::BatchResponse(resps) => {
             assert_eq!(resps.len(), 2);
@@ -881,7 +885,7 @@ fn test_batch_partial_errors() {
 fn test_batch_empty() {
     let mut engine = make_engine();
 
-    let resp = engine.apply_command(MqCommand::batch(&[]), 1, 1000);
+    let resp = engine.apply_command(&MqCommand::batch(&[]), 1, 1000);
     match resp {
         MqResponse::BatchResponse(resps) => {
             assert_eq!(resps.len(), 0);

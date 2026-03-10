@@ -8,8 +8,15 @@ use smallvec::SmallVec;
 /// CRC64-NVME hash of a name string, used as the key in name→ID lookup maps.
 #[inline]
 pub fn name_hash(name: &str) -> u64 {
+    name_hash_bytes(name.as_bytes())
+}
+
+/// CRC64-NVME hash of raw bytes. Use when the input is already `&[u8]` or
+/// `Bytes` to avoid a UTF-8 validation / String allocation round-trip.
+#[inline]
+pub fn name_hash_bytes(b: &[u8]) -> u64 {
     let mut digest = Digest::new();
-    digest.write(name.as_bytes());
+    digest.write(b);
     digest.sum64()
 }
 
@@ -115,7 +122,7 @@ pub struct Binding {
     pub routing_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Subscription {
     pub entity_type: EntityType,
     pub entity_id: u64,
@@ -124,8 +131,8 @@ pub struct Subscription {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentRange {
     pub segment_id: u64,
-    pub min_index: u64,
-    pub max_index: u64,
+    pub record_count: u64,
+    pub total_bytes: u64,
 }
 
 // =============================================================================
@@ -216,13 +223,13 @@ pub struct QueueMessageMeta {
     #[serde(default)]
     pub expires_at: Option<u64>,
     /// Topic name to publish a response to on ACK (request/reply pattern).
-    /// Extracted from the flat message header at enqueue time.
+    /// Extracted from the flat message header at enqueue time (zero-copy `Bytes`).
     #[serde(default)]
-    pub reply_to: Option<String>,
+    pub reply_to: Option<Bytes>,
     /// Correlation ID for request/reply matching.
-    /// Extracted from the flat message header at enqueue time.
+    /// Extracted from the flat message header at enqueue time (zero-copy `Bytes`).
     #[serde(default)]
-    pub correlation_id: Option<String>,
+    pub correlation_id: Option<Bytes>,
 }
 
 // =============================================================================
@@ -523,7 +530,7 @@ pub enum MqResponse {
         id: u64,
     },
     Messages {
-        messages: Vec<DeliveredMessage>,
+        messages: SmallVec<[DeliveredMessage; 8]>,
     },
     Published {
         offsets: SmallVec<[u64; 16]>,
@@ -682,7 +689,7 @@ mod tests {
             format!(
                 "{}",
                 MqResponse::Messages {
-                    messages: vec![DeliveredMessage {
+                    messages: smallvec::smallvec![DeliveredMessage {
                         message_id: 1,
                         attempt: 1,
                         original_timestamp: 0,
@@ -766,8 +773,8 @@ mod tests {
             visibility_deadline: Some(31000),
             dedup_key: Some(Bytes::from_static(b"dedup")),
             expires_at: Some(60000),
-            reply_to: Some("reply-topic".into()),
-            correlation_id: Some("corr-123".into()),
+            reply_to: Some(Bytes::from_static(b"reply-topic")),
+            correlation_id: Some(Bytes::from_static(b"corr-123")),
         };
         let bytes = bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap();
         let (decoded, _): (QueueMessageMeta, _) =
@@ -830,7 +837,7 @@ mod tests {
     #[test]
     fn test_mq_response_serde_roundtrip() {
         let resp = MqResponse::Messages {
-            messages: vec![DeliveredMessage {
+            messages: smallvec::smallvec![DeliveredMessage {
                 message_id: 42,
                 attempt: 2,
                 original_timestamp: 500,

@@ -114,17 +114,17 @@ async fn test_snapshot_install_with_segment_sync() {
     // --- Leader side: build snapshot with file manifest ---
     let mut leader_engine = make_engine();
     leader_engine.apply_command(
-        MqCommand::create_topic("events", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
         1,
         1000,
     );
     leader_engine.apply_command(
-        MqCommand::publish(1, &[make_msg(b"msg1"), make_msg(b"msg2")]),
+        &MqCommand::publish(1, &[make_msg(b"msg1"), make_msg(b"msg2")]),
         2,
         1001,
     );
     leader_engine.apply_command(
-        MqCommand::create_queue("tasks", &bisque_mq::config::QueueConfig::default()),
+        &MqCommand::create_queue("tasks", &bisque_mq::config::QueueConfig::default()),
         3,
         1002,
     );
@@ -174,9 +174,7 @@ async fn test_snapshot_install_with_segment_sync() {
     assert_eq!(synced_seg2, seg2_data, "seg_000002.log content mismatch");
 
     // Verify engine state was restored
-    let follower_engine = follower_sm.shared_engine();
-    let engine = follower_engine.read();
-    let snap = engine.snapshot();
+    let snap = follower_sm.snapshot();
     assert_eq!(snap.topics.len(), 1);
     assert_eq!(snap.topics[0].meta.name, "events");
     assert_eq!(snap.topics[0].meta.message_count, 2);
@@ -220,7 +218,7 @@ async fn test_snapshot_install_without_sync_client() {
 async fn test_snapshot_install_empty_manifest() {
     let mut engine = make_engine();
     engine.apply_command(
-        MqCommand::create_topic("t", RetentionPolicy::default(), 0),
+        &MqCommand::create_topic("t", RetentionPolicy::default(), 0),
         1,
         1000,
     );
@@ -242,9 +240,7 @@ async fn test_snapshot_install_empty_manifest() {
         .unwrap();
 
     // Engine state should still be restored
-    let follower_engine = follower_sm.shared_engine();
-    let engine = follower_engine.read();
-    let snap = engine.snapshot();
+    let snap = follower_sm.snapshot();
     assert_eq!(snap.topics.len(), 1);
     assert_eq!(snap.topics[0].meta.name, "t");
 }

@@ -185,14 +185,19 @@ impl MqWriteBatcher {
 ///
 /// Returns `(merged_commands, response_slots)` where each slot knows how to
 /// distribute the raft response back to original callers.
-fn merge_pending(pending: &mut Vec<BatchedRequest>) -> (Vec<MqCommand>, Vec<ResponseSlot>) {
+///
+/// `publish_idx` and `enqueue_idx` are caller-owned scratch maps, reused across
+/// flushes to avoid per-flush HashMap allocation.
+fn merge_pending(
+    pending: &mut Vec<BatchedRequest>,
+    publish_idx: &mut HashMap<u64, usize>,
+    enqueue_idx: &mut HashMap<u64, usize>,
+) -> (Vec<MqCommand>, Vec<ResponseSlot>) {
     let mut commands = Vec::with_capacity(pending.len());
     let mut slots = Vec::with_capacity(pending.len());
 
-    // Index: topic_id → position in `commands` vec (for Publish merging).
-    let mut publish_idx: HashMap<u64, usize> = HashMap::new();
-    // Index: queue_id → position in `commands` vec (for Enqueue merging).
-    let mut enqueue_idx: HashMap<u64, usize> = HashMap::new();
+    publish_idx.clear();
+    enqueue_idx.clear();
 
     for req in pending.drain(..) {
         match req.command.tag() {
@@ -303,6 +308,9 @@ async fn batcher_loop(
     m_commands_batched: metrics::Histogram,
 ) {
     let mut pending: Vec<BatchedRequest> = Vec::with_capacity(config.max_batch_count);
+    // Reusable scratch maps for merge_pending — avoids per-flush HashMap allocation.
+    let mut publish_idx: HashMap<u64, usize> = HashMap::new();
+    let mut enqueue_idx: HashMap<u64, usize> = HashMap::new();
 
     loop {
         // Step 1: Block until the first request arrives.
@@ -338,7 +346,7 @@ async fn batcher_loop(
         let flushed_by_count = num_commands >= config.max_batch_count;
 
         // Step 3: Merge same-topic Publishes and same-queue Enqueues.
-        let (commands, slots) = merge_pending(&mut pending);
+        let (commands, slots) = merge_pending(&mut pending, &mut publish_idx, &mut enqueue_idx);
 
         // Step 4: Build command and propose through Raft.
         if commands.len() == 1 {
