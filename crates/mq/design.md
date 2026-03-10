@@ -11,32 +11,32 @@ Like bisque-lance, bisque-mq is a raft state machine engine. Commands are propos
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  bisque-mq Engine                                        │
-│                                                          │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌───────────┐  │
-│  │ Topics  │  │ Queues  │  │ Actors  │  │   Jobs    │  │
-│  │ (log)   │  │ (tasks) │  │ (serial)│  │ (cron)    │  │
-│  └────┬────┘  └────┬────┘  └────┬────┘  └─────┬─────┘  │
-│       │            │            │              │         │
+┌─────────────────────────────────────────────────────────┐
+│  bisque-mq Engine                                       │
+│                                                         │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌───────────┐   │
+│  │ Topics  │  │ Queues  │  │ Actors  │  │   Jobs    │   │
+│  │ (log)   │  │ (tasks) │  │ (serial)│  │ (cron)    │   │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └─────┬─────┘   │
+│       │            │            │              │        │
 │  ┌────▼────────────▼────────────▼──────────────▼─────┐  │
-│  │              MQ State Machine                      │  │
-│  │  (applies raft log entries, updates MDBX manifest) │  │
+│  │              MQ State Machine                     │  │
+│  │  (applies raft log entries, updates MDBX manifest)│  │
 │  └────────────────────┬──────────────────────────────┘  │
-│                       │                                  │
+│                       │                                 │
 │  ┌────────────────────▼──────────────────────────────┐  │
-│  │              MDBX Manifest                         │  │
-│  │  - Entity definitions (topics, queues, actors,     │  │
-│  │    jobs, consumers, producers)                     │  │
-│  │  - Consumer offsets & ack state                    │  │
-│  │  - Segment index (which raft segments hold data    │  │
-│  │    for which entity)                               │  │
-│  │  - Actor assignments & mailbox metadata            │  │
-│  │  - Job schedules, ownership, and execution state   │  │
-│  │  - Deduplication window state                      │  │
+│  │              MDBX Manifest                        │  │
+│  │  - Entity definitions (topics, queues, actors,    │  │
+│  │    jobs, consumers, producers)                    │  │
+│  │  - Consumer offsets & ack state                   │  │
+│  │  - Segment index (which raft segments hold data   │  │
+│  │    for which entity)                              │  │
+│  │  - Actor assignments & mailbox metadata           │  │
+│  │  - Job schedules, ownership, and execution state  │  │
+│  │  - Deduplication window state                     │  │
 │  └───────────────────────────────────────────────────┘  │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
+│                                                         │
+└─────────────────────────────────────────────────────────┘
         │                                     ▲
         │  Raft log segments ARE the          │
         │  durable message store              │
@@ -73,7 +73,7 @@ Kafka-like append-only logs for pub/sub and event streaming.
 - **Append-only**: Messages are never removed or redelivered (log compaction is a future concern).
 - **Multi-consumer**: Each consumer tracks its own offset independently.
 - **Ordered**: Messages within a topic are totally ordered by raft log index.
-- **Partitionless**: A single topic is a single ordered log. Parallelism comes from having multiple topics or multiple raft groups.
+- **Optionally partitioned**: By default, a topic is a single ordered log. Topics created with `partition_count > 1` distribute data across multiple raft groups for parallel writes and consumption (see [Topic Partitioning](#topic-partitioning)).
 
 #### Data Model
 ```
@@ -118,7 +118,7 @@ Reliable task queues with at-least-once delivery, visibility timeouts, retries, 
 #### Semantics
 - **Competing consumers**: Each message is delivered to exactly one consumer at a time.
 - **Visibility timeout**: After delivery, the message is invisible to other consumers for a configurable duration. If not acknowledged within the timeout, it becomes visible again.
-- **Retry limit**: Messages exceeding `max_retries` are moved to a dead-letter queue (DLQ).
+- **Retry limit**: Messages exceeding `max_retries` are published to a dead-letter topic (DLQ). Topic-backed DLQs enable fan-out (alerting, retry services, audit), filtering by routing key, and replay from any offset.
 - **Deduplication**: Optional sliding-window dedup based on a producer-supplied dedup key. Messages with duplicate keys within the window are silently dropped.
 - **Ordering**: Best-effort FIFO. Redeliveries may cause out-of-order processing, but initial delivery follows raft log order.
 - **Priority**: Optional integer priority (0 = highest). Higher priority messages are delivered first among visible messages.
@@ -132,7 +132,7 @@ QueueMeta (MDBX)
 ├── config: QueueConfig
 │   ├── visibility_timeout_ms: u64       (default: 30_000)
 │   ├── max_retries: u32                 (default: 3)
-│   ├── dead_letter_queue_id: Option<u64>
+│   ├── dead_letter_topic_id: Option<u64>
 │   ├── dedup_window_secs: Option<u64>   (e.g., 300 = 5 min)
 │   ├── delay_default_ms: u64            (default: 0)
 │   └── max_in_flight_per_consumer: u32  (default: 100)
@@ -168,13 +168,13 @@ DedupWindow (in-memory, checkpointed to MDBX)
 | `Deliver { queue_id, consumer_id, max_count }` | Assign pending messages to consumer; set visibility deadline |
 | `Ack { queue_id, message_ids }` | Mark messages as completed; remove from index |
 | `Nack { queue_id, message_ids }` | Return messages to pending (immediate retry) |
-| `DeadLetter { queue_id, message_ids }` | Move to DLQ after max retries |
+| `PublishToDlq { source_queue_id, dlq_topic_id, dead_letter_ids, messages }` | Publish to DLQ topic after max retries; clean up source queue |
 | `ExtendVisibility { queue_id, message_ids, extension_ms }` | Extend the visibility timeout for in-flight messages |
 
 #### Visibility Timeout Enforcement
 A leader-driven background task scans in-flight messages whose visibility deadline has passed. For each expired message:
 1. If `attempts < max_retries`: re-enqueue as pending (increment attempts).
-2. If `attempts >= max_retries`: propose `DeadLetter` command.
+2. If `attempts >= max_retries`: mark as `DeadLetter`; return `DeadLettered` response so the caller reads the original bytes from the raft log and proposes `PublishToDlq` to publish them to the configured DLQ topic.
 
 This scan is raft-proposed so all replicas agree on timeout expirations deterministically. The leader batches expired messages into a single `TimeoutExpired { queue_id, message_ids }` command.
 
@@ -548,7 +548,7 @@ Note: Message payloads are NOT included in the snapshot — they live in the raf
 The purge floor determines the oldest raft log entry that cannot be deleted. It is the minimum of:
 
 1. **Topic tail indexes**: Oldest non-purged message across all topics (respecting retention policy).
-2. **Queue message indexes**: Oldest pending/in-flight/DLQ message across all queues.
+2. **Queue message indexes**: Oldest pending/in-flight message across all queues (dead-lettered messages are cleaned up after publishing to the DLQ topic).
 3. **Actor mailbox indexes**: Oldest undelivered message across all active actors.
 4. **Raft's own requirements**: Last applied index minus a configured buffer for slow followers.
 
@@ -600,7 +600,144 @@ cron = "0.13"                        # Cron expression parsing
 
 ---
 
-## Future Considerations (Out of Scope for v1)
+## Topic Partitioning
+
+### Motivation
+
+A single raft group has a single leader for all writes. For workloads with millions of small messages, this becomes the throughput bottleneck. Topic partitioning distributes writes across multiple independent raft groups, each owning a subset of a topic's data.
+
+This also enables Kafka connector parity: Kafka topics are inherently partitioned, and mapping Kafka partitions to bisque-mq partitions gives a natural 1:1 bridge.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Partitioned Topic "events" (partition_count=4)           │
+│                                                           │
+│  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐ │
+│  │ Partition 0│ │ Partition 1│ │ Partition 2│ │ Partition 3│ │
+│  │ group=100 │ │ group=101 │ │ group=102 │ │ group=103 │ │
+│  │ (raft)    │ │ (raft)    │ │ (raft)    │ │ (raft)    │ │
+│  └───────────┘ └───────────┘ └───────────┘ └───────────┘ │
+│        ▲              ▲            ▲             ▲         │
+│        │              │            │             │         │
+│  ┌─────┴──────────────┴────────────┴─────────────┴─────┐  │
+│  │         Partition Router (hash / round-robin)       │  │
+│  └─────────────────────────┬───────────────────────────┘  │
+│                             │                              │
+│  ┌──────────────────────────▼──────────────────────────┐  │
+│  │  Coordinator Group (group_id from catalog)          │  │
+│  │  - TopicMeta with partition_count & partition_map    │  │
+│  │  - Consumer group ↔ partition assignment             │  │
+│  │  - Queues, actors, jobs (non-partitioned entities)  │  │
+│  └─────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+```
+
+#### Two-Tier Group Model
+
+**Coordinator group** (the existing single raft group per catalog):
+- Stores all entity metadata: `TopicMeta`, `QueueMeta`, etc.
+- Stores the **partition map**: topic_id → `Vec<PartitionInfo>` mapping each partition index to its raft group_id
+- Handles `CreateTopic` / `DeleteTopic` — allocates partition groups
+- Handles all non-partitioned entities (queues, actors, jobs, exchanges, consumers, producers)
+- Handles consumer group → partition assignment for partitioned topics
+
+**Partition groups** (one raft group per partition):
+- Stores only message data for that partition (via raft log = message store)
+- Handles `Publish` and `CommitOffset` for its partition
+- Lightweight state machine: only `TopicState` for the single partition it owns
+- Independent leader election — partitions can have different leaders for write parallelism
+
+#### Partition Assignment
+
+Messages are assigned to partitions using the **partition key**:
+
+1. **Explicit key**: Producer provides a `key` in `MessagePayload`. The key is hashed (`crc64(key) % partition_count`) to select a partition. Messages with the same key always go to the same partition (ordering guarantee).
+2. **No key**: Round-robin or random assignment across partitions (max throughput, no ordering).
+3. **Explicit partition**: Producer specifies `partition: Option<u32>` directly (for Kafka connector).
+
+#### Data Model Changes
+
+```
+TopicMeta (MDBX — coordinator group)
+├── topic_id: u64
+├── name: String
+├── ... (existing fields)
+├── partition_count: u32             (0 or 1 = unpartitioned, >1 = partitioned)
+└── partitions: Vec<PartitionInfo>   (empty if unpartitioned)
+
+PartitionInfo
+├── partition_index: u32
+├── group_id: u64                    (raft group owning this partition)
+└── status: PartitionStatus          (Active | Draining | Inactive)
+```
+
+**Unpartitioned topics** (`partition_count <= 1`) work exactly as they do today — all data goes through the coordinator group's raft log. Zero behavioral change, zero overhead for existing topics.
+
+**Partitioned topics** (`partition_count > 1`) have their data spread across partition groups. The coordinator stores only metadata; the partition groups store the actual messages.
+
+#### Operations
+
+| Operation | Where It Runs |
+|-----------|--------------|
+| `CreateTopic { partition_count > 1 }` | Coordinator: allocates N partition groups, stores partition map |
+| `CreateTopic { partition_count <= 1 }` | Coordinator: existing behavior (data in coordinator group) |
+| `Publish { topic_id, messages }` (unpartitioned) | Coordinator group (existing) |
+| `Publish { topic_id, partition, messages }` (partitioned) | Routed to partition group by key/index |
+| `CommitOffset` (partitioned) | Partition group (each partition tracks offsets independently) |
+| `Subscribe` (partitioned) | Consumer gets assigned specific partitions via coordinator |
+| `DeleteTopic` (partitioned) | Coordinator: marks partitions draining, then removes groups |
+
+#### Consumer Group Partition Assignment
+
+When a consumer subscribes to a partitioned topic:
+1. Coordinator assigns partitions to consumers in the group (range or round-robin strategy)
+2. Each consumer receives a `Subscribed` response with its assigned partition indexes
+3. Consumer reads from assigned partition groups directly
+4. On rebalance (consumer join/leave), coordinator reassigns and notifies consumers
+
+```
+PartitionAssignment (in coordinator ConsumerState)
+├── topic_id: u64
+├── consumer_id: u64
+└── assigned_partitions: Vec<u32>    (partition indexes)
+```
+
+### Wire Protocol Changes
+
+The existing `ClientFrame::Subscribe` already has `group_id` and `entity_type`/`name_hash`. For partitioned topics, the handler resolves the partition map and subscribes the consumer to the appropriate partition group(s).
+
+For `ClientFrame::Publish`, the `group_id` identifies the coordinator, but messages for partitioned topics need routing to partition groups. The handler performs this routing transparently — the producer publishes to the topic and the server routes to the correct partition based on the message key.
+
+### Implementation Phases
+
+**Phase 1: Partition metadata** (this PR)
+- Add `partition_count` and `partitions: Vec<PartitionInfo>` to `TopicMeta`
+- Add `PartitionInfo` and `PartitionStatus` types
+- Update `CreateTopic` command to accept `partition_count`
+- Update `MqEngine::apply_command` to store partition metadata
+- Update `MqRouter` trait with `get_partition_batcher(group_id, partition_index)` method
+- No behavioral change for `partition_count <= 1`
+
+**Phase 2: Partition group provisioning**
+- `MqState::ensure_provisioned` creates N partition raft groups for partitioned topics
+- Each partition group has its own `MqWriteBatcher`
+- `BisqueMqRouter` tracks partition group batchers in a `DashMap<(u64, u32), Arc<MqWriteBatcher>>`
+
+**Phase 3: Partition-aware publish and consume**
+- Handler routes `Publish` to correct partition group based on message key
+- Handler assigns partitions to consumers on `Subscribe`
+- Consumer offset tracking per-partition
+
+**Phase 4: Rebalancing**
+- Consumer group rebalance on join/leave
+- Partition draining for topic deletion
+- Dynamic partition count changes (split/merge — future)
+
+---
+
+## Future Considerations (Out of Scope)
 
 - **Topic compaction**: Key-based log compaction (keep only latest value per key).
 - **Transactions**: Atomic publish across multiple topics/queues.
@@ -609,4 +746,5 @@ cron = "0.13"                        # Cron expression parsing
 - **Rate limiting**: Per-producer and per-consumer rate limits.
 - **Message filtering**: Server-side subscription filters (header-based, content-based).
 - **Delayed/scheduled messages**: Queue messages with a future delivery time (partially supported via `delay_default_ms`).
-- **Topic partitioning**: Hash-based partitioning for parallel consumption within a single topic.
+- **Cross-cluster federation**: Multi-cluster topic mirroring and routing.
+- **Dynamic repartitioning**: Changing partition count on a live topic (split/merge).

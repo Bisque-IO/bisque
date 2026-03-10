@@ -15,6 +15,7 @@ use bisque_raft::{SegmentPrefetcher, SegmentSyncClient};
 use crate::MqTypeConfig;
 use crate::engine::MqEngine;
 use crate::manifest::{GroupMeta, MqManifestManager, StructuralWrite};
+use crate::segment_index::SegmentIndexMap;
 use crate::types::{MqCommand, MqResponse, MqSnapshotData};
 
 /// Raft state machine that drives the MQ engine.
@@ -47,6 +48,9 @@ pub struct MqStateMachine {
     sync_addr: Option<String>,
     /// Group directory path for listing segment files in snapshot builder.
     group_dir: Option<std::path::PathBuf>,
+    /// Per-segment index builders — lives outside the engine RwLock for
+    /// lock-free concurrent reads during applies.
+    segment_indexes: Arc<SegmentIndexMap>,
 }
 
 impl MqStateMachine {
@@ -64,6 +68,7 @@ impl MqStateMachine {
             sync_client: None,
             sync_addr: None,
             group_dir: None,
+            segment_indexes: Arc::new(SegmentIndexMap::new()),
         }
     }
 
@@ -106,6 +111,11 @@ impl MqStateMachine {
     /// Get a shared reference to the engine for use by leader tasks.
     pub fn shared_engine(&self) -> Arc<RwLock<MqEngine>> {
         Arc::clone(&self.engine)
+    }
+
+    /// Get a shared reference to the segment index map.
+    pub fn shared_segment_indexes(&self) -> Arc<SegmentIndexMap> {
+        Arc::clone(&self.segment_indexes)
     }
 
     fn update_purge_floor(&self, engine: &mut MqEngine) {
@@ -158,6 +168,8 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
 
                     let mut engine = self.engine.write();
                     engine.restore(snapshot_data);
+                    drop(engine);
+                    self.segment_indexes.clear();
                     info!(
                         group_id = self.group_id,
                         last_applied = ?self.last_applied,
@@ -178,6 +190,8 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
 
                     let mut engine = self.engine.write();
                     engine.restore_structural(structural);
+                    drop(engine);
+                    self.segment_indexes.clear();
 
                     // Return a synthetic last_applied at structural_purge_floor
                     // so openraft replays from there.
@@ -226,11 +240,17 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                 EntryPayload::Normal(cmd) => {
                     let log_index = entry.log_id.index;
 
+                    // Look up the physical record location for segment index tracking
+                    let record_location = self.prefetcher.as_ref().and_then(|p| {
+                        let loc = p.log_location(log_index)?;
+                        Some((loc.segment_id as u32, loc.offset as u32))
+                    });
+
                     // Check if this is a structural command before applying
                     let structural_kind = classify_structural(&cmd);
 
                     let mut engine = self.engine.write();
-                    let response = engine.apply_command(cmd, log_index, current_time);
+                    let response = engine.apply_command(cmd.clone(), log_index, current_time);
 
                     // Fire-and-forget structural writes to MDBX after apply
                     if let Some(ref manifest) = self.manifest {
@@ -249,6 +269,11 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                         }
                     }
                     drop(engine);
+
+                    // Track segment index entries — outside engine lock
+                    if let Some(loc) = record_location {
+                        self.segment_indexes.track_command(&cmd, loc);
+                    }
 
                     response
                 }
@@ -269,6 +294,46 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
             self.update_purge_floor(&mut engine);
         }
         self.update_pin_ceiling();
+
+        // Drain sealed segment indexes and write .sidx files on blocking pool.
+        // The current segment_id is derived from the last applied entry's record location.
+        if let Some(ref group_dir) = self.group_dir {
+            let current_seg_id = self.last_applied.and_then(|la| {
+                self.prefetcher.as_ref().and_then(|p| {
+                    let loc = p.log_location(la.index)?;
+                    Some(loc.segment_id as u32)
+                })
+            });
+
+            let sealed = self.segment_indexes.take_sealed(current_seg_id);
+
+            if !sealed.is_empty() {
+                let dir = group_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    for (seg_id, idx) in sealed {
+                        let path = dir.join(format!("{:020}.sidx", seg_id));
+                        match std::fs::File::create(&path) {
+                            Ok(mut file) => {
+                                if let Err(e) = idx.write_to(&mut file) {
+                                    warn!(
+                                        segment_id = seg_id,
+                                        error = %e,
+                                        "failed to write .sidx file"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    segment_id = seg_id,
+                                    error = %e,
+                                    "failed to create .sidx file"
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        }
 
         Ok(())
     }
@@ -359,6 +424,7 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
             engine.restore(snap);
             self.update_purge_floor(&mut engine);
         }
+        self.segment_indexes.clear();
 
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
@@ -462,26 +528,25 @@ enum StructuralKind {
 }
 
 fn classify_structural(cmd: &MqCommand) -> StructuralKind {
-    match cmd {
-        MqCommand::CreateTopic { .. } => StructuralKind::CreateTopic,
-        MqCommand::DeleteTopic { topic_id } => StructuralKind::DeleteTopic(*topic_id),
-        MqCommand::CreateQueue { .. } => StructuralKind::CreateQueue,
-        MqCommand::DeleteQueue { queue_id } => StructuralKind::DeleteQueue(*queue_id),
-        MqCommand::CreateActorNamespace { .. } => StructuralKind::CreateActorNamespace,
-        MqCommand::DeleteActorNamespace { namespace_id } => {
-            StructuralKind::DeleteActorNamespace(*namespace_id)
+    match cmd.tag() {
+        MqCommand::TAG_CREATE_TOPIC => StructuralKind::CreateTopic,
+        MqCommand::TAG_DELETE_TOPIC => StructuralKind::DeleteTopic(cmd.field_u64(1)),
+        MqCommand::TAG_CREATE_QUEUE => StructuralKind::CreateQueue,
+        MqCommand::TAG_DELETE_QUEUE => StructuralKind::DeleteQueue(cmd.field_u64(1)),
+        MqCommand::TAG_CREATE_ACTOR_NAMESPACE => StructuralKind::CreateActorNamespace,
+        MqCommand::TAG_DELETE_ACTOR_NAMESPACE => {
+            StructuralKind::DeleteActorNamespace(cmd.field_u64(1))
         }
-        MqCommand::CreateJob { .. } => StructuralKind::CreateJob,
-        MqCommand::DeleteJob { job_id } => StructuralKind::DeleteJob(*job_id),
-        MqCommand::Batch(cmds) => {
-            // Quick check: skip Vec allocation if no sub-command is structural.
-            if cmds
-                .iter()
-                .all(|c| matches!(classify_structural(c), StructuralKind::None))
-            {
+        MqCommand::TAG_CREATE_JOB => StructuralKind::CreateJob,
+        MqCommand::TAG_DELETE_JOB => StructuralKind::DeleteJob(cmd.field_u64(1)),
+        MqCommand::TAG_BATCH => {
+            let batch = cmd.as_batch();
+            let kinds: Vec<StructuralKind> =
+                batch.commands().map(|c| classify_structural(&c)).collect();
+            if kinds.iter().all(|k| matches!(k, StructuralKind::None)) {
                 StructuralKind::None
             } else {
-                StructuralKind::Batch(cmds.iter().map(classify_structural).collect())
+                StructuralKind::Batch(kinds)
             }
         }
         _ => StructuralKind::None,

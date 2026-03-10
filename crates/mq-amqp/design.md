@@ -1,164 +1,190 @@
-# bisque-mq-amqp — AMQP 1.0 Protocol Adapter
+# bisque-mq-amqp Design
 
 ## Overview
 
-Implements the AMQP 1.0 protocol (ISO/IEC 19464:2014) as a thin adapter over
-bisque-mq's Raft-replicated topic/queue engine. AMQP 1.0 clients (Apache Qpid,
-Azure Service Bus SDK, RabbitMQ AMQP 1.0 plugin clients, etc.) connect to
-bisque-mq as a standard AMQP 1.0 broker.
-
-## AMQP 1.0 vs 0-9-1
-
-AMQP 1.0 is a fundamentally different protocol from AMQP 0-9-1:
-
-| Aspect | AMQP 0-9-1 | AMQP 1.0 |
-|--------|-----------|----------|
-| Model | Exchange/Queue/Binding | Address-based (no protocol-level exchanges) |
-| Multiplexing | Connection → Channel | Connection → Session → Link |
-| Frame types | Method/Header/Body/Heartbeat | Performatives (open/begin/attach/transfer/etc.) |
-| Type system | Field tables | Rich AMQP type system (composite types) |
-| Flow control | Channel-level QoS | Link-level credit-based flow |
-| Settlement | Ack/Nack per delivery tag | Disposition with delivery states |
-| Wire format | Class/method dispatch | Described types with descriptors |
+AMQP 0-9-1 protocol adapter that translates AMQP frames into bisque-mq
+`MqCommand` / `MqResponse` interactions via the `MqWriteBatcher`. This allows
+any standard AMQP 0-9-1 client (e.g. RabbitMQ client libraries, Pika, amqplib)
+to produce and consume messages through bisque-mq without modification.
 
 ## Architecture
 
 ```
-TCP listener  (port 5672 default)
-  └─ SASL negotiation (optional)
-       └─ AmqpCodec       AMQP 1.0 frame parse / serialize
-            └─ AmqpConnection  connection-level performatives
-                 └─ AmqpSession    session-level performatives + transfer numbering
-                      └─ AmqpLink     per-link state (sender/receiver)
-                           └─ MqWriteBatcher  → Raft → MqEngine
+AMQP Client
+    │
+    ▼
+TCP Listener (AmqpServer)
+    │
+    ▼
+AMQP Frame Codec (tokio codec: AmqpCodec)
+    │  ┌──────────────────────────────┐
+    ▼  │                              │
+AmqpConnection                        │
+    │  ├─ Channel 0: connection ctrl  │
+    │  ├─ Channel 1: AmqpChannel      │
+    │  ├─ Channel 2: AmqpChannel      │
+    │  └─ ...                         │
+    │                                 │
+    ▼                                 │
+MqWriteBatcher ────► Raft ────► MqEngine
 ```
 
-## Protocol Layers
+1. **TCP Listener** — `AmqpServer` binds a socket and accepts connections.
+2. **Frame Codec** — `AmqpCodec` implements a tokio-style `Encoder`/`Decoder`
+   that reads/writes raw AMQP 0-9-1 frames (7-byte header + payload + frame-end
+   marker).
+3. **Connection** — `AmqpConnection` owns the TCP stream, manages the
+   connection handshake, heartbeats, and a map of open channels.
+4. **Channel** — `AmqpChannel` holds per-channel state (consumers, unacked
+   deliveries, QoS prefetch, tx state) and dispatches decoded method frames to
+   the appropriate `MqCommand`.
+5. **MqWriteBatcher** — Each channel submits commands through the shared
+   `MqWriteBatcher`, which coalesces them into Raft proposals.
 
-### 1. Transport (Connection)
-- **open**: Negotiate connection parameters (max-frame-size, channel-max, idle-timeout)
-- **close**: Graceful shutdown with error condition
-- Heartbeat via empty frames (idle-timeout / 2)
+## AMQP → bisque-mq Mapping
 
-### 2. Session
-- **begin**: Create a session (maps to a channel number)
-- **end**: Terminate a session
-- Transfer numbering: `next-outgoing-id`, `incoming-window`, `outgoing-window`
-- Flow control at the session level
+| AMQP Method | bisque-mq Command / Action |
+|---|---|
+| `connection.start` / `tune` / `open` | Protocol handshake + auth; negotiated params stored in `AmqpConnection` |
+| `connection.close` | Tear down all channels, `DisconnectConsumer` for each active consumer |
+| `channel.open` | Create `AmqpChannel` in the connection's channel map |
+| `channel.close` | Destroy channel, clean up consumers/unacked state |
+| `exchange.declare` | `MqCommand::CreateExchange { name, exchange_type }` |
+| `exchange.delete` | `MqCommand::DeleteExchange { exchange_id }` |
+| `queue.declare` | `MqCommand::CreateQueue { name, config }` |
+| `queue.delete` | `MqCommand::DeleteQueue { queue_id }` |
+| `queue.bind` | `MqCommand::CreateBinding { exchange_id, queue_id, routing_key }` |
+| `queue.unbind` | `MqCommand::DeleteBinding { binding_id }` |
+| `queue.purge` | `MqCommand::PurgeQueue { queue_id }` |
+| `basic.publish` | `MqCommand::PublishToExchange { exchange_id, messages }` (when exchange is named) or `MqCommand::Enqueue { queue_id, messages }` (default exchange routes by queue name) |
+| `basic.consume` | `MqCommand::RegisterConsumer { consumer_id, group_name, subscriptions }` |
+| `basic.cancel` | `MqCommand::DisconnectConsumer { consumer_id }` |
+| `basic.deliver` | Pushed from server to client (not a command — we generate these frames) |
+| `basic.ack` | `MqCommand::Ack { queue_id, message_ids }` |
+| `basic.nack` | `MqCommand::Nack { queue_id, message_ids }` with optional requeue |
+| `basic.reject` | `MqCommand::Nack { queue_id, message_ids }` (single message) |
+| `basic.get` | `MqCommand::Deliver { queue_id, consumer_id, max_count: 1 }` |
+| `basic.qos` (prefetch) | Sets `QueueConfig::max_in_flight_per_consumer` for the channel's consumer |
+| `tx.select` | Begin accumulating commands in a batch buffer |
+| `tx.commit` | `MqCommand::Batch(accumulated_commands)` |
+| `tx.rollback` | Discard accumulated batch buffer |
 
-### 3. Link
-- **attach**: Create a sender or receiver link to an address (topic/queue name)
-- **detach**: Remove a link
-- **flow**: Credit-based flow control (receiver grants credits to sender)
-- **transfer**: Send a message over a link
-- **disposition**: Settle deliveries (accepted, rejected, released, modified)
+## Exchange Types
 
-## Address Mapping
+The three exchange types are already implemented in `bisque_mq::exchange`:
 
-AMQP 1.0 uses string addresses to identify message sources and targets:
+- **direct** — routes to queues whose binding key exactly matches the routing key
+- **fanout** — routes to all bound queues regardless of routing key
+- **topic** — routes using AMQP-style wildcard matching (`*` = one word, `#` = zero or more)
 
-| Address Pattern | bisque-mq Entity | Role |
-|----------------|-------------------|------|
-| `topic/{name}` | Topic | Sender publishes, receiver subscribes |
-| `queue/{name}` | Queue | Sender enqueues, receiver dequeues |
-| `exchange/{name}` | Exchange | Sender publishes to exchange |
-| `{name}` | Auto-detect | Resolve by trying topic, then queue |
+## Default Exchanges
 
-## Message Mapping
+Created automatically when a virtual host / namespace is initialized:
 
-| AMQP 1.0 Section | MessagePayload Field | Notes |
-|-------------------|---------------------|-------|
-| properties.message-id | message_id | Assigned on publish (raft log index) |
-| properties.correlation-id | headers["correlation-id"] | Stored in headers |
-| properties.subject | routing_key | For exchange routing |
-| properties.creation-time | timestamp | Milliseconds |
-| header.ttl | ttl_ms | Per-message TTL |
-| application-properties | headers | Key-value pairs |
-| data section | value (Bytes) | Message body |
-| message-annotations.x-key | key | Message key for partitioning |
+| Name | Type | Behaviour |
+|---|---|---|
+| `""` (empty string) | direct | Routes to the queue whose name equals the routing key |
+| `amq.direct` | direct | Standard direct exchange |
+| `amq.fanout` | fanout | Standard fanout exchange |
+| `amq.topic` | topic | Standard topic exchange |
 
-## Link → bisque-mq Mapping
+## Message Properties
 
-### Sender Links (client sends to bisque-mq)
-- **attach(role=sender, target=topic/X)** → Resolve topic ID, register producer
-- **transfer** → `MqCommand::Publish { topic_id, messages }`
-- **transfer(target=queue/X)** → `MqCommand::Enqueue { queue_id, messages }`
+AMQP `basic-properties` are mapped to/from `MessagePayload`:
 
-### Receiver Links (client receives from bisque-mq)
-- **attach(role=receiver, source=queue/X)** → Register consumer, subscribe to queue
-- **flow(link-credit=N)** → `MqCommand::Deliver { queue_id, consumer_id, max_count: N }`
-- **disposition(accepted)** → `MqCommand::Ack { queue_id, message_ids }`
-- **disposition(rejected)** → `MqCommand::Nack { queue_id, message_ids }`
-- **disposition(released)** → `MqCommand::Nack` (redeliver)
+| AMQP Property | bisque-mq Field |
+|---|---|
+| `content-type` | `headers[("content-type", ...)]` |
+| `content-encoding` | `headers[("content-encoding", ...)]` |
+| `delivery-mode` | `headers[("x-delivery-mode", ...)]` (1 = transient, 2 = persistent) |
+| `priority` | `headers[("x-priority", ...)]` |
+| `correlation-id` | `headers[("correlation-id", ...)]` |
+| `reply-to` | `headers[("reply-to", ...)]` |
+| `expiration` | `ttl_ms` (parsed from string milliseconds) |
+| `message-id` | `headers[("message-id", ...)]` |
+| `timestamp` | `timestamp` |
+| `type` | `headers[("type", ...)]` |
+| `user-id` | `headers[("user-id", ...)]` |
+| `app-id` | `headers[("app-id", ...)]` |
+| `headers` (field table) | Remaining entries merged into `headers` |
 
-### Receiver Links on Topics
-- **attach(role=receiver, source=topic/X)** → Register consumer with topic subscription
-- Messages delivered as they arrive (push model with credit)
-- **disposition(accepted)** → `MqCommand::CommitOffset { topic_id, consumer_id, offset }`
+## Consumer Lifecycle
 
-## Settlement Modes
+1. Client sends `basic.consume` with queue name and consumer tag.
+2. Adapter calls `MqCommand::RegisterConsumer` and records the subscription.
+3. Engine pushes delivered messages; adapter wraps each in a `basic.deliver`
+   frame and sends it on the channel.
+4. Client sends `basic.ack` / `basic.nack` / `basic.reject`.
+5. Adapter translates to `MqCommand::Ack` or `MqCommand::Nack`.
+6. On `basic.cancel` or channel close, adapter sends
+   `MqCommand::DisconnectConsumer`.
 
-| AMQP Mode | Constant | bisque-mq Behavior |
-|-----------|----------|-------------------|
-| settled (snd-settle-mode=settled) | Pre-settled / fire-and-forget | Publish without ack |
-| unsettled (snd-settle-mode=unsettled) | At-least-once | Track delivery, wait for disposition |
-| mixed | Per-transfer choice | Check settled flag on each transfer |
+## Channel Multiplexing
 
-## Flow Control
+AMQP allows multiple logical channels over a single TCP connection. Each
+channel has its own:
 
-AMQP 1.0 uses **credit-based flow control** at the link level:
+- Consumer set (consumer_tag → consumer_id mapping)
+- Unacked delivery tracking (delivery_tag → (queue_id, message_id))
+- QoS prefetch settings
+- Transaction buffer (if tx.select has been issued)
 
-1. Receiver attaches with `link-credit = 0` (no messages yet)
-2. Receiver sends `flow` with `link-credit = N` (grant N message credits)
-3. Sender sends up to N transfers, decrementing credit
-4. When credit exhausted, sender stops until more flow frames arrive
+Channel 0 is reserved for connection-level control frames.
 
-This maps naturally to `MqCommand::Deliver { max_count: link_credit }`.
+## Open Questions / Things to Figure Out
 
-## SASL Authentication
+- **AMQP frame max size negotiation**: During `connection.tune` we propose a
+  frame-max. Need to decide the default (RabbitMQ uses 131072). Must enforce
+  this when encoding content body frames — split large bodies into multiple
+  frames at the negotiated boundary.
 
-AMQP 1.0 defines SASL as a separate protocol layer before AMQP transport:
+- **Heartbeat negotiation**: AMQP defines its own heartbeat mechanism in
+  `connection.tune`. bisque-mq already has `MqCommand::Heartbeat`. Decide
+  whether to use AMQP heartbeats at the TCP layer (to detect dead connections)
+  and separately issue bisque `Heartbeat` commands for the engine's consumer
+  liveness tracking.
 
-1. Client connects, sends AMQP header with protocol-id=3 (SASL)
-2. Server sends `sasl-mechanisms` (PLAIN, ANONYMOUS)
-3. Client sends `sasl-init` with chosen mechanism + credentials
-4. Server sends `sasl-outcome` (ok/auth-error)
-5. Client sends AMQP header with protocol-id=0 (AMQP transport)
-6. Normal AMQP 1.0 connection proceeds
+- **Whether to support AMQP transactions (`tx.select`) or just batches**:
+  AMQP transactions guarantee atomicity of publishes + acks within a commit.
+  We can map `tx.commit` to `MqCommand::Batch`, but true rollback semantics
+  for acks are not currently supported in bisque-mq. We may want to only
+  support publisher confirms as an alternative.
 
-## Wire Format
+- **Virtual host mapping to bisque namespaces/groups**: AMQP `connection.open`
+  includes a virtual-host field (`/` by default). Decide whether to map each
+  vhost to a separate bisque-mq Raft group, a namespace prefix, or ignore it
+  initially.
 
-### Frame Structure
-```
-[4 bytes: size]  [1 byte: doff]  [1 byte: type]  [2 bytes: channel]  [payload]
-```
-- **size**: Total frame size including header (minimum 8)
-- **doff**: Data offset in 4-byte words (minimum 2 = 8 bytes header)
-- **type**: 0 = AMQP frame, 1 = SASL frame
-- **channel**: Session channel number (0 for connection-level)
+- **Header exchange and consistent-hash exchange support**: These are RabbitMQ
+  extensions not part of core AMQP 0-9-1. Defer or add new `ExchangeType`
+  variants.
 
-### AMQP Type System Encoding
-- **Primitive types**: null, boolean, ubyte, ushort, uint, ulong, byte, short, int,
-  long, float, double, timestamp, uuid, binary, string, symbol
-- **Described types**: descriptor + value (used for all performatives)
-- **Composite types**: list with described type descriptor
-- **Encoding**: Single-byte format codes, variable-length with size prefixes
+- **Dead letter exchange integration**: AMQP supports `x-dead-letter-exchange`
+  and `x-dead-letter-routing-key` as queue arguments. bisque-mq has
+  `dead_letter_queue_id` in `QueueConfig`. Need to bridge: on DLQ, resolve the
+  DLX exchange name to an exchange_id and route through it.
 
-## Open Questions
+- **Message TTL per-queue vs per-message**: AMQP supports both `x-message-ttl`
+  (queue argument, applies to all messages) and per-message `expiration`
+  property. bisque-mq has `MessagePayload::ttl_ms` for per-message. Need to
+  implement queue-level TTL as well.
 
-1. **Dynamic link addresses**: Should `attach` with no target/source address
-   auto-create temporary queues?
-2. **Durable subscriptions**: How to map AMQP 1.0 durable terminus to
-   bisque-mq consumer persistence?
-3. **Message annotations vs application-properties**: Which AMQP section
-   carries bisque-mq headers?
-4. **Multi-transfer messages**: Large messages split across multiple transfer
-   frames — need frame assembly.
-5. **Transaction coordinator**: AMQP 1.0 defines a transactional model with
-   coordinator/controller links. Phase 2.
-6. **Distribution modes**: `move` (competing consumers) vs `copy` (pub-sub)
-   on source. Maps to queue vs topic.
-7. **Filters on source**: AMQP 1.0 supports filter sets on receiver link
-   source. Not implemented initially.
-8. **Connection idle-timeout**: Send heartbeat frames to keep connection alive.
-9. **SASL EXTERNAL**: Certificate-based auth integration with bisque-meta.
+- **Queue mirroring / HA policy**: In RabbitMQ, `x-ha-policy` controls
+  mirroring. In bisque-mq, all queues are already replicated via Raft, so
+  this argument can be accepted and ignored (or used to control Raft group
+  placement).
+
+- **Exclusive / auto-delete queue semantics**: `exclusive` queues are visible
+  only to the declaring connection and deleted when it closes. `auto-delete`
+  queues are deleted when the last consumer disconnects. These require
+  connection/channel lifecycle hooks.
+
+- **Authentication**: AMQP uses SASL mechanisms in `connection.start-ok`.
+  Support PLAIN (username/password) initially, mapped to bisque auth tokens.
+  EXTERNAL (TLS client certs) can come later.
+
+- **Publisher confirms vs AMQP transactions**: Publisher confirms
+  (`confirm.select`) are a RabbitMQ extension that provides per-message
+  acknowledgement from the broker. Simpler and more performant than
+  `tx.select/commit`. Since `MqWriteBatcher::submit` already returns a
+  response per command, publisher confirms are a natural fit.

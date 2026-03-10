@@ -934,17 +934,13 @@ mod tests {
     use super::*;
     use crate::config::MqConfig;
     use crate::engine::MqEngine;
-    use crate::types::{MessagePayload, MqCommand, RetentionPolicy};
+    use crate::flat::FlatMessageBuilder;
+    use crate::types::{MqCommand, RetentionPolicy};
 
-    fn make_msg(value: &[u8]) -> MessagePayload {
-        MessagePayload {
-            key: None,
-            value: bytes::Bytes::from(value.to_vec()),
-            headers: Vec::new(),
-            timestamp: 1000,
-            ttl_ms: None,
-            routing_key: None,
-        }
+    fn make_msg(value: &[u8]) -> bytes::Bytes {
+        FlatMessageBuilder::new(bytes::Bytes::from(value.to_vec()))
+            .timestamp(1000)
+            .build()
     }
 
     #[test]
@@ -971,10 +967,7 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::CreateTopic {
-                name: "t1".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"t1".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1004,10 +997,7 @@ mod tests {
         };
         let mut engine1 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine1.apply_command(
-            MqCommand::CreateTopic {
-                name: "old_topic".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"old_topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1022,18 +1012,12 @@ mod tests {
         };
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine2.apply_command(
-            MqCommand::CreateTopic {
-                name: "new_topic".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"new_topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
         engine2.apply_command(
-            MqCommand::CreateQueue {
-                name: "q1".to_string(),
-                config: crate::config::QueueConfig::default(),
-            },
+            MqCommand::create_queue(&"q1".to_string(), &crate::config::QueueConfig::default()),
             2,
             1001,
         );
@@ -1106,21 +1090,11 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::CreateTopic {
-                name: "events".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
-        engine.apply_command(
-            MqCommand::Publish {
-                topic_id: 1,
-                messages: vec![make_msg(b"hello")],
-            },
-            2,
-            1001,
-        );
+        engine.apply_command(MqCommand::publish(1, &vec![make_msg(b"hello")]), 2, 1001);
 
         let snap = engine.snapshot();
 
@@ -1191,84 +1165,72 @@ mod tests {
 
         // Topic
         engine.apply_command(
-            MqCommand::CreateTopic {
-                name: "events".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
         engine.apply_command(
-            MqCommand::Publish {
-                topic_id: 1,
-                messages: vec![make_msg(b"m1"), make_msg(b"m2")],
-            },
+            MqCommand::publish(1, &vec![make_msg(b"m1"), make_msg(b"m2")]),
             2,
             1001,
         );
 
         // Queue with messages
         engine.apply_command(
-            MqCommand::CreateQueue {
-                name: "tasks".to_string(),
-                config: crate::config::QueueConfig::default(),
-            },
+            MqCommand::create_queue(&"tasks".to_string(), &crate::config::QueueConfig::default()),
             3,
             1002,
         );
         engine.apply_command(
-            MqCommand::Enqueue {
-                queue_id: 2,
-                messages: vec![make_msg(b"q1"), make_msg(b"q2"), make_msg(b"q3")],
-                dedup_keys: vec![None, None, None],
-            },
+            MqCommand::enqueue(
+                2,
+                &vec![make_msg(b"q1"), make_msg(b"q2"), make_msg(b"q3")],
+                &vec![None, None, None],
+            ),
             4,
             1003,
         );
 
         // Actor namespace
         engine.apply_command(
-            MqCommand::CreateActorNamespace {
-                name: "actors".to_string(),
-                config: crate::config::ActorConfig::default(),
-            },
+            MqCommand::create_actor_namespace(
+                &"actors".to_string(),
+                &crate::config::ActorConfig::default(),
+            ),
             5,
             1004,
         );
 
         // Job
         engine.apply_command(
-            MqCommand::CreateJob {
-                name: "cron-job".to_string(),
-                config: crate::config::JobConfig {
+            MqCommand::create_job(
+                &"cron-job".to_string(),
+                &crate::config::JobConfig {
                     cron_expression: "0 * * * *".to_string(),
                     ..Default::default()
                 },
-            },
+            ),
             6,
             1005,
         );
 
         // Consumer
         engine.apply_command(
-            MqCommand::RegisterConsumer {
-                consumer_id: 100,
-                group_name: "group-1".to_string(),
-                subscriptions: vec![crate::types::Subscription {
+            MqCommand::register_consumer(
+                100,
+                &"group-1".to_string(),
+                &vec![crate::types::Subscription {
                     entity_type: crate::types::EntityType::Topic,
                     entity_id: 1,
                 }],
-            },
+            ),
             7,
             1006,
         );
 
         // Producer
         engine.apply_command(
-            MqCommand::RegisterProducer {
-                producer_id: 200,
-                name: Some("my-producer".to_string()),
-            },
+            MqCommand::register_producer(200, Some(&"my-producer".to_string())),
             8,
             1007,
         );
@@ -1321,33 +1283,33 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::CreateQueue {
-                name: "dedup-q".to_string(),
-                config: crate::config::QueueConfig {
+            MqCommand::create_queue(
+                &"dedup-q".to_string(),
+                &crate::config::QueueConfig {
                     dedup_window_secs: Some(60),
                     ..Default::default()
                 },
-            },
+            ),
             1,
             1000,
         );
         // Enqueue with dedup key
         engine.apply_command(
-            MqCommand::Enqueue {
-                queue_id: 1,
-                messages: vec![make_msg(b"d1")],
-                dedup_keys: vec![Some(bytes::Bytes::from_static(b"key-1"))],
-            },
+            MqCommand::enqueue(
+                1,
+                &vec![make_msg(b"d1")],
+                &vec![Some(bytes::Bytes::from_static(b"key-1"))],
+            ),
             2,
             1001,
         );
         // Second enqueue with same key (should be deduped)
         engine.apply_command(
-            MqCommand::Enqueue {
-                queue_id: 1,
-                messages: vec![make_msg(b"d1-dup")],
-                dedup_keys: vec![Some(bytes::Bytes::from_static(b"key-1"))],
-            },
+            MqCommand::enqueue(
+                1,
+                &vec![make_msg(b"d1-dup")],
+                &vec![Some(bytes::Bytes::from_static(b"key-1"))],
+            ),
             3,
             1002,
         );
@@ -1382,10 +1344,11 @@ mod tests {
         // Write structural data first
         let mut tmp_engine = MqEngine::new(MqConfig::new("/tmp/test"));
         tmp_engine.apply_command(
-            MqCommand::CreateTopic {
-                name: "structural-topic".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(
+                &"structural-topic".to_string(),
+                RetentionPolicy::default(),
+                0,
+            ),
             1,
             1000,
         );
@@ -1400,10 +1363,10 @@ mod tests {
         // Install snapshot — should clear the entities table
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::CreateQueue {
-                name: "snap-queue".to_string(),
-                config: crate::config::QueueConfig::default(),
-            },
+            MqCommand::create_queue(
+                &"snap-queue".to_string(),
+                &crate::config::QueueConfig::default(),
+            ),
             1,
             1000,
         );
@@ -1431,10 +1394,7 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::CreateTopic {
-                name: "snap-topic".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"snap-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1444,10 +1404,10 @@ mod tests {
         // Now apply structural writes (simulates post-snapshot operation)
         let mut tmp_engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         tmp_engine2.apply_command(
-            MqCommand::CreateQueue {
-                name: "new-queue".to_string(),
-                config: crate::config::QueueConfig::default(),
-            },
+            MqCommand::create_queue(
+                &"new-queue".to_string(),
+                &crate::config::QueueConfig::default(),
+            ),
             1,
             1000,
         );
@@ -1490,10 +1450,7 @@ mod tests {
         // Create 5 entities to advance next_id
         for i in 0..5 {
             engine.apply_command(
-                MqCommand::CreateTopic {
-                    name: format!("t{}", i),
-                    retention: RetentionPolicy::default(),
-                },
+                MqCommand::create_topic(&format!("t{}", i), RetentionPolicy::default(), 0),
                 i + 1,
                 1000,
             );
@@ -1521,10 +1478,7 @@ mod tests {
 
         let mut engine1 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine1.apply_command(
-            MqCommand::CreateTopic {
-                name: "group1-topic".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"group1-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1534,10 +1488,10 @@ mod tests {
 
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine2.apply_command(
-            MqCommand::CreateQueue {
-                name: "group2-queue".to_string(),
-                config: crate::config::QueueConfig::default(),
-            },
+            MqCommand::create_queue(
+                &"group2-queue".to_string(),
+                &crate::config::QueueConfig::default(),
+            ),
             1,
             1000,
         );
@@ -1568,20 +1522,17 @@ mod tests {
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         for i in 0..50 {
             engine.apply_command(
-                MqCommand::CreateTopic {
-                    name: format!("topic-{}", i),
-                    retention: RetentionPolicy::default(),
-                },
+                MqCommand::create_topic(&format!("topic-{}", i), RetentionPolicy::default(), 0),
                 i + 1,
                 1000,
             );
         }
         for i in 0..30 {
             engine.apply_command(
-                MqCommand::CreateQueue {
-                    name: format!("queue-{}", i),
-                    config: crate::config::QueueConfig::default(),
-                },
+                MqCommand::create_queue(
+                    &format!("queue-{}", i),
+                    &crate::config::QueueConfig::default(),
+                ),
                 51 + i,
                 1000,
             );
@@ -1605,10 +1556,7 @@ mod tests {
         let mut engine1 = MqEngine::new(MqConfig::new("/tmp/test"));
         for i in 0..3 {
             engine1.apply_command(
-                MqCommand::CreateTopic {
-                    name: format!("old-{}", i),
-                    retention: RetentionPolicy::default(),
-                },
+                MqCommand::create_topic(&format!("old-{}", i), RetentionPolicy::default(), 0),
                 i + 1,
                 1000,
             );
@@ -1621,10 +1569,10 @@ mod tests {
         // Second snapshot: 1 queue (no topics)
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine2.apply_command(
-            MqCommand::CreateQueue {
-                name: "replacement-q".to_string(),
-                config: crate::config::QueueConfig::default(),
-            },
+            MqCommand::create_queue(
+                &"replacement-q".to_string(),
+                &crate::config::QueueConfig::default(),
+            ),
             1,
             1000,
         );
@@ -1645,43 +1593,29 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::CreateTopic {
-                name: "t".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
         engine.apply_command(
-            MqCommand::Publish {
-                topic_id: 1,
-                messages: vec![make_msg(b"a"), make_msg(b"b"), make_msg(b"c")],
-            },
+            MqCommand::publish(1, &vec![make_msg(b"a"), make_msg(b"b"), make_msg(b"c")]),
             2,
             1001,
         );
         // Register a consumer and commit an offset
         engine.apply_command(
-            MqCommand::RegisterConsumer {
-                consumer_id: 42,
-                group_name: "g1".to_string(),
-                subscriptions: vec![crate::types::Subscription {
+            MqCommand::register_consumer(
+                42,
+                &"g1".to_string(),
+                &vec![crate::types::Subscription {
                     entity_type: crate::types::EntityType::Topic,
                     entity_id: 1,
                 }],
-            },
+            ),
             3,
             1002,
         );
-        engine.apply_command(
-            MqCommand::CommitOffset {
-                consumer_id: 42,
-                topic_id: 1,
-                offset: 2,
-            },
-            4,
-            1003,
-        );
+        engine.apply_command(MqCommand::commit_offset(1, 42, 2), 4, 1003);
 
         let snap = engine.snapshot();
         assert!(!snap.topics[0].consumer_offsets.is_empty());
@@ -1702,35 +1636,18 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::CreateTopic {
-                name: "t".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
+        engine.apply_command(MqCommand::publish(1, &vec![make_msg(b"a")]), 2, 1001);
         engine.apply_command(
-            MqCommand::Publish {
-                topic_id: 1,
-                messages: vec![make_msg(b"a")],
-            },
-            2,
-            1001,
-        );
-        engine.apply_command(
-            MqCommand::CreateQueue {
-                name: "q".to_string(),
-                config: crate::config::QueueConfig::default(),
-            },
+            MqCommand::create_queue(&"q".to_string(), &crate::config::QueueConfig::default()),
             3,
             1002,
         );
         engine.apply_command(
-            MqCommand::Enqueue {
-                queue_id: 2,
-                messages: vec![make_msg(b"b")],
-                dedup_keys: vec![None],
-            },
+            MqCommand::enqueue(2, &vec![make_msg(b"b")], &vec![None]),
             4,
             1003,
         );
@@ -1779,10 +1696,7 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::CreateTopic {
-                name: "t".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1821,10 +1735,11 @@ mod tests {
         for gid in 1..=5u64 {
             let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
             engine.apply_command(
-                MqCommand::CreateTopic {
-                    name: format!("group-{}-topic", gid),
-                    retention: RetentionPolicy::default(),
-                },
+                MqCommand::create_topic(
+                    &format!("group-{}-topic", gid),
+                    RetentionPolicy::default(),
+                    0,
+                ),
                 1,
                 1000,
             );
@@ -1854,10 +1769,7 @@ mod tests {
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            MqCommand::CreateTopic {
-                name: "t".to_string(),
-                retention: RetentionPolicy::default(),
-            },
+            MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );

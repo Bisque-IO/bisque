@@ -58,7 +58,7 @@ pub struct QueueConfig {
     #[serde(default = "default_queue_max_retries")]
     pub max_retries: u32,
     #[serde(default)]
-    pub dead_letter_queue_id: Option<u64>,
+    pub dead_letter_topic_id: Option<u64>,
     #[serde(default)]
     pub dedup_window_secs: Option<u64>,
     #[serde(default)]
@@ -82,7 +82,7 @@ impl Default for QueueConfig {
         Self {
             visibility_timeout_ms: default_visibility_timeout_ms(),
             max_retries: default_queue_max_retries(),
-            dead_letter_queue_id: None,
+            dead_letter_topic_id: None,
             dedup_window_secs: None,
             delay_default_ms: 0,
             max_in_flight_per_consumer: default_max_in_flight(),
@@ -178,7 +178,7 @@ mod tests {
         let config = QueueConfig::default();
         assert_eq!(config.visibility_timeout_ms, 30_000);
         assert_eq!(config.max_retries, 3);
-        assert!(config.dead_letter_queue_id.is_none());
+        assert!(config.dead_letter_topic_id.is_none());
         assert!(config.dedup_window_secs.is_none());
         assert_eq!(config.delay_default_ms, 0);
         assert_eq!(config.max_in_flight_per_consumer, 100);
@@ -219,7 +219,7 @@ mod tests {
         let config = QueueConfig {
             visibility_timeout_ms: 60_000,
             max_retries: 5,
-            dead_letter_queue_id: Some(42),
+            dead_letter_topic_id: Some(42),
             dedup_window_secs: Some(120),
             delay_default_ms: 1000,
             max_in_flight_per_consumer: 50,
@@ -227,7 +227,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let decoded: QueueConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.visibility_timeout_ms, 60_000);
-        assert_eq!(decoded.dead_letter_queue_id, Some(42));
+        assert_eq!(decoded.dead_letter_topic_id, Some(42));
         assert_eq!(decoded.dedup_window_secs, Some(120));
     }
 
@@ -238,7 +238,7 @@ mod tests {
         let config: QueueConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.visibility_timeout_ms, 30_000);
         assert_eq!(config.max_retries, 3);
-        assert!(config.dead_letter_queue_id.is_none());
+        assert!(config.dead_letter_topic_id.is_none());
     }
 
     #[test]

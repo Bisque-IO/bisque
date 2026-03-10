@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use bytes::Bytes;
+
 use crate::scheduler::DeliveryScheduler;
 use crate::subscription::SubscriptionState;
 
@@ -11,7 +13,7 @@ pub struct ConsumerSession {
     /// Durable consumer identity (persisted in raft state machine).
     pub consumer_id: u64,
     /// Session token returned from handshake (for reconnection).
-    pub session_token: Vec<u8>,
+    pub session_token: Bytes,
 
     /// Active subscriptions keyed by client-assigned sub_id.
     subscriptions: HashMap<u32, SubscriptionState>,
@@ -31,7 +33,7 @@ pub struct ConsumerSession {
 }
 
 impl ConsumerSession {
-    pub fn new(consumer_id: u64, session_token: Vec<u8>) -> Self {
+    pub fn new(consumer_id: u64, session_token: Bytes) -> Self {
         let labels = [("consumer", consumer_id.to_string())];
         Self {
             consumer_id,
@@ -183,7 +185,7 @@ mod tests {
     use crate::subscription::{ENTITY_TYPE_QUEUE, ENTITY_TYPE_TOPIC};
 
     fn make_session() -> ConsumerSession {
-        ConsumerSession::new(42, b"token".to_vec())
+        ConsumerSession::new(42, Bytes::from_static(b"token"))
     }
 
     fn topic_sub(sub_id: u32) -> SubscriptionState {
@@ -200,7 +202,7 @@ mod tests {
     fn test_new_session() {
         let session = make_session();
         assert_eq!(session.consumer_id, 42);
-        assert_eq!(session.session_token, b"token");
+        assert_eq!(session.session_token, &b"token"[..]);
         assert_eq!(session.subscription_count(), 0);
         assert_eq!(session.byte_budget, u64::MAX);
         assert_eq!(session.total_in_flight_bytes, 0);

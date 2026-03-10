@@ -211,7 +211,7 @@ async fn test_subscribe_and_receive_messages() {
     for i in 0..3u64 {
         send_server(
             &mut server,
-            &ServerFrame::Message(Box::new(ServerMessage {
+            &ServerFrame::Message(ServerMessage {
                 sub_id: 1,
                 message_id: 100 + i,
                 timestamp: 1_700_000_000 + i,
@@ -221,7 +221,7 @@ async fn test_subscribe_and_receive_messages() {
                     Bytes::from_static(b"idx"),
                     Bytes::from(i.to_le_bytes().to_vec()),
                 )],
-            })),
+            }),
         )
         .await;
     }
@@ -368,38 +368,38 @@ async fn test_multiple_subscriptions_interleaved() {
     // Server interleaves messages from both subscriptions
     send_server(
         &mut server,
-        &ServerFrame::Message(Box::new(ServerMessage {
+        &ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 1000,
             timestamp: 1,
             key: None,
             value: Bytes::from_static(b"topic-msg-1"),
             headers: vec![],
-        })),
+        }),
     )
     .await;
     send_server(
         &mut server,
-        &ServerFrame::Message(Box::new(ServerMessage {
+        &ServerFrame::Message(ServerMessage {
             sub_id: 2,
             message_id: 2000,
             timestamp: 2,
             key: None,
             value: Bytes::from_static(b"queue-msg-1"),
             headers: vec![],
-        })),
+        }),
     )
     .await;
     send_server(
         &mut server,
-        &ServerFrame::Message(Box::new(ServerMessage {
+        &ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 1001,
             timestamp: 3,
             key: None,
             value: Bytes::from_static(b"topic-msg-2"),
             headers: vec![],
-        })),
+        }),
     )
     .await;
 
@@ -852,7 +852,7 @@ async fn test_full_session_lifecycle() {
         let sub_id = (i % 3) as u32 + 1;
         send_server(
             &mut server,
-            &ServerFrame::Message(Box::new(ServerMessage {
+            &ServerFrame::Message(ServerMessage {
                 sub_id,
                 message_id: 1000 + i,
                 timestamp: 1_700_000_000 + i,
@@ -863,7 +863,7 @@ async fn test_full_session_lifecycle() {
                 },
                 value: Bytes::from(format!("msg-{}", i)),
                 headers: vec![],
-            })),
+            }),
         )
         .await;
     }
@@ -984,14 +984,14 @@ async fn test_high_throughput_message_stream() {
     // Server sends 1000 messages
     let write_task = tokio::spawn(async move {
         for i in 0..msg_count {
-            let frame = ServerFrame::Message(Box::new(ServerMessage {
+            let frame = ServerFrame::Message(ServerMessage {
                 sub_id: 1,
                 message_id: i,
                 timestamp: i,
                 key: None,
                 value: Bytes::from(vec![0xAA; 100]),
                 headers: vec![],
-            }));
+            });
             let data = encode_server_frame(&frame).unwrap();
             write_tcp_frame(&mut server, &data).await.unwrap();
         }
@@ -1076,14 +1076,14 @@ async fn test_concurrent_bidirectional_traffic() {
     // Server writer: sends messages
     let server_tx = tokio::spawn(async move {
         for i in 0..msg_count {
-            let frame = ServerFrame::Message(Box::new(ServerMessage {
+            let frame = ServerFrame::Message(ServerMessage {
                 sub_id: (i % 3) as u32 + 1,
                 message_id: i,
                 timestamp: i,
                 key: None,
                 value: Bytes::from(vec![0xBB; 50]),
                 headers: vec![],
-            }));
+            });
             let data = encode_server_frame(&frame).unwrap();
             write_tcp_frame(&mut server_write, &data).await.unwrap();
         }
@@ -1169,7 +1169,7 @@ async fn test_large_message_over_tcp() {
 
     // 1MB value
     let large_value = Bytes::from(vec![0xEE; 1_000_000]);
-    let frame = ServerFrame::Message(Box::new(ServerMessage {
+    let frame = ServerFrame::Message(ServerMessage {
         sub_id: 1,
         message_id: 42,
         timestamp: 999,
@@ -1179,7 +1179,7 @@ async fn test_large_message_over_tcp() {
             Bytes::from_static(b"big-header"),
             Bytes::from(vec![0xCC; 10_000]),
         )],
-    }));
+    });
 
     send_server(&mut server, &frame).await;
     let decoded = recv_server(&mut client, &mut buf).await;

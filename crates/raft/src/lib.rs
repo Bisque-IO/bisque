@@ -9,6 +9,7 @@ pub(crate) mod manifest_mdbx;
 pub mod network;
 pub mod record_format;
 pub mod rpc_server;
+pub mod segment_archive;
 pub mod segment_sync;
 pub mod storage;
 pub mod storage_mmap;
@@ -28,6 +29,7 @@ pub use rpc_server::{
     BisqueRpcServer, BisqueRpcServerConfig,
     protocol::{ResponseMessage, RpcMessage},
 };
+pub use segment_archive::{ArchiveManager, InMemoryArchive, S3ArchiveConfig, SegmentArchive};
 pub use segment_sync::{
     SegmentSyncClient, SegmentSyncClientConfig, SegmentSyncServer, SegmentSyncServerConfig,
     SnapshotFileEntry, SyncResult, list_segment_files,

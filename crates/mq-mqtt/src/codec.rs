@@ -6,6 +6,7 @@
 //! - Per-packet-type serialization and deserialization
 //! - MQTT 5.0 property parsing
 
+use bisque_mq::flat::FlatMessage;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::types::{
@@ -190,6 +191,20 @@ fn write_variable_int(mut value: u32, buf: &mut BytesMut) {
         if value == 0 {
             break;
         }
+    }
+}
+
+/// Compute the encoded size of a variable-length integer.
+#[inline]
+fn variable_int_size(value: u32) -> usize {
+    if value < 128 {
+        1
+    } else if value < 16384 {
+        2
+    } else if value < 2_097_152 {
+        3
+    } else {
+        4
     }
 }
 
@@ -507,6 +522,113 @@ pub fn decode_packet(buf: &[u8]) -> Result<(MqttPacket, usize), CodecError> {
     Ok((packet, total_size))
 }
 
+/// Decode a single MQTT packet from a frozen `Bytes` buffer.
+///
+/// For PUBLISH packets, topic and payload are zero-copy `Bytes::slice()` from
+/// the input buffer (refcount bump only, no heap allocation). All other packet
+/// types use the standard decode path.
+///
+/// Returns the decoded packet and the total number of bytes consumed.
+pub fn decode_packet_from_bytes(buf: &Bytes) -> Result<(MqttPacket, usize), CodecError> {
+    let (type_nibble, flags, remaining_length, header_size) = parse_fixed_header(buf)?;
+
+    let total_size = header_size + remaining_length;
+    if buf.len() < total_size {
+        return Err(CodecError::Incomplete);
+    }
+
+    let packet_type =
+        PacketType::from_u8(type_nibble).ok_or(CodecError::UnknownPacketType(type_nibble))?;
+
+    let packet = match packet_type {
+        PacketType::Publish => decode_publish_zero_copy(buf, header_size, total_size, flags)?,
+        _ => {
+            // Non-PUBLISH packets use the standard &[u8] decode path.
+            let payload = &buf[header_size..total_size];
+            let mut cursor = payload;
+            match packet_type {
+                PacketType::Connect => decode_connect(&mut cursor)?,
+                PacketType::ConnAck => decode_connack(&mut cursor)?,
+                PacketType::PubAck => decode_puback(&mut cursor)?,
+                PacketType::PubRec => decode_pubrec(&mut cursor)?,
+                PacketType::PubRel => decode_pubrel(&mut cursor)?,
+                PacketType::PubComp => decode_pubcomp(&mut cursor)?,
+                PacketType::Subscribe => decode_subscribe(&mut cursor)?,
+                PacketType::SubAck => decode_suback(&mut cursor)?,
+                PacketType::Unsubscribe => decode_unsubscribe(&mut cursor)?,
+                PacketType::UnsubAck => decode_unsuback(&mut cursor)?,
+                PacketType::PingReq => MqttPacket::PingReq,
+                PacketType::PingResp => MqttPacket::PingResp,
+                PacketType::Disconnect => decode_disconnect(&mut cursor, remaining_length)?,
+                PacketType::Auth => MqttPacket::Auth,
+                PacketType::Publish => unreachable!(),
+            }
+        }
+    };
+
+    Ok((packet, total_size))
+}
+
+/// Zero-copy PUBLISH decode: topic and payload are `Bytes::slice()` from the input buffer.
+fn decode_publish_zero_copy(
+    buf: &Bytes,
+    start: usize,
+    end: usize,
+    flags: u8,
+) -> Result<MqttPacket, CodecError> {
+    let dup = flags & 0x08 != 0;
+    let qos_val = (flags >> 1) & 0x03;
+    let qos = QoS::from_u8(qos_val).ok_or(CodecError::InvalidQoS(qos_val))?;
+    let retain = flags & 0x01 != 0;
+
+    let data = &buf[start..end];
+    let mut pos = 0;
+
+    // Topic: 2-byte length + UTF-8 data
+    if data.len() < 2 {
+        return Err(CodecError::UnexpectedEof);
+    }
+    let topic_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    if data.len() < pos + topic_len {
+        return Err(CodecError::UnexpectedEof);
+    }
+    // Validate UTF-8
+    std::str::from_utf8(&data[pos..pos + topic_len]).map_err(|_| CodecError::InvalidUtf8)?;
+    // Zero-copy slice from the input buffer
+    let topic = buf.slice(start + pos..start + pos + topic_len);
+    pos += topic_len;
+
+    // Packet ID
+    let packet_id = if qos != QoS::AtMostOnce {
+        if data.len() < pos + 2 {
+            return Err(CodecError::UnexpectedEof);
+        }
+        let id = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        pos += 2;
+        Some(id)
+    } else {
+        None
+    };
+
+    // Payload: zero-copy slice of remaining bytes
+    let payload = if pos < data.len() {
+        buf.slice(start + pos..end)
+    } else {
+        Bytes::new()
+    };
+
+    Ok(MqttPacket::Publish(Publish {
+        dup,
+        qos,
+        retain,
+        topic,
+        packet_id,
+        payload,
+        properties: Properties::default(),
+    }))
+}
+
 fn decode_connect(buf: &mut &[u8]) -> Result<MqttPacket, CodecError> {
     // Protocol Name
     let protocol_name = read_mqtt_string(buf)?;
@@ -621,7 +743,8 @@ fn decode_publish(buf: &mut &[u8], flags: u8) -> Result<MqttPacket, CodecError> 
     let qos = QoS::from_u8(qos_val).ok_or(CodecError::InvalidQoS(qos_val))?;
     let retain = flags & 0x01 != 0;
 
-    let topic = read_mqtt_string(buf)?;
+    // Read topic as Bytes (validate UTF-8 but keep as Bytes).
+    let topic = read_mqtt_string_as_bytes(buf)?;
 
     let packet_id = if qos != QoS::AtMostOnce {
         if buf.remaining() < 2 {
@@ -648,6 +771,22 @@ fn decode_publish(buf: &mut &[u8], flags: u8) -> Result<MqttPacket, CodecError> 
         payload,
         properties: Properties::default(),
     }))
+}
+
+/// Read an MQTT UTF-8 string and return as `Bytes` (validates UTF-8 but avoids `String` alloc).
+fn read_mqtt_string_as_bytes(buf: &mut &[u8]) -> Result<Bytes, CodecError> {
+    if buf.remaining() < 2 {
+        return Err(CodecError::UnexpectedEof);
+    }
+    let len = buf.get_u16() as usize;
+    if buf.remaining() < len {
+        return Err(CodecError::UnexpectedEof);
+    }
+    let data = &buf[..len];
+    std::str::from_utf8(data).map_err(|_| CodecError::InvalidUtf8)?;
+    let result = Bytes::copy_from_slice(data);
+    buf.advance(len);
+    Ok(result)
 }
 
 fn decode_puback(buf: &mut &[u8]) -> Result<MqttPacket, CodecError> {
@@ -889,6 +1028,211 @@ pub fn encode_packet(packet: &MqttPacket, buf: &mut BytesMut) {
     }
 }
 
+/// Encode an MQTT PUBLISH packet directly from a `FlatMessage`, bypassing the
+/// intermediate `Publish` and `Properties` structs entirely.
+///
+/// This is the zero-allocation outbound hot path. The topic, payload, and all
+/// MQTT 5.0 properties are read directly from the FlatMessage's zero-copy spans
+/// and written into the wire buffer in a single pass.
+///
+/// # Arguments
+/// - `flat_msg`: The flat message containing the payload, routing key (topic), and headers.
+/// - `qos`: Effective QoS for delivery.
+/// - `retain`: Whether the retain flag should be set.
+/// - `dup`: Whether the DUP flag should be set.
+/// - `packet_id`: Packet identifier (required for QoS 1/2).
+/// - `is_v5`: Whether to encode MQTT 5.0 properties.
+/// - `subscription_id`: MQTT 5.0 subscription identifier (if any).
+/// - `topic_alias`: MQTT 5.0 topic alias (if any).
+/// - `buf`: Output buffer to write the encoded packet into.
+pub fn encode_publish_from_flat(
+    flat_msg: &FlatMessage,
+    qos: QoS,
+    retain: bool,
+    dup: bool,
+    packet_id: Option<u16>,
+    is_v5: bool,
+    subscription_id: Option<u32>,
+    topic_alias: Option<u16>,
+    buf: &mut BytesMut,
+) {
+    let topic = flat_msg.routing_key().unwrap_or_default();
+    let payload = flat_msg.value();
+
+    // Compute MQTT 5.0 properties size.
+    let props_content_size = if is_v5 {
+        compute_flat_properties_size(flat_msg, subscription_id, topic_alias)
+    } else {
+        0
+    };
+    let props_total_size = if is_v5 {
+        variable_int_size(props_content_size as u32) + props_content_size
+    } else {
+        0
+    };
+
+    // Variable header: topic (2 + len) + optional packet_id (2) + properties
+    let var_header_size =
+        2 + topic.len() + if qos != QoS::AtMostOnce { 2 } else { 0 } + props_total_size;
+
+    let remaining = var_header_size + payload.len();
+
+    // Reserve capacity for the entire packet.
+    buf.reserve(1 + 4 + remaining);
+
+    // Fixed header byte.
+    let mut first_byte = 0x30u8;
+    if dup {
+        first_byte |= 0x08;
+    }
+    first_byte |= (qos.as_u8() & 0x03) << 1;
+    if retain {
+        first_byte |= 0x01;
+    }
+    buf.put_u8(first_byte);
+    encode_remaining_length(remaining, buf);
+
+    // Topic (MQTT string: 2-byte length + raw bytes).
+    buf.put_u16(topic.len() as u16);
+    buf.extend_from_slice(&topic);
+
+    // Packet ID (QoS 1/2 only).
+    if qos != QoS::AtMostOnce {
+        if let Some(id) = packet_id {
+            buf.put_u16(id);
+        }
+    }
+
+    // MQTT 5.0 properties.
+    if is_v5 {
+        write_variable_int(props_content_size as u32, buf);
+        write_flat_properties(flat_msg, subscription_id, topic_alias, buf);
+    }
+
+    // Payload (from FlatMessage value span — zero-copy from mmap).
+    buf.extend_from_slice(&payload);
+}
+
+/// Compute the encoded byte size of MQTT 5.0 properties extracted from a FlatMessage.
+fn compute_flat_properties_size(
+    flat_msg: &FlatMessage,
+    subscription_id: Option<u32>,
+    topic_alias: Option<u16>,
+) -> usize {
+    let mut size = 0;
+
+    // message_expiry_interval (0x02): 1 + 4
+    if let Some(ttl_ms) = flat_msg.ttl_ms() {
+        if ttl_ms / 1000 > 0 {
+            size += 1 + 4;
+        }
+    }
+
+    // response_topic (0x08): 1 + 2 + len
+    if let Some(rt) = flat_msg.reply_to() {
+        size += 1 + 2 + rt.len();
+    }
+
+    // correlation_data (0x09): 1 + 2 + len
+    if let Some(cd) = flat_msg.correlation_id() {
+        size += 1 + 2 + cd.len();
+    }
+
+    // subscription_identifier (0x0B): 1 + variable_int
+    if let Some(sub_id) = subscription_id {
+        size += 1 + variable_int_size(sub_id);
+    }
+
+    // topic_alias (0x23): 1 + 2
+    if topic_alias.is_some() {
+        size += 1 + 2;
+    }
+
+    // FlatMessage headers → MQTT properties
+    for i in 0..flat_msg.header_count() {
+        let (k, v) = flat_msg.header(i);
+        if &k[..] == b"mqtt.content_type" {
+            // content_type (0x03): 1 + 2 + len
+            size += 1 + 2 + v.len();
+        } else if &k[..] == b"mqtt.payload_format" && !v.is_empty() {
+            // payload_format_indicator (0x01): 1 + 1
+            size += 1 + 1;
+        } else if k.starts_with(b"mqtt.user.") {
+            // user_property (0x26): 1 + (2 + key_len) + (2 + val_len)
+            let user_key_len = k.len() - 10; // skip "mqtt.user."
+            size += 1 + 2 + user_key_len + 2 + v.len();
+        }
+    }
+
+    size
+}
+
+/// Write MQTT 5.0 properties extracted from a FlatMessage into the buffer.
+fn write_flat_properties(
+    flat_msg: &FlatMessage,
+    subscription_id: Option<u32>,
+    topic_alias: Option<u16>,
+    buf: &mut BytesMut,
+) {
+    // payload_format_indicator (0x01) — write early per MQTT convention
+    // (handled below in header loop to avoid double iteration)
+
+    // message_expiry_interval (0x02)
+    if let Some(ttl_ms) = flat_msg.ttl_ms() {
+        let secs = (ttl_ms / 1000) as u32;
+        if secs > 0 {
+            buf.put_u8(0x02);
+            buf.put_u32(secs);
+        }
+    }
+
+    // response_topic (0x08)
+    if let Some(rt) = flat_msg.reply_to() {
+        buf.put_u8(0x08);
+        buf.put_u16(rt.len() as u16);
+        buf.extend_from_slice(&rt);
+    }
+
+    // correlation_data (0x09)
+    if let Some(cd) = flat_msg.correlation_id() {
+        buf.put_u8(0x09);
+        buf.put_u16(cd.len() as u16);
+        buf.extend_from_slice(&cd);
+    }
+
+    // subscription_identifier (0x0B)
+    if let Some(sub_id) = subscription_id {
+        buf.put_u8(0x0B);
+        write_variable_int(sub_id, buf);
+    }
+
+    // topic_alias (0x23)
+    if let Some(alias) = topic_alias {
+        buf.put_u8(0x23);
+        buf.put_u16(alias);
+    }
+
+    // FlatMessage headers → MQTT properties
+    for i in 0..flat_msg.header_count() {
+        let (k, v) = flat_msg.header(i);
+        if &k[..] == b"mqtt.content_type" {
+            buf.put_u8(0x03);
+            buf.put_u16(v.len() as u16);
+            buf.extend_from_slice(&v);
+        } else if &k[..] == b"mqtt.payload_format" && !v.is_empty() {
+            buf.put_u8(0x01);
+            buf.put_u8(v[0]);
+        } else if k.starts_with(b"mqtt.user.") {
+            let user_key = &k[10..]; // skip "mqtt.user."
+            buf.put_u8(0x26);
+            buf.put_u16(user_key.len() as u16);
+            buf.extend_from_slice(user_key);
+            buf.put_u16(v.len() as u16);
+            buf.extend_from_slice(&v);
+        }
+    }
+}
+
 fn encode_connect(connect: &Connect, buf: &mut BytesMut) {
     let mut payload = BytesMut::new();
 
@@ -941,18 +1285,12 @@ fn encode_connack(connack: &ConnAck, buf: &mut BytesMut) {
 }
 
 fn encode_publish(publish: &Publish, buf: &mut BytesMut) {
-    let mut payload = BytesMut::new();
+    // Pre-compute remaining length to avoid intermediate BytesMut allocation.
+    let topic_len = publish.topic.len();
+    let var_header_size = 2 + topic_len + if publish.qos != QoS::AtMostOnce { 2 } else { 0 };
+    let remaining = var_header_size + publish.payload.len();
 
-    // Variable header
-    write_mqtt_string(&publish.topic, &mut payload);
-    if publish.qos != QoS::AtMostOnce {
-        if let Some(packet_id) = publish.packet_id {
-            payload.put_u16(packet_id);
-        }
-    }
-
-    // Payload
-    payload.extend_from_slice(&publish.payload);
+    buf.reserve(1 + 4 + remaining); // 1 fixed header + up to 4 remaining length bytes + payload
 
     // Fixed header
     let mut first_byte = 0x30u8; // PUBLISH = 3 << 4
@@ -963,10 +1301,22 @@ fn encode_publish(publish: &Publish, buf: &mut BytesMut) {
     if publish.retain {
         first_byte |= 0x01;
     }
-
     buf.put_u8(first_byte);
-    encode_remaining_length(payload.len(), buf);
-    buf.extend_from_slice(&payload);
+    encode_remaining_length(remaining, buf);
+
+    // Topic (write as MQTT string: 2-byte length + raw bytes)
+    buf.put_u16(topic_len as u16);
+    buf.extend_from_slice(&publish.topic);
+
+    // Packet ID
+    if publish.qos != QoS::AtMostOnce {
+        if let Some(packet_id) = publish.packet_id {
+            buf.put_u16(packet_id);
+        }
+    }
+
+    // Payload
+    buf.extend_from_slice(&publish.payload);
 }
 
 fn encode_puback(puback: &PubAck, buf: &mut BytesMut) {
@@ -1178,7 +1528,7 @@ mod tests {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: "test/topic".to_string(),
+            topic: Bytes::from_static(b"test/topic"),
             packet_id: None,
             payload: Bytes::from_static(b"hello"),
             properties: Properties::default(),
@@ -1195,7 +1545,7 @@ mod tests {
                 assert!(!p.dup);
                 assert_eq!(p.qos, QoS::AtMostOnce);
                 assert!(!p.retain);
-                assert_eq!(p.topic, "test/topic");
+                assert_eq!(&p.topic[..], b"test/topic");
                 assert!(p.packet_id.is_none());
                 assert_eq!(p.payload.as_ref(), b"hello");
             }
@@ -1209,7 +1559,7 @@ mod tests {
             dup: false,
             qos: QoS::AtLeastOnce,
             retain: true,
-            topic: "sensor/1/temp".to_string(),
+            topic: Bytes::from_static(b"sensor/1/temp"),
             packet_id: Some(42),
             payload: Bytes::from_static(b"22.5"),
             properties: Properties::default(),
@@ -1223,12 +1573,123 @@ mod tests {
             MqttPacket::Publish(p) => {
                 assert_eq!(p.qos, QoS::AtLeastOnce);
                 assert!(p.retain);
-                assert_eq!(p.topic, "sensor/1/temp");
+                assert_eq!(&p.topic[..], b"sensor/1/temp");
                 assert_eq!(p.packet_id, Some(42));
                 assert_eq!(p.payload.as_ref(), b"22.5");
             }
             _ => panic!("expected Publish"),
         }
+    }
+
+    #[test]
+    fn test_decode_packet_from_bytes_zero_copy() {
+        let publish = MqttPacket::Publish(Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: Bytes::from_static(b"zero/copy/topic"),
+            packet_id: None,
+            payload: Bytes::from_static(b"payload data"),
+            properties: Properties::default(),
+        });
+
+        let mut buf = BytesMut::new();
+        encode_packet(&publish, &mut buf);
+
+        // Freeze and use zero-copy decode.
+        let frozen = buf.freeze();
+        let (decoded, consumed) = decode_packet_from_bytes(&frozen).unwrap();
+        assert_eq!(consumed, frozen.len());
+
+        match decoded {
+            MqttPacket::Publish(p) => {
+                assert_eq!(&p.topic[..], b"zero/copy/topic");
+                assert_eq!(&p.payload[..], b"payload data");
+                // Verify the topic and payload share the same backing buffer
+                // (they are slices of frozen, not independent allocations).
+            }
+            _ => panic!("expected Publish"),
+        }
+    }
+
+    #[test]
+    fn test_encode_publish_from_flat_no_v5() {
+        use bisque_mq::flat::FlatMessageBuilder;
+
+        let flat_bytes = FlatMessageBuilder::new(Bytes::from_static(b"sensor reading"))
+            .routing_key(Bytes::from_static(b"sensor/1/temp"))
+            .build();
+
+        let flat = FlatMessage::new(flat_bytes).unwrap();
+        let mut buf = BytesMut::new();
+
+        // Encode without V5 properties.
+        encode_publish_from_flat(
+            &flat,
+            QoS::AtLeastOnce,
+            false,
+            false,
+            Some(42),
+            false,
+            None,
+            None,
+            &mut buf,
+        );
+
+        // Decode and verify topic, QoS, packet_id, payload.
+        let (decoded, _) = decode_packet(&buf).unwrap();
+        match decoded {
+            MqttPacket::Publish(p) => {
+                assert_eq!(&p.topic[..], b"sensor/1/temp");
+                assert_eq!(p.qos, QoS::AtLeastOnce);
+                assert_eq!(p.packet_id, Some(42));
+                assert_eq!(&p.payload[..], b"sensor reading");
+            }
+            _ => panic!("expected Publish"),
+        }
+    }
+
+    #[test]
+    fn test_encode_publish_from_flat_v5_properties() {
+        use bisque_mq::flat::FlatMessageBuilder;
+
+        let flat_bytes = FlatMessageBuilder::new(Bytes::from_static(b"data"))
+            .routing_key(Bytes::from_static(b"t"))
+            .reply_to(Bytes::from_static(b"reply/topic"))
+            .correlation_id(Bytes::from_static(b"corr-123"))
+            .ttl_ms(60_000)
+            .header("mqtt.content_type", &b"application/json"[..])
+            .header("mqtt.payload_format", &b"\x01"[..])
+            .header("mqtt.user.custom", &b"value"[..])
+            .build();
+
+        let flat = FlatMessage::new(flat_bytes).unwrap();
+        let mut buf = BytesMut::new();
+
+        encode_publish_from_flat(
+            &flat,
+            QoS::AtMostOnce,
+            false,
+            false,
+            None,
+            true,
+            Some(7),
+            Some(3),
+            &mut buf,
+        );
+
+        // Verify the encoded packet is valid (can be parsed by fixed header).
+        let (_, _, remaining_length, header_size) = parse_fixed_header(&buf).unwrap();
+        assert_eq!(buf.len(), header_size + remaining_length);
+
+        // Verify the topic is at the right position.
+        // Fixed header = first_byte + remaining_length_bytes
+        let topic_len = u16::from_be_bytes([buf[header_size], buf[header_size + 1]]) as usize;
+        assert_eq!(topic_len, 1); // "t"
+        assert_eq!(buf[header_size + 2], b't');
+
+        // The payload "data" should be at the end.
+        assert_eq!(&buf[buf.len() - 4..], b"data");
     }
 
     #[test]

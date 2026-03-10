@@ -90,6 +90,9 @@ pub struct ActorInMemory {
     pub state: ActorState,
     /// Ordered mailbox of raft log indexes for pending messages.
     pub mailbox: VecDeque<u64>,
+    /// Per-message reply_to topic name, keyed by log_index.
+    /// Only populated for messages that have a reply_to field.
+    pub reply_to_map: HashMap<u64, String>,
 }
 
 impl ActorNamespaceState {
@@ -117,6 +120,7 @@ impl ActorNamespaceState {
         actor_id: &Bytes,
         log_index: u64,
         current_time: u64,
+        reply_to: Option<String>,
     ) -> Result<(), crate::types::MqError> {
         let actor = self.actors.entry(actor_id.clone()).or_insert_with(|| {
             self.meta.active_actor_count += 1;
@@ -133,6 +137,7 @@ impl ActorNamespaceState {
                     attempts: 0,
                 },
                 mailbox: VecDeque::new(),
+                reply_to_map: HashMap::new(),
             }
         });
 
@@ -143,6 +148,9 @@ impl ActorNamespaceState {
         }
 
         actor.mailbox.push_back(log_index);
+        if let Some(rt) = reply_to {
+            actor.reply_to_map.insert(log_index, rt);
+        }
         actor.state.pending_count += 1;
         actor.state.head_index = log_index;
         if actor.state.tail_index == 0 {
@@ -185,11 +193,13 @@ impl ActorNamespaceState {
         Some(msg_index)
     }
 
-    pub fn apply_ack(&mut self, actor_id: &Bytes, message_id: u64) {
+    /// ACK a message and return its `reply_to` topic name (if any).
+    pub fn apply_ack(&mut self, actor_id: &Bytes, message_id: u64) -> Option<String> {
         if let Some(actor) = self.actors.get_mut(actor_id) {
             if actor.state.in_flight_index == Some(message_id) {
                 actor.state.in_flight_index = None;
                 actor.state.attempts = 0;
+                let reply_to = actor.reply_to_map.remove(&message_id);
                 // Update tail to next pending if any
                 if let Some(&next) = actor.mailbox.front() {
                     actor.state.tail_index = next;
@@ -201,8 +211,10 @@ impl ActorNamespaceState {
                     }
                 }
                 self.m_ack_count.increment(1);
+                return reply_to;
             }
         }
+        None
     }
 
     pub fn apply_nack(&mut self, actor_id: &Bytes, message_id: u64) {
@@ -313,7 +325,7 @@ mod tests {
         let mut ns = make_ns("test");
         let aid = actor_id("user-1");
 
-        ns.apply_send(&aid, 10, 1000).unwrap();
+        ns.apply_send(&aid, 10, 1000, None).unwrap();
         assert_eq!(ns.actors.len(), 1);
         assert_eq!(ns.meta.active_actor_count, 1);
 
@@ -329,9 +341,9 @@ mod tests {
         let mut ns = make_ns("test");
         let aid = actor_id("user-1");
 
-        ns.apply_send(&aid, 10, 1000).unwrap();
-        ns.apply_send(&aid, 11, 1001).unwrap();
-        ns.apply_send(&aid, 12, 1002).unwrap();
+        ns.apply_send(&aid, 10, 1000, None).unwrap();
+        ns.apply_send(&aid, 11, 1001, None).unwrap();
+        ns.apply_send(&aid, 12, 1002, None).unwrap();
 
         let actor = &ns.actors[&aid];
         assert_eq!(actor.state.pending_count, 3);
@@ -350,9 +362,9 @@ mod tests {
         let mut ns = ActorNamespaceState::new(meta);
         let aid = actor_id("user-1");
 
-        ns.apply_send(&aid, 10, 1000).unwrap();
-        ns.apply_send(&aid, 11, 1001).unwrap();
-        let result = ns.apply_send(&aid, 12, 1002);
+        ns.apply_send(&aid, 10, 1000, None).unwrap();
+        ns.apply_send(&aid, 11, 1001, None).unwrap();
+        let result = ns.apply_send(&aid, 12, 1002, None);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -365,7 +377,7 @@ mod tests {
         let mut ns = make_ns("test");
         let aid = actor_id("user-1");
 
-        ns.apply_send(&aid, 10, 1000).unwrap();
+        ns.apply_send(&aid, 10, 1000, None).unwrap();
         // No assignment yet
         assert!(ns.apply_deliver(&aid, 100).is_none());
 
@@ -380,8 +392,8 @@ mod tests {
         let mut ns = make_ns("test");
         let aid = actor_id("user-1");
 
-        ns.apply_send(&aid, 10, 1000).unwrap();
-        ns.apply_send(&aid, 11, 1001).unwrap();
+        ns.apply_send(&aid, 10, 1000, None).unwrap();
+        ns.apply_send(&aid, 11, 1001, None).unwrap();
         ns.apply_assign(100, &[aid.clone()]);
 
         // First deliver
@@ -398,8 +410,8 @@ mod tests {
         let mut ns = make_ns("test");
         let aid = actor_id("user-1");
 
-        ns.apply_send(&aid, 10, 1000).unwrap();
-        ns.apply_send(&aid, 11, 1001).unwrap();
+        ns.apply_send(&aid, 10, 1000, None).unwrap();
+        ns.apply_send(&aid, 11, 1001, None).unwrap();
         ns.apply_assign(100, &[aid.clone()]);
 
         ns.apply_deliver(&aid, 100);
@@ -419,7 +431,7 @@ mod tests {
         let mut ns = make_ns("test");
         let aid = actor_id("user-1");
 
-        ns.apply_send(&aid, 10, 1000).unwrap();
+        ns.apply_send(&aid, 10, 1000, None).unwrap();
         ns.apply_assign(100, &[aid.clone()]);
         ns.apply_deliver(&aid, 100);
 
@@ -436,8 +448,8 @@ mod tests {
         let a1 = actor_id("user-1");
         let a2 = actor_id("user-2");
 
-        ns.apply_send(&a1, 10, 1000).unwrap();
-        ns.apply_send(&a2, 11, 1001).unwrap();
+        ns.apply_send(&a1, 10, 1000, None).unwrap();
+        ns.apply_send(&a2, 11, 1001, None).unwrap();
 
         ns.apply_assign(100, &[a1.clone(), a2.clone()]);
         assert_eq!(ns.consumer_assignments[&100].len(), 2);
@@ -453,7 +465,7 @@ mod tests {
         let mut ns = make_ns("test");
         let aid = actor_id("user-1");
 
-        ns.apply_send(&aid, 10, 1000).unwrap();
+        ns.apply_send(&aid, 10, 1000, None).unwrap();
         ns.apply_assign(100, &[aid.clone()]);
         ns.apply_deliver(&aid, 100);
 
@@ -473,12 +485,12 @@ mod tests {
         let a1 = actor_id("idle");
         let a2 = actor_id("active");
 
-        ns.apply_send(&a1, 10, 1000).unwrap();
+        ns.apply_send(&a1, 10, 1000, None).unwrap();
         ns.apply_assign(100, &[a1.clone()]);
         ns.apply_deliver(&a1, 100);
         ns.apply_ack(&a1, 10); // now idle, last_activity_at=1000
 
-        ns.apply_send(&a2, 11, 5000).unwrap(); // active, has pending
+        ns.apply_send(&a2, 11, 5000, None).unwrap(); // active, has pending
 
         let evicted = ns.apply_evict_idle(3000); // evict actors idle before 3000
         assert_eq!(evicted, 1);
@@ -493,8 +505,8 @@ mod tests {
         let a2 = actor_id("assigned");
         let _a3 = actor_id("empty");
 
-        ns.apply_send(&a1, 10, 1000).unwrap();
-        ns.apply_send(&a2, 11, 1000).unwrap();
+        ns.apply_send(&a1, 10, 1000, None).unwrap();
+        ns.apply_send(&a2, 11, 1000, None).unwrap();
         // a3 not created (no messages)
 
         ns.apply_assign(100, &[a2.clone()]);
@@ -512,8 +524,8 @@ mod tests {
         let a1 = actor_id("a1");
         let a2 = actor_id("a2");
 
-        ns.apply_send(&a1, 10, 1000).unwrap();
-        ns.apply_send(&a2, 20, 1000).unwrap();
+        ns.apply_send(&a1, 10, 1000, None).unwrap();
+        ns.apply_send(&a2, 20, 1000, None).unwrap();
 
         assert_eq!(ns.min_required_index(), Some(10));
     }
@@ -523,8 +535,8 @@ mod tests {
         let mut ns = make_ns("test");
         let aid = actor_id("a1");
 
-        ns.apply_send(&aid, 10, 1000).unwrap();
-        ns.apply_send(&aid, 20, 1001).unwrap();
+        ns.apply_send(&aid, 10, 1000, None).unwrap();
+        ns.apply_send(&aid, 20, 1001, None).unwrap();
         ns.apply_assign(100, &[aid.clone()]);
         ns.apply_deliver(&aid, 100); // msg 10 is now in-flight
 
@@ -537,8 +549,8 @@ mod tests {
         let a1 = actor_id("a1");
         let a2 = actor_id("a2");
 
-        ns.apply_send(&a1, 10, 1000).unwrap();
-        ns.apply_send(&a2, 11, 1000).unwrap();
+        ns.apply_send(&a1, 10, 1000, None).unwrap();
+        ns.apply_send(&a2, 11, 1000, None).unwrap();
 
         ns.apply_assign(100, &[a1.clone()]);
         ns.apply_assign(200, &[a2.clone()]);

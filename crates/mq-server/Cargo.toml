@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 bisque-mq = { workspace = true }
 bisque-mq-protocol = { workspace = true }
+bisque-raft = { workspace = true }
 bytes = { workspace = true }
 metrics = { workspace = true }
 thiserror = { workspace = true }

@@ -1313,6 +1313,7 @@ version = "0.1.0"
 dependencies = [
  "bisque-mq",
  "bisque-mq-protocol",
+ "bisque-raft",
  "bytes",
  "metrics",
  "thiserror 2.0.18",
@@ -1327,6 +1328,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bisque-mq",
+ "bisque-raft",
  "bytes",
  "chrono",
  "metrics",
@@ -1379,6 +1381,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

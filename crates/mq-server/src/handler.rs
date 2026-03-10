@@ -1,9 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bisque_mq::types::{MqCommand, MqResponse};
+use bisque_mq::flat::FlatMessage;
+use bisque_mq::types::{MqCommand, MqResponse, PartitionInfo};
 use bisque_mq::write_batcher::MqWriteBatcher;
 use bisque_mq_protocol::types::{ClientFrame, ServerFrame, ServerMessage};
+use bisque_raft::SegmentPrefetcher;
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
@@ -49,6 +51,24 @@ pub trait MqRouter: Send + Sync + 'static {
         group_id: u64,
         entity_id: u64,
     ) -> tokio::sync::watch::Receiver<u64>;
+
+    /// Get the segment prefetcher for a given raft group.
+    /// Used to read flat message payloads from the raft log by message_id (log index).
+    fn get_prefetcher(&self, group_id: u64) -> Option<SegmentPrefetcher>;
+
+    /// Get the partition map for a topic. Returns `None` if the topic doesn't exist.
+    /// Returns `Some(empty slice)` if the topic is unpartitioned.
+    fn get_topic_partitions(&self, group_id: u64, entity_id: u64) -> Option<Vec<PartitionInfo>> {
+        let _ = (group_id, entity_id);
+        None
+    }
+
+    /// Get the write batcher for a specific partition of a partitioned topic.
+    /// Returns `None` if no batcher is available for that partition group.
+    fn get_partition_batcher(&self, partition_group_id: u64) -> Option<Arc<MqWriteBatcher>> {
+        // Default: fall through to get_batcher
+        self.get_batcher(partition_group_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +145,8 @@ pub struct ConsumerHandler<R: MqRouter> {
     topic_watcher_handles: Vec<(u32, tokio::task::JoinHandle<()>)>,
     last_client_heartbeat: Instant,
     delivery_notify: Arc<Notify>,
+    /// Reusable buffer for message batch delivery — avoids per-call Vec allocation.
+    msg_batch_buf: Vec<ServerMessage>,
 }
 
 impl<R: MqRouter> ConsumerHandler<R> {
@@ -146,6 +168,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
             topic_watcher_handles: Vec::new(),
             last_client_heartbeat: Instant::now(),
             delivery_notify: Arc::new(Notify::new()),
+            msg_batch_buf: Vec::new(),
         }
     }
 
@@ -178,7 +201,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
                 match self.router.validate_token(&token, consumer_id) {
                     Ok((cid, session_token)) => {
                         let session_token = Bytes::from(session_token);
-                        self.session = Some(ConsumerSession::new(cid, session_token.to_vec()));
+                        self.session = Some(ConsumerSession::new(cid, session_token.clone()));
                         self.send_frame(ServerFrame::HandshakeOk {
                             consumer_id: cid,
                             session_token,
@@ -302,14 +325,14 @@ impl<R: MqRouter> ConsumerHandler<R> {
                 sub_id,
                 message_ids,
             } => {
-                self.handle_ack(sub_id, &message_ids).await?;
+                self.handle_ack(sub_id, message_ids).await?;
             }
 
             ClientFrame::Nack {
                 sub_id,
                 message_ids,
             } => {
-                self.handle_nack(sub_id, &message_ids).await?;
+                self.handle_nack(sub_id, message_ids).await?;
             }
 
             ClientFrame::CommitOffset { sub_id, offset } => {
@@ -334,6 +357,15 @@ impl<R: MqRouter> ConsumerHandler<R> {
                     session.update_byte_budget(budget_bytes);
                     self.delivery_notify.notify_one();
                 }
+            }
+
+            ClientFrame::Publish {
+                group_id,
+                topic_name_hash,
+                messages,
+            } => {
+                self.handle_publish(group_id, topic_name_hash, messages)
+                    .await?;
             }
         }
 
@@ -418,7 +450,11 @@ impl<R: MqRouter> ConsumerHandler<R> {
     // Ack / Nack / CommitOffset
     // -----------------------------------------------------------------------
 
-    async fn handle_ack(&mut self, sub_id: u32, message_ids: &[u64]) -> Result<(), ConsumerError> {
+    async fn handle_ack(
+        &mut self,
+        sub_id: u32,
+        message_ids: Vec<u64>,
+    ) -> Result<(), ConsumerError> {
         let (group_id, entity_type, entity_id) = match self.get_sub_routing(sub_id) {
             Some(info) => info,
             None => return Ok(()),
@@ -431,22 +467,20 @@ impl<R: MqRouter> ConsumerHandler<R> {
             ENTITY_TYPE_QUEUE => {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
                     let _ = batcher
-                        .submit(MqCommand::Ack {
-                            queue_id: entity_id,
-                            message_ids: message_ids.to_vec(),
-                        })
+                        .submit(MqCommand::ack(entity_id, &message_ids, None))
                         .await;
                 }
             }
             ENTITY_TYPE_ACTOR_NAMESPACE => {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
-                    for &msg_id in message_ids {
+                    for &msg_id in &message_ids {
                         let _ = batcher
-                            .submit(MqCommand::AckActorMessage {
-                                namespace_id: entity_id,
-                                actor_id: Bytes::new(), // TODO: track actor_id per in-flight message
-                                message_id: msg_id,
-                            })
+                            .submit(MqCommand::ack_actor_message(
+                                entity_id,
+                                &[], // TODO: track actor_id per in-flight message
+                                msg_id,
+                                None,
+                            ))
                             .await;
                     }
                 }
@@ -465,7 +499,11 @@ impl<R: MqRouter> ConsumerHandler<R> {
         Ok(())
     }
 
-    async fn handle_nack(&mut self, sub_id: u32, message_ids: &[u64]) -> Result<(), ConsumerError> {
+    async fn handle_nack(
+        &mut self,
+        sub_id: u32,
+        message_ids: Vec<u64>,
+    ) -> Result<(), ConsumerError> {
         let (group_id, entity_type, entity_id) = match self.get_sub_routing(sub_id) {
             Some(info) => info,
             None => return Ok(()),
@@ -478,22 +516,19 @@ impl<R: MqRouter> ConsumerHandler<R> {
             ENTITY_TYPE_QUEUE => {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
                     let _ = batcher
-                        .submit(MqCommand::Nack {
-                            queue_id: entity_id,
-                            message_ids: message_ids.to_vec(),
-                        })
+                        .submit(MqCommand::nack(entity_id, &message_ids))
                         .await;
                 }
             }
             ENTITY_TYPE_ACTOR_NAMESPACE => {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
-                    for &msg_id in message_ids {
+                    for &msg_id in &message_ids {
                         let _ = batcher
-                            .submit(MqCommand::NackActorMessage {
-                                namespace_id: entity_id,
-                                actor_id: Bytes::new(),
-                                message_id: msg_id,
-                            })
+                            .submit(MqCommand::nack_actor_message(
+                                entity_id,
+                                &[], // TODO: track actor_id per in-flight message
+                                msg_id,
+                            ))
                             .await;
                     }
                 }
@@ -527,13 +562,43 @@ impl<R: MqRouter> ConsumerHandler<R> {
 
         if let Some(batcher) = self.router.get_batcher(group_id) {
             let _ = batcher
-                .submit(MqCommand::CommitOffset {
-                    topic_id: entity_id,
-                    consumer_id,
-                    offset,
-                })
+                .submit(MqCommand::commit_offset(entity_id, consumer_id, offset))
                 .await;
         }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Publish (native producer)
+    // -----------------------------------------------------------------------
+
+    async fn handle_publish(
+        &mut self,
+        group_id: u64,
+        topic_name_hash: u64,
+        messages: Vec<Bytes>,
+    ) -> Result<(), ConsumerError> {
+        let topic_id =
+            match self
+                .router
+                .resolve_entity(group_id, ENTITY_TYPE_TOPIC, topic_name_hash)
+            {
+                Some(id) => id,
+                None => {
+                    debug!(topic_name_hash, "publish to unknown topic");
+                    return Ok(());
+                }
+            };
+
+        let batcher = match self.router.get_batcher(group_id) {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let _ = batcher
+            .submit(MqCommand::publish(topic_id, &messages))
+            .await;
 
         Ok(())
     }
@@ -623,38 +688,14 @@ impl<R: MqRouter> ConsumerHandler<R> {
         };
 
         let response = batcher
-            .submit(MqCommand::Deliver {
-                queue_id,
-                consumer_id,
-                max_count,
-            })
+            .submit(MqCommand::deliver(queue_id, consumer_id, max_count))
             .await?;
 
         match response {
             MqResponse::Messages { messages } => {
                 let delivered = !messages.is_empty();
-                for msg in messages {
-                    let server_msg = ServerMessage {
-                        sub_id,
-                        message_id: msg.message_id,
-                        timestamp: msg.payload.timestamp,
-                        key: msg.payload.key,
-                        value: msg.payload.value,
-                        headers: msg
-                            .payload
-                            .headers
-                            .into_iter()
-                            .map(|(k, v)| (Bytes::from(k.into_bytes()), v))
-                            .collect(),
-                    };
-                    let msg_bytes = server_msg.payload_bytes();
-
-                    self.send_frame(ServerFrame::Message(Box::new(server_msg)))
-                        .await?;
-
-                    if let Some(session) = &mut self.session {
-                        session.on_message_sent(sub_id, msg_bytes);
-                    }
+                if delivered {
+                    self.send_message_batch(group_id, sub_id, &messages).await?;
                 }
                 Ok(delivered)
             }
@@ -684,42 +725,63 @@ impl<R: MqRouter> ConsumerHandler<R> {
         };
 
         let response = batcher
-            .submit(MqCommand::DeliverActorMessage {
+            .submit(MqCommand::deliver_actor_message(
                 namespace_id,
-                actor_id: Bytes::new(), // TODO: track assigned actors
+                &[], // TODO: track assigned actors
                 consumer_id,
-            })
+            ))
             .await?;
 
         if let MqResponse::Messages { messages } = response {
             let delivered = !messages.is_empty();
-            for msg in messages {
-                let server_msg = ServerMessage {
-                    sub_id,
-                    message_id: msg.message_id,
-                    timestamp: msg.payload.timestamp,
-                    key: msg.payload.key,
-                    value: msg.payload.value,
-                    headers: msg
-                        .payload
-                        .headers
-                        .into_iter()
-                        .map(|(k, v)| (Bytes::from(k.into_bytes()), v))
-                        .collect(),
-                };
-                let msg_bytes = server_msg.payload_bytes();
-
-                self.send_frame(ServerFrame::Message(Box::new(server_msg)))
-                    .await?;
-
-                if let Some(session) = &mut self.session {
-                    session.on_message_sent(sub_id, msg_bytes);
-                }
+            if delivered {
+                self.send_message_batch(group_id, sub_id, &messages).await?;
             }
             return Ok(delivered);
         }
 
         Ok(false)
+    }
+
+    /// Convert delivered messages to ServerMessages and send as a single
+    /// MessageBatch frame. Reuses an internal buffer to avoid per-call allocation.
+    async fn send_message_batch(
+        &mut self,
+        group_id: u64,
+        sub_id: u32,
+        messages: &[bisque_mq::types::DeliveredMessage],
+    ) -> Result<(), ConsumerError> {
+        let prefetcher = self.router.get_prefetcher(group_id);
+        self.msg_batch_buf.clear();
+
+        for msg in messages {
+            let server_msg = if let Some(ref pf) = prefetcher {
+                flat_to_server_message(pf, sub_id, msg.message_id)
+            } else {
+                None
+            };
+            if let Some(m) = server_msg {
+                self.msg_batch_buf.push(m);
+            }
+        }
+
+        if self.msg_batch_buf.is_empty() {
+            return Ok(());
+        }
+
+        // Track bytes per message for flow control before sending.
+        if let Some(session) = &mut self.session {
+            for m in &self.msg_batch_buf {
+                session.on_message_sent(sub_id, m.payload_bytes());
+            }
+        }
+
+        // Drain elements into a new Vec, preserving the buffer's heap allocation
+        // so the next call reuses it without re-allocating.
+        let batch: Vec<ServerMessage> = self.msg_batch_buf.drain(..).collect();
+        self.send_frame(ServerFrame::MessageBatch(batch)).await?;
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -757,7 +819,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         for group_id in session.group_ids() {
             if let Some(batcher) = self.router.get_batcher(group_id) {
                 let _ = batcher
-                    .submit(MqCommand::DisconnectConsumer { consumer_id })
+                    .submit(MqCommand::disconnect_consumer(consumer_id))
                     .await;
             }
         }
@@ -794,6 +856,29 @@ impl<R: MqRouter> ConsumerHandler<R> {
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Flat message → ServerMessage conversion
+// ---------------------------------------------------------------------------
+
+/// Read a flat message from the raft log and convert it to a `ServerMessage`.
+/// Returns `None` if the message has been purged or is unreadable.
+fn flat_to_server_message(
+    prefetcher: &SegmentPrefetcher,
+    sub_id: u32,
+    message_id: u64,
+) -> Option<ServerMessage> {
+    let flat_bytes = bisque_mq::read_message_at(prefetcher, message_id)?;
+    let flat = FlatMessage::new(flat_bytes)?;
+    Some(ServerMessage {
+        sub_id,
+        message_id,
+        timestamp: flat.timestamp(),
+        key: flat.key(),
+        value: flat.value(),
+        headers: flat.headers().collect(),
+    })
 }
 
 #[cfg(test)]
@@ -885,6 +970,10 @@ mod tests {
                     let (_, rx) = tokio::sync::watch::channel(0);
                     rx
                 })
+        }
+
+        fn get_prefetcher(&self, _group_id: u64) -> Option<SegmentPrefetcher> {
+            None // Tests that need prefetcher will use integration tests
         }
     }
 

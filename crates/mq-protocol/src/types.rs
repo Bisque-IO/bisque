@@ -363,6 +363,15 @@ pub enum ClientFrame {
     SetByteBudget {
         budget_bytes: u64,
     },
+    /// Publish pre-encoded flat messages to a topic (by name hash).
+    /// Enables native high-throughput producers without going through
+    /// SQS/Kafka/MQTT adapters.
+    Publish {
+        group_id: u64,
+        topic_name_hash: u64,
+        /// Pre-encoded flat message bytes (see `flat::FlatMessageBuilder`).
+        messages: Vec<Bytes>,
+    },
 }
 
 impl Encode for ClientFrame {
@@ -432,6 +441,19 @@ impl Encode for ClientFrame {
                 (ClientTag::SetByteBudget as u8).encode(w)?;
                 budget_bytes.encode(w)?;
             }
+            Self::Publish {
+                group_id,
+                topic_name_hash,
+                messages,
+            } => {
+                (ClientTag::Publish as u8).encode(w)?;
+                group_id.encode(w)?;
+                topic_name_hash.encode(w)?;
+                (messages.len() as u16).encode(w)?;
+                for msg in messages {
+                    encode_bytes_u32(w, msg)?;
+                }
+            }
         }
         Ok(())
     }
@@ -450,6 +472,14 @@ impl Encode for ClientFrame {
             Self::Heartbeat => 0,
             Self::Close => 0,
             Self::SetByteBudget { .. } => 8,
+            Self::Publish { messages, .. } => {
+                8 + 8
+                    + 2
+                    + messages
+                        .iter()
+                        .map(|m| encoded_size_bytes_u32(m))
+                        .sum::<usize>()
+            }
         }
     }
 }
@@ -494,6 +524,20 @@ impl Decode for ClientFrame {
             ClientTag::SetByteBudget => Ok(Self::SetByteBudget {
                 budget_bytes: u64::decode(r)?,
             }),
+            ClientTag::Publish => {
+                let group_id = u64::decode(r)?;
+                let topic_name_hash = u64::decode(r)?;
+                let count = u16::decode(r)? as usize;
+                let mut messages = Vec::with_capacity(count);
+                for _ in 0..count {
+                    messages.push(Bytes::from(decode_bytes_u32(r)?));
+                }
+                Ok(Self::Publish {
+                    group_id,
+                    topic_name_hash,
+                    messages,
+                })
+            }
         }
     }
 }
@@ -540,6 +584,20 @@ impl ClientFrame {
             ClientTag::SetByteBudget => Ok(Self::SetByteBudget {
                 budget_bytes: read_u64_le_buf(&mut buf)?,
             }),
+            ClientTag::Publish => {
+                let group_id = read_u64_le_buf(&mut buf)?;
+                let topic_name_hash = read_u64_le_buf(&mut buf)?;
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut messages = Vec::with_capacity(count);
+                for _ in 0..count {
+                    messages.push(split_bytes_u32(&mut buf)?);
+                }
+                Ok(Self::Publish {
+                    group_id,
+                    topic_name_hash,
+                    messages,
+                })
+            }
         }
     }
 }
@@ -548,9 +606,9 @@ impl ClientFrame {
 // ServerFrame
 // =============================================================================
 
-/// Message payload extracted from ServerFrame::Message.
-/// Boxed inside the enum to keep the enum small (~8 bytes for Message variant)
-/// — better for channel buffers where non-Message variants are common.
+/// Message payload sent to the client.
+/// Stored inline in `ServerFrame::Message` — the enum is ~80 bytes which is
+/// acceptable for a bounded channel with 64 slots (~5 KiB total).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerMessage {
     pub sub_id: u32,
@@ -573,6 +631,99 @@ impl ServerMessage {
         }
         total
     }
+
+    /// Encode the message body (without frame tag) into a writer.
+    fn encode_body<W: Write>(&self, w: &mut W) -> Result<(), ProtocolError> {
+        self.sub_id.encode(w)?;
+        self.message_id.encode(w)?;
+        self.timestamp.encode(w)?;
+        match &self.key {
+            None => 0u8.encode(w)?,
+            Some(k) => {
+                1u8.encode(w)?;
+                encode_bytes_u32(w, k)?;
+            }
+        }
+        encode_bytes_u32(w, &self.value)?;
+        (self.headers.len() as u16).encode(w)?;
+        for (name, val) in &self.headers {
+            encode_bytes_u16(w, name)?;
+            encode_bytes_u32(w, val)?;
+        }
+        Ok(())
+    }
+
+    /// Encoded size of the message body (without frame tag).
+    fn body_encoded_size(&self) -> usize {
+        let key_size = match &self.key {
+            None => 1,
+            Some(k) => 1 + encoded_size_bytes_u32(k),
+        };
+        let headers_size: usize = self
+            .headers
+            .iter()
+            .map(|(name, val)| encoded_size_bytes_u16(name) + encoded_size_bytes_u32(val))
+            .sum();
+        4 + 8 + 8 + key_size + encoded_size_bytes_u32(&self.value) + 2 + headers_size
+    }
+
+    /// Decode message body from an `io::Read` (without tag byte).
+    fn decode_body<R: Read>(r: &mut R) -> Result<Self, ProtocolError> {
+        let sub_id = u32::decode(r)?;
+        let message_id = u64::decode(r)?;
+        let timestamp = u64::decode(r)?;
+        let key_tag = u8::decode(r)?;
+        let key = match key_tag {
+            0 => None,
+            1 => Some(Bytes::from(decode_bytes_u32(r)?)),
+            _ => return Err(ProtocolError::UnknownTag(key_tag)),
+        };
+        let value = Bytes::from(decode_bytes_u32(r)?);
+        let header_count = u16::decode(r)? as usize;
+        let mut headers = Vec::with_capacity(header_count);
+        for _ in 0..header_count {
+            let name = Bytes::from(decode_bytes_u16(r)?);
+            let val = Bytes::from(decode_bytes_u32(r)?);
+            headers.push((name, val));
+        }
+        Ok(Self {
+            sub_id,
+            message_id,
+            timestamp,
+            key,
+            value,
+            headers,
+        })
+    }
+
+    /// Zero-copy decode message body from a `Bytes` buffer (without tag byte).
+    fn decode_body_bytes(buf: &mut Bytes) -> Result<Self, ProtocolError> {
+        let sub_id = read_u32_le_buf(buf)?;
+        let message_id = read_u64_le_buf(buf)?;
+        let timestamp = read_u64_le_buf(buf)?;
+        let key_tag = read_u8_buf(buf)?;
+        let key = match key_tag {
+            0 => None,
+            1 => Some(split_bytes_u32(buf)?),
+            _ => return Err(ProtocolError::UnknownTag(key_tag)),
+        };
+        let value = split_bytes_u32(buf)?;
+        let header_count = read_u16_le_buf(buf)? as usize;
+        let mut headers = Vec::with_capacity(header_count);
+        for _ in 0..header_count {
+            let name = split_bytes_u16(buf)?;
+            let val = split_bytes_u32(buf)?;
+            headers.push((name, val));
+        }
+        Ok(Self {
+            sub_id,
+            message_id,
+            timestamp,
+            key,
+            value,
+            headers,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -589,7 +740,10 @@ pub enum ServerFrame {
         sub_id: u32,
         entity_id: u64,
     },
-    Message(Box<ServerMessage>),
+    Message(ServerMessage),
+    /// Batch of messages sharing one TCP frame. Reduces per-message framing
+    /// overhead and enables single-syscall delivery of multiple messages.
+    MessageBatch(Vec<ServerMessage>),
     SubscriptionErr {
         sub_id: u32,
         code: u16,
@@ -626,21 +780,13 @@ impl Encode for ServerFrame {
             }
             Self::Message(msg) => {
                 (ServerTag::Message as u8).encode(w)?;
-                msg.sub_id.encode(w)?;
-                msg.message_id.encode(w)?;
-                msg.timestamp.encode(w)?;
-                match &msg.key {
-                    None => 0u8.encode(w)?,
-                    Some(k) => {
-                        1u8.encode(w)?;
-                        encode_bytes_u32(w, k)?;
-                    }
-                }
-                encode_bytes_u32(w, &msg.value)?;
-                (msg.headers.len() as u16).encode(w)?;
-                for (name, val) in &msg.headers {
-                    encode_bytes_u16(w, name)?;
-                    encode_bytes_u32(w, val)?;
+                msg.encode_body(w)?;
+            }
+            Self::MessageBatch(msgs) => {
+                (ServerTag::MessageBatch as u8).encode(w)?;
+                (msgs.len() as u16).encode(w)?;
+                for msg in msgs {
+                    msg.encode_body(w)?;
                 }
             }
             Self::SubscriptionErr {
@@ -670,17 +816,9 @@ impl Encode for ServerFrame {
             Self::HandshakeOk { session_token, .. } => 8 + encoded_size_bytes_u16(session_token),
             Self::HandshakeErr { message, .. } => 2 + encoded_size_bytes_u16(message),
             Self::Subscribed { .. } => 4 + 8,
-            Self::Message(msg) => {
-                let key_size = match &msg.key {
-                    None => 1,
-                    Some(k) => 1 + encoded_size_bytes_u32(k),
-                };
-                let headers_size: usize = msg
-                    .headers
-                    .iter()
-                    .map(|(name, val)| encoded_size_bytes_u16(name) + encoded_size_bytes_u32(val))
-                    .sum();
-                4 + 8 + 8 + key_size + encoded_size_bytes_u32(&msg.value) + 2 + headers_size
+            Self::Message(msg) => msg.body_encoded_size(),
+            Self::MessageBatch(msgs) => {
+                2 + msgs.iter().map(|m| m.body_encoded_size()).sum::<usize>()
             }
             Self::SubscriptionErr { message, .. } => 4 + 2 + encoded_size_bytes_u16(message),
             Self::Heartbeat { .. } => 8,
@@ -705,32 +843,14 @@ impl Decode for ServerFrame {
                 sub_id: u32::decode(r)?,
                 entity_id: u64::decode(r)?,
             }),
-            ServerTag::Message => {
-                let sub_id = u32::decode(r)?;
-                let message_id = u64::decode(r)?;
-                let timestamp = u64::decode(r)?;
-                let key_tag = u8::decode(r)?;
-                let key = match key_tag {
-                    0 => None,
-                    1 => Some(Bytes::from(decode_bytes_u32(r)?)),
-                    _ => return Err(ProtocolError::UnknownTag(key_tag)),
-                };
-                let value = Bytes::from(decode_bytes_u32(r)?);
-                let header_count = u16::decode(r)? as usize;
-                let mut headers = Vec::with_capacity(header_count);
-                for _ in 0..header_count {
-                    let name = Bytes::from(decode_bytes_u16(r)?);
-                    let val = Bytes::from(decode_bytes_u32(r)?);
-                    headers.push((name, val));
+            ServerTag::Message => Ok(Self::Message(ServerMessage::decode_body(r)?)),
+            ServerTag::MessageBatch => {
+                let count = u16::decode(r)? as usize;
+                let mut msgs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    msgs.push(ServerMessage::decode_body(r)?);
                 }
-                Ok(Self::Message(Box::new(ServerMessage {
-                    sub_id,
-                    message_id,
-                    timestamp,
-                    key,
-                    value,
-                    headers,
-                })))
+                Ok(Self::MessageBatch(msgs))
             }
             ServerTag::SubscriptionErr => Ok(Self::SubscriptionErr {
                 sub_id: u32::decode(r)?,
@@ -765,32 +885,14 @@ impl ServerFrame {
                 sub_id: read_u32_le_buf(&mut buf)?,
                 entity_id: read_u64_le_buf(&mut buf)?,
             }),
-            ServerTag::Message => {
-                let sub_id = read_u32_le_buf(&mut buf)?;
-                let message_id = read_u64_le_buf(&mut buf)?;
-                let timestamp = read_u64_le_buf(&mut buf)?;
-                let key_tag = read_u8_buf(&mut buf)?;
-                let key = match key_tag {
-                    0 => None,
-                    1 => Some(split_bytes_u32(&mut buf)?),
-                    _ => return Err(ProtocolError::UnknownTag(key_tag)),
-                };
-                let value = split_bytes_u32(&mut buf)?;
-                let header_count = read_u16_le_buf(&mut buf)? as usize;
-                let mut headers = Vec::with_capacity(header_count);
-                for _ in 0..header_count {
-                    let name = split_bytes_u16(&mut buf)?;
-                    let val = split_bytes_u32(&mut buf)?;
-                    headers.push((name, val));
+            ServerTag::Message => Ok(Self::Message(ServerMessage::decode_body_bytes(&mut buf)?)),
+            ServerTag::MessageBatch => {
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut msgs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    msgs.push(ServerMessage::decode_body_bytes(&mut buf)?);
                 }
-                Ok(Self::Message(Box::new(ServerMessage {
-                    sub_id,
-                    message_id,
-                    timestamp,
-                    key,
-                    value,
-                    headers,
-                })))
+                Ok(Self::MessageBatch(msgs))
             }
             ServerTag::SubscriptionErr => Ok(Self::SubscriptionErr {
                 sub_id: read_u32_le_buf(&mut buf)?,
@@ -997,7 +1099,7 @@ mod tests {
 
     #[test]
     fn test_server_message_roundtrip() {
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 500,
             timestamp: 1_700_000_000_000,
@@ -1013,35 +1115,35 @@ mod tests {
                     Bytes::from_static(b"abc-def"),
                 ),
             ],
-        }));
+        });
         assert_eq!(roundtrip_server(&frame), frame);
         assert_eq!(roundtrip_server_zc(&frame), frame);
     }
 
     #[test]
     fn test_server_message_no_key() {
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 2,
             message_id: 1,
             timestamp: 0,
             key: None,
             value: Bytes::from_static(b"data"),
             headers: vec![],
-        }));
+        });
         assert_eq!(roundtrip_server(&frame), frame);
         assert_eq!(roundtrip_server_zc(&frame), frame);
     }
 
     #[test]
     fn test_server_message_empty_key() {
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 2,
             message_id: 1,
             timestamp: 0,
             key: Some(Bytes::new()),
             value: Bytes::new(),
             headers: vec![],
-        }));
+        });
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
@@ -1105,14 +1207,14 @@ mod tests {
 
     #[test]
     fn test_invalid_key_tag_in_message() {
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 1,
             timestamp: 1,
             key: None,
             value: Bytes::from_static(b"x"),
             headers: vec![],
-        }));
+        });
         let mut encoded = frame.encode_to_vec().unwrap();
         // key tag is at offset: 1(tag) + 4(sub_id) + 8(msg_id) + 8(timestamp) = 21
         encoded[21] = 0x99;
@@ -1182,28 +1284,28 @@ mod tests {
     #[test]
     fn test_message_large_value() {
         let value = Bytes::from(vec![0xCC; 1_000_000]);
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 1,
             timestamp: 1,
             key: None,
             value,
             headers: vec![],
-        }));
+        });
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
     #[test]
     fn test_message_large_key() {
         let key = Bytes::from(vec![0xDD; 100_000]);
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 1,
             timestamp: 1,
             key: Some(key),
             value: Bytes::from_static(b"v"),
             headers: vec![],
-        }));
+        });
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
@@ -1217,27 +1319,27 @@ mod tests {
                 )
             })
             .collect();
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 10,
             message_id: 999,
             timestamp: 1_700_000_000,
             key: Some(Bytes::from_static(b"k")),
             value: Bytes::from_static(b"v"),
             headers,
-        }));
+        });
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
     #[test]
     fn test_message_empty_header_name_and_value() {
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 1,
             timestamp: 0,
             key: None,
             value: Bytes::new(),
             headers: vec![(Bytes::new(), Bytes::new()), (Bytes::new(), Bytes::new())],
-        }));
+        });
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
@@ -1348,14 +1450,14 @@ mod tests {
 
     #[test]
     fn test_zero_copy_server_message() {
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 42,
             timestamp: 1000,
             key: Some(Bytes::from_static(b"key")),
             value: Bytes::from_static(b"value"),
             headers: vec![(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))],
-        }));
+        });
         assert_eq!(roundtrip_server_zc(&frame), frame);
     }
 
@@ -1378,5 +1480,103 @@ mod tests {
         };
         // key(3) + value(5) + header_name(1) + header_val(1) = 10
         assert_eq!(msg.payload_bytes(), 10);
+    }
+
+    // =========================================================================
+    // MessageBatch roundtrips
+    // =========================================================================
+
+    #[test]
+    fn test_server_message_batch_roundtrip() {
+        let frame = ServerFrame::MessageBatch(vec![
+            ServerMessage {
+                sub_id: 1,
+                message_id: 100,
+                timestamp: 1000,
+                key: Some(Bytes::from_static(b"k1")),
+                value: Bytes::from_static(b"v1"),
+                headers: vec![],
+            },
+            ServerMessage {
+                sub_id: 1,
+                message_id: 101,
+                timestamp: 1001,
+                key: None,
+                value: Bytes::from_static(b"v2"),
+                headers: vec![(Bytes::from_static(b"h"), Bytes::from_static(b"v"))],
+            },
+            ServerMessage {
+                sub_id: 2,
+                message_id: 200,
+                timestamp: 2000,
+                key: Some(Bytes::from_static(b"k3")),
+                value: Bytes::from_static(b"v3"),
+                headers: vec![],
+            },
+        ]);
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_message_batch_empty() {
+        let frame = ServerFrame::MessageBatch(vec![]);
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_message_batch_single() {
+        let frame = ServerFrame::MessageBatch(vec![ServerMessage {
+            sub_id: 5,
+            message_id: 42,
+            timestamp: 999,
+            key: None,
+            value: Bytes::from_static(b"hello"),
+            headers: vec![],
+        }]);
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    // =========================================================================
+    // ClientFrame::Publish roundtrips
+    // =========================================================================
+
+    #[test]
+    fn test_client_publish_roundtrip() {
+        let frame = ClientFrame::Publish {
+            group_id: 7,
+            topic_name_hash: 0xDEADBEEF,
+            messages: vec![
+                Bytes::from_static(b"msg1"),
+                Bytes::from_static(b"msg2"),
+                Bytes::from_static(b"msg3"),
+            ],
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_publish_empty_messages() {
+        let frame = ClientFrame::Publish {
+            group_id: 1,
+            topic_name_hash: 42,
+            messages: vec![],
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_publish_single_large_message() {
+        let frame = ClientFrame::Publish {
+            group_id: 1,
+            topic_name_hash: 42,
+            messages: vec![Bytes::from(vec![0xAB; 100_000])],
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
     }
 }

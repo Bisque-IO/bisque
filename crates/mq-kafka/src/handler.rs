@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use bisque_mq::types::{MessagePayload, MqCommand, MqResponse, RetentionPolicy, name_hash};
+use bisque_mq::flat::FlatMessageBuilder;
+use bisque_mq::types::{MqCommand, MqResponse, RetentionPolicy, name_hash};
 use bisque_mq::write_batcher::MqWriteBatcher;
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -289,7 +290,7 @@ impl KafkaHandler {
             .unwrap()
             .as_millis() as u64;
 
-        let messages: Vec<MessagePayload> = batch
+        let messages: Vec<Bytes> = batch
             .records
             .iter()
             .map(|r| {
@@ -298,24 +299,21 @@ impl KafkaHandler {
                 } else {
                     now
                 };
-                MessagePayload {
-                    key: r.key.clone(),
-                    value: r.value.clone().unwrap_or_default(),
-                    headers: r
-                        .headers
-                        .iter()
-                        .map(|h| (h.key.clone(), h.value.clone()))
-                        .collect(),
-                    timestamp,
-                    ttl_ms: None,
-                    routing_key: None,
+                let mut builder = FlatMessageBuilder::new(r.value.clone().unwrap_or_default())
+                    .timestamp(timestamp);
+                if let Some(ref key) = r.key {
+                    builder = builder.key(key.clone());
                 }
+                for h in &r.headers {
+                    builder = builder.header(Bytes::from(h.key.clone()), h.value.clone());
+                }
+                builder.build()
             })
             .collect();
 
         self.m_produce_messages.increment(messages.len() as u64);
 
-        let cmd = MqCommand::Publish { topic_id, messages };
+        let cmd = MqCommand::publish(topic_id, &messages);
 
         match self.batcher.submit(cmd).await {
             Ok(MqResponse::Published { offsets }) => {
@@ -594,11 +592,7 @@ impl KafkaHandler {
                         });
                     }
                     Some(topic_id) => {
-                        let cmd = MqCommand::CommitOffset {
-                            topic_id,
-                            consumer_id,
-                            offset: offset as u64,
-                        };
+                        let cmd = MqCommand::commit_offset(topic_id, consumer_id, offset as u64);
                         let error_code = match self.batcher.submit(cmd).await {
                             Ok(MqResponse::Ok) => ErrorCode::None.as_i16(),
                             Ok(MqResponse::Error(e)) => {
@@ -690,10 +684,7 @@ impl KafkaHandler {
 
             for i in 0..num_partitions {
                 let mq_name = partition::partition_topic_name(&ct.name, i as i32);
-                let cmd = MqCommand::CreateTopic {
-                    name: mq_name,
-                    retention: RetentionPolicy::default(),
-                };
+                let cmd = MqCommand::create_topic(&mq_name, RetentionPolicy::default(), 0);
                 match self.batcher.submit(cmd).await {
                     Ok(MqResponse::EntityCreated { .. }) => {}
                     Ok(MqResponse::Error(bisque_mq::types::MqError::AlreadyExists { .. })) => {
@@ -758,7 +749,7 @@ impl KafkaHandler {
                 Some(ids) => {
                     let mut error_code = ErrorCode::None.as_i16();
                     for topic_id in ids {
-                        let cmd = MqCommand::DeleteTopic { topic_id };
+                        let cmd = MqCommand::delete_topic(topic_id);
                         if let Err(e) = self.batcher.submit(cmd).await {
                             warn!("delete topic error: {e}");
                             error_code = ErrorCode::UnknownTopicOrPartition.as_i16();

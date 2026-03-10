@@ -7,15 +7,11 @@ impl MqEngine {
     fn recompute_purge_floor(&mut self) -> u64 {
         let mut min_index = u64::MAX;
 
-        for topic in self.topics.values_mut() {
-            if topic.meta.message_count > 0 {
-                min_index = min_index.min(topic.meta.tail_index);
-            }
-            let topic_min = topic.min_required_index();
-            if topic_min > 0 {
-                min_index = min_index.min(topic_min);
-            }
-        }
+        // Topics use dense per-topic offsets and direct segment addressing
+        // (MessageLocation), so their tail_index / consumer offsets are NOT
+        // raft log indexes and must not participate in the raft purge floor.
+        // Segment retention for topic data is handled separately via segment
+        // reference tracking.
 
         for queue in self.queues.values_mut() {
             if let Some(q_min) = queue.min_required_index() {

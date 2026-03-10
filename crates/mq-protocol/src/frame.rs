@@ -200,14 +200,14 @@ mod tests {
         use crate::types::ServerMessage;
         let (mut client, mut server) = tokio::io::duplex(8192);
 
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 5,
             message_id: 42,
             timestamp: 1_700_000_000,
             key: Some(Bytes::from_static(b"key")),
             value: Bytes::from_static(b"hello"),
             headers: vec![(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))],
-        }));
+        });
         let encoded = encode_server_frame(&frame).unwrap();
 
         write_tcp_frame(&mut server, &encoded).await.unwrap();
@@ -290,14 +290,14 @@ mod tests {
         use crate::types::ServerMessage;
         let (mut writer, mut reader) = tokio::io::duplex(8192);
 
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 42,
             timestamp: 1000,
             key: Some(Bytes::from_static(b"key")),
             value: Bytes::from_static(b"value"),
             headers: vec![(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))],
-        }));
+        });
         let encoded = encode_server_frame(&frame).unwrap();
         write_tcp_frame(&mut writer, &encoded).await.unwrap();
         drop(writer);
@@ -313,14 +313,14 @@ mod tests {
         use crate::types::ServerMessage;
         let (mut writer, mut reader) = tokio::io::duplex(8192);
 
-        let frame = ServerFrame::Message(Box::new(ServerMessage {
+        let frame = ServerFrame::Message(ServerMessage {
             sub_id: 1,
             message_id: 1,
             timestamp: 1,
             key: None,
             value: Bytes::from_static(b"test"),
             headers: vec![],
-        }));
+        });
 
         let mut buf = Vec::new();
         encode_server_frame_prefixed(&frame, &mut buf).unwrap();

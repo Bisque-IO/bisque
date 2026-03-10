@@ -37,6 +37,7 @@ tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 tracing = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

@@ -418,7 +418,9 @@ pub struct Publish {
     pub dup: bool,
     pub qos: QoS,
     pub retain: bool,
-    pub topic: String,
+    /// Topic name as raw bytes (validated UTF-8 on decode).
+    /// Using `Bytes` instead of `String` enables zero-copy from the read buffer.
+    pub topic: Bytes,
     /// Packet identifier (present for QoS 1 and 2).
     #[serde(default)]
     pub packet_id: Option<u16>,

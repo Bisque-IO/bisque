@@ -8,9 +8,12 @@
 //!
 //! Uses [`crossfire`] lock-free bounded channels for the ingestion queue.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
+use bytes::Bytes;
 use openraft::Raft;
+use smallvec::SmallVec;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -79,6 +82,14 @@ pub enum MqBatcherError {
 struct BatchedRequest {
     command: MqCommand,
     response_tx: oneshot::Sender<MqResponse>,
+}
+
+/// Tracks how to distribute a merged response back to original callers.
+enum ResponseSlot {
+    /// Single original caller — forward response directly.
+    Single(oneshot::Sender<MqResponse>),
+    /// Merged Publish callers — split `Published { offsets }` by message count.
+    MergedPublish(Vec<(oneshot::Sender<MqResponse>, usize)>),
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +181,119 @@ impl MqWriteBatcher {
 // Batcher loop
 // ---------------------------------------------------------------------------
 
+/// Merge same-topic `Publish` commands in `pending` to reduce per-command overhead.
+///
+/// Returns `(merged_commands, response_slots)` where each slot knows how to
+/// distribute the raft response back to original callers.
+fn merge_pending(pending: &mut Vec<BatchedRequest>) -> (Vec<MqCommand>, Vec<ResponseSlot>) {
+    let mut commands = Vec::with_capacity(pending.len());
+    let mut slots = Vec::with_capacity(pending.len());
+
+    // Index: topic_id → position in `commands` vec (for Publish merging).
+    let mut publish_idx: HashMap<u64, usize> = HashMap::new();
+    // Index: queue_id → position in `commands` vec (for Enqueue merging).
+    let mut enqueue_idx: HashMap<u64, usize> = HashMap::new();
+
+    for req in pending.drain(..) {
+        match req.command.tag() {
+            MqCommand::TAG_PUBLISH => {
+                let v = req.command.as_publish();
+                let topic_id = v.topic_id();
+                if let Some(&idx) = publish_idx.get(&topic_id) {
+                    // Merge: collect messages from both and create new command
+                    let msg_count = v.message_count() as usize;
+                    let existing: &MqCommand = &commands[idx];
+                    let ex_v = existing.as_publish();
+                    let mut all_msgs: Vec<Bytes> = ex_v.messages().collect();
+                    all_msgs.extend(v.messages());
+                    commands[idx] = MqCommand::publish(topic_id, &all_msgs);
+                    if let ResponseSlot::MergedPublish(ref mut callers) = slots[idx] {
+                        callers.push((req.response_tx, msg_count));
+                    }
+                } else {
+                    let idx = commands.len();
+                    let msg_count = v.message_count() as usize;
+                    publish_idx.insert(topic_id, idx);
+                    commands.push(req.command);
+                    slots.push(ResponseSlot::MergedPublish(vec![(
+                        req.response_tx,
+                        msg_count,
+                    )]));
+                }
+            }
+            MqCommand::TAG_ENQUEUE => {
+                let v = req.command.as_enqueue();
+                let queue_id = v.queue_id();
+                if let Some(&idx) = enqueue_idx.get(&queue_id) {
+                    let msg_count = v.message_count() as usize;
+                    let existing = &commands[idx];
+                    let ex_v = existing.as_enqueue();
+                    let mut all_msgs: Vec<Bytes> = ex_v.messages().collect();
+                    all_msgs.extend(v.messages());
+                    let mut all_keys: Vec<Option<Bytes>> = ex_v.dedup_keys().collect();
+                    all_keys.extend(v.dedup_keys());
+                    commands[idx] = MqCommand::enqueue(queue_id, &all_msgs, &all_keys);
+                    if let ResponseSlot::MergedPublish(ref mut callers) = slots[idx] {
+                        callers.push((req.response_tx, msg_count));
+                    }
+                } else {
+                    let idx = commands.len();
+                    let msg_count = v.message_count() as usize;
+                    enqueue_idx.insert(queue_id, idx);
+                    commands.push(req.command);
+                    slots.push(ResponseSlot::MergedPublish(vec![(
+                        req.response_tx,
+                        msg_count,
+                    )]));
+                }
+            }
+            _ => {
+                commands.push(req.command);
+                slots.push(ResponseSlot::Single(req.response_tx));
+            }
+        }
+    }
+
+    (commands, slots)
+}
+
+/// Distribute a response to its original caller(s) via the slot.
+fn dispatch_response(slot: ResponseSlot, response: MqResponse) {
+    match slot {
+        ResponseSlot::Single(tx) => {
+            let _ = tx.send(response);
+        }
+        ResponseSlot::MergedPublish(callers) => {
+            if callers.len() == 1 {
+                let _ = callers.into_iter().next().unwrap().0.send(response);
+                return;
+            }
+            match response {
+                MqResponse::Published { offsets } => {
+                    let mut offset_iter = offsets.into_iter();
+                    for (tx, count) in callers {
+                        let caller_offsets: SmallVec<[u64; 16]> =
+                            (&mut offset_iter).take(count).collect();
+                        let _ = tx.send(MqResponse::Published {
+                            offsets: caller_offsets,
+                        });
+                    }
+                }
+                MqResponse::Error(_) => {
+                    for (tx, _) in callers {
+                        let _ = tx.send(response.clone());
+                    }
+                }
+                other => {
+                    for (tx, _) in callers {
+                        let _ = tx.send(other.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn batcher_loop(
     rx: crossfire::AsyncRx<crossfire::mpsc::Array<BatchedRequest>>,
     raft: Raft<MqTypeConfig>,
@@ -213,48 +337,43 @@ async fn batcher_loop(
         let num_commands = pending.len();
         let flushed_by_count = num_commands >= config.max_batch_count;
 
-        // Step 3: Build command and propose through Raft.
-        if num_commands == 1 {
+        // Step 3: Merge same-topic Publishes and same-queue Enqueues.
+        let (commands, slots) = merge_pending(&mut pending);
+
+        // Step 4: Build command and propose through Raft.
+        if commands.len() == 1 {
             // Single-command fast path: no Batch wrapper.
-            let req = pending.drain(..).next().unwrap();
-            match raft.client_write(req.command).await {
+            let cmd = commands.into_iter().next().unwrap();
+            let slot = slots.into_iter().next().unwrap();
+            match raft.client_write(cmd).await {
                 Ok(resp) => {
-                    let _ = req.response_tx.send(resp.response().clone());
+                    dispatch_response(slot, resp.response().clone());
                 }
                 Err(e) => {
                     warn!("mq batcher: raft error: {}", e);
-                    let _ = req
-                        .response_tx
-                        .send(MqResponse::Error(MqError::Custom(format!(
-                            "raft error: {}",
-                            e
-                        ))));
+                    dispatch_response(
+                        slot,
+                        MqResponse::Error(MqError::Custom(format!("raft error: {}", e))),
+                    );
                 }
             }
         } else {
-            // Multi-command: wrap in Batch. Move commands to avoid cloning.
-            let (commands, response_txs): (Vec<MqCommand>, Vec<oneshot::Sender<MqResponse>>) =
-                pending
-                    .drain(..)
-                    .map(|r| (r.command, r.response_tx))
-                    .unzip();
-            let batch_cmd = MqCommand::Batch(commands);
+            let batch_cmd = MqCommand::batch(&commands);
 
             match raft.client_write(batch_cmd).await {
                 Ok(resp) => {
                     let response = resp.response().clone();
                     match response {
                         MqResponse::BatchResponse(responses) => {
-                            for (tx, individual_response) in
-                                response_txs.into_iter().zip(responses.into_iter())
+                            for (slot, individual_response) in
+                                slots.into_iter().zip(responses.into_iter())
                             {
-                                let _ = tx.send(individual_response);
+                                dispatch_response(slot, individual_response);
                             }
                         }
                         other => {
-                            // Unexpected — send same response to all callers.
-                            for tx in response_txs {
-                                let _ = tx.send(other.clone());
+                            for slot in slots {
+                                dispatch_response(slot, other.clone());
                             }
                         }
                     }
@@ -263,8 +382,8 @@ async fn batcher_loop(
                     warn!("mq batcher: raft batch error: {}", e);
                     let error_resp =
                         MqResponse::Error(MqError::Custom(format!("raft error: {}", e)));
-                    for tx in response_txs {
-                        let _ = tx.send(error_resp.clone());
+                    for slot in slots {
+                        dispatch_response(slot, error_resp.clone());
                     }
                 }
             }

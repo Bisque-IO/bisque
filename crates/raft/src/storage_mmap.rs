@@ -21,7 +21,7 @@
 //! Plus shared manifest MDBX in `{base_dir}/.raft_manifest/` for fast recovery.
 
 use crate::codec::{BorrowPayload, Decode, Encode};
-use crate::manifest_mdbx::{ManifestManager, SegmentMeta};
+use crate::manifest_mdbx::{ManifestManager, SegmentLocation, SegmentMeta};
 use crate::record_format::{
     AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, HEADER_SIZE, LENGTH_SIZE, LogIndex,
     LogLocation, MAX_GROUPS, RecordType, RecordTypeFlags, append_record_into, validate_record,
@@ -69,6 +69,25 @@ pub struct MmapStorageConfig {
     pub max_record_size: u64,
     /// Delay before triggering fsync after the first write. Allows write coalescing.
     pub fsync_delay: std::time::Duration,
+
+    // -- Tiered storage settings (Tier 1/2) --
+    /// Maximum number of sealed segments to keep pinned (mmap'd) in memory.
+    /// When exceeded, the least-recently-used segments are unpinned (closed).
+    /// This controls Tier 1 (hot) memory usage. 0 = unlimited (no eviction).
+    pub max_pinned_segments: u32,
+    /// Maximum total bytes of segment files to retain on local disk.
+    /// When exceeded, oldest sealed segments may be deleted (only if archived to S3).
+    /// 0 = unlimited.
+    pub max_local_bytes: u64,
+    /// Maximum number of concurrent segment reopen (mmap) operations.
+    /// Provides backpressure when many reads hit unpinned segments simultaneously.
+    pub max_concurrent_segment_opens: u32,
+
+    // -- Tier 3: Remote archival settings --
+    /// Optional S3-compatible archive configuration. When set, sealed segments
+    /// are uploaded to remote storage after sealing, and can be fetched on
+    /// cache miss when the local file has been evicted.
+    pub s3_archive: Option<crate::segment_archive::S3ArchiveConfig>,
 }
 
 impl Default for MmapStorageConfig {
@@ -79,6 +98,10 @@ impl Default for MmapStorageConfig {
             segment_size: DEFAULT_SEGMENT_SIZE,
             max_record_size: DEFAULT_MAX_RECORD_SIZE,
             fsync_delay: std::time::Duration::from_millis(1),
+            max_pinned_segments: 256,
+            max_local_bytes: 0,
+            max_concurrent_segment_opens: 8,
+            s3_archive: None,
         }
     }
 }
@@ -101,6 +124,32 @@ impl MmapStorageConfig {
     /// Set the fsync delay (time to coalesce writes before fsyncing)
     pub fn with_fsync_delay(mut self, delay: std::time::Duration) -> Self {
         self.fsync_delay = delay;
+        self
+    }
+
+    /// Set the maximum number of sealed segments to keep pinned in memory.
+    /// 0 = unlimited (no LRU eviction).
+    pub fn with_max_pinned_segments(mut self, max: u32) -> Self {
+        self.max_pinned_segments = max;
+        self
+    }
+
+    /// Set the maximum total bytes of segment files on local disk.
+    /// 0 = unlimited.
+    pub fn with_max_local_bytes(mut self, max: u64) -> Self {
+        self.max_local_bytes = max;
+        self
+    }
+
+    /// Set the maximum number of concurrent segment reopen operations.
+    pub fn with_max_concurrent_segment_opens(mut self, max: u32) -> Self {
+        self.max_concurrent_segment_opens = max;
+        self
+    }
+
+    /// Enable S3-compatible segment archival with the given config.
+    pub fn with_s3_archive(mut self, config: crate::segment_archive::S3ArchiveConfig) -> Self {
+        self.s3_archive = Some(config);
         self
     }
 }
@@ -300,7 +349,7 @@ fn bytes_from_segment(segment: &Arc<Segment>, offset: usize, len: usize) -> byte
 // MmapSegmentMap — in-memory segment tracking shared between writer and readers
 // ---------------------------------------------------------------------------
 
-/// A sealed segment pinned in memory with its entry index range.
+/// A sealed segment pinned in memory with its entry index range and LRU tracking.
 /// Per-segment entry location table. Built once when a segment is pinned.
 /// Enables O(1) direct Vec index lookup for entry reads — no LogIndex (Congee)
 /// or segment map (HashMap mutex) lookups needed.
@@ -360,20 +409,32 @@ struct PinnedEntry {
     min_index: u64,
     max_index: u64,
     entry_index: Arc<SegmentEntryIndex>,
+    /// Monotonic counter for LRU eviction. Higher = more recently accessed.
+    last_access: u64,
 }
 
 struct MmapSegmentMap {
-    /// Segments pinned by the state machine. No eviction — explicit unpin only.
+    /// Sealed segments pinned (mmap'd) in memory with LRU eviction tracking.
     /// Arc'd so prefetch tasks can capture it without borrowing self.
     pinned: Arc<Mutex<HashMap<u64, PinnedEntry>>>,
     /// Active segment: atomically swapped on rotation. No lock on read path.
     active: ArcSwap<Segment>,
     /// Group directory for reopening segments from disk.
     group_dir: PathBuf,
+    /// Group ID for archive key generation.
+    group_id: u64,
     /// State machine's minimum required index. Segments fully below this can be purged.
     purge_floor: Arc<AtomicU64>,
     /// State machine's last applied index. Segments fully above this are not needed yet.
     pin_ceiling: Arc<AtomicU64>,
+    /// Monotonic counter for LRU tracking. Incremented on each segment access.
+    access_counter: AtomicU64,
+    /// Maximum number of pinned segments. 0 = unlimited.
+    max_pinned: u32,
+    /// Semaphore limiting concurrent segment reopen (mmap) operations.
+    reopen_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Optional archive manager for downloading remote segments on cache miss.
+    archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
 }
 
 /// Sentinel segment used as initial placeholder before the first real segment is set.
@@ -395,17 +456,58 @@ fn sentinel_segment() -> Arc<Segment> {
 }
 
 impl MmapSegmentMap {
-    fn new(group_dir: PathBuf, purge_floor: Arc<AtomicU64>, pin_ceiling: Arc<AtomicU64>) -> Self {
+    fn new(
+        group_dir: PathBuf,
+        group_id: u64,
+        purge_floor: Arc<AtomicU64>,
+        pin_ceiling: Arc<AtomicU64>,
+        config: &MmapStorageConfig,
+        archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
+    ) -> Self {
         Self {
             pinned: Arc::new(Mutex::new(HashMap::new())),
             active: ArcSwap::new(sentinel_segment()),
             group_dir,
+            group_id,
             purge_floor,
             pin_ceiling,
+            access_counter: AtomicU64::new(1),
+            max_pinned: config.max_pinned_segments,
+            reopen_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                config.max_concurrent_segment_opens as usize,
+            )),
+            archive,
+        }
+    }
+
+    /// Increment and return the next access counter value for LRU tracking.
+    #[inline]
+    fn next_access(&self) -> u64 {
+        self.access_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Evict least-recently-used pinned segments until count <= limit.
+    /// Must be called with `pinned` already locked. Does NOT delete files — only unpins.
+    fn evict_lru(pinned: &mut HashMap<u64, PinnedEntry>, max: u32) {
+        if max == 0 {
+            return; // unlimited
+        }
+        while pinned.len() > max as usize {
+            // Find the entry with the smallest last_access
+            let victim = pinned
+                .iter()
+                .min_by_key(|(_, e)| e.last_access)
+                .map(|(&k, _)| k);
+            if let Some(seg_id) = victim {
+                pinned.remove(&seg_id);
+            } else {
+                break;
+            }
         }
     }
 
     /// Pin a sealed segment with its entry index range and entry index.
+    /// Evicts LRU segments if over the limit.
     fn pin(
         &self,
         segment: Arc<Segment>,
@@ -413,6 +515,7 @@ impl MmapSegmentMap {
         max_index: u64,
         entry_index: Arc<SegmentEntryIndex>,
     ) {
+        let access = self.next_access();
         let mut pinned = self.pinned.lock();
         pinned.insert(
             segment.segment_id,
@@ -421,12 +524,15 @@ impl MmapSegmentMap {
                 min_index,
                 max_index,
                 entry_index,
+                last_access: access,
             },
         );
+        Self::evict_lru(&mut pinned, self.max_pinned);
     }
 
     /// Find the segment for a given segment_id. Lock-free for active, O(1) for pinned.
     /// Returns None if the segment is not pinned — caller must use async reopen.
+    /// Updates LRU access time on hit.
     fn find_segment(&self, segment_id: u64) -> Option<Arc<Segment>> {
         // Check active first (most recent writes) — no lock
         let active = self.active.load();
@@ -434,26 +540,49 @@ impl MmapSegmentMap {
             return Some(Arc::clone(&active));
         }
         // Check pinned — O(1) hash lookup, brief mutex
-        let pinned = self.pinned.lock();
-        pinned.get(&segment_id).map(|e| Arc::clone(&e.segment))
+        let mut pinned = self.pinned.lock();
+        if let Some(entry) = pinned.get_mut(&segment_id) {
+            entry.last_access = self.next_access();
+            return Some(Arc::clone(&entry.segment));
+        }
+        None
     }
 
     /// Get segment + entry index for cached reads. Brief mutex lock.
     /// Returns None if not pinned (active segments don't have entry indexes).
+    /// Updates LRU access time on hit.
     fn find_segment_indexed(
         &self,
         segment_id: u64,
     ) -> Option<(Arc<Segment>, Arc<SegmentEntryIndex>)> {
-        let pinned = self.pinned.lock();
-        pinned
-            .get(&segment_id)
-            .map(|e| (Arc::clone(&e.segment), Arc::clone(&e.entry_index)))
+        let mut pinned = self.pinned.lock();
+        if let Some(entry) = pinned.get_mut(&segment_id) {
+            entry.last_access = self.next_access();
+            return Some((Arc::clone(&entry.segment), Arc::clone(&entry.entry_index)));
+        }
+        None
     }
 
     /// Async reopen a sealed segment from disk via spawn_blocking.
+    /// Acquires a semaphore permit for backpressure on concurrent opens.
     /// Auto-pins if the segment falls within [purge_floor, pin_ceiling].
+    /// Evicts LRU segments if over the limit.
     /// Builds a SegmentEntryIndex for O(1) entry lookups.
     async fn reopen_segment(&self, segment_id: u64) -> Option<Arc<Segment>> {
+        // Acquire semaphore permit — blocks if too many concurrent reopens
+        let _permit = self.reopen_semaphore.acquire().await.ok()?;
+
+        let local_path = segment_path(&self.group_dir, segment_id);
+
+        // If local file is missing but we have an archive, try downloading from remote
+        if !local_path.exists() {
+            if let Some(ref archive) = self.archive {
+                let _ = archive
+                    .download_segment(self.group_id, segment_id, &local_path)
+                    .await;
+            }
+        }
+
         let group_dir = self.group_dir.clone();
         let purge_floor = Arc::clone(&self.purge_floor);
         let pin_ceiling = Arc::clone(&self.pin_ceiling);
@@ -485,6 +614,7 @@ impl MmapSegmentMap {
 
         let (seg, pin_info, entry_index) = result;
         if let Some((min, max)) = pin_info {
+            let access = self.next_access();
             let mut guard = self.pinned.lock();
             guard.insert(
                 segment_id,
@@ -493,13 +623,17 @@ impl MmapSegmentMap {
                     min_index: min,
                     max_index: max,
                     entry_index,
+                    last_access: access,
                 },
             );
+            Self::evict_lru(&mut guard, self.max_pinned);
         }
         Some(seg)
     }
 
     /// Fire-and-forget prefetch: spawn a background task to reopen and pin a segment.
+    /// Uses try_acquire on the semaphore — skips if no permits available.
+    /// Evicts LRU segments if over the limit.
     /// Builds a SegmentEntryIndex for O(1) entry lookups.
     fn prefetch_segment(&self, segment_id: u64) {
         // Skip if already available
@@ -513,10 +647,19 @@ impl MmapSegmentMap {
             }
         }
 
+        // Try to acquire semaphore — skip prefetch if at capacity
+        let permit = match self.reopen_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
         let group_dir = self.group_dir.clone();
         let pinned = Arc::clone(&self.pinned);
+        let max_pinned = self.max_pinned;
+        let access_counter = self.access_counter.fetch_add(1, Ordering::Relaxed);
 
         tokio::task::spawn(async move {
+            let _permit = permit; // hold until done
             let result = tokio::task::spawn_blocking(move || {
                 let path = segment_path(&group_dir, segment_id);
                 let file = std::fs::File::open(&path).ok()?;
@@ -543,8 +686,10 @@ impl MmapSegmentMap {
                         min_index: min,
                         max_index: max,
                         entry_index,
+                        last_access: access_counter,
                     },
                 );
+                Self::evict_lru(&mut guard, max_pinned);
             }
             Some(())
         });
@@ -599,6 +744,11 @@ impl MmapSegmentMap {
         });
 
         removed
+    }
+
+    /// Return the number of currently pinned segments.
+    fn pinned_count(&self) -> usize {
+        self.pinned.lock().len()
     }
 }
 
@@ -676,6 +826,8 @@ struct SealRequest {
     manifest_tx: MAsyncTx<Array<SegmentMeta>>,
     entry_count: u64,
     first_entry_offset: u64,
+    /// Optional archive for uploading sealed segments to remote storage.
+    archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
 }
 
 /// Result of a background pre-allocation: pending, completed, or failed.
@@ -719,6 +871,8 @@ struct FsyncState<C: RaftTypeConfig> {
     cv: std::sync::Condvar,
     /// Delay before triggering fsync after first enqueue.
     fsync_delay: std::time::Duration,
+    /// Tokio runtime handle for spawning async tasks (e.g. S3 upload) from the fsync thread.
+    tokio_handle: Option<tokio::runtime::Handle>,
     /// Test-only: force sync_data() to return an error.
     #[cfg(test)]
     force_sync_error: AtomicBool,
@@ -738,6 +892,7 @@ impl<C: RaftTypeConfig> FsyncState<C> {
             }),
             cv: std::sync::Condvar::new(),
             fsync_delay,
+            tokio_handle: tokio::runtime::Handle::try_current().ok(),
             #[cfg(test)]
             force_sync_error: AtomicBool::new(false),
             #[cfg(test)]
@@ -959,7 +1114,61 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
                 record_type_flags: req.record_type_flags,
                 entry_count: req.entry_count,
                 first_entry_offset: req.first_entry_offset,
+                location: SegmentLocation::Local,
             });
+
+            // Fire-and-forget: upload sealed segment to remote archive
+            if let Some(archive) = req.archive {
+                let path = req.segment.path.clone();
+                let group_id = req.group_id;
+                let segment_id = req.segment.segment_id;
+                let manifest_tx = req.manifest_tx.clone();
+                let valid_bytes = req.valid_bytes;
+                let min_index = req.min_index;
+                let max_index = req.max_index;
+                let record_count = req.record_count;
+                let record_type_flags = req.record_type_flags;
+                let entry_count = req.entry_count;
+                let first_entry_offset = req.first_entry_offset;
+
+                if let Some(handle) = state.tokio_handle.as_ref() {
+                    handle.spawn(async move {
+                        match archive.upload_segment(group_id, segment_id, &path).await {
+                            Ok(()) => {
+                                // Update manifest location to Both (local + remote)
+                                let _ = manifest_tx.try_send(SegmentMeta {
+                                    group_id,
+                                    segment_id,
+                                    valid_bytes,
+                                    min_index,
+                                    max_index,
+                                    min_ts: None,
+                                    max_ts: None,
+                                    sealed: true,
+                                    record_count,
+                                    record_type_flags,
+                                    entry_count,
+                                    first_entry_offset,
+                                    location: SegmentLocation::Both,
+                                });
+                                tracing::debug!(
+                                    group_id,
+                                    segment_id,
+                                    "segment archived to remote storage"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    group_id,
+                                    segment_id,
+                                    error = %e,
+                                    "failed to archive segment to remote storage"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
         }
 
         // Process pre-allocation requests: create segment files off the hot path
@@ -1067,6 +1276,8 @@ struct WriterState {
     entry_offsets: Vec<(u64, u32)>,
     /// Number of entry records written to the active segment.
     entry_count: u64,
+    /// Optional archive for uploading sealed segments to remote storage.
+    archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
 }
 
 impl WriterState {
@@ -1188,7 +1399,7 @@ impl WriterState {
         let first_entry_offset = self.entry_offsets.first().map_or(0, |&(off, _)| off);
         let entry_count = self.entry_count;
 
-        // Enqueue background sealing: fsync + truncate + manifest update
+        // Enqueue background sealing: fsync + truncate + manifest update + optional S3 upload
         fsync_state.enqueue_seal(SealRequest {
             segment: old_active.clone(),
             valid_bytes,
@@ -1200,6 +1411,7 @@ impl WriterState {
             manifest_tx: manifest_tx.clone(),
             entry_count,
             first_entry_offset,
+            archive: self.archive.clone(),
         });
 
         // Build entry index from collected offsets — zero scanning cost
@@ -1380,6 +1592,8 @@ struct MmapGroupState<C: RaftTypeConfig> {
     /// Last applied index from the state machine.
     /// Segments fully above this are not needed yet. 0 = unconstrained.
     pin_ceiling: Arc<AtomicU64>,
+    /// Optional archive manager for uploading sealed segments to remote storage.
+    archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
 }
 
 impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
@@ -1390,6 +1604,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         group_dir: &Path,
         manifest: &ManifestManager,
         fsync_state: Arc<FsyncState<C>>,
+        archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
     ) -> io::Result<Self>
     where
         C: RaftTypeConfig<
@@ -1409,8 +1624,11 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         let pin_ceiling = Arc::new(AtomicU64::new(0));
         let segment_map = Arc::new(MmapSegmentMap::new(
             group_dir.to_path_buf(),
+            group_id,
             Arc::clone(&purge_floor),
             Arc::clone(&pin_ceiling),
+            config,
+            archive.clone(),
         ));
 
         // Load manifest data for this group
@@ -1562,6 +1780,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                     record_type_flags: scan.record_type_flags,
                     entry_count: 0,
                     first_entry_offset: 0,
+                    location: SegmentLocation::Local,
                 });
             }
 
@@ -1664,6 +1883,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             group_id,
             entry_offsets: Vec::new(),
             entry_count: 0,
+            archive: archive.clone(),
         };
 
         let manifest_tx = manifest.sender();
@@ -1682,6 +1902,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             fsync_state,
             purge_floor,
             pin_ceiling,
+            archive,
         })
     }
 
@@ -1838,13 +2059,32 @@ pub struct MmapPerGroupLogStorage<C: RaftTypeConfig> {
     fsync_state: Arc<FsyncState<C>>,
     /// Fsync thread handle — joined on stop() for deterministic shutdown
     fsync_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Optional archive manager for S3-compatible segment archival.
+    archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
 }
 
 impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
     /// Create a new mmap per-group storage instance.
     pub async fn new(config: impl Into<MmapStorageConfig>) -> io::Result<Self> {
+        Self::new_with_archive(config, None).await
+    }
+
+    /// Create a new mmap per-group storage instance with an optional segment archive
+    /// for S3-compatible remote segment storage.
+    pub async fn new_with_archive(
+        config: impl Into<MmapStorageConfig>,
+        archive: Option<Arc<dyn crate::segment_archive::SegmentArchive>>,
+    ) -> io::Result<Self> {
         let config = Arc::new(config.into());
         tokio::fs::create_dir_all(&*config.base_dir).await?;
+
+        // Build ArchiveManager if both config and archive impl are present
+        let archive_mgr = match (&config.s3_archive, archive) {
+            (Some(s3_config), Some(archive_impl)) => Some(Arc::new(
+                crate::segment_archive::ArchiveManager::new(archive_impl, s3_config.clone()),
+            )),
+            _ => None,
+        };
 
         let base = (*config.base_dir).clone();
         let manifest_dir = config
@@ -1882,6 +2122,7 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
             creation_lock: tokio::sync::Mutex::new(()),
             fsync_state,
             fsync_thread: std::sync::Mutex::new(Some(fsync_handle)),
+            archive: archive_mgr,
         })
     }
 
@@ -1935,9 +2176,17 @@ impl<C: RaftTypeConfig> MmapPerGroupLogStorage<C> {
         let group_dir = group_dir_path(&config.base_dir, group_id);
         let manifest = self.manifest.clone();
         let fsync_state = self.fsync_state.clone();
+        let archive = self.archive.clone();
 
         let state = tokio::task::spawn_blocking(move || {
-            MmapGroupState::new(group_id, &config, &group_dir, &manifest, fsync_state)
+            MmapGroupState::new(
+                group_id,
+                &config,
+                &group_dir,
+                &manifest,
+                fsync_state,
+                archive,
+            )
         })
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
@@ -2041,6 +2290,127 @@ impl SegmentPrefetcher {
     /// Return the segment ID that contains the given log index, if known.
     pub fn segment_id_for(&self, log_index: u64) -> Option<u64> {
         self.log_index.get(log_index).map(|loc| loc.segment_id)
+    }
+
+    /// Return the full `LogLocation` for a given log index.
+    pub fn log_location(&self, log_index: u64) -> Option<LogLocation> {
+        self.log_index.get(log_index)
+    }
+
+    /// Read raw bytes at a specific `(segment_id, offset)` with a known length.
+    ///
+    /// Returns a zero-copy `Bytes` backed by the mmap segment.
+    /// Used for direct message access via `MessageLocation`.
+    pub fn read_bytes_at(&self, segment_id: u32, offset: u32, len: u32) -> Option<bytes::Bytes> {
+        let segment = self.segment_map.find_segment(segment_id as u64)?;
+        let valid_bytes = segment.logical_size.load(Ordering::Acquire) as usize;
+        let start = offset as usize;
+        let end = start + len as usize;
+        if end > valid_bytes || end > segment.capacity() {
+            return None;
+        }
+        Some(bytes_from_segment(
+            &Arc::clone(&segment),
+            start,
+            len as usize,
+        ))
+    }
+
+    /// Read a length-prefixed message at a specific `(segment_id, offset)`.
+    ///
+    /// Expects `[len:4][data...]` at the given offset. Reads the 4-byte length
+    /// prefix, then returns the data portion as zero-copy `Bytes`.
+    pub fn read_length_prefixed_at(&self, segment_id: u32, offset: u32) -> Option<bytes::Bytes> {
+        let segment = self.segment_map.find_segment(segment_id as u64)?;
+        let valid_bytes = segment.logical_size.load(Ordering::Acquire) as usize;
+        let start = offset as usize;
+        if start + 4 > valid_bytes {
+            return None;
+        }
+        let len_bytes = segment.read_slice(start, 4);
+        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        let data_start = start + 4;
+        let data_end = data_start + len;
+        if data_end > valid_bytes || data_end > segment.capacity() {
+            return None;
+        }
+        Some(bytes_from_segment(&Arc::clone(&segment), data_start, len))
+    }
+
+    /// Read the command data portion of a Normal (tag=1) raft log entry.
+    ///
+    /// Returns a zero-copy `Bytes` backed by the mmap segment containing the
+    /// serialized command payload (e.g. bincode-encoded `MqCommand`).
+    /// Returns `None` if the entry is not found, not in a loaded segment,
+    /// or is not a Normal entry.
+    ///
+    /// Record layout: `[len:4][type:1][group_id:3][term:8][node_id:8][index:8][tag:1][data...][crc:8]`
+    /// This method returns just the `[data...]` portion.
+    pub fn read_normal_entry_data(&self, log_index: u64) -> Option<bytes::Bytes> {
+        let loc = self.log_index.get(log_index)?;
+        let segment = self.segment_map.find_segment(loc.segment_id)?;
+
+        let valid_bytes = segment.logical_size.load(Ordering::Acquire) as usize;
+        let start = loc.offset as usize;
+        let end = start + loc.len as usize;
+        if end > valid_bytes || end > segment.capacity() {
+            return None;
+        }
+
+        // Minimum record: header(8) + entry_header(25) + crc(8) = 41
+        if loc.len < 41 {
+            return None;
+        }
+
+        let buf = segment.read_slice(start, loc.len as usize);
+
+        // Check tag byte: offset 32 from record start (8 header + 24 entry prefix)
+        let tag = buf[HEADER_SIZE + 24];
+        if tag != 1 {
+            return None; // Not a Normal entry
+        }
+
+        // Data region: after entry header, before CRC
+        let data_start = HEADER_SIZE + 25; // 8 + 25 = 33
+        let data_end = loc.len as usize - CRC64_SIZE; // len - 8
+        if data_start >= data_end {
+            return None;
+        }
+
+        Some(bytes_from_segment(
+            &Arc::clone(&segment),
+            start + data_start,
+            data_end - data_start,
+        ))
+    }
+
+    /// Return the full valid region of a segment as a single `Bytes`.
+    ///
+    /// The returned `Bytes` holds an `Arc<Segment>` ref, keeping the mmap
+    /// pinned while any slice of it is alive. This enables cursor-based
+    /// sequential scanning of the entire segment without per-record lookups.
+    ///
+    /// Returns `None` if the segment is not currently pinned or active.
+    pub fn segment_bytes(&self, segment_id: u64) -> Option<bytes::Bytes> {
+        let segment = self.segment_map.find_segment(segment_id)?;
+        let valid = segment.logical_size.load(Ordering::Acquire) as usize;
+        if valid == 0 {
+            return None;
+        }
+        Some(bytes_from_segment(&segment, 0, valid))
+    }
+
+    /// Return the segment ID of the currently active (writable) segment.
+    pub fn active_segment_id(&self) -> u64 {
+        self.segment_map.active.load().segment_id
+    }
+
+    /// Return sorted IDs of all currently pinned (sealed) segments.
+    pub fn pinned_segment_ids(&self) -> Vec<u64> {
+        let pinned = self.segment_map.pinned.lock();
+        let mut ids: Vec<u64> = pinned.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 }
 
@@ -6916,6 +7286,7 @@ mod tests {
                 segment_size: DEFAULT_SEGMENT_SIZE,
                 max_record_size: DEFAULT_MAX_RECORD_SIZE,
                 fsync_delay: Duration::from_millis(1),
+                ..Default::default()
             };
             let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
             let mut log = storage.get_log_storage(0).await.unwrap();
@@ -8501,6 +8872,810 @@ mod tests {
             }
 
             storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_lru_eviction_limits_pinned_segments() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // Small segments (512 bytes) to force many rotations, max 3 pinned
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_max_pinned_segments(3);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write enough entries to create many segments (each ~41 bytes, so ~12 per 512-byte segment)
+            for i in 1..=100 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Verify the segment map respects the pinned limit
+            let group_state = storage.get_or_create_group(0).await.unwrap();
+            let pinned_count = group_state.segment_map.pinned_count();
+            assert!(
+                pinned_count <= 3,
+                "Expected at most 3 pinned segments, got {pinned_count}"
+            );
+
+            // All entries should still be readable (via reopen from disk for evicted segments)
+            let result = log.try_get_log_entries(1..101).await.unwrap();
+            assert_eq!(result.len(), 100);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_lru_eviction_preserves_most_recent() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // Small segments, max 2 pinned
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_max_pinned_segments(2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write many entries to create multiple segments
+            for i in 1..=60 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let group_state = storage.get_or_create_group(0).await.unwrap();
+            let pinned_count = group_state.segment_map.pinned_count();
+            assert!(
+                pinned_count <= 2,
+                "Expected at most 2 pinned segments, got {pinned_count}"
+            );
+
+            // Read most recent entries — should be fast (in pinned segments)
+            let result = log.try_get_log_entries(55..61).await.unwrap();
+            assert_eq!(result.len(), 6);
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(entry.log_id.index, 55 + i as u64);
+            }
+
+            // Read old entries — should trigger reopen from disk
+            let result = log.try_get_log_entries(1..11).await.unwrap();
+            assert_eq!(result.len(), 10);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_unlimited_pinned_segments_when_zero() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // max_pinned_segments=0 means unlimited
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_max_pinned_segments(0);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=80 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            let group_state = storage.get_or_create_group(0).await.unwrap();
+            let pinned_count = group_state.segment_map.pinned_count();
+            // With unlimited, all sealed segments should stay pinned
+            assert!(
+                pinned_count > 3,
+                "Expected many pinned segments with unlimited, got {pinned_count}"
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_backpressure_semaphore_limits_concurrent_opens() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            // Small segments, very low max pinned (1) to force reopens, low concurrent opens (2)
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_max_pinned_segments(1)
+                .with_max_concurrent_segment_opens(2);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write enough entries to create many segments
+            for i in 1..=60 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Issue multiple reads that span evicted segments — the semaphore should
+            // limit concurrent reopens to 2 but still complete all reads
+            let result = log.try_get_log_entries(1..61).await.unwrap();
+            assert_eq!(result.len(), 60);
+
+            // Verify all entries are correct
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(
+                    entry.log_id.index,
+                    (i + 1) as u64,
+                    "Entry {} has wrong index",
+                    i
+                );
+            }
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_lru_eviction_with_purge_interaction() {
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_max_pinned_segments(3);
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write entries
+            for i in 1..=50 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Purge old entries
+            let purge_id = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 30,
+            };
+            log.purge(purge_id).await.unwrap();
+
+            let group_state = storage.get_or_create_group(0).await.unwrap();
+            let pinned_count = group_state.segment_map.pinned_count();
+            // After purge, some segments should have been removed, pinned count should be small
+            assert!(
+                pinned_count <= 3,
+                "Expected at most 3 pinned segments after purge, got {pinned_count}"
+            );
+
+            // Remaining entries should still be readable
+            let result = log.try_get_log_entries(31..51).await.unwrap();
+            assert_eq!(result.len(), 20);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_segment_location_config_roundtrip() {
+        // Verify that SegmentLocation is correctly encoded/decoded in manifest
+        use crate::manifest_mdbx::{SegmentLocation, SegmentMeta as ManifestSegmentMeta};
+        use crate::record_format::RecordTypeFlags;
+
+        for &loc in &[
+            SegmentLocation::Local,
+            SegmentLocation::Remote,
+            SegmentLocation::Both,
+        ] {
+            let meta = ManifestSegmentMeta {
+                group_id: 1,
+                segment_id: 42,
+                valid_bytes: 1024,
+                min_index: Some(10),
+                max_index: Some(50),
+                min_ts: None,
+                max_ts: None,
+                sealed: true,
+                record_count: 40,
+                record_type_flags: RecordTypeFlags::default(),
+                entry_count: 40,
+                first_entry_offset: 8,
+                location: loc,
+            };
+            let encoded = meta.encode_value();
+            let decoded =
+                ManifestSegmentMeta::decode_value(1, 42, &encoded).expect("decode should succeed");
+            assert_eq!(
+                decoded.location, loc,
+                "Location roundtrip failed for {:?}",
+                loc
+            );
+            assert_eq!(decoded.valid_bytes, 1024);
+            assert_eq!(decoded.min_index, Some(10));
+            assert_eq!(decoded.max_index, Some(50));
+        }
+    }
+
+    #[test]
+    fn test_segment_location_backward_compat() {
+        // Old data (location byte = 0) should decode as Local
+        use crate::manifest_mdbx::SegmentMeta as ManifestSegmentMeta;
+        use crate::record_format::RecordTypeFlags;
+
+        let meta = ManifestSegmentMeta {
+            group_id: 1,
+            segment_id: 1,
+            valid_bytes: 512,
+            min_index: Some(1),
+            max_index: Some(10),
+            min_ts: None,
+            max_ts: None,
+            sealed: true,
+            record_count: 10,
+            record_type_flags: RecordTypeFlags::default(),
+            entry_count: 10,
+            first_entry_offset: 0,
+            location: SegmentLocation::Local,
+        };
+        let mut encoded = meta.encode_value();
+        // Zero out the location byte to simulate old format
+        encoded[2] = 0;
+        let decoded =
+            ManifestSegmentMeta::decode_value(1, 1, &encoded).expect("decode should succeed");
+        assert_eq!(
+            decoded.location,
+            crate::manifest_mdbx::SegmentLocation::Local,
+            "Old format should decode as Local"
+        );
+    }
+
+    #[test]
+    fn test_s3_archive_upload_on_seal() {
+        use crate::segment_archive::{InMemoryArchive, S3ArchiveConfig};
+
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let archive = Arc::new(InMemoryArchive::new());
+            let s3_config = S3ArchiveConfig {
+                bucket: "test".to_string(),
+                key_prefix: "raft/".to_string(),
+                ..Default::default()
+            };
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_s3_archive(s3_config);
+
+            let storage = MmapPerGroupLogStorage::<C>::new_with_archive(
+                config,
+                Some(archive.clone() as Arc<dyn crate::segment_archive::SegmentArchive>),
+            )
+            .await
+            .unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write enough entries to force multiple segment rotations (seals)
+            for i in 1..=50 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Give the async upload tasks time to complete
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Sealed segments should have been uploaded to the archive
+            let count = archive.object_count();
+            assert!(
+                count > 0,
+                "Expected at least 1 archived segment, got {count}"
+            );
+
+            // All entries should still be readable
+            let result = log.try_get_log_entries(1..51).await.unwrap();
+            assert_eq!(result.len(), 50);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_s3_archive_fetch_on_cache_miss() {
+        use crate::segment_archive::{InMemoryArchive, S3ArchiveConfig};
+
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let archive = Arc::new(InMemoryArchive::new());
+            let s3_config = S3ArchiveConfig {
+                bucket: "test".to_string(),
+                key_prefix: "raft/".to_string(),
+                min_local_retention_secs: 0,
+                ..Default::default()
+            };
+
+            // Write data with archival enabled and very low pin limit
+            // This forces LRU eviction of old segments. When we read old entries,
+            // the reopen path will find the local file missing and fetch from S3.
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_max_pinned_segments(2)
+                .with_s3_archive(s3_config);
+
+            let storage = MmapPerGroupLogStorage::<C>::new_with_archive(
+                config,
+                Some(archive.clone() as Arc<dyn crate::segment_archive::SegmentArchive>),
+            )
+            .await
+            .unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=60 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Wait for background S3 uploads to complete
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let archived_count = archive.object_count();
+            assert!(archived_count > 0, "Expected archived segments");
+
+            // Delete local files of early segments (which have been archived)
+            // to simulate local eviction. The segment map has already evicted
+            // these from memory (max_pinned_segments=2).
+            let group_dir = tmp.path().join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".log"))
+                .collect();
+            seg_files.sort_by_key(|e| e.file_name());
+
+            // Delete the 2 oldest segment files
+            for f in seg_files.iter().take(2) {
+                let _ = std::fs::remove_file(f.path());
+            }
+
+            // Read all entries — old segments should be fetched from S3 archive
+            let result = log.try_get_log_entries(1..61).await.unwrap();
+            assert_eq!(
+                result.len(),
+                60,
+                "All entries should be readable after S3 fetch"
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_local_eviction_when_max_bytes_exceeded() {
+        use crate::segment_archive::{ArchiveManager, InMemoryArchive, S3ArchiveConfig};
+
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let archive = Arc::new(InMemoryArchive::new());
+            let s3_config = S3ArchiveConfig {
+                bucket: "test".to_string(),
+                key_prefix: "raft/".to_string(),
+                min_local_retention_secs: 0, // Allow immediate eviction in test
+                ..Default::default()
+            };
+            let archive_mgr = ArchiveManager::new(
+                archive.clone() as Arc<dyn crate::segment_archive::SegmentArchive>,
+                s3_config.clone(),
+            );
+
+            // Create some fake segment files
+            let group_dir = tmp.path().join("group_0");
+            tokio::fs::create_dir_all(&group_dir).await.unwrap();
+
+            let mut total_bytes = 0u64;
+            let mut segment_files = Vec::new();
+            for i in 1..=5 {
+                let seg_path = group_dir.join(format!("seg_{i:06}.log"));
+                let data = vec![0u8; 1024]; // 1KB each
+                tokio::fs::write(&seg_path, &data).await.unwrap();
+
+                // Upload to archive (simulate archival)
+                archive_mgr.upload_segment(0, i, &seg_path).await.unwrap();
+
+                total_bytes += 1024;
+                // Use mtime in the past to pass retention check
+                // (min_local_retention_secs=0 so this should work)
+                segment_files.push((i, seg_path, 1024u64, true));
+            }
+
+            assert_eq!(total_bytes, 5120);
+            assert_eq!(archive.object_count(), 5);
+
+            // Evict to max 3KB — should delete 2 oldest segments
+            let (deleted, freed) = archive_mgr.evict_local_segments(3072, segment_files).await;
+
+            assert!(deleted >= 2, "Expected at least 2 deletions, got {deleted}");
+            assert!(
+                freed >= 2048,
+                "Expected at least 2048 bytes freed, got {freed}"
+            );
+
+            // Verify that the evicted files no longer exist
+            let remaining_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".log"))
+                .collect();
+            assert!(
+                remaining_files.len() <= 3,
+                "Expected at most 3 remaining files, got {}",
+                remaining_files.len()
+            );
+        });
+    }
+
+    #[test]
+    fn test_full_tiered_storage_lifecycle() {
+        use crate::segment_archive::{InMemoryArchive, S3ArchiveConfig};
+
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let archive = Arc::new(InMemoryArchive::new());
+            let s3_config = S3ArchiveConfig {
+                bucket: "test".to_string(),
+                key_prefix: "raft/".to_string(),
+                min_local_retention_secs: 0,
+                ..Default::default()
+            };
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_max_pinned_segments(3)
+                .with_max_concurrent_segment_opens(4)
+                .with_s3_archive(s3_config);
+
+            let storage = MmapPerGroupLogStorage::<C>::new_with_archive(
+                config,
+                Some(archive.clone() as Arc<dyn crate::segment_archive::SegmentArchive>),
+            )
+            .await
+            .unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Step 1: Write many entries (creates multiple segments)
+            for i in 1..=100 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            // Wait for background archival
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Step 2: Verify archival happened
+            let archived = archive.object_count();
+            assert!(archived > 0, "Expected archived segments");
+
+            // Step 3: Verify pinned count is bounded
+            let group_state = storage.get_or_create_group(0).await.unwrap();
+            let pinned = group_state.segment_map.pinned_count();
+            assert!(pinned <= 3, "Expected max 3 pinned, got {pinned}");
+
+            // Step 4: Read all entries (exercises reopen path for evicted segments)
+            let result = log.try_get_log_entries(1..101).await.unwrap();
+            assert_eq!(result.len(), 100);
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(entry.log_id.index, (i + 1) as u64);
+            }
+
+            // Step 5: Purge old entries
+            let purge_id = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 50,
+            };
+            log.purge(purge_id).await.unwrap();
+
+            // Step 6: Remaining entries should still be readable
+            let result = log.try_get_log_entries(51..101).await.unwrap();
+            assert_eq!(result.len(), 50);
+
+            storage.stop();
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Compressed archival tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compressed_upload_on_seal() {
+        use crate::segment_archive::{InMemoryArchive, S3ArchiveConfig};
+
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let archive = Arc::new(InMemoryArchive::new());
+            let s3_config = S3ArchiveConfig {
+                bucket: "test".to_string(),
+                key_prefix: "raft/".to_string(),
+                compress_archived: true,
+                compression_level: 3,
+                ..Default::default()
+            };
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_s3_archive(s3_config);
+
+            let storage = MmapPerGroupLogStorage::<C>::new_with_archive(
+                config,
+                Some(archive.clone() as Arc<dyn crate::segment_archive::SegmentArchive>),
+            )
+            .await
+            .unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=50 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Archived objects should use .zst extension
+            let count = archive.object_count();
+            assert!(
+                count > 0,
+                "Expected at least 1 archived segment, got {count}"
+            );
+
+            // Verify keys end with .log.zst
+            for key in archive.keys() {
+                assert!(
+                    key.ends_with(".log.zst"),
+                    "Expected .log.zst extension, got: {key}"
+                );
+            }
+
+            // All entries still readable
+            let result = log.try_get_log_entries(1..51).await.unwrap();
+            assert_eq!(result.len(), 50);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_compressed_fetch_on_cache_miss() {
+        use crate::segment_archive::{InMemoryArchive, S3ArchiveConfig};
+
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let archive = Arc::new(InMemoryArchive::new());
+            let s3_config = S3ArchiveConfig {
+                bucket: "test".to_string(),
+                key_prefix: "raft/".to_string(),
+                min_local_retention_secs: 0,
+                compress_archived: true,
+                compression_level: 3,
+                ..Default::default()
+            };
+
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_max_pinned_segments(2)
+                .with_s3_archive(s3_config);
+
+            let storage = MmapPerGroupLogStorage::<C>::new_with_archive(
+                config,
+                Some(archive.clone() as Arc<dyn crate::segment_archive::SegmentArchive>),
+            )
+            .await
+            .unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            for i in 1..=60 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let archived_count = archive.object_count();
+            assert!(archived_count > 0, "Expected archived segments");
+
+            // All archived objects should be compressed
+            for key in archive.keys() {
+                assert!(key.ends_with(".log.zst"), "Expected compressed key: {key}");
+            }
+
+            // Delete local files of early segments to force S3 fetch + decompress
+            let group_dir = tmp.path().join("group_0");
+            let mut seg_files: Vec<_> = std::fs::read_dir(&group_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".log"))
+                .collect();
+            seg_files.sort_by_key(|e| e.file_name());
+
+            for f in seg_files.iter().take(2) {
+                let _ = std::fs::remove_file(f.path());
+            }
+
+            // Read all entries — triggers download + decompress from S3
+            let result = log.try_get_log_entries(1..61).await.unwrap();
+            assert_eq!(
+                result.len(),
+                60,
+                "All entries readable after compressed S3 fetch"
+            );
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_compressed_full_tiered_lifecycle() {
+        use crate::segment_archive::{InMemoryArchive, S3ArchiveConfig};
+
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let archive = Arc::new(InMemoryArchive::new());
+            let s3_config = S3ArchiveConfig {
+                bucket: "test".to_string(),
+                key_prefix: "raft/".to_string(),
+                min_local_retention_secs: 0,
+                compress_archived: true,
+                compression_level: 1, // Fast compression for test
+                ..Default::default()
+            };
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(512)
+                .with_max_pinned_segments(3)
+                .with_max_concurrent_segment_opens(4)
+                .with_s3_archive(s3_config);
+
+            let storage = MmapPerGroupLogStorage::<C>::new_with_archive(
+                config,
+                Some(archive.clone() as Arc<dyn crate::segment_archive::SegmentArchive>),
+            )
+            .await
+            .unwrap();
+
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Write 100 entries across many segments
+            for i in 1..=100 {
+                let entries = vec![make_entry(i, 1)];
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                rx.await.unwrap().unwrap();
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Verify compressed archival
+            let archived = archive.object_count();
+            assert!(archived > 0, "Expected archived segments");
+            for key in archive.keys() {
+                assert!(key.ends_with(".log.zst"), "Key should be compressed: {key}");
+                let data = archive.get_data(&key).unwrap();
+                // Compressed data should start with zstd magic number (0xFD2FB528)
+                assert!(data.len() >= 4, "Compressed data too small");
+                assert_eq!(
+                    &data[..4],
+                    &[0x28, 0xB5, 0x2F, 0xFD],
+                    "Expected zstd magic bytes"
+                );
+            }
+
+            // Read all entries (exercises reopen + decompress for evicted segments)
+            let result = log.try_get_log_entries(1..101).await.unwrap();
+            assert_eq!(result.len(), 100);
+            for (i, entry) in result.iter().enumerate() {
+                assert_eq!(entry.log_id.index, (i + 1) as u64);
+            }
+
+            // Purge old entries
+            let purge_id = LogId {
+                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 50,
+            };
+            log.purge(purge_id).await.unwrap();
+
+            // Remaining entries still readable
+            let result = log.try_get_log_entries(51..101).await.unwrap();
+            assert_eq!(result.len(), 50);
+
+            storage.stop();
+        });
+    }
+
+    #[test]
+    fn test_compressed_eviction_roundtrip() {
+        use crate::segment_archive::{ArchiveManager, InMemoryArchive, S3ArchiveConfig};
+
+        run_async(async {
+            let tmp = TempDir::new().unwrap();
+            let archive = Arc::new(InMemoryArchive::new());
+            let s3_config = S3ArchiveConfig {
+                bucket: "test".to_string(),
+                key_prefix: "raft/".to_string(),
+                min_local_retention_secs: 0,
+                compress_archived: true,
+                compression_level: 3,
+                ..Default::default()
+            };
+            let archive_mgr = ArchiveManager::new(
+                archive.clone() as Arc<dyn crate::segment_archive::SegmentArchive>,
+                s3_config.clone(),
+            );
+
+            // Create fake segment files and upload compressed
+            let group_dir = tmp.path().join("group_0");
+            tokio::fs::create_dir_all(&group_dir).await.unwrap();
+
+            let mut segment_files = Vec::new();
+            for i in 1..=5 {
+                let seg_path = group_dir.join(format!("seg_{i:06}.log"));
+                let data = vec![0xABu8; 1024];
+                tokio::fs::write(&seg_path, &data).await.unwrap();
+                archive_mgr.upload_segment(0, i, &seg_path).await.unwrap();
+                segment_files.push((i, seg_path, 1024u64, true));
+            }
+
+            // All should be stored compressed
+            assert_eq!(archive.object_count(), 5);
+            for key in archive.keys() {
+                assert!(key.ends_with(".log.zst"));
+                let data = archive.get_data(&key).unwrap();
+                // Compressed 1KB of 0xAB should be much smaller
+                assert!(
+                    data.len() < 1024,
+                    "Expected compression, got {} bytes",
+                    data.len()
+                );
+            }
+
+            // Evict 2 segments
+            let (deleted, freed) = archive_mgr.evict_local_segments(3072, segment_files).await;
+            assert!(deleted >= 2);
+            assert!(freed >= 2048);
+
+            // Download an evicted segment and verify it decompresses correctly
+            let restore_path = group_dir.join("seg_000001_restored.log");
+            archive_mgr
+                .download_segment(0, 1, &restore_path)
+                .await
+                .unwrap();
+            let restored = tokio::fs::read(&restore_path).await.unwrap();
+            assert_eq!(restored, vec![0xABu8; 1024]);
         });
     }
 }

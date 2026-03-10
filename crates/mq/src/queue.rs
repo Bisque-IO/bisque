@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::config::QueueConfig;
-use crate::types::{MessagePayload, MessageState, QueueMessageMeta, SegmentRange, name_hash};
+use crate::flat::FlatMessageMeta;
+use crate::types::{MessageState, QueueMessageMeta, SegmentRange, name_hash};
 
 // =============================================================================
 // Queue Metadata (persisted to MDBX)
@@ -125,6 +126,9 @@ pub struct QueueState {
     /// Consumer in-flight index: consumer_id → set of message_ids.
     /// Enables O(1) lookup on consumer disconnect instead of O(n) full scan.
     pub(crate) consumer_in_flight: HashMap<u64, Vec<u64>>,
+    /// Expiry deadline index: expires_at_ms → set of message_ids.
+    /// Enables O(log n + k) scanning for messages that have exceeded their TTL.
+    pub(crate) expires_at_deadlines: BTreeMap<u64, Vec<u64>>,
 
     /// Cached min message_id for purge floor. `None` = dirty, needs recompute.
     cached_min_message_id: Option<Option<u64>>,
@@ -156,6 +160,7 @@ impl QueueState {
             dedup: DedupWindow::new(dedup_window_secs),
             in_flight_deadlines: BTreeMap::new(),
             consumer_in_flight: HashMap::new(),
+            expires_at_deadlines: BTreeMap::new(),
             cached_min_message_id: Some(None),
             m_enqueue_count,
             m_deliver_count,
@@ -166,19 +171,25 @@ impl QueueState {
         }
     }
 
+    /// Enqueue pre-encoded flat messages.
+    ///
+    /// Each entry in `messages` is a raw flat-encoded `Bytes` buffer (see
+    /// `flat::FlatMessageBuilder`). Only the fixed 32-byte header is parsed
+    /// to extract `ttl_ms` and `delay_ms` — the variable-length payload is
+    /// never deserialized on this path.
     pub fn apply_enqueue(
         &mut self,
         log_index: u64,
-        messages: &[MessagePayload],
+        messages: &[Bytes],
         dedup_keys: &[Option<Bytes>],
         current_time: u64,
     ) -> SmallVec<[u64; 16]> {
         let mut offsets = SmallVec::with_capacity(messages.len());
         let dedup_enabled = self.dedup.window_secs > 0;
-        let delay_ms = self.meta.config.delay_default_ms;
+        let default_delay_ms = self.meta.config.delay_default_ms;
         let queue_id = self.meta.queue_id;
 
-        for (i, _msg) in messages.iter().enumerate() {
+        for (i, msg_buf) in messages.iter().enumerate() {
             let dedup_key = dedup_keys.get(i).and_then(|k| k.as_ref());
 
             // Check dedup
@@ -190,11 +201,46 @@ impl QueueState {
             }
 
             let message_id = log_index;
-            let deliver_after = if delay_ms > 0 {
-                current_time + delay_ms
+
+            // Extract metadata from the flat header (first 32 bytes only)
+            let flat_meta = FlatMessageMeta::parse(msg_buf);
+
+            // Compute expires_at from per-message ttl_ms
+            let expires_at = flat_meta
+                .and_then(|m| m.ttl_ms_opt())
+                .map(|ttl| current_time + ttl);
+
+            // Per-message delay_ms overrides queue-level delay_default_ms
+            let msg_delay = flat_meta.and_then(|m| m.delay_ms_opt());
+            let effective_delay = msg_delay.unwrap_or(default_delay_ms);
+            let deliver_after = if effective_delay > 0 {
+                let da = current_time + effective_delay;
+                // Validate: delay must not extend past expires_at
+                if let Some(exp) = expires_at {
+                    da.min(exp)
+                } else {
+                    da
+                }
             } else {
                 0
             };
+
+            // Extract reply_to and correlation_id for request/reply pattern.
+            // Only do the full flat message parse when the flags indicate presence.
+            let (reply_to, correlation_id) =
+                if flat_meta.map_or(false, |m| m.has_reply_to() || m.has_correlation_id()) {
+                    let flat = crate::flat::FlatMessage::new(msg_buf.clone());
+                    (
+                        flat.as_ref()
+                            .and_then(|f| f.reply_to())
+                            .map(|b| String::from_utf8(b.to_vec()).unwrap_or_default()),
+                        flat.as_ref()
+                            .and_then(|f| f.correlation_id())
+                            .map(|b| String::from_utf8(b.to_vec()).unwrap_or_default()),
+                    )
+                } else {
+                    (None, None)
+                };
 
             let meta = QueueMessageMeta {
                 message_id,
@@ -207,11 +253,22 @@ impl QueueState {
                 consumer_id: None,
                 visibility_deadline: None,
                 dedup_key: dedup_key.cloned(),
+                expires_at,
+                reply_to,
+                correlation_id,
             };
 
             self.messages.insert(message_id, meta);
             self.pending.insert((0, message_id), ());
             self.meta.pending_count += 1;
+
+            // Maintain expiry deadline index for proactive scanning
+            if let Some(exp) = expires_at {
+                self.expires_at_deadlines
+                    .entry(exp)
+                    .or_default()
+                    .push(message_id);
+            }
 
             // Update cached min: new message can only lower the floor
             if let Some(ref mut cached) = self.cached_min_message_id {
@@ -242,6 +299,7 @@ impl QueueState {
         let mut delivered = SmallVec::<[u64; 16]>::new();
         let timeout_ms = self.meta.config.visibility_timeout_ms;
         let mut to_remove = SmallVec::<[(u8, u64); 16]>::new();
+        let mut expired_ids = SmallVec::<[(u8, u64); 4]>::new();
 
         for (&(priority, msg_id), _) in &self.pending {
             if delivered.len() >= max {
@@ -249,6 +307,13 @@ impl QueueState {
             }
 
             if let Some(meta) = self.messages.get(&msg_id) {
+                // Check if message has expired (total TTL exceeded)
+                if let Some(exp) = meta.expires_at {
+                    if current_time >= exp {
+                        expired_ids.push((priority, msg_id));
+                        continue;
+                    }
+                }
                 if meta.deliver_after > current_time && meta.deliver_after > 0 {
                     continue;
                 }
@@ -256,6 +321,21 @@ impl QueueState {
 
             to_remove.push((priority, msg_id));
             delivered.push(msg_id);
+        }
+
+        // Remove expired messages from pending
+        for &(priority, msg_id) in &expired_ids {
+            self.pending.remove(&(priority, msg_id));
+            if let Some(meta) = self.messages.remove(&msg_id) {
+                self.meta.pending_count = self.meta.pending_count.saturating_sub(1);
+                self.remove_from_expires_index(meta.expires_at, msg_id);
+                // Invalidate cached min if this could have been it
+                if let Some(Some(cached_min)) = self.cached_min_message_id {
+                    if msg_id <= cached_min {
+                        self.cached_min_message_id = None;
+                    }
+                }
+            }
         }
 
         for key in &to_remove {
@@ -298,6 +378,7 @@ impl QueueState {
                     self.meta.in_flight_count = self.meta.in_flight_count.saturating_sub(1);
                     self.remove_from_deadline_index(meta.visibility_deadline, msg_id);
                     self.remove_from_consumer_index(meta.consumer_id, msg_id);
+                    self.remove_from_expires_index(meta.expires_at, msg_id);
                     count += 1;
 
                     // Invalidate cached min if this could have been it
@@ -357,7 +438,8 @@ impl QueueState {
     pub fn apply_timeout_expired(
         &mut self,
         message_ids: &[u64],
-        _dead_letter_queue: Option<u64>,
+        _dead_letter_topic: Option<u64>,
+        current_time: u64,
     ) -> SmallVec<[u64; 4]> {
         let max_retries = self.meta.config.max_retries;
         let mut dead_lettered = SmallVec::<[u64; 4]>::new();
@@ -370,8 +452,14 @@ impl QueueState {
 
                 let old_deadline = meta.visibility_deadline;
                 let old_consumer = meta.consumer_id;
+                let msg_expires_at = meta.expires_at;
 
-                if meta.attempts >= max_retries {
+                // If the message has exceeded its total TTL, dead-letter it
+                // regardless of retry count.
+                let total_expired = msg_expires_at.is_some_and(|exp| current_time >= exp);
+                let is_dead = meta.attempts >= max_retries || total_expired;
+
+                if is_dead {
                     meta.state = MessageState::DeadLetter;
                     meta.consumer_id = None;
                     meta.visibility_deadline = None;
@@ -391,10 +479,34 @@ impl QueueState {
 
                 self.remove_from_deadline_index(old_deadline, msg_id);
                 self.remove_from_consumer_index(old_consumer, msg_id);
+                if is_dead {
+                    self.remove_from_expires_index(msg_expires_at, msg_id);
+                }
             }
         }
 
         dead_lettered
+    }
+
+    /// Remove dead-lettered messages from this queue after they have been
+    /// published to the DLQ topic. This frees the entries from the message
+    /// index so they no longer pin the purge floor.
+    pub fn apply_remove_dead_lettered(&mut self, message_ids: &[u64]) {
+        for &msg_id in message_ids {
+            if let Some(meta) = self.messages.get(&msg_id) {
+                if meta.state != MessageState::DeadLetter {
+                    continue;
+                }
+                self.meta.dlq_count = self.meta.dlq_count.saturating_sub(1);
+                // Invalidate cached min if this could have been it
+                if let Some(Some(cached_min)) = self.cached_min_message_id {
+                    if msg_id <= cached_min {
+                        self.cached_min_message_id = None;
+                    }
+                }
+            }
+            self.messages.remove(&msg_id);
+        }
     }
 
     pub fn apply_prune_dedup(&mut self, before_timestamp: u64) {
@@ -446,6 +558,57 @@ impl QueueState {
         min
     }
 
+    /// Find pending messages whose `expires_at` has passed.
+    /// Uses the expires_at BTreeMap index for O(log n + k) efficiency.
+    pub fn find_expired_pending(&self, current_time: u64) -> SmallVec<[u64; 16]> {
+        let mut expired = SmallVec::new();
+        for (_exp, msg_ids) in self.expires_at_deadlines.range(..=current_time) {
+            for &msg_id in msg_ids {
+                if let Some(meta) = self.messages.get(&msg_id) {
+                    if meta.state == MessageState::Pending {
+                        expired.push(msg_id);
+                    }
+                }
+            }
+        }
+        expired
+    }
+
+    /// Remove expired pending messages from the queue.
+    pub fn apply_expire_pending(&mut self, message_ids: &[u64]) {
+        for &msg_id in message_ids {
+            if let Some(meta) = self.messages.get(&msg_id) {
+                if meta.state != MessageState::Pending {
+                    continue;
+                }
+                let priority = meta.priority;
+                let expires_at = meta.expires_at;
+                self.pending.remove(&(priority, msg_id));
+                self.remove_from_expires_index(expires_at, msg_id);
+                self.meta.pending_count = self.meta.pending_count.saturating_sub(1);
+                // Invalidate cached min if this could have been it
+                if let Some(Some(cached_min)) = self.cached_min_message_id {
+                    if msg_id <= cached_min {
+                        self.cached_min_message_id = None;
+                    }
+                }
+            }
+            self.messages.remove(&msg_id);
+        }
+    }
+
+    /// Remove a message from the expires_at deadline index.
+    fn remove_from_expires_index(&mut self, expires_at: Option<u64>, msg_id: u64) {
+        if let Some(exp) = expires_at {
+            if let Some(ids) = self.expires_at_deadlines.get_mut(&exp) {
+                ids.retain(|&id| id != msg_id);
+                if ids.is_empty() {
+                    self.expires_at_deadlines.remove(&exp);
+                }
+            }
+        }
+    }
+
     /// Remove a message from the deadline index.
     fn remove_from_deadline_index(&mut self, deadline: Option<u64>, msg_id: u64) {
         if let Some(dl) = deadline {
@@ -474,7 +637,7 @@ impl QueueState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::MessagePayload;
+    use crate::flat::FlatMessageBuilder;
 
     fn make_queue(name: &str) -> QueueState {
         let meta = QueueMeta::new(1, name.to_string(), 1000, QueueConfig::default());
@@ -486,15 +649,11 @@ mod tests {
         QueueState::new(meta)
     }
 
-    fn make_msg(value: &[u8]) -> MessagePayload {
-        MessagePayload {
-            key: None,
-            value: Bytes::from(value.to_vec()),
-            headers: Vec::new(),
-            timestamp: 1000,
-            ttl_ms: None,
-            routing_key: None,
-        }
+    /// Build a flat-encoded message with just a value and timestamp.
+    fn make_msg(value: &[u8]) -> Bytes {
+        FlatMessageBuilder::new(Bytes::from(value.to_vec()))
+            .timestamp(1000)
+            .build()
     }
 
     // =========================================================================
@@ -682,7 +841,7 @@ mod tests {
         q.apply_enqueue(10, &[make_msg(b"msg")], &[None], 1000);
         q.apply_deliver(100, 1, 2000, 20);
 
-        let dead_lettered = q.apply_timeout_expired(&[10], None);
+        let dead_lettered = q.apply_timeout_expired(&[10], None, 32000);
         assert!(dead_lettered.is_empty());
         assert_eq!(q.meta.pending_count, 1);
         assert_eq!(q.meta.in_flight_count, 0);
@@ -699,14 +858,37 @@ mod tests {
         q.apply_enqueue(10, &[make_msg(b"msg")], &[None], 1000);
 
         q.apply_deliver(100, 1, 2000, 20);
-        q.apply_timeout_expired(&[10], None); // attempt 1 → re-enqueue
+        q.apply_timeout_expired(&[10], None, 32000); // attempt 1 → re-enqueue
         q.apply_deliver(100, 1, 3000, 30); // attempt 2
-        let dead_lettered = q.apply_timeout_expired(&[10], None);
+        let dead_lettered = q.apply_timeout_expired(&[10], None, 33000);
 
         assert_eq!(dead_lettered.as_slice(), &[10u64]);
         assert_eq!(q.messages[&10].state, MessageState::DeadLetter);
         assert_eq!(q.meta.dlq_count, 1);
         assert_eq!(q.meta.in_flight_count, 0);
+    }
+
+    #[test]
+    fn test_remove_dead_lettered_cleans_up() {
+        let config = QueueConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+        let mut q = make_queue_with_config("test", config);
+        q.apply_enqueue(10, &[make_msg(b"msg")], &[None], 1000);
+
+        q.apply_deliver(100, 1, 2000, 20); // attempt 1
+        let dead_lettered = q.apply_timeout_expired(&[10], None, 33000);
+
+        assert_eq!(dead_lettered.as_slice(), &[10u64]);
+        assert_eq!(q.meta.dlq_count, 1);
+        assert!(q.messages.contains_key(&10));
+
+        // Simulate PublishToDlq cleanup
+        q.apply_remove_dead_lettered(&[10]);
+        assert_eq!(q.meta.dlq_count, 0);
+        assert!(!q.messages.contains_key(&10));
+        assert!(q.min_required_index().is_none());
     }
 
     #[test]

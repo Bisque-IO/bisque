@@ -26,19 +26,35 @@ pub struct MessagePayload {
     pub headers: Vec<(String, Bytes)>,
     pub timestamp: u64,
     /// Per-message time-to-live in milliseconds.
-    /// If set, the message expires at `timestamp + ttl_ms`.
+    /// If set, the message expires at `enqueue_time + ttl_ms` regardless of retries.
     #[serde(default)]
     pub ttl_ms: Option<u64>,
     /// Routing key for exchange-based routing (AMQP/MQTT topic patterns).
     #[serde(default)]
     pub routing_key: Option<String>,
+    /// Topic name to publish a response to (request/response pattern).
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// Client-specified correlation identifier for request/response matching.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Per-message delay in milliseconds before the message becomes eligible
+    /// for delivery. Overrides the queue-level `delay_default_ms` when set.
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+}
+
+impl MessagePayload {
+    /// Encode this payload into the flat binary format for raft log storage.
+    pub fn encode_flat(&self) -> Bytes {
+        crate::flat::FlatMessageBuilder::from(self).build()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveredMessage {
     /// Raft log index of this message.
     pub message_id: u64,
-    pub payload: MessagePayload,
     pub attempt: u32,
     pub original_timestamp: u64,
 }
@@ -78,6 +94,15 @@ impl Default for ExchangeType {
     }
 }
 
+/// Notification emitted when a message is published to an exchange.
+/// Used for QoS 0 fan-out to avoid polling latency.
+#[derive(Debug, Clone)]
+pub struct ExchangePublishNotification {
+    pub exchange_id: u64,
+    /// The flat message bytes published.
+    pub messages: Vec<Bytes>,
+}
+
 /// A binding from an exchange to a queue with an optional routing key pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Binding {
@@ -101,6 +126,35 @@ pub struct SegmentRange {
     pub segment_id: u64,
     pub min_index: u64,
     pub max_index: u64,
+}
+
+// =============================================================================
+// Topic Partitioning
+// =============================================================================
+
+/// Status of a single partition within a partitioned topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionStatus {
+    /// Partition is actively accepting writes and serving reads.
+    Active,
+    /// Partition is draining (no new writes, consumers finishing).
+    Draining,
+    /// Partition is inactive (data may still exist but no I/O).
+    Inactive,
+}
+
+/// Metadata for a single partition of a partitioned topic.
+///
+/// Stored in the coordinator group's `TopicMeta.partitions` vector.
+/// The actual message data lives in the partition's own raft group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionInfo {
+    /// Zero-based partition index within the topic.
+    pub partition_index: u32,
+    /// Raft group ID that owns this partition's data.
+    pub group_id: u64,
+    /// Current partition status.
+    pub status: PartitionStatus,
 }
 
 // =============================================================================
@@ -157,6 +211,18 @@ pub struct QueueMessageMeta {
     pub visibility_deadline: Option<u64>,
     #[serde(default)]
     pub dedup_key: Option<Bytes>,
+    /// Absolute timestamp (ms) when this message expires regardless of retries.
+    /// Computed at enqueue time from `MessagePayload.ttl_ms`.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// Topic name to publish a response to on ACK (request/reply pattern).
+    /// Extracted from the flat message header at enqueue time.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// Correlation ID for request/reply matching.
+    /// Extracted from the flat message header at enqueue time.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
 }
 
 // =============================================================================
@@ -251,411 +317,145 @@ pub enum EntityStats {
 }
 
 // =============================================================================
-// MqCommand
+// MqCommand — zero-copy view over flat-encoded command buffer
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MqCommand {
+/// Zero-copy command type for the MQ engine.
+///
+/// Wraps a flat-encoded binary buffer (`Bytes`). On the write path, constructor
+/// methods encode fields into the buffer. On the read path (state machine apply),
+/// the buffer is wrapped zero-copy from the mmap-backed raft log.
+///
+/// Per-variant accessor structs (in `codec`) provide typed zero-copy APIs
+/// over the raw buffer.
+#[derive(Clone)]
+pub struct MqCommand {
+    pub(crate) buf: Bytes,
+}
+
+// Tag constants for MqCommand discriminants.
+impl MqCommand {
     // -- Topics --
-    CreateTopic {
-        name: String,
-        retention: RetentionPolicy,
-    },
-    DeleteTopic {
-        topic_id: u64,
-    },
-    Publish {
-        topic_id: u64,
-        messages: Vec<MessagePayload>,
-    },
-    CommitOffset {
-        topic_id: u64,
-        consumer_id: u64,
-        offset: u64,
-    },
-    PurgeTopic {
-        topic_id: u64,
-        before_index: u64,
-    },
-
+    pub const TAG_CREATE_TOPIC: u8 = 0;
+    pub const TAG_DELETE_TOPIC: u8 = 1;
+    pub const TAG_PUBLISH: u8 = 2;
+    pub const TAG_COMMIT_OFFSET: u8 = 3;
+    pub const TAG_PURGE_TOPIC: u8 = 4;
     // -- Queues --
-    CreateQueue {
-        name: String,
-        config: crate::config::QueueConfig,
-    },
-    DeleteQueue {
-        queue_id: u64,
-    },
-    Enqueue {
-        queue_id: u64,
-        messages: Vec<MessagePayload>,
-        dedup_keys: Vec<Option<Bytes>>,
-    },
-    Deliver {
-        queue_id: u64,
-        consumer_id: u64,
-        max_count: u32,
-    },
-    Ack {
-        queue_id: u64,
-        message_ids: Vec<u64>,
-    },
-    Nack {
-        queue_id: u64,
-        message_ids: Vec<u64>,
-    },
-    ExtendVisibility {
-        queue_id: u64,
-        message_ids: Vec<u64>,
-        extension_ms: u64,
-    },
-    TimeoutExpired {
-        queue_id: u64,
-        message_ids: Vec<u64>,
-    },
-    PruneDedupWindow {
-        queue_id: u64,
-        before_timestamp: u64,
-    },
-    /// Purge all messages from a queue.
-    PurgeQueue {
-        queue_id: u64,
-    },
-    /// Get queue attributes (read-only, does not go through Raft).
-    GetQueueAttributes {
-        queue_id: u64,
-    },
-
+    pub const TAG_CREATE_QUEUE: u8 = 5;
+    pub const TAG_DELETE_QUEUE: u8 = 6;
+    pub const TAG_ENQUEUE: u8 = 7;
+    pub const TAG_DELIVER: u8 = 8;
+    pub const TAG_ACK: u8 = 9;
+    pub const TAG_NACK: u8 = 10;
+    pub const TAG_EXTEND_VISIBILITY: u8 = 11;
+    pub const TAG_TIMEOUT_EXPIRED: u8 = 12;
+    pub const TAG_PUBLISH_TO_DLQ: u8 = 13;
+    pub const TAG_PRUNE_DEDUP_WINDOW: u8 = 14;
+    pub const TAG_EXPIRE_PENDING_MESSAGES: u8 = 15;
+    pub const TAG_PURGE_QUEUE: u8 = 16;
+    pub const TAG_GET_QUEUE_ATTRIBUTES: u8 = 17;
     // -- Exchanges --
-    CreateExchange {
-        name: String,
-        exchange_type: ExchangeType,
-    },
-    DeleteExchange {
-        exchange_id: u64,
-    },
-    CreateBinding {
-        exchange_id: u64,
-        queue_id: u64,
-        routing_key: Option<String>,
-    },
-    DeleteBinding {
-        binding_id: u64,
-    },
-    /// Publish to an exchange — routes to bound queues based on exchange type.
-    PublishToExchange {
-        exchange_id: u64,
-        messages: Vec<MessagePayload>,
-    },
-
+    pub const TAG_CREATE_EXCHANGE: u8 = 18;
+    pub const TAG_DELETE_EXCHANGE: u8 = 19;
+    pub const TAG_CREATE_BINDING: u8 = 20;
+    pub const TAG_DELETE_BINDING: u8 = 21;
+    pub const TAG_PUBLISH_TO_EXCHANGE: u8 = 22;
     // -- Actors --
-    CreateActorNamespace {
-        name: String,
-        config: crate::config::ActorConfig,
-    },
-    DeleteActorNamespace {
-        namespace_id: u64,
-    },
-    SendToActor {
-        namespace_id: u64,
-        actor_id: Bytes,
-        message: MessagePayload,
-    },
-    DeliverActorMessage {
-        namespace_id: u64,
-        actor_id: Bytes,
-        consumer_id: u64,
-    },
-    AckActorMessage {
-        namespace_id: u64,
-        actor_id: Bytes,
-        message_id: u64,
-    },
-    NackActorMessage {
-        namespace_id: u64,
-        actor_id: Bytes,
-        message_id: u64,
-    },
-    AssignActors {
-        namespace_id: u64,
-        consumer_id: u64,
-        actor_ids: Vec<Bytes>,
-    },
-    ReleaseActors {
-        namespace_id: u64,
-        consumer_id: u64,
-    },
-    EvictIdleActors {
-        namespace_id: u64,
-        before_timestamp: u64,
-    },
-
+    pub const TAG_CREATE_ACTOR_NAMESPACE: u8 = 23;
+    pub const TAG_DELETE_ACTOR_NAMESPACE: u8 = 24;
+    pub const TAG_SEND_TO_ACTOR: u8 = 25;
+    pub const TAG_DELIVER_ACTOR_MESSAGE: u8 = 26;
+    pub const TAG_ACK_ACTOR_MESSAGE: u8 = 27;
+    pub const TAG_NACK_ACTOR_MESSAGE: u8 = 28;
+    pub const TAG_ASSIGN_ACTORS: u8 = 29;
+    pub const TAG_RELEASE_ACTORS: u8 = 30;
+    pub const TAG_EVICT_IDLE_ACTORS: u8 = 31;
     // -- Jobs --
-    CreateJob {
-        name: String,
-        config: crate::config::JobConfig,
-    },
-    DeleteJob {
-        job_id: u64,
-    },
-    UpdateJob {
-        job_id: u64,
-        config: crate::config::JobConfig,
-    },
-    EnableJob {
-        job_id: u64,
-    },
-    DisableJob {
-        job_id: u64,
-    },
-    TriggerJob {
-        job_id: u64,
-        execution_id: u64,
-        triggered_at: u64,
-    },
-    AssignJob {
-        job_id: u64,
-        consumer_id: u64,
-    },
-    CompleteJob {
-        job_id: u64,
-        execution_id: u64,
-    },
-    FailJob {
-        job_id: u64,
-        execution_id: u64,
-        error: String,
-    },
-    TimeoutJob {
-        job_id: u64,
-        execution_id: u64,
-    },
-
+    pub const TAG_CREATE_JOB: u8 = 32;
+    pub const TAG_DELETE_JOB: u8 = 33;
+    pub const TAG_UPDATE_JOB: u8 = 34;
+    pub const TAG_ENABLE_JOB: u8 = 35;
+    pub const TAG_DISABLE_JOB: u8 = 36;
+    pub const TAG_TRIGGER_JOB: u8 = 37;
+    pub const TAG_ASSIGN_JOB: u8 = 38;
+    pub const TAG_COMPLETE_JOB: u8 = 39;
+    pub const TAG_FAIL_JOB: u8 = 40;
+    pub const TAG_TIMEOUT_JOB: u8 = 41;
     // -- Sessions --
-    RegisterConsumer {
-        consumer_id: u64,
-        group_name: String,
-        subscriptions: Vec<Subscription>,
-    },
-    DisconnectConsumer {
-        consumer_id: u64,
-    },
-    Heartbeat {
-        consumer_id: u64,
-    },
-    RegisterProducer {
-        producer_id: u64,
-        name: Option<String>,
-    },
-    DisconnectProducer {
-        producer_id: u64,
-    },
-
+    pub const TAG_REGISTER_CONSUMER: u8 = 42;
+    pub const TAG_DISCONNECT_CONSUMER: u8 = 43;
+    pub const TAG_HEARTBEAT: u8 = 44;
+    pub const TAG_REGISTER_PRODUCER: u8 = 45;
+    pub const TAG_DISCONNECT_PRODUCER: u8 = 46;
     // -- Batch --
-    Batch(Vec<MqCommand>),
+    pub const TAG_BATCH: u8 = 47;
+}
+
+impl MqCommand {
+    /// Command type tag (first byte of the buffer).
+    #[inline]
+    pub fn tag(&self) -> u8 {
+        self.buf[0]
+    }
+
+    /// Read a u64 LE field at the given byte offset.
+    #[inline]
+    pub(crate) fn field_u64(&self, offset: usize) -> u64 {
+        u64::from_le_bytes(self.buf[offset..offset + 8].try_into().unwrap())
+    }
+
+    /// Read a u32 LE field at the given byte offset.
+    #[inline]
+    pub(crate) fn field_u32(&self, offset: usize) -> u32 {
+        u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// Raw buffer access.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Wrap raw bytes as an MqCommand (zero-copy).
+    #[inline]
+    pub fn from_bytes(buf: Bytes) -> Self {
+        Self { buf }
+    }
 }
 
 impl fmt::Display for MqCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CreateTopic { name, .. } => write!(f, "CreateTopic({})", name),
-            Self::DeleteTopic { topic_id } => write!(f, "DeleteTopic({})", topic_id),
-            Self::Publish { topic_id, messages } => {
-                write!(f, "Publish(topic={}, count={})", topic_id, messages.len())
-            }
-            Self::CommitOffset {
-                topic_id,
-                consumer_id,
-                offset,
-            } => {
-                write!(
-                    f,
-                    "CommitOffset(topic={}, consumer={}, offset={})",
-                    topic_id, consumer_id, offset
-                )
-            }
-            Self::PurgeTopic { topic_id, .. } => write!(f, "PurgeTopic({})", topic_id),
-            Self::CreateQueue { name, .. } => write!(f, "CreateQueue({})", name),
-            Self::DeleteQueue { queue_id } => write!(f, "DeleteQueue({})", queue_id),
-            Self::Enqueue {
-                queue_id, messages, ..
-            } => {
-                write!(f, "Enqueue(queue={}, count={})", queue_id, messages.len())
-            }
-            Self::Deliver {
-                queue_id,
-                consumer_id,
-                max_count,
-            } => {
-                write!(
-                    f,
-                    "Deliver(queue={}, consumer={}, max={})",
-                    queue_id, consumer_id, max_count
-                )
-            }
-            Self::Ack {
-                queue_id,
-                message_ids,
-            } => {
-                write!(f, "Ack(queue={}, count={})", queue_id, message_ids.len())
-            }
-            Self::Nack {
-                queue_id,
-                message_ids,
-            } => {
-                write!(f, "Nack(queue={}, count={})", queue_id, message_ids.len())
-            }
-            Self::ExtendVisibility { queue_id, .. } => {
-                write!(f, "ExtendVisibility(queue={})", queue_id)
-            }
-            Self::TimeoutExpired {
-                queue_id,
-                message_ids,
-            } => {
-                write!(
-                    f,
-                    "TimeoutExpired(queue={}, count={})",
-                    queue_id,
-                    message_ids.len()
-                )
-            }
-            Self::PruneDedupWindow { queue_id, .. } => {
-                write!(f, "PruneDedupWindow(queue={})", queue_id)
-            }
-            Self::PurgeQueue { queue_id } => write!(f, "PurgeQueue({})", queue_id),
-            Self::GetQueueAttributes { queue_id } => {
-                write!(f, "GetQueueAttributes({})", queue_id)
-            }
-            Self::CreateExchange { name, .. } => write!(f, "CreateExchange({})", name),
-            Self::DeleteExchange { exchange_id } => write!(f, "DeleteExchange({})", exchange_id),
-            Self::CreateBinding {
-                exchange_id,
-                queue_id,
-                ..
-            } => write!(f, "CreateBinding(ex={}, q={})", exchange_id, queue_id),
-            Self::DeleteBinding { binding_id } => write!(f, "DeleteBinding({})", binding_id),
-            Self::PublishToExchange {
-                exchange_id,
-                messages,
-            } => write!(
-                f,
-                "PublishToExchange(ex={}, count={})",
-                exchange_id,
-                messages.len()
-            ),
-            Self::CreateActorNamespace { name, .. } => write!(f, "CreateActorNamespace({})", name),
-            Self::DeleteActorNamespace { namespace_id } => {
-                write!(f, "DeleteActorNamespace({})", namespace_id)
-            }
-            Self::SendToActor {
-                namespace_id,
-                actor_id,
-                ..
-            } => {
-                write!(
-                    f,
-                    "SendToActor(ns={}, actor={} bytes)",
-                    namespace_id,
-                    actor_id.len()
-                )
-            }
-            Self::DeliverActorMessage { namespace_id, .. } => {
-                write!(f, "DeliverActorMessage(ns={})", namespace_id)
-            }
-            Self::AckActorMessage { namespace_id, .. } => {
-                write!(f, "AckActorMessage(ns={})", namespace_id)
-            }
-            Self::NackActorMessage { namespace_id, .. } => {
-                write!(f, "NackActorMessage(ns={})", namespace_id)
-            }
-            Self::AssignActors {
-                namespace_id,
-                consumer_id,
-                actor_ids,
-            } => {
-                write!(
-                    f,
-                    "AssignActors(ns={}, consumer={}, count={})",
-                    namespace_id,
-                    consumer_id,
-                    actor_ids.len()
-                )
-            }
-            Self::ReleaseActors {
-                namespace_id,
-                consumer_id,
-            } => {
-                write!(
-                    f,
-                    "ReleaseActors(ns={}, consumer={})",
-                    namespace_id, consumer_id
-                )
-            }
-            Self::EvictIdleActors { namespace_id, .. } => {
-                write!(f, "EvictIdleActors(ns={})", namespace_id)
-            }
-            Self::CreateJob { name, .. } => write!(f, "CreateJob({})", name),
-            Self::DeleteJob { job_id } => write!(f, "DeleteJob({})", job_id),
-            Self::UpdateJob { job_id, .. } => write!(f, "UpdateJob({})", job_id),
-            Self::EnableJob { job_id } => write!(f, "EnableJob({})", job_id),
-            Self::DisableJob { job_id } => write!(f, "DisableJob({})", job_id),
-            Self::TriggerJob {
-                job_id,
-                execution_id,
-                ..
-            } => {
-                write!(f, "TriggerJob(job={}, exec={})", job_id, execution_id)
-            }
-            Self::AssignJob {
-                job_id,
-                consumer_id,
-            } => {
-                write!(f, "AssignJob(job={}, consumer={})", job_id, consumer_id)
-            }
-            Self::CompleteJob {
-                job_id,
-                execution_id,
-            } => {
-                write!(f, "CompleteJob(job={}, exec={})", job_id, execution_id)
-            }
-            Self::FailJob {
-                job_id,
-                execution_id,
-                ..
-            } => {
-                write!(f, "FailJob(job={}, exec={})", job_id, execution_id)
-            }
-            Self::TimeoutJob {
-                job_id,
-                execution_id,
-            } => {
-                write!(f, "TimeoutJob(job={}, exec={})", job_id, execution_id)
-            }
-            Self::RegisterConsumer {
-                consumer_id,
-                group_name,
-                ..
-            } => {
-                write!(
-                    f,
-                    "RegisterConsumer(id={}, group={})",
-                    consumer_id, group_name
-                )
-            }
-            Self::DisconnectConsumer { consumer_id } => {
-                write!(f, "DisconnectConsumer({})", consumer_id)
-            }
-            Self::Heartbeat { consumer_id } => write!(f, "Heartbeat({})", consumer_id),
-            Self::RegisterProducer { producer_id, .. } => {
-                write!(f, "RegisterProducer({})", producer_id)
-            }
-            Self::DisconnectProducer { producer_id } => {
-                write!(f, "DisconnectProducer({})", producer_id)
-            }
-            Self::Batch(cmds) => write!(f, "Batch(count={})", cmds.len()),
-        }
+        crate::codec::fmt_mq_command(self, f)
     }
 }
+
+impl fmt::Debug for MqCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MqCommand(tag={}, {} bytes)", self.tag(), self.buf.len())
+    }
+}
+
+// Custom Serialize/Deserialize — OpenRaft requires these bounds via AppData.
+// The actual raft log codec uses our flat binary Encode/Decode, not serde.
+
+impl Serialize for MqCommand {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.buf)
+    }
+}
+
+impl<'de> Deserialize<'de> for MqCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = <Vec<u8>>::deserialize(deserializer)?;
+        Ok(Self {
+            buf: Bytes::from(bytes),
+        })
+    }
+}
+
+// Note: Display impl for MqCommand is delegated to codec::fmt_mq_command
+// (defined in codec.rs since it needs access to the encoding format).
 
 // =============================================================================
 // MqError — zero-alloc error type for hot paths
@@ -691,7 +491,7 @@ pub enum MqError {
     /// Entity not found (zero-alloc)
     NotFound { entity: EntityKind, id: u64 },
     /// Entity with given name already exists
-    AlreadyExists { entity: EntityKind },
+    AlreadyExists { entity: EntityKind, id: u64 },
     /// Actor mailbox is full
     MailboxFull { pending: u32 },
     /// Dynamic error message (escape hatch)
@@ -702,7 +502,9 @@ impl fmt::Display for MqError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound { entity, id } => write!(f, "{} {} not found", entity, id),
-            Self::AlreadyExists { entity } => write!(f, "{} already exists", entity),
+            Self::AlreadyExists { entity, id } => {
+                write!(f, "{} already exists (id={})", entity, id)
+            }
             Self::MailboxFull { pending } => write!(f, "mailbox full ({} messages)", pending),
             Self::Custom(msg) => f.write_str(msg),
         }
@@ -717,11 +519,25 @@ impl fmt::Display for MqError {
 pub enum MqResponse {
     Ok,
     Error(MqError),
-    EntityCreated { id: u64 },
-    Messages { messages: Vec<DeliveredMessage> },
-    Published { offsets: SmallVec<[u64; 16]> },
+    EntityCreated {
+        id: u64,
+    },
+    Messages {
+        messages: Vec<DeliveredMessage>,
+    },
+    Published {
+        offsets: SmallVec<[u64; 16]>,
+    },
     Stats(EntityStats),
     BatchResponse(Vec<MqResponse>),
+    /// Messages were dead-lettered. The caller (background timer) should read
+    /// the original message bytes from the raft log and issue `PublishToDlq`.
+    DeadLettered {
+        /// Raft log indexes of the dead-lettered messages.
+        dead_letter_ids: Vec<u64>,
+        /// The configured DLQ topic to publish them to.
+        dlq_topic_id: u64,
+    },
 }
 
 impl fmt::Display for MqResponse {
@@ -734,6 +550,17 @@ impl fmt::Display for MqResponse {
             Self::Published { offsets } => write!(f, "Published(count={})", offsets.len()),
             Self::Stats(_) => write!(f, "Stats"),
             Self::BatchResponse(resps) => write!(f, "BatchResponse(count={})", resps.len()),
+            Self::DeadLettered {
+                dead_letter_ids,
+                dlq_topic_id,
+            } => {
+                write!(
+                    f,
+                    "DeadLettered(count={}, dlq_topic={})",
+                    dead_letter_ids.len(),
+                    dlq_topic_id
+                )
+            }
         }
     }
 }
@@ -804,6 +631,7 @@ pub struct ExchangeSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::config::{ActorConfig, JobConfig, QueueConfig};
 
     // =========================================================================
@@ -814,46 +642,24 @@ mod tests {
     fn test_mq_command_display() {
         let cases: Vec<(MqCommand, &str)> = vec![
             (
-                MqCommand::CreateTopic {
-                    name: "events".to_string(),
-                    retention: RetentionPolicy::default(),
-                },
+                MqCommand::create_topic("events", RetentionPolicy::default(), 0),
                 "CreateTopic(events)",
             ),
-            (MqCommand::DeleteTopic { topic_id: 42 }, "DeleteTopic(42)"),
+            (MqCommand::delete_topic(42), "DeleteTopic(42)"),
             (
-                MqCommand::Publish {
-                    topic_id: 1,
-                    messages: vec![MessagePayload {
-                        key: None,
-                        value: Bytes::from_static(b"x"),
-                        headers: Vec::new(),
-                        timestamp: 0,
-                        ttl_ms: None,
-                        routing_key: None,
-                    }],
-                },
+                MqCommand::publish(
+                    1,
+                    &[crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"x")).build()],
+                ),
                 "Publish(topic=1, count=1)",
             ),
             (
-                MqCommand::CreateQueue {
-                    name: "tasks".to_string(),
-                    config: QueueConfig::default(),
-                },
+                MqCommand::create_queue("tasks", &QueueConfig::default()),
                 "CreateQueue(tasks)",
             ),
-            (
-                MqCommand::Ack {
-                    queue_id: 5,
-                    message_ids: vec![1, 2, 3],
-                },
-                "Ack(queue=5, count=3)",
-            ),
-            (MqCommand::Heartbeat { consumer_id: 99 }, "Heartbeat(99)"),
-            (
-                MqCommand::DisconnectConsumer { consumer_id: 7 },
-                "DisconnectConsumer(7)",
-            ),
+            (MqCommand::ack(5, &[1, 2, 3], None), "Ack(queue=5, count=3)"),
+            (MqCommand::heartbeat(99), "Heartbeat(99)"),
+            (MqCommand::disconnect_consumer(7), "DisconnectConsumer(7)"),
         ];
 
         for (cmd, expected) in cases {
@@ -878,14 +684,6 @@ mod tests {
                 MqResponse::Messages {
                     messages: vec![DeliveredMessage {
                         message_id: 1,
-                        payload: MessagePayload {
-                            key: None,
-                            value: Bytes::new(),
-                            headers: Vec::new(),
-                            timestamp: 0,
-                            ttl_ms: None,
-                            routing_key: None,
-                        },
                         attempt: 1,
                         original_timestamp: 0,
                     }]
@@ -917,6 +715,9 @@ mod tests {
             timestamp: 12345,
             ttl_ms: None,
             routing_key: None,
+            reply_to: None,
+            correlation_id: None,
+            delay_ms: None,
         };
         let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         let (decoded, _): (MessagePayload, _) =
@@ -964,6 +765,9 @@ mod tests {
             consumer_id: Some(100),
             visibility_deadline: Some(31000),
             dedup_key: Some(Bytes::from_static(b"dedup")),
+            expires_at: Some(60000),
+            reply_to: Some("reply-topic".into()),
+            correlation_id: Some("corr-123".into()),
         };
         let bytes = bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap();
         let (decoded, _): (QueueMessageMeta, _) =
@@ -1007,34 +811,20 @@ mod tests {
 
     #[test]
     fn test_mq_command_serde_roundtrip() {
-        let cmd = MqCommand::Enqueue {
-            queue_id: 5,
-            messages: vec![MessagePayload {
-                key: Some(Bytes::from_static(b"k")),
-                value: Bytes::from_static(b"v"),
-                headers: Vec::new(),
-                timestamp: 999,
-                ttl_ms: None,
-                routing_key: None,
-            }],
-            dedup_keys: vec![Some(Bytes::from_static(b"dk"))],
-        };
+        let flat_msg = crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"v"))
+            .key(Bytes::from_static(b"k"))
+            .timestamp(999)
+            .build();
+        let cmd = MqCommand::enqueue(5, &[flat_msg], &[Some(Bytes::from_static(b"dk"))]);
         let bytes = bincode::serde::encode_to_vec(&cmd, bincode::config::standard()).unwrap();
         let (decoded, _): (MqCommand, _) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
 
-        match decoded {
-            MqCommand::Enqueue {
-                queue_id,
-                messages,
-                dedup_keys,
-            } => {
-                assert_eq!(queue_id, 5);
-                assert_eq!(messages.len(), 1);
-                assert_eq!(dedup_keys.len(), 1);
-            }
-            _ => panic!("wrong variant"),
-        }
+        assert_eq!(decoded.tag(), MqCommand::TAG_ENQUEUE);
+        let v = decoded.as_enqueue();
+        assert_eq!(v.queue_id(), 5);
+        assert_eq!(v.messages().count(), 1);
+        assert_eq!(v.dedup_keys().count(), 1);
     }
 
     #[test]
@@ -1042,14 +832,6 @@ mod tests {
         let resp = MqResponse::Messages {
             messages: vec![DeliveredMessage {
                 message_id: 42,
-                payload: MessagePayload {
-                    key: None,
-                    value: Bytes::from_static(b"data"),
-                    headers: Vec::new(),
-                    timestamp: 1000,
-                    ttl_ms: None,
-                    routing_key: None,
-                },
                 attempt: 2,
                 original_timestamp: 500,
             }],
@@ -1129,34 +911,27 @@ mod tests {
 
     #[test]
     fn test_batch_serde_roundtrip() {
-        let cmd = MqCommand::Batch(vec![
-            MqCommand::CreateTopic {
-                name: "t1".to_string(),
-                retention: RetentionPolicy::default(),
-            },
-            MqCommand::Publish {
-                topic_id: 1,
-                messages: vec![MessagePayload {
-                    key: None,
-                    value: Bytes::from_static(b"data"),
-                    headers: Vec::new(),
-                    timestamp: 100,
-                    ttl_ms: None,
-                    routing_key: None,
-                }],
-            },
-        ]);
+        let sub_cmds = vec![
+            MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
+            MqCommand::publish(
+                1,
+                &[
+                    crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"data"))
+                        .timestamp(100)
+                        .build(),
+                ],
+            ),
+        ];
+        let cmd = MqCommand::batch(&sub_cmds);
         let bytes = bincode::serde::encode_to_vec(&cmd, bincode::config::standard()).unwrap();
         let (decoded, _): (MqCommand, _) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-        match decoded {
-            MqCommand::Batch(cmds) => {
-                assert_eq!(cmds.len(), 2);
-                assert!(matches!(cmds[0], MqCommand::CreateTopic { .. }));
-                assert!(matches!(cmds[1], MqCommand::Publish { .. }));
-            }
-            _ => panic!("expected Batch"),
-        }
+        assert_eq!(decoded.tag(), MqCommand::TAG_BATCH);
+        let batch = decoded.as_batch();
+        assert_eq!(batch.count(), 2);
+        let cmds: Vec<MqCommand> = batch.commands().collect();
+        assert_eq!(cmds[0].tag(), MqCommand::TAG_CREATE_TOPIC);
+        assert_eq!(cmds[1].tag(), MqCommand::TAG_PUBLISH);
 
         let resp =
             MqResponse::BatchResponse(vec![MqResponse::Ok, MqResponse::EntityCreated { id: 5 }]);
@@ -1175,11 +950,12 @@ mod tests {
 
     #[test]
     fn test_batch_display() {
-        let cmd = MqCommand::Batch(vec![
-            MqCommand::DeleteTopic { topic_id: 1 },
-            MqCommand::DeleteQueue { queue_id: 2 },
-            MqCommand::Heartbeat { consumer_id: 3 },
-        ]);
+        let sub_cmds = vec![
+            MqCommand::delete_topic(1),
+            MqCommand::delete_queue(2),
+            MqCommand::heartbeat(3),
+        ];
+        let cmd = MqCommand::batch(&sub_cmds);
         assert_eq!(format!("{}", cmd), "Batch(count=3)");
 
         let resp = MqResponse::BatchResponse(vec![MqResponse::Ok, MqResponse::Ok]);

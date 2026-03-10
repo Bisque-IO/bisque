@@ -26,15 +26,10 @@ fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-manifest-integration-test"))
 }
 
-fn make_msg(value: &[u8]) -> MessagePayload {
-    MessagePayload {
-        key: None,
-        value: Bytes::from(value.to_vec()),
-        headers: Vec::new(),
-        timestamp: 1000,
-        ttl_ms: None,
-        routing_key: None,
-    }
+fn make_msg(value: &[u8]) -> Bytes {
+    bisque_mq::flat::FlatMessageBuilder::new(Bytes::from(value.to_vec()))
+        .timestamp(1000)
+        .build()
 }
 
 fn leader_id() -> openraft::impls::leader_id_adv::LeaderId<MqTypeConfig> {
@@ -67,26 +62,17 @@ async fn test_snapshot_recovery_via_applied_state() {
     // --- First lifecycle: install a snapshot ---
     let mut engine = make_engine();
     engine.apply_command(
-        MqCommand::CreateTopic {
-            name: "events".to_string(),
-            retention: RetentionPolicy::default(),
-        },
+        MqCommand::create_topic("events", RetentionPolicy::default(), 0),
         1,
         1000,
     );
     engine.apply_command(
-        MqCommand::Publish {
-            topic_id: 1,
-            messages: vec![make_msg(b"m1"), make_msg(b"m2")],
-        },
+        MqCommand::publish(1, &[make_msg(b"m1"), make_msg(b"m2")]),
         2,
         1001,
     );
     engine.apply_command(
-        MqCommand::CreateQueue {
-            name: "tasks".to_string(),
-            config: bisque_mq::config::QueueConfig::default(),
-        },
+        MqCommand::create_queue("tasks", &bisque_mq::config::QueueConfig::default()),
         3,
         1002,
     );
@@ -136,18 +122,12 @@ async fn test_snapshot_install_then_recovery_via_applied_state() {
     // Build an engine with a topic and queue
     let mut engine = make_engine();
     engine.apply_command(
-        MqCommand::CreateTopic {
-            name: "my-topic".to_string(),
-            retention: RetentionPolicy::default(),
-        },
+        MqCommand::create_topic("my-topic", RetentionPolicy::default(), 0),
         1,
         1000,
     );
     engine.apply_command(
-        MqCommand::CreateQueue {
-            name: "my-queue".to_string(),
-            config: bisque_mq::config::QueueConfig::default(),
-        },
+        MqCommand::create_queue("my-queue", &bisque_mq::config::QueueConfig::default()),
         2,
         1001,
     );
@@ -215,10 +195,7 @@ async fn test_snapshot_overwrites_structural_on_restart() {
     // First: install snapshot with topic "t1"
     let mut engine1 = make_engine();
     engine1.apply_command(
-        MqCommand::CreateTopic {
-            name: "t1".to_string(),
-            retention: RetentionPolicy::default(),
-        },
+        MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
         1,
         1000,
     );
@@ -234,10 +211,7 @@ async fn test_snapshot_overwrites_structural_on_restart() {
     // Second: install snapshot with queue "q1" (no topics)
     let mut engine2 = make_engine();
     engine2.apply_command(
-        MqCommand::CreateQueue {
-            name: "q1".to_string(),
-            config: bisque_mq::config::QueueConfig::default(),
-        },
+        MqCommand::create_queue("q1", &bisque_mq::config::QueueConfig::default()),
         1,
         1000,
     );
@@ -279,18 +253,12 @@ async fn test_get_current_snapshot_none_when_empty() {
 async fn test_get_current_snapshot_after_install() {
     let mut engine = make_engine();
     engine.apply_command(
-        MqCommand::CreateTopic {
-            name: "live-topic".to_string(),
-            retention: RetentionPolicy::default(),
-        },
+        MqCommand::create_topic("live-topic", RetentionPolicy::default(), 0),
         1,
         1000,
     );
     engine.apply_command(
-        MqCommand::CreateQueue {
-            name: "live-queue".to_string(),
-            config: bisque_mq::config::QueueConfig::default(),
-        },
+        MqCommand::create_queue("live-queue", &bisque_mq::config::QueueConfig::default()),
         2,
         1001,
     );
@@ -358,21 +326,11 @@ async fn test_install_snapshot_persists_to_manifest() {
 
     let mut engine = make_engine();
     engine.apply_command(
-        MqCommand::CreateTopic {
-            name: "persisted".to_string(),
-            retention: RetentionPolicy::default(),
-        },
+        MqCommand::create_topic("persisted", RetentionPolicy::default(), 0),
         1,
         1000,
     );
-    engine.apply_command(
-        MqCommand::Publish {
-            topic_id: 1,
-            messages: vec![make_msg(b"x")],
-        },
-        2,
-        1001,
-    );
+    engine.apply_command(MqCommand::publish(1, &[make_msg(b"x")]), 2, 1001);
 
     let snap_bytes =
         bincode::serde::encode_to_vec(&engine.snapshot(), bincode::config::standard()).unwrap();
@@ -408,21 +366,11 @@ async fn test_snapshot_builder_to_install_to_recovery_roundtrip() {
     // --- Leader builds snapshot ---
     let mut leader_engine = make_engine();
     leader_engine.apply_command(
-        MqCommand::CreateTopic {
-            name: "rt-topic".to_string(),
-            retention: RetentionPolicy::default(),
-        },
+        MqCommand::create_topic("rt-topic", RetentionPolicy::default(), 0),
         1,
         1000,
     );
-    leader_engine.apply_command(
-        MqCommand::Publish {
-            topic_id: 1,
-            messages: vec![make_msg(b"payload")],
-        },
-        2,
-        1001,
-    );
+    leader_engine.apply_command(MqCommand::publish(1, &[make_msg(b"payload")]), 2, 1001);
 
     let mut leader_sm = MqStateMachine::new(leader_engine);
     // Manually set last_applied so get_snapshot_builder works

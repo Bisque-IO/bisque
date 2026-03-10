@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 bisque-mq = { workspace = true }
+bisque-raft = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 axum = { workspace = true }
 bytes = { workspace = true }

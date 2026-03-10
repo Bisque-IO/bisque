@@ -14,6 +14,7 @@ pub enum ClientTag {
     Heartbeat = 0x08,
     Close = 0x09,
     SetByteBudget = 0x0A,
+    Publish = 0x0B,
 }
 
 impl TryFrom<u8> for ClientTag {
@@ -31,6 +32,7 @@ impl TryFrom<u8> for ClientTag {
             0x08 => Ok(Self::Heartbeat),
             0x09 => Ok(Self::Close),
             0x0A => Ok(Self::SetByteBudget),
+            0x0B => Ok(Self::Publish),
             _ => Err(ProtocolError::UnknownTag(value)),
         }
     }
@@ -47,6 +49,7 @@ pub enum ServerTag {
     SubscriptionErr = 0x85,
     Heartbeat = 0x86,
     Close = 0x87,
+    MessageBatch = 0x88,
 }
 
 impl TryFrom<u8> for ServerTag {
@@ -61,6 +64,7 @@ impl TryFrom<u8> for ServerTag {
             0x85 => Ok(Self::SubscriptionErr),
             0x86 => Ok(Self::Heartbeat),
             0x87 => Ok(Self::Close),
+            0x88 => Ok(Self::MessageBatch),
             _ => Err(ProtocolError::UnknownTag(value)),
         }
     }
@@ -93,6 +97,7 @@ mod tests {
             ClientTag::Heartbeat,
             ClientTag::Close,
             ClientTag::SetByteBudget,
+            ClientTag::Publish,
         ] {
             let byte = tag as u8;
             assert_eq!(ClientTag::try_from(byte).unwrap(), tag);
@@ -111,6 +116,7 @@ mod tests {
             ServerTag::SubscriptionErr,
             ServerTag::Heartbeat,
             ServerTag::Close,
+            ServerTag::MessageBatch,
         ] {
             let byte = tag as u8;
             assert_eq!(ServerTag::try_from(byte).unwrap(), tag);

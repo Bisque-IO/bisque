@@ -23,10 +23,10 @@ use bisque_mq::MqEngine;
 use bisque_mq::write_batcher::MqWriteBatcher;
 use bisque_mq_protocol::frame::{
     decode_client_frame_bytes, encode_server_frame_prefixed, read_tcp_frame_bytes,
-    write_tcp_frame_prefixed,
 };
 use bisque_mq_protocol::types::{ClientFrame, ServerFrame};
 use bisque_mq_server::handler::{ConsumerHandler, ConsumerHandlerConfig, MqRouter};
+use tokio::io::AsyncWriteExt;
 
 use bisque_meta::engine::MetaEngine;
 use bisque_meta::token::TokenManager;
@@ -284,6 +284,9 @@ pub struct BisqueMqRouter {
     engine: Arc<RwLock<MqEngine>>,
     /// Primary batcher (single-group fast path).
     primary_batcher: Option<(u64, Arc<MqWriteBatcher>)>,
+    /// Partition group batchers: partition_group_id → batcher.
+    /// Populated when partitioned topics are provisioned.
+    partition_batchers: DashMap<u64, Arc<MqWriteBatcher>>,
     /// Token manager for handshake validation.
     token_manager: Arc<TokenManager>,
     /// Lock-free entity name→id cache: (entity_type, name_hash) → entity_id.
@@ -306,6 +309,7 @@ impl BisqueMqRouter {
         Self {
             engine,
             primary_batcher: None,
+            partition_batchers: DashMap::new(),
             token_manager,
             entity_cache: DashMap::new(),
             topic_head_cache: DashMap::new(),
@@ -316,6 +320,11 @@ impl BisqueMqRouter {
     pub fn with_batcher(mut self, group_id: u64, batcher: Arc<MqWriteBatcher>) -> Self {
         self.primary_batcher = Some((group_id, batcher));
         self
+    }
+
+    /// Register a batcher for a partition group.
+    pub fn add_partition_batcher(&self, partition_group_id: u64, batcher: Arc<MqWriteBatcher>) {
+        self.partition_batchers.insert(partition_group_id, batcher);
     }
 }
 
@@ -396,6 +405,25 @@ impl MqRouter for BisqueMqRouter {
         });
         entry.subscribe()
     }
+
+    fn get_prefetcher(&self, _group_id: u64) -> Option<bisque_raft::SegmentPrefetcher> {
+        None // TODO: wire up raft segment prefetcher for message payload access
+    }
+
+    fn get_topic_partitions(
+        &self,
+        _group_id: u64,
+        entity_id: u64,
+    ) -> Option<Vec<bisque_mq::types::PartitionInfo>> {
+        let engine = self.engine.read();
+        engine.get_topic_partitions(entity_id).map(|s| s.to_vec())
+    }
+
+    fn get_partition_batcher(&self, partition_group_id: u64) -> Option<Arc<MqWriteBatcher>> {
+        self.partition_batchers
+            .get(&partition_group_id)
+            .map(|entry| Arc::clone(entry.value()))
+    }
 }
 
 /// Start the MQ consumer TCP server.
@@ -459,13 +487,30 @@ async fn handle_mq_connection(
 
     let writer_handle = tokio::spawn(async move {
         let mut writer = writer;
-        let mut encode_buf = Vec::with_capacity(4096);
+        // Reusable buffer: accumulates one or more length-prefixed frames,
+        // then flushes in a single write_all syscall.
+        let mut write_buf = Vec::with_capacity(8192);
+        let mut frame_buf = Vec::with_capacity(4096);
         while let Some(frame) = server_rx.recv().await {
-            if let Err(e) = encode_server_frame_prefixed(&frame, &mut encode_buf) {
+            write_buf.clear();
+            // Encode the first frame.
+            if let Err(e) = encode_server_frame_prefixed(&frame, &mut frame_buf) {
                 warn!(error = %e, "MQ protocol encode error");
                 return;
             }
-            if let Err(e) = write_tcp_frame_prefixed(&mut writer, &encode_buf).await {
+            write_buf.extend_from_slice(&frame_buf);
+
+            // Drain any additional frames already queued in the channel.
+            while let Ok(extra) = server_rx.try_recv() {
+                if let Err(e) = encode_server_frame_prefixed(&extra, &mut frame_buf) {
+                    warn!(error = %e, "MQ protocol encode error");
+                    return;
+                }
+                write_buf.extend_from_slice(&frame_buf);
+            }
+
+            // Single syscall for all coalesced frames.
+            if let Err(e) = writer.write_all(&write_buf).await {
                 debug!(error = %e, "MQ TCP write error");
                 return;
             }

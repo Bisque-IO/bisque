@@ -11,6 +11,39 @@ use libmdbx::{
 
 const RAFT_SEGMENTS_META_TABLE: &str = "raft_segments_meta_v3";
 
+/// Where a segment's data resides in the tiered storage hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub(crate) enum SegmentLocation {
+    /// Segment file exists on local disk only.
+    #[default]
+    Local = 0,
+    /// Segment has been archived to remote (S3) storage; local file deleted.
+    Remote = 1,
+    /// Segment exists on both local disk and remote (S3) storage.
+    Both = 2,
+}
+
+impl SegmentLocation {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Remote,
+            2 => Self::Both,
+            _ => Self::Local,
+        }
+    }
+
+    /// Returns true if a local file is expected to exist.
+    pub(crate) fn has_local(&self) -> bool {
+        matches!(self, Self::Local | Self::Both)
+    }
+
+    /// Returns true if the segment has been archived remotely.
+    pub(crate) fn has_remote(&self) -> bool {
+        matches!(self, Self::Remote | Self::Both)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SegmentMeta {
     pub(crate) group_id: u64,
@@ -34,6 +67,8 @@ pub(crate) struct SegmentMeta {
     pub(crate) entry_count: u64,
     /// Byte offset of the first Entry record in the segment.
     pub(crate) first_entry_offset: u64,
+    /// Where this segment's data resides (local, remote, or both).
+    pub(crate) location: SegmentLocation,
 }
 
 impl SegmentMeta {
@@ -50,6 +85,15 @@ impl SegmentMeta {
             && (self.first_entry_offset == 0 || other.first_entry_offset < self.first_entry_offset)
         {
             self.first_entry_offset = other.first_entry_offset;
+        }
+
+        // Location: upgrade toward "Both" if either side has remote
+        if other.location.has_remote() && !self.location.has_remote() {
+            self.location = if self.location.has_local() {
+                SegmentLocation::Both
+            } else {
+                other.location
+            };
         }
 
         match (self.min_index, other.min_index) {
@@ -81,8 +125,8 @@ impl SegmentMeta {
         k
     }
 
-    fn encode_value(&self) -> [u8; 72] {
-        // [flags:1][record_type_flags:1][pad:6][valid:8][min_i:8][max_i:8][min_ts:8][max_ts:8][record_count:8][entry_count:8][first_entry_offset:8]
+    pub(crate) fn encode_value(&self) -> [u8; 72] {
+        // [flags:1][record_type_flags:1][location:1][pad:5][valid:8][min_i:8][max_i:8][min_ts:8][max_ts:8][record_count:8][entry_count:8][first_entry_offset:8]
         let mut v = [0u8; 72];
         let mut flags = 0u8;
         if self.min_index.is_some() && self.max_index.is_some() {
@@ -96,6 +140,7 @@ impl SegmentMeta {
         }
         v[0] = flags;
         v[1] = self.record_type_flags.to_u8();
+        v[2] = self.location as u8;
         v[8..16].copy_from_slice(&self.valid_bytes.to_be_bytes());
         let min_i = self.min_index.unwrap_or(0);
         let max_i = self.max_index.unwrap_or(0);
@@ -111,12 +156,13 @@ impl SegmentMeta {
         v
     }
 
-    fn decode_value(group_id: u64, segment_id: u64, bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn decode_value(group_id: u64, segment_id: u64, bytes: &[u8]) -> Option<Self> {
         if bytes.len() != 72 {
             return None;
         }
         let flags = bytes[0];
         let record_type_flags = RecordTypeFlags::from_u8(bytes[1]);
+        let location = SegmentLocation::from_u8(bytes[2]);
         let valid_bytes = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
         let min_i = u64::from_be_bytes(bytes[16..24].try_into().ok()?);
         let max_i = u64::from_be_bytes(bytes[24..32].try_into().ok()?);
@@ -143,6 +189,7 @@ impl SegmentMeta {
             record_type_flags,
             entry_count,
             first_entry_offset,
+            location,
         })
     }
 }
@@ -460,6 +507,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         }
     }
 
@@ -478,6 +526,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         let key = meta.key_bytes();
@@ -508,6 +557,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         let encoded = meta.encode_value();
@@ -538,6 +588,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         let encoded = meta.encode_value();
@@ -569,6 +620,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         let encoded = meta.encode_value();
@@ -596,6 +648,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         let encoded = meta.encode_value();
@@ -632,6 +685,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         let encoded = meta.encode_value();
@@ -830,6 +884,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             };
             manifest
                 .apply_segment_updates(std::iter::once(meta))
@@ -866,6 +921,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         manifest
@@ -905,6 +961,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -919,6 +976,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -933,6 +991,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
         ];
 
@@ -970,6 +1029,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
             SegmentMeta {
                 group_id: 2,
@@ -984,6 +1044,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
             SegmentMeta {
                 group_id: 3,
@@ -998,6 +1059,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
         ];
 
@@ -1040,6 +1102,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
         manifest
             .apply_segment_updates(std::iter::once(meta1))
@@ -1059,6 +1122,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
         manifest
             .apply_segment_updates(std::iter::once(meta2))
@@ -1092,6 +1156,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -1106,6 +1171,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -1120,6 +1186,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
         ];
 
@@ -1152,6 +1219,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -1166,6 +1234,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
             SegmentMeta {
                 group_id: 1,
@@ -1180,6 +1249,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             },
         ];
 
@@ -1230,6 +1300,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         // Send async (try_send for test since send() is async)
@@ -1264,6 +1335,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             };
             sender.try_send(meta).unwrap();
         }
@@ -1304,6 +1376,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             };
             sender.try_send(meta).unwrap();
         }
@@ -1338,6 +1411,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
         sender1.try_send(meta).unwrap();
 
@@ -1375,6 +1449,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             };
             sender.try_send(meta).unwrap();
         }
@@ -1423,6 +1498,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
         sender.try_send(meta).unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -1456,6 +1532,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             };
             sender.try_send(meta).unwrap();
             std::thread::sleep(Duration::from_millis(200));
@@ -1508,6 +1585,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
         let encoded = meta.encode_value();
         let decoded = SegmentMeta::decode_value(0, 0, &encoded).unwrap();
@@ -1569,6 +1647,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         let other = SegmentMeta {
@@ -1584,6 +1663,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         base.merge_from(other);
@@ -1636,6 +1716,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             })
             .collect();
 
@@ -1668,6 +1749,7 @@ mod tests {
                     record_type_flags: RecordTypeFlags::default(),
                     entry_count: 0,
                     first_entry_offset: 0,
+                    location: SegmentLocation::default(),
                 })
             })
             .collect();
@@ -1712,6 +1794,7 @@ mod tests {
                         record_type_flags: RecordTypeFlags::default(),
                         entry_count: 0,
                         first_entry_offset: 0,
+                        location: SegmentLocation::default(),
                     };
                     let _ = s.try_send(meta);
                 }
@@ -1768,6 +1851,7 @@ mod tests {
                 record_type_flags: RecordTypeFlags::default(),
                 entry_count: 0,
                 first_entry_offset: 0,
+                location: SegmentLocation::default(),
             };
             sender.try_send(meta).unwrap();
         }
@@ -1807,6 +1891,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
         sender.try_send(meta).unwrap();
         drop(sender);
@@ -1839,6 +1924,7 @@ mod tests {
                     record_type_flags: RecordTypeFlags::default(),
                     entry_count: 0,
                     first_entry_offset: 0,
+                    location: SegmentLocation::default(),
                 };
                 if s.try_send(meta).is_err() {
                     break; // Channel closed
@@ -1869,6 +1955,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::from_u8(0b1111), // all flags set
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         let encoded = meta.encode_value();
@@ -1891,6 +1978,7 @@ mod tests {
             record_type_flags: RecordTypeFlags::default(),
             entry_count: 0,
             first_entry_offset: 0,
+            location: SegmentLocation::default(),
         };
 
         let encoded = meta.encode_value();

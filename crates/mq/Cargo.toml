@@ -20,10 +20,10 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 crossfire = { workspace = true }
-dashmap = { workspace = true }
 futures = { workspace = true }
 smallvec = { version = "1", features = ["serde"] }
 crc64fast-nvme = { workspace = true }
+dashmap = { workspace = true }
 cron = "0.15"
 chrono = { workspace = true }
 

@@ -1,12 +1,12 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
 use base64::Engine as _;
 use bisque_mq::config::QueueConfig;
-use bisque_mq::types::{
-    DeliveredMessage, MessagePayload, MqCommand, MqError, MqResponse, name_hash,
-};
+use bisque_mq::flat::FlatMessageBuilder;
+use bisque_mq::types::{DeliveredMessage, MqCommand, MqError, MqResponse, name_hash};
 use bisque_mq::write_batcher::MqWriteBatcher;
 use bytes::Bytes;
 use serde::Deserialize;
@@ -19,6 +19,8 @@ use crate::types::*;
 pub struct SqsState {
     /// The write batcher for submitting commands.
     batcher: Arc<MqWriteBatcher>,
+    /// Log reader for fetching message payloads from raft log segments.
+    log_reader: bisque_raft::SegmentPrefetcher,
     /// Base URL for queue URL construction.
     base_url: String,
     /// Default group ID for queue operations.
@@ -30,13 +32,19 @@ pub struct SqsState {
 }
 
 impl SqsState {
-    pub fn new(batcher: Arc<MqWriteBatcher>, base_url: String, group_id: u64) -> Self {
+    pub fn new(
+        batcher: Arc<MqWriteBatcher>,
+        log_reader: bisque_raft::SegmentPrefetcher,
+        base_url: String,
+        group_id: u64,
+    ) -> Self {
         let labels = [("group", group_id.to_string())];
         let m_send_count = metrics::counter!("sqs.send_message.count", &labels);
         let m_receive_count = metrics::counter!("sqs.receive_message.count", &labels);
         let m_delete_count = metrics::counter!("sqs.delete_message.count", &labels);
         Self {
             batcher,
+            log_reader,
             base_url,
             group_id,
             m_send_count,
@@ -133,16 +141,13 @@ impl SqsState {
             }
             if let Some(ref policy) = attrs.redrive_policy {
                 if let Ok(rp) = serde_json::from_str::<RedrivePolicy>(policy) {
-                    // Resolve DLQ ARN to queue_id would happen here
+                    // TODO: Resolve DLQ ARN to topic_id and set config.dead_letter_topic_id
                     config.max_retries = rp.max_receive_count;
                 }
             }
         }
 
-        let cmd = MqCommand::CreateQueue {
-            name: req.queue_name.clone(),
-            config,
-        };
+        let cmd = MqCommand::create_queue(&req.queue_name, &config);
 
         let resp = self.batcher.submit(cmd).await?;
         match resp {
@@ -165,7 +170,7 @@ impl SqsState {
         let hash = name_hash(&queue_name);
         // We need to resolve name → ID. For now, assume the caller provides the right URL.
         // In production, this would go through MqRouter::resolve_entity.
-        let cmd = MqCommand::DeleteQueue { queue_id: hash };
+        let cmd = MqCommand::delete_queue(hash);
         let resp = self.batcher.submit(cmd).await?;
         match resp {
             MqResponse::Ok => Ok(Json(())),
@@ -180,7 +185,7 @@ impl SqsState {
     ) -> Result<Json<GetQueueUrlResponse>, SqsError> {
         // Verify queue exists by getting attributes
         let hash = name_hash(&req.queue_name);
-        let cmd = MqCommand::GetQueueAttributes { queue_id: hash };
+        let cmd = MqCommand::get_queue_attributes(hash);
         let resp = self.batcher.submit(cmd).await?;
         match resp {
             MqResponse::Stats(_) => Ok(Json(GetQueueUrlResponse {
@@ -224,20 +229,16 @@ impl SqsState {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let payload = MessagePayload {
-            key,
-            value,
-            headers,
-            timestamp: now_ms,
-            ttl_ms: None,
-            routing_key: None,
-        };
+        let mut builder = FlatMessageBuilder::new(value).timestamp(now_ms);
+        if let Some(k) = key {
+            builder = builder.key(k);
+        }
+        for (hk, hv) in headers {
+            builder = builder.header(Bytes::from(hk), hv);
+        }
+        let flat_msg = builder.build();
 
-        let cmd = MqCommand::Enqueue {
-            queue_id,
-            messages: vec![payload],
-            dedup_keys: vec![dedup_key],
-        };
+        let cmd = MqCommand::enqueue(queue_id, &[flat_msg], &[dedup_key]);
 
         let resp = self.batcher.submit(cmd).await?;
         self.m_send_count.increment(1);
@@ -285,23 +286,18 @@ impl SqsState {
                 .as_ref()
                 .map(|s| Bytes::from(s.clone().into_bytes()));
 
-            messages.push(MessagePayload {
-                key,
-                value,
-                headers: Vec::new(),
-                timestamp: now_ms,
-                ttl_ms: None,
-                routing_key: None,
-            });
+            {
+                let mut builder = FlatMessageBuilder::new(value).timestamp(now_ms);
+                if let Some(k) = key {
+                    builder = builder.key(k);
+                }
+                messages.push(builder.build());
+            }
             dedup_keys.push(dedup);
             entry_ids.push(entry.id.clone());
         }
 
-        let cmd = MqCommand::Enqueue {
-            queue_id,
-            messages,
-            dedup_keys,
-        };
+        let cmd = MqCommand::enqueue(queue_id, &messages, &dedup_keys);
 
         let resp = self.batcher.submit(cmd).await?;
         self.m_send_count.increment(entry_ids.len() as u64);
@@ -342,11 +338,7 @@ impl SqsState {
         // In a real implementation, this would be tied to a persistent consumer session.
         let consumer_id = rand_consumer_id();
 
-        let cmd = MqCommand::Deliver {
-            queue_id,
-            consumer_id,
-            max_count,
-        };
+        let cmd = MqCommand::deliver(queue_id, consumer_id, max_count);
 
         // Long-poll: retry up to wait_time seconds
         let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_time as u64);
@@ -359,7 +351,7 @@ impl SqsState {
                     self.m_receive_count.increment(messages.len() as u64);
                     let sqs_messages = messages
                         .into_iter()
-                        .map(|m| to_sqs_message(queue_id, m))
+                        .map(|m| to_sqs_message(queue_id, m, &self.log_reader))
                         .collect();
                     return Ok(Json(ReceiveMessageResponse {
                         messages: sqs_messages,
@@ -385,10 +377,7 @@ impl SqsState {
     pub async fn delete_message(&self, req: DeleteMessageRequest) -> Result<Json<()>, SqsError> {
         let (queue_id, message_id) = Self::decode_receipt_handle(&req.receipt_handle)?;
 
-        let cmd = MqCommand::Ack {
-            queue_id,
-            message_ids: vec![message_id],
-        };
+        let cmd = MqCommand::ack(queue_id, &[message_id], None);
 
         let resp = self.batcher.submit(cmd).await?;
         self.m_delete_count.increment(1);
@@ -407,36 +396,16 @@ impl SqsState {
         let mut successful = Vec::new();
         let mut failed = Vec::new();
 
+        // Group valid entries by queue_id to batch into a single Ack per queue.
+        let mut by_queue: HashMap<u64, Vec<(String, u64)>> = HashMap::new();
+
         for entry in &req.entries {
             match Self::decode_receipt_handle(&entry.receipt_handle) {
                 Ok((queue_id, message_id)) => {
-                    let cmd = MqCommand::Ack {
-                        queue_id,
-                        message_ids: vec![message_id],
-                    };
-                    match self.batcher.submit(cmd).await {
-                        Ok(MqResponse::Ok) => {
-                            successful.push(DeleteMessageBatchResultEntry {
-                                id: entry.id.clone(),
-                            });
-                        }
-                        Ok(MqResponse::Error(e)) => {
-                            failed.push(BatchResultErrorEntry {
-                                id: entry.id.clone(),
-                                code: "InternalError".to_string(),
-                                message: e.to_string(),
-                                sender_fault: false,
-                            });
-                        }
-                        _ => {
-                            failed.push(BatchResultErrorEntry {
-                                id: entry.id.clone(),
-                                code: "InternalError".to_string(),
-                                message: "unexpected response".to_string(),
-                                sender_fault: false,
-                            });
-                        }
-                    }
+                    by_queue
+                        .entry(queue_id)
+                        .or_default()
+                        .push((entry.id.clone(), message_id));
                 }
                 Err(_) => {
                     failed.push(BatchResultErrorEntry {
@@ -445,6 +414,40 @@ impl SqsState {
                         message: "invalid receipt handle".to_string(),
                         sender_fault: true,
                     });
+                }
+            }
+        }
+
+        // Single Ack command per queue with all message_ids.
+        for (queue_id, entries) in by_queue {
+            let (ids, message_ids): (Vec<String>, Vec<u64>) = entries.into_iter().unzip();
+            let cmd = MqCommand::ack(queue_id, &message_ids, None);
+            match self.batcher.submit(cmd).await {
+                Ok(MqResponse::Ok) => {
+                    for id in ids {
+                        successful.push(DeleteMessageBatchResultEntry { id });
+                    }
+                }
+                Ok(MqResponse::Error(e)) => {
+                    let msg = e.to_string();
+                    for id in ids {
+                        failed.push(BatchResultErrorEntry {
+                            id,
+                            code: "InternalError".to_string(),
+                            message: msg.clone(),
+                            sender_fault: false,
+                        });
+                    }
+                }
+                _ => {
+                    for id in ids {
+                        failed.push(BatchResultErrorEntry {
+                            id,
+                            code: "InternalError".to_string(),
+                            message: "unexpected response".to_string(),
+                            sender_fault: false,
+                        });
+                    }
                 }
             }
         }
@@ -459,11 +462,11 @@ impl SqsState {
     ) -> Result<Json<()>, SqsError> {
         let (queue_id, message_id) = Self::decode_receipt_handle(&req.receipt_handle)?;
 
-        let cmd = MqCommand::ExtendVisibility {
+        let cmd = MqCommand::extend_visibility(
             queue_id,
-            message_ids: vec![message_id],
-            extension_ms: req.visibility_timeout as u64 * 1000,
-        };
+            &[message_id],
+            req.visibility_timeout as u64 * 1000,
+        );
 
         let resp = self.batcher.submit(cmd).await?;
         match resp {
@@ -480,29 +483,17 @@ impl SqsState {
         let mut successful = Vec::new();
         let mut failed = Vec::new();
 
+        // Group by (queue_id, extension_ms) to batch into single ExtendVisibility commands.
+        let mut by_key: HashMap<(u64, u64), Vec<(String, u64)>> = HashMap::new();
+
         for entry in &req.entries {
             match Self::decode_receipt_handle(&entry.receipt_handle) {
                 Ok((queue_id, message_id)) => {
-                    let cmd = MqCommand::ExtendVisibility {
-                        queue_id,
-                        message_ids: vec![message_id],
-                        extension_ms: entry.visibility_timeout as u64 * 1000,
-                    };
-                    match self.batcher.submit(cmd).await {
-                        Ok(MqResponse::Ok) => {
-                            successful.push(ChangeMessageVisibilityBatchResultEntry {
-                                id: entry.id.clone(),
-                            });
-                        }
-                        _ => {
-                            failed.push(BatchResultErrorEntry {
-                                id: entry.id.clone(),
-                                code: "InternalError".to_string(),
-                                message: "failed to change visibility".to_string(),
-                                sender_fault: false,
-                            });
-                        }
-                    }
+                    let extension_ms = entry.visibility_timeout as u64 * 1000;
+                    by_key
+                        .entry((queue_id, extension_ms))
+                        .or_default()
+                        .push((entry.id.clone(), message_id));
                 }
                 Err(_) => {
                     failed.push(BatchResultErrorEntry {
@@ -511,6 +502,28 @@ impl SqsState {
                         message: "invalid receipt handle".to_string(),
                         sender_fault: true,
                     });
+                }
+            }
+        }
+
+        for ((queue_id, extension_ms), entries) in by_key {
+            let (ids, message_ids): (Vec<String>, Vec<u64>) = entries.into_iter().unzip();
+            let cmd = MqCommand::extend_visibility(queue_id, &message_ids, extension_ms);
+            match self.batcher.submit(cmd).await {
+                Ok(MqResponse::Ok) => {
+                    for id in ids {
+                        successful.push(ChangeMessageVisibilityBatchResultEntry { id });
+                    }
+                }
+                _ => {
+                    for id in ids {
+                        failed.push(BatchResultErrorEntry {
+                            id,
+                            code: "InternalError".to_string(),
+                            message: "failed to change visibility".to_string(),
+                            sender_fault: false,
+                        });
+                    }
                 }
             }
         }
@@ -525,7 +538,7 @@ impl SqsState {
         let (_group_id, queue_name) = self.parse_queue_url(&req.queue_url)?;
         let queue_id = name_hash(&queue_name);
 
-        let cmd = MqCommand::PurgeQueue { queue_id };
+        let cmd = MqCommand::purge_queue(queue_id);
         let resp = self.batcher.submit(cmd).await?;
         match resp {
             MqResponse::Ok => Ok(Json(())),
@@ -541,7 +554,7 @@ impl SqsState {
         let (_group_id, queue_name) = self.parse_queue_url(&req.queue_url)?;
         let queue_id = name_hash(&queue_name);
 
-        let cmd = MqCommand::GetQueueAttributes { queue_id };
+        let cmd = MqCommand::get_queue_attributes(queue_id);
         let resp = self.batcher.submit(cmd).await?;
 
         match resp {
@@ -588,8 +601,20 @@ struct RedrivePolicy {
     _dead_letter_target_arn: Option<String>,
 }
 
-fn to_sqs_message(queue_id: u64, msg: DeliveredMessage) -> SqsMessage {
-    let body = String::from_utf8_lossy(&msg.payload.value).to_string();
+fn to_sqs_message(
+    queue_id: u64,
+    msg: DeliveredMessage,
+    prefetcher: &bisque_raft::SegmentPrefetcher,
+) -> SqsMessage {
+    let body = if let Some(flat_bytes) = bisque_mq::read_message_at(prefetcher, msg.message_id) {
+        if let Some(flat) = bisque_mq::flat::FlatMessage::new(flat_bytes) {
+            String::from_utf8_lossy(&flat.value()).into_owned()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
     let md5 = SqsState::md5_hex(body.as_bytes());
     let receipt_handle = SqsState::encode_receipt_handle(queue_id, msg.message_id);
 
