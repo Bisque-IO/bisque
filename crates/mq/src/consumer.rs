@@ -1,10 +1,13 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::types::Subscription;
 
+/// Persisted consumer metadata (snapshot / MDBX).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerMeta {
     pub consumer_id: u64,
@@ -34,27 +37,65 @@ impl ConsumerMeta {
     }
 }
 
-/// In-memory consumer state.
+/// Lock-free in-memory consumer state.
+///
+/// Immutable identity fields are stored directly. Mutable state uses atomics
+/// and `RwLock` for concurrent readers with single-writer (Raft apply path).
 pub struct ConsumerState {
+    // -- Immutable identity (set once at creation) --
     pub meta: ConsumerMeta,
+
+    // -- Mutable state --
+    last_heartbeat_at: AtomicU64,
+    assigned_jobs: RwLock<HashSet<u64>>,
+
     /// entity_id → list of in-flight message_ids
     pub in_flight: DashMap<u64, Vec<u64>>,
 }
 
 impl ConsumerState {
     pub fn new(meta: ConsumerMeta) -> Self {
+        let last_heartbeat_at = AtomicU64::new(meta.last_heartbeat_at);
+        let assigned_jobs = RwLock::new(meta.assigned_jobs.clone());
         Self {
             meta,
+            last_heartbeat_at,
+            assigned_jobs,
             in_flight: DashMap::new(),
         }
     }
 
-    pub fn heartbeat(&mut self, at: u64) {
-        self.meta.last_heartbeat_at = at;
+    #[inline]
+    pub fn last_heartbeat_at(&self) -> u64 {
+        self.last_heartbeat_at.load(Ordering::Relaxed)
+    }
+
+    pub fn assigned_jobs(&self) -> parking_lot::RwLockReadGuard<'_, HashSet<u64>> {
+        self.assigned_jobs.read()
+    }
+
+    pub fn heartbeat(&self, at: u64) {
+        self.last_heartbeat_at.store(at, Ordering::Relaxed);
     }
 
     pub fn is_dead(&self, current_time: u64, timeout_ms: u64) -> bool {
-        current_time > self.meta.last_heartbeat_at + timeout_ms
+        current_time > self.last_heartbeat_at() + timeout_ms
+    }
+
+    pub fn add_assigned_job(&self, job_id: u64) {
+        self.assigned_jobs.write().insert(job_id);
+    }
+
+    pub fn remove_assigned_job(&self, job_id: u64) {
+        self.assigned_jobs.write().remove(&job_id);
+    }
+
+    /// Flush mutable state back to a cloned `ConsumerMeta` for snapshot/persistence.
+    pub fn snapshot_meta(&self) -> ConsumerMeta {
+        let mut m = self.meta.clone();
+        m.last_heartbeat_at = self.last_heartbeat_at();
+        m.assigned_jobs = self.assigned_jobs.read().clone();
+        m
     }
 }
 
@@ -90,11 +131,11 @@ mod tests {
 
     #[test]
     fn test_heartbeat() {
-        let mut consumer = make_consumer(1, 1000);
-        assert_eq!(consumer.meta.last_heartbeat_at, 1000);
+        let consumer = make_consumer(1, 1000);
+        assert_eq!(consumer.last_heartbeat_at(), 1000);
 
         consumer.heartbeat(5000);
-        assert_eq!(consumer.meta.last_heartbeat_at, 5000);
+        assert_eq!(consumer.last_heartbeat_at(), 5000);
     }
 
     #[test]
@@ -113,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_is_dead_after_heartbeat() {
-        let mut consumer = make_consumer(1, 1000);
+        let consumer = make_consumer(1, 1000);
         consumer.heartbeat(10_000);
 
         // Deadline resets to heartbeat time
@@ -143,5 +184,31 @@ mod tests {
         assert_eq!(decoded.group_name, "workers");
         assert_eq!(decoded.subscriptions.len(), 1);
         assert!(decoded.subscriptions.iter().any(|s| s.entity_id == 5));
+    }
+
+    #[test]
+    fn test_snapshot_meta_roundtrip() {
+        let consumer = make_consumer(1, 1000);
+        consumer.heartbeat(5000);
+        consumer.add_assigned_job(42);
+
+        let snap = consumer.snapshot_meta();
+        assert_eq!(snap.consumer_id, 1);
+        assert_eq!(snap.last_heartbeat_at, 5000);
+        assert!(snap.assigned_jobs.contains(&42));
+    }
+
+    #[test]
+    fn test_assigned_jobs() {
+        let consumer = make_consumer(1, 1000);
+        assert!(consumer.assigned_jobs().is_empty());
+
+        consumer.add_assigned_job(10);
+        consumer.add_assigned_job(20);
+        assert_eq!(consumer.assigned_jobs().len(), 2);
+
+        consumer.remove_assigned_job(10);
+        assert_eq!(consumer.assigned_jobs().len(), 1);
+        assert!(consumer.assigned_jobs().contains(&20));
     }
 }

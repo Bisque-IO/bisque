@@ -17,7 +17,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 metrics = { workspace = true }
 crc32fast = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
+bisque-mq = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }

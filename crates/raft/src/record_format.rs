@@ -327,8 +327,10 @@ impl LogIndex {
 
     pub fn truncate_from(&self, first_removed: u64) {
         // Remove keys in [first_removed, u64::MAX] in batches.
+        // Collect freed slots locally, then push all at once to reduce lock acquisitions.
         let guard = epoch::pin();
         let mut buf: Vec<([u8; 8], usize)> = vec![([0u8; 8], 0usize); 256];
+        let mut freed_slots = Vec::new();
 
         loop {
             let n = self
@@ -344,16 +346,22 @@ impl LogIndex {
                     continue;
                 }
                 if let Some(slot) = self.map.remove(key, &guard) {
-                    self.free.write().push(slot);
+                    freed_slots.push(slot);
                 }
             }
+        }
+
+        if !freed_slots.is_empty() {
+            self.free.write().extend(freed_slots);
         }
     }
 
     pub fn purge_to(&self, last_removed: u64) {
         // Remove keys in [0, last_removed] in batches.
+        // Collect freed slots locally, then push all at once to reduce lock acquisitions.
         let guard = epoch::pin();
         let mut buf: Vec<([u8; 8], usize)> = vec![([0u8; 8], 0usize); 256];
+        let mut freed_slots = Vec::new();
 
         let end = last_removed.saturating_add(1);
         loop {
@@ -368,9 +376,13 @@ impl LogIndex {
                     continue;
                 }
                 if let Some(slot) = self.map.remove(key, &guard) {
-                    self.free.write().push(slot);
+                    freed_slots.push(slot);
                 }
             }
+        }
+
+        if !freed_slots.is_empty() {
+            self.free.write().extend(freed_slots);
         }
     }
 }

@@ -500,7 +500,7 @@ fn mq_reader_read_message_at() {
         let cmd = MqCommand::publish(1, &[msg.clone()]);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
-        let metadata = Arc::new(MqMetadata::new());
+        let metadata = Arc::new(MqMetadata::default());
         let reader = MqReader::new(prefetcher, metadata);
 
         let result = reader.read_message_at(1).unwrap();
@@ -523,7 +523,7 @@ fn mq_reader_read_messages_at_into() {
         let cmd = MqCommand::publish(1, &msgs);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
-        let metadata = Arc::new(MqMetadata::new());
+        let metadata = Arc::new(MqMetadata::default());
         let reader = MqReader::new(prefetcher, metadata);
 
         let mut out = Vec::new();
@@ -543,13 +543,14 @@ fn mq_reader_list_topics_with_prefix() {
         let (storage, log) = setup_storage(&tmp, 1024 * 1024).await;
         let prefetcher = log.prefetcher();
 
-        let metadata = Arc::new(MqMetadata::new());
+        let metadata = Arc::new(MqMetadata::default());
         metadata.insert_topic(Arc::new(TopicMeta::with_state(
             1,
             "events.clicks".into(),
             10,
             0,
             10,
+            0,
             0,
             0,
         )));
@@ -561,6 +562,7 @@ fn mq_reader_list_topics_with_prefix() {
             5,
             0,
             0,
+            0,
         )));
         metadata.insert_topic(Arc::new(TopicMeta::with_state(
             3,
@@ -568,6 +570,7 @@ fn mq_reader_list_topics_with_prefix() {
             1,
             0,
             1,
+            0,
             0,
             0,
         )));
@@ -602,13 +605,14 @@ fn mq_reader_read_latest_topic_message() {
         let cmd = MqCommand::publish(42, &msgs);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
-        let metadata = Arc::new(MqMetadata::new());
+        let metadata = Arc::new(MqMetadata::default());
         metadata.insert_topic(Arc::new(TopicMeta::with_state(
             42,
             "retained-topic".into(),
             1,
             0,
             1,
+            0,
             1,
             0,
         )));
@@ -638,7 +642,7 @@ fn mq_reader_segment_cursor() {
         ];
         append_entries(&mut log, entries).await;
 
-        let metadata = Arc::new(MqMetadata::new());
+        let metadata = Arc::new(MqMetadata::default());
         let reader = MqReader::new(prefetcher, metadata);
 
         let active_id = log.prefetcher().active_segment_id();
@@ -784,13 +788,14 @@ fn end_to_end_scanner_and_reader() {
         append_entries(&mut log, entries).await;
 
         // Set up metadata.
-        let metadata = Arc::new(MqMetadata::new());
+        let metadata = Arc::new(MqMetadata::default());
         metadata.insert_topic(Arc::new(TopicMeta::with_state(
             0,
             "topic-0".into(),
             30,
             0,
             10,
+            0,
             30,
             0,
         )));
@@ -800,6 +805,7 @@ fn end_to_end_scanner_and_reader() {
             30,
             0,
             10,
+            0,
             28,
             0,
         )));
@@ -809,6 +815,7 @@ fn end_to_end_scanner_and_reader() {
             30,
             0,
             10,
+            0,
             29,
             0,
         )));

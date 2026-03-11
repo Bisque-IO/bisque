@@ -1,6 +1,7 @@
-use std::cell::UnsafeCell;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::config::JobConfig;
@@ -57,13 +58,38 @@ impl JobMeta {
 // In-memory Job State
 // =============================================================================
 
+/// Sentinel for Option<u64> atomics: 0 means None.
+const NONE_U64: u64 = 0;
+
+#[inline]
+fn opt_to_atomic(v: Option<u64>) -> u64 {
+    v.unwrap_or(NONE_U64)
+}
+
+#[inline]
+fn atomic_to_opt(v: u64) -> Option<u64> {
+    if v == NONE_U64 { None } else { Some(v) }
+}
+
 /// Lock-free job instance.
 ///
-/// All apply methods take `&self` using interior mutability (unsafe single-writer
-/// pointer cast). The Raft apply path is the only writer; readers access
-/// immutable fields like `should_trigger()` and `is_execution_timed_out()`.
+/// Immutable identity fields are stored directly in `meta`. Mutable state uses
+/// atomics for safe concurrent reads (leader tasks checking triggers/timeouts)
+/// with single-writer updates (Raft apply path). No `UnsafeCell` needed.
 pub struct JobInstance {
-    meta: UnsafeCell<JobMeta>,
+    // -- Immutable identity (set once at creation, never changed) --
+    pub meta: JobMeta,
+
+    // -- Mutable state (atomics for concurrent readers + single writer) --
+    enabled: AtomicBool,
+    config: RwLock<JobConfig>,
+    pub(crate) assigned_consumer_id: AtomicU64,
+    pub(crate) last_triggered_at: AtomicU64,
+    pub(crate) last_completed_at: AtomicU64,
+    pub(crate) next_trigger_at: AtomicU64,
+    pub(crate) current_execution_id: AtomicU64,
+    pub(crate) consecutive_failures: AtomicU32,
+    pub(crate) queued_triggers: AtomicU32,
 
     // Pre-initialized metrics
     m_trigger_count: metrics::Counter,
@@ -72,20 +98,38 @@ pub struct JobInstance {
     m_timeout_count: metrics::Counter,
 }
 
-// SAFETY: Single-writer (Raft apply path) guarantees no concurrent mutation.
-unsafe impl Send for JobInstance {}
-unsafe impl Sync for JobInstance {}
-
 impl JobInstance {
-    pub fn new(meta: JobMeta) -> Self {
-        let labels = [("job", meta.name.clone())];
+    pub fn new(meta: JobMeta, catalog_name: &str) -> Self {
+        let labels = [
+            ("catalog", catalog_name.to_owned()),
+            ("job", meta.name.clone()),
+        ];
         let m_trigger_count = metrics::counter!("mq.job.trigger.count", &labels);
         let m_complete_count = metrics::counter!("mq.job.complete.count", &labels);
         let m_fail_count = metrics::counter!("mq.job.fail.count", &labels);
         let m_timeout_count = metrics::counter!("mq.job.timeout.count", &labels);
 
+        let enabled = AtomicBool::new(meta.enabled);
+        let config = RwLock::new(meta.config.clone());
+        let assigned_consumer_id = AtomicU64::new(opt_to_atomic(meta.state.assigned_consumer_id));
+        let last_triggered_at = AtomicU64::new(opt_to_atomic(meta.state.last_triggered_at));
+        let last_completed_at = AtomicU64::new(opt_to_atomic(meta.state.last_completed_at));
+        let next_trigger_at = AtomicU64::new(meta.state.next_trigger_at);
+        let current_execution_id = AtomicU64::new(opt_to_atomic(meta.state.current_execution_id));
+        let consecutive_failures = AtomicU32::new(meta.state.consecutive_failures);
+        let queued_triggers = AtomicU32::new(meta.state.queued_triggers);
+
         Self {
-            meta: UnsafeCell::new(meta),
+            meta,
+            enabled,
+            config,
+            assigned_consumer_id,
+            last_triggered_at,
+            last_completed_at,
+            next_trigger_at,
+            current_execution_id,
+            consecutive_failures,
+            queued_triggers,
             m_trigger_count,
             m_complete_count,
             m_fail_count,
@@ -93,99 +137,145 @@ impl JobInstance {
         }
     }
 
-    /// Read-only access to meta.
+    // -- Atomic accessors --
+
     #[inline]
-    pub fn meta(&self) -> &JobMeta {
-        unsafe { &*self.meta.get() }
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Get a mutable reference to meta. SAFETY: only called from single-writer Raft apply path.
     #[inline]
-    pub(crate) fn meta_mut(&self) -> &mut JobMeta {
-        unsafe { &mut *self.meta.get() }
+    pub fn assigned_consumer_id(&self) -> Option<u64> {
+        atomic_to_opt(self.assigned_consumer_id.load(Ordering::Relaxed))
     }
+
+    #[inline]
+    pub fn last_triggered_at(&self) -> Option<u64> {
+        atomic_to_opt(self.last_triggered_at.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn last_completed_at(&self) -> Option<u64> {
+        atomic_to_opt(self.last_completed_at.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn next_trigger_at(&self) -> u64 {
+        self.next_trigger_at.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn current_execution_id(&self) -> Option<u64> {
+        atomic_to_opt(self.current_execution_id.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn queued_triggers(&self) -> u32 {
+        self.queued_triggers.load(Ordering::Relaxed)
+    }
+
+    /// Build a JobMeta snapshot by flushing atomics back to a cloned meta.
+    pub fn snapshot_meta(&self) -> JobMeta {
+        let mut m = self.meta.clone();
+        m.enabled = self.enabled();
+        m.config = self.config.read().clone();
+        m.state.assigned_consumer_id = self.assigned_consumer_id();
+        m.state.last_triggered_at = self.last_triggered_at();
+        m.state.last_completed_at = self.last_completed_at();
+        m.state.next_trigger_at = self.next_trigger_at();
+        m.state.current_execution_id = self.current_execution_id();
+        m.state.consecutive_failures = self.consecutive_failures();
+        m.state.queued_triggers = self.queued_triggers();
+        m
+    }
+
+    // -- Apply methods (single-writer Raft apply path) --
 
     pub fn apply_trigger(&self, execution_id: u64, triggered_at: u64) {
-        let meta = self.meta_mut();
-        meta.state.current_execution_id = Some(execution_id);
-        meta.state.last_triggered_at = Some(triggered_at);
-        // Compute next trigger time
-        meta.state.next_trigger_at =
-            compute_next_trigger(&meta.config.cron_expression, triggered_at);
+        self.current_execution_id
+            .store(execution_id, Ordering::Relaxed);
+        self.last_triggered_at
+            .store(triggered_at, Ordering::Relaxed);
+        let next = compute_next_trigger(&self.config.read().cron_expression, triggered_at);
+        self.next_trigger_at.store(next, Ordering::Relaxed);
         self.m_trigger_count.increment(1);
     }
 
     pub fn apply_assign(&self, consumer_id: u64) {
-        self.meta_mut().state.assigned_consumer_id = Some(consumer_id);
+        self.assigned_consumer_id
+            .store(consumer_id, Ordering::Relaxed);
     }
 
     pub fn apply_unassign(&self) {
-        self.meta_mut().state.assigned_consumer_id = None;
+        self.assigned_consumer_id.store(NONE_U64, Ordering::Relaxed);
     }
 
     pub fn apply_complete(&self, execution_id: u64, current_time: u64) {
-        let meta = self.meta_mut();
-        if meta.state.current_execution_id == Some(execution_id) {
-            meta.state.current_execution_id = None;
-            meta.state.last_completed_at = Some(current_time);
-            meta.state.consecutive_failures = 0;
+        if self.current_execution_id() == Some(execution_id) {
+            self.current_execution_id.store(NONE_U64, Ordering::Relaxed);
+            self.last_completed_at
+                .store(current_time, Ordering::Relaxed);
+            self.consecutive_failures.store(0, Ordering::Relaxed);
             self.m_complete_count.increment(1);
 
             // Dequeue a queued trigger if any
-            if meta.state.queued_triggers > 0 {
-                meta.state.queued_triggers -= 1;
+            let qt = self.queued_triggers.load(Ordering::Relaxed);
+            if qt > 0 {
+                self.queued_triggers.store(qt - 1, Ordering::Relaxed);
             }
         }
     }
 
     pub fn apply_fail(&self, execution_id: u64) {
-        let meta = self.meta_mut();
-        if meta.state.current_execution_id == Some(execution_id) {
-            meta.state.current_execution_id = None;
-            meta.state.consecutive_failures += 1;
+        if self.current_execution_id() == Some(execution_id) {
+            self.current_execution_id.store(NONE_U64, Ordering::Relaxed);
+            self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
             self.m_fail_count.increment(1);
         }
     }
 
     pub fn apply_timeout(&self, execution_id: u64) {
-        let meta = self.meta_mut();
-        if meta.state.current_execution_id == Some(execution_id) {
-            meta.state.current_execution_id = None;
-            meta.state.consecutive_failures += 1;
-            meta.state.assigned_consumer_id = None;
+        if self.current_execution_id() == Some(execution_id) {
+            self.current_execution_id.store(NONE_U64, Ordering::Relaxed);
+            self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+            self.assigned_consumer_id.store(NONE_U64, Ordering::Relaxed);
             self.m_timeout_count.increment(1);
         }
     }
 
-    pub fn apply_set_enabled(&self, enabled: bool) {
-        self.meta_mut().enabled = enabled;
+    pub fn apply_set_enabled(&self, value: bool) {
+        self.enabled.store(value, Ordering::Relaxed);
     }
 
-    pub fn apply_set_config(&self, config: JobConfig) {
-        self.meta_mut().config = config;
+    pub fn apply_set_config(&self, new_config: JobConfig) {
+        *self.config.write() = new_config;
     }
 
     /// Check if this job should be triggered now.
     pub fn should_trigger(&self, current_time: u64) -> bool {
-        let meta = self.meta();
-        if !meta.enabled {
+        if !self.enabled() {
             return false;
         }
-        if current_time < meta.state.next_trigger_at {
+        if current_time < self.next_trigger_at() {
             return false;
         }
-        match meta.config.overlap_policy {
-            OverlapPolicy::Skip => meta.state.current_execution_id.is_none(),
-            OverlapPolicy::Queue => meta.state.queued_triggers < meta.config.max_queued,
+        let config = self.config.read();
+        match config.overlap_policy {
+            OverlapPolicy::Skip => self.current_execution_id().is_none(),
+            OverlapPolicy::Queue => self.queued_triggers() < config.max_queued,
         }
     }
 
     /// Check if the current execution has timed out.
     pub fn is_execution_timed_out(&self, current_time: u64) -> bool {
-        let meta = self.meta();
-        if let Some(triggered_at) = meta.state.last_triggered_at {
-            if meta.state.current_execution_id.is_some() {
-                return current_time > triggered_at + meta.config.execution_timeout_ms;
+        if let Some(triggered_at) = self.last_triggered_at() {
+            if self.current_execution_id().is_some() {
+                return current_time > triggered_at + self.config.read().execution_timeout_ms;
             }
         }
         false
@@ -226,22 +316,22 @@ mod tests {
             ..Default::default()
         };
         let meta = JobMeta::new(1, name.to_string(), 1000, config);
-        JobInstance::new(meta)
+        JobInstance::new(meta, "test")
     }
 
     fn make_job_with_config(name: &str, config: JobConfig) -> JobInstance {
         let meta = JobMeta::new(1, name.to_string(), 1000, config);
-        JobInstance::new(meta)
+        JobInstance::new(meta, "test")
     }
 
     #[test]
     fn test_job_meta_defaults() {
         let job = make_job("test-job");
-        assert_eq!(job.meta().job_id, 1);
-        assert_eq!(job.meta().name, "test-job");
-        assert!(job.meta().enabled);
-        assert!(job.meta().state.current_execution_id.is_none());
-        assert_eq!(job.meta().state.consecutive_failures, 0);
+        assert_eq!(job.meta.job_id, 1);
+        assert_eq!(job.meta.name, "test-job");
+        assert!(job.enabled());
+        assert!(job.current_execution_id().is_none());
+        assert_eq!(job.consecutive_failures(), 0);
     }
 
     #[test]
@@ -249,16 +339,16 @@ mod tests {
         let job = make_job("test-job");
         job.apply_trigger(100, 5000);
 
-        assert_eq!(job.meta().state.current_execution_id, Some(100));
-        assert_eq!(job.meta().state.last_triggered_at, Some(5000));
-        assert!(job.meta().state.next_trigger_at > 5000);
+        assert_eq!(job.current_execution_id(), Some(100));
+        assert_eq!(job.last_triggered_at(), Some(5000));
+        assert!(job.next_trigger_at() > 5000);
     }
 
     #[test]
     fn test_assign() {
         let job = make_job("test-job");
         job.apply_assign(42);
-        assert_eq!(job.meta().state.assigned_consumer_id, Some(42));
+        assert_eq!(job.assigned_consumer_id(), Some(42));
     }
 
     #[test]
@@ -267,9 +357,9 @@ mod tests {
         job.apply_trigger(100, 5000);
         job.apply_complete(100, 6000);
 
-        assert!(job.meta().state.current_execution_id.is_none());
-        assert_eq!(job.meta().state.last_completed_at, Some(6000));
-        assert_eq!(job.meta().state.consecutive_failures, 0);
+        assert!(job.current_execution_id().is_none());
+        assert_eq!(job.last_completed_at(), Some(6000));
+        assert_eq!(job.consecutive_failures(), 0);
     }
 
     #[test]
@@ -279,8 +369,8 @@ mod tests {
         job.apply_complete(999, 6000); // wrong ID
 
         // Should not change state
-        assert_eq!(job.meta().state.current_execution_id, Some(100));
-        assert!(job.meta().state.last_completed_at.is_none());
+        assert_eq!(job.current_execution_id(), Some(100));
+        assert!(job.last_completed_at().is_none());
     }
 
     #[test]
@@ -289,8 +379,8 @@ mod tests {
         job.apply_trigger(100, 5000);
         job.apply_fail(100);
 
-        assert!(job.meta().state.current_execution_id.is_none());
-        assert_eq!(job.meta().state.consecutive_failures, 1);
+        assert!(job.current_execution_id().is_none());
+        assert_eq!(job.consecutive_failures(), 1);
     }
 
     #[test]
@@ -299,16 +389,16 @@ mod tests {
 
         job.apply_trigger(1, 5000);
         job.apply_fail(1);
-        assert_eq!(job.meta().state.consecutive_failures, 1);
+        assert_eq!(job.consecutive_failures(), 1);
 
         job.apply_trigger(2, 6000);
         job.apply_fail(2);
-        assert_eq!(job.meta().state.consecutive_failures, 2);
+        assert_eq!(job.consecutive_failures(), 2);
 
         // Successful completion resets
         job.apply_trigger(3, 7000);
         job.apply_complete(3, 8000);
-        assert_eq!(job.meta().state.consecutive_failures, 0);
+        assert_eq!(job.consecutive_failures(), 0);
     }
 
     #[test]
@@ -318,9 +408,9 @@ mod tests {
         job.apply_trigger(100, 5000);
         job.apply_timeout(100);
 
-        assert!(job.meta().state.current_execution_id.is_none());
-        assert_eq!(job.meta().state.consecutive_failures, 1);
-        assert!(job.meta().state.assigned_consumer_id.is_none());
+        assert!(job.current_execution_id().is_none());
+        assert_eq!(job.consecutive_failures(), 1);
+        assert!(job.assigned_consumer_id().is_none());
     }
 
     #[test]
@@ -340,12 +430,12 @@ mod tests {
     #[test]
     fn test_should_trigger_skip_policy() {
         let job = make_job("test-job");
-        job.meta_mut().state.next_trigger_at = 5000;
+        job.next_trigger_at.store(5000, Ordering::Relaxed);
 
         assert!(job.should_trigger(6000));
 
         // With active execution, skip policy prevents trigger
-        job.meta_mut().state.current_execution_id = Some(1);
+        job.current_execution_id.store(1, Ordering::Relaxed);
         assert!(!job.should_trigger(6000));
     }
 
@@ -358,13 +448,13 @@ mod tests {
             ..Default::default()
         };
         let job = make_job_with_config("test-job", config);
-        job.meta_mut().state.next_trigger_at = 5000;
-        job.meta_mut().state.current_execution_id = Some(1);
+        job.next_trigger_at.store(5000, Ordering::Relaxed);
+        job.current_execution_id.store(1, Ordering::Relaxed);
 
         // Can queue up to max_queued
         assert!(job.should_trigger(6000));
 
-        job.meta_mut().state.queued_triggers = 2;
+        job.queued_triggers.store(2, Ordering::Relaxed);
         assert!(!job.should_trigger(6000));
     }
 
@@ -382,11 +472,11 @@ mod tests {
     #[test]
     fn test_queued_triggers_decrement_on_complete() {
         let job = make_job("test-job");
-        job.meta_mut().state.queued_triggers = 3;
+        job.queued_triggers.store(3, Ordering::Relaxed);
         job.apply_trigger(100, 5000);
         job.apply_complete(100, 6000);
 
-        assert_eq!(job.meta().state.queued_triggers, 2);
+        assert_eq!(job.queued_triggers(), 2);
     }
 
     #[test]
@@ -400,5 +490,18 @@ mod tests {
         // Every minute
         let result = compute_next_trigger("0 * * * * *", 1000);
         assert!(result > 1000);
+    }
+
+    #[test]
+    fn test_snapshot_meta_roundtrip() {
+        let job = make_job("test-job");
+        job.apply_trigger(100, 5000);
+        job.apply_assign(42);
+
+        let snap = job.snapshot_meta();
+        assert_eq!(snap.state.current_execution_id, Some(100));
+        assert_eq!(snap.state.last_triggered_at, Some(5000));
+        assert_eq!(snap.state.assigned_consumer_id, Some(42));
+        assert!(snap.enabled);
     }
 }

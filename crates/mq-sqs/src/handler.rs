@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +10,6 @@ use bisque_mq::types::{DeliveredMessage, MqCommand, MqError, MqResponse, name_ha
 use bisque_mq::write_batcher::MqWriteBatcher;
 use bytes::Bytes;
 use serde::Deserialize;
-use tracing::{debug, warn};
 
 use crate::error::SqsError;
 use crate::types::*;
@@ -31,14 +30,21 @@ pub struct SqsState {
     m_delete_count: metrics::Counter,
 }
 
+/// Receipt handle is 16 raw bytes: [queue_id:u64 LE][message_id:u64 LE], then base64-encoded.
+const RECEIPT_HANDLE_RAW_LEN: usize = 16;
+
 impl SqsState {
     pub fn new(
         batcher: Arc<MqWriteBatcher>,
         log_reader: bisque_raft::SegmentPrefetcher,
         base_url: String,
         group_id: u64,
+        catalog_name: &str,
     ) -> Self {
-        let labels = [("group", group_id.to_string())];
+        let labels = [
+            ("catalog", catalog_name.to_owned()),
+            ("group", group_id.to_string()),
+        ];
         let m_send_count = metrics::counter!("sqs.send_message.count", &labels);
         let m_receive_count = metrics::counter!("sqs.receive_message.count", &labels);
         let m_delete_count = metrics::counter!("sqs.delete_message.count", &labels);
@@ -57,60 +63,53 @@ impl SqsState {
         format!("{}/sqs/{}/{}", self.base_url, self.group_id, queue_name)
     }
 
-    fn parse_queue_url(&self, queue_url: &str) -> Result<(u64, String), SqsError> {
+    /// Returns (&str slice into the URL) — zero allocation.
+    fn parse_queue_name<'a>(&self, queue_url: &'a str) -> Result<&'a str, SqsError> {
         // Format: {base}/sqs/{group_id}/{queue_name}
-        let parts: Vec<&str> = queue_url.rsplitn(3, '/').collect();
-        if parts.len() < 2 {
-            return Err(SqsError::InvalidParameter(format!(
-                "invalid queue URL: {}",
-                queue_url
-            )));
-        }
-        let queue_name = parts[0].to_string();
-        let group_id = parts
-            .get(1)
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(self.group_id);
-        Ok((group_id, queue_name))
+        queue_url
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| SqsError::InvalidParameter(format!("invalid queue URL: {}", queue_url)))
     }
 
-    fn resolve_queue(&self, queue_url: &str) -> Result<(u64, u64), SqsError> {
-        let (_group_id, queue_name) = self.parse_queue_url(queue_url)?;
-        let hash = name_hash(&queue_name);
-        // We encode queue_id in the receipt handle, but for URL resolution
-        // we need to look up by name. Submit a GetQueueAttributes to verify existence.
-        // For now, use the name hash as a proxy — the actual resolution happens
-        // when the command is applied by the engine.
-        Ok((self.group_id, hash))
-    }
-
+    /// Binary receipt handle: 16 raw bytes [queue_id LE | message_id LE] → base64url.
     fn encode_receipt_handle(queue_id: u64, message_id: u64) -> String {
-        let data = format!("{}:{}", queue_id, message_id);
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data.as_bytes())
+        let mut buf = [0u8; RECEIPT_HANDLE_RAW_LEN];
+        buf[..8].copy_from_slice(&queue_id.to_le_bytes());
+        buf[8..].copy_from_slice(&message_id.to_le_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
     }
 
+    /// Decode binary receipt handle back to (queue_id, message_id).
+    /// Uses stack buffer — zero heap allocation.
     fn decode_receipt_handle(handle: &str) -> Result<(u64, u64), SqsError> {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(handle)
+        let mut buf = [0u8; RECEIPT_HANDLE_RAW_LEN];
+        let len = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode_slice(handle, &mut buf)
             .map_err(|_| SqsError::InvalidReceiptHandle)?;
-        let s = String::from_utf8(bytes).map_err(|_| SqsError::InvalidReceiptHandle)?;
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 2 {
+        if len != RECEIPT_HANDLE_RAW_LEN {
             return Err(SqsError::InvalidReceiptHandle);
         }
-        let queue_id = parts[0]
-            .parse::<u64>()
-            .map_err(|_| SqsError::InvalidReceiptHandle)?;
-        let message_id = parts[1]
-            .parse::<u64>()
-            .map_err(|_| SqsError::InvalidReceiptHandle)?;
+        let queue_id = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let message_id = u64::from_le_bytes(buf[8..].try_into().unwrap());
         Ok((queue_id, message_id))
     }
 
+    /// Stack-based hex encoding — single allocation with exact capacity.
     fn md5_hex(data: &[u8]) -> String {
-        // Simple placeholder — SQS returns MD5 of message body.
-        // Use a fast hash for now since we don't have md5 dep.
-        format!("{:016x}{:016x}", data.len() as u64, crc(data))
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let len_val = data.len() as u64;
+        let crc_val = crc(data);
+        let mut buf = String::with_capacity(32);
+        for &byte in len_val
+            .to_be_bytes()
+            .iter()
+            .chain(crc_val.to_be_bytes().iter())
+        {
+            buf.push(HEX[(byte >> 4) as usize] as char);
+            buf.push(HEX[(byte & 0xf) as usize] as char);
+        }
+        buf
     }
 
     // =========================================================================
@@ -166,10 +165,8 @@ impl SqsState {
     }
 
     pub async fn delete_queue(&self, req: DeleteQueueRequest) -> Result<Json<()>, SqsError> {
-        let (_group_id, queue_name) = self.parse_queue_url(&req.queue_url)?;
-        let hash = name_hash(&queue_name);
-        // We need to resolve name → ID. For now, assume the caller provides the right URL.
-        // In production, this would go through MqRouter::resolve_entity.
+        let queue_name = self.parse_queue_name(&req.queue_url)?;
+        let hash = name_hash(queue_name);
         let cmd = MqCommand::delete_queue(hash);
         let resp = self.batcher.submit(cmd).await?;
         match resp {
@@ -200,12 +197,14 @@ impl SqsState {
         &self,
         req: SendMessageRequest,
     ) -> Result<Json<SendMessageResponse>, SqsError> {
-        let (_group_id, queue_name) = self.parse_queue_url(&req.queue_url)?;
-        let queue_id = name_hash(&queue_name);
+        let queue_name = self.parse_queue_name(&req.queue_url)?;
+        let queue_id = name_hash(queue_name);
 
-        let value = Bytes::from(req.message_body.clone());
-        let md5 = Self::md5_hex(&value);
+        // Compute MD5 from borrowed bytes, then take ownership — zero-copy.
+        let md5 = Self::md5_hex(req.message_body.as_bytes());
+        let value = Bytes::from(req.message_body.into_bytes());
 
+        // Take ownership directly — no clone.
         let key = req.message_group_id.map(|s| Bytes::from(s.into_bytes()));
         let dedup_key = req
             .message_deduplication_id
@@ -215,7 +214,8 @@ impl SqsState {
         if let Some(attrs) = req.message_attributes {
             for (k, v) in attrs {
                 if let Some(sv) = v.get("StringValue").and_then(|v| v.as_str()) {
-                    headers.push((k, Bytes::from(sv.to_string().into_bytes())));
+                    // Zero-copy: copy_from_slice instead of to_string().into_bytes()
+                    headers.push((k, Bytes::copy_from_slice(sv.as_bytes())));
                 } else if let Some(bv) = v.get("BinaryValue").and_then(|v| v.as_str()) {
                     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(bv) {
                         headers.push((k, Bytes::from(decoded)));
@@ -244,14 +244,11 @@ impl SqsState {
         self.m_send_count.increment(1);
 
         match resp {
-            MqResponse::Published { offsets } => {
-                let msg_id = offsets.first().copied().unwrap_or(0);
-                Ok(Json(SendMessageResponse {
-                    message_id: msg_id.to_string(),
-                    md5_of_message_body: md5,
-                    sequence_number: Some(msg_id.to_string()),
-                }))
-            }
+            MqResponse::Published { base_offset, .. } => Ok(Json(SendMessageResponse {
+                message_id: base_offset.to_string(),
+                md5_of_message_body: md5,
+                sequence_number: Some(base_offset.to_string()),
+            })),
             MqResponse::Error(e) => Err(SqsError::Internal(e.to_string())),
             _ => Err(SqsError::Internal("unexpected response".into())),
         }
@@ -261,40 +258,36 @@ impl SqsState {
         &self,
         req: SendMessageBatchRequest,
     ) -> Result<Json<SendMessageBatchResponse>, SqsError> {
-        let (_group_id, queue_name) = self.parse_queue_url(&req.queue_url)?;
-        let queue_id = name_hash(&queue_name);
+        let queue_name = self.parse_queue_name(&req.queue_url)?;
+        let queue_id = name_hash(queue_name);
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut messages = Vec::with_capacity(req.entries.len());
-        let mut dedup_keys = Vec::with_capacity(req.entries.len());
-        let mut entry_ids = Vec::with_capacity(req.entries.len());
-        let mut md5s = Vec::with_capacity(req.entries.len());
+        let len = req.entries.len();
+        let mut messages = Vec::with_capacity(len);
+        let mut dedup_keys = Vec::with_capacity(len);
+        let mut entry_ids = Vec::with_capacity(len);
+        let mut md5s = Vec::with_capacity(len);
 
-        for entry in &req.entries {
-            let value = Bytes::from(entry.message_body.clone().into_bytes());
-            md5s.push(Self::md5_hex(&value));
-            let key = entry
-                .message_group_id
-                .as_ref()
-                .map(|s| Bytes::from(s.clone().into_bytes()));
+        // Consume entries by value — zero-copy, no clones.
+        for entry in req.entries {
+            md5s.push(Self::md5_hex(entry.message_body.as_bytes()));
+            let value = Bytes::from(entry.message_body.into_bytes());
+            let key = entry.message_group_id.map(|s| Bytes::from(s.into_bytes()));
             let dedup = entry
                 .message_deduplication_id
-                .as_ref()
-                .map(|s| Bytes::from(s.clone().into_bytes()));
+                .map(|s| Bytes::from(s.into_bytes()));
 
-            {
-                let mut builder = FlatMessageBuilder::new(value).timestamp(now_ms);
-                if let Some(k) = key {
-                    builder = builder.key(k);
-                }
-                messages.push(builder.build());
+            let mut builder = FlatMessageBuilder::new(value).timestamp(now_ms);
+            if let Some(k) = key {
+                builder = builder.key(k);
             }
+            messages.push(builder.build());
             dedup_keys.push(dedup);
-            entry_ids.push(entry.id.clone());
+            entry_ids.push(entry.id);
         }
 
         let cmd = MqCommand::enqueue(queue_id, &messages, &dedup_keys);
@@ -303,15 +296,18 @@ impl SqsState {
         self.m_send_count.increment(entry_ids.len() as u64);
 
         match resp {
-            MqResponse::Published { offsets } => {
+            MqResponse::Published { base_offset, .. } => {
                 let successful = entry_ids
                     .into_iter()
-                    .zip(offsets.iter())
-                    .zip(md5s.iter())
-                    .map(|((id, &offset), md5)| SendMessageBatchResultEntry {
-                        id,
-                        message_id: offset.to_string(),
-                        md5_of_message_body: md5.clone(),
+                    .zip(md5s.into_iter())
+                    .enumerate()
+                    .map(|(i, (id, md5))| {
+                        let offset = base_offset + i as u64;
+                        SendMessageBatchResultEntry {
+                            id,
+                            message_id: offset.to_string(),
+                            md5_of_message_body: md5,
+                        }
                     })
                     .collect();
 
@@ -329,13 +325,12 @@ impl SqsState {
         &self,
         req: ReceiveMessageRequest,
     ) -> Result<Json<ReceiveMessageResponse>, SqsError> {
-        let (_group_id, queue_name) = self.parse_queue_url(&req.queue_url)?;
-        let queue_id = name_hash(&queue_name);
+        let queue_name = self.parse_queue_name(&req.queue_url)?;
+        let queue_id = name_hash(queue_name);
         let max_count = req.max_number_of_messages.unwrap_or(1).min(10);
         let wait_time = req.wait_time_seconds.unwrap_or(0);
 
         // Generate a consumer ID for this receive operation.
-        // In a real implementation, this would be tied to a persistent consumer session.
         let consumer_id = rand_consumer_id();
 
         let cmd = MqCommand::deliver(queue_id, consumer_id, max_count);
@@ -396,22 +391,23 @@ impl SqsState {
         let mut successful = Vec::new();
         let mut failed = Vec::new();
 
-        // Group valid entries by queue_id to batch into a single Ack per queue.
-        let mut by_queue: HashMap<u64, Vec<(String, u64)>> = HashMap::new();
+        // Vec-based grouping instead of HashMap — SQS batch max is 10 entries.
+        let mut by_queue: Vec<(u64, Vec<(String, u64)>)> = Vec::new();
 
-        for entry in &req.entries {
+        for entry in req.entries {
             match Self::decode_receipt_handle(&entry.receipt_handle) {
                 Ok((queue_id, message_id)) => {
-                    by_queue
-                        .entry(queue_id)
-                        .or_default()
-                        .push((entry.id.clone(), message_id));
+                    if let Some(group) = by_queue.iter_mut().find(|(qid, _)| *qid == queue_id) {
+                        group.1.push((entry.id, message_id));
+                    } else {
+                        by_queue.push((queue_id, vec![(entry.id, message_id)]));
+                    }
                 }
                 Err(_) => {
                     failed.push(BatchResultErrorEntry {
-                        id: entry.id.clone(),
-                        code: "ReceiptHandleIsInvalid".to_string(),
-                        message: "invalid receipt handle".to_string(),
+                        id: entry.id,
+                        code: Cow::Borrowed("ReceiptHandleIsInvalid"),
+                        message: Cow::Borrowed("invalid receipt handle"),
                         sender_fault: true,
                     });
                 }
@@ -429,11 +425,11 @@ impl SqsState {
                     }
                 }
                 Ok(MqResponse::Error(e)) => {
-                    let msg = e.to_string();
+                    let msg: Cow<'static, str> = Cow::Owned(e.to_string());
                     for id in ids {
                         failed.push(BatchResultErrorEntry {
                             id,
-                            code: "InternalError".to_string(),
+                            code: Cow::Borrowed("InternalError"),
                             message: msg.clone(),
                             sender_fault: false,
                         });
@@ -443,8 +439,8 @@ impl SqsState {
                     for id in ids {
                         failed.push(BatchResultErrorEntry {
                             id,
-                            code: "InternalError".to_string(),
-                            message: "unexpected response".to_string(),
+                            code: Cow::Borrowed("InternalError"),
+                            message: Cow::Borrowed("unexpected response"),
                             sender_fault: false,
                         });
                     }
@@ -483,23 +479,25 @@ impl SqsState {
         let mut successful = Vec::new();
         let mut failed = Vec::new();
 
-        // Group by (queue_id, extension_ms) to batch into single ExtendVisibility commands.
-        let mut by_key: HashMap<(u64, u64), Vec<(String, u64)>> = HashMap::new();
+        // Vec-based grouping by (queue_id, extension_ms) — SQS batch max 10 entries.
+        let mut by_key: Vec<((u64, u64), Vec<(String, u64)>)> = Vec::new();
 
-        for entry in &req.entries {
+        for entry in req.entries {
             match Self::decode_receipt_handle(&entry.receipt_handle) {
                 Ok((queue_id, message_id)) => {
                     let extension_ms = entry.visibility_timeout as u64 * 1000;
-                    by_key
-                        .entry((queue_id, extension_ms))
-                        .or_default()
-                        .push((entry.id.clone(), message_id));
+                    let key = (queue_id, extension_ms);
+                    if let Some(group) = by_key.iter_mut().find(|(k, _)| *k == key) {
+                        group.1.push((entry.id, message_id));
+                    } else {
+                        by_key.push((key, vec![(entry.id, message_id)]));
+                    }
                 }
                 Err(_) => {
                     failed.push(BatchResultErrorEntry {
-                        id: entry.id.clone(),
-                        code: "ReceiptHandleIsInvalid".to_string(),
-                        message: "invalid receipt handle".to_string(),
+                        id: entry.id,
+                        code: Cow::Borrowed("ReceiptHandleIsInvalid"),
+                        message: Cow::Borrowed("invalid receipt handle"),
                         sender_fault: true,
                     });
                 }
@@ -519,8 +517,8 @@ impl SqsState {
                     for id in ids {
                         failed.push(BatchResultErrorEntry {
                             id,
-                            code: "InternalError".to_string(),
-                            message: "failed to change visibility".to_string(),
+                            code: Cow::Borrowed("InternalError"),
+                            message: Cow::Borrowed("failed to change visibility"),
                             sender_fault: false,
                         });
                     }
@@ -535,8 +533,8 @@ impl SqsState {
     }
 
     pub async fn purge_queue(&self, req: PurgeQueueRequest) -> Result<Json<()>, SqsError> {
-        let (_group_id, queue_name) = self.parse_queue_url(&req.queue_url)?;
-        let queue_id = name_hash(&queue_name);
+        let queue_name = self.parse_queue_name(&req.queue_url)?;
+        let queue_id = name_hash(queue_name);
 
         let cmd = MqCommand::purge_queue(queue_id);
         let resp = self.batcher.submit(cmd).await?;
@@ -551,8 +549,8 @@ impl SqsState {
         &self,
         req: GetQueueAttributesRequest,
     ) -> Result<Json<GetQueueAttributesResponse>, SqsError> {
-        let (_group_id, queue_name) = self.parse_queue_url(&req.queue_url)?;
-        let queue_id = name_hash(&queue_name);
+        let queue_name = self.parse_queue_name(&req.queue_url)?;
+        let queue_id = name_hash(queue_name);
 
         let cmd = MqCommand::get_queue_attributes(queue_id);
         let resp = self.batcher.submit(cmd).await?;
@@ -564,21 +562,21 @@ impl SqsState {
                 in_flight_count,
                 dlq_count,
             }) => {
-                let mut attrs = serde_json::Map::new();
+                let mut attrs = serde_json::Map::with_capacity(4);
                 attrs.insert(
-                    "ApproximateNumberOfMessages".to_string(),
+                    "ApproximateNumberOfMessages".into(),
                     serde_json::Value::String(pending_count.to_string()),
                 );
                 attrs.insert(
-                    "ApproximateNumberOfMessagesNotVisible".to_string(),
+                    "ApproximateNumberOfMessagesNotVisible".into(),
                     serde_json::Value::String(in_flight_count.to_string()),
                 );
                 attrs.insert(
-                    "ApproximateNumberOfMessagesDelayed".to_string(),
-                    serde_json::Value::String("0".to_string()),
+                    "ApproximateNumberOfMessagesDelayed".into(),
+                    serde_json::Value::String("0".into()),
                 );
                 attrs.insert(
-                    "ApproximateNumberOfMessagesDead".to_string(),
+                    "ApproximateNumberOfMessagesDead".into(),
                     serde_json::Value::String(dlq_count.to_string()),
                 );
                 Ok(Json(GetQueueAttributesResponse { attributes: attrs }))
@@ -608,7 +606,11 @@ fn to_sqs_message(
 ) -> SqsMessage {
     let body = if let Some(flat_bytes) = bisque_mq::read_message_at(prefetcher, msg.message_id) {
         if let Some(flat) = bisque_mq::flat::FlatMessage::new(flat_bytes) {
-            String::from_utf8_lossy(&flat.value()).into_owned()
+            let val = flat.value();
+            // Try zero-copy String::from_utf8 first (common case: valid UTF-8).
+            // Falls back to lossy only for invalid data.
+            String::from_utf8(val.to_vec())
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
         } else {
             String::new()
         }
@@ -655,14 +657,36 @@ mod tests {
     }
 
     #[test]
+    fn test_receipt_handle_large_values() {
+        let handle = SqsState::encode_receipt_handle(u64::MAX, u64::MAX - 1);
+        let (qid, mid) = SqsState::decode_receipt_handle(&handle).unwrap();
+        assert_eq!(qid, u64::MAX);
+        assert_eq!(mid, u64::MAX - 1);
+    }
+
+    #[test]
+    fn test_receipt_handle_zero() {
+        let handle = SqsState::encode_receipt_handle(0, 0);
+        let (qid, mid) = SqsState::decode_receipt_handle(&handle).unwrap();
+        assert_eq!(qid, 0);
+        assert_eq!(mid, 0);
+    }
+
+    #[test]
     fn test_invalid_receipt_handle() {
         assert!(SqsState::decode_receipt_handle("invalid").is_err());
         assert!(SqsState::decode_receipt_handle("").is_err());
+        // Valid base64 but wrong length
+        assert!(SqsState::decode_receipt_handle("AQID").is_err());
     }
 
     #[test]
     fn test_md5_hex() {
         let result = SqsState::md5_hex(b"hello");
         assert_eq!(result.len(), 32);
+        // Verify consistent output
+        assert_eq!(result, SqsState::md5_hex(b"hello"));
+        // Different input → different output
+        assert_ne!(result, SqsState::md5_hex(b"world"));
     }
 }

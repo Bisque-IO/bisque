@@ -1,4 +1,269 @@
-use bytes::Bytes;
+use std::fmt;
+
+use bytes::{Buf, Bytes, BytesMut};
+
+// =============================================================================
+// WireString — zero-copy UTF-8 string backed by Bytes
+// =============================================================================
+
+/// A validated UTF-8 string backed by `Bytes` for zero-copy decoding.
+///
+/// Created during Kafka protocol decoding by slicing into the input `Bytes`
+/// buffer. Cloning is O(1) (atomic refcount increment, no data copy).
+/// Dereferences to `&str` for transparent use in all string-accepting APIs.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct WireString(Bytes);
+
+/// Hash as `str` so that `HashMap<WireString, _>` can be queried with `&str`
+/// via `Borrow<str>`. Derived `Hash` would go through `Bytes → [u8]` which
+/// differs from `str`'s hash (which appends a 0xFF separator).
+impl std::hash::Hash for WireString {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl WireString {
+    /// Create from a `Bytes` that is already known to be valid UTF-8.
+    ///
+    /// # Safety (logical)
+    /// The caller must ensure the bytes are valid UTF-8. This is enforced
+    /// by the codec's decode path which validates before constructing.
+    #[inline]
+    pub fn from_utf8_unchecked(b: Bytes) -> Self {
+        Self(b)
+    }
+
+    /// Create from a `&'static str` — no allocation.
+    #[inline]
+    pub fn from_static(s: &'static str) -> Self {
+        Self(Bytes::from_static(s.as_bytes()))
+    }
+
+    /// Create an empty WireString.
+    #[inline]
+    pub fn empty() -> Self {
+        Self(Bytes::new())
+    }
+
+    /// The underlying bytes.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consume into the underlying `Bytes`.
+    #[inline]
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
+
+    /// The underlying `Bytes` handle (cheap clone).
+    #[inline]
+    pub fn bytes(&self) -> &Bytes {
+        &self.0
+    }
+
+    /// View as `&str`. Zero-cost since UTF-8 was validated at construction.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        // SAFETY: validated at decode time by read_string / read_nullable_string
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::ops::Deref for WireString {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for WireString {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for WireString {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<[u8]> for WireString {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl fmt::Debug for WireString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+impl fmt::Display for WireString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl From<String> for WireString {
+    #[inline]
+    fn from(s: String) -> Self {
+        Self(Bytes::from(s))
+    }
+}
+
+impl From<&str> for WireString {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Self(Bytes::from(s.to_owned()))
+    }
+}
+
+impl PartialEq<str> for WireString {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for WireString {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for WireString {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+// =============================================================================
+// BytesCursor — position-tracked reader over Bytes for zero-copy slicing
+// =============================================================================
+
+/// A cursor over a `Bytes` buffer that tracks read position and supports
+/// zero-copy sub-slicing via `Bytes::slice()`.
+pub struct BytesCursor {
+    data: Bytes,
+    pos: usize,
+}
+
+impl BytesCursor {
+    #[inline]
+    pub fn new(data: Bytes) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    #[inline]
+    pub fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[self.pos..]
+    }
+
+    #[inline]
+    pub fn advance(&mut self, n: usize) {
+        self.pos += n;
+    }
+
+    /// Zero-copy slice of `len` bytes at current position. Does NOT advance.
+    #[inline]
+    pub fn slice(&self, len: usize) -> Bytes {
+        self.data.slice(self.pos..self.pos + len)
+    }
+
+    /// Zero-copy slice + advance.
+    #[inline]
+    pub fn read_slice(&mut self, len: usize) -> Bytes {
+        let b = self.data.slice(self.pos..self.pos + len);
+        self.pos += len;
+        b
+    }
+
+    #[inline]
+    pub fn read_u8(&mut self) -> u8 {
+        let v = self.data[self.pos];
+        self.pos += 1;
+        v
+    }
+
+    #[inline]
+    pub fn read_i8(&mut self) -> i8 {
+        self.read_u8() as i8
+    }
+
+    #[inline]
+    pub fn read_i16(&mut self) -> i16 {
+        let v = i16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+        self.pos += 2;
+        v
+    }
+
+    #[inline]
+    pub fn read_i32(&mut self) -> i32 {
+        let s = self.pos;
+        let v = i32::from_be_bytes([
+            self.data[s],
+            self.data[s + 1],
+            self.data[s + 2],
+            self.data[s + 3],
+        ]);
+        self.pos += 4;
+        v
+    }
+
+    #[inline]
+    pub fn read_i64(&mut self) -> i64 {
+        let s = self.pos;
+        let v = i64::from_be_bytes([
+            self.data[s],
+            self.data[s + 1],
+            self.data[s + 2],
+            self.data[s + 3],
+            self.data[s + 4],
+            self.data[s + 5],
+            self.data[s + 6],
+            self.data[s + 7],
+        ]);
+        self.pos += 8;
+        v
+    }
+
+    #[inline]
+    pub fn read_u32(&mut self) -> u32 {
+        let s = self.pos;
+        let v = u32::from_be_bytes([
+            self.data[s],
+            self.data[s + 1],
+            self.data[s + 2],
+            self.data[s + 3],
+        ]);
+        self.pos += 4;
+        v
+    }
+}
 
 // =============================================================================
 // API Keys
@@ -124,11 +389,11 @@ pub struct RequestHeader {
     pub api_key: i16,
     pub api_version: i16,
     pub correlation_id: i32,
-    pub client_id: Option<String>,
+    pub client_id: Option<WireString>,
 }
 
 // =============================================================================
-// Requests
+// Requests — all string fields use WireString (zero-copy from wire)
 // =============================================================================
 
 #[derive(Debug, Clone)]
@@ -156,7 +421,7 @@ pub enum KafkaRequest {
 #[derive(Debug, Clone)]
 pub struct MetadataRequest {
     /// `None` means all topics.
-    pub topics: Option<Vec<String>>,
+    pub topics: Option<Vec<WireString>>,
 }
 
 // -- Produce --
@@ -170,14 +435,14 @@ pub struct ProduceRequest {
 
 #[derive(Debug, Clone)]
 pub struct ProduceTopicData {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<ProducePartitionData>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProducePartitionData {
     pub partition_index: i32,
-    /// Raw record batch bytes (decoded separately).
+    /// Raw record batch bytes (decoded separately). Zero-copy from wire.
     pub record_set: Option<Bytes>,
 }
 
@@ -192,7 +457,7 @@ pub struct FetchRequest {
 
 #[derive(Debug, Clone)]
 pub struct FetchTopicData {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<FetchPartitionData>,
 }
 
@@ -213,7 +478,7 @@ pub struct ListOffsetsRequest {
 
 #[derive(Debug, Clone)]
 pub struct ListOffsetsTopicData {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<ListOffsetsPartitionData>,
 }
 
@@ -228,7 +493,7 @@ pub struct ListOffsetsPartitionData {
 
 #[derive(Debug, Clone)]
 pub struct FindCoordinatorRequest {
-    pub key: String,
+    pub key: WireString,
     /// 0 = group, 1 = transaction.
     pub key_type: i8,
 }
@@ -237,17 +502,17 @@ pub struct FindCoordinatorRequest {
 
 #[derive(Debug, Clone)]
 pub struct JoinGroupRequest {
-    pub group_id: String,
+    pub group_id: WireString,
     pub session_timeout_ms: i32,
     pub rebalance_timeout_ms: i32,
-    pub member_id: String,
-    pub protocol_type: String,
+    pub member_id: WireString,
+    pub protocol_type: WireString,
     pub protocols: Vec<JoinGroupProtocol>,
 }
 
 #[derive(Debug, Clone)]
 pub struct JoinGroupProtocol {
-    pub name: String,
+    pub name: WireString,
     pub metadata: Bytes,
 }
 
@@ -255,15 +520,15 @@ pub struct JoinGroupProtocol {
 
 #[derive(Debug, Clone)]
 pub struct SyncGroupRequest {
-    pub group_id: String,
+    pub group_id: WireString,
     pub generation_id: i32,
-    pub member_id: String,
+    pub member_id: WireString,
     pub assignments: Vec<SyncGroupAssignment>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SyncGroupAssignment {
-    pub member_id: String,
+    pub member_id: WireString,
     pub assignment: Bytes,
 }
 
@@ -271,32 +536,32 @@ pub struct SyncGroupAssignment {
 
 #[derive(Debug, Clone)]
 pub struct HeartbeatRequest {
-    pub group_id: String,
+    pub group_id: WireString,
     pub generation_id: i32,
-    pub member_id: String,
+    pub member_id: WireString,
 }
 
 // -- LeaveGroup --
 
 #[derive(Debug, Clone)]
 pub struct LeaveGroupRequest {
-    pub group_id: String,
-    pub member_id: String,
+    pub group_id: WireString,
+    pub member_id: WireString,
 }
 
 // -- OffsetCommit --
 
 #[derive(Debug, Clone)]
 pub struct OffsetCommitRequest {
-    pub group_id: String,
+    pub group_id: WireString,
     pub generation_id: i32,
-    pub member_id: String,
+    pub member_id: WireString,
     pub topics: Vec<OffsetCommitTopicData>,
 }
 
 #[derive(Debug, Clone)]
 pub struct OffsetCommitTopicData {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<OffsetCommitPartitionData>,
 }
 
@@ -304,20 +569,20 @@ pub struct OffsetCommitTopicData {
 pub struct OffsetCommitPartitionData {
     pub partition_index: i32,
     pub offset: i64,
-    pub metadata: Option<String>,
+    pub metadata: Option<WireString>,
 }
 
 // -- OffsetFetch --
 
 #[derive(Debug, Clone)]
 pub struct OffsetFetchRequest {
-    pub group_id: String,
+    pub group_id: WireString,
     pub topics: Vec<OffsetFetchTopicData>,
 }
 
 #[derive(Debug, Clone)]
 pub struct OffsetFetchTopicData {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<i32>,
 }
 
@@ -331,7 +596,7 @@ pub struct CreateTopicsRequest {
 
 #[derive(Debug, Clone)]
 pub struct CreateTopicRequest {
-    pub name: String,
+    pub name: WireString,
     pub num_partitions: i32,
     pub replication_factor: i16,
 }
@@ -340,7 +605,7 @@ pub struct CreateTopicRequest {
 
 #[derive(Debug, Clone)]
 pub struct DeleteTopicsRequest {
-    pub topic_names: Vec<String>,
+    pub topic_names: Vec<WireString>,
     pub timeout_ms: i32,
 }
 
@@ -348,11 +613,11 @@ pub struct DeleteTopicsRequest {
 
 #[derive(Debug, Clone)]
 pub struct DescribeGroupsRequest {
-    pub group_ids: Vec<String>,
+    pub group_ids: Vec<WireString>,
 }
 
 // =============================================================================
-// Responses
+// Responses — WireString for string fields (zero-copy echo from requests)
 // =============================================================================
 
 #[derive(Debug, Clone)]
@@ -401,14 +666,14 @@ pub struct MetadataResponse {
 #[derive(Debug, Clone)]
 pub struct BrokerMeta {
     pub node_id: i32,
-    pub host: String,
+    pub host: WireString,
     pub port: i32,
 }
 
 #[derive(Debug, Clone)]
 pub struct TopicMetadata {
     pub error_code: i16,
-    pub name: String,
+    pub name: WireString,
     pub partitions: Vec<PartitionMetadata>,
 }
 
@@ -430,7 +695,7 @@ pub struct ProduceResponse {
 
 #[derive(Debug, Clone)]
 pub struct ProduceTopicResponse {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<ProducePartitionResponse>,
 }
 
@@ -450,7 +715,7 @@ pub struct FetchResponse {
 
 #[derive(Debug, Clone)]
 pub struct FetchTopicResponse {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<FetchPartitionResponse>,
 }
 
@@ -472,7 +737,7 @@ pub struct ListOffsetsResponse {
 
 #[derive(Debug, Clone)]
 pub struct ListOffsetsTopicResponse {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<ListOffsetsPartitionResponse>,
 }
 
@@ -490,7 +755,7 @@ pub struct ListOffsetsPartitionResponse {
 pub struct FindCoordinatorResponse {
     pub error_code: i16,
     pub node_id: i32,
-    pub host: String,
+    pub host: WireString,
     pub port: i32,
 }
 
@@ -500,15 +765,15 @@ pub struct FindCoordinatorResponse {
 pub struct JoinGroupResponse {
     pub error_code: i16,
     pub generation_id: i32,
-    pub protocol_name: String,
-    pub leader: String,
-    pub member_id: String,
+    pub protocol_name: WireString,
+    pub leader: WireString,
+    pub member_id: WireString,
     pub members: Vec<JoinGroupMember>,
 }
 
 #[derive(Debug, Clone)]
 pub struct JoinGroupMember {
-    pub member_id: String,
+    pub member_id: WireString,
     pub metadata: Bytes,
 }
 
@@ -543,7 +808,7 @@ pub struct OffsetCommitResponse {
 
 #[derive(Debug, Clone)]
 pub struct OffsetCommitTopicResponse {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<OffsetCommitPartitionResponse>,
 }
 
@@ -562,7 +827,7 @@ pub struct OffsetFetchResponse {
 
 #[derive(Debug, Clone)]
 pub struct OffsetFetchTopicResponse {
-    pub topic_name: String,
+    pub topic_name: WireString,
     pub partitions: Vec<OffsetFetchPartitionResponse>,
 }
 
@@ -570,7 +835,7 @@ pub struct OffsetFetchTopicResponse {
 pub struct OffsetFetchPartitionResponse {
     pub partition_index: i32,
     pub offset: i64,
-    pub metadata: Option<String>,
+    pub metadata: Option<WireString>,
     pub error_code: i16,
 }
 
@@ -583,7 +848,7 @@ pub struct CreateTopicsResponse {
 
 #[derive(Debug, Clone)]
 pub struct CreateTopicResponse {
-    pub name: String,
+    pub name: WireString,
     pub error_code: i16,
 }
 
@@ -596,7 +861,7 @@ pub struct DeleteTopicsResponse {
 
 #[derive(Debug, Clone)]
 pub struct DeleteTopicResponse {
-    pub name: String,
+    pub name: WireString,
     pub error_code: i16,
 }
 
@@ -610,18 +875,18 @@ pub struct DescribeGroupsResponse {
 #[derive(Debug, Clone)]
 pub struct DescribedGroup {
     pub error_code: i16,
-    pub group_id: String,
-    pub state: String,
-    pub protocol_type: String,
-    pub protocol: String,
+    pub group_id: WireString,
+    pub state: WireString,
+    pub protocol_type: WireString,
+    pub protocol: WireString,
     pub members: Vec<DescribedGroupMember>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DescribedGroupMember {
-    pub member_id: String,
-    pub client_id: String,
-    pub client_host: String,
+    pub member_id: WireString,
+    pub client_id: WireString,
+    pub client_host: WireString,
     pub metadata: Bytes,
     pub assignment: Bytes,
 }
@@ -636,8 +901,8 @@ pub struct ListGroupsResponse {
 
 #[derive(Debug, Clone)]
 pub struct ListedGroup {
-    pub group_id: String,
-    pub protocol_type: String,
+    pub group_id: WireString,
+    pub protocol_type: WireString,
 }
 
 // =============================================================================
@@ -686,7 +951,8 @@ pub struct Record {
 
 #[derive(Debug, Clone)]
 pub struct RecordHeader {
-    pub key: String,
+    /// Header key — stored as Bytes (zero-copy from wire).
+    pub key: Bytes,
     pub value: Bytes,
 }
 
@@ -756,5 +1022,55 @@ mod tests {
         let (min, max) = ApiKey::ApiVersions.version_range();
         assert_eq!(min, 0);
         assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn test_wire_string_deref() {
+        let ws = WireString::from("hello");
+        assert_eq!(&*ws, "hello");
+        assert_eq!(ws.as_str(), "hello");
+        assert_eq!(ws.len(), 5);
+    }
+
+    #[test]
+    fn test_wire_string_clone_is_cheap() {
+        let ws = WireString::from("test");
+        let ws2 = ws.clone();
+        // Both point to same underlying data
+        assert_eq!(ws.as_bytes().as_ptr(), ws2.as_bytes().as_ptr());
+    }
+
+    #[test]
+    fn test_wire_string_from_static() {
+        let ws = WireString::from_static("static");
+        assert_eq!(&*ws, "static");
+    }
+
+    #[test]
+    fn test_wire_string_eq() {
+        let ws = WireString::from("abc");
+        assert_eq!(ws, "abc");
+        assert_eq!(ws, String::from("abc"));
+    }
+
+    #[test]
+    fn test_bytes_cursor_basic() {
+        let data = Bytes::from_static(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.remaining(), 10);
+        let s = cur.read_slice(3);
+        assert_eq!(&s[..], &[0, 1, 2]);
+        assert_eq!(cur.remaining(), 7);
+        assert_eq!(cur.read_u8(), 3);
+        assert_eq!(cur.remaining(), 6);
+    }
+
+    #[test]
+    fn test_bytes_cursor_zero_copy() {
+        let data = Bytes::from(vec![10, 20, 30, 40, 50]);
+        let mut cur = BytesCursor::new(data.clone());
+        let slice = cur.read_slice(3);
+        // slice should share underlying allocation with data
+        assert_eq!(&slice[..], &[10, 20, 30]);
     }
 }

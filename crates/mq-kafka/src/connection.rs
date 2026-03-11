@@ -7,68 +7,103 @@ use crate::types::*;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Shared (non-per-connection) metrics handles for Kafka connections.
+/// Avoids creating high-cardinality metric series per connection.
+pub struct KafkaConnMetrics {
+    pub requests: metrics::Counter,
+    pub bytes_in: metrics::Counter,
+    pub bytes_out: metrics::Counter,
+}
+
+impl KafkaConnMetrics {
+    pub fn new(catalog_name: &str) -> Self {
+        let labels = [("catalog", catalog_name.to_owned())];
+        Self {
+            requests: metrics::counter!("kafka.conn.requests", &labels),
+            bytes_in: metrics::counter!("kafka.conn.bytes_in", &labels),
+            bytes_out: metrics::counter!("kafka.conn.bytes_out", &labels),
+        }
+    }
+}
+
 /// Per-TCP-connection state for a Kafka client.
 pub struct KafkaConnection {
     pub id: u64,
-    pub client_id: Option<String>,
+    pub client_id: Option<WireString>,
     pub read_buf: BytesMut,
     pub write_buf: BytesMut,
     /// bisque-mq consumer IDs registered via this connection (for cleanup on disconnect).
-    pub consumer_member_ids: Vec<String>,
+    pub consumer_member_ids: Vec<WireString>,
+    metrics: &'static KafkaConnMetrics,
+}
 
-    // Pre-initialized metrics handles
-    m_requests: metrics::Counter,
-    m_bytes_in: metrics::Counter,
-    m_bytes_out: metrics::Counter,
+// Use a lazily-initialized global for shared metrics to avoid passing through constructors.
+static CONN_METRICS: std::sync::OnceLock<KafkaConnMetrics> = std::sync::OnceLock::new();
+
+fn shared_metrics() -> &'static KafkaConnMetrics {
+    CONN_METRICS.get_or_init(|| KafkaConnMetrics::new("default"))
+}
+
+/// Initialize the shared Kafka connection metrics with a specific catalog name.
+/// Must be called before `shared_metrics()` for the catalog label to take effect.
+pub fn init_conn_metrics(catalog_name: &str) {
+    CONN_METRICS.get_or_init(|| KafkaConnMetrics::new(catalog_name));
 }
 
 impl KafkaConnection {
     pub fn new() -> Self {
         let id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-        let labels = [("conn_id", format!("{}", id))];
         Self {
             id,
             client_id: None,
             read_buf: BytesMut::with_capacity(65536),
             write_buf: BytesMut::with_capacity(65536),
             consumer_member_ids: Vec::new(),
-            m_requests: metrics::counter!("kafka.conn.requests", &labels),
-            m_bytes_in: metrics::counter!("kafka.conn.bytes_in", &labels),
-            m_bytes_out: metrics::counter!("kafka.conn.bytes_out", &labels),
+            metrics: shared_metrics(),
         }
     }
 
     /// Append incoming bytes to the read buffer.
     pub fn feed_data(&mut self, data: &[u8]) {
-        self.m_bytes_in.increment(data.len() as u64);
+        self.metrics.bytes_in.increment(data.len() as u64);
         self.read_buf.extend_from_slice(data);
     }
 
     /// Try to decode a complete Kafka request from the read buffer.
-    /// Returns `Ok(None)` if more data is needed.
+    /// Uses zero-copy decode: splits off the frame from BytesMut and freezes
+    /// to get a `Bytes`, then all string/bytes fields are zero-copy slices.
     pub fn try_decode_request(
         &mut self,
     ) -> Result<Option<(RequestHeader, KafkaRequest)>, CodecError> {
-        match codec::decode_request(&self.read_buf) {
-            Ok((header, request, consumed)) => {
-                // Update client_id from first request
-                if self.client_id.is_none() {
-                    self.client_id = header.client_id.clone();
-                }
-                let _ = self.read_buf.split_to(consumed);
-                self.m_requests.increment(1);
-                Ok(Some((header, request)))
-            }
-            Err(CodecError::Incomplete) => Ok(None),
-            Err(e) => Err(e),
+        // Peek at frame size without consuming
+        let total = match codec::peek_frame_size(&self.read_buf) {
+            Ok(total) => total,
+            Err(CodecError::Incomplete) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        if self.read_buf.len() < total {
+            return Ok(None);
         }
+
+        // Split off the frame and freeze for zero-copy Bytes-based decode
+        let frame = self.read_buf.split_to(total).freeze();
+        let (header, request) = codec::decode_request_bytes(frame)?;
+
+        // Update client_id from first request (zero-copy clone)
+        if self.client_id.is_none() {
+            self.client_id = header.client_id.clone();
+        }
+        self.metrics.requests.increment(1);
+        Ok(Some((header, request)))
     }
 
     /// Encode a response into the write buffer.
     pub fn encode_response(&mut self, correlation_id: i32, response: &KafkaResponse) {
         let before = self.write_buf.len();
         codec::encode_response(correlation_id, response, &mut self.write_buf);
-        self.m_bytes_out
+        self.metrics
+            .bytes_out
             .increment((self.write_buf.len() - before) as u64);
     }
 
@@ -103,7 +138,6 @@ mod tests {
     #[test]
     fn test_feed_and_decode_incomplete() {
         let mut conn = KafkaConnection::new();
-        // Feed partial data
         conn.feed_data(&[0, 0, 0, 20]);
         let result = conn.try_decode_request().unwrap();
         assert!(result.is_none());
@@ -113,12 +147,11 @@ mod tests {
     fn test_feed_and_decode_api_versions() {
         let mut conn = KafkaConnection::new();
 
-        // Build a valid ApiVersions request frame
         let mut payload = BytesMut::new();
-        payload.put_i16(18); // api_key = ApiVersions
-        payload.put_i16(0); // api_version
-        payload.put_i32(42); // correlation_id
-        payload.put_i16(-1); // null client_id
+        payload.put_i16(18);
+        payload.put_i16(0);
+        payload.put_i32(42);
+        payload.put_i16(-1);
 
         let mut frame = BytesMut::new();
         frame.put_i32(payload.len() as i32);
@@ -131,7 +164,6 @@ mod tests {
         assert_eq!(header.correlation_id, 42);
         assert!(matches!(req, KafkaRequest::ApiVersions));
 
-        // Buffer should be consumed
         assert!(conn.read_buf.is_empty());
     }
 
@@ -153,7 +185,6 @@ mod tests {
     fn test_multiple_requests_in_buffer() {
         let mut conn = KafkaConnection::new();
 
-        // Write two ApiVersions requests back-to-back
         for cid in [1i32, 2] {
             let mut payload = BytesMut::new();
             payload.put_i16(18);

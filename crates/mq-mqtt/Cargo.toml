@@ -8,14 +8,15 @@ license.workspace = true
 
 [dependencies]
 bisque-mq = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
 bytes = { workspace = true }
-tracing = { workspace = true }
-thiserror = { workspace = true }
-parking_lot = { workspace = true }
+metrics = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+smallvec = { workspace = true, features = ["serde"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }

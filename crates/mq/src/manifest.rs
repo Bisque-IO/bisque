@@ -117,6 +117,8 @@ pub(crate) enum StructuralWrite {
     DeleteActorNamespace(u64),
     CreateJob(crate::job::JobMeta),
     DeleteJob(u64),
+    CreateConsumerGroup(crate::consumer_group::ConsumerGroupMeta),
+    DeleteConsumerGroup(u64),
 }
 
 /// Command sent to the manifest worker thread.
@@ -160,6 +162,7 @@ const ACTOR_NS_PREFIX: &[u8] = b"A";
 const JOB_PREFIX: &[u8] = b"J";
 const CONSUMER_PREFIX: &[u8] = b"C";
 const PRODUCER_PREFIX: &[u8] = b"P";
+const CONSUMER_GROUP_PREFIX: &[u8] = b"G";
 
 /// Structural state loaded from MDBX on recovery.
 pub(crate) struct StructuralState {
@@ -420,6 +423,7 @@ impl GroupMdbxEnv {
         let mut jobs = Vec::new();
         let mut consumers = Vec::new();
         let mut producers = Vec::new();
+        let mut consumer_groups = Vec::new();
         let mut found_any = false;
 
         let mut cursor = txn
@@ -486,6 +490,14 @@ impl GroupMdbxEnv {
                             })?;
                     producers.push(snap);
                 }
+                b'G' => {
+                    let (snap, _): (crate::consumer_group::ConsumerGroupSnapshot, _) =
+                        bincode::serde::decode_from_slice(&value, bincode::config::standard())
+                            .map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                            })?;
+                    consumer_groups.push(snap);
+                }
                 _ => {}
             }
         }
@@ -502,6 +514,7 @@ impl GroupMdbxEnv {
             consumers,
             producers,
             exchanges: Vec::new(),
+            consumer_groups,
             next_id,
             file_manifest: Vec::new(),
             sync_addr: None,
@@ -667,6 +680,17 @@ impl GroupMdbxEnv {
                 let key = entity_key(JOB_PREFIX, *id);
                 let _ = txn.del(&entities_tbl, &key[..], None);
             }
+            StructuralWrite::CreateConsumerGroup(meta) => {
+                let key = entity_key(CONSUMER_GROUP_PREFIX, meta.group_id);
+                let bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                txn.put(&entities_tbl, &key[..], &bytes, WriteFlags::empty())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+            StructuralWrite::DeleteConsumerGroup(id) => {
+                let key = entity_key(CONSUMER_GROUP_PREFIX, *id);
+                let _ = txn.del(&entities_tbl, &key[..], None);
+            }
         }
 
         // Update structural purge floor
@@ -767,6 +791,14 @@ impl GroupMdbxEnv {
         for producer in &snap.producers {
             let key = entity_key(PRODUCER_PREFIX, producer.meta.producer_id);
             let bytes = bincode::serde::encode_to_vec(producer, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            txn.put(&snap_tbl, &key[..], &bytes, WriteFlags::empty())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        for cg in &snap.consumer_groups {
+            let key = entity_key(CONSUMER_GROUP_PREFIX, cg.meta.group_id);
+            let bytes = bincode::serde::encode_to_vec(cg, bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             txn.put(&snap_tbl, &key[..], &bytes, WriteFlags::empty())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1671,7 +1703,7 @@ mod tests {
             1,
             1000,
         );
-        let topic_meta = tmp_engine.meta.topics.get(&1).unwrap().meta().clone();
+        let topic_meta = tmp_engine.meta.topics.get(&1).unwrap().snapshot_meta();
         env.apply_structural_write(1, 2, &StructuralWrite::CreateTopic(topic_meta))
             .unwrap();
 

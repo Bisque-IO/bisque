@@ -4,8 +4,32 @@ use bytes::Bytes;
 use tokio::io::{AsyncWriteExt, DuplexStream};
 
 use bisque_mq_protocol::error::ProtocolError;
+use bisque_mq_protocol::flat::{FlatMessage, FlatMessageBuilder};
 use bisque_mq_protocol::frame::*;
 use bisque_mq_protocol::types::*;
+
+/// Helper to build a WireMessage from common test fields.
+fn make_wire_msg(
+    sub_id: u32,
+    message_id: u64,
+    timestamp: u64,
+    key: Option<&[u8]>,
+    value: &[u8],
+    headers: &[(&[u8], &[u8])],
+) -> WireMessage {
+    let mut builder = FlatMessageBuilder::new(Bytes::from(value.to_vec())).timestamp(timestamp);
+    if let Some(k) = key {
+        builder = builder.key(Bytes::from(k.to_vec()));
+    }
+    for (name, val) in headers {
+        builder = builder.header(Bytes::from(name.to_vec()), Bytes::from(val.to_vec()));
+    }
+    WireMessage {
+        sub_id,
+        message_id,
+        flat: FlatMessage::new(builder.build()).unwrap(),
+    }
+}
 
 // =============================================================================
 // Helpers
@@ -209,19 +233,19 @@ async fn test_subscribe_and_receive_messages() {
 
     // Server delivers 3 messages
     for i in 0..3u64 {
+        let key_str = format!("key-{}", i);
+        let val_str = format!("payload-{}", i);
+        let idx_bytes = i.to_le_bytes();
         send_server(
             &mut server,
-            &ServerFrame::Message(ServerMessage {
-                sub_id: 1,
-                message_id: 100 + i,
-                timestamp: 1_700_000_000 + i,
-                key: Some(Bytes::from(format!("key-{}", i))),
-                value: Bytes::from(format!("payload-{}", i)),
-                headers: vec![(
-                    Bytes::from_static(b"idx"),
-                    Bytes::from(i.to_le_bytes().to_vec()),
-                )],
-            }),
+            &ServerFrame::Message(make_wire_msg(
+                1,
+                100 + i,
+                1_700_000_000 + i,
+                Some(key_str.as_bytes()),
+                val_str.as_bytes(),
+                &[(b"idx", &idx_bytes)],
+            )),
         )
         .await;
     }
@@ -233,8 +257,8 @@ async fn test_subscribe_and_receive_messages() {
             ServerFrame::Message(msg) => {
                 assert_eq!(msg.sub_id, 1);
                 assert_eq!(msg.message_id, 100 + i);
-                assert_eq!(msg.key, Some(Bytes::from(format!("key-{}", i))));
-                assert_eq!(msg.value, Bytes::from(format!("payload-{}", i)));
+                assert_eq!(msg.flat.key(), Some(Bytes::from(format!("key-{}", i))));
+                assert_eq!(msg.flat.value(), Bytes::from(format!("payload-{}", i)));
             }
             _ => panic!("expected Message"),
         }
@@ -368,38 +392,17 @@ async fn test_multiple_subscriptions_interleaved() {
     // Server interleaves messages from both subscriptions
     send_server(
         &mut server,
-        &ServerFrame::Message(ServerMessage {
-            sub_id: 1,
-            message_id: 1000,
-            timestamp: 1,
-            key: None,
-            value: Bytes::from_static(b"topic-msg-1"),
-            headers: vec![],
-        }),
+        &ServerFrame::Message(make_wire_msg(1, 1000, 1, None, b"topic-msg-1", &[])),
     )
     .await;
     send_server(
         &mut server,
-        &ServerFrame::Message(ServerMessage {
-            sub_id: 2,
-            message_id: 2000,
-            timestamp: 2,
-            key: None,
-            value: Bytes::from_static(b"queue-msg-1"),
-            headers: vec![],
-        }),
+        &ServerFrame::Message(make_wire_msg(2, 2000, 2, None, b"queue-msg-1", &[])),
     )
     .await;
     send_server(
         &mut server,
-        &ServerFrame::Message(ServerMessage {
-            sub_id: 1,
-            message_id: 1001,
-            timestamp: 3,
-            key: None,
-            value: Bytes::from_static(b"topic-msg-2"),
-            headers: vec![],
-        }),
+        &ServerFrame::Message(make_wire_msg(1, 1001, 3, None, b"topic-msg-2", &[])),
     )
     .await;
 
@@ -850,20 +853,22 @@ async fn test_full_session_lifecycle() {
     // 6. Receive interleaved messages
     for i in 0..5u64 {
         let sub_id = (i % 3) as u32 + 1;
+        let key_str = format!("k{}", i);
+        let val_str = format!("msg-{}", i);
         send_server(
             &mut server,
-            &ServerFrame::Message(ServerMessage {
+            &ServerFrame::Message(make_wire_msg(
                 sub_id,
-                message_id: 1000 + i,
-                timestamp: 1_700_000_000 + i,
-                key: if i % 2 == 0 {
-                    Some(Bytes::from(format!("k{}", i)))
+                1000 + i,
+                1_700_000_000 + i,
+                if i % 2 == 0 {
+                    Some(key_str.as_bytes())
                 } else {
                     None
                 },
-                value: Bytes::from(format!("msg-{}", i)),
-                headers: vec![],
-            }),
+                val_str.as_bytes(),
+                &[],
+            )),
         )
         .await;
     }
@@ -984,14 +989,7 @@ async fn test_high_throughput_message_stream() {
     // Server sends 1000 messages
     let write_task = tokio::spawn(async move {
         for i in 0..msg_count {
-            let frame = ServerFrame::Message(ServerMessage {
-                sub_id: 1,
-                message_id: i,
-                timestamp: i,
-                key: None,
-                value: Bytes::from(vec![0xAA; 100]),
-                headers: vec![],
-            });
+            let frame = ServerFrame::Message(make_wire_msg(1, i, i, None, &vec![0xAA; 100], &[]));
             let data = encode_server_frame(&frame).unwrap();
             write_tcp_frame(&mut server, &data).await.unwrap();
         }
@@ -1076,14 +1074,14 @@ async fn test_concurrent_bidirectional_traffic() {
     // Server writer: sends messages
     let server_tx = tokio::spawn(async move {
         for i in 0..msg_count {
-            let frame = ServerFrame::Message(ServerMessage {
-                sub_id: (i % 3) as u32 + 1,
-                message_id: i,
-                timestamp: i,
-                key: None,
-                value: Bytes::from(vec![0xBB; 50]),
-                headers: vec![],
-            });
+            let frame = ServerFrame::Message(make_wire_msg(
+                (i % 3) as u32 + 1,
+                i,
+                i,
+                None,
+                &vec![0xBB; 50],
+                &[],
+            ));
             let data = encode_server_frame(&frame).unwrap();
             write_tcp_frame(&mut server_write, &data).await.unwrap();
         }
@@ -1168,18 +1166,17 @@ async fn test_large_message_over_tcp() {
     let mut buf = Vec::new();
 
     // 1MB value
-    let large_value = Bytes::from(vec![0xEE; 1_000_000]);
-    let frame = ServerFrame::Message(ServerMessage {
-        sub_id: 1,
-        message_id: 42,
-        timestamp: 999,
-        key: Some(Bytes::from(vec![0xDD; 1000])),
-        value: large_value.clone(),
-        headers: vec![(
-            Bytes::from_static(b"big-header"),
-            Bytes::from(vec![0xCC; 10_000]),
-        )],
-    });
+    let large_value = vec![0xEE; 1_000_000];
+    let large_key = vec![0xDD; 1000];
+    let big_header_val = vec![0xCC; 10_000];
+    let frame = ServerFrame::Message(make_wire_msg(
+        1,
+        42,
+        999,
+        Some(&large_key),
+        &large_value,
+        &[(b"big-header", &big_header_val)],
+    ));
 
     send_server(&mut server, &frame).await;
     let decoded = recv_server(&mut client, &mut buf).await;

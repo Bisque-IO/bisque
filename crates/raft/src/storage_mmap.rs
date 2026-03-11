@@ -1013,19 +1013,17 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
                 return;
             }
 
-            // Extract segments whose delay has expired, leave the rest
+            // Extract segments whose delay has expired, leave the rest.
+            // Take the whole map and partition — avoids allocating a keys Vec.
             let now = nanos_now();
             let mut ready_entries = Vec::new();
-            let keys: Vec<usize> = inner.pending.keys().copied().collect();
-            for key in keys {
-                let t = inner.pending[&key]
-                    .segment
-                    .first_enqueue_nanos
-                    .load(Ordering::Acquire);
+            let taken = std::mem::take(&mut inner.pending);
+            for (key, entry) in taken {
+                let t = entry.segment.first_enqueue_nanos.load(Ordering::Acquire);
                 if t == 0 || t + delay_nanos <= now {
-                    if let Some(entry) = inner.pending.remove(&key) {
-                        ready_entries.push(entry);
-                    }
+                    ready_entries.push(entry);
+                } else {
+                    inner.pending.insert(key, entry);
                 }
             }
 

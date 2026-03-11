@@ -93,12 +93,22 @@ impl MqState {
             return Ok(());
         }
 
-        info!(group_id, "provisioning MQ engine");
+        // Resolve catalog name for metrics labeling.
+        let catalog_name = self
+            .meta_engine
+            .list_all_catalogs()
+            .into_iter()
+            .find(|c| c.engine == EngineType::Mq && c.raft_group_id == group_id)
+            .map(|c| c.name)
+            .unwrap_or_else(|| "default".to_string());
+
+        info!(group_id, %catalog_name, "provisioning MQ engine");
 
         // MQ engine
         let mq_dir = self.data_dir.join("mq");
         std::fs::create_dir_all(&mq_dir)?;
-        let mq_config = bisque_mq::MqConfig::new(&mq_dir);
+        let mq_config =
+            bisque_mq::MqConfig::new(&mq_dir).with_catalog(group_id, catalog_name.clone());
         let mq_engine = bisque_mq::MqEngine::new(mq_config.clone());
 
         // Raft log storage
@@ -194,6 +204,7 @@ impl MqState {
             bisque_mq::MqWriteBatcherConfig::default(),
             mq_raft,
             group_id,
+            &catalog_name,
         ));
 
         // Router

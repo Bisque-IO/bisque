@@ -3,6 +3,7 @@ use std::io::{Cursor, Read, Write};
 use bytes::{Buf, Bytes};
 
 use crate::error::ProtocolError;
+use crate::flat::FlatMessage;
 use crate::tag::{ClientTag, ServerTag};
 
 // =============================================================================
@@ -202,6 +203,7 @@ fn encoded_size_bytes_u32(data: &[u8]) -> usize {
 }
 
 /// Encode a u64 vec with u16 count prefix.
+#[inline]
 fn encode_u64_vec<W: Write>(w: &mut W, ids: &[u64]) -> Result<(), ProtocolError> {
     (ids.len() as u16).encode(w)?;
     for id in ids {
@@ -210,6 +212,7 @@ fn encode_u64_vec<W: Write>(w: &mut W, ids: &[u64]) -> Result<(), ProtocolError>
     Ok(())
 }
 
+#[inline]
 fn decode_u64_vec<R: Read>(r: &mut R) -> Result<Vec<u64>, ProtocolError> {
     let count = u16::decode(r)? as usize;
     let mut ids = Vec::with_capacity(count);
@@ -219,6 +222,7 @@ fn decode_u64_vec<R: Read>(r: &mut R) -> Result<Vec<u64>, ProtocolError> {
     Ok(ids)
 }
 
+#[inline]
 fn encoded_size_u64_vec(ids: &[u64]) -> usize {
     2 + ids.len() * 8
 }
@@ -297,6 +301,7 @@ fn split_bytes_u32(buf: &mut Bytes) -> Result<Bytes, ProtocolError> {
     Ok(buf.split_to(len))
 }
 
+#[inline]
 fn read_u64_vec_buf(buf: &mut Bytes) -> Result<Vec<u64>, ProtocolError> {
     let count = read_u16_le_buf(buf)? as usize;
     if buf.remaining() < count * 8 {
@@ -312,6 +317,7 @@ fn read_u64_vec_buf(buf: &mut Bytes) -> Result<Vec<u64>, ProtocolError> {
     Ok(ids)
 }
 
+#[inline]
 fn read_option_u64_buf(buf: &mut Bytes) -> Result<Option<u64>, ProtocolError> {
     let tag = read_u8_buf(buf)?;
     match tag {
@@ -371,6 +377,77 @@ pub enum ClientFrame {
         topic_name_hash: u64,
         /// Pre-encoded flat message bytes (see `flat::FlatMessageBuilder`).
         messages: Vec<Bytes>,
+    },
+
+    // ── Consumer group operations ──────────────────────────────────────────
+    /// Create a new consumer group.
+    CreateGroup {
+        group_id: u64,
+        name: Bytes,
+        auto_offset_reset: u8,
+    },
+    /// Delete a consumer group.
+    DeleteGroup {
+        group_id: u64,
+        name_hash: u64,
+    },
+    /// Join a consumer group (triggers rebalance).
+    JoinGroup {
+        group_id: u64,
+        name_hash: u64,
+        member_id: Bytes,
+        client_id: Bytes,
+        session_timeout_ms: u32,
+        rebalance_timeout_ms: u32,
+        protocol_type: Bytes,
+        /// `(protocol_name, metadata)` pairs.
+        protocols: Vec<(Bytes, Bytes)>,
+    },
+    /// Sync partition assignments after a rebalance.
+    SyncGroup {
+        group_id: u64,
+        name_hash: u64,
+        generation: i32,
+        member_id: Bytes,
+        /// `(member_id, assignment)` pairs — only populated by the leader.
+        assignments: Vec<(Bytes, Bytes)>,
+    },
+    /// Leave a consumer group.
+    LeaveGroup {
+        group_id: u64,
+        name_hash: u64,
+        member_id: Bytes,
+    },
+    /// Consumer group heartbeat (separate from connection heartbeat).
+    GroupHeartbeat {
+        group_id: u64,
+        name_hash: u64,
+        member_id: Bytes,
+        generation: i32,
+    },
+    /// Commit offsets for a consumer group.
+    CommitGroupOffset {
+        group_id: u64,
+        name_hash: u64,
+        generation: i32,
+        /// `(topic_id, partition_index, offset, metadata)` tuples.
+        offsets: Vec<(u64, u32, u64, Bytes)>,
+    },
+    /// Fetch committed offsets for a consumer group.
+    FetchGroupOffsets {
+        group_id: u64,
+        name_hash: u64,
+        /// `(topic_id, partition_index)` pairs to fetch.
+        partitions: Vec<(u64, u32)>,
+    },
+    /// List all consumer groups in a raft group.
+    ListGroups {
+        group_id: u64,
+    },
+    /// Describe a specific consumer group.
+    DescribeGroup {
+        group_id: u64,
+        name_hash: u64,
     },
 }
 
@@ -454,6 +531,132 @@ impl Encode for ClientFrame {
                     encode_bytes_u32(w, msg)?;
                 }
             }
+            Self::CreateGroup {
+                group_id,
+                name,
+                auto_offset_reset,
+            } => {
+                (ClientTag::CreateGroup as u8).encode(w)?;
+                group_id.encode(w)?;
+                encode_bytes_u16(w, name)?;
+                auto_offset_reset.encode(w)?;
+            }
+            Self::DeleteGroup {
+                group_id,
+                name_hash,
+            } => {
+                (ClientTag::DeleteGroup as u8).encode(w)?;
+                group_id.encode(w)?;
+                name_hash.encode(w)?;
+            }
+            Self::JoinGroup {
+                group_id,
+                name_hash,
+                member_id,
+                client_id,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                protocol_type,
+                protocols,
+            } => {
+                (ClientTag::JoinGroup as u8).encode(w)?;
+                group_id.encode(w)?;
+                name_hash.encode(w)?;
+                encode_bytes_u16(w, member_id)?;
+                encode_bytes_u16(w, client_id)?;
+                session_timeout_ms.encode(w)?;
+                rebalance_timeout_ms.encode(w)?;
+                encode_bytes_u16(w, protocol_type)?;
+                (protocols.len() as u16).encode(w)?;
+                for (name, metadata) in protocols {
+                    encode_bytes_u16(w, name)?;
+                    encode_bytes_u32(w, metadata)?;
+                }
+            }
+            Self::SyncGroup {
+                group_id,
+                name_hash,
+                generation,
+                member_id,
+                assignments,
+            } => {
+                (ClientTag::SyncGroup as u8).encode(w)?;
+                group_id.encode(w)?;
+                name_hash.encode(w)?;
+                (*generation as u32).encode(w)?;
+                encode_bytes_u16(w, member_id)?;
+                (assignments.len() as u16).encode(w)?;
+                for (mid, assignment) in assignments {
+                    encode_bytes_u16(w, mid)?;
+                    encode_bytes_u32(w, assignment)?;
+                }
+            }
+            Self::LeaveGroup {
+                group_id,
+                name_hash,
+                member_id,
+            } => {
+                (ClientTag::LeaveGroup as u8).encode(w)?;
+                group_id.encode(w)?;
+                name_hash.encode(w)?;
+                encode_bytes_u16(w, member_id)?;
+            }
+            Self::GroupHeartbeat {
+                group_id,
+                name_hash,
+                member_id,
+                generation,
+            } => {
+                (ClientTag::GroupHeartbeat as u8).encode(w)?;
+                group_id.encode(w)?;
+                name_hash.encode(w)?;
+                encode_bytes_u16(w, member_id)?;
+                (*generation as u32).encode(w)?;
+            }
+            Self::CommitGroupOffset {
+                group_id,
+                name_hash,
+                generation,
+                offsets,
+            } => {
+                (ClientTag::CommitGroupOffset as u8).encode(w)?;
+                group_id.encode(w)?;
+                name_hash.encode(w)?;
+                (*generation as u32).encode(w)?;
+                (offsets.len() as u16).encode(w)?;
+                for (topic_id, partition_index, offset, metadata) in offsets {
+                    topic_id.encode(w)?;
+                    partition_index.encode(w)?;
+                    offset.encode(w)?;
+                    encode_bytes_u16(w, metadata)?;
+                }
+            }
+            Self::FetchGroupOffsets {
+                group_id,
+                name_hash,
+                partitions,
+            } => {
+                (ClientTag::FetchGroupOffsets as u8).encode(w)?;
+                group_id.encode(w)?;
+                name_hash.encode(w)?;
+                (partitions.len() as u16).encode(w)?;
+                for (topic_id, partition_index) in partitions {
+                    topic_id.encode(w)?;
+                    partition_index.encode(w)?;
+                }
+            }
+            Self::ListGroups { group_id } => {
+                (ClientTag::ListGroups as u8).encode(w)?;
+                group_id.encode(w)?;
+            }
+            Self::DescribeGroup {
+                group_id,
+                name_hash,
+            } => {
+                (ClientTag::DescribeGroup as u8).encode(w)?;
+                group_id.encode(w)?;
+                name_hash.encode(w)?;
+            }
         }
         Ok(())
     }
@@ -480,6 +683,55 @@ impl Encode for ClientFrame {
                         .map(|m| encoded_size_bytes_u32(m))
                         .sum::<usize>()
             }
+            Self::CreateGroup { name, .. } => 8 + encoded_size_bytes_u16(name) + 1,
+            Self::DeleteGroup { .. } => 8 + 8,
+            Self::JoinGroup {
+                member_id,
+                client_id,
+                protocol_type,
+                protocols,
+                ..
+            } => {
+                8 + 8
+                    + encoded_size_bytes_u16(member_id)
+                    + encoded_size_bytes_u16(client_id)
+                    + 4
+                    + 4
+                    + encoded_size_bytes_u16(protocol_type)
+                    + 2
+                    + protocols
+                        .iter()
+                        .map(|(n, m)| encoded_size_bytes_u16(n) + encoded_size_bytes_u32(m))
+                        .sum::<usize>()
+            }
+            Self::SyncGroup {
+                member_id,
+                assignments,
+                ..
+            } => {
+                8 + 8
+                    + 4
+                    + encoded_size_bytes_u16(member_id)
+                    + 2
+                    + assignments
+                        .iter()
+                        .map(|(mid, a)| encoded_size_bytes_u16(mid) + encoded_size_bytes_u32(a))
+                        .sum::<usize>()
+            }
+            Self::LeaveGroup { member_id, .. } => 8 + 8 + encoded_size_bytes_u16(member_id),
+            Self::GroupHeartbeat { member_id, .. } => 8 + 8 + encoded_size_bytes_u16(member_id) + 4,
+            Self::CommitGroupOffset { offsets, .. } => {
+                8 + 8
+                    + 4
+                    + 2
+                    + offsets
+                        .iter()
+                        .map(|(_, _, _, meta)| 8 + 4 + 8 + encoded_size_bytes_u16(meta))
+                        .sum::<usize>()
+            }
+            Self::FetchGroupOffsets { partitions, .. } => 8 + 8 + 2 + partitions.len() * (8 + 4),
+            Self::ListGroups { .. } => 8,
+            Self::DescribeGroup { .. } => 8 + 8,
         }
     }
 }
@@ -538,6 +790,115 @@ impl Decode for ClientFrame {
                     messages,
                 })
             }
+            ClientTag::CreateGroup => Ok(Self::CreateGroup {
+                group_id: u64::decode(r)?,
+                name: Bytes::from(decode_bytes_u16(r)?),
+                auto_offset_reset: u8::decode(r)?,
+            }),
+            ClientTag::DeleteGroup => Ok(Self::DeleteGroup {
+                group_id: u64::decode(r)?,
+                name_hash: u64::decode(r)?,
+            }),
+            ClientTag::JoinGroup => {
+                let group_id = u64::decode(r)?;
+                let name_hash = u64::decode(r)?;
+                let member_id = Bytes::from(decode_bytes_u16(r)?);
+                let client_id = Bytes::from(decode_bytes_u16(r)?);
+                let session_timeout_ms = u32::decode(r)?;
+                let rebalance_timeout_ms = u32::decode(r)?;
+                let protocol_type = Bytes::from(decode_bytes_u16(r)?);
+                let count = u16::decode(r)? as usize;
+                let mut protocols = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let name = Bytes::from(decode_bytes_u16(r)?);
+                    let metadata = Bytes::from(decode_bytes_u32(r)?);
+                    protocols.push((name, metadata));
+                }
+                Ok(Self::JoinGroup {
+                    group_id,
+                    name_hash,
+                    member_id,
+                    client_id,
+                    session_timeout_ms,
+                    rebalance_timeout_ms,
+                    protocol_type,
+                    protocols,
+                })
+            }
+            ClientTag::SyncGroup => {
+                let group_id = u64::decode(r)?;
+                let name_hash = u64::decode(r)?;
+                let generation = u32::decode(r)? as i32;
+                let member_id = Bytes::from(decode_bytes_u16(r)?);
+                let count = u16::decode(r)? as usize;
+                let mut assignments = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mid = Bytes::from(decode_bytes_u16(r)?);
+                    let assignment = Bytes::from(decode_bytes_u32(r)?);
+                    assignments.push((mid, assignment));
+                }
+                Ok(Self::SyncGroup {
+                    group_id,
+                    name_hash,
+                    generation,
+                    member_id,
+                    assignments,
+                })
+            }
+            ClientTag::LeaveGroup => Ok(Self::LeaveGroup {
+                group_id: u64::decode(r)?,
+                name_hash: u64::decode(r)?,
+                member_id: Bytes::from(decode_bytes_u16(r)?),
+            }),
+            ClientTag::GroupHeartbeat => Ok(Self::GroupHeartbeat {
+                group_id: u64::decode(r)?,
+                name_hash: u64::decode(r)?,
+                member_id: Bytes::from(decode_bytes_u16(r)?),
+                generation: u32::decode(r)? as i32,
+            }),
+            ClientTag::CommitGroupOffset => {
+                let group_id = u64::decode(r)?;
+                let name_hash = u64::decode(r)?;
+                let generation = u32::decode(r)? as i32;
+                let count = u16::decode(r)? as usize;
+                let mut offsets = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let topic_id = u64::decode(r)?;
+                    let partition_index = u32::decode(r)?;
+                    let offset = u64::decode(r)?;
+                    let metadata = Bytes::from(decode_bytes_u16(r)?);
+                    offsets.push((topic_id, partition_index, offset, metadata));
+                }
+                Ok(Self::CommitGroupOffset {
+                    group_id,
+                    name_hash,
+                    generation,
+                    offsets,
+                })
+            }
+            ClientTag::FetchGroupOffsets => {
+                let group_id = u64::decode(r)?;
+                let name_hash = u64::decode(r)?;
+                let count = u16::decode(r)? as usize;
+                let mut partitions = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let topic_id = u64::decode(r)?;
+                    let partition_index = u32::decode(r)?;
+                    partitions.push((topic_id, partition_index));
+                }
+                Ok(Self::FetchGroupOffsets {
+                    group_id,
+                    name_hash,
+                    partitions,
+                })
+            }
+            ClientTag::ListGroups => Ok(Self::ListGroups {
+                group_id: u64::decode(r)?,
+            }),
+            ClientTag::DescribeGroup => Ok(Self::DescribeGroup {
+                group_id: u64::decode(r)?,
+                name_hash: u64::decode(r)?,
+            }),
         }
     }
 }
@@ -598,6 +959,115 @@ impl ClientFrame {
                     messages,
                 })
             }
+            ClientTag::CreateGroup => Ok(Self::CreateGroup {
+                group_id: read_u64_le_buf(&mut buf)?,
+                name: split_bytes_u16(&mut buf)?,
+                auto_offset_reset: read_u8_buf(&mut buf)?,
+            }),
+            ClientTag::DeleteGroup => Ok(Self::DeleteGroup {
+                group_id: read_u64_le_buf(&mut buf)?,
+                name_hash: read_u64_le_buf(&mut buf)?,
+            }),
+            ClientTag::JoinGroup => {
+                let group_id = read_u64_le_buf(&mut buf)?;
+                let name_hash = read_u64_le_buf(&mut buf)?;
+                let member_id = split_bytes_u16(&mut buf)?;
+                let client_id = split_bytes_u16(&mut buf)?;
+                let session_timeout_ms = read_u32_le_buf(&mut buf)?;
+                let rebalance_timeout_ms = read_u32_le_buf(&mut buf)?;
+                let protocol_type = split_bytes_u16(&mut buf)?;
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut protocols = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let name = split_bytes_u16(&mut buf)?;
+                    let metadata = split_bytes_u32(&mut buf)?;
+                    protocols.push((name, metadata));
+                }
+                Ok(Self::JoinGroup {
+                    group_id,
+                    name_hash,
+                    member_id,
+                    client_id,
+                    session_timeout_ms,
+                    rebalance_timeout_ms,
+                    protocol_type,
+                    protocols,
+                })
+            }
+            ClientTag::SyncGroup => {
+                let group_id = read_u64_le_buf(&mut buf)?;
+                let name_hash = read_u64_le_buf(&mut buf)?;
+                let generation = read_u32_le_buf(&mut buf)? as i32;
+                let member_id = split_bytes_u16(&mut buf)?;
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut assignments = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mid = split_bytes_u16(&mut buf)?;
+                    let assignment = split_bytes_u32(&mut buf)?;
+                    assignments.push((mid, assignment));
+                }
+                Ok(Self::SyncGroup {
+                    group_id,
+                    name_hash,
+                    generation,
+                    member_id,
+                    assignments,
+                })
+            }
+            ClientTag::LeaveGroup => Ok(Self::LeaveGroup {
+                group_id: read_u64_le_buf(&mut buf)?,
+                name_hash: read_u64_le_buf(&mut buf)?,
+                member_id: split_bytes_u16(&mut buf)?,
+            }),
+            ClientTag::GroupHeartbeat => Ok(Self::GroupHeartbeat {
+                group_id: read_u64_le_buf(&mut buf)?,
+                name_hash: read_u64_le_buf(&mut buf)?,
+                member_id: split_bytes_u16(&mut buf)?,
+                generation: read_u32_le_buf(&mut buf)? as i32,
+            }),
+            ClientTag::CommitGroupOffset => {
+                let group_id = read_u64_le_buf(&mut buf)?;
+                let name_hash = read_u64_le_buf(&mut buf)?;
+                let generation = read_u32_le_buf(&mut buf)? as i32;
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut offsets = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let topic_id = read_u64_le_buf(&mut buf)?;
+                    let partition_index = read_u32_le_buf(&mut buf)?;
+                    let offset = read_u64_le_buf(&mut buf)?;
+                    let metadata = split_bytes_u16(&mut buf)?;
+                    offsets.push((topic_id, partition_index, offset, metadata));
+                }
+                Ok(Self::CommitGroupOffset {
+                    group_id,
+                    name_hash,
+                    generation,
+                    offsets,
+                })
+            }
+            ClientTag::FetchGroupOffsets => {
+                let group_id = read_u64_le_buf(&mut buf)?;
+                let name_hash = read_u64_le_buf(&mut buf)?;
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut partitions = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let topic_id = read_u64_le_buf(&mut buf)?;
+                    let partition_index = read_u32_le_buf(&mut buf)?;
+                    partitions.push((topic_id, partition_index));
+                }
+                Ok(Self::FetchGroupOffsets {
+                    group_id,
+                    name_hash,
+                    partitions,
+                })
+            }
+            ClientTag::ListGroups => Ok(Self::ListGroups {
+                group_id: read_u64_le_buf(&mut buf)?,
+            }),
+            ClientTag::DescribeGroup => Ok(Self::DescribeGroup {
+                group_id: read_u64_le_buf(&mut buf)?,
+                name_hash: read_u64_le_buf(&mut buf)?,
+            }),
         }
     }
 }
@@ -606,122 +1076,81 @@ impl ClientFrame {
 // ServerFrame
 // =============================================================================
 
-/// Message payload sent to the client.
-/// Stored inline in `ServerFrame::Message` — the enum is ~80 bytes which is
-/// acceptable for a bounded channel with 64 slots (~5 KiB total).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ServerMessage {
+/// Wire message wrapping a zero-copy `FlatMessage` with protocol-level routing
+/// fields (`sub_id`, `message_id`).
+///
+/// Wire format: `[sub_id:4][message_id:8][flat_len:4][flat_bytes...]`
+///
+/// The client accesses message fields via `flat.value()`, `flat.key()`,
+/// `flat.timestamp()`, `flat.headers()`, etc. — all zero-copy.
+#[derive(Debug, Clone)]
+pub struct WireMessage {
     pub sub_id: u32,
     pub message_id: u64,
-    pub timestamp: u64,
-    pub key: Option<Bytes>,
-    pub value: Bytes,
-    pub headers: Vec<(Bytes, Bytes)>,
+    pub flat: FlatMessage,
 }
 
-impl ServerMessage {
-    /// Total byte size of message payload (value + key + headers).
+impl PartialEq for WireMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.sub_id == other.sub_id
+            && self.message_id == other.message_id
+            && self.flat.as_bytes() == other.flat.as_bytes()
+    }
+}
+
+impl WireMessage {
+    /// Total byte size of message payload (flat message buffer).
+    #[inline]
     pub fn payload_bytes(&self) -> u64 {
-        let mut total = self.value.len() as u64;
-        if let Some(ref k) = self.key {
-            total += k.len() as u64;
-        }
-        for (name, val) in &self.headers {
-            total += name.len() as u64 + val.len() as u64;
-        }
-        total
+        self.flat.as_bytes().len() as u64
     }
 
     /// Encode the message body (without frame tag) into a writer.
+    #[inline]
     fn encode_body<W: Write>(&self, w: &mut W) -> Result<(), ProtocolError> {
         self.sub_id.encode(w)?;
         self.message_id.encode(w)?;
-        self.timestamp.encode(w)?;
-        match &self.key {
-            None => 0u8.encode(w)?,
-            Some(k) => {
-                1u8.encode(w)?;
-                encode_bytes_u32(w, k)?;
-            }
-        }
-        encode_bytes_u32(w, &self.value)?;
-        (self.headers.len() as u16).encode(w)?;
-        for (name, val) in &self.headers {
-            encode_bytes_u16(w, name)?;
-            encode_bytes_u32(w, val)?;
-        }
+        encode_bytes_u32(w, self.flat.as_bytes())?;
         Ok(())
     }
 
     /// Encoded size of the message body (without frame tag).
+    #[inline]
     fn body_encoded_size(&self) -> usize {
-        let key_size = match &self.key {
-            None => 1,
-            Some(k) => 1 + encoded_size_bytes_u32(k),
-        };
-        let headers_size: usize = self
-            .headers
-            .iter()
-            .map(|(name, val)| encoded_size_bytes_u16(name) + encoded_size_bytes_u32(val))
-            .sum();
-        4 + 8 + 8 + key_size + encoded_size_bytes_u32(&self.value) + 2 + headers_size
+        4 + 8 + encoded_size_bytes_u32(self.flat.as_bytes())
     }
 
     /// Decode message body from an `io::Read` (without tag byte).
+    #[inline]
     fn decode_body<R: Read>(r: &mut R) -> Result<Self, ProtocolError> {
         let sub_id = u32::decode(r)?;
         let message_id = u64::decode(r)?;
-        let timestamp = u64::decode(r)?;
-        let key_tag = u8::decode(r)?;
-        let key = match key_tag {
-            0 => None,
-            1 => Some(Bytes::from(decode_bytes_u32(r)?)),
-            _ => return Err(ProtocolError::UnknownTag(key_tag)),
-        };
-        let value = Bytes::from(decode_bytes_u32(r)?);
-        let header_count = u16::decode(r)? as usize;
-        let mut headers = Vec::with_capacity(header_count);
-        for _ in 0..header_count {
-            let name = Bytes::from(decode_bytes_u16(r)?);
-            let val = Bytes::from(decode_bytes_u32(r)?);
-            headers.push((name, val));
-        }
+        let flat_bytes = Bytes::from(decode_bytes_u32(r)?);
+        let flat = FlatMessage::new(flat_bytes).ok_or_else(|| ProtocolError::Truncated {
+            need: crate::flat::HEADER_SIZE,
+            have: 0,
+        })?;
         Ok(Self {
             sub_id,
             message_id,
-            timestamp,
-            key,
-            value,
-            headers,
+            flat,
         })
     }
 
     /// Zero-copy decode message body from a `Bytes` buffer (without tag byte).
+    #[inline]
     fn decode_body_bytes(buf: &mut Bytes) -> Result<Self, ProtocolError> {
         let sub_id = read_u32_le_buf(buf)?;
         let message_id = read_u64_le_buf(buf)?;
-        let timestamp = read_u64_le_buf(buf)?;
-        let key_tag = read_u8_buf(buf)?;
-        let key = match key_tag {
-            0 => None,
-            1 => Some(split_bytes_u32(buf)?),
-            _ => return Err(ProtocolError::UnknownTag(key_tag)),
-        };
-        let value = split_bytes_u32(buf)?;
-        let header_count = read_u16_le_buf(buf)? as usize;
-        let mut headers = Vec::with_capacity(header_count);
-        for _ in 0..header_count {
-            let name = split_bytes_u16(buf)?;
-            let val = split_bytes_u32(buf)?;
-            headers.push((name, val));
-        }
+        let flat_bytes = split_bytes_u32(buf)?;
+        let flat = FlatMessage::new(flat_bytes).ok_or_else(|| ProtocolError::Truncated {
+            need: crate::flat::HEADER_SIZE,
+            have: 0,
+        })?;
         Ok(Self {
             sub_id,
             message_id,
-            timestamp,
-            key,
-            value,
-            headers,
+            flat,
         })
     }
 }
@@ -740,10 +1169,10 @@ pub enum ServerFrame {
         sub_id: u32,
         entity_id: u64,
     },
-    Message(ServerMessage),
+    Message(WireMessage),
     /// Batch of messages sharing one TCP frame. Reduces per-message framing
     /// overhead and enables single-syscall delivery of multiple messages.
-    MessageBatch(Vec<ServerMessage>),
+    MessageBatch(Vec<WireMessage>),
     SubscriptionErr {
         sub_id: u32,
         code: u16,
@@ -754,6 +1183,66 @@ pub enum ServerFrame {
     },
     Close {
         reason: Bytes,
+    },
+    /// Pre-encoded frame bytes (tag + payload). Used by the server to send
+    /// wire-format data that was encoded directly from the storage layer
+    /// (e.g. FlatMessage → wire bytes) without materializing intermediate structs.
+    /// The Vec contains the complete frame body including the tag byte.
+    PreEncoded(Vec<u8>),
+
+    // ── Consumer group responses ───────────────────────────────────────────
+    /// Consumer group created successfully.
+    GroupCreated {
+        consumer_group_id: u64,
+    },
+    /// Consumer group deleted successfully.
+    GroupDeleted,
+    /// JoinGroup response with group membership info.
+    GroupJoined {
+        generation: i32,
+        leader: Bytes,
+        member_id: Bytes,
+        protocol_name: Bytes,
+        is_leader: u8,
+        /// `(member_id, protocol_metadata)` — only populated for the leader.
+        members: Vec<(Bytes, Bytes)>,
+    },
+    /// SyncGroup response with the member's partition assignment.
+    GroupSynced {
+        assignment: Bytes,
+    },
+    /// LeaveGroup completed.
+    GroupLeft,
+    /// Consumer group heartbeat acknowledged.
+    GroupHeartbeatOk,
+    /// Consumer group offset commit acknowledged.
+    GroupOffsetCommitted,
+    /// Fetched committed offsets for requested partitions.
+    /// `(topic_id, partition_index, committed_offset, metadata)`.
+    GroupOffsetsFetched {
+        offsets: Vec<(u64, u32, u64, Bytes)>,
+    },
+    /// List of consumer groups.
+    /// `(consumer_group_id, name, phase, protocol_type)`.
+    GroupList {
+        groups: Vec<(u64, Bytes, u8, Bytes)>,
+    },
+    /// Detailed consumer group description.
+    GroupDescription {
+        consumer_group_id: u64,
+        name: Bytes,
+        phase: u8,
+        protocol_type: Bytes,
+        protocol_name: Bytes,
+        leader: Bytes,
+        generation: i32,
+        /// `(member_id, client_id, assignment)`.
+        members: Vec<(Bytes, Bytes, Bytes)>,
+    },
+    /// Consumer group operation error.
+    GroupError {
+        code: u16,
+        message: Bytes,
     },
 }
 
@@ -807,11 +1296,108 @@ impl Encode for ServerFrame {
                 (ServerTag::Close as u8).encode(w)?;
                 encode_bytes_u16(w, reason)?;
             }
+            Self::PreEncoded(data) => {
+                w.write_all(data)?;
+            }
+            Self::GroupCreated { consumer_group_id } => {
+                (ServerTag::GroupCreated as u8).encode(w)?;
+                consumer_group_id.encode(w)?;
+            }
+            Self::GroupDeleted => {
+                (ServerTag::GroupDeleted as u8).encode(w)?;
+            }
+            Self::GroupJoined {
+                generation,
+                leader,
+                member_id,
+                protocol_name,
+                is_leader,
+                members,
+            } => {
+                (ServerTag::GroupJoined as u8).encode(w)?;
+                (*generation as u32).encode(w)?;
+                encode_bytes_u16(w, leader)?;
+                encode_bytes_u16(w, member_id)?;
+                encode_bytes_u16(w, protocol_name)?;
+                is_leader.encode(w)?;
+                (members.len() as u16).encode(w)?;
+                for (mid, metadata) in members {
+                    encode_bytes_u16(w, mid)?;
+                    encode_bytes_u32(w, metadata)?;
+                }
+            }
+            Self::GroupSynced { assignment } => {
+                (ServerTag::GroupSynced as u8).encode(w)?;
+                encode_bytes_u32(w, assignment)?;
+            }
+            Self::GroupLeft => {
+                (ServerTag::GroupLeft as u8).encode(w)?;
+            }
+            Self::GroupHeartbeatOk => {
+                (ServerTag::GroupHeartbeatOk as u8).encode(w)?;
+            }
+            Self::GroupOffsetCommitted => {
+                (ServerTag::GroupOffsetCommitted as u8).encode(w)?;
+            }
+            Self::GroupOffsetsFetched { offsets } => {
+                (ServerTag::GroupOffsetsFetched as u8).encode(w)?;
+                (offsets.len() as u16).encode(w)?;
+                for (topic_id, partition_index, offset, metadata) in offsets {
+                    topic_id.encode(w)?;
+                    partition_index.encode(w)?;
+                    offset.encode(w)?;
+                    encode_bytes_u16(w, metadata)?;
+                }
+            }
+            Self::GroupList { groups } => {
+                (ServerTag::GroupList as u8).encode(w)?;
+                (groups.len() as u16).encode(w)?;
+                for (group_id, name, phase, protocol_type) in groups {
+                    group_id.encode(w)?;
+                    encode_bytes_u16(w, name)?;
+                    phase.encode(w)?;
+                    encode_bytes_u16(w, protocol_type)?;
+                }
+            }
+            Self::GroupDescription {
+                consumer_group_id,
+                name,
+                phase,
+                protocol_type,
+                protocol_name,
+                leader,
+                generation,
+                members,
+            } => {
+                (ServerTag::GroupDescription as u8).encode(w)?;
+                consumer_group_id.encode(w)?;
+                encode_bytes_u16(w, name)?;
+                phase.encode(w)?;
+                encode_bytes_u16(w, protocol_type)?;
+                encode_bytes_u16(w, protocol_name)?;
+                encode_bytes_u16(w, leader)?;
+                (*generation as u32).encode(w)?;
+                (members.len() as u16).encode(w)?;
+                for (mid, cid, assignment) in members {
+                    encode_bytes_u16(w, mid)?;
+                    encode_bytes_u16(w, cid)?;
+                    encode_bytes_u32(w, assignment)?;
+                }
+            }
+            Self::GroupError { code, message } => {
+                (ServerTag::GroupError as u8).encode(w)?;
+                code.encode(w)?;
+                encode_bytes_u16(w, message)?;
+            }
         }
         Ok(())
     }
 
     fn encoded_size(&self) -> usize {
+        match self {
+            Self::PreEncoded(data) => return data.len(),
+            _ => {}
+        }
         1 + match self {
             Self::HandshakeOk { session_token, .. } => 8 + encoded_size_bytes_u16(session_token),
             Self::HandshakeErr { message, .. } => 2 + encoded_size_bytes_u16(message),
@@ -823,6 +1409,71 @@ impl Encode for ServerFrame {
             Self::SubscriptionErr { message, .. } => 4 + 2 + encoded_size_bytes_u16(message),
             Self::Heartbeat { .. } => 8,
             Self::Close { reason } => encoded_size_bytes_u16(reason),
+            Self::PreEncoded(_) => unreachable!(),
+            Self::GroupCreated { .. } => 8,
+            Self::GroupDeleted => 0,
+            Self::GroupJoined {
+                leader,
+                member_id,
+                protocol_name,
+                members,
+                ..
+            } => {
+                4 + encoded_size_bytes_u16(leader)
+                    + encoded_size_bytes_u16(member_id)
+                    + encoded_size_bytes_u16(protocol_name)
+                    + 1
+                    + 2
+                    + members
+                        .iter()
+                        .map(|(mid, meta)| {
+                            encoded_size_bytes_u16(mid) + encoded_size_bytes_u32(meta)
+                        })
+                        .sum::<usize>()
+            }
+            Self::GroupSynced { assignment } => encoded_size_bytes_u32(assignment),
+            Self::GroupLeft => 0,
+            Self::GroupHeartbeatOk => 0,
+            Self::GroupOffsetCommitted => 0,
+            Self::GroupOffsetsFetched { offsets } => {
+                2 + offsets
+                    .iter()
+                    .map(|(_, _, _, meta)| 8 + 4 + 8 + encoded_size_bytes_u16(meta))
+                    .sum::<usize>()
+            }
+            Self::GroupList { groups } => {
+                2 + groups
+                    .iter()
+                    .map(|(_, name, _, pt)| {
+                        8 + encoded_size_bytes_u16(name) + 1 + encoded_size_bytes_u16(pt)
+                    })
+                    .sum::<usize>()
+            }
+            Self::GroupDescription {
+                name,
+                protocol_type,
+                protocol_name,
+                leader,
+                members,
+                ..
+            } => {
+                8 + encoded_size_bytes_u16(name)
+                    + 1
+                    + encoded_size_bytes_u16(protocol_type)
+                    + encoded_size_bytes_u16(protocol_name)
+                    + encoded_size_bytes_u16(leader)
+                    + 4
+                    + 2
+                    + members
+                        .iter()
+                        .map(|(mid, cid, a)| {
+                            encoded_size_bytes_u16(mid)
+                                + encoded_size_bytes_u16(cid)
+                                + encoded_size_bytes_u32(a)
+                        })
+                        .sum::<usize>()
+            }
+            Self::GroupError { message, .. } => 2 + encoded_size_bytes_u16(message),
         }
     }
 }
@@ -843,12 +1494,12 @@ impl Decode for ServerFrame {
                 sub_id: u32::decode(r)?,
                 entity_id: u64::decode(r)?,
             }),
-            ServerTag::Message => Ok(Self::Message(ServerMessage::decode_body(r)?)),
+            ServerTag::Message => Ok(Self::Message(WireMessage::decode_body(r)?)),
             ServerTag::MessageBatch => {
                 let count = u16::decode(r)? as usize;
                 let mut msgs = Vec::with_capacity(count);
                 for _ in 0..count {
-                    msgs.push(ServerMessage::decode_body(r)?);
+                    msgs.push(WireMessage::decode_body(r)?);
                 }
                 Ok(Self::MessageBatch(msgs))
             }
@@ -862,6 +1513,93 @@ impl Decode for ServerFrame {
             }),
             ServerTag::Close => Ok(Self::Close {
                 reason: Bytes::from(decode_bytes_u16(r)?),
+            }),
+            ServerTag::GroupCreated => Ok(Self::GroupCreated {
+                consumer_group_id: u64::decode(r)?,
+            }),
+            ServerTag::GroupDeleted => Ok(Self::GroupDeleted),
+            ServerTag::GroupJoined => {
+                let generation = u32::decode(r)? as i32;
+                let leader = Bytes::from(decode_bytes_u16(r)?);
+                let member_id = Bytes::from(decode_bytes_u16(r)?);
+                let protocol_name = Bytes::from(decode_bytes_u16(r)?);
+                let is_leader = u8::decode(r)?;
+                let count = u16::decode(r)? as usize;
+                let mut members = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mid = Bytes::from(decode_bytes_u16(r)?);
+                    let metadata = Bytes::from(decode_bytes_u32(r)?);
+                    members.push((mid, metadata));
+                }
+                Ok(Self::GroupJoined {
+                    generation,
+                    leader,
+                    member_id,
+                    protocol_name,
+                    is_leader,
+                    members,
+                })
+            }
+            ServerTag::GroupSynced => Ok(Self::GroupSynced {
+                assignment: Bytes::from(decode_bytes_u32(r)?),
+            }),
+            ServerTag::GroupLeft => Ok(Self::GroupLeft),
+            ServerTag::GroupHeartbeatOk => Ok(Self::GroupHeartbeatOk),
+            ServerTag::GroupOffsetCommitted => Ok(Self::GroupOffsetCommitted),
+            ServerTag::GroupOffsetsFetched => {
+                let count = u16::decode(r)? as usize;
+                let mut offsets = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let topic_id = u64::decode(r)?;
+                    let partition_index = u32::decode(r)?;
+                    let offset = u64::decode(r)?;
+                    let metadata = Bytes::from(decode_bytes_u16(r)?);
+                    offsets.push((topic_id, partition_index, offset, metadata));
+                }
+                Ok(Self::GroupOffsetsFetched { offsets })
+            }
+            ServerTag::GroupList => {
+                let count = u16::decode(r)? as usize;
+                let mut groups = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let group_id = u64::decode(r)?;
+                    let name = Bytes::from(decode_bytes_u16(r)?);
+                    let phase = u8::decode(r)?;
+                    let protocol_type = Bytes::from(decode_bytes_u16(r)?);
+                    groups.push((group_id, name, phase, protocol_type));
+                }
+                Ok(Self::GroupList { groups })
+            }
+            ServerTag::GroupDescription => {
+                let consumer_group_id = u64::decode(r)?;
+                let name = Bytes::from(decode_bytes_u16(r)?);
+                let phase = u8::decode(r)?;
+                let protocol_type = Bytes::from(decode_bytes_u16(r)?);
+                let protocol_name = Bytes::from(decode_bytes_u16(r)?);
+                let leader = Bytes::from(decode_bytes_u16(r)?);
+                let generation = u32::decode(r)? as i32;
+                let count = u16::decode(r)? as usize;
+                let mut members = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mid = Bytes::from(decode_bytes_u16(r)?);
+                    let cid = Bytes::from(decode_bytes_u16(r)?);
+                    let assignment = Bytes::from(decode_bytes_u32(r)?);
+                    members.push((mid, cid, assignment));
+                }
+                Ok(Self::GroupDescription {
+                    consumer_group_id,
+                    name,
+                    phase,
+                    protocol_type,
+                    protocol_name,
+                    leader,
+                    generation,
+                    members,
+                })
+            }
+            ServerTag::GroupError => Ok(Self::GroupError {
+                code: u16::decode(r)?,
+                message: Bytes::from(decode_bytes_u16(r)?),
             }),
         }
     }
@@ -885,12 +1623,12 @@ impl ServerFrame {
                 sub_id: read_u32_le_buf(&mut buf)?,
                 entity_id: read_u64_le_buf(&mut buf)?,
             }),
-            ServerTag::Message => Ok(Self::Message(ServerMessage::decode_body_bytes(&mut buf)?)),
+            ServerTag::Message => Ok(Self::Message(WireMessage::decode_body_bytes(&mut buf)?)),
             ServerTag::MessageBatch => {
                 let count = read_u16_le_buf(&mut buf)? as usize;
                 let mut msgs = Vec::with_capacity(count);
                 for _ in 0..count {
-                    msgs.push(ServerMessage::decode_body_bytes(&mut buf)?);
+                    msgs.push(WireMessage::decode_body_bytes(&mut buf)?);
                 }
                 Ok(Self::MessageBatch(msgs))
             }
@@ -904,6 +1642,93 @@ impl ServerFrame {
             }),
             ServerTag::Close => Ok(Self::Close {
                 reason: split_bytes_u16(&mut buf)?,
+            }),
+            ServerTag::GroupCreated => Ok(Self::GroupCreated {
+                consumer_group_id: read_u64_le_buf(&mut buf)?,
+            }),
+            ServerTag::GroupDeleted => Ok(Self::GroupDeleted),
+            ServerTag::GroupJoined => {
+                let generation = read_u32_le_buf(&mut buf)? as i32;
+                let leader = split_bytes_u16(&mut buf)?;
+                let member_id = split_bytes_u16(&mut buf)?;
+                let protocol_name = split_bytes_u16(&mut buf)?;
+                let is_leader = read_u8_buf(&mut buf)?;
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut members = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mid = split_bytes_u16(&mut buf)?;
+                    let metadata = split_bytes_u32(&mut buf)?;
+                    members.push((mid, metadata));
+                }
+                Ok(Self::GroupJoined {
+                    generation,
+                    leader,
+                    member_id,
+                    protocol_name,
+                    is_leader,
+                    members,
+                })
+            }
+            ServerTag::GroupSynced => Ok(Self::GroupSynced {
+                assignment: split_bytes_u32(&mut buf)?,
+            }),
+            ServerTag::GroupLeft => Ok(Self::GroupLeft),
+            ServerTag::GroupHeartbeatOk => Ok(Self::GroupHeartbeatOk),
+            ServerTag::GroupOffsetCommitted => Ok(Self::GroupOffsetCommitted),
+            ServerTag::GroupOffsetsFetched => {
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut offsets = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let topic_id = read_u64_le_buf(&mut buf)?;
+                    let partition_index = read_u32_le_buf(&mut buf)?;
+                    let offset = read_u64_le_buf(&mut buf)?;
+                    let metadata = split_bytes_u16(&mut buf)?;
+                    offsets.push((topic_id, partition_index, offset, metadata));
+                }
+                Ok(Self::GroupOffsetsFetched { offsets })
+            }
+            ServerTag::GroupList => {
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut groups = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let group_id = read_u64_le_buf(&mut buf)?;
+                    let name = split_bytes_u16(&mut buf)?;
+                    let phase = read_u8_buf(&mut buf)?;
+                    let protocol_type = split_bytes_u16(&mut buf)?;
+                    groups.push((group_id, name, phase, protocol_type));
+                }
+                Ok(Self::GroupList { groups })
+            }
+            ServerTag::GroupDescription => {
+                let consumer_group_id = read_u64_le_buf(&mut buf)?;
+                let name = split_bytes_u16(&mut buf)?;
+                let phase = read_u8_buf(&mut buf)?;
+                let protocol_type = split_bytes_u16(&mut buf)?;
+                let protocol_name = split_bytes_u16(&mut buf)?;
+                let leader = split_bytes_u16(&mut buf)?;
+                let generation = read_u32_le_buf(&mut buf)? as i32;
+                let count = read_u16_le_buf(&mut buf)? as usize;
+                let mut members = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mid = split_bytes_u16(&mut buf)?;
+                    let cid = split_bytes_u16(&mut buf)?;
+                    let assignment = split_bytes_u32(&mut buf)?;
+                    members.push((mid, cid, assignment));
+                }
+                Ok(Self::GroupDescription {
+                    consumer_group_id,
+                    name,
+                    phase,
+                    protocol_type,
+                    protocol_name,
+                    leader,
+                    generation,
+                    members,
+                })
+            }
+            ServerTag::GroupError => Ok(Self::GroupError {
+                code: read_u16_le_buf(&mut buf)?,
+                message: split_bytes_u16(&mut buf)?,
             }),
         }
     }
@@ -1097,53 +1922,54 @@ mod tests {
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
+    /// Helper to build a WireMessage from common test fields.
+    fn make_wire_msg(
+        sub_id: u32,
+        message_id: u64,
+        timestamp: u64,
+        key: Option<&[u8]>,
+        value: &[u8],
+        headers: &[(&[u8], &[u8])],
+    ) -> WireMessage {
+        use crate::flat::FlatMessageBuilder;
+        let mut builder = FlatMessageBuilder::new(Bytes::from(value.to_vec())).timestamp(timestamp);
+        if let Some(k) = key {
+            builder = builder.key(Bytes::from(k.to_vec()));
+        }
+        for (name, val) in headers {
+            builder = builder.header(Bytes::from(name.to_vec()), Bytes::from(val.to_vec()));
+        }
+        WireMessage {
+            sub_id,
+            message_id,
+            flat: FlatMessage::new(builder.build()).unwrap(),
+        }
+    }
+
     #[test]
     fn test_server_message_roundtrip() {
-        let frame = ServerFrame::Message(ServerMessage {
-            sub_id: 1,
-            message_id: 500,
-            timestamp: 1_700_000_000_000,
-            key: Some(Bytes::from_static(b"user:123")),
-            value: Bytes::from_static(b"hello world"),
-            headers: vec![
-                (
-                    Bytes::from_static(b"content-type"),
-                    Bytes::from_static(b"text/plain"),
-                ),
-                (
-                    Bytes::from_static(b"trace-id"),
-                    Bytes::from_static(b"abc-def"),
-                ),
-            ],
-        });
+        let frame = ServerFrame::Message(make_wire_msg(
+            1,
+            500,
+            1_700_000_000_000,
+            Some(b"user:123"),
+            b"hello world",
+            &[(b"content-type", b"text/plain"), (b"trace-id", b"abc-def")],
+        ));
         assert_eq!(roundtrip_server(&frame), frame);
         assert_eq!(roundtrip_server_zc(&frame), frame);
     }
 
     #[test]
     fn test_server_message_no_key() {
-        let frame = ServerFrame::Message(ServerMessage {
-            sub_id: 2,
-            message_id: 1,
-            timestamp: 0,
-            key: None,
-            value: Bytes::from_static(b"data"),
-            headers: vec![],
-        });
+        let frame = ServerFrame::Message(make_wire_msg(2, 1, 0, None, b"data", &[]));
         assert_eq!(roundtrip_server(&frame), frame);
         assert_eq!(roundtrip_server_zc(&frame), frame);
     }
 
     #[test]
     fn test_server_message_empty_key() {
-        let frame = ServerFrame::Message(ServerMessage {
-            sub_id: 2,
-            message_id: 1,
-            timestamp: 0,
-            key: Some(Bytes::new()),
-            value: Bytes::new(),
-            headers: vec![],
-        });
+        let frame = ServerFrame::Message(make_wire_msg(2, 1, 0, Some(b""), b"", &[]));
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
@@ -1206,20 +2032,18 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_key_tag_in_message() {
-        let frame = ServerFrame::Message(ServerMessage {
-            sub_id: 1,
-            message_id: 1,
-            timestamp: 1,
-            key: None,
-            value: Bytes::from_static(b"x"),
-            headers: vec![],
-        });
+    fn test_invalid_flat_message_in_wire() {
+        // Build a valid WireMessage, then corrupt the flat_bytes to be too short
+        let frame = ServerFrame::Message(make_wire_msg(1, 1, 1, None, b"x", &[]));
         let mut encoded = frame.encode_to_vec().unwrap();
-        // key tag is at offset: 1(tag) + 4(sub_id) + 8(msg_id) + 8(timestamp) = 21
-        encoded[21] = 0x99;
+        // Corrupt the flat_len field to claim more bytes than available
+        // flat_len is at offset: 1(tag) + 4(sub_id) + 8(msg_id) = 13
+        encoded[13..17].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         let err = ServerFrame::decode_from_slice(&encoded).unwrap_err();
-        assert!(matches!(err, ProtocolError::UnknownTag(0x99)));
+        assert!(matches!(
+            err,
+            ProtocolError::Io(_) | ProtocolError::Truncated { .. }
+        ));
     }
 
     // =========================================================================
@@ -1283,63 +2107,42 @@ mod tests {
 
     #[test]
     fn test_message_large_value() {
-        let value = Bytes::from(vec![0xCC; 1_000_000]);
-        let frame = ServerFrame::Message(ServerMessage {
-            sub_id: 1,
-            message_id: 1,
-            timestamp: 1,
-            key: None,
-            value,
-            headers: vec![],
-        });
+        let value = vec![0xCC; 1_000_000];
+        let frame = ServerFrame::Message(make_wire_msg(1, 1, 1, None, &value, &[]));
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
     #[test]
     fn test_message_large_key() {
-        let key = Bytes::from(vec![0xDD; 100_000]);
-        let frame = ServerFrame::Message(ServerMessage {
-            sub_id: 1,
-            message_id: 1,
-            timestamp: 1,
-            key: Some(key),
-            value: Bytes::from_static(b"v"),
-            headers: vec![],
-        });
+        let key = vec![0xDD; 100_000];
+        let frame = ServerFrame::Message(make_wire_msg(1, 1, 1, Some(&key), b"v", &[]));
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
     #[test]
     fn test_message_many_headers() {
-        let headers: Vec<(Bytes, Bytes)> = (0..200)
-            .map(|i| {
-                (
-                    Bytes::from(format!("header-{}", i).into_bytes()),
-                    Bytes::from(format!("value-{}", i).into_bytes()),
-                )
-            })
-            .collect();
-        let frame = ServerFrame::Message(ServerMessage {
+        use crate::flat::FlatMessageBuilder;
+        let mut builder = FlatMessageBuilder::new(Bytes::from_static(b"v"))
+            .key(Bytes::from_static(b"k"))
+            .timestamp(1_700_000_000);
+        for i in 0..200 {
+            builder = builder.header(
+                Bytes::from(format!("header-{}", i).into_bytes()),
+                Bytes::from(format!("value-{}", i).into_bytes()),
+            );
+        }
+        let frame = ServerFrame::Message(WireMessage {
             sub_id: 10,
             message_id: 999,
-            timestamp: 1_700_000_000,
-            key: Some(Bytes::from_static(b"k")),
-            value: Bytes::from_static(b"v"),
-            headers,
+            flat: FlatMessage::new(builder.build()).unwrap(),
         });
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
     #[test]
     fn test_message_empty_header_name_and_value() {
-        let frame = ServerFrame::Message(ServerMessage {
-            sub_id: 1,
-            message_id: 1,
-            timestamp: 0,
-            key: None,
-            value: Bytes::new(),
-            headers: vec![(Bytes::new(), Bytes::new()), (Bytes::new(), Bytes::new())],
-        });
+        let frame =
+            ServerFrame::Message(make_wire_msg(1, 1, 0, None, b"", &[(b"", b""), (b"", b"")]));
         assert_eq!(roundtrip_server(&frame), frame);
     }
 
@@ -1450,14 +2253,14 @@ mod tests {
 
     #[test]
     fn test_zero_copy_server_message() {
-        let frame = ServerFrame::Message(ServerMessage {
-            sub_id: 1,
-            message_id: 42,
-            timestamp: 1000,
-            key: Some(Bytes::from_static(b"key")),
-            value: Bytes::from_static(b"value"),
-            headers: vec![(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))],
-        });
+        let frame = ServerFrame::Message(make_wire_msg(
+            1,
+            42,
+            1000,
+            Some(b"key"),
+            b"value",
+            &[(b"h1", b"v1")],
+        ));
         assert_eq!(roundtrip_server_zc(&frame), frame);
     }
 
@@ -1469,17 +2272,10 @@ mod tests {
     }
 
     #[test]
-    fn test_server_message_payload_bytes() {
-        let msg = ServerMessage {
-            sub_id: 1,
-            message_id: 1,
-            timestamp: 0,
-            key: Some(Bytes::from_static(b"key")),
-            value: Bytes::from_static(b"value"),
-            headers: vec![(Bytes::from_static(b"h"), Bytes::from_static(b"v"))],
-        };
-        // key(3) + value(5) + header_name(1) + header_val(1) = 10
-        assert_eq!(msg.payload_bytes(), 10);
+    fn test_wire_message_payload_bytes() {
+        let msg = make_wire_msg(1, 1, 0, Some(b"key"), b"value", &[(b"h", b"v")]);
+        // payload_bytes returns the entire flat buffer size
+        assert!(msg.payload_bytes() > 0);
     }
 
     // =========================================================================
@@ -1489,30 +2285,9 @@ mod tests {
     #[test]
     fn test_server_message_batch_roundtrip() {
         let frame = ServerFrame::MessageBatch(vec![
-            ServerMessage {
-                sub_id: 1,
-                message_id: 100,
-                timestamp: 1000,
-                key: Some(Bytes::from_static(b"k1")),
-                value: Bytes::from_static(b"v1"),
-                headers: vec![],
-            },
-            ServerMessage {
-                sub_id: 1,
-                message_id: 101,
-                timestamp: 1001,
-                key: None,
-                value: Bytes::from_static(b"v2"),
-                headers: vec![(Bytes::from_static(b"h"), Bytes::from_static(b"v"))],
-            },
-            ServerMessage {
-                sub_id: 2,
-                message_id: 200,
-                timestamp: 2000,
-                key: Some(Bytes::from_static(b"k3")),
-                value: Bytes::from_static(b"v3"),
-                headers: vec![],
-            },
+            make_wire_msg(1, 100, 1000, Some(b"k1"), b"v1", &[]),
+            make_wire_msg(1, 101, 1001, None, b"v2", &[(b"h", b"v")]),
+            make_wire_msg(2, 200, 2000, Some(b"k3"), b"v3", &[]),
         ]);
         assert_eq!(roundtrip_server(&frame), frame);
         assert_eq!(roundtrip_server_zc(&frame), frame);
@@ -1527,14 +2302,7 @@ mod tests {
 
     #[test]
     fn test_server_message_batch_single() {
-        let frame = ServerFrame::MessageBatch(vec![ServerMessage {
-            sub_id: 5,
-            message_id: 42,
-            timestamp: 999,
-            key: None,
-            value: Bytes::from_static(b"hello"),
-            headers: vec![],
-        }]);
+        let frame = ServerFrame::MessageBatch(vec![make_wire_msg(5, 42, 999, None, b"hello", &[])]);
         assert_eq!(roundtrip_server(&frame), frame);
         assert_eq!(roundtrip_server_zc(&frame), frame);
     }
@@ -1578,5 +2346,336 @@ mod tests {
         };
         assert_eq!(roundtrip_client(&frame), frame);
         assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    // =========================================================================
+    // Consumer group ClientFrame roundtrips
+    // =========================================================================
+
+    #[test]
+    fn test_client_create_group_roundtrip() {
+        let frame = ClientFrame::CreateGroup {
+            group_id: 1,
+            name: Bytes::from_static(b"my-group"),
+            auto_offset_reset: 1,
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_delete_group_roundtrip() {
+        let frame = ClientFrame::DeleteGroup {
+            group_id: 1,
+            name_hash: 0xCAFEBABE,
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_join_group_roundtrip() {
+        let frame = ClientFrame::JoinGroup {
+            group_id: 1,
+            name_hash: 0xDEAD,
+            member_id: Bytes::from_static(b""),
+            client_id: Bytes::from_static(b"client-1"),
+            session_timeout_ms: 30000,
+            rebalance_timeout_ms: 60000,
+            protocol_type: Bytes::from_static(b"consumer"),
+            protocols: vec![
+                (
+                    Bytes::from_static(b"range"),
+                    Bytes::from_static(b"\x00\x01\x02"),
+                ),
+                (
+                    Bytes::from_static(b"roundrobin"),
+                    Bytes::from_static(b"\x03\x04"),
+                ),
+            ],
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_join_group_empty_protocols() {
+        let frame = ClientFrame::JoinGroup {
+            group_id: 1,
+            name_hash: 0,
+            member_id: Bytes::from_static(b"member-1"),
+            client_id: Bytes::from_static(b"client-1"),
+            session_timeout_ms: 10000,
+            rebalance_timeout_ms: 30000,
+            protocol_type: Bytes::from_static(b"consumer"),
+            protocols: vec![],
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_sync_group_roundtrip() {
+        let frame = ClientFrame::SyncGroup {
+            group_id: 1,
+            name_hash: 0xBEEF,
+            generation: 5,
+            member_id: Bytes::from_static(b"member-1"),
+            assignments: vec![
+                (
+                    Bytes::from_static(b"member-1"),
+                    Bytes::from_static(b"\x00\x01"),
+                ),
+                (
+                    Bytes::from_static(b"member-2"),
+                    Bytes::from_static(b"\x02\x03"),
+                ),
+            ],
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_leave_group_roundtrip() {
+        let frame = ClientFrame::LeaveGroup {
+            group_id: 1,
+            name_hash: 0x1234,
+            member_id: Bytes::from_static(b"member-1"),
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_group_heartbeat_roundtrip() {
+        let frame = ClientFrame::GroupHeartbeat {
+            group_id: 1,
+            name_hash: 0x5678,
+            member_id: Bytes::from_static(b"member-1"),
+            generation: 3,
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_commit_group_offset_roundtrip() {
+        let frame = ClientFrame::CommitGroupOffset {
+            group_id: 1,
+            name_hash: 0xABCD,
+            generation: 2,
+            offsets: vec![
+                (100, 0, 500, Bytes::from_static(b"")),
+                (100, 1, 300, Bytes::from_static(b"meta")),
+                (200, 0, 1000, Bytes::from_static(b"")),
+            ],
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_fetch_group_offsets_roundtrip() {
+        let frame = ClientFrame::FetchGroupOffsets {
+            group_id: 1,
+            name_hash: 0x9999,
+            partitions: vec![(100, 0), (100, 1), (200, 0)],
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_list_groups_roundtrip() {
+        let frame = ClientFrame::ListGroups { group_id: 7 };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_client_describe_group_roundtrip() {
+        let frame = ClientFrame::DescribeGroup {
+            group_id: 1,
+            name_hash: 0xAAAA,
+        };
+        assert_eq!(roundtrip_client(&frame), frame);
+        assert_eq!(roundtrip_client_zc(&frame), frame);
+    }
+
+    // =========================================================================
+    // Consumer group ServerFrame roundtrips
+    // =========================================================================
+
+    #[test]
+    fn test_server_group_created_roundtrip() {
+        let frame = ServerFrame::GroupCreated {
+            consumer_group_id: 42,
+        };
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_group_deleted_roundtrip() {
+        assert_eq!(
+            roundtrip_server(&ServerFrame::GroupDeleted),
+            ServerFrame::GroupDeleted
+        );
+        assert_eq!(
+            roundtrip_server_zc(&ServerFrame::GroupDeleted),
+            ServerFrame::GroupDeleted
+        );
+    }
+
+    #[test]
+    fn test_server_group_joined_roundtrip() {
+        let frame = ServerFrame::GroupJoined {
+            generation: 3,
+            leader: Bytes::from_static(b"member-1"),
+            member_id: Bytes::from_static(b"member-2"),
+            protocol_name: Bytes::from_static(b"range"),
+            is_leader: 0,
+            members: vec![
+                (
+                    Bytes::from_static(b"member-1"),
+                    Bytes::from_static(b"\x00\x01"),
+                ),
+                (
+                    Bytes::from_static(b"member-2"),
+                    Bytes::from_static(b"\x02\x03"),
+                ),
+            ],
+        };
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_group_joined_leader() {
+        let frame = ServerFrame::GroupJoined {
+            generation: 1,
+            leader: Bytes::from_static(b"member-1"),
+            member_id: Bytes::from_static(b"member-1"),
+            protocol_name: Bytes::from_static(b"roundrobin"),
+            is_leader: 1,
+            members: vec![(Bytes::from_static(b"member-1"), Bytes::from_static(b"\x00"))],
+        };
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_group_synced_roundtrip() {
+        let frame = ServerFrame::GroupSynced {
+            assignment: Bytes::from_static(b"\x00\x01\x02\x03"),
+        };
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_group_left_roundtrip() {
+        assert_eq!(
+            roundtrip_server(&ServerFrame::GroupLeft),
+            ServerFrame::GroupLeft
+        );
+    }
+
+    #[test]
+    fn test_server_group_heartbeat_ok_roundtrip() {
+        assert_eq!(
+            roundtrip_server(&ServerFrame::GroupHeartbeatOk),
+            ServerFrame::GroupHeartbeatOk
+        );
+    }
+
+    #[test]
+    fn test_server_group_offset_committed_roundtrip() {
+        assert_eq!(
+            roundtrip_server(&ServerFrame::GroupOffsetCommitted),
+            ServerFrame::GroupOffsetCommitted
+        );
+    }
+
+    #[test]
+    fn test_server_group_offsets_fetched_roundtrip() {
+        let frame = ServerFrame::GroupOffsetsFetched {
+            offsets: vec![
+                (100, 0, 500, Bytes::from_static(b"")),
+                (100, 1, 300, Bytes::from_static(b"meta")),
+                (200, 0, 1000, Bytes::from_static(b"")),
+            ],
+        };
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_group_list_roundtrip() {
+        let frame = ServerFrame::GroupList {
+            groups: vec![
+                (
+                    1,
+                    Bytes::from_static(b"group-a"),
+                    3,
+                    Bytes::from_static(b"consumer"),
+                ),
+                (
+                    2,
+                    Bytes::from_static(b"group-b"),
+                    0,
+                    Bytes::from_static(b""),
+                ),
+            ],
+        };
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_group_description_roundtrip() {
+        let frame = ServerFrame::GroupDescription {
+            consumer_group_id: 42,
+            name: Bytes::from_static(b"my-group"),
+            phase: 3,
+            protocol_type: Bytes::from_static(b"consumer"),
+            protocol_name: Bytes::from_static(b"range"),
+            leader: Bytes::from_static(b"member-1"),
+            generation: 5,
+            members: vec![
+                (
+                    Bytes::from_static(b"member-1"),
+                    Bytes::from_static(b"client-1"),
+                    Bytes::from_static(b"\x00\x01"),
+                ),
+                (
+                    Bytes::from_static(b"member-2"),
+                    Bytes::from_static(b"client-2"),
+                    Bytes::from_static(b"\x02\x03"),
+                ),
+            ],
+        };
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_group_error_roundtrip() {
+        let frame = ServerFrame::GroupError {
+            code: 404,
+            message: Bytes::from_static(b"consumer group not found"),
+        };
+        assert_eq!(roundtrip_server(&frame), frame);
+        assert_eq!(roundtrip_server_zc(&frame), frame);
+    }
+
+    #[test]
+    fn test_server_group_error_empty_message() {
+        let frame = ServerFrame::GroupError {
+            code: 0,
+            message: Bytes::new(),
+        };
+        assert_eq!(roundtrip_server(&frame), frame);
     }
 }

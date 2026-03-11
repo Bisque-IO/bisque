@@ -22,6 +22,7 @@ use dashmap::DashMap;
 
 use crate::actor::ActorNamespaceState;
 use crate::consumer::ConsumerState;
+use crate::consumer_group::ConsumerGroupState;
 use crate::exchange::ExchangeState;
 use crate::job::JobInstance;
 use crate::producer::ProducerMeta;
@@ -46,6 +47,7 @@ pub struct TopicMeta {
     head_index: AtomicU64,
     tail_index: AtomicU64,
     message_count: AtomicU64,
+    total_bytes: AtomicU64,
     /// Raft log index of the latest publish. 0 means none.
     latest_log_index: AtomicU64,
     /// Position within the batch for the last message.
@@ -60,6 +62,7 @@ impl TopicMeta {
             head_index: AtomicU64::new(0),
             tail_index: AtomicU64::new(0),
             message_count: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
             latest_log_index: AtomicU64::new(0),
             latest_msg_pos: AtomicUsize::new(0),
         }
@@ -72,6 +75,7 @@ impl TopicMeta {
         head_index: u64,
         tail_index: u64,
         message_count: u64,
+        total_bytes: u64,
         latest_log_index: u64,
         latest_msg_pos: usize,
     ) -> Self {
@@ -81,6 +85,7 @@ impl TopicMeta {
             head_index: AtomicU64::new(head_index),
             tail_index: AtomicU64::new(tail_index),
             message_count: AtomicU64::new(message_count),
+            total_bytes: AtomicU64::new(total_bytes),
             latest_log_index: AtomicU64::new(latest_log_index),
             latest_msg_pos: AtomicUsize::new(latest_msg_pos),
         }
@@ -101,6 +106,11 @@ impl TopicMeta {
     #[inline]
     pub fn message_count(&self) -> u64 {
         self.message_count.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
     }
 
     /// Returns 0 if no message has been published yet.
@@ -156,12 +166,14 @@ impl TopicMeta {
         head_index: u64,
         tail_index: u64,
         message_count: u64,
+        total_bytes: u64,
         latest_log_index: u64,
         latest_msg_pos: usize,
     ) {
         self.head_index.store(head_index, Ordering::Relaxed);
         self.tail_index.store(tail_index, Ordering::Relaxed);
         self.message_count.store(message_count, Ordering::Relaxed);
+        self.total_bytes.store(total_bytes, Ordering::Relaxed);
         self.latest_log_index
             .store(latest_log_index, Ordering::Relaxed);
         self.latest_msg_pos.store(latest_msg_pos, Ordering::Relaxed);
@@ -176,6 +188,7 @@ impl fmt::Debug for TopicMeta {
             .field("head_index", &self.head_index())
             .field("tail_index", &self.tail_index())
             .field("message_count", &self.message_count())
+            .field("total_bytes", &self.total_bytes())
             .field("latest_log_index", &self.latest_log_index())
             .field("latest_msg_pos", &self.latest_msg_pos())
             .finish()
@@ -216,6 +229,9 @@ impl fmt::Debug for QueueMeta {
 ///   per-entry mutations — only the target shard is locked.
 /// - **Protocol adapters** cache `Arc<TopicMeta>` for zero-cost atomic reads.
 pub struct MqMetadata {
+    /// Catalog name for metrics labeling (set at construction, immutable).
+    catalog_name: String,
+
     // -- Protocol adapter caches (lightweight, with atomics for hot fields) --
     topics_by_id: DashMap<u64, Arc<TopicMeta>>,
     topics_by_name: DashMap<String, u64>,
@@ -232,6 +248,10 @@ pub struct MqMetadata {
     // -- Session stores --
     pub(crate) consumers: DashMap<u64, ConsumerState>,
     pub(crate) producers: DashMap<u64, ProducerMeta>,
+
+    // -- Consumer groups (Raft-replicated coordinator state) --
+    pub(crate) consumer_groups: DashMap<u64, ConsumerGroupState>,
+    pub(crate) consumer_group_names: DashMap<u64, u64>, // name_hash → group_id
 
     // -- Name hash (CRC64-NVME) → ID lookup indexes --
     pub(crate) topic_names: DashMap<u64, u64>,
@@ -255,8 +275,9 @@ pub struct MqMetadata {
 }
 
 impl MqMetadata {
-    pub fn new() -> Self {
+    pub fn new(catalog_name: String) -> Self {
         Self {
+            catalog_name,
             topics_by_id: DashMap::new(),
             topics_by_name: DashMap::new(),
             queues_by_id: DashMap::new(),
@@ -268,6 +289,8 @@ impl MqMetadata {
             exchanges: DashMap::new(),
             consumers: DashMap::new(),
             producers: DashMap::new(),
+            consumer_groups: DashMap::new(),
+            consumer_group_names: DashMap::new(),
             topic_names: DashMap::new(),
             queue_names: DashMap::new(),
             namespace_names: DashMap::new(),
@@ -280,6 +303,12 @@ impl MqMetadata {
             cached_purge_floor: AtomicU64::new(0),
             purge_floor_dirty: AtomicBool::new(true),
         }
+    }
+
+    /// The catalog name for metrics labeling.
+    #[inline]
+    pub fn catalog_name(&self) -> &str {
+        &self.catalog_name
     }
 
     /// Allocate a monotonically increasing entity ID.
@@ -305,7 +334,7 @@ impl MqMetadata {
     pub fn get_topic_head_from_state(&self, topic_id: u64) -> u64 {
         self.topics
             .get(&topic_id)
-            .map(|t| t.meta().head_index)
+            .map(|t| t.head_index())
             .unwrap_or(0)
     }
 
@@ -313,7 +342,7 @@ impl MqMetadata {
     pub fn get_topic_partitions(&self, topic_id: u64) -> Option<Vec<crate::types::PartitionInfo>> {
         self.topics
             .get(&topic_id)
-            .map(|t| t.meta().partitions.clone())
+            .map(|t| t.meta.partitions.clone())
     }
 
     // -- Topic operations --
@@ -512,11 +541,40 @@ impl MqMetadata {
         self.consumer_actor_ns_index.clear();
         self.consumer_job_index.clear();
     }
+
+    // -- Consumer group operations (public API for Kafka adapter) --
+
+    /// Resolve a consumer group name hash to its group ID.
+    pub fn resolve_consumer_group(&self, name_hash: u64) -> Option<u64> {
+        self.consumer_group_names.get(&name_hash).map(|r| *r)
+    }
+
+    /// Get a consumer group state by ID.
+    /// Returns a `DashMap` ref guard for reading group state.
+    pub fn get_consumer_group(
+        &self,
+        group_id: u64,
+    ) -> Option<dashmap::mapref::one::Ref<'_, u64, ConsumerGroupState>> {
+        self.consumer_groups.get(&group_id)
+    }
+
+    /// Iterate over all consumer groups.
+    pub fn iter_consumer_groups(&self) -> dashmap::iter::Iter<'_, u64, ConsumerGroupState> {
+        self.consumer_groups.iter()
+    }
+
+    /// Find the group ID that a member belongs to (scans all groups).
+    pub fn find_member_group(&self, member_id: &str) -> Option<u64> {
+        self.consumer_groups
+            .iter()
+            .find(|entry| entry.value().has_member(member_id))
+            .map(|entry| *entry.key())
+    }
 }
 
 impl Default for MqMetadata {
     fn default() -> Self {
-        Self::new()
+        Self::new("default".to_string())
     }
 }
 
@@ -543,6 +601,7 @@ mod tests {
             head,
             tail,
             count,
+            0,
             log_idx,
             msg_pos,
         ))
@@ -557,7 +616,7 @@ mod tests {
 
     #[test]
     fn empty_metadata() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         assert!(meta.list_topics_with_prefix("").is_empty());
         assert!(meta.get_topic_head(1).is_none());
         assert!(meta.get_topic_tail(1).is_none());
@@ -568,7 +627,7 @@ mod tests {
 
     #[test]
     fn insert_and_query_topics() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         meta.insert_topic(make_topic_with_state(1, "events", 100, 50, 50, 999, 2));
         meta.insert_topic(make_topic_with_state(2, "events.clicks", 10, 0, 10, 500, 0));
         meta.insert_queue(make_queue(10, "work-queue"));
@@ -593,7 +652,7 @@ mod tests {
 
     #[test]
     fn cached_arc_reads_atomics_directly() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         meta.insert_topic(make_topic_with_state(1, "t", 10, 0, 10, 100, 0));
 
         // Caller caches the Arc.
@@ -617,7 +676,7 @@ mod tests {
 
     #[test]
     fn remove_topic() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         meta.insert_topic(make_topic(1, "a"));
         meta.insert_topic(make_topic(2, "b"));
         meta.insert_topic(make_topic(3, "c"));
@@ -633,7 +692,7 @@ mod tests {
 
     #[test]
     fn remove_queue() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         meta.insert_queue(make_queue(1, "q1"));
         meta.insert_queue(make_queue(2, "q2"));
         assert_eq!(meta.queue_count(), 2);
@@ -646,7 +705,7 @@ mod tests {
 
     #[test]
     fn empty_topic_returns_none_for_head_tail() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         meta.insert_topic(make_topic(1, "empty-topic"));
 
         assert!(meta.get_topic_head(1).is_none());
@@ -658,7 +717,7 @@ mod tests {
 
     #[test]
     fn list_topics_into() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         meta.insert_topic(make_topic(1, "alpha"));
         meta.insert_topic(make_topic(2, "beta"));
 
@@ -674,11 +733,11 @@ mod tests {
 
     #[test]
     fn bulk_update() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         meta.insert_topic(make_topic(1, "t"));
 
         let t = meta.get_topic(1).unwrap();
-        t.update(100, 50, 50, 999, 7);
+        t.update(100, 50, 50, 0, 999, 7);
 
         assert_eq!(t.head_index(), 100);
         assert_eq!(t.tail_index(), 50);
@@ -688,7 +747,7 @@ mod tests {
 
     #[test]
     fn concurrent_readers_see_atomic_updates() {
-        let meta = Arc::new(MqMetadata::new());
+        let meta = Arc::new(MqMetadata::default());
         meta.insert_topic(make_topic_with_state(1, "v1", 10, 0, 10, 100, 0));
 
         // Two readers cache the same Arc.
@@ -707,7 +766,7 @@ mod tests {
 
     #[test]
     fn find_by_name_o1() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         meta.insert_topic(make_topic(1, "foo"));
         meta.insert_topic(make_topic(2, "bar"));
         meta.insert_queue(make_queue(10, "inbox"));
@@ -724,7 +783,7 @@ mod tests {
 
     #[test]
     fn insert_replaces_existing() {
-        let meta = MqMetadata::new();
+        let meta = MqMetadata::default();
         meta.insert_topic(make_topic_with_state(1, "t", 10, 0, 10, 50, 0));
 
         // Replace with new Arc.
@@ -738,7 +797,7 @@ mod tests {
 
     #[test]
     fn debug_impl() {
-        let t = TopicMeta::with_state(1, "test".into(), 100, 50, 50, 999, 2);
+        let t = TopicMeta::with_state(1, "test".into(), 100, 50, 50, 0, 999, 2);
         let s = format!("{:?}", t);
         assert!(s.contains("test"));
         assert!(s.contains("100"));

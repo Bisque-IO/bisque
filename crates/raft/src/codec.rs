@@ -132,6 +132,24 @@ impl Decode for u32 {
     }
 }
 
+impl Encode for i32 {
+    fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
+        writer.write_all(&self.to_le_bytes())?;
+        Ok(())
+    }
+    fn encoded_size(&self) -> usize {
+        4
+    }
+}
+
+impl Decode for i32 {
+    fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf)?;
+        Ok(i32::from_le_bytes(buf))
+    }
+}
+
 impl Encode for u64 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         writer.write_all(&self.to_le_bytes())?;
@@ -526,9 +544,10 @@ where
                 node_id.encode(writer)?;
             }
         }
-        let nodes: Vec<_> = self.nodes().collect();
-        (nodes.len() as u32).encode(writer)?;
-        for (node_id, node) in &nodes {
+        // Iterate twice to avoid collecting into Vec: once for count, once for data.
+        let node_count = self.nodes().count();
+        (node_count as u32).encode(writer)?;
+        for (node_id, node) in self.nodes() {
             node_id.encode(writer)?;
             node.encode(writer)?;
         }
@@ -538,9 +557,9 @@ where
     fn encoded_size(&self) -> usize {
         let configs = self.get_joint_config();
         let configs_size: usize = 4 + configs.iter().map(|c| 4 + c.len() * 8).sum::<usize>();
-        let nodes: Vec<_> = self.nodes().collect();
-        let nodes_size: usize = 4 + nodes
-            .iter()
+        // Iterate directly — no Vec allocation needed for size computation.
+        let nodes_size: usize = 4 + self
+            .nodes()
             .map(|(_, n)| 8 + n.encoded_size())
             .sum::<usize>();
         configs_size + nodes_size

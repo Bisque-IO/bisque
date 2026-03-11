@@ -74,21 +74,16 @@ pub async fn read_tcp_frame_bytes<R: AsyncRead + Unpin>(
 
 /// Write a TCP frame: `[u32 len][data]`.
 ///
-/// For small frames, combines length + data into a single write to avoid two syscalls.
+/// Zero-allocation: writes the 4-byte length prefix and payload separately.
+/// Callers should wrap the writer in `BufWriter` to coalesce into a single
+/// syscall when needed.
 pub async fn write_tcp_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
 ) -> Result<(), ProtocolError> {
     let len_bytes = (data.len() as u32).to_le_bytes();
-    if data.len() <= 4092 {
-        let mut combined = Vec::with_capacity(4 + data.len());
-        combined.extend_from_slice(&len_bytes);
-        combined.extend_from_slice(data);
-        writer.write_all(&combined).await?;
-    } else {
-        writer.write_all(&len_bytes).await?;
-        writer.write_all(data).await?;
-    }
+    writer.write_all(&len_bytes).await?;
+    writer.write_all(data).await?;
     Ok(())
 }
 
@@ -197,16 +192,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_tcp_frame_server_message_roundtrip() {
-        use crate::types::ServerMessage;
+        use crate::flat::{FlatMessage, FlatMessageBuilder};
+        use crate::types::WireMessage;
         let (mut client, mut server) = tokio::io::duplex(8192);
 
-        let frame = ServerFrame::Message(ServerMessage {
+        let flat = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
+            .key(Bytes::from_static(b"key"))
+            .timestamp(1_700_000_000)
+            .header(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))
+            .build();
+        let frame = ServerFrame::Message(WireMessage {
             sub_id: 5,
             message_id: 42,
-            timestamp: 1_700_000_000,
-            key: Some(Bytes::from_static(b"key")),
-            value: Bytes::from_static(b"hello"),
-            headers: vec![(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))],
+            flat: FlatMessage::new(flat).unwrap(),
         });
         let encoded = encode_server_frame(&frame).unwrap();
 
@@ -287,16 +285,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_tcp_frame_bytes_zero_copy() {
-        use crate::types::ServerMessage;
+        use crate::flat::{FlatMessage, FlatMessageBuilder};
+        use crate::types::WireMessage;
         let (mut writer, mut reader) = tokio::io::duplex(8192);
 
-        let frame = ServerFrame::Message(ServerMessage {
+        let flat = FlatMessageBuilder::new(Bytes::from_static(b"value"))
+            .key(Bytes::from_static(b"key"))
+            .timestamp(1000)
+            .header(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))
+            .build();
+        let frame = ServerFrame::Message(WireMessage {
             sub_id: 1,
             message_id: 42,
-            timestamp: 1000,
-            key: Some(Bytes::from_static(b"key")),
-            value: Bytes::from_static(b"value"),
-            headers: vec![(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))],
+            flat: FlatMessage::new(flat).unwrap(),
         });
         let encoded = encode_server_frame(&frame).unwrap();
         write_tcp_frame(&mut writer, &encoded).await.unwrap();
@@ -310,16 +311,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_server_frame_prefixed() {
-        use crate::types::ServerMessage;
+        use crate::flat::{FlatMessage, FlatMessageBuilder};
+        use crate::types::WireMessage;
         let (mut writer, mut reader) = tokio::io::duplex(8192);
 
-        let frame = ServerFrame::Message(ServerMessage {
+        let flat = FlatMessageBuilder::new(Bytes::from_static(b"test"))
+            .timestamp(1)
+            .build();
+        let frame = ServerFrame::Message(WireMessage {
             sub_id: 1,
             message_id: 1,
-            timestamp: 1,
-            key: None,
-            value: Bytes::from_static(b"test"),
-            headers: vec![],
+            flat: FlatMessage::new(flat).unwrap(),
         });
 
         let mut buf = Vec::new();

@@ -2,6 +2,7 @@ pub mod actor;
 pub mod codec;
 pub mod config;
 pub mod consumer;
+pub mod consumer_group;
 pub mod cursor;
 pub mod engine;
 pub mod exchange;

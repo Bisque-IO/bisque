@@ -15,34 +15,33 @@ fn make_engine() -> MqEngine {
 }
 
 // =============================================================================
-// MessagePayload ↔ FlatMessage roundtrip
+// FlatMessageBuilder → FlatMessage roundtrip
 // =============================================================================
 
 #[test]
-fn test_message_payload_full_roundtrip() {
-    let payload = MessagePayload {
-        key: Some(Bytes::from_static(b"order-key-123")),
-        value: Bytes::from("important payload data"),
-        headers: vec![
-            (
-                "content-type".into(),
-                Bytes::from_static(b"application/json"),
-            ),
-            ("x-trace-id".into(), Bytes::from_static(b"trace-abc-def")),
-            ("x-priority".into(), Bytes::from_static(b"high")),
-        ],
-        timestamp: 1700000000,
-        ttl_ms: Some(30_000),
-        delay_ms: Some(5_000),
-        routing_key: Some("orders.us.west".into()),
-        reply_to: Some("reply-topic-1".into()),
-        correlation_id: Some("corr-uuid-456".into()),
-    };
+fn test_flat_message_full_roundtrip() {
+    let flat_bytes = FlatMessageBuilder::new(Bytes::from("important payload data"))
+        .key(Bytes::from_static(b"order-key-123"))
+        .timestamp(1700000000)
+        .ttl_ms(30_000)
+        .delay_ms(5_000)
+        .routing_key(Bytes::from_static(b"orders.us.west"))
+        .reply_to(Bytes::from_static(b"reply-topic-1"))
+        .correlation_id(Bytes::from_static(b"corr-uuid-456"))
+        .header(
+            Bytes::from_static(b"content-type"),
+            Bytes::from_static(b"application/json"),
+        )
+        .header(
+            Bytes::from_static(b"x-trace-id"),
+            Bytes::from_static(b"trace-abc-def"),
+        )
+        .header(
+            Bytes::from_static(b"x-priority"),
+            Bytes::from_static(b"high"),
+        )
+        .build();
 
-    // Encode via the convenience method
-    let flat_bytes = payload.encode_flat();
-
-    // Decode and verify every field
     let flat = FlatMessage::new(flat_bytes).expect("valid flat message");
     assert_eq!(flat.value(), Bytes::from("important payload data"));
     assert_eq!(flat.key(), Some(Bytes::from_static(b"order-key-123")));
@@ -60,35 +59,11 @@ fn test_message_payload_full_roundtrip() {
     let (k0, v0) = flat.header(0);
     assert_eq!(k0, Bytes::from_static(b"content-type"));
     assert_eq!(v0, Bytes::from_static(b"application/json"));
-
-    // Round-trip back to MessagePayload
-    let back = flat.to_message_payload();
-    assert_eq!(back.key, payload.key);
-    assert_eq!(back.value, payload.value);
-    assert_eq!(back.timestamp, payload.timestamp);
-    assert_eq!(back.ttl_ms, payload.ttl_ms);
-    assert_eq!(back.delay_ms, payload.delay_ms);
-    assert_eq!(back.routing_key, payload.routing_key);
-    assert_eq!(back.reply_to, payload.reply_to);
-    assert_eq!(back.correlation_id, payload.correlation_id);
-    assert_eq!(back.headers.len(), 3);
 }
 
 #[test]
-fn test_message_payload_minimal_roundtrip() {
-    let payload = MessagePayload {
-        key: None,
-        value: Bytes::from_static(b"bare"),
-        headers: vec![],
-        timestamp: 0,
-        ttl_ms: None,
-        delay_ms: None,
-        routing_key: None,
-        reply_to: None,
-        correlation_id: None,
-    };
-
-    let flat_bytes = payload.encode_flat();
+fn test_flat_message_minimal_roundtrip() {
+    let flat_bytes = FlatMessageBuilder::new(Bytes::from_static(b"bare")).build();
     let flat = FlatMessage::new(flat_bytes).unwrap();
 
     assert_eq!(flat.value(), Bytes::from_static(b"bare"));
@@ -99,10 +74,6 @@ fn test_message_payload_minimal_roundtrip() {
     assert!(flat.reply_to().is_none());
     assert!(flat.correlation_id().is_none());
     assert_eq!(flat.header_count(), 0);
-
-    let back = flat.to_message_payload();
-    assert_eq!(back.value, payload.value);
-    assert!(back.key.is_none());
 }
 
 // =============================================================================
@@ -327,7 +298,7 @@ fn test_topic_publish_flat_messages() {
 
     let resp = engine.apply_command(&MqCommand::publish(topic_id, &messages), 2, 1000);
     match resp {
-        MqResponse::Published { offsets } => assert_eq!(offsets.len(), 3),
+        MqResponse::Published { count, .. } => assert_eq!(count, 3),
         other => panic!("expected Published, got {:?}", other),
     }
 

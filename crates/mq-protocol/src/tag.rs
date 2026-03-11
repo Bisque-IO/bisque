@@ -15,6 +15,17 @@ pub enum ClientTag {
     Close = 0x09,
     SetByteBudget = 0x0A,
     Publish = 0x0B,
+    // Consumer group operations
+    CreateGroup = 0x0C,
+    DeleteGroup = 0x0D,
+    JoinGroup = 0x0E,
+    SyncGroup = 0x0F,
+    LeaveGroup = 0x10,
+    GroupHeartbeat = 0x11,
+    CommitGroupOffset = 0x12,
+    FetchGroupOffsets = 0x13,
+    ListGroups = 0x14,
+    DescribeGroup = 0x15,
 }
 
 impl TryFrom<u8> for ClientTag {
@@ -33,6 +44,16 @@ impl TryFrom<u8> for ClientTag {
             0x09 => Ok(Self::Close),
             0x0A => Ok(Self::SetByteBudget),
             0x0B => Ok(Self::Publish),
+            0x0C => Ok(Self::CreateGroup),
+            0x0D => Ok(Self::DeleteGroup),
+            0x0E => Ok(Self::JoinGroup),
+            0x0F => Ok(Self::SyncGroup),
+            0x10 => Ok(Self::LeaveGroup),
+            0x11 => Ok(Self::GroupHeartbeat),
+            0x12 => Ok(Self::CommitGroupOffset),
+            0x13 => Ok(Self::FetchGroupOffsets),
+            0x14 => Ok(Self::ListGroups),
+            0x15 => Ok(Self::DescribeGroup),
             _ => Err(ProtocolError::UnknownTag(value)),
         }
     }
@@ -50,6 +71,18 @@ pub enum ServerTag {
     Heartbeat = 0x86,
     Close = 0x87,
     MessageBatch = 0x88,
+    // Consumer group responses
+    GroupCreated = 0x89,
+    GroupDeleted = 0x8A,
+    GroupJoined = 0x8B,
+    GroupSynced = 0x8C,
+    GroupLeft = 0x8D,
+    GroupHeartbeatOk = 0x8E,
+    GroupOffsetCommitted = 0x8F,
+    GroupOffsetsFetched = 0x90,
+    GroupList = 0x91,
+    GroupDescription = 0x92,
+    GroupError = 0x93,
 }
 
 impl TryFrom<u8> for ServerTag {
@@ -65,19 +98,30 @@ impl TryFrom<u8> for ServerTag {
             0x86 => Ok(Self::Heartbeat),
             0x87 => Ok(Self::Close),
             0x88 => Ok(Self::MessageBatch),
+            0x89 => Ok(Self::GroupCreated),
+            0x8A => Ok(Self::GroupDeleted),
+            0x8B => Ok(Self::GroupJoined),
+            0x8C => Ok(Self::GroupSynced),
+            0x8D => Ok(Self::GroupLeft),
+            0x8E => Ok(Self::GroupHeartbeatOk),
+            0x8F => Ok(Self::GroupOffsetCommitted),
+            0x90 => Ok(Self::GroupOffsetsFetched),
+            0x91 => Ok(Self::GroupList),
+            0x92 => Ok(Self::GroupDescription),
+            0x93 => Ok(Self::GroupError),
             _ => Err(ProtocolError::UnknownTag(value)),
         }
     }
 }
 
-/// Returns true if the tag byte is in the client range (0x01..=0x0F).
+/// Returns true if the tag byte is in the client range (0x01..=0x1F).
 pub fn is_client_tag(tag: u8) -> bool {
-    (0x01..=0x0F).contains(&tag)
+    (0x01..=0x1F).contains(&tag)
 }
 
-/// Returns true if the tag byte is in the server range (0x81..=0x8F).
+/// Returns true if the tag byte is in the server range (0x81..=0x9F).
 pub fn is_server_tag(tag: u8) -> bool {
-    (0x81..=0x8F).contains(&tag)
+    (0x81..=0x9F).contains(&tag)
 }
 
 #[cfg(test)]
@@ -98,6 +142,16 @@ mod tests {
             ClientTag::Close,
             ClientTag::SetByteBudget,
             ClientTag::Publish,
+            ClientTag::CreateGroup,
+            ClientTag::DeleteGroup,
+            ClientTag::JoinGroup,
+            ClientTag::SyncGroup,
+            ClientTag::LeaveGroup,
+            ClientTag::GroupHeartbeat,
+            ClientTag::CommitGroupOffset,
+            ClientTag::FetchGroupOffsets,
+            ClientTag::ListGroups,
+            ClientTag::DescribeGroup,
         ] {
             let byte = tag as u8;
             assert_eq!(ClientTag::try_from(byte).unwrap(), tag);
@@ -117,6 +171,17 @@ mod tests {
             ServerTag::Heartbeat,
             ServerTag::Close,
             ServerTag::MessageBatch,
+            ServerTag::GroupCreated,
+            ServerTag::GroupDeleted,
+            ServerTag::GroupJoined,
+            ServerTag::GroupSynced,
+            ServerTag::GroupLeft,
+            ServerTag::GroupHeartbeatOk,
+            ServerTag::GroupOffsetCommitted,
+            ServerTag::GroupOffsetsFetched,
+            ServerTag::GroupList,
+            ServerTag::GroupDescription,
+            ServerTag::GroupError,
         ] {
             let byte = tag as u8;
             assert_eq!(ServerTag::try_from(byte).unwrap(), tag);

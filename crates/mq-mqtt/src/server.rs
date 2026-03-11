@@ -24,6 +24,45 @@ use crate::session::{MqttSession, MqttSessionConfig, PublishPlan, RetainedPlan, 
 use crate::types::{MqttPacket, ProtocolVersion, QoS};
 
 // =============================================================================
+// Pre-initialized Metrics (OnceLock pattern — zero cost after first init)
+// =============================================================================
+
+struct MqttMetrics {
+    packets_received: metrics::Counter,
+    packets_sent: metrics::Counter,
+    connections_total: metrics::Counter,
+    connections_active: metrics::Gauge,
+    publishes_in: metrics::Counter,
+    publishes_out: metrics::Counter,
+    subscribes: metrics::Counter,
+    bytes_in: metrics::Counter,
+    bytes_out: metrics::Counter,
+}
+
+impl MqttMetrics {
+    fn new(catalog_name: &str) -> Self {
+        let labels = [("catalog", catalog_name.to_owned())];
+        Self {
+            packets_received: metrics::counter!("mqtt.packets.received", &labels),
+            packets_sent: metrics::counter!("mqtt.packets.sent", &labels),
+            connections_total: metrics::counter!("mqtt.connections.total", &labels),
+            connections_active: metrics::gauge!("mqtt.connections.active", &labels),
+            publishes_in: metrics::counter!("mqtt.publishes.in", &labels),
+            publishes_out: metrics::counter!("mqtt.publishes.out", &labels),
+            subscribes: metrics::counter!("mqtt.subscribes", &labels),
+            bytes_in: metrics::counter!("mqtt.bytes.in", &labels),
+            bytes_out: metrics::counter!("mqtt.bytes.out", &labels),
+        }
+    }
+}
+
+static MQTT_METRICS: std::sync::OnceLock<MqttMetrics> = std::sync::OnceLock::new();
+
+fn shared_metrics() -> &'static MqttMetrics {
+    MQTT_METRICS.get_or_init(|| MqttMetrics::new("default"))
+}
+
+// =============================================================================
 // Server Configuration
 // =============================================================================
 
@@ -122,7 +161,10 @@ impl MqttServer {
         config: MqttServerConfig,
         batcher: Arc<MqWriteBatcher>,
         log_reader: Arc<MqReader>,
+        catalog_name: &str,
     ) -> Self {
+        // Initialize metrics with catalog label (first call wins via OnceLock).
+        MQTT_METRICS.get_or_init(|| MqttMetrics::new(catalog_name));
         Self {
             config,
             batcher,
@@ -194,6 +236,10 @@ async fn accept_loop(
 
                         debug!(peer = %peer_addr, "new MQTT connection");
 
+                        let m = shared_metrics();
+                        m.connections_total.increment(1);
+                        m.connections_active.increment(1.0);
+
                         let config = config.clone();
                         let batcher = Arc::clone(&batcher);
                         let log_reader = Arc::clone(&log_reader);
@@ -211,6 +257,7 @@ async fn accept_loop(
                                 debug!(peer = %peer_addr, error = %e, "connection closed with error");
                             }
                             stats.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            shared_metrics().connections_active.decrement(1.0);
                         });
                     }
                     Err(e) => {
@@ -531,6 +578,9 @@ async fn orchestrate_subscribe(
 // =============================================================================
 
 /// Poll subscription queues and deliver messages to the MQTT client.
+///
+/// The `sub_buf` and `flat_messages_buf` are caller-owned reusable buffers
+/// to avoid per-cycle allocations.
 async fn deliver_outbound(
     session: &mut MqttSession,
     batcher: &MqWriteBatcher,
@@ -539,24 +589,26 @@ async fn deliver_outbound(
     stats: &MqttServerStats,
     batch_size: u32,
     write_buf: &mut BytesMut,
+    sub_buf: &mut Vec<(u64, QoS)>,
+    flat_messages_buf: &mut Vec<Bytes>,
 ) -> Result<(), ConnectionError> {
     if session.is_inflight_full() {
         return Ok(());
     }
 
-    // Collect subscriptions with queue IDs to avoid borrow conflict.
-    let subs: Vec<(String, u64, QoS)> = session
-        .subscriptions_iter()
-        .filter_map(|(_filter, mapping)| {
-            mapping
-                .queue_id
-                .map(|qid| (mapping.filter.clone(), qid, mapping.max_qos))
-        })
-        .collect();
+    let m = shared_metrics();
+
+    // Collect (queue_id, max_qos) into reusable buffer to avoid borrow conflict.
+    sub_buf.clear();
+    sub_buf.extend(
+        session
+            .subscriptions_iter()
+            .filter_map(|(_filter, mapping)| mapping.queue_id.map(|qid| (qid, mapping.max_qos))),
+    );
 
     let is_v5 = session.protocol_version == ProtocolVersion::V5;
 
-    for (_filter, queue_id, max_qos) in subs {
+    for &(queue_id, max_qos) in sub_buf.iter() {
         if session.is_inflight_full() {
             break;
         }
@@ -571,11 +623,11 @@ async fn deliver_outbound(
             .submit(MqCommand::deliver(queue_id, session.session_id, remaining))
             .await?;
 
-        let mut flat_messages_buf: Vec<Bytes> = Vec::new();
         if let MqResponse::Messages { messages } = resp {
             for delivered in &messages {
                 // Read flat message bytes from the raft log via log reader.
-                log_reader.read_messages_at_into(delivered.message_id, &mut flat_messages_buf);
+                flat_messages_buf.clear();
+                log_reader.read_messages_at_into(delivered.message_id, flat_messages_buf);
 
                 if flat_messages_buf.is_empty() {
                     // Message has been purged — NACK it so the queue can move on.
@@ -585,7 +637,7 @@ async fn deliver_outbound(
                     continue;
                 }
 
-                for flat_bytes in &flat_messages_buf {
+                for flat_bytes in flat_messages_buf.iter() {
                     if let Some(flat) = FlatMessage::new(flat_bytes.clone()) {
                         // Zero-alloc outbound: track inflight + encode directly from FlatMessage.
                         let tracking = session.track_outbound_delivery(
@@ -624,6 +676,7 @@ async fn deliver_outbound(
                         stats
                             .total_packets_sent
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.publishes_out.increment(1);
                     }
                 }
             }
@@ -632,7 +685,10 @@ async fn deliver_outbound(
 
     // Batch write: flush all encoded packets in a single write_all.
     if !write_buf.is_empty() {
+        let len = write_buf.len();
         stream.write_all(write_buf).await?;
+        m.bytes_out.increment(len as u64);
+        m.packets_sent.increment(1);
         write_buf.clear();
     }
 
@@ -779,13 +835,20 @@ async fn connection_loop(
     let mut delivery_interval = tokio::time::interval(Duration::from_millis(delivery_poll_ms));
     delivery_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Reusable buffers for deliver_outbound — hoisted to avoid per-cycle allocation.
+    let mut sub_buf: Vec<(u64, QoS)> = Vec::new();
+    let mut flat_messages_buf: Vec<Bytes> = Vec::new();
+
+    let m = shared_metrics();
+
     loop {
         tokio::select! {
             // Inbound: read from TCP with keep-alive timeout.
             read_result = tokio::time::timeout(keep_alive_timeout, stream.read_buf(read_buf)) => {
                 match read_result {
                     Ok(Ok(0)) => return Err(ConnectionError::Closed),
-                    Ok(Ok(_n)) => {
+                    Ok(Ok(n)) => {
+                        m.bytes_in.increment(n as u64);
                         // Process all complete packets in the buffer.
                         // Use zero-copy decode: freeze the packet bytes so PUBLISH
                         // topic/payload are Bytes::slice() from the frozen buffer.
@@ -802,6 +865,7 @@ async fn connection_loop(
                                         Ok((packet, _)) => {
                                             stats.total_packets_received
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            m.packets_received.increment(1);
 
                                             let is_disconnect = matches!(packet, MqttPacket::Disconnect(_));
 
@@ -835,7 +899,7 @@ async fn connection_loop(
 
             // Outbound: deliver messages from subscription queues.
             _ = delivery_interval.tick(), if !session.is_inflight_full() && session.subscription_count() > 0 => {
-                deliver_outbound(session, batcher, log_reader.as_ref(), stream, stats, delivery_batch_size, write_buf).await?;
+                deliver_outbound(session, batcher, log_reader.as_ref(), stream, stats, delivery_batch_size, write_buf, &mut sub_buf, &mut flat_messages_buf).await?;
             }
         }
     }
@@ -855,8 +919,11 @@ async fn process_inbound_packet(
     stats: &MqttServerStats,
     write_buf: &mut BytesMut,
 ) -> Result<(), ConnectionError> {
+    let m = shared_metrics();
+
     match packet {
         MqttPacket::Publish(publish) => {
+            m.publishes_in.increment(1);
             // Full orchestration: session builds plan, server resolves IDs.
             let plan = session.handle_publish(publish);
 
@@ -868,6 +935,7 @@ async fn process_inbound_packet(
         }
 
         MqttPacket::Subscribe(subscribe) => {
+            m.subscribes.increment(1);
             // Full orchestration: create exchange, queues, bindings.
             let plan = session.handle_subscribe(
                 subscribe.packet_id,
@@ -906,7 +974,37 @@ async fn process_inbound_packet(
             }
         }
 
-        // All other packets go through the generic process_packet path.
+        // Inline dispatch for ack packets — avoids Vec allocations on hot path.
+        MqttPacket::PubAck(puback) => {
+            if let Some(cmd) = session.handle_puback(puback.packet_id) {
+                let _ = batcher.submit(cmd).await;
+            }
+        }
+
+        MqttPacket::PubRec(pubrec) => {
+            let pubrel = session.handle_pubrec(pubrec.packet_id);
+            send_packets(stream, std::slice::from_ref(&pubrel), stats, write_buf).await?;
+        }
+
+        MqttPacket::PubRel(pubrel) => {
+            let pubcomp = session.handle_pubrel(pubrel.packet_id);
+            send_packets(stream, std::slice::from_ref(&pubcomp), stats, write_buf).await?;
+        }
+
+        MqttPacket::PubComp(pubcomp) => {
+            if let Some(cmd) = session.handle_pubcomp(pubcomp.packet_id) {
+                let _ = batcher.submit(cmd).await;
+            }
+        }
+
+        MqttPacket::PingReq => {
+            let (cmd, pong) = session.handle_pingreq();
+            let _ = batcher.submit(cmd).await;
+            send_packets(stream, std::slice::from_ref(&pong), stats, write_buf).await?;
+        }
+
+        // Remaining packet types (ConnAck, SubAck, UnsubAck, PingResp, Auth)
+        // are unexpected from clients or handled via process_packet fallback.
         _ => {
             let (commands, responses) = session.process_packet(packet);
             for cmd in commands {
@@ -959,6 +1057,7 @@ async fn deliver_retained_on_subscribe(
     plan: &SubscribePlan,
     write_buf: &mut BytesMut,
 ) -> Result<(), ConnectionError> {
+    // Clone once per subscribe (not per message) to avoid borrow conflict with `session`.
     let retained_prefix = session.config.retained_prefix.clone();
 
     for filter_plan in &plan.filters {
@@ -987,7 +1086,7 @@ async fn deliver_retained_on_subscribe(
             let topics = log_reader.list_topics_with_prefix(&retained_prefix);
             for (name, topic_id) in topics {
                 let name_str = std::str::from_utf8(&name).unwrap_or("");
-                if let Some(mqtt_topic) = name_str.strip_prefix(retained_prefix.as_str()) {
+                if let Some(mqtt_topic) = name_str.strip_prefix(&*retained_prefix) {
                     if mqtt_topic_matches_filter(mqtt_topic, filter) {
                         deliver_single_retained(
                             session,
@@ -1066,31 +1165,26 @@ async fn deliver_single_retained(
 
 /// Check if an MQTT topic matches a topic filter (with `+` and `#` wildcards).
 ///
+/// Zero-allocation: uses split iterators instead of collecting into Vecs.
+///
 /// - `+` matches a single topic level
 /// - `#` matches zero or more remaining levels (must be the last segment)
 fn mqtt_topic_matches_filter(topic: &str, filter: &str) -> bool {
-    let topic_parts: Vec<&str> = topic.split('/').collect();
-    let filter_parts: Vec<&str> = filter.split('/').collect();
+    let mut topic_iter = topic.split('/');
+    let mut filter_iter = filter.split('/');
 
-    let mut ti = 0;
-    let mut fi = 0;
-
-    while fi < filter_parts.len() {
-        if filter_parts[fi] == "#" {
-            return true; // # matches everything remaining
-        }
-        if ti >= topic_parts.len() {
-            return false;
-        }
-        if filter_parts[fi] == "+" || filter_parts[fi] == topic_parts[ti] {
-            ti += 1;
-            fi += 1;
-        } else {
-            return false;
+    loop {
+        match (filter_iter.next(), topic_iter.next()) {
+            (Some("#"), _) => return true, // # matches everything remaining
+            (Some(f), Some(t)) => {
+                if f != "+" && f != t {
+                    return false;
+                }
+            }
+            (None, None) => return true, // both exhausted, exact match
+            (Some(_), None) | (None, Some(_)) => return false, // length mismatch
         }
     }
-
-    ti == topic_parts.len() && fi == filter_parts.len()
 }
 
 // =============================================================================

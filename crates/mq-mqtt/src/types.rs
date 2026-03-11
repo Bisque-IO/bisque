@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 // =============================================================================
 // Protocol Version
@@ -319,8 +320,8 @@ pub struct Properties {
     pub maximum_qos: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retain_available: Option<bool>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub user_properties: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "SmallVec::is_empty")]
+    pub user_properties: SmallVec<[(String, String); 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_packet_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -475,7 +476,7 @@ pub struct PubComp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscribe {
     pub packet_id: u16,
-    pub filters: Vec<TopicFilter>,
+    pub filters: SmallVec<[TopicFilter; 4]>,
     #[serde(default)]
     pub properties: Properties,
 }
@@ -485,7 +486,7 @@ pub struct Subscribe {
 pub struct SubAck {
     pub packet_id: u16,
     /// Return codes / reason codes per subscription.
-    pub return_codes: Vec<u8>,
+    pub return_codes: SmallVec<[u8; 8]>,
     #[serde(default)]
     pub properties: Properties,
 }
@@ -494,7 +495,7 @@ pub struct SubAck {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Unsubscribe {
     pub packet_id: u16,
-    pub filters: Vec<String>,
+    pub filters: SmallVec<[String; 4]>,
     #[serde(default)]
     pub properties: Properties,
 }
@@ -505,7 +506,7 @@ pub struct UnsubAck {
     pub packet_id: u16,
     /// MQTT 5.0 reason codes per filter.
     #[serde(default)]
-    pub reason_codes: Vec<u8>,
+    pub reason_codes: SmallVec<[u8; 8]>,
     #[serde(default)]
     pub properties: Properties,
 }

@@ -408,6 +408,9 @@ impl GroupConnection {
         use crossfire::TryRecvError;
         use std::io::IoSlice;
 
+        // Reuse across iterations — after warmup this never reallocates.
+        let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(32);
+
         loop {
             if !alive.load(Ordering::Acquire) {
                 return;
@@ -424,7 +427,6 @@ impl GroupConnection {
                 alive.store(false, Ordering::Release);
                 return;
             }
-            let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(32);
             let mut total_bytes = first.data.len();
             data_bufs.push(first.data);
 
@@ -443,30 +445,36 @@ impl GroupConnection {
                 }
             }
 
-            // 4. Vectored write — writev() syscall, zero-copy batching
-            let write_err = {
-                let mut slices: Vec<IoSlice<'_>> =
-                    data_bufs.iter().map(|b| IoSlice::new(b)).collect();
-                let mut remaining: &mut [IoSlice<'_>] = &mut slices;
-                loop {
-                    if remaining.is_empty() {
-                        break None;
+            // 4. Vectored write — writev() syscall, stack-allocated IoSlice, zero alloc
+            let write_err: Option<Cow<'static, str>> = 'write: {
+                let mut pos = 0;
+                while pos < data_bufs.len() {
+                    let chunk = &data_bufs[pos..];
+                    let n = chunk.len().min(64);
+                    let mut slices = [IoSlice::new(&[]); 64];
+                    for (s, b) in slices[..n].iter_mut().zip(chunk.iter()) {
+                        *s = IoSlice::new(b);
                     }
-                    match write_half.write_vectored(remaining).await {
-                        Ok(0) => {
-                            break Some("write_vectored returned 0 bytes".into());
-                        }
-                        Ok(n) => {
-                            IoSlice::advance_slices(&mut remaining, n);
-                        }
-                        Err(e) => {
-                            break Some(format!("write error: {e}"));
+                    let mut remaining: &mut [IoSlice<'_>] = &mut slices[..n];
+                    while !remaining.is_empty() {
+                        match write_half.write_vectored(remaining).await {
+                            Ok(0) => {
+                                break 'write Some("write_vectored returned 0 bytes".into());
+                            }
+                            Ok(w) => {
+                                IoSlice::advance_slices(&mut remaining, w);
+                            }
+                            Err(e) => {
+                                break 'write Some(format!("write error: {e}").into());
+                            }
                         }
                     }
+                    pos += n;
                 }
+                None
             };
             // Borrow on data_bufs released — return buffers to the pool
-            for buf in data_bufs {
+            for buf in data_bufs.drain(..) {
                 return_encode_buffer(buf);
             }
             if let Some(err_msg) = write_err {

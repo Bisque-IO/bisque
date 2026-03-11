@@ -1,5 +1,5 @@
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -31,6 +31,14 @@ pub struct QueueMeta {
     pub in_flight_count: u64,
     pub dlq_count: u64,
     #[serde(default)]
+    pub pending_bytes: u64,
+    #[serde(default)]
+    pub in_flight_bytes: u64,
+    #[serde(default)]
+    pub total_messages: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
     pub name_hash: u64,
 }
 
@@ -45,6 +53,10 @@ impl QueueMeta {
             pending_count: 0,
             in_flight_count: 0,
             dlq_count: 0,
+            pending_bytes: 0,
+            in_flight_bytes: 0,
+            total_messages: 0,
+            total_bytes: 0,
             name_hash: hash,
         }
     }
@@ -129,6 +141,10 @@ pub struct QueueState {
     pending_count: AtomicU64,
     in_flight_count: AtomicU64,
     dlq_count: AtomicU64,
+    pending_bytes: AtomicU64,
+    in_flight_bytes: AtomicU64,
+    total_messages: AtomicU64,
+    total_bytes: AtomicU64,
 
     /// Message index: message_id → metadata (state, attempts, consumer, etc.)
     pub(crate) messages: DashMap<u64, QueueMessageMeta>,
@@ -160,8 +176,11 @@ pub struct QueueState {
 }
 
 impl QueueState {
-    pub fn new(meta: QueueMeta) -> Self {
-        let labels = [("queue", meta.name.clone())];
+    pub fn new(meta: QueueMeta, catalog_name: &str) -> Self {
+        let labels = [
+            ("catalog", catalog_name.to_owned()),
+            ("queue", meta.name.clone()),
+        ];
         let m_enqueue_count = metrics::counter!("mq.queue.enqueue.count", &labels);
         let m_deliver_count = metrics::counter!("mq.queue.deliver.count", &labels);
         let m_ack_count = metrics::counter!("mq.queue.ack.count", &labels);
@@ -173,11 +192,19 @@ impl QueueState {
         let pending_count = meta.pending_count;
         let in_flight_count = meta.in_flight_count;
         let dlq_count = meta.dlq_count;
+        let pending_bytes = meta.pending_bytes;
+        let in_flight_bytes = meta.in_flight_bytes;
+        let total_messages = meta.total_messages;
+        let total_bytes = meta.total_bytes;
         Self {
             meta,
             pending_count: AtomicU64::new(pending_count),
             in_flight_count: AtomicU64::new(in_flight_count),
             dlq_count: AtomicU64::new(dlq_count),
+            pending_bytes: AtomicU64::new(pending_bytes),
+            in_flight_bytes: AtomicU64::new(in_flight_bytes),
+            total_messages: AtomicU64::new(total_messages),
+            total_bytes: AtomicU64::new(total_bytes),
             messages: DashMap::new(),
             pending: Mutex::new(BTreeMap::new()),
             dedup: Mutex::new(DedupWindow::new(dedup_window_secs)),
@@ -211,11 +238,35 @@ impl QueueState {
         self.dlq_count.load(Ordering::Relaxed)
     }
 
+    #[inline]
+    pub fn pending_bytes(&self) -> u64 {
+        self.pending_bytes.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn in_flight_bytes(&self) -> u64 {
+        self.in_flight_bytes.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn total_messages(&self) -> u64 {
+        self.total_messages.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+
     /// Sync atomic counters back to meta for snapshotting.
     pub fn sync_meta_counts(&mut self) {
         self.meta.pending_count = self.pending_count.load(Ordering::Relaxed);
         self.meta.in_flight_count = self.in_flight_count.load(Ordering::Relaxed);
         self.meta.dlq_count = self.dlq_count.load(Ordering::Relaxed);
+        self.meta.pending_bytes = self.pending_bytes.load(Ordering::Relaxed);
+        self.meta.in_flight_bytes = self.in_flight_bytes.load(Ordering::Relaxed);
+        self.meta.total_messages = self.total_messages.load(Ordering::Relaxed);
+        self.meta.total_bytes = self.total_bytes.load(Ordering::Relaxed);
     }
 
     /// Check if the queue has any messages.
@@ -225,28 +276,28 @@ impl QueueState {
 
     /// Whether the expiry deadlines index has any entries.
     pub fn has_expiry_deadlines(&self) -> bool {
-        !self.expires_at_deadlines.lock().unwrap().is_empty()
+        !self.expires_at_deadlines.lock().is_empty()
     }
 
     /// Get the dedup window_secs config.
     pub fn dedup_window_secs(&self) -> u64 {
-        self.dedup.lock().unwrap().window_secs
+        self.dedup.lock().window_secs
     }
 
     /// Whether the dedup window has any entries.
     pub fn has_dedup_entries(&self) -> bool {
-        let guard = self.dedup.lock().unwrap();
+        let guard = self.dedup.lock();
         guard.window_secs > 0 && !guard.buckets.is_empty()
     }
 
     /// Snapshot the dedup window entries.
     pub fn dedup_snapshot_entries(&self) -> Vec<(u64, Vec<Bytes>)> {
-        self.dedup.lock().unwrap().snapshot_entries()
+        self.dedup.lock().snapshot_entries()
     }
 
     /// Restore dedup entries from snapshot.
     pub fn dedup_restore_entries(&self, entries: Vec<(u64, Vec<Bytes>)>) {
-        self.dedup.lock().unwrap().restore_entries(entries);
+        self.dedup.lock().restore_entries(entries);
     }
 
     /// Insert a message directly (used during snapshot restore).
@@ -258,12 +309,11 @@ impl QueueState {
         let consumer_id = msg.consumer_id;
 
         if state == MessageState::Pending {
-            self.pending.lock().unwrap().insert((priority, msg_id), ());
+            self.pending.lock().insert((priority, msg_id), ());
         } else if state == MessageState::InFlight {
             if let Some(deadline) = visibility_deadline {
                 self.in_flight_deadlines
                     .lock()
-                    .unwrap()
                     .entry(deadline)
                     .or_default()
                     .push(msg_id);
@@ -279,12 +329,14 @@ impl QueueState {
     pub fn purge(&self) -> bool {
         let had_messages = !self.messages.is_empty();
         self.messages.clear();
-        self.pending.lock().unwrap().clear();
-        self.in_flight_deadlines.lock().unwrap().clear();
+        self.pending.lock().clear();
+        self.in_flight_deadlines.lock().clear();
         self.consumer_in_flight.clear();
-        self.expires_at_deadlines.lock().unwrap().clear();
+        self.expires_at_deadlines.lock().clear();
         self.pending_count.store(0, Ordering::Relaxed);
         self.in_flight_count.store(0, Ordering::Relaxed);
+        self.pending_bytes.store(0, Ordering::Relaxed);
+        self.in_flight_bytes.store(0, Ordering::Relaxed);
         self.cached_min_message_id
             .store(MIN_NONE, Ordering::Relaxed);
         had_messages
@@ -302,15 +354,15 @@ impl QueueState {
         messages: &[Bytes],
         dedup_keys: &[Option<Bytes>],
         current_time: u64,
-    ) -> SmallVec<[u64; 16]> {
-        let mut offsets = SmallVec::with_capacity(messages.len());
-        let mut dedup_guard = self.dedup.lock().unwrap();
+    ) -> usize {
+        let mut enqueued: usize = 0;
+        let mut dedup_guard = self.dedup.lock();
         let dedup_enabled = dedup_guard.window_secs > 0;
         let default_delay_ms = self.meta.config.delay_default_ms;
         let queue_id = self.meta.queue_id;
 
-        let mut pending_guard = self.pending.lock().unwrap();
-        let mut expires_guard = self.expires_at_deadlines.lock().unwrap();
+        let mut pending_guard = self.pending.lock();
+        let mut expires_guard = self.expires_at_deadlines.lock();
 
         for (i, msg_buf) in messages.iter().enumerate() {
             let dedup_key = dedup_keys.get(i).and_then(|k| k.as_ref());
@@ -318,7 +370,7 @@ impl QueueState {
             // Check dedup
             if let Some(key) = dedup_key {
                 if dedup_enabled && dedup_guard.contains(key, current_time) {
-                    offsets.push(log_index);
+                    enqueued += 1;
                     continue;
                 }
             }
@@ -360,6 +412,8 @@ impl QueueState {
                     (None, None)
                 };
 
+            let value_len = FlatMessageMeta::value_len(msg_buf).unwrap_or(0) as u32;
+
             let meta = QueueMessageMeta {
                 message_id,
                 queue_id,
@@ -374,11 +428,17 @@ impl QueueState {
                 expires_at,
                 reply_to,
                 correlation_id,
+                value_len,
             };
 
             self.messages.insert(message_id, meta);
             pending_guard.insert((0, message_id), ());
             self.pending_count.fetch_add(1, Ordering::Relaxed);
+            self.pending_bytes
+                .fetch_add(value_len as u64, Ordering::Relaxed);
+            self.total_messages.fetch_add(1, Ordering::Relaxed);
+            self.total_bytes
+                .fetch_add(value_len as u64, Ordering::Relaxed);
 
             // Maintain expiry deadline index for proactive scanning
             if let Some(exp) = expires_at {
@@ -403,11 +463,11 @@ impl QueueState {
                 }
             }
 
-            offsets.push(message_id);
+            enqueued += 1;
         }
 
-        self.m_enqueue_count.increment(offsets.len() as u64);
-        offsets
+        self.m_enqueue_count.increment(enqueued as u64);
+        enqueued
     }
 
     pub fn apply_deliver(
@@ -423,7 +483,7 @@ impl QueueState {
         let mut to_remove = SmallVec::<[(u8, u64); 16]>::new();
         let mut expired_ids = SmallVec::<[(u8, u64); 4]>::new();
 
-        let mut pending_guard = self.pending.lock().unwrap();
+        let mut pending_guard = self.pending.lock();
 
         for (&(priority, msg_id), _) in pending_guard.iter() {
             if delivered.len() >= max {
@@ -452,6 +512,8 @@ impl QueueState {
             pending_guard.remove(&(priority, msg_id));
             if let Some((_, meta)) = self.messages.remove(&msg_id) {
                 self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                self.pending_bytes
+                    .fetch_sub(meta.value_len as u64, Ordering::Relaxed);
                 self.remove_from_expires_index_locked(meta.expires_at, msg_id);
                 // Invalidate cached min if this could have been it
                 let cached = self.cached_min_message_id.load(Ordering::Relaxed);
@@ -468,17 +530,22 @@ impl QueueState {
         drop(pending_guard);
 
         let deadline = current_time + timeout_ms;
-        let mut deadlines_guard = self.in_flight_deadlines.lock().unwrap();
+        let mut deadlines_guard = self.in_flight_deadlines.lock();
         for &msg_id in &delivered {
-            if let Some(mut meta) = self.messages.get_mut(&msg_id) {
+            let msg_bytes = if let Some(mut meta) = self.messages.get_mut(&msg_id) {
                 meta.state = MessageState::InFlight;
                 meta.consumer_id = Some(consumer_id);
                 meta.last_delivered_at = Some(current_time);
                 meta.visibility_deadline = Some(deadline);
                 meta.attempts += 1;
-            }
+                meta.value_len as u64
+            } else {
+                0
+            };
             self.pending_count.fetch_sub(1, Ordering::Relaxed);
             self.in_flight_count.fetch_add(1, Ordering::Relaxed);
+            self.pending_bytes.fetch_sub(msg_bytes, Ordering::Relaxed);
+            self.in_flight_bytes.fetch_add(msg_bytes, Ordering::Relaxed);
 
             // Maintain deadline index
             deadlines_guard.entry(deadline).or_default().push(msg_id);
@@ -500,6 +567,8 @@ impl QueueState {
             if let Some((_, meta)) = self.messages.remove(&msg_id) {
                 if meta.state == MessageState::InFlight {
                     self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+                    self.in_flight_bytes
+                        .fetch_sub(meta.value_len as u64, Ordering::Relaxed);
                     self.remove_from_deadline_index(meta.visibility_deadline, msg_id);
                     self.remove_from_consumer_index(meta.consumer_id, msg_id);
                     self.remove_from_expires_index(meta.expires_at, msg_id);
@@ -519,19 +588,22 @@ impl QueueState {
 
     pub fn apply_nack(&self, message_ids: &[u64]) {
         let mut count = 0u64;
-        let mut pending_guard = self.pending.lock().unwrap();
+        let mut pending_guard = self.pending.lock();
         for &msg_id in message_ids {
             if let Some(mut meta) = self.messages.get_mut(&msg_id) {
                 if meta.state == MessageState::InFlight {
                     let old_deadline = meta.visibility_deadline;
                     let old_consumer = meta.consumer_id;
                     let priority = meta.priority;
+                    let msg_bytes = meta.value_len as u64;
                     meta.state = MessageState::Pending;
                     meta.consumer_id = None;
                     meta.visibility_deadline = None;
                     pending_guard.insert((priority, msg_id), ());
                     self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
                     self.pending_count.fetch_add(1, Ordering::Relaxed);
+                    self.in_flight_bytes.fetch_sub(msg_bytes, Ordering::Relaxed);
+                    self.pending_bytes.fetch_add(msg_bytes, Ordering::Relaxed);
                     drop(meta);
                     self.remove_from_deadline_index(old_deadline, msg_id);
                     self.remove_from_consumer_index(old_consumer, msg_id);
@@ -544,7 +616,7 @@ impl QueueState {
     }
 
     pub fn apply_extend_visibility(&self, message_ids: &[u64], extension_ms: u64) {
-        let mut deadlines_guard = self.in_flight_deadlines.lock().unwrap();
+        let mut deadlines_guard = self.in_flight_deadlines.lock();
         for &msg_id in message_ids {
             if let Some(mut meta) = self.messages.get_mut(&msg_id) {
                 if meta.state == MessageState::InFlight {
@@ -576,7 +648,7 @@ impl QueueState {
     ) -> SmallVec<[u64; 4]> {
         let max_retries = self.meta.config.max_retries;
         let mut dead_lettered = SmallVec::<[u64; 4]>::new();
-        let mut pending_guard = self.pending.lock().unwrap();
+        let mut pending_guard = self.pending.lock();
 
         for &msg_id in message_ids {
             if let Some(mut meta) = self.messages.get_mut(&msg_id) {
@@ -587,6 +659,7 @@ impl QueueState {
                 let old_deadline = meta.visibility_deadline;
                 let old_consumer = meta.consumer_id;
                 let msg_expires_at = meta.expires_at;
+                let msg_bytes = meta.value_len as u64;
 
                 // If the message has exceeded its total TTL, dead-letter it
                 // regardless of retry count.
@@ -598,6 +671,7 @@ impl QueueState {
                     meta.consumer_id = None;
                     meta.visibility_deadline = None;
                     self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+                    self.in_flight_bytes.fetch_sub(msg_bytes, Ordering::Relaxed);
                     self.dlq_count.fetch_add(1, Ordering::Relaxed);
                     self.m_dlq_count.increment(1);
                     dead_lettered.push(msg_id);
@@ -608,7 +682,9 @@ impl QueueState {
                     meta.visibility_deadline = None;
                     pending_guard.insert((priority, msg_id), ());
                     self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+                    self.in_flight_bytes.fetch_sub(msg_bytes, Ordering::Relaxed);
                     self.pending_count.fetch_add(1, Ordering::Relaxed);
+                    self.pending_bytes.fetch_add(msg_bytes, Ordering::Relaxed);
                     self.m_timeout_count.increment(1);
                 }
 
@@ -646,14 +722,14 @@ impl QueueState {
     }
 
     pub fn apply_prune_dedup(&self, before_timestamp: u64) {
-        self.dedup.lock().unwrap().prune(before_timestamp);
+        self.dedup.lock().prune(before_timestamp);
     }
 
     /// Find in-flight messages whose visibility deadline has passed.
     /// Uses the deadline BTreeMap index for O(log n + k) instead of O(n).
     pub fn find_expired_messages(&self, current_time: u64) -> SmallVec<[u64; 16]> {
         let mut expired = SmallVec::new();
-        let deadlines = self.in_flight_deadlines.lock().unwrap();
+        let deadlines = self.in_flight_deadlines.lock();
         for (_deadline, msg_ids) in deadlines.range(..=current_time) {
             for &msg_id in msg_ids {
                 // Verify the message is still in-flight (may have been acked/nacked)
@@ -717,7 +793,7 @@ impl QueueState {
     /// Uses the expires_at BTreeMap index for O(log n + k) efficiency.
     pub fn find_expired_pending(&self, current_time: u64) -> SmallVec<[u64; 16]> {
         let mut expired = SmallVec::new();
-        let expires = self.expires_at_deadlines.lock().unwrap();
+        let expires = self.expires_at_deadlines.lock();
         for (_exp, msg_ids) in expires.range(..=current_time) {
             for &msg_id in msg_ids {
                 if let Some(meta) = self.messages.get(&msg_id) {
@@ -732,7 +808,7 @@ impl QueueState {
 
     /// Remove expired pending messages from the queue.
     pub fn apply_expire_pending(&self, message_ids: &[u64]) {
-        let mut pending_guard = self.pending.lock().unwrap();
+        let mut pending_guard = self.pending.lock();
         for &msg_id in message_ids {
             if let Some(meta) = self.messages.get(&msg_id) {
                 if meta.state != MessageState::Pending {
@@ -758,7 +834,7 @@ impl QueueState {
     /// Remove a message from the expires_at deadline index.
     fn remove_from_expires_index(&self, expires_at: Option<u64>, msg_id: u64) {
         if let Some(exp) = expires_at {
-            let mut guard = self.expires_at_deadlines.lock().unwrap();
+            let mut guard = self.expires_at_deadlines.lock();
             if let Some(ids) = guard.get_mut(&exp) {
                 if let Some(pos) = ids.iter().position(|&id| id == msg_id) {
                     ids.swap_remove(pos);
@@ -773,7 +849,7 @@ impl QueueState {
     /// Remove from expires index when the lock is already held (during apply_deliver).
     fn remove_from_expires_index_locked(&self, expires_at: Option<u64>, msg_id: u64) {
         if let Some(exp) = expires_at {
-            let mut guard = self.expires_at_deadlines.lock().unwrap();
+            let mut guard = self.expires_at_deadlines.lock();
             if let Some(ids) = guard.get_mut(&exp) {
                 if let Some(pos) = ids.iter().position(|&id| id == msg_id) {
                     ids.swap_remove(pos);
@@ -788,7 +864,7 @@ impl QueueState {
     /// Remove a message from the deadline index.
     fn remove_from_deadline_index(&self, deadline: Option<u64>, msg_id: u64) {
         if let Some(dl) = deadline {
-            let mut guard = self.in_flight_deadlines.lock().unwrap();
+            let mut guard = self.in_flight_deadlines.lock();
             Self::remove_from_deadline_index_locked(&mut guard, Some(dl), msg_id);
         }
     }
@@ -834,12 +910,12 @@ mod tests {
 
     fn make_queue(name: &str) -> QueueState {
         let meta = QueueMeta::new(1, name.to_string(), 1000, QueueConfig::default());
-        QueueState::new(meta)
+        QueueState::new(meta, "test")
     }
 
     fn make_queue_with_config(name: &str, config: QueueConfig) -> QueueState {
         let meta = QueueMeta::new(1, name.to_string(), 1000, config);
-        QueueState::new(meta)
+        QueueState::new(meta, "test")
     }
 
     /// Build a flat-encoded message with just a value and timestamp.
@@ -904,13 +980,13 @@ mod tests {
     fn test_enqueue_basic() {
         let q = make_queue("test");
         let msgs = vec![make_msg(b"hello")];
-        let offsets = q.apply_enqueue(10, &msgs, &[None], 1000);
+        let count = q.apply_enqueue(10, &msgs, &[None], 1000);
 
-        assert_eq!(offsets.as_slice(), &[10u64]);
+        assert_eq!(count, 1);
         assert_eq!(q.pending_count(), 1);
         assert!(q.messages.contains_key(&10));
         assert_eq!(q.messages.get(&10).unwrap().state, MessageState::Pending);
-        assert!(q.pending.lock().unwrap().contains_key(&(0, 10)));
+        assert!(q.pending.lock().contains_key(&(0, 10)));
     }
 
     #[test]
@@ -922,13 +998,13 @@ mod tests {
         let q = make_queue_with_config("test", config);
         let key = Bytes::from_static(b"dedup-key");
 
-        let offsets1 = q.apply_enqueue(10, &[make_msg(b"first")], &[Some(key.clone())], 1000);
-        assert_eq!(offsets1.len(), 1);
+        let count1 = q.apply_enqueue(10, &[make_msg(b"first")], &[Some(key.clone())], 1000);
+        assert_eq!(count1, 1);
         assert_eq!(q.pending_count(), 1);
 
         // Duplicate within window — skipped
-        let offsets2 = q.apply_enqueue(11, &[make_msg(b"second")], &[Some(key.clone())], 1005);
-        assert_eq!(offsets2.len(), 1);
+        let count2 = q.apply_enqueue(11, &[make_msg(b"second")], &[Some(key.clone())], 1005);
+        assert_eq!(count2, 1);
         assert_eq!(q.pending_count(), 1); // no new message
     }
 
@@ -1011,7 +1087,7 @@ mod tests {
         assert_eq!(q.pending_count(), 1);
         assert_eq!(q.messages.get(&10).unwrap().state, MessageState::Pending);
         assert!(q.messages.get(&10).unwrap().consumer_id.is_none());
-        assert!(q.pending.lock().unwrap().contains_key(&(0, 10)));
+        assert!(q.pending.lock().contains_key(&(0, 10)));
     }
 
     #[test]
@@ -1106,13 +1182,13 @@ mod tests {
         };
         let q = make_queue_with_config("test", config);
         {
-            let mut dedup = q.dedup.lock().unwrap();
+            let mut dedup = q.dedup.lock();
             dedup.insert(Bytes::from_static(b"old"), 10);
             dedup.insert(Bytes::from_static(b"new"), 100);
         }
 
         q.apply_prune_dedup(50);
-        let dedup = q.dedup.lock().unwrap();
+        let dedup = q.dedup.lock();
         assert!(!dedup.buckets.contains_key(&10));
         assert!(dedup.buckets.contains_key(&100));
     }

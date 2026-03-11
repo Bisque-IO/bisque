@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use openraft::Raft;
-use smallvec::SmallVec;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -88,7 +87,7 @@ struct BatchedRequest {
 enum ResponseSlot {
     /// Single original caller — forward response directly.
     Single(oneshot::Sender<MqResponse>),
-    /// Merged Publish callers — split `Published { offsets }` by message count.
+    /// Merged Publish callers — split `Published` by message count per caller.
     MergedPublish(Vec<(oneshot::Sender<MqResponse>, usize)>),
 }
 
@@ -110,22 +109,31 @@ pub struct MqWriteBatcher {
 
 impl MqWriteBatcher {
     /// Create a new `MqWriteBatcher` and spawn the batcher loop.
-    pub fn new(config: MqWriteBatcherConfig, raft: Raft<MqTypeConfig>, group_id: u64) -> Self {
+    pub fn new(
+        config: MqWriteBatcherConfig,
+        raft: Raft<MqTypeConfig>,
+        group_id: u64,
+        catalog_name: &str,
+    ) -> Self {
         let (tx, rx) = crossfire::mpsc::bounded_async::<BatchedRequest>(config.channel_capacity);
 
+        let catalog = catalog_name.to_owned();
         let group_label = group_id.to_string();
         let m_flush_count = metrics::counter!(
-            "bisque_mq_batcher_flushes_total",
+            "mq.batcher.flushes",
+            "catalog" => catalog.clone(),
             "group" => group_label.clone(),
             "reason" => "count"
         );
         let m_flush_linger = metrics::counter!(
-            "bisque_mq_batcher_flushes_total",
+            "mq.batcher.flushes",
+            "catalog" => catalog.clone(),
             "group" => group_label.clone(),
             "reason" => "linger"
         );
         let m_commands_batched = metrics::histogram!(
-            "bisque_mq_batcher_commands_per_flush",
+            "mq.batcher.commands_per_flush",
+            "catalog" => catalog,
             "group" => group_label
         );
 
@@ -144,6 +152,33 @@ impl MqWriteBatcher {
             m_flush_count,
             m_flush_linger,
             m_commands_batched,
+        }
+    }
+
+    /// Create a test batcher that routes commands through the given engine.
+    ///
+    /// Each submitted command is applied directly (no batching, no Raft).
+    /// The engine is protected by a Mutex for single-writer access.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_test(engine: std::sync::Arc<parking_lot::Mutex<crate::engine::MqEngine>>) -> Self {
+        let (tx, rx) = crossfire::mpsc::bounded_async::<BatchedRequest>(1024);
+        let task = tokio::spawn(async move {
+            let mut log_index = 1u64;
+            while let Ok(req) = rx.recv().await {
+                let resp = {
+                    let mut eng = engine.lock();
+                    eng.apply_command(&req.command, log_index, log_index * 1000)
+                };
+                log_index += 1;
+                let _ = req.response_tx.send(resp);
+            }
+        });
+        Self {
+            tx,
+            task: parking_lot::Mutex::new(Some(task)),
+            m_flush_count: metrics::counter!("test.flush_count"),
+            m_flush_linger: metrics::counter!("test.flush_linger"),
+            m_commands_batched: metrics::histogram!("test.commands_batched"),
         }
     }
 
@@ -274,14 +309,17 @@ fn dispatch_response(slot: ResponseSlot, response: MqResponse) {
                 return;
             }
             match response {
-                MqResponse::Published { offsets } => {
-                    let mut offset_iter = offsets.into_iter();
-                    for (tx, count) in callers {
-                        let caller_offsets: SmallVec<[u64; 16]> =
-                            (&mut offset_iter).take(count).collect();
+                MqResponse::Published {
+                    base_offset,
+                    count: _,
+                } => {
+                    let mut consumed = 0u64;
+                    for (tx, caller_count) in callers {
                         let _ = tx.send(MqResponse::Published {
-                            offsets: caller_offsets,
+                            base_offset: base_offset + consumed,
+                            count: caller_count as u64,
                         });
+                        consumed += caller_count as u64;
                     }
                 }
                 MqResponse::Error(_) => {

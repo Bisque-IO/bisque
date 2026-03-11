@@ -10,10 +10,10 @@
 //!
 //! Connection → Session → Link hierarchy with credit-based flow control.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::BytesMut;
+use bytes::{Buf, Bytes, BytesMut};
+use smallvec::SmallVec;
 use tracing::{debug, info, warn};
 
 use crate::codec::{self, CodecError};
@@ -46,8 +46,8 @@ pub enum ConnectionPhase {
 /// Authentication state.
 #[derive(Debug, Clone, Default)]
 pub struct AuthState {
-    pub mechanism: String,
-    pub username: String,
+    pub mechanism: WireString,
+    pub username: WireString,
     pub authenticated: bool,
 }
 
@@ -72,8 +72,8 @@ pub struct AmqpSession {
     pub outgoing_window: u32,
     /// Handle max for this session.
     pub handle_max: u32,
-    /// Links by handle.
-    pub links: HashMap<u32, AmqpLink>,
+    /// Links by handle. SmallVec for typical 1-8 links per session.
+    pub links: SmallVec<[(u32, AmqpLink); 8]>,
     /// Next available link handle.
     next_handle: u32,
 }
@@ -88,7 +88,7 @@ impl AmqpSession {
             incoming_window: 2048,
             outgoing_window: 2048,
             handle_max: u32::MAX,
-            links: HashMap::new(),
+            links: SmallVec::new(),
             next_handle: 0,
         }
     }
@@ -105,6 +105,21 @@ impl AmqpSession {
         let id = self.next_outgoing_id;
         self.next_outgoing_id = self.next_outgoing_id.wrapping_add(1);
         id
+    }
+
+    /// Find a link by handle.
+    #[inline]
+    fn find_link(&self, handle: u32) -> Option<usize> {
+        self.links.iter().position(|(h, _)| *h == handle)
+    }
+
+    /// Get a mutable reference to a link by handle.
+    #[inline]
+    fn get_link_mut(&mut self, handle: u32) -> Option<&mut AmqpLink> {
+        self.links
+            .iter_mut()
+            .find(|(h, _)| *h == handle)
+            .map(|(_, l)| l)
     }
 }
 
@@ -127,19 +142,19 @@ pub struct AmqpConnection {
     /// Authentication state.
     pub auth: AuthState,
     /// Our container ID.
-    pub container_id: String,
+    pub container_id: WireString,
     /// Peer's container ID.
-    pub peer_container_id: Option<String>,
+    pub peer_container_id: Option<WireString>,
     /// Negotiated max frame size.
     pub max_frame_size: u32,
     /// Negotiated channel max.
     pub channel_max: u16,
     /// Idle timeout in milliseconds (0 = disabled).
     pub idle_timeout: u32,
-    /// Sessions indexed by local channel number.
-    pub sessions: HashMap<u16, AmqpSession>,
+    /// Sessions indexed by local channel number. SmallVec for typical 1-4 sessions.
+    pub sessions: SmallVec<[(u16, AmqpSession); 4]>,
     /// Map from remote channel to local channel.
-    remote_to_local_channel: HashMap<u16, u16>,
+    remote_to_local_channel: SmallVec<[(u16, u16); 4]>,
     /// Next local channel to allocate.
     next_channel: u16,
     /// Read buffer for incoming data.
@@ -151,17 +166,18 @@ pub struct AmqpConnection {
 impl AmqpConnection {
     /// Create a new connection in the initial state.
     pub fn new() -> Self {
+        let id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         Self {
-            id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             phase: ConnectionPhase::AwaitingHeader,
             auth: AuthState::default(),
-            container_id: format!("bisque-mq-{}", NEXT_CONNECTION_ID.load(Ordering::Relaxed)),
+            container_id: WireString::from_string(format!("bisque-mq-{}", id.wrapping_add(1))),
             peer_container_id: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             channel_max: DEFAULT_CHANNEL_MAX,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            sessions: HashMap::new(),
-            remote_to_local_channel: HashMap::new(),
+            sessions: SmallVec::new(),
+            remote_to_local_channel: SmallVec::new(),
             next_channel: 0,
             read_buf: BytesMut::with_capacity(8192),
             write_buf: BytesMut::with_capacity(8192),
@@ -169,16 +185,20 @@ impl AmqpConnection {
     }
 
     /// Feed incoming bytes from the TCP stream.
+    #[inline]
     pub fn feed_data(&mut self, data: &[u8]) {
         self.read_buf.extend_from_slice(data);
     }
 
-    /// Take the outgoing write buffer.
-    pub fn take_write_buf(&mut self) -> BytesMut {
-        std::mem::replace(&mut self.write_buf, BytesMut::with_capacity(4096))
+    /// Take the outgoing write buffer contents as frozen Bytes (zero-copy).
+    /// Reuses the existing allocation by splitting.
+    #[inline]
+    pub fn take_write_bytes(&mut self) -> Bytes {
+        self.write_buf.split().freeze()
     }
 
     /// Check if there is data pending to be written.
+    #[inline]
     pub fn has_pending_writes(&self) -> bool {
         !self.write_buf.is_empty()
     }
@@ -250,7 +270,7 @@ impl AmqpConnection {
                 // Direct AMQP (no SASL).
                 debug!(conn = self.id, "AMQP header received (no SASL)");
                 self.auth.authenticated = true; // anonymous
-                self.auth.mechanism = "ANONYMOUS".to_string();
+                self.auth.mechanism = WireString::from_static("ANONYMOUS");
                 self.write_buf.extend_from_slice(&AMQP_HEADER);
                 self.send_open();
                 self.phase = ConnectionPhase::AwaitingOpen;
@@ -291,9 +311,8 @@ impl AmqpConnection {
     // =========================================================================
 
     fn send_sasl_mechanisms(&mut self) {
-        let mut payload = BytesMut::new();
-        codec::encode_sasl_mechanisms(&mut payload, &["PLAIN", "ANONYMOUS"]);
-        codec::encode_frame(&mut self.write_buf, 0, FRAME_TYPE_SASL, &payload);
+        // Encode directly into write_buf — no intermediate BytesMut allocation.
+        codec::encode_framed_sasl_mechanisms(&mut self.write_buf, &["PLAIN", "ANONYMOUS"]);
         debug!(conn = self.id, "sent sasl-mechanisms");
     }
 
@@ -302,12 +321,20 @@ impl AmqpConnection {
             return Ok(false);
         }
 
-        let (frame, consumed) = match codec::decode_frame(&self.read_buf) {
-            Ok(r) => r,
-            Err(CodecError::Incomplete) => return Ok(false),
-            Err(e) => return Err(ConnectionError::Codec(e)),
-        };
-        self.read_buf.advance(consumed);
+        // Peek at frame size before consuming — avoids freeze+copy-back on Incomplete.
+        let size = u32::from_be_bytes([
+            self.read_buf[0],
+            self.read_buf[1],
+            self.read_buf[2],
+            self.read_buf[3],
+        ]) as usize;
+        if size > self.read_buf.len() {
+            return Ok(false); // incomplete frame, wait for more data
+        }
+
+        // Split exactly the frame bytes and freeze — no copy-back needed.
+        let frame_bytes = self.read_buf.split_to(size).freeze();
+        let (frame, _) = codec::decode_frame(&frame_bytes)?;
 
         match frame.body {
             FrameBody::Sasl(SaslPerformative::Init(init)) => {
@@ -315,17 +342,15 @@ impl AmqpConnection {
 
                 if init.mechanism == "PLAIN" {
                     if let Some(ref response) = init.initial_response {
-                        self.parse_sasl_plain(response);
+                        self.parse_sasl_plain(response.clone());
                     }
                     self.auth.authenticated = true;
                 } else if init.mechanism == "ANONYMOUS" {
                     self.auth.authenticated = true;
-                    self.auth.username = "anonymous".to_string();
+                    self.auth.username = WireString::from_static("anonymous");
                 } else {
-                    // Unknown mechanism — reject.
-                    let mut payload = BytesMut::new();
-                    codec::encode_sasl_outcome(&mut payload, SaslCode::Auth);
-                    codec::encode_frame(&mut self.write_buf, 0, FRAME_TYPE_SASL, &payload);
+                    // Unknown mechanism — reject. Encode directly, no intermediate alloc.
+                    codec::encode_framed_sasl_outcome(&mut self.write_buf, SaslCode::Auth);
                     self.phase = ConnectionPhase::Closed;
                     return Err(ConnectionError::AuthenticationFailed);
                 }
@@ -337,10 +362,8 @@ impl AmqpConnection {
                     "SASL authentication succeeded"
                 );
 
-                // Send sasl-outcome(ok).
-                let mut payload = BytesMut::new();
-                codec::encode_sasl_outcome(&mut payload, SaslCode::Ok);
-                codec::encode_frame(&mut self.write_buf, 0, FRAME_TYPE_SASL, &payload);
+                // Send sasl-outcome(ok) directly into write_buf — no intermediate alloc.
+                codec::encode_framed_sasl_outcome(&mut self.write_buf, SaslCode::Ok);
 
                 self.phase = ConnectionPhase::AwaitingAmqpHeader;
                 Ok(true)
@@ -352,12 +375,34 @@ impl AmqpConnection {
         }
     }
 
-    fn parse_sasl_plain(&mut self, response: &[u8]) {
-        let parts: Vec<&[u8]> = response.split(|&b| b == 0).collect();
-        if parts.len() >= 3 {
-            self.auth.username = String::from_utf8_lossy(parts[1]).to_string();
-        } else if parts.len() == 2 {
-            self.auth.username = String::from_utf8_lossy(parts[0]).to_string();
+    fn parse_sasl_plain(&mut self, response: Bytes) {
+        // SASL PLAIN format: [authzid]\0[authcid]\0[password]
+        // Find the positions of null bytes without allocating a Vec
+        let mut first_null = None;
+        let mut second_null = None;
+        for (i, &b) in response.iter().enumerate() {
+            if b == 0 {
+                if first_null.is_none() {
+                    first_null = Some(i);
+                } else {
+                    second_null = Some(i);
+                    break;
+                }
+            }
+        }
+        // Zero-copy: slice directly from the Bytes buffer
+        if let (Some(n1), Some(n2)) = (first_null, second_null) {
+            // authcid is between first and second null
+            let username_bytes = response.slice(n1 + 1..n2);
+            if std::str::from_utf8(&username_bytes).is_ok() {
+                self.auth.username = WireString::from_utf8_unchecked(username_bytes);
+            }
+        } else if let Some(n1) = first_null {
+            // Fallback: just one null separator
+            let username_bytes = response.slice(..n1);
+            if std::str::from_utf8(&username_bytes).is_ok() {
+                self.auth.username = WireString::from_utf8_unchecked(username_bytes);
+            }
         }
     }
 
@@ -366,6 +411,8 @@ impl AmqpConnection {
     // =========================================================================
 
     fn send_open(&mut self) {
+        let mut caps = SmallVec::new();
+        caps.push(WireString::from_static("ANONYMOUS-RELAY"));
         let open = Open {
             container_id: self.container_id.clone(),
             hostname: None,
@@ -376,23 +423,29 @@ impl AmqpConnection {
             } else {
                 None
             },
-            offered_capabilities: vec!["ANONYMOUS-RELAY".to_string()],
+            offered_capabilities: caps,
             ..Default::default()
         };
-        let mut payload = BytesMut::new();
-        codec::encode_performative(&mut payload, &Performative::Open(open));
-        codec::encode_frame(&mut self.write_buf, 0, FRAME_TYPE_AMQP, &payload);
+        codec::encode_framed_performative(
+            &mut self.write_buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Open(open),
+        );
         debug!(conn = self.id, "sent Open");
     }
 
     /// Send a connection-level error and initiate close.
-    pub fn send_connection_error(&mut self, condition: &str, description: &str) {
+    pub fn send_connection_error(&mut self, condition: &'static str, description: &'static str) {
         let close = Close {
-            error: Some(AmqpError::new(condition, description)),
+            error: Some(AmqpError::from_static(condition, description)),
         };
-        let mut payload = BytesMut::new();
-        codec::encode_performative(&mut payload, &Performative::Close(close));
-        codec::encode_frame(&mut self.write_buf, 0, FRAME_TYPE_AMQP, &payload);
+        codec::encode_framed_performative(
+            &mut self.write_buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Close(close),
+        );
         self.phase = ConnectionPhase::Closing;
     }
 
@@ -405,12 +458,20 @@ impl AmqpConnection {
             return Ok(false);
         }
 
-        let (frame, consumed) = match codec::decode_frame(&self.read_buf) {
-            Ok(r) => r,
-            Err(CodecError::Incomplete) => return Ok(false),
-            Err(e) => return Err(ConnectionError::Codec(e)),
-        };
-        self.read_buf.advance(consumed);
+        // Peek at frame size before consuming — avoids freeze+copy-back on Incomplete.
+        let size = u32::from_be_bytes([
+            self.read_buf[0],
+            self.read_buf[1],
+            self.read_buf[2],
+            self.read_buf[3],
+        ]) as usize;
+        if size > self.read_buf.len() {
+            return Ok(false); // incomplete frame, wait for more data
+        }
+
+        // Split exactly the frame bytes and freeze — no copy-back needed.
+        let frame_bytes = self.read_buf.split_to(size).freeze();
+        let (frame, _) = codec::decode_frame(&frame_bytes)?;
 
         match frame.body {
             FrameBody::Empty => {
@@ -462,12 +523,15 @@ impl AmqpConnection {
     {
         let local_ch = self
             .remote_to_local_channel
-            .get(&channel)
-            .copied()
+            .iter()
+            .find(|(r, _)| *r == channel)
+            .map(|(_, l)| *l)
             .unwrap_or(channel);
         let session = self
             .sessions
-            .get_mut(&local_ch)
+            .iter_mut()
+            .find(|(ch, _)| *ch == local_ch)
+            .map(|(_, s)| s)
             .ok_or(ConnectionError::UnknownSession(channel))?;
         f(session, &mut self.write_buf).map_err(ConnectionError::Link)?;
         Ok(true)
@@ -523,11 +587,14 @@ impl AmqpConnection {
             info!(conn = self.id, "peer closed connection");
         }
 
-        // Send Close response.
+        // Send Close response directly into write buffer.
         let resp = Close { error: None };
-        let mut payload = BytesMut::new();
-        codec::encode_performative(&mut payload, &Performative::Close(resp));
-        codec::encode_frame(&mut self.write_buf, 0, FRAME_TYPE_AMQP, &payload);
+        codec::encode_framed_performative(
+            &mut self.write_buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Close(resp),
+        );
 
         self.phase = ConnectionPhase::Closed;
         Ok(false)
@@ -558,7 +625,7 @@ impl AmqpConnection {
             session.handle_max = begin.handle_max;
         }
 
-        // Send Begin response.
+        // Send Begin response directly into write buffer.
         let resp = Begin {
             remote_channel: Some(remote_channel),
             next_outgoing_id: session.next_outgoing_id,
@@ -567,18 +634,16 @@ impl AmqpConnection {
             handle_max: session.handle_max,
             ..Default::default()
         };
-        let mut payload = BytesMut::new();
-        codec::encode_performative(&mut payload, &Performative::Begin(resp));
-        codec::encode_frame(
+        codec::encode_framed_performative(
             &mut self.write_buf,
             local_channel,
             FRAME_TYPE_AMQP,
-            &payload,
+            &Performative::Begin(resp),
         );
 
-        self.sessions.insert(local_channel, session);
+        self.sessions.push((local_channel, session));
         self.remote_to_local_channel
-            .insert(remote_channel, local_channel);
+            .push((remote_channel, local_channel));
 
         debug!(
             conn = self.id,
@@ -590,13 +655,21 @@ impl AmqpConnection {
     fn handle_end(&mut self, channel: u16, end: End) -> Result<bool, ConnectionError> {
         let local_ch = self
             .remote_to_local_channel
-            .get(&channel)
-            .copied()
+            .iter()
+            .find(|(r, _)| *r == channel)
+            .map(|(_, l)| *l)
             .unwrap_or(channel);
 
-        if let Some(session) = self.sessions.remove(&local_ch) {
+        if let Some(idx) = self.sessions.iter().position(|(ch, _)| *ch == local_ch) {
+            let (_, session) = self.sessions.remove(idx);
             if let Some(remote) = session.remote_channel {
-                self.remote_to_local_channel.remove(&remote);
+                if let Some(pos) = self
+                    .remote_to_local_channel
+                    .iter()
+                    .position(|(r, _)| *r == remote)
+                {
+                    self.remote_to_local_channel.remove(pos);
+                }
             }
 
             if let Some(ref err) = end.error {
@@ -610,9 +683,12 @@ impl AmqpConnection {
 
             // Send End response.
             let resp = End { error: None };
-            let mut payload = BytesMut::new();
-            codec::encode_performative(&mut payload, &Performative::End(resp));
-            codec::encode_frame(&mut self.write_buf, local_ch, FRAME_TYPE_AMQP, &payload);
+            codec::encode_framed_performative(
+                &mut self.write_buf,
+                local_ch,
+                FRAME_TYPE_AMQP,
+                &Performative::End(resp),
+            );
 
             debug!(conn = self.id, channel = local_ch, "session ended");
         } else {
@@ -629,8 +705,6 @@ impl AmqpConnection {
         ch
     }
 }
-
-use bytes::Buf;
 
 // =============================================================================
 // Session-level performative handlers
@@ -664,7 +738,7 @@ impl AmqpSession {
 
         let link = AmqpLink::new(handle, attach.name.clone(), our_role, address);
 
-        // Send Attach response.
+        // Send Attach response directly into write buffer.
         let resp = Attach {
             name: attach.name,
             handle,
@@ -680,11 +754,14 @@ impl AmqpSession {
             },
             ..Default::default()
         };
-        let mut payload = BytesMut::new();
-        codec::encode_performative(&mut payload, &Performative::Attach(resp));
-        codec::encode_frame(write_buf, self.local_channel, FRAME_TYPE_AMQP, &payload);
+        codec::encode_framed_performative(
+            write_buf,
+            self.local_channel,
+            FRAME_TYPE_AMQP,
+            &Performative::Attach(resp),
+        );
 
-        self.links.insert(handle, link);
+        self.links.push((handle, link));
         debug!(
             channel = self.local_channel,
             handle,
@@ -701,16 +778,21 @@ impl AmqpSession {
     ) -> Result<(), LinkError> {
         let handle = detach.handle;
 
-        if let Some(_link) = self.links.remove(&handle) {
+        if let Some(idx) = self.find_link(handle) {
+            self.links.remove(idx);
+
             // Send Detach response.
             let resp = Detach {
                 handle,
                 closed: detach.closed,
                 error: None,
             };
-            let mut payload = BytesMut::new();
-            codec::encode_performative(&mut payload, &Performative::Detach(resp));
-            codec::encode_frame(write_buf, self.local_channel, FRAME_TYPE_AMQP, &payload);
+            codec::encode_framed_performative(
+                write_buf,
+                self.local_channel,
+                FRAME_TYPE_AMQP,
+                &Performative::Detach(resp),
+            );
             debug!(channel = self.local_channel, handle, "link detached");
         } else {
             warn!(
@@ -730,7 +812,8 @@ impl AmqpSession {
 
         // If this is a link-level flow, update the link.
         if let Some(handle) = flow.handle {
-            if let Some(link) = self.links.get_mut(&handle) {
+            let ch = self.local_channel;
+            if let Some(link) = self.get_link_mut(handle) {
                 if let Some(credit) = flow.link_credit {
                     link.link_credit = credit;
                 }
@@ -738,9 +821,8 @@ impl AmqpSession {
                     link.delivery_count = count;
                 }
                 link.drain = flow.drain;
-
                 debug!(
-                    channel = self.local_channel,
+                    channel = ch,
                     handle,
                     credit = link.link_credit,
                     "flow updated for link"
@@ -758,9 +840,12 @@ impl AmqpSession {
                 echo: false,
                 ..Default::default()
             };
-            let mut payload = BytesMut::new();
-            codec::encode_performative(&mut payload, &Performative::Flow(resp));
-            codec::encode_frame(write_buf, self.local_channel, FRAME_TYPE_AMQP, &payload);
+            codec::encode_framed_performative(
+                write_buf,
+                self.local_channel,
+                FRAME_TYPE_AMQP,
+                &Performative::Flow(resp),
+            );
         }
 
         Ok(())
@@ -773,24 +858,20 @@ impl AmqpSession {
     ) -> Result<(), LinkError> {
         let handle = transfer.handle;
 
-        let link = self
-            .links
-            .get_mut(&handle)
-            .ok_or(LinkError::UnknownHandle(handle))?;
-
-        // Track delivery for unsettled transfers.
+        // Read fields before borrowing self mutably
         let settled = transfer.settled.unwrap_or(false);
         let delivery_id = transfer.delivery_id.unwrap_or(self.next_incoming_id);
+        let payload_len = transfer.payload.len();
+
+        let link = self
+            .get_link_mut(handle)
+            .ok_or(LinkError::UnknownHandle(handle))?;
 
         link.on_transfer_received(&transfer);
 
         debug!(
             channel = self.local_channel,
-            handle,
-            delivery_id,
-            settled,
-            payload_len = transfer.payload.len(),
-            "transfer received"
+            handle, delivery_id, settled, payload_len, "transfer received"
         );
 
         // For now, immediately accept all messages (auto-settle).
@@ -803,9 +884,12 @@ impl AmqpSession {
                 state: Some(DeliveryState::Accepted),
                 batchable: false,
             };
-            let mut payload = BytesMut::new();
-            codec::encode_performative(&mut payload, &Performative::Disposition(disposition));
-            codec::encode_frame(write_buf, self.local_channel, FRAME_TYPE_AMQP, &payload);
+            codec::encode_framed_performative(
+                write_buf,
+                self.local_channel,
+                FRAME_TYPE_AMQP,
+                &Performative::Disposition(disposition),
+            );
         }
 
         self.next_incoming_id = self.next_incoming_id.wrapping_add(1);
@@ -826,7 +910,6 @@ impl AmqpSession {
             settled = disposition.settled,
             "disposition received"
         );
-        // TODO: Update unsettled delivery map when integrated with MqWriteBatcher.
         Ok(())
     }
 }
@@ -924,15 +1007,15 @@ mod tests {
     #[test]
     fn test_sasl_plain_parsing() {
         let mut conn = AmqpConnection::new();
-        conn.parse_sasl_plain(b"\x00guest\x00secret");
-        assert_eq!(conn.auth.username, "guest");
+        conn.parse_sasl_plain(Bytes::from_static(b"\x00guest\x00secret"));
+        assert_eq!(&*conn.auth.username, "guest");
     }
 
     #[test]
     fn test_sasl_plain_no_leading_null() {
         let mut conn = AmqpConnection::new();
-        conn.parse_sasl_plain(b"user\x00pass");
-        assert_eq!(conn.auth.username, "user");
+        conn.parse_sasl_plain(Bytes::from_static(b"user\x00pass"));
+        assert_eq!(&*conn.auth.username, "user");
     }
 
     #[test]
@@ -943,19 +1026,22 @@ mod tests {
         conn.feed_data(&AMQP_HEADER);
         conn.process().unwrap();
         assert_eq!(conn.phase, ConnectionPhase::AwaitingOpen);
-        conn.take_write_buf(); // consume header + Open
+        conn.take_write_bytes(); // consume header + Open
 
         // Step 2: Send client Open.
         let open = Open {
-            container_id: "test-client".to_string(),
+            container_id: WireString::from("test-client"),
             max_frame_size: 32768,
             channel_max: 128,
             ..Default::default()
         };
-        let mut payload = BytesMut::new();
-        codec::encode_performative(&mut payload, &Performative::Open(open));
         let mut frame_buf = BytesMut::new();
-        codec::encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+        codec::encode_framed_performative(
+            &mut frame_buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Open(open),
+        );
         conn.feed_data(&frame_buf);
         conn.process().unwrap();
         assert_eq!(conn.phase, ConnectionPhase::Open);
@@ -975,7 +1061,7 @@ mod tests {
         conn.process().unwrap();
 
         // Should have echoed a heartbeat.
-        let write = conn.take_write_buf();
+        let write = conn.take_write_bytes();
         assert!(!write.is_empty());
         let (frame, _) = codec::decode_frame(&write).unwrap();
         assert!(matches!(frame.body, FrameBody::Empty));
@@ -994,23 +1080,29 @@ mod tests {
             outgoing_window: 1024,
             ..Default::default()
         };
-        let mut payload = BytesMut::new();
-        codec::encode_performative(&mut payload, &Performative::Begin(begin));
         let mut frame_buf = BytesMut::new();
-        codec::encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+        codec::encode_framed_performative(
+            &mut frame_buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Begin(begin),
+        );
         conn.feed_data(&frame_buf);
         conn.process().unwrap();
 
         assert_eq!(conn.sessions.len(), 1);
-        let write = conn.take_write_buf();
+        let write = conn.take_write_bytes();
         assert!(!write.is_empty());
 
         // Send End.
         let end = End { error: None };
-        let mut payload = BytesMut::new();
-        codec::encode_performative(&mut payload, &Performative::End(end));
         let mut frame_buf = BytesMut::new();
-        codec::encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+        codec::encode_framed_performative(
+            &mut frame_buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::End(end),
+        );
         conn.feed_data(&frame_buf);
         conn.process().unwrap();
 
@@ -1023,10 +1115,13 @@ mod tests {
         conn.phase = ConnectionPhase::Open;
 
         let close = Close { error: None };
-        let mut payload = BytesMut::new();
-        codec::encode_performative(&mut payload, &Performative::Close(close));
         let mut frame_buf = BytesMut::new();
-        codec::encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+        codec::encode_framed_performative(
+            &mut frame_buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Close(close),
+        );
         conn.feed_data(&frame_buf);
         let result = conn.process().unwrap();
         assert!(!result);

@@ -9,6 +9,7 @@
 //!   We grant the peer credit via Flow frames.
 
 use bytes::Bytes;
+use smallvec::SmallVec;
 
 use crate::types::*;
 
@@ -35,11 +36,11 @@ pub struct AmqpLink {
     /// Link handle (session-local).
     pub handle: u32,
     /// Link name (unique within connection).
-    pub name: String,
+    pub name: WireString,
     /// Our role on this link.
     pub role: Role,
     /// Address this link is associated with (source or target).
-    pub address: Option<String>,
+    pub address: Option<WireString>,
     /// Link state.
     pub state: LinkState,
     /// Credit available (for sender: credits granted by receiver; for receiver: credits we granted).
@@ -52,8 +53,8 @@ pub struct AmqpLink {
     pub snd_settle_mode: SndSettleMode,
     /// Receiver settle mode.
     pub rcv_settle_mode: RcvSettleMode,
-    /// Unsettled deliveries: delivery_id → delivery_tag.
-    pub unsettled: Vec<UnsettledDelivery>,
+    /// Unsettled deliveries. SmallVec for typical small counts.
+    pub unsettled: SmallVec<[UnsettledDelivery; 8]>,
 }
 
 /// An unsettled delivery tracked by the link.
@@ -66,7 +67,7 @@ pub struct UnsettledDelivery {
 
 impl AmqpLink {
     /// Create a new link.
-    pub fn new(handle: u32, name: String, role: Role, address: Option<String>) -> Self {
+    pub fn new(handle: u32, name: WireString, role: Role, address: Option<WireString>) -> Self {
         Self {
             handle,
             name,
@@ -78,16 +79,18 @@ impl AmqpLink {
             drain: false,
             snd_settle_mode: SndSettleMode::Mixed,
             rcv_settle_mode: RcvSettleMode::First,
-            unsettled: Vec::new(),
+            unsettled: SmallVec::new(),
         }
     }
 
     /// Check if we have credit to send (sender role).
+    #[inline]
     pub fn has_credit(&self) -> bool {
         self.role == Role::Sender && self.link_credit > 0
     }
 
     /// Consume one credit for an outgoing transfer (sender role).
+    #[inline]
     pub fn consume_credit(&mut self) {
         if self.link_credit > 0 {
             self.link_credit -= 1;
@@ -136,13 +139,13 @@ impl AmqpLink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedAddress {
     /// topic/{name}
-    Topic(String),
+    Topic(WireString),
     /// queue/{name}
-    Queue(String),
+    Queue(WireString),
     /// exchange/{name}
-    Exchange(String),
+    Exchange(WireString),
     /// Bare name (auto-detect).
-    Auto(String),
+    Auto(WireString),
 }
 
 impl ResolvedAddress {
@@ -152,13 +155,13 @@ impl ResolvedAddress {
             return None;
         }
         if let Some(name) = address.strip_prefix("topic/") {
-            Some(Self::Topic(name.to_string()))
+            Some(Self::Topic(WireString::from(name)))
         } else if let Some(name) = address.strip_prefix("queue/") {
-            Some(Self::Queue(name.to_string()))
+            Some(Self::Queue(WireString::from(name)))
         } else if let Some(name) = address.strip_prefix("exchange/") {
-            Some(Self::Exchange(name.to_string()))
+            Some(Self::Exchange(WireString::from(name)))
         } else {
-            Some(Self::Auto(address.to_string()))
+            Some(Self::Auto(WireString::from(address)))
         }
     }
 
@@ -201,12 +204,12 @@ mod tests {
     fn test_link_new() {
         let link = AmqpLink::new(
             0,
-            "link-0".into(),
+            WireString::from("link-0"),
             Role::Sender,
-            Some("topic/events".into()),
+            Some(WireString::from("topic/events")),
         );
         assert_eq!(link.handle, 0);
-        assert_eq!(link.name, "link-0");
+        assert_eq!(&*link.name, "link-0");
         assert_eq!(link.role, Role::Sender);
         assert_eq!(link.state, LinkState::Active);
         assert_eq!(link.link_credit, 0);
@@ -215,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_link_credit() {
-        let mut link = AmqpLink::new(0, "link-0".into(), Role::Sender, None);
+        let mut link = AmqpLink::new(0, WireString::from("link-0"), Role::Sender, None);
         link.link_credit = 10;
         assert!(link.has_credit());
 
@@ -226,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_link_on_transfer() {
-        let mut link = AmqpLink::new(0, "link-0".into(), Role::Receiver, None);
+        let mut link = AmqpLink::new(0, WireString::from("link-0"), Role::Receiver, None);
         link.link_credit = 5;
 
         let transfer = Transfer {
@@ -245,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_link_settle_range() {
-        let mut link = AmqpLink::new(0, "link-0".into(), Role::Receiver, None);
+        let mut link = AmqpLink::new(0, WireString::from("link-0"), Role::Receiver, None);
         link.unsettled.push(UnsettledDelivery {
             delivery_id: 0,
             delivery_tag: Bytes::from_static(b"a"),
@@ -271,53 +274,58 @@ mod tests {
     fn test_resolved_address_parse() {
         assert_eq!(
             ResolvedAddress::parse("topic/events"),
-            Some(ResolvedAddress::Topic("events".into()))
+            Some(ResolvedAddress::Topic(WireString::from("events")))
         );
         assert_eq!(
             ResolvedAddress::parse("queue/tasks"),
-            Some(ResolvedAddress::Queue("tasks".into()))
+            Some(ResolvedAddress::Queue(WireString::from("tasks")))
         );
         assert_eq!(
             ResolvedAddress::parse("exchange/logs"),
-            Some(ResolvedAddress::Exchange("logs".into()))
+            Some(ResolvedAddress::Exchange(WireString::from("logs")))
         );
         assert_eq!(
             ResolvedAddress::parse("my-queue"),
-            Some(ResolvedAddress::Auto("my-queue".into()))
+            Some(ResolvedAddress::Auto(WireString::from("my-queue")))
         );
         assert_eq!(ResolvedAddress::parse(""), None);
     }
 
     #[test]
     fn test_resolved_address_name() {
-        let addr = ResolvedAddress::Topic("events".into());
+        let addr = ResolvedAddress::Topic(WireString::from("events"));
         assert_eq!(addr.name(), "events");
 
-        let addr = ResolvedAddress::Auto("my-queue".into());
+        let addr = ResolvedAddress::Auto(WireString::from("my-queue"));
         assert_eq!(addr.name(), "my-queue");
     }
 
     #[test]
     fn test_link_resolved_address() {
-        let link = AmqpLink::new(0, "link-0".into(), Role::Sender, Some("queue/tasks".into()));
+        let link = AmqpLink::new(
+            0,
+            WireString::from("link-0"),
+            Role::Sender,
+            Some(WireString::from("queue/tasks")),
+        );
         assert_eq!(
             link.resolved_address(),
-            Some(ResolvedAddress::Queue("tasks".into()))
+            Some(ResolvedAddress::Queue(WireString::from("tasks")))
         );
 
-        let link = AmqpLink::new(0, "link-1".into(), Role::Sender, None);
+        let link = AmqpLink::new(0, WireString::from("link-1"), Role::Sender, None);
         assert_eq!(link.resolved_address(), None);
     }
 
     #[test]
     fn test_receiver_no_credit() {
-        let link = AmqpLink::new(0, "link-0".into(), Role::Receiver, None);
+        let link = AmqpLink::new(0, WireString::from("link-0"), Role::Receiver, None);
         assert!(!link.has_credit());
     }
 
     #[test]
     fn test_pre_settled_transfer_not_tracked() {
-        let mut link = AmqpLink::new(0, "link-0".into(), Role::Receiver, None);
+        let mut link = AmqpLink::new(0, WireString::from("link-0"), Role::Receiver, None);
         link.link_credit = 5;
 
         let transfer = Transfer {

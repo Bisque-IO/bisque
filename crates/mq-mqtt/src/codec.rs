@@ -8,6 +8,7 @@
 
 use bisque_mq::flat::FlatMessage;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use smallvec::SmallVec;
 
 use crate::types::{
     ConnAck, Connect, ConnectFlags, Disconnect, MqttPacket, PacketType, Properties,
@@ -345,122 +346,215 @@ fn read_properties(buf: &mut &[u8]) -> Result<Properties, CodecError> {
     Ok(props)
 }
 
-/// Write MQTT 5.0 properties into a buffer.
-fn write_properties(props: &Properties, buf: &mut BytesMut) {
-    let mut prop_buf = BytesMut::new();
-
-    if let Some(v) = props.payload_format_indicator {
-        prop_buf.put_u8(0x01);
-        prop_buf.put_u8(v);
+/// Compute the encoded byte size of MQTT 5.0 properties (content only, excluding
+/// the variable-length integer prefix).
+fn compute_properties_size(props: &Properties) -> usize {
+    let mut size = 0;
+    if props.payload_format_indicator.is_some() {
+        size += 1 + 1;
     }
-    if let Some(v) = props.message_expiry_interval {
-        prop_buf.put_u8(0x02);
-        prop_buf.put_u32(v);
+    if props.message_expiry_interval.is_some() {
+        size += 1 + 4;
     }
     if let Some(ref v) = props.content_type {
-        prop_buf.put_u8(0x03);
-        write_mqtt_string(v, &mut prop_buf);
+        size += 1 + 2 + v.len();
     }
     if let Some(ref v) = props.response_topic {
-        prop_buf.put_u8(0x08);
-        write_mqtt_string(v, &mut prop_buf);
+        size += 1 + 2 + v.len();
     }
     if let Some(ref v) = props.correlation_data {
-        prop_buf.put_u8(0x09);
-        write_mqtt_bytes(v, &mut prop_buf);
+        size += 1 + 2 + v.len();
     }
     if let Some(v) = props.subscription_identifier {
-        prop_buf.put_u8(0x0B);
-        write_variable_int(v, &mut prop_buf);
+        size += 1 + variable_int_size(v);
     }
-    if let Some(v) = props.session_expiry_interval {
-        prop_buf.put_u8(0x11);
-        prop_buf.put_u32(v);
+    if props.session_expiry_interval.is_some() {
+        size += 1 + 4;
     }
     if let Some(ref v) = props.assigned_client_identifier {
-        prop_buf.put_u8(0x12);
-        write_mqtt_string(v, &mut prop_buf);
+        size += 1 + 2 + v.len();
     }
-    if let Some(v) = props.server_keep_alive {
-        prop_buf.put_u8(0x13);
-        prop_buf.put_u16(v);
+    if props.server_keep_alive.is_some() {
+        size += 1 + 2;
     }
     if let Some(ref v) = props.authentication_method {
-        prop_buf.put_u8(0x15);
-        write_mqtt_string(v, &mut prop_buf);
+        size += 1 + 2 + v.len();
     }
     if let Some(ref v) = props.authentication_data {
-        prop_buf.put_u8(0x16);
-        write_mqtt_bytes(v, &mut prop_buf);
+        size += 1 + 2 + v.len();
     }
-    if let Some(v) = props.request_problem_information {
-        prop_buf.put_u8(0x17);
-        prop_buf.put_u8(v);
+    if props.request_problem_information.is_some() {
+        size += 1 + 1;
     }
-    if let Some(v) = props.will_delay_interval {
-        prop_buf.put_u8(0x18);
-        prop_buf.put_u32(v);
+    if props.will_delay_interval.is_some() {
+        size += 1 + 4;
     }
-    if let Some(v) = props.request_response_information {
-        prop_buf.put_u8(0x19);
-        prop_buf.put_u8(v);
+    if props.request_response_information.is_some() {
+        size += 1 + 1;
     }
     if let Some(ref v) = props.response_information {
-        prop_buf.put_u8(0x1A);
-        write_mqtt_string(v, &mut prop_buf);
+        size += 1 + 2 + v.len();
     }
     if let Some(ref v) = props.server_reference {
-        prop_buf.put_u8(0x1C);
-        write_mqtt_string(v, &mut prop_buf);
+        size += 1 + 2 + v.len();
     }
     if let Some(ref v) = props.reason_string {
-        prop_buf.put_u8(0x1F);
-        write_mqtt_string(v, &mut prop_buf);
+        size += 1 + 2 + v.len();
     }
-    if let Some(v) = props.receive_maximum {
-        prop_buf.put_u8(0x21);
-        prop_buf.put_u16(v);
+    if props.receive_maximum.is_some() {
+        size += 1 + 2;
     }
-    if let Some(v) = props.topic_alias_maximum {
-        prop_buf.put_u8(0x22);
-        prop_buf.put_u16(v);
+    if props.topic_alias_maximum.is_some() {
+        size += 1 + 2;
     }
-    if let Some(v) = props.topic_alias {
-        prop_buf.put_u8(0x23);
-        prop_buf.put_u16(v);
+    if props.topic_alias.is_some() {
+        size += 1 + 2;
     }
-    if let Some(v) = props.maximum_qos {
-        prop_buf.put_u8(0x24);
-        prop_buf.put_u8(v);
+    if props.maximum_qos.is_some() {
+        size += 1 + 1;
     }
-    if let Some(v) = props.retain_available {
-        prop_buf.put_u8(0x25);
-        prop_buf.put_u8(v as u8);
+    if props.retain_available.is_some() {
+        size += 1 + 1;
     }
     for (key, val) in &props.user_properties {
-        prop_buf.put_u8(0x26);
-        write_mqtt_string(key, &mut prop_buf);
-        write_mqtt_string(val, &mut prop_buf);
+        size += 1 + 2 + key.len() + 2 + val.len();
+    }
+    if props.maximum_packet_size.is_some() {
+        size += 1 + 4;
+    }
+    if props.wildcard_subscription_available.is_some() {
+        size += 1 + 1;
+    }
+    if props.subscription_identifier_available.is_some() {
+        size += 1 + 1;
+    }
+    if props.shared_subscription_available.is_some() {
+        size += 1 + 1;
+    }
+    size
+}
+
+/// Total encoded size of properties including the variable-length prefix.
+#[inline]
+fn properties_wire_size(props: &Properties) -> usize {
+    let content_size = compute_properties_size(props);
+    variable_int_size(content_size as u32) + content_size
+}
+
+/// Write MQTT 5.0 properties directly into the output buffer (no intermediate allocation).
+fn write_properties(props: &Properties, buf: &mut BytesMut) {
+    let content_size = compute_properties_size(props);
+    write_variable_int(content_size as u32, buf);
+
+    if let Some(v) = props.payload_format_indicator {
+        buf.put_u8(0x01);
+        buf.put_u8(v);
+    }
+    if let Some(v) = props.message_expiry_interval {
+        buf.put_u8(0x02);
+        buf.put_u32(v);
+    }
+    if let Some(ref v) = props.content_type {
+        buf.put_u8(0x03);
+        write_mqtt_string(v, buf);
+    }
+    if let Some(ref v) = props.response_topic {
+        buf.put_u8(0x08);
+        write_mqtt_string(v, buf);
+    }
+    if let Some(ref v) = props.correlation_data {
+        buf.put_u8(0x09);
+        write_mqtt_bytes(v, buf);
+    }
+    if let Some(v) = props.subscription_identifier {
+        buf.put_u8(0x0B);
+        write_variable_int(v, buf);
+    }
+    if let Some(v) = props.session_expiry_interval {
+        buf.put_u8(0x11);
+        buf.put_u32(v);
+    }
+    if let Some(ref v) = props.assigned_client_identifier {
+        buf.put_u8(0x12);
+        write_mqtt_string(v, buf);
+    }
+    if let Some(v) = props.server_keep_alive {
+        buf.put_u8(0x13);
+        buf.put_u16(v);
+    }
+    if let Some(ref v) = props.authentication_method {
+        buf.put_u8(0x15);
+        write_mqtt_string(v, buf);
+    }
+    if let Some(ref v) = props.authentication_data {
+        buf.put_u8(0x16);
+        write_mqtt_bytes(v, buf);
+    }
+    if let Some(v) = props.request_problem_information {
+        buf.put_u8(0x17);
+        buf.put_u8(v);
+    }
+    if let Some(v) = props.will_delay_interval {
+        buf.put_u8(0x18);
+        buf.put_u32(v);
+    }
+    if let Some(v) = props.request_response_information {
+        buf.put_u8(0x19);
+        buf.put_u8(v);
+    }
+    if let Some(ref v) = props.response_information {
+        buf.put_u8(0x1A);
+        write_mqtt_string(v, buf);
+    }
+    if let Some(ref v) = props.server_reference {
+        buf.put_u8(0x1C);
+        write_mqtt_string(v, buf);
+    }
+    if let Some(ref v) = props.reason_string {
+        buf.put_u8(0x1F);
+        write_mqtt_string(v, buf);
+    }
+    if let Some(v) = props.receive_maximum {
+        buf.put_u8(0x21);
+        buf.put_u16(v);
+    }
+    if let Some(v) = props.topic_alias_maximum {
+        buf.put_u8(0x22);
+        buf.put_u16(v);
+    }
+    if let Some(v) = props.topic_alias {
+        buf.put_u8(0x23);
+        buf.put_u16(v);
+    }
+    if let Some(v) = props.maximum_qos {
+        buf.put_u8(0x24);
+        buf.put_u8(v);
+    }
+    if let Some(v) = props.retain_available {
+        buf.put_u8(0x25);
+        buf.put_u8(v as u8);
+    }
+    for (key, val) in &props.user_properties {
+        buf.put_u8(0x26);
+        write_mqtt_string(key, buf);
+        write_mqtt_string(val, buf);
     }
     if let Some(v) = props.maximum_packet_size {
-        prop_buf.put_u8(0x27);
-        prop_buf.put_u32(v);
+        buf.put_u8(0x27);
+        buf.put_u32(v);
     }
     if let Some(v) = props.wildcard_subscription_available {
-        prop_buf.put_u8(0x28);
-        prop_buf.put_u8(v as u8);
+        buf.put_u8(0x28);
+        buf.put_u8(v as u8);
     }
     if let Some(v) = props.subscription_identifier_available {
-        prop_buf.put_u8(0x29);
-        prop_buf.put_u8(v as u8);
+        buf.put_u8(0x29);
+        buf.put_u8(v as u8);
     }
     if let Some(v) = props.shared_subscription_available {
-        prop_buf.put_u8(0x2A);
-        prop_buf.put_u8(v as u8);
+        buf.put_u8(0x2A);
+        buf.put_u8(v as u8);
     }
-
-    write_variable_int(prop_buf.len() as u32, buf);
-    buf.extend_from_slice(&prop_buf);
 }
 
 // =============================================================================
@@ -891,7 +985,7 @@ fn decode_subscribe(buf: &mut &[u8]) -> Result<MqttPacket, CodecError> {
     // For simplicity, we always try to parse subscription options.
     let properties = Properties::default();
 
-    let mut filters = Vec::new();
+    let mut filters = SmallVec::new();
     while buf.has_remaining() {
         let filter = read_mqtt_string(buf)?;
         if !buf.has_remaining() {
@@ -925,7 +1019,7 @@ fn decode_suback(buf: &mut &[u8]) -> Result<MqttPacket, CodecError> {
     }
     let packet_id = buf.get_u16();
 
-    let mut return_codes = Vec::new();
+    let mut return_codes = SmallVec::new();
     while buf.has_remaining() {
         return_codes.push(buf.get_u8());
     }
@@ -943,7 +1037,7 @@ fn decode_unsubscribe(buf: &mut &[u8]) -> Result<MqttPacket, CodecError> {
     }
     let packet_id = buf.get_u16();
 
-    let mut filters = Vec::new();
+    let mut filters = SmallVec::new();
     while buf.has_remaining() {
         filters.push(read_mqtt_string(buf)?);
     }
@@ -961,7 +1055,7 @@ fn decode_unsuback(buf: &mut &[u8]) -> Result<MqttPacket, CodecError> {
     }
     let packet_id = buf.get_u16();
 
-    let mut reason_codes = Vec::new();
+    let mut reason_codes = SmallVec::new();
     while buf.has_remaining() {
         reason_codes.push(buf.get_u8());
     }
@@ -1234,54 +1328,92 @@ fn write_flat_properties(
 }
 
 fn encode_connect(connect: &Connect, buf: &mut BytesMut) {
-    let mut payload = BytesMut::new();
+    // Pre-compute remaining length to avoid intermediate BytesMut.
+    let mut remaining = 0usize;
 
-    // Variable header
-    write_mqtt_string(&connect.protocol_name, &mut payload);
-    payload.put_u8(connect.protocol_version.level());
-    payload.put_u8(connect.flags.to_byte());
-    payload.put_u16(connect.keep_alive);
+    // Variable header: protocol name + level + flags + keep_alive
+    remaining += 2 + connect.protocol_name.len() + 1 + 1 + 2;
 
-    // MQTT 5.0 properties
-    if connect.protocol_version == ProtocolVersion::V5 {
-        write_properties(&connect.properties, &mut payload);
-    }
+    // MQTT 5.0 connect properties
+    let connect_props_size = if connect.protocol_version == ProtocolVersion::V5 {
+        properties_wire_size(&connect.properties)
+    } else {
+        0
+    };
+    remaining += connect_props_size;
 
-    // Payload
-    write_mqtt_string(&connect.client_id, &mut payload);
+    // Payload: client_id
+    remaining += 2 + connect.client_id.len();
 
+    // Will
     if let Some(ref will) = connect.will {
         if connect.protocol_version == ProtocolVersion::V5 {
-            write_properties(&will.properties, &mut payload);
+            remaining += properties_wire_size(&will.properties);
         }
-        write_mqtt_string(&will.topic, &mut payload);
-        write_mqtt_bytes(&will.payload, &mut payload);
+        remaining += 2 + will.topic.len();
+        remaining += 2 + will.payload.len();
     }
 
+    // Username / password
     if let Some(ref username) = connect.username {
-        write_mqtt_string(username, &mut payload);
+        remaining += 2 + username.len();
+    }
+    if let Some(ref password) = connect.password {
+        remaining += 2 + password.len();
     }
 
-    if let Some(ref password) = connect.password {
-        write_mqtt_bytes(password, &mut payload);
-    }
+    buf.reserve(1 + 4 + remaining);
 
     // Fixed header: CONNECT = 0x10
     buf.put_u8(0x10);
-    encode_remaining_length(payload.len(), buf);
-    buf.extend_from_slice(&payload);
+    encode_remaining_length(remaining, buf);
+
+    // Variable header
+    write_mqtt_string(&connect.protocol_name, buf);
+    buf.put_u8(connect.protocol_version.level());
+    buf.put_u8(connect.flags.to_byte());
+    buf.put_u16(connect.keep_alive);
+
+    if connect.protocol_version == ProtocolVersion::V5 {
+        write_properties(&connect.properties, buf);
+    }
+
+    // Payload
+    write_mqtt_string(&connect.client_id, buf);
+
+    if let Some(ref will) = connect.will {
+        if connect.protocol_version == ProtocolVersion::V5 {
+            write_properties(&will.properties, buf);
+        }
+        write_mqtt_string(&will.topic, buf);
+        write_mqtt_bytes(&will.payload, buf);
+    }
+
+    if let Some(ref username) = connect.username {
+        write_mqtt_string(username, buf);
+    }
+
+    if let Some(ref password) = connect.password {
+        write_mqtt_bytes(password, buf);
+    }
 }
 
 fn encode_connack(connack: &ConnAck, buf: &mut BytesMut) {
-    let mut payload = BytesMut::new();
-    let ack_flags: u8 = if connack.session_present { 0x01 } else { 0x00 };
-    payload.put_u8(ack_flags);
-    payload.put_u8(connack.return_code);
+    // Pre-compute remaining length: ack_flags(1) + return_code(1) + optional V5 properties.
+    let props_size = properties_wire_size(&connack.properties);
+    // Only include properties if they have content (V5).
+    let has_props = compute_properties_size(&connack.properties) > 0;
+    let remaining = 2 + if has_props { props_size } else { 0 };
 
-    // Fixed header: CONNACK = 0x20
-    buf.put_u8(0x20);
-    encode_remaining_length(payload.len(), buf);
-    buf.extend_from_slice(&payload);
+    buf.reserve(1 + 4 + remaining);
+    buf.put_u8(0x20); // CONNACK = 2 << 4
+    encode_remaining_length(remaining, buf);
+    buf.put_u8(if connack.session_present { 0x01 } else { 0x00 });
+    buf.put_u8(connack.return_code);
+
+    if has_props {
+        write_properties(&connack.properties, buf);
+    }
 }
 
 fn encode_publish(publish: &Publish, buf: &mut BytesMut) {
@@ -1344,11 +1476,19 @@ fn encode_pubcomp(pubcomp: &PubComp, buf: &mut BytesMut) {
 }
 
 fn encode_subscribe(subscribe: &Subscribe, buf: &mut BytesMut) {
-    let mut payload = BytesMut::new();
-    payload.put_u16(subscribe.packet_id);
+    // Pre-compute remaining length: packet_id(2) + sum(2 + filter_len + 1) per filter.
+    let mut remaining = 2usize;
+    for filter in &subscribe.filters {
+        remaining += 2 + filter.filter.len() + 1;
+    }
+
+    buf.reserve(1 + 4 + remaining);
+    buf.put_u8(0x82); // SUBSCRIBE = 8 << 4 | 0x02
+    encode_remaining_length(remaining, buf);
+    buf.put_u16(subscribe.packet_id);
 
     for filter in &subscribe.filters {
-        write_mqtt_string(&filter.filter, &mut payload);
+        write_mqtt_string(&filter.filter, buf);
         let mut options: u8 = filter.qos.as_u8() & 0x03;
         if filter.no_local {
             options |= 0x04;
@@ -1357,48 +1497,46 @@ fn encode_subscribe(subscribe: &Subscribe, buf: &mut BytesMut) {
             options |= 0x08;
         }
         options |= (filter.retain_handling & 0x03) << 4;
-        payload.put_u8(options);
+        buf.put_u8(options);
     }
-
-    buf.put_u8(0x82); // SUBSCRIBE = 8 << 4 | 0x02
-    encode_remaining_length(payload.len(), buf);
-    buf.extend_from_slice(&payload);
 }
 
 fn encode_suback(suback: &SubAck, buf: &mut BytesMut) {
-    let mut payload = BytesMut::new();
-    payload.put_u16(suback.packet_id);
-    for &code in &suback.return_codes {
-        payload.put_u8(code);
-    }
+    // Pre-compute: packet_id(2) + return_codes.
+    let remaining = 2 + suback.return_codes.len();
 
+    buf.reserve(1 + 4 + remaining);
     buf.put_u8(0x90); // SUBACK = 9 << 4
-    encode_remaining_length(payload.len(), buf);
-    buf.extend_from_slice(&payload);
+    encode_remaining_length(remaining, buf);
+    buf.put_u16(suback.packet_id);
+    buf.extend_from_slice(&suback.return_codes);
 }
 
 fn encode_unsubscribe(unsubscribe: &Unsubscribe, buf: &mut BytesMut) {
-    let mut payload = BytesMut::new();
-    payload.put_u16(unsubscribe.packet_id);
+    // Pre-compute: packet_id(2) + sum(2 + filter_len) per filter.
+    let mut remaining = 2usize;
     for filter in &unsubscribe.filters {
-        write_mqtt_string(filter, &mut payload);
+        remaining += 2 + filter.len();
     }
 
+    buf.reserve(1 + 4 + remaining);
     buf.put_u8(0xA2); // UNSUBSCRIBE = 10 << 4 | 0x02
-    encode_remaining_length(payload.len(), buf);
-    buf.extend_from_slice(&payload);
+    encode_remaining_length(remaining, buf);
+    buf.put_u16(unsubscribe.packet_id);
+    for filter in &unsubscribe.filters {
+        write_mqtt_string(filter, buf);
+    }
 }
 
 fn encode_unsuback(unsuback: &UnsubAck, buf: &mut BytesMut) {
-    let mut payload = BytesMut::new();
-    payload.put_u16(unsuback.packet_id);
-    for &code in &unsuback.reason_codes {
-        payload.put_u8(code);
-    }
+    // Pre-compute: packet_id(2) + reason_codes.
+    let remaining = 2 + unsuback.reason_codes.len();
 
+    buf.reserve(1 + 4 + remaining);
     buf.put_u8(0xB0); // UNSUBACK = 11 << 4
-    encode_remaining_length(payload.len(), buf);
-    buf.extend_from_slice(&payload);
+    encode_remaining_length(remaining, buf);
+    buf.put_u16(unsuback.packet_id);
+    buf.extend_from_slice(&unsuback.reason_codes);
 }
 
 fn encode_ping_req(buf: &mut BytesMut) {
@@ -1413,17 +1551,26 @@ fn encode_ping_resp(buf: &mut BytesMut) {
 
 fn encode_disconnect(disconnect: &Disconnect, buf: &mut BytesMut) {
     if disconnect.reason_code.is_none() {
-        // MQTT 3.1.1 DISCONNECT: no variable header
-        buf.put_u8(0xE0); // DISCONNECT = 14 << 4
+        // MQTT 3.1.1 DISCONNECT: no variable header.
+        buf.put_u8(0xE0);
         buf.put_u8(0x00);
     } else {
-        let mut payload = BytesMut::new();
-        if let Some(rc) = disconnect.reason_code {
-            payload.put_u8(rc);
-        }
+        // MQTT 5.0: reason_code(1) + optional properties.
+        let props_content_size = compute_properties_size(&disconnect.properties);
+        let has_props = props_content_size > 0;
+        let remaining = 1 + if has_props {
+            variable_int_size(props_content_size as u32) + props_content_size
+        } else {
+            0
+        };
+
+        buf.reserve(1 + 4 + remaining);
         buf.put_u8(0xE0);
-        encode_remaining_length(payload.len(), buf);
-        buf.extend_from_slice(&payload);
+        encode_remaining_length(remaining, buf);
+        buf.put_u8(disconnect.reason_code.unwrap());
+        if has_props {
+            write_properties(&disconnect.properties, buf);
+        }
     }
 }
 
@@ -1434,6 +1581,7 @@ fn encode_disconnect(disconnect: &Disconnect, buf: &mut BytesMut) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
 
     #[test]
     fn test_remaining_length_single_byte() {
@@ -1696,7 +1844,7 @@ mod tests {
     fn test_encode_decode_subscribe() {
         let subscribe = MqttPacket::Subscribe(Subscribe {
             packet_id: 1,
-            filters: vec![
+            filters: smallvec![
                 TopicFilter {
                     filter: "sensor/+/data".to_string(),
                     qos: QoS::AtLeastOnce,
@@ -1736,7 +1884,7 @@ mod tests {
     fn test_encode_decode_suback() {
         let suback = MqttPacket::SubAck(SubAck {
             packet_id: 1,
-            return_codes: vec![0x01, 0x02, 0x80],
+            return_codes: smallvec![0x01, 0x02, 0x80],
             properties: Properties::default(),
         });
 
@@ -1747,7 +1895,7 @@ mod tests {
         match decoded {
             MqttPacket::SubAck(s) => {
                 assert_eq!(s.packet_id, 1);
-                assert_eq!(s.return_codes, vec![0x01, 0x02, 0x80]);
+                assert_eq!(s.return_codes.as_slice(), &[0x01, 0x02, 0x80]);
             }
             _ => panic!("expected SubAck"),
         }
@@ -1757,7 +1905,7 @@ mod tests {
     fn test_encode_decode_unsubscribe() {
         let unsub = MqttPacket::Unsubscribe(Unsubscribe {
             packet_id: 5,
-            filters: vec!["sensor/+/data".to_string(), "control/#".to_string()],
+            filters: smallvec!["sensor/+/data".to_string(), "control/#".to_string()],
             properties: Properties::default(),
         });
 
@@ -1920,7 +2068,7 @@ mod tests {
             message_expiry_interval: Some(3600),
             content_type: Some("application/json".to_string()),
             response_topic: Some("reply/to".to_string()),
-            user_properties: vec![
+            user_properties: smallvec![
                 ("key1".to_string(), "val1".to_string()),
                 ("key2".to_string(), "val2".to_string()),
             ],

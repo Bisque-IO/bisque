@@ -1228,7 +1228,9 @@ dependencies = [
 name = "bisque-mq"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bincode 2.0.1",
+ "bisque-mq-protocol",
  "bisque-raft",
  "bytes",
  "chrono",
@@ -1259,7 +1261,7 @@ dependencies = [
  "bytes",
  "parking_lot",
  "serde",
- "serde_json",
+ "smallvec",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1270,6 +1272,7 @@ dependencies = [
 name = "bisque-mq-kafka"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bisque-mq",
  "bytes",
  "crc32fast",
@@ -1289,9 +1292,10 @@ version = "0.1.0"
 dependencies = [
  "bisque-mq",
  "bytes",
- "parking_lot",
+ "metrics",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1316,6 +1320,8 @@ dependencies = [
  "bisque-raft",
  "bytes",
  "metrics",
+ "parking_lot",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1330,16 +1336,13 @@ dependencies = [
  "bisque-mq",
  "bisque-raft",
  "bytes",
- "chrono",
  "metrics",
- "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]

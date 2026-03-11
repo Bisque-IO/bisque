@@ -527,6 +527,8 @@ enum StructuralKind {
     DeleteActorNamespace(u64),
     CreateJob,
     DeleteJob(u64),
+    CreateConsumerGroup,
+    DeleteConsumerGroup(u64),
     Batch(Vec<StructuralKind>),
 }
 
@@ -542,6 +544,10 @@ fn classify_structural(cmd: &MqCommand) -> StructuralKind {
         }
         MqCommand::TAG_CREATE_JOB => StructuralKind::CreateJob,
         MqCommand::TAG_DELETE_JOB => StructuralKind::DeleteJob(cmd.field_u64(1)),
+        MqCommand::TAG_CREATE_CONSUMER_GROUP => StructuralKind::CreateConsumerGroup,
+        MqCommand::TAG_DELETE_CONSUMER_GROUP => {
+            StructuralKind::DeleteConsumerGroup(cmd.field_u64(1))
+        }
         MqCommand::TAG_BATCH => {
             let batch = cmd.as_batch();
             let kinds: Vec<StructuralKind> =
@@ -570,7 +576,7 @@ fn collect_structural_writes(
             if let MqResponse::EntityCreated { id } = response {
                 meta.topics
                     .get(id)
-                    .map(|t| vec![StructuralWrite::CreateTopic(t.meta().clone())])
+                    .map(|t| vec![StructuralWrite::CreateTopic(t.snapshot_meta())])
             } else {
                 None
             }
@@ -602,12 +608,24 @@ fn collect_structural_writes(
             if let MqResponse::EntityCreated { id } = response {
                 meta.jobs
                     .get(id)
-                    .map(|j| vec![StructuralWrite::CreateJob(j.meta().clone())])
+                    .map(|j| vec![StructuralWrite::CreateJob(j.snapshot_meta())])
             } else {
                 None
             }
         }
         StructuralKind::DeleteJob(id) => Some(vec![StructuralWrite::DeleteJob(id)]),
+        StructuralKind::CreateConsumerGroup => {
+            if let MqResponse::EntityCreated { id } = response {
+                meta.consumer_groups
+                    .get(id)
+                    .map(|g| vec![StructuralWrite::CreateConsumerGroup(g.snapshot_meta())])
+            } else {
+                None
+            }
+        }
+        StructuralKind::DeleteConsumerGroup(id) => {
+            Some(vec![StructuralWrite::DeleteConsumerGroup(id)])
+        }
         StructuralKind::Batch(kinds) => {
             let responses = if let MqResponse::BatchResponse(resps) = response {
                 resps.as_slice()

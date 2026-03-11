@@ -9,6 +9,10 @@ use crate::types::{InputSource, OverlapPolicy, RetryConfig};
 #[derive(Debug, Clone)]
 pub struct MqConfig {
     pub data_dir: PathBuf,
+    /// Catalog identity for metrics isolation. Set via `with_catalog()`.
+    pub catalog_id: u64,
+    /// Catalog name for metrics labels. Set via `with_catalog()`.
+    pub catalog_name: String,
     pub visibility_scan_interval: Duration,
     pub cron_eval_interval: Duration,
     pub heartbeat_timeout: Duration,
@@ -17,12 +21,20 @@ pub struct MqConfig {
     pub purge_floor_interval: Duration,
     pub actor_rebalance_interval: Duration,
     pub job_timeout_interval: Duration,
+    /// How often to check for expired consumer group sessions (default: 5s).
+    pub group_session_expiry_interval: Duration,
+    /// How often to check for expired consumer group offsets (default: 10 min).
+    pub group_offset_expiry_interval: Duration,
+    /// How long to retain offsets for empty groups (default: 7 days).
+    pub group_offset_retention_ms: u64,
 }
 
 impl MqConfig {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            catalog_id: 0,
+            catalog_name: "default".to_string(),
             visibility_scan_interval: Duration::from_secs(1),
             cron_eval_interval: Duration::from_secs(1),
             heartbeat_timeout: Duration::from_secs(30),
@@ -31,6 +43,9 @@ impl MqConfig {
             purge_floor_interval: Duration::from_secs(30),
             actor_rebalance_interval: Duration::from_secs(10),
             job_timeout_interval: Duration::from_secs(5),
+            group_session_expiry_interval: Duration::from_secs(5),
+            group_offset_expiry_interval: Duration::from_secs(600),
+            group_offset_retention_ms: 7 * 24 * 60 * 60 * 1000, // 7 days
         }
     }
 
@@ -46,6 +61,12 @@ impl MqConfig {
 
     pub fn with_heartbeat_timeout(mut self, timeout: Duration) -> Self {
         self.heartbeat_timeout = timeout;
+        self
+    }
+
+    pub fn with_catalog(mut self, catalog_id: u64, catalog_name: String) -> Self {
+        self.catalog_id = catalog_id;
+        self.catalog_name = catalog_name;
         self
     }
 }

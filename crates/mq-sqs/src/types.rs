@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -254,9 +256,9 @@ pub struct BatchResultErrorEntry {
     #[serde(rename = "Id")]
     pub id: String,
     #[serde(rename = "Code")]
-    pub code: String,
+    pub code: Cow<'static, str>,
     #[serde(rename = "Message")]
-    pub message: String,
+    pub message: Cow<'static, str>,
     #[serde(rename = "SenderFault")]
     pub sender_fault: bool,
 }

@@ -4,7 +4,12 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
-use crate::types::*;
+use crate::types::{
+    self, DescribedGroup, DescribedGroupMember, ErrorCode, HeartbeatRequest, HeartbeatResponse,
+    JoinGroupMember, JoinGroupProtocol, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest,
+    LeaveGroupResponse, ListedGroup, SyncGroupAssignment, SyncGroupRequest, SyncGroupResponse,
+    WireString,
+};
 
 // =============================================================================
 // Group Phase State Machine
@@ -41,12 +46,14 @@ impl GroupPhase {
 // =============================================================================
 
 struct MemberState {
-    member_id: String,
-    client_id: String,
+    member_id: WireString,
+    client_id: WireString,
     session_timeout_ms: i32,
+    #[allow(dead_code)]
     rebalance_timeout_ms: i32,
-    protocol_type: String,
-    protocols: Vec<(String, Bytes)>,
+    #[allow(dead_code)]
+    protocol_type: WireString,
+    protocols: Vec<(WireString, Bytes)>,
     assignment: Bytes,
     last_heartbeat: Instant,
 }
@@ -56,12 +63,12 @@ struct MemberState {
 // =============================================================================
 
 struct PendingJoin {
-    member_id: String,
+    member_id: WireString,
     tx: oneshot::Sender<JoinGroupResponse>,
 }
 
 struct PendingSync {
-    member_id: String,
+    member_id: WireString,
     tx: oneshot::Sender<SyncGroupResponse>,
 }
 
@@ -70,24 +77,24 @@ struct PendingSync {
 // =============================================================================
 
 struct GroupState {
-    group_id: String,
+    group_id: WireString,
     generation_id: i32,
-    protocol_type: String,
-    protocol_name: String,
-    leader: Option<String>,
-    members: HashMap<String, MemberState>,
+    protocol_type: WireString,
+    protocol_name: WireString,
+    leader: Option<WireString>,
+    members: HashMap<WireString, MemberState>,
     phase: GroupPhase,
     pending_joins: Vec<PendingJoin>,
     pending_syncs: Vec<PendingSync>,
 }
 
 impl GroupState {
-    fn new(group_id: String) -> Self {
+    fn new(group_id: WireString) -> Self {
         Self {
             group_id,
             generation_id: 0,
-            protocol_type: String::new(),
-            protocol_name: String::new(),
+            protocol_type: WireString::empty(),
+            protocol_name: WireString::empty(),
             leader: None,
             members: HashMap::new(),
             phase: GroupPhase::Empty,
@@ -97,7 +104,7 @@ impl GroupState {
     }
 
     /// Select a common protocol supported by all members.
-    fn select_protocol(&self) -> Option<String> {
+    fn select_protocol(&self) -> Option<WireString> {
         if self.members.is_empty() {
             return None;
         }
@@ -212,9 +219,9 @@ impl GroupState {
 /// Server-side consumer group coordinator implementing Kafka's
 /// JoinGroup/SyncGroup/Heartbeat/LeaveGroup protocol.
 pub struct GroupCoordinator {
-    groups: HashMap<String, GroupState>,
+    groups: HashMap<WireString, GroupState>,
     /// Reverse index: member_id → group_id.
-    member_index: HashMap<String, String>,
+    member_index: HashMap<WireString, WireString>,
     next_member_id: u64,
 }
 
@@ -227,10 +234,10 @@ impl GroupCoordinator {
         }
     }
 
-    fn generate_member_id(&mut self, client_id: &str) -> String {
+    fn generate_member_id(&mut self, client_id: &str) -> WireString {
         let id = self.next_member_id;
         self.next_member_id += 1;
-        format!("{}-{}", client_id, id)
+        WireString::from(format!("{}-{}", client_id, id))
     }
 
     /// Handle a JoinGroup request. Returns a oneshot receiver that will
@@ -243,12 +250,14 @@ impl GroupCoordinator {
             return Err(JoinGroupResponse {
                 error_code: ErrorCode::InvalidGroupId.as_i16(),
                 generation_id: -1,
-                protocol_name: String::new(),
-                leader: String::new(),
-                member_id: String::new(),
+                protocol_name: WireString::empty(),
+                leader: WireString::empty(),
+                member_id: WireString::empty(),
                 members: Vec::new(),
             });
         }
+
+        let group_id = req.group_id.clone();
 
         // Assign member_id if empty (before borrowing self.groups)
         let member_id = if req.member_id.is_empty() {
@@ -264,11 +273,11 @@ impl GroupCoordinator {
 
         let group = self
             .groups
-            .entry(req.group_id.clone())
-            .or_insert_with(|| GroupState::new(req.group_id.clone()));
+            .entry(group_id.clone())
+            .or_insert_with(|| GroupState::new(group_id.clone()));
 
         // Register or update member
-        let protocols: Vec<(String, Bytes)> = req
+        let protocols: Vec<(WireString, Bytes)> = req
             .protocols
             .iter()
             .map(|p| (p.name.clone(), p.metadata.clone()))
@@ -288,8 +297,7 @@ impl GroupCoordinator {
             },
         );
 
-        self.member_index
-            .insert(member_id.clone(), req.group_id.clone());
+        self.member_index.insert(member_id.clone(), group_id);
 
         if group.protocol_type.is_empty() {
             group.protocol_type = req.protocol_type.clone();
@@ -340,14 +348,12 @@ impl GroupCoordinator {
             });
         }
 
+        let member_id = req.member_id.clone();
         let (tx, rx) = oneshot::channel();
-        group.pending_syncs.push(PendingSync {
-            member_id: req.member_id.clone(),
-            tx,
-        });
+        group.pending_syncs.push(PendingSync { member_id, tx });
 
         // If this is the leader and they provided assignments, complete
-        let is_leader = group.leader.as_deref() == Some(&req.member_id);
+        let is_leader = group.leader.as_deref() == Some(req.member_id.as_str());
         if is_leader && !req.assignments.is_empty() {
             group.complete_sync(&req.assignments);
         } else if group.pending_syncs.len() >= group.members.len() {
@@ -412,7 +418,6 @@ impl GroupCoordinator {
         group.remove_member(&req.member_id);
 
         if group.phase == GroupPhase::Empty && group.members.is_empty() {
-            // Clean up dead group
             self.groups.remove(&req.group_id);
         }
 
@@ -423,18 +428,18 @@ impl GroupCoordinator {
 
     /// Check for expired sessions and remove dead members.
     /// Returns the list of group IDs that transitioned to PreparingRebalance.
-    pub fn expire_sessions(&mut self) -> Vec<String> {
+    pub fn expire_sessions(&mut self) -> Vec<WireString> {
         let now = Instant::now();
         let mut rebalanced = Vec::new();
 
-        let group_ids: Vec<String> = self.groups.keys().cloned().collect();
+        let group_ids: Vec<WireString> = self.groups.keys().cloned().collect();
         for group_id in group_ids {
             let group = self.groups.get_mut(&group_id).unwrap();
             if group.phase == GroupPhase::Dead || group.phase == GroupPhase::Empty {
                 continue;
             }
 
-            let expired: Vec<String> = group
+            let expired: Vec<WireString> = group
                 .members
                 .iter()
                 .filter(|(_, m)| {
@@ -462,16 +467,16 @@ impl GroupCoordinator {
         match self.groups.get(group_id) {
             None => DescribedGroup {
                 error_code: ErrorCode::InvalidGroupId.as_i16(),
-                group_id: group_id.to_string(),
-                state: "Dead".to_string(),
-                protocol_type: String::new(),
-                protocol: String::new(),
+                group_id: WireString::from(group_id),
+                state: WireString::from_static("Dead"),
+                protocol_type: WireString::empty(),
+                protocol: WireString::empty(),
                 members: Vec::new(),
             },
             Some(group) => DescribedGroup {
                 error_code: ErrorCode::None.as_i16(),
                 group_id: group.group_id.clone(),
-                state: group.phase.as_str().to_string(),
+                state: WireString::from_static(group.phase.as_str()),
                 protocol_type: group.protocol_type.clone(),
                 protocol: group.protocol_name.clone(),
                 members: group
@@ -487,7 +492,7 @@ impl GroupCoordinator {
                         DescribedGroupMember {
                             member_id: m.member_id.clone(),
                             client_id: m.client_id.clone(),
-                            client_host: String::new(),
+                            client_host: WireString::empty(),
                             metadata,
                             assignment: m.assignment.clone(),
                         }
@@ -531,13 +536,13 @@ mod tests {
 
     fn make_join_req(group: &str, member: &str, protocol: &str) -> JoinGroupRequest {
         JoinGroupRequest {
-            group_id: group.to_string(),
+            group_id: WireString::from(group),
             session_timeout_ms: 30000,
             rebalance_timeout_ms: 30000,
-            member_id: member.to_string(),
-            protocol_type: "consumer".to_string(),
+            member_id: WireString::from(member),
+            protocol_type: WireString::from("consumer"),
             protocols: vec![JoinGroupProtocol {
-                name: protocol.to_string(),
+                name: WireString::from(protocol),
                 metadata: Bytes::from_static(b"meta"),
             }],
         }
@@ -558,7 +563,7 @@ mod tests {
         // SyncGroup as leader
         let member_id = resp.member_id.clone();
         let sync_req = SyncGroupRequest {
-            group_id: "g1".to_string(),
+            group_id: WireString::from("g1"),
             generation_id: 1,
             member_id: member_id.clone(),
             assignments: vec![SyncGroupAssignment {
@@ -587,7 +592,7 @@ mod tests {
         // Complete sync for gen 1
         let sync_rx = coord
             .sync_group(&SyncGroupRequest {
-                group_id: "g1".to_string(),
+                group_id: WireString::from("g1"),
                 generation_id: 1,
                 member_id: m1.clone(),
                 assignments: vec![SyncGroupAssignment {
@@ -624,9 +629,9 @@ mod tests {
     fn test_heartbeat_unknown_group() {
         let mut coord = GroupCoordinator::new();
         let resp = coord.heartbeat(&HeartbeatRequest {
-            group_id: "nonexistent".to_string(),
+            group_id: WireString::from("nonexistent"),
             generation_id: 1,
-            member_id: "m1".to_string(),
+            member_id: WireString::from("m1"),
         });
         assert_eq!(resp.error_code, ErrorCode::InvalidGroupId.as_i16());
     }
@@ -640,7 +645,7 @@ mod tests {
         let member_id = resp.member_id;
 
         let leave_resp = coord.leave_group(&LeaveGroupRequest {
-            group_id: "g1".to_string(),
+            group_id: WireString::from("g1"),
             member_id: member_id.clone(),
         });
         assert_eq!(leave_resp.error_code, ErrorCode::None.as_i16());

@@ -17,7 +17,9 @@ use crate::codec::{
 use crate::manager::MultiRaftManager;
 use crate::network::MultiplexedTransport;
 use crate::storage::MultiRaftLogStorage;
-use crate::transport_tcp::{BoxedReader, BoxedWriter, FRAME_PREFIX_LEN, encode_framed};
+use crate::transport_tcp::{
+    BoxedReader, BoxedWriter, FRAME_PREFIX_LEN, encode_framed, return_encode_buffer,
+};
 use bytes::{Buf, BytesMut};
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -452,7 +454,7 @@ where
         use std::sync::atomic::Ordering;
         use tokio::io::AsyncWriteExt;
 
-        // Reusable vec for collecting pre-encoded frames each iteration
+        // Reuse across iterations — after warmup this never reallocates.
         let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(32);
 
         loop {
@@ -511,7 +513,10 @@ where
                 None
             };
 
-            data_bufs.clear();
+            // Return buffers to the thread-local encode pool for reuse.
+            for buf in data_bufs.drain(..) {
+                return_encode_buffer(buf);
+            }
 
             if let Some(e) = write_err {
                 tracing::error!("RPC writer: {e}");

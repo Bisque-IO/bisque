@@ -68,12 +68,21 @@ impl PartitionMap {
     }
 
     /// Resolve a `(kafka_topic, partition_index)` to a bisque-mq topic ID.
+    ///
+    /// Fast path O(1): direct index when partitions are contiguous from 0.
+    /// Fallback O(log n): binary search for sparse partition indices.
     pub fn resolve(&self, kafka_topic: &str, partition: i32) -> Option<u64> {
         self.topics.get(kafka_topic).and_then(|parts| {
+            let idx = partition as usize;
+            // Fast path: partitions are typically 0..N contiguous
+            if idx < parts.len() && parts[idx].0 == partition {
+                return Some(parts[idx].1);
+            }
+            // Fallback: binary search (sorted by partition index)
             parts
-                .iter()
-                .find(|&&(idx, _)| idx == partition)
-                .map(|&(_, id)| id)
+                .binary_search_by_key(&partition, |&(p, _)| p)
+                .ok()
+                .map(|pos| parts[pos].1)
         })
     }
 
@@ -118,7 +127,7 @@ mod tests {
             ("events-2".to_string(), 102),
             ("orders-0".to_string(), 200),
             ("orders-1".to_string(), 201),
-            ("standalone".to_string(), 300), // Not a Kafka partition topic
+            ("standalone".to_string(), 300),
         ];
         map.refresh(&mq_topics);
 
@@ -136,7 +145,6 @@ mod tests {
     #[test]
     fn test_partition_map_sorted() {
         let mut map = PartitionMap::new();
-        // Insert in reverse order
         let mq_topics = vec![
             ("t-2".to_string(), 12),
             ("t-0".to_string(), 10),
@@ -159,5 +167,20 @@ mod tests {
         let mut topics = map.kafka_topics();
         topics.sort();
         assert_eq!(topics, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn test_resolve_fast_path() {
+        let mut map = PartitionMap::new();
+        let mq_topics: Vec<_> = (0..100)
+            .map(|i| (format!("t-{i}"), i as u64 + 1000))
+            .collect();
+        map.refresh(&mq_topics);
+
+        // All should hit the O(1) fast path
+        for i in 0..100 {
+            assert_eq!(map.resolve("t", i), Some(i as u64 + 1000));
+        }
+        assert_eq!(map.resolve("t", 100), None);
     }
 }

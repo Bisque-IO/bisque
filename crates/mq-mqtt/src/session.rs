@@ -9,12 +9,14 @@
 //! - MQTT 5.0 topic alias mappings, flow control, session expiry
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bisque_mq::MqCommand;
 use bisque_mq::flat::{FlatMessage, FlatMessageBuilder};
 use bytes::Bytes;
+use smallvec::SmallVec;
 use tracing::{debug, warn};
 
 use crate::types::{
@@ -48,9 +50,11 @@ pub struct MqttSessionConfig {
     /// Default keep-alive in seconds (used if client sends 0).
     pub default_keep_alive: u16,
     /// Prefix for bisque-mq topic names created from MQTT topics.
-    pub topic_prefix: String,
+    /// Arc<str> avoids per-connection String cloning.
+    pub topic_prefix: Arc<str>,
     /// Prefix for retained message topics.
-    pub retained_prefix: String,
+    /// Arc<str> avoids per-connection String cloning.
+    pub retained_prefix: Arc<str>,
 }
 
 impl Default for MqttSessionConfig {
@@ -59,8 +63,8 @@ impl Default for MqttSessionConfig {
             max_inflight: 65535,
             max_packet_size: 1024 * 1024,
             default_keep_alive: 60,
-            topic_prefix: "mqtt/".to_string(),
-            retained_prefix: "$mqtt/retained/".to_string(),
+            topic_prefix: Arc::from("mqtt/"),
+            retained_prefix: Arc::from("$mqtt/retained/"),
         }
     }
 }
@@ -171,7 +175,7 @@ pub struct PublishPlan {
     /// The flat message bytes to publish through the exchange.
     pub flat_message: Bytes,
     /// MQTT response packets to send back to the client (PUBACK/PUBREC).
-    pub responses: Vec<MqttPacket>,
+    pub responses: SmallVec<[MqttPacket; 2]>,
     /// Optional retained message plan.
     pub retained: Option<RetainedPlan>,
 }
@@ -195,7 +199,7 @@ pub struct SubscribePlan {
     /// Cached exchange_id if already known.
     pub cached_exchange_id: Option<u64>,
     /// Per-filter subscription details.
-    pub filters: Vec<SubscribeFilterPlan>,
+    pub filters: SmallVec<[SubscribeFilterPlan; 4]>,
     /// The SUBACK response packet.
     pub suback: MqttPacket,
 }
@@ -271,8 +275,9 @@ pub struct MqttSession {
     // -- MQTT 5.0 features --
     /// Inbound topic alias map (alias number -> topic bytes), set by client.
     inbound_topic_aliases: HashMap<u16, Bytes>,
-    /// Outbound topic alias map (topic string -> alias number), set by server.
-    outbound_topic_aliases: HashMap<String, u16>,
+    /// Outbound topic alias map (topic bytes -> alias number), set by server.
+    /// Uses Bytes key to avoid String allocation on lookup/insert.
+    outbound_topic_aliases: HashMap<Bytes, u16>,
     next_outbound_alias: u16,
     /// Client's max topic alias (from CONNECT properties).
     max_topic_alias: u16,
@@ -280,6 +285,13 @@ pub struct MqttSession {
     client_receive_maximum: u16,
     /// Session expiry interval in seconds (0 = expire on disconnect).
     pub session_expiry_interval: u32,
+
+    // -- Performance counters --
+    /// O(1) counter for outbound QoS 1 in-flight messages.
+    /// Maintained on insert/remove to avoid iterating qos1_inflight.
+    outbound_qos1_count: usize,
+    /// Cached first subscription identifier for O(1) outbound delivery lookup.
+    cached_first_sub_id: Option<u32>,
 }
 
 impl MqttSession {
@@ -306,6 +318,8 @@ impl MqttSession {
             max_topic_alias: 0,
             client_receive_maximum: 65535,
             session_expiry_interval: 0,
+            outbound_qos1_count: 0,
+            cached_first_sub_id: None,
         }
     }
 
@@ -414,12 +428,16 @@ impl MqttSession {
         self.entity_cache.topics.get(name).copied()
     }
 
-    /// Look up a cached binding ID.
+    /// Look up a cached binding ID (zero-alloc: iterates instead of allocating key).
     pub fn cached_binding_id(&self, exchange_id: u64, routing_key: &str) -> Option<u64> {
-        self.entity_cache
-            .bindings
-            .get(&(exchange_id, routing_key.to_string()))
-            .copied()
+        // Avoid allocating a (u64, String) key for the lookup by iterating.
+        // The binding cache is small (typically <10 entries per session).
+        for ((eid, rk), &bid) in &self.entity_cache.bindings {
+            if *eid == exchange_id && rk == routing_key {
+                return Some(bid);
+            }
+        }
+        None
     }
 
     // =========================================================================
@@ -429,7 +447,7 @@ impl MqttSession {
     /// Handle an incoming CONNECT packet.
     ///
     /// Returns a list of `MqCommand`s to execute and the CONNACK response packet.
-    pub fn handle_connect(&mut self, connect: &Connect) -> (Vec<MqCommand>, MqttPacket) {
+    pub fn handle_connect(&mut self, connect: &Connect) -> (SmallVec<[MqCommand; 4]>, MqttPacket) {
         self.client_id = connect.client_id.clone();
         self.protocol_version = connect.protocol_version;
         self.clean_session = connect.flags.clean_session;
@@ -454,19 +472,22 @@ impl MqttSession {
             self.session_expiry_interval = sei;
         }
 
-        let mut commands = Vec::new();
+        let mut commands = SmallVec::new();
+
+        // Compute consumer/producer name once to avoid double format! allocation.
+        let consumer_name = format!("mqtt/{}", self.client_id);
 
         // Register this session as a bisque-mq consumer.
         commands.push(MqCommand::register_consumer(
             self.session_id,
-            &format!("mqtt/{}", self.client_id),
+            &consumer_name,
             &[],
         ));
 
         // Register as a producer for publishing.
         commands.push(MqCommand::register_producer(
             self.session_id,
-            Some(&format!("mqtt/{}", self.client_id)),
+            Some(&consumer_name),
         ));
 
         // If clean session, clear any old subscription state.
@@ -476,6 +497,12 @@ impl MqttSession {
             self.qos2_inbound.clear();
             self.qos2_outbound.clear();
             self.entity_cache = EntityCache::default();
+            self.outbound_qos1_count = 0;
+            self.cached_first_sub_id = None;
+            // Reset topic alias maps (correctness: old aliases invalid on reconnect).
+            self.outbound_topic_aliases.clear();
+            self.inbound_topic_aliases.clear();
+            self.next_outbound_alias = 1;
         }
 
         // Build CONNACK with capabilities for MQTT 5.0.
@@ -537,7 +564,7 @@ impl MqttSession {
                     exchange_name: MQTT_EXCHANGE_NAME,
                     cached_exchange_id: None,
                     flat_message: Bytes::new(),
-                    responses: Vec::new(),
+                    responses: SmallVec::new(),
                     retained: None,
                 };
             }
@@ -556,7 +583,7 @@ impl MqttSession {
 
         // MQTT 5.0 request/response -> FlatMessage native fields.
         if let Some(ref rt) = publish.properties.response_topic {
-            builder = builder.reply_to(Bytes::from(rt.clone()));
+            builder = builder.reply_to(Bytes::copy_from_slice(rt.as_bytes()));
         }
         if let Some(ref cd) = publish.properties.correlation_data {
             builder = builder.correlation_id(cd.clone());
@@ -564,13 +591,20 @@ impl MqttSession {
 
         // Store remaining MQTT 5.0 properties as headers using static keys.
         if let Some(ref ct) = publish.properties.content_type {
-            builder = builder.header(HDR_CONTENT_TYPE.clone(), Bytes::from(ct.clone()));
+            builder = builder.header(
+                HDR_CONTENT_TYPE.clone(),
+                Bytes::copy_from_slice(ct.as_bytes()),
+            );
         }
         if let Some(pfi) = publish.properties.payload_format_indicator {
             builder = builder.header(HDR_PAYLOAD_FORMAT.clone(), Bytes::copy_from_slice(&[pfi]));
         }
         for (key, val) in &publish.properties.user_properties {
-            builder = builder.header(format!("mqtt.user.{}", key), Bytes::from(val.clone()));
+            // Build "mqtt.user.<key>" without intermediate String by writing to a BytesMut.
+            let mut hdr_key = bytes::BytesMut::with_capacity(10 + key.len());
+            hdr_key.extend_from_slice(b"mqtt.user.");
+            hdr_key.extend_from_slice(key.as_bytes());
+            builder = builder.header(hdr_key.freeze(), Bytes::copy_from_slice(val.as_bytes()));
         }
         if let Some(secs) = publish.properties.message_expiry_interval {
             builder = builder.ttl_ms(secs as u64 * 1000);
@@ -579,7 +613,7 @@ impl MqttSession {
         let flat_message = builder.build();
 
         // Build response packets and track in-flight state.
-        let mut responses = Vec::new();
+        let mut responses = SmallVec::new();
         match publish.qos {
             QoS::AtMostOnce => {
                 // QoS 0: no acknowledgment needed.
@@ -653,31 +687,32 @@ impl MqttSession {
     // =========================================================================
 
     /// Handle PUBACK from client (QoS 1 acknowledgment for server -> client delivery).
-    pub fn handle_puback(&mut self, packet_id: u16) -> Vec<MqCommand> {
-        let mut commands = Vec::new();
-
+    ///
+    /// Returns an ACK command if this was an outbound delivery, None otherwise.
+    pub fn handle_puback(&mut self, packet_id: u16) -> Option<MqCommand> {
         if let Some(inflight) = self.qos1_inflight.remove(&packet_id) {
-            if inflight.direction == Direction::Outbound {
-                // Outbound QoS 1: client acknowledged our delivery. ACK in bisque-mq.
+            let is_outbound = inflight.direction == Direction::Outbound;
+            if is_outbound {
+                self.outbound_qos1_count -= 1;
+            }
+            debug!(packet_id, direction = ?inflight.direction, "QoS 1 acknowledged");
+            if is_outbound {
                 if let (Some(queue_id), Some(message_id)) =
                     (inflight.mq_queue_id, inflight.mq_message_id)
                 {
-                    commands.push(MqCommand::ack(queue_id, &[message_id], None));
+                    return Some(MqCommand::ack(queue_id, &[message_id], None));
                 }
             }
-            // Inbound QoS 1: nothing to do (already published on receive).
-            debug!(packet_id, direction = ?inflight.direction, "QoS 1 acknowledged");
         } else {
             warn!(packet_id, "PUBACK for unknown packet ID");
         }
-
-        commands
+        None
     }
 
     /// Handle PUBREC from client (QoS 2, client acknowledges our outbound PUBLISH).
     ///
-    /// Returns MqCommands and the PUBREL response.
-    pub fn handle_pubrec(&mut self, packet_id: u16) -> (Vec<MqCommand>, MqttPacket) {
+    /// Returns the PUBREL response packet. No MqCommands needed at this stage.
+    pub fn handle_pubrec(&mut self, packet_id: u16) -> MqttPacket {
         // Transition outbound QoS 2 from PublishSent -> PubRelSent.
         if let Some(state) = self.qos2_outbound.remove(&packet_id) {
             match state {
@@ -702,18 +737,17 @@ impl MqttSession {
             warn!(packet_id, "PUBREC for unknown outbound packet ID");
         }
 
-        let pubrel = MqttPacket::PubRel(PubRel {
+        MqttPacket::PubRel(PubRel {
             packet_id,
             reason_code: None,
             properties: Properties::default(),
-        });
-        (vec![], pubrel)
+        })
     }
 
     /// Handle PUBREL from client (QoS 2 inbound, step 2).
     ///
-    /// Returns MqCommands and the PUBCOMP response.
-    pub fn handle_pubrel(&mut self, packet_id: u16) -> (Vec<MqCommand>, MqttPacket) {
+    /// Returns the PUBCOMP response packet. No MqCommands needed at this stage.
+    pub fn handle_pubrel(&mut self, packet_id: u16) -> MqttPacket {
         if let Some(state) = self.qos2_inbound.get(&packet_id) {
             match state {
                 QoS2InboundState::PubRecSent => {
@@ -731,19 +765,17 @@ impl MqttSession {
         self.qos2_inbound
             .insert(packet_id, QoS2InboundState::Complete);
 
-        let pubcomp = MqttPacket::PubComp(PubComp {
+        MqttPacket::PubComp(PubComp {
             packet_id,
             reason_code: None,
             properties: Properties::default(),
-        });
-
-        (vec![], pubcomp)
+        })
     }
 
     /// Handle PUBCOMP from client (QoS 2 outbound complete).
-    pub fn handle_pubcomp(&mut self, packet_id: u16) -> Vec<MqCommand> {
-        let mut commands = Vec::new();
-
+    ///
+    /// Returns an ACK command if the QoS 2 flow completed successfully, None otherwise.
+    pub fn handle_pubcomp(&mut self, packet_id: u16) -> Option<MqCommand> {
         if let Some(state) = self.qos2_outbound.remove(&packet_id) {
             match state {
                 QoS2OutboundState::PubRelSent {
@@ -751,8 +783,8 @@ impl MqttSession {
                     mq_message_id,
                 } => {
                     // QoS 2 delivery complete. ACK in bisque-mq.
-                    commands.push(MqCommand::ack(mq_queue_id, &[mq_message_id], None));
                     debug!(packet_id, "QoS 2 outbound delivery complete");
+                    return Some(MqCommand::ack(mq_queue_id, &[mq_message_id], None));
                 }
                 QoS2OutboundState::PublishSent { .. } => {
                     warn!(
@@ -764,8 +796,7 @@ impl MqttSession {
         } else {
             warn!(packet_id, "PUBCOMP for unknown packet ID");
         }
-
-        commands
+        None
     }
 
     // =========================================================================
@@ -781,8 +812,8 @@ impl MqttSession {
         filters: &[crate::types::TopicFilter],
         subscription_id: Option<u32>,
     ) -> SubscribePlan {
-        let mut filter_plans = Vec::new();
-        let mut return_codes = Vec::new();
+        let mut filter_plans = SmallVec::new();
+        let mut return_codes = SmallVec::new();
 
         for filter in filters {
             // Check for shared subscription.
@@ -839,6 +870,11 @@ impl MqttSession {
 
             return_codes.push(filter.qos.as_u8());
 
+            // Update cached subscription ID for O(1) outbound lookup.
+            if subscription_id.is_some() && self.cached_first_sub_id.is_none() {
+                self.cached_first_sub_id = subscription_id;
+            }
+
             debug!(
                 client_id = %self.client_id,
                 filter = %filter.filter,
@@ -872,9 +908,9 @@ impl MqttSession {
         &mut self,
         packet_id: u16,
         filters: &[String],
-    ) -> (Vec<MqCommand>, MqttPacket) {
-        let mut commands = Vec::new();
-        let mut reason_codes = Vec::new();
+    ) -> (SmallVec<[MqCommand; 4]>, MqttPacket) {
+        let mut commands = SmallVec::new();
+        let mut reason_codes = SmallVec::new();
 
         for filter in filters {
             if let Some(mapping) = self.subscriptions.remove(filter) {
@@ -898,6 +934,9 @@ impl MqttSession {
                 reason_codes.push(0x11); // No subscription existed
             }
         }
+
+        // Recalculate cached subscription ID after removals.
+        self.cached_first_sub_id = self.subscriptions.values().find_map(|m| m.subscription_id);
 
         let unsuback = MqttPacket::UnsubAck(UnsubAck {
             packet_id,
@@ -923,11 +962,11 @@ impl MqttSession {
     // =========================================================================
 
     /// Handle a DISCONNECT packet (clean disconnect).
-    pub fn handle_disconnect(&mut self) -> Vec<MqCommand> {
+    pub fn handle_disconnect(&mut self) -> SmallVec<[MqCommand; 8]> {
         self.will = None;
         self.connected = false;
 
-        let mut commands = Vec::new();
+        let mut commands = SmallVec::new();
 
         commands.push(MqCommand::disconnect_consumer(self.session_id));
         commands.push(MqCommand::disconnect_producer(self.session_id));
@@ -965,8 +1004,8 @@ impl MqttSession {
     /// Handle an unclean disconnect (TCP connection dropped without DISCONNECT).
     ///
     /// Returns a `PublishPlan` for the will message (if any) and cleanup commands.
-    pub fn handle_unclean_disconnect(&mut self) -> (Option<PublishPlan>, Vec<MqCommand>) {
-        let mut commands = Vec::new();
+    pub fn handle_unclean_disconnect(&mut self) -> (Option<PublishPlan>, SmallVec<[MqCommand; 8]>) {
+        let mut commands = SmallVec::new();
 
         // Build will message plan if present.
         let will_plan = if let Some(ref will) = self.will {
@@ -977,7 +1016,7 @@ impl MqttSession {
 
             // Preserve MQTT 5.0 will properties.
             if let Some(ref rt) = will.properties.response_topic {
-                builder = builder.reply_to(Bytes::from(rt.clone()));
+                builder = builder.reply_to(Bytes::copy_from_slice(rt.as_bytes()));
             }
             if let Some(ref cd) = will.properties.correlation_data {
                 builder = builder.correlation_id(cd.clone());
@@ -986,14 +1025,20 @@ impl MqttSession {
                 builder = builder.ttl_ms(secs as u64 * 1000);
             }
             if let Some(ref ct) = will.properties.content_type {
-                builder = builder.header(HDR_CONTENT_TYPE.clone(), Bytes::from(ct.clone()));
+                builder = builder.header(
+                    HDR_CONTENT_TYPE.clone(),
+                    Bytes::copy_from_slice(ct.as_bytes()),
+                );
             }
             if let Some(pfi) = will.properties.payload_format_indicator {
                 builder =
                     builder.header(HDR_PAYLOAD_FORMAT.clone(), Bytes::copy_from_slice(&[pfi]));
             }
             for (k, v) in &will.properties.user_properties {
-                builder = builder.header(format!("mqtt.user.{}", k), Bytes::from(v.clone()));
+                let mut hdr_key = bytes::BytesMut::with_capacity(10 + k.len());
+                hdr_key.extend_from_slice(b"mqtt.user.");
+                hdr_key.extend_from_slice(k.as_bytes());
+                builder = builder.header(hdr_key.freeze(), Bytes::copy_from_slice(v.as_bytes()));
             }
 
             // Will delay interval: use FlatMessage delay.
@@ -1009,7 +1054,7 @@ impl MqttSession {
                 exchange_name: MQTT_EXCHANGE_NAME,
                 cached_exchange_id: self.entity_cache.exchanges.get(MQTT_EXCHANGE_NAME).copied(),
                 flat_message,
-                responses: Vec::new(),
+                responses: SmallVec::new(),
                 retained: if will.retain && !will.payload.is_empty() {
                     let retained_name = self.retained_topic_name(&will.topic);
                     let cached_topic_id = self.entity_cache.topics.get(&retained_name).copied();
@@ -1039,7 +1084,7 @@ impl MqttSession {
         commands.push(MqCommand::disconnect_producer(self.session_id));
 
         // Group NACKs for outbound QoS 1 messages by queue_id.
-        let mut nack_groups: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut nack_groups: HashMap<u64, SmallVec<[u64; 4]>> = HashMap::new();
         for inflight in self.qos1_inflight.values() {
             if inflight.direction == Direction::Outbound {
                 if let (Some(qid), Some(mid)) = (inflight.mq_queue_id, inflight.mq_message_id) {
@@ -1069,6 +1114,7 @@ impl MqttSession {
         self.qos1_inflight.clear();
         self.qos2_inbound.clear();
         self.qos2_outbound.clear();
+        self.outbound_qos1_count = 0;
 
         debug!(
             client_id = %self.client_id,
@@ -1139,24 +1185,19 @@ impl MqttSession {
                 }
             }
 
-            // Find matching subscription identifier and apply topic alias.
-            for mapping in self.subscriptions.values() {
-                if let Some(sub_id) = mapping.subscription_id {
-                    properties.subscription_identifier = Some(sub_id);
-                    break;
-                }
+            // Use cached subscription identifier (O(1) instead of iterating).
+            if let Some(sub_id) = self.cached_first_sub_id {
+                properties.subscription_identifier = Some(sub_id);
             }
 
-            // Outbound topic alias assignment.
-            let topic_str = std::str::from_utf8(&topic).unwrap_or("unknown");
+            // Outbound topic alias assignment (zero-alloc lookup via Bytes key).
             if self.max_topic_alias > 0 {
-                if let Some(&alias) = self.outbound_topic_aliases.get(topic_str) {
+                if let Some(&alias) = self.outbound_topic_aliases.get(&topic[..]) {
                     properties.topic_alias = Some(alias);
                 } else if self.next_outbound_alias <= self.max_topic_alias {
                     let alias = self.next_outbound_alias;
                     self.next_outbound_alias += 1;
-                    self.outbound_topic_aliases
-                        .insert(topic_str.to_string(), alias);
+                    self.outbound_topic_aliases.insert(topic.clone(), alias);
                     properties.topic_alias = Some(alias);
                 }
             }
@@ -1175,6 +1216,7 @@ impl MqttSession {
                             direction: Direction::Outbound,
                         },
                     );
+                    self.outbound_qos1_count += 1;
                 }
                 QoS::ExactlyOnce => {
                     self.qos2_outbound.insert(
@@ -1227,6 +1269,7 @@ impl MqttSession {
                             direction: Direction::Outbound,
                         },
                     );
+                    self.outbound_qos1_count += 1;
                 }
                 QoS::ExactlyOnce => {
                     if let (Some(qid), Some(mid)) = (mq_queue_id, mq_message_id) {
@@ -1293,6 +1336,7 @@ impl MqttSession {
                         direction: Direction::Outbound,
                     },
                 );
+                self.outbound_qos1_count += 1;
             }
             QoS::ExactlyOnce => {
                 self.qos2_outbound.insert(
@@ -1310,19 +1354,18 @@ impl MqttSession {
     }
 
     /// Resolve outbound topic alias for a topic (V5 only).
-    /// Returns the alias to include in properties, or None.
+    /// Zero-alloc lookup via Bytes key; only allocates on first-time insert.
     pub fn resolve_outbound_topic_alias(&mut self, topic: &[u8]) -> Option<u16> {
         if self.max_topic_alias == 0 {
             return None;
         }
-        let topic_str = std::str::from_utf8(topic).unwrap_or("unknown");
-        if let Some(&alias) = self.outbound_topic_aliases.get(topic_str) {
+        if let Some(&alias) = self.outbound_topic_aliases.get(topic) {
             Some(alias)
         } else if self.next_outbound_alias <= self.max_topic_alias {
             let alias = self.next_outbound_alias;
             self.next_outbound_alias += 1;
             self.outbound_topic_aliases
-                .insert(topic_str.to_string(), alias);
+                .insert(Bytes::copy_from_slice(topic), alias);
             Some(alias)
         } else {
             None
@@ -1330,13 +1373,9 @@ impl MqttSession {
     }
 
     /// Find a subscription identifier to include in outbound PUBLISH (V5).
+    /// O(1) via cached value instead of iterating all subscriptions.
     pub fn find_subscription_id(&self) -> Option<u32> {
-        for mapping in self.subscriptions.values() {
-            if let Some(sub_id) = mapping.subscription_id {
-                return Some(sub_id);
-            }
-        }
-        None
+        self.cached_first_sub_id
     }
 
     // =========================================================================
@@ -1359,13 +1398,9 @@ impl MqttSession {
     }
 
     /// Total outbound in-flight count (for flow control).
+    /// O(1) via maintained counters instead of iterating qos1_inflight.
     pub fn outbound_inflight_count(&self) -> usize {
-        let qos1_out = self
-            .qos1_inflight
-            .values()
-            .filter(|v| v.direction == Direction::Outbound)
-            .count();
-        qos1_out + self.qos2_outbound.len()
+        self.outbound_qos1_count + self.qos2_outbound.len()
     }
 
     /// Check if the session has exceeded its inflight limit.
@@ -1422,11 +1457,14 @@ impl MqttSession {
     /// (they return structured plans for the server to orchestrate).
     ///
     /// This dispatch method handles simple packets that don't need orchestration.
-    pub fn process_packet(&mut self, packet: &MqttPacket) -> (Vec<MqCommand>, Vec<MqttPacket>) {
+    pub fn process_packet(
+        &mut self,
+        packet: &MqttPacket,
+    ) -> (SmallVec<[MqCommand; 4]>, SmallVec<[MqttPacket; 2]>) {
         match packet {
             MqttPacket::Connect(connect) => {
                 let (cmds, connack) = self.handle_connect(connect);
-                (cmds, vec![connack])
+                (cmds, smallvec::smallvec![connack])
             }
             MqttPacket::Publish(_publish) => {
                 // PUBLISH requires orchestration via handle_publish + server logic.
@@ -1435,23 +1473,25 @@ impl MqttSession {
                 let plan = self.handle_publish(_publish);
                 // Return the responses from the plan; the server must separately
                 // orchestrate the exchange publish.
-                (vec![], plan.responses)
+                (SmallVec::new(), plan.responses)
             }
             MqttPacket::PubAck(puback) => {
-                let cmds = self.handle_puback(puback.packet_id);
-                (cmds, vec![])
+                let cmds: SmallVec<[MqCommand; 4]> =
+                    self.handle_puback(puback.packet_id).into_iter().collect();
+                (cmds, SmallVec::new())
             }
             MqttPacket::PubRec(pubrec) => {
-                let (cmds, pubrel) = self.handle_pubrec(pubrec.packet_id);
-                (cmds, vec![pubrel])
+                let pubrel = self.handle_pubrec(pubrec.packet_id);
+                (SmallVec::new(), smallvec::smallvec![pubrel])
             }
             MqttPacket::PubRel(pubrel) => {
-                let (cmds, pubcomp) = self.handle_pubrel(pubrel.packet_id);
-                (cmds, vec![pubcomp])
+                let pubcomp = self.handle_pubrel(pubrel.packet_id);
+                (SmallVec::new(), smallvec::smallvec![pubcomp])
             }
             MqttPacket::PubComp(pubcomp) => {
-                let cmds = self.handle_pubcomp(pubcomp.packet_id);
-                (cmds, vec![])
+                let cmds: SmallVec<[MqCommand; 4]> =
+                    self.handle_pubcomp(pubcomp.packet_id).into_iter().collect();
+                (cmds, SmallVec::new())
             }
             MqttPacket::Subscribe(subscribe) => {
                 // SUBSCRIBE requires orchestration via handle_subscribe + server.
@@ -1460,20 +1500,20 @@ impl MqttSession {
                     &subscribe.filters,
                     subscribe.properties.subscription_identifier,
                 );
-                (vec![], vec![plan.suback])
+                (SmallVec::new(), smallvec::smallvec![plan.suback])
             }
             MqttPacket::Unsubscribe(unsubscribe) => {
                 let (cmds, unsuback) =
                     self.handle_unsubscribe(unsubscribe.packet_id, &unsubscribe.filters);
-                (cmds, vec![unsuback])
+                (cmds, smallvec::smallvec![unsuback])
             }
             MqttPacket::PingReq => {
                 let (cmd, pong) = self.handle_pingreq();
-                (vec![cmd], vec![pong])
+                (smallvec::smallvec![cmd], smallvec::smallvec![pong])
             }
             MqttPacket::Disconnect(_disconnect) => {
                 let cmds = self.handle_disconnect();
-                (cmds, vec![])
+                (SmallVec::from_iter(cmds), SmallVec::new())
             }
             // AUTH is only valid in MQTT 5.0 enhanced authentication flows,
             // which we do not support. Respond with DISCONNECT reason code 0x8C
@@ -1485,7 +1525,7 @@ impl MqttSession {
                     properties: Default::default(),
                 });
                 let cmds = self.handle_disconnect();
-                (cmds, vec![disconnect])
+                (SmallVec::from_iter(cmds), smallvec::smallvec![disconnect])
             }
             // Server-originated packets should not arrive from client.
             MqttPacket::ConnAck(_)
@@ -1496,7 +1536,7 @@ impl MqttSession {
                     packet_type = ?packet.packet_type(),
                     "unexpected packet from client"
                 );
-                (vec![], vec![])
+                (SmallVec::new(), SmallVec::new())
             }
         }
     }
@@ -1686,7 +1726,7 @@ mod tests {
         assert_eq!(session.qos2_inflight_count(), 1);
 
         // PUBREL completes the inbound QoS 2.
-        let (_, pubcomp) = session.handle_pubrel(10);
+        let pubcomp = session.handle_pubrel(10);
         assert!(matches!(pubcomp, MqttPacket::PubComp(_)));
     }
 
@@ -1825,7 +1865,7 @@ mod tests {
         match plan.suback {
             MqttPacket::SubAck(sa) => {
                 assert_eq!(sa.packet_id, 1);
-                assert_eq!(sa.return_codes, vec![1, 0]);
+                assert_eq!(sa.return_codes.as_slice(), &[1, 0]);
             }
             _ => panic!("expected SubAck"),
         }
@@ -1897,7 +1937,7 @@ mod tests {
         match unsuback {
             MqttPacket::UnsubAck(ua) => {
                 assert_eq!(ua.packet_id, 2);
-                assert_eq!(ua.reason_codes, vec![0x00]);
+                assert_eq!(ua.reason_codes.as_slice(), &[0x00]);
             }
             _ => panic!("expected UnsubAck"),
         }
@@ -2067,7 +2107,7 @@ mod tests {
         assert_eq!(session.qos2_outbound.len(), 1);
 
         // Client sends PUBREC.
-        let (_cmds, pubrel) = session.handle_pubrec(packet_id);
+        let pubrel = session.handle_pubrec(packet_id);
         assert!(matches!(pubrel, MqttPacket::PubRel(_)));
 
         // State should be PubRelSent now.
@@ -2077,11 +2117,11 @@ mod tests {
         ));
 
         // Client sends PUBCOMP.
-        let cmds = session.handle_pubcomp(packet_id);
+        let cmd = session.handle_pubcomp(packet_id);
 
         // Should ACK in bisque-mq.
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].tag(), MqCommand::TAG_ACK);
+        let cmd = cmd.expect("should return ACK command");
+        assert_eq!(cmd.tag(), MqCommand::TAG_ACK);
         assert!(session.qos2_outbound.is_empty());
     }
 
@@ -2113,9 +2153,9 @@ mod tests {
         assert_eq!(session.qos1_inflight_count(), 1);
 
         // PUBACK from client should ACK in bisque-mq.
-        let cmds = session.handle_puback(1);
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].tag(), MqCommand::TAG_ACK);
+        let cmd = session.handle_puback(1);
+        let cmd = cmd.expect("should return ACK command");
+        assert_eq!(cmd.tag(), MqCommand::TAG_ACK);
     }
 
     // ---- Entity cache tests ----
@@ -2193,23 +2233,9 @@ mod tests {
 
         assert!(!session.is_inflight_full());
 
-        // Add 2 outbound QoS 1 entries.
-        session.qos1_inflight.insert(
-            1,
-            QoS1InFlight {
-                mq_message_id: None,
-                mq_queue_id: None,
-                direction: Direction::Outbound,
-            },
-        );
-        session.qos1_inflight.insert(
-            2,
-            QoS1InFlight {
-                mq_message_id: None,
-                mq_queue_id: None,
-                direction: Direction::Outbound,
-            },
-        );
+        // Add 2 outbound QoS 1 entries via track_outbound_delivery.
+        session.track_outbound_delivery(QoS::AtLeastOnce, 0, 1);
+        session.track_outbound_delivery(QoS::AtLeastOnce, 0, 2);
 
         assert!(session.is_inflight_full());
         assert_eq!(session.remaining_inflight(), 0);
@@ -2224,14 +2250,8 @@ mod tests {
         session.handle_connect(&make_connect("rm-client", true));
         session.client_receive_maximum = 1;
 
-        session.qos1_inflight.insert(
-            1,
-            QoS1InFlight {
-                mq_message_id: None,
-                mq_queue_id: None,
-                direction: Direction::Outbound,
-            },
-        );
+        // Add 1 outbound QoS 1 entry via track_outbound_delivery.
+        session.track_outbound_delivery(QoS::AtLeastOnce, 0, 1);
 
         assert!(session.is_inflight_full());
     }

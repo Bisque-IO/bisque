@@ -1,8 +1,146 @@
 //! AMQP 1.0 type system, performatives, and error conditions.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 
 use bytes::Bytes;
+use smallvec::SmallVec;
+
+// =============================================================================
+// WireString — zero-copy UTF-8 string backed by Bytes
+// =============================================================================
+
+/// A zero-copy UTF-8 string backed by `Bytes`.
+///
+/// Cloning is O(1) (atomic refcount increment, no data copy).
+/// Implements `Deref<Target=str>` for transparent string access.
+#[derive(Debug, Clone, Eq)]
+pub struct WireString(Bytes);
+
+impl WireString {
+    /// Create from a `Bytes` that has already been validated as UTF-8.
+    ///
+    /// # Safety (logical)
+    /// Caller must ensure `b` contains valid UTF-8.
+    #[inline]
+    pub fn from_utf8_unchecked(b: Bytes) -> Self {
+        Self(b)
+    }
+
+    /// Create from a `Bytes`, validating UTF-8.
+    #[inline]
+    pub fn from_utf8(b: Bytes) -> Result<Self, std::str::Utf8Error> {
+        std::str::from_utf8(&b)?;
+        Ok(Self(b))
+    }
+
+    /// Create from a static string.
+    #[inline]
+    pub fn from_static(s: &'static str) -> Self {
+        Self(Bytes::from_static(s.as_bytes()))
+    }
+
+    /// Create from an owned String (takes ownership, no copy if already heap).
+    #[inline]
+    pub fn from_string(s: String) -> Self {
+        Self(Bytes::from(s.into_bytes()))
+    }
+
+    /// Get the underlying Bytes.
+    #[inline]
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.0
+    }
+
+    /// Convert to the underlying Bytes (zero-copy).
+    #[inline]
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Deref for WireString {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        // SAFETY: We guarantee UTF-8 at construction time.
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+impl PartialEq for WireString {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl PartialEq<str> for WireString {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.as_ref() == other
+    }
+}
+
+impl PartialEq<&str> for WireString {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self.as_ref() == *other
+    }
+}
+
+impl Hash for WireString {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
+impl AsRef<str> for WireString {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+
+impl fmt::Display for WireString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self)
+    }
+}
+
+impl From<&str> for WireString {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Self(Bytes::copy_from_slice(s.as_bytes()))
+    }
+}
+
+impl From<String> for WireString {
+    #[inline]
+    fn from(s: String) -> Self {
+        Self::from_string(s)
+    }
+}
+
+impl Default for WireString {
+    #[inline]
+    fn default() -> Self {
+        Self(Bytes::new())
+    }
+}
 
 // =============================================================================
 // Protocol Constants
@@ -50,9 +188,12 @@ pub enum AmqpValue {
     /// Milliseconds since Unix epoch.
     Timestamp(i64),
     Uuid([u8; 16]),
+    /// Zero-copy binary data.
     Binary(Bytes),
-    String(String),
-    Symbol(String),
+    /// Zero-copy UTF-8 string.
+    String(WireString),
+    /// Zero-copy UTF-8 symbol.
+    Symbol(WireString),
     /// Described type: (descriptor, value).
     Described(Box<AmqpValue>, Box<AmqpValue>),
     /// Ordered list of values.
@@ -64,10 +205,12 @@ pub enum AmqpValue {
 }
 
 impl AmqpValue {
+    #[inline]
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
 
+    #[inline]
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(s) | Self::Symbol(s) => Some(s),
@@ -75,6 +218,15 @@ impl AmqpValue {
         }
     }
 
+    #[inline]
+    pub fn as_wire_string(&self) -> Option<&WireString> {
+        match self {
+            Self::String(s) | Self::Symbol(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Self::Uint(v) => Some(*v),
@@ -85,6 +237,7 @@ impl AmqpValue {
         }
     }
 
+    #[inline]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Ulong(v) => Some(*v),
@@ -94,6 +247,7 @@ impl AmqpValue {
         }
     }
 
+    #[inline]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Self::Long(v) => Some(*v),
@@ -103,6 +257,7 @@ impl AmqpValue {
         }
     }
 
+    #[inline]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Boolean(v) => Some(*v),
@@ -110,6 +265,7 @@ impl AmqpValue {
         }
     }
 
+    #[inline]
     pub fn as_binary(&self) -> Option<&Bytes> {
         match self {
             Self::Binary(b) => Some(b),
@@ -117,6 +273,7 @@ impl AmqpValue {
         }
     }
 
+    #[inline]
     pub fn as_list(&self) -> Option<&[AmqpValue]> {
         match self {
             Self::List(l) => Some(l),
@@ -124,6 +281,7 @@ impl AmqpValue {
         }
     }
 
+    #[inline]
     pub fn as_map(&self) -> Option<&[(AmqpValue, AmqpValue)]> {
         match self {
             Self::Map(m) => Some(m),
@@ -240,9 +398,9 @@ pub enum Performative {
 impl fmt::Display for Performative {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Open(p) => write!(f, "Open(container={:?})", p.container_id),
+            Self::Open(p) => write!(f, "Open(container={:?})", &*p.container_id),
             Self::Begin(p) => write!(f, "Begin(channel={:?})", p.remote_channel),
-            Self::Attach(p) => write!(f, "Attach(name={}, role={:?})", p.name, p.role),
+            Self::Attach(p) => write!(f, "Attach(name={}, role={:?})", &*p.name, p.role),
             Self::Flow(_) => write!(f, "Flow"),
             Self::Transfer(p) => write!(
                 f,
@@ -260,30 +418,30 @@ impl fmt::Display for Performative {
 
 #[derive(Debug, Clone)]
 pub struct Open {
-    pub container_id: String,
-    pub hostname: Option<String>,
+    pub container_id: WireString,
+    pub hostname: Option<WireString>,
     pub max_frame_size: u32,
     pub channel_max: u16,
     pub idle_timeout: Option<u32>,
-    pub outgoing_locales: Vec<String>,
-    pub incoming_locales: Vec<String>,
-    pub offered_capabilities: Vec<String>,
-    pub desired_capabilities: Vec<String>,
+    pub outgoing_locales: SmallVec<[WireString; 2]>,
+    pub incoming_locales: SmallVec<[WireString; 2]>,
+    pub offered_capabilities: SmallVec<[WireString; 4]>,
+    pub desired_capabilities: SmallVec<[WireString; 4]>,
     pub properties: Option<AmqpValue>,
 }
 
 impl Default for Open {
     fn default() -> Self {
         Self {
-            container_id: String::new(),
+            container_id: WireString::default(),
             hostname: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             channel_max: DEFAULT_CHANNEL_MAX,
             idle_timeout: None,
-            outgoing_locales: Vec::new(),
-            incoming_locales: Vec::new(),
-            offered_capabilities: Vec::new(),
-            desired_capabilities: Vec::new(),
+            outgoing_locales: SmallVec::new(),
+            incoming_locales: SmallVec::new(),
+            offered_capabilities: SmallVec::new(),
+            desired_capabilities: SmallVec::new(),
             properties: None,
         }
     }
@@ -296,8 +454,8 @@ pub struct Begin {
     pub incoming_window: u32,
     pub outgoing_window: u32,
     pub handle_max: u32,
-    pub offered_capabilities: Vec<String>,
-    pub desired_capabilities: Vec<String>,
+    pub offered_capabilities: SmallVec<[WireString; 4]>,
+    pub desired_capabilities: SmallVec<[WireString; 4]>,
     pub properties: Option<AmqpValue>,
 }
 
@@ -309,8 +467,8 @@ impl Default for Begin {
             incoming_window: 2048,
             outgoing_window: 2048,
             handle_max: u32::MAX,
-            offered_capabilities: Vec::new(),
-            desired_capabilities: Vec::new(),
+            offered_capabilities: SmallVec::new(),
+            desired_capabilities: SmallVec::new(),
             properties: None,
         }
     }
@@ -326,10 +484,12 @@ pub enum Role {
 }
 
 impl Role {
+    #[inline]
     pub fn from_bool(v: bool) -> Self {
         if v { Self::Receiver } else { Self::Sender }
     }
 
+    #[inline]
     pub fn as_bool(self) -> bool {
         match self {
             Self::Sender => false,
@@ -348,6 +508,7 @@ pub enum SndSettleMode {
 }
 
 impl SndSettleMode {
+    #[inline]
     pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Unsettled,
@@ -366,6 +527,7 @@ pub enum RcvSettleMode {
 }
 
 impl RcvSettleMode {
+    #[inline]
     pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::First,
@@ -377,32 +539,32 @@ impl RcvSettleMode {
 /// Source terminus.
 #[derive(Debug, Clone, Default)]
 pub struct Source {
-    pub address: Option<String>,
+    pub address: Option<WireString>,
     pub durable: u32,
-    pub expiry_policy: Option<String>,
+    pub expiry_policy: Option<WireString>,
     pub timeout: u32,
     pub dynamic: bool,
-    pub distribution_mode: Option<String>,
+    pub distribution_mode: Option<WireString>,
     pub filter: Option<AmqpValue>,
     pub default_outcome: Option<AmqpValue>,
-    pub outcomes: Vec<String>,
-    pub capabilities: Vec<String>,
+    pub outcomes: SmallVec<[WireString; 4]>,
+    pub capabilities: SmallVec<[WireString; 4]>,
 }
 
 /// Target terminus.
 #[derive(Debug, Clone, Default)]
 pub struct Target {
-    pub address: Option<String>,
+    pub address: Option<WireString>,
     pub durable: u32,
-    pub expiry_policy: Option<String>,
+    pub expiry_policy: Option<WireString>,
     pub timeout: u32,
     pub dynamic: bool,
-    pub capabilities: Vec<String>,
+    pub capabilities: SmallVec<[WireString; 4]>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Attach {
-    pub name: String,
+    pub name: WireString,
     pub handle: u32,
     pub role: Role,
     pub snd_settle_mode: SndSettleMode,
@@ -413,15 +575,15 @@ pub struct Attach {
     pub incomplete_unsettled: bool,
     pub initial_delivery_count: Option<u32>,
     pub max_message_size: Option<u64>,
-    pub offered_capabilities: Vec<String>,
-    pub desired_capabilities: Vec<String>,
+    pub offered_capabilities: SmallVec<[WireString; 4]>,
+    pub desired_capabilities: SmallVec<[WireString; 4]>,
     pub properties: Option<AmqpValue>,
 }
 
 impl Default for Attach {
     fn default() -> Self {
         Self {
-            name: String::new(),
+            name: WireString::default(),
             handle: 0,
             role: Role::Sender,
             snd_settle_mode: SndSettleMode::Mixed,
@@ -432,8 +594,8 @@ impl Default for Attach {
             incomplete_unsettled: false,
             initial_delivery_count: None,
             max_message_size: None,
-            offered_capabilities: Vec::new(),
-            desired_capabilities: Vec::new(),
+            offered_capabilities: SmallVec::new(),
+            desired_capabilities: SmallVec::new(),
             properties: None,
         }
     }
@@ -546,16 +708,25 @@ pub enum DeliveryState {
 /// AMQP 1.0 error condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmqpError {
-    pub condition: String,
-    pub description: Option<String>,
+    pub condition: WireString,
+    pub description: Option<WireString>,
     pub info: Option<AmqpValue>,
 }
 
 impl AmqpError {
     pub fn new(condition: &str, description: &str) -> Self {
         Self {
-            condition: condition.to_string(),
-            description: Some(description.to_string()),
+            condition: WireString::from(condition),
+            description: Some(WireString::from(description)),
+            info: None,
+        }
+    }
+
+    /// Create from static strings — zero-copy, no allocation.
+    pub fn from_static(condition: &'static str, description: &'static str) -> Self {
+        Self {
+            condition: WireString::from_static(condition),
+            description: Some(WireString::from_static(description)),
             info: None,
         }
     }
@@ -609,14 +780,14 @@ pub enum SaslPerformative {
 
 #[derive(Debug, Clone)]
 pub struct SaslMechanisms {
-    pub mechanisms: Vec<String>,
+    pub mechanisms: SmallVec<[WireString; 4]>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SaslInit {
-    pub mechanism: String,
+    pub mechanism: WireString,
     pub initial_response: Option<Bytes>,
-    pub hostname: Option<String>,
+    pub hostname: Option<WireString>,
 }
 
 #[derive(Debug, Clone)]
@@ -636,6 +807,7 @@ pub enum SaslCode {
 }
 
 impl SaslCode {
+    #[inline]
     pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Ok,
@@ -688,17 +860,17 @@ pub struct MessageHeader {
 pub struct MessageProperties {
     pub message_id: Option<AmqpValue>,
     pub user_id: Option<Bytes>,
-    pub to: Option<String>,
-    pub subject: Option<String>,
-    pub reply_to: Option<String>,
+    pub to: Option<WireString>,
+    pub subject: Option<WireString>,
+    pub reply_to: Option<WireString>,
     pub correlation_id: Option<AmqpValue>,
-    pub content_type: Option<String>,
-    pub content_encoding: Option<String>,
+    pub content_type: Option<WireString>,
+    pub content_encoding: Option<WireString>,
     pub absolute_expiry_time: Option<i64>,
     pub creation_time: Option<i64>,
-    pub group_id: Option<String>,
+    pub group_id: Option<WireString>,
     pub group_sequence: Option<u32>,
-    pub reply_to_group_id: Option<String>,
+    pub reply_to_group_id: Option<WireString>,
 }
 
 /// A parsed AMQP 1.0 message (from Transfer payload).
@@ -709,7 +881,7 @@ pub struct AmqpMessage {
     pub message_annotations: Option<AmqpValue>,
     pub properties: Option<MessageProperties>,
     pub application_properties: Option<AmqpValue>,
-    pub body: Vec<Bytes>,
+    pub body: SmallVec<[Bytes; 1]>,
     pub footer: Option<AmqpValue>,
 }
 
@@ -722,18 +894,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_wire_string_basics() {
+        let ws = WireString::from("hello");
+        assert_eq!(&*ws, "hello");
+        assert_eq!(ws.len(), 5);
+        assert!(!ws.is_empty());
+        assert_eq!(ws, "hello");
+
+        let ws2 = ws.clone(); // O(1) clone
+        assert_eq!(ws, ws2);
+
+        let empty = WireString::default();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_wire_string_from_static() {
+        let ws = WireString::from_static("static-str");
+        assert_eq!(&*ws, "static-str");
+    }
+
+    #[test]
+    fn test_wire_string_display() {
+        let ws = WireString::from("display-test");
+        assert_eq!(format!("{ws}"), "display-test");
+    }
+
+    #[test]
     fn test_amqp_value_display() {
         assert_eq!(AmqpValue::Null.to_string(), "null");
         assert_eq!(AmqpValue::Boolean(true).to_string(), "true");
-        assert_eq!(AmqpValue::String("hello".into()).to_string(), "\"hello\"");
-        assert_eq!(AmqpValue::Symbol("sym".into()).to_string(), ":sym");
+        assert_eq!(
+            AmqpValue::String(WireString::from("hello")).to_string(),
+            "\"hello\""
+        );
+        assert_eq!(
+            AmqpValue::Symbol(WireString::from("sym")).to_string(),
+            ":sym"
+        );
         assert_eq!(AmqpValue::Uint(42).to_string(), "42");
     }
 
     #[test]
     fn test_amqp_value_accessors() {
-        assert_eq!(AmqpValue::String("test".into()).as_str(), Some("test"));
-        assert_eq!(AmqpValue::Symbol("sym".into()).as_str(), Some("sym"));
+        assert_eq!(
+            AmqpValue::String(WireString::from("test")).as_str(),
+            Some("test")
+        );
+        assert_eq!(
+            AmqpValue::Symbol(WireString::from("sym")).as_str(),
+            Some("sym")
+        );
         assert_eq!(AmqpValue::Uint(42).as_str(), None);
 
         assert_eq!(AmqpValue::Uint(42).as_u32(), Some(42));
@@ -744,8 +955,14 @@ mod tests {
     #[test]
     fn test_amqp_value_map_get() {
         let map = AmqpValue::Map(vec![
-            (AmqpValue::String("key1".into()), AmqpValue::Uint(1)),
-            (AmqpValue::String("key2".into()), AmqpValue::Uint(2)),
+            (
+                AmqpValue::String(WireString::from("key1")),
+                AmqpValue::Uint(1),
+            ),
+            (
+                AmqpValue::String(WireString::from("key2")),
+                AmqpValue::Uint(2),
+            ),
         ]);
         assert_eq!(map.map_get("key1").and_then(|v| v.as_u32()), Some(1));
         assert_eq!(map.map_get("key2").and_then(|v| v.as_u32()), Some(2));
@@ -788,20 +1005,20 @@ mod tests {
     #[test]
     fn test_amqp_error() {
         let err = AmqpError::new(condition::NOT_FOUND, "queue not found");
-        assert_eq!(err.condition, "amqp:not-found");
+        assert_eq!(&*err.condition, "amqp:not-found");
         assert_eq!(err.description.as_deref(), Some("queue not found"));
     }
 
     #[test]
     fn test_performative_display() {
         let open = Performative::Open(Open {
-            container_id: "test".into(),
+            container_id: WireString::from("test"),
             ..Default::default()
         });
         assert!(open.to_string().contains("test"));
 
         let attach = Performative::Attach(Attach {
-            name: "link1".into(),
+            name: WireString::from("link1"),
             role: Role::Sender,
             ..Default::default()
         });

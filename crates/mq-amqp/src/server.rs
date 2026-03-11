@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -65,7 +66,7 @@ impl AmqpServerConfig {
 pub struct AmqpServer {
     config: AmqpServerConfig,
     /// Active connection count.
-    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl AmqpServer {
@@ -73,7 +74,7 @@ impl AmqpServer {
     pub fn new(config: AmqpServerConfig) -> Self {
         Self {
             config,
-            active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -88,9 +89,7 @@ impl AmqpServer {
                     match accept_result {
                         Ok((stream, peer_addr)) => {
                             if self.config.max_connections > 0 {
-                                let current = self.active_connections.load(
-                                    std::sync::atomic::Ordering::Relaxed
-                                );
+                                let current = self.active_connections.load(Ordering::Relaxed);
                                 if current >= self.config.max_connections {
                                     warn!(
                                         peer = %peer_addr,
@@ -107,7 +106,7 @@ impl AmqpServer {
                             let read_buf_size = self.config.read_buf_size;
                             let mut shutdown_rx = shutdown.clone();
 
-                            active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            active.fetch_add(1, Ordering::Relaxed);
 
                             tokio::spawn(async move {
                                 debug!(peer = %peer_addr, "accepted AMQP 1.0 connection");
@@ -119,7 +118,7 @@ impl AmqpServer {
                                         warn!(peer = %peer_addr, error = %e, "AMQP connection error");
                                     }
                                 }
-                                active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                active.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
                         Err(e) => {
@@ -139,8 +138,7 @@ impl AmqpServer {
 
     /// Get the current number of active connections.
     pub fn active_connection_count(&self) -> usize {
-        self.active_connections
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.active_connections.load(Ordering::Relaxed)
     }
 }
 
@@ -156,6 +154,7 @@ async fn handle_connection(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ConnectionError> {
     let mut conn = AmqpConnection::new();
+    // Reusable read buffer — allocated once per connection, reused for every read.
     let mut read_buf = vec![0u8; read_buf_size];
 
     info!(
@@ -167,7 +166,7 @@ async fn handle_connection(
     loop {
         // Flush any pending writes first.
         if conn.has_pending_writes() {
-            let data = conn.take_write_buf();
+            let data = conn.take_write_bytes();
             if let Err(e) = stream.write_all(&data).await {
                 warn!(
                     conn_id = conn.id,
@@ -199,7 +198,7 @@ async fn handle_connection(
                             Ok(false) => {
                                 // Connection closed gracefully. Flush final writes.
                                 if conn.has_pending_writes() {
-                                    let data = conn.take_write_buf();
+                                    let data = conn.take_write_bytes();
                                     let _ = stream.write_all(&data).await;
                                 }
                                 return Ok(());
@@ -212,7 +211,7 @@ async fn handle_connection(
                                 );
                                 // Try to flush any error frames we generated.
                                 if conn.has_pending_writes() {
-                                    let data = conn.take_write_buf();
+                                    let data = conn.take_write_bytes();
                                     let _ = stream.write_all(&data).await;
                                 }
                                 return Err(e);
@@ -237,7 +236,7 @@ async fn handle_connection(
                         "server shutting down",
                     );
                     if conn.has_pending_writes() {
-                        let data = conn.take_write_buf();
+                        let data = conn.take_write_bytes();
                         let _ = stream.write_all(&data).await;
                     }
                     return Ok(());

@@ -194,6 +194,38 @@ impl MqRaftNode {
             ));
         }
 
+        // 8. Consumer group session expiry
+        {
+            handles.push(self.spawn_leader_task(
+                "mq-group-session-expiry",
+                self.config.group_session_expiry_interval,
+                move |raft, _node_id| {
+                    Box::pin(async move {
+                        let now = unix_ms();
+                        let cmd = MqCommand::expire_group_sessions(now);
+                        let _ = raft.client_write(cmd).await;
+                    })
+                },
+            ));
+        }
+
+        // 9. Consumer group offset expiry
+        {
+            let retention_ms = self.config.group_offset_retention_ms;
+            handles.push(self.spawn_leader_task(
+                "mq-group-offset-expiry",
+                self.config.group_offset_expiry_interval,
+                move |raft, _node_id| {
+                    Box::pin(async move {
+                        let now = unix_ms();
+                        let before = now.saturating_sub(retention_ms);
+                        let cmd = MqCommand::expire_group_offsets(before);
+                        let _ = raft.client_write(cmd).await;
+                    })
+                },
+            ));
+        }
+
         info!(
             node_id = self.node_id,
             group_id = self.group_id,
@@ -436,9 +468,9 @@ pub(crate) fn collect_dead_consumers(
         }
 
         // Timeout assigned jobs
-        for &job_id in &consumer.meta.assigned_jobs {
+        for &job_id in consumer.assigned_jobs().iter() {
             if let Some(job) = meta.jobs.get(&job_id) {
-                if let Some(execution_id) = job.meta().state.current_execution_id {
+                if let Some(execution_id) = job.current_execution_id() {
                     commands.push(MqCommand::timeout_job(job_id, execution_id));
                 }
             }
@@ -469,7 +501,7 @@ pub(crate) fn collect_timed_out_jobs(meta: &MqMetadata, now_ms: u64) -> Vec<MqCo
         let job_id = *entry.key();
         let job = entry.value();
         if job.is_execution_timed_out(now_ms) {
-            if let Some(execution_id) = job.meta().state.current_execution_id {
+            if let Some(execution_id) = job.current_execution_id() {
                 commands.push(MqCommand::timeout_job(job_id, execution_id));
             }
         }
@@ -685,7 +717,7 @@ mod tests {
 
         // Force the job to be due by setting next_trigger_at
         if let Some(job) = engine.meta.jobs.get(&1) {
-            job.meta_mut().state.next_trigger_at = 5000;
+            job.next_trigger_at.store(5000, Ordering::Relaxed);
         }
 
         let counter = AtomicU64::new(100);
@@ -717,9 +749,8 @@ mod tests {
 
         // Set due and currently executing
         if let Some(job) = engine.meta.jobs.get(&1) {
-            let m = job.meta_mut();
-            m.state.next_trigger_at = 5000;
-            m.state.current_execution_id = Some(42);
+            job.next_trigger_at.store(5000, Ordering::Relaxed);
+            job.current_execution_id.store(42, Ordering::Relaxed);
         }
 
         let counter = AtomicU64::new(1);
@@ -818,8 +849,8 @@ mod tests {
         engine.apply_command(&MqCommand::assign_job(1, 100), 3, 1000);
         engine.apply_command(&MqCommand::trigger_job(1, 42, 1000), 4, 1000);
         // Add assigned job to consumer
-        if let Some(mut consumer) = engine.meta.consumers.get_mut(&100) {
-            consumer.meta.assigned_jobs.insert(1);
+        if let Some(consumer) = engine.meta.consumers.get(&100) {
+            consumer.add_assigned_job(1);
         }
 
         let cmds = collect_dead_consumers(&engine.meta, 32000, 30_000);

@@ -41,6 +41,8 @@ const TAG_RESP_PUBLISHED: u8 = 4;
 const TAG_RESP_STATS: u8 = 5;
 const TAG_RESP_BATCH: u8 = 6;
 const TAG_RESP_DEAD_LETTERED: u8 = 7;
+const TAG_RESP_GROUP_JOINED: u8 = 8;
+const TAG_RESP_GROUP_SYNCED: u8 = 9;
 
 // =============================================================================
 // Bytes encoding helpers
@@ -59,6 +61,14 @@ fn decode_bytes_owned<R: Read>(r: &mut R) -> Result<Bytes, CodecError> {
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(Bytes::from(buf))
+}
+
+#[inline]
+fn decode_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, CodecError> {
+    let len = u32::decode(r)? as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 #[inline]
@@ -462,6 +472,7 @@ impl Encode for EntityKind {
             EntityKind::Consumer => 4,
             EntityKind::Exchange => 5,
             EntityKind::Binding => 6,
+            EntityKind::ConsumerGroup => 7,
         };
         tag.encode(w)
     }
@@ -480,6 +491,7 @@ impl Decode for EntityKind {
             4 => Ok(EntityKind::Consumer),
             5 => Ok(EntityKind::Exchange),
             6 => Ok(EntityKind::Binding),
+            7 => Ok(EntityKind::ConsumerGroup),
             t => Err(CodecError::InvalidDiscriminant(t)),
         }
     }
@@ -504,6 +516,9 @@ impl Encode for MqError {
                 2u8.encode(w)?;
                 pending.encode(w)
             }
+            MqError::IllegalGeneration => 4u8.encode(w),
+            MqError::RebalanceInProgress => 5u8.encode(w),
+            MqError::UnknownMemberId => 6u8.encode(w),
             MqError::Custom(msg) => {
                 3u8.encode(w)?;
                 msg.encode(w)
@@ -514,6 +529,9 @@ impl Encode for MqError {
         1 + match self {
             MqError::NotFound { .. } | MqError::AlreadyExists { .. } => 1 + 8,
             MqError::MailboxFull { .. } => 4,
+            MqError::IllegalGeneration
+            | MqError::RebalanceInProgress
+            | MqError::UnknownMemberId => 0,
             MqError::Custom(msg) => msg.encoded_size(),
         }
     }
@@ -534,6 +552,9 @@ impl Decode for MqError {
                 pending: u32::decode(r)?,
             }),
             3 => Ok(MqError::Custom(String::decode(r)?)),
+            4 => Ok(MqError::IllegalGeneration),
+            5 => Ok(MqError::RebalanceInProgress),
+            6 => Ok(MqError::UnknownMemberId),
             t => Err(CodecError::InvalidDiscriminant(t)),
         }
     }
@@ -1127,6 +1148,119 @@ impl MqCommand {
             buf: Bytes::from(buf),
         }
     }
+
+    // -- Consumer Groups --
+
+    pub fn create_consumer_group(name: &str, auto_offset_reset: u8) -> Self {
+        build_cmd!(
+            Self::TAG_CREATE_CONSUMER_GROUP,
+            |w: &mut Vec<u8>| name.to_string().encode(w),
+            |w: &mut Vec<u8>| auto_offset_reset.encode(w)
+        )
+    }
+
+    pub fn delete_consumer_group(group_id: u64) -> Self {
+        build_cmd!(Self::TAG_DELETE_CONSUMER_GROUP, |w: &mut Vec<u8>| group_id
+            .encode(w))
+    }
+
+    pub fn commit_group_offset(
+        group_id: u64,
+        generation: i32,
+        topic_id: u64,
+        partition_index: u32,
+        offset: u64,
+        metadata: Option<&str>,
+        timestamp: u64,
+    ) -> Self {
+        build_cmd!(
+            Self::TAG_COMMIT_GROUP_OFFSET,
+            |w: &mut Vec<u8>| group_id.encode(w),
+            |w: &mut Vec<u8>| generation.encode(w),
+            |w: &mut Vec<u8>| topic_id.encode(w),
+            |w: &mut Vec<u8>| partition_index.encode(w),
+            |w: &mut Vec<u8>| offset.encode(w),
+            |w: &mut Vec<u8>| encode_opt_str(w, metadata),
+            |w: &mut Vec<u8>| timestamp.encode(w)
+        )
+    }
+
+    pub fn join_consumer_group(
+        group_id: u64,
+        member_id: &str,
+        client_id: &str,
+        session_timeout_ms: i32,
+        rebalance_timeout_ms: i32,
+        protocol_type: &str,
+        protocols: &[(&str, &[u8])],
+    ) -> Self {
+        let mut buf = Vec::new();
+        Self::TAG_JOIN_CONSUMER_GROUP.encode(&mut buf).unwrap();
+        group_id.encode(&mut buf).unwrap();
+        member_id.to_string().encode(&mut buf).unwrap();
+        client_id.to_string().encode(&mut buf).unwrap();
+        session_timeout_ms.encode(&mut buf).unwrap();
+        rebalance_timeout_ms.encode(&mut buf).unwrap();
+        protocol_type.to_string().encode(&mut buf).unwrap();
+        (protocols.len() as u32).encode(&mut buf).unwrap();
+        for (name, meta) in protocols {
+            name.to_string().encode(&mut buf).unwrap();
+            encode_bytes(&mut buf, meta).unwrap();
+        }
+        MqCommand {
+            buf: Bytes::from(buf),
+        }
+    }
+
+    pub fn sync_consumer_group(
+        group_id: u64,
+        generation: i32,
+        member_id: &str,
+        assignments: &[(&str, &[u8])],
+    ) -> Self {
+        let mut buf = Vec::new();
+        Self::TAG_SYNC_CONSUMER_GROUP.encode(&mut buf).unwrap();
+        group_id.encode(&mut buf).unwrap();
+        generation.encode(&mut buf).unwrap();
+        member_id.to_string().encode(&mut buf).unwrap();
+        (assignments.len() as u32).encode(&mut buf).unwrap();
+        for (mid, data) in assignments {
+            mid.to_string().encode(&mut buf).unwrap();
+            encode_bytes(&mut buf, data).unwrap();
+        }
+        MqCommand {
+            buf: Bytes::from(buf),
+        }
+    }
+
+    pub fn leave_consumer_group(group_id: u64, member_id: &str) -> Self {
+        build_cmd!(
+            Self::TAG_LEAVE_CONSUMER_GROUP,
+            |w: &mut Vec<u8>| group_id.encode(w),
+            |w: &mut Vec<u8>| member_id.to_string().encode(w)
+        )
+    }
+
+    pub fn heartbeat_consumer_group(group_id: u64, member_id: &str, generation: i32) -> Self {
+        build_cmd!(
+            Self::TAG_HEARTBEAT_CONSUMER_GROUP,
+            |w: &mut Vec<u8>| group_id.encode(w),
+            |w: &mut Vec<u8>| member_id.to_string().encode(w),
+            |w: &mut Vec<u8>| generation.encode(w)
+        )
+    }
+
+    pub fn expire_group_offsets(before_timestamp: u64) -> Self {
+        build_cmd!(Self::TAG_EXPIRE_GROUP_OFFSETS, |w: &mut Vec<u8>| {
+            before_timestamp.encode(w)
+        })
+    }
+
+    pub fn expire_group_sessions(now_ms: u64) -> Self {
+        build_cmd!(Self::TAG_EXPIRE_GROUP_SESSIONS, |w: &mut Vec<u8>| {
+            now_ms.encode(w)
+        })
+    }
 }
 
 // =============================================================================
@@ -1280,6 +1414,42 @@ impl MqCommand {
 
     pub fn as_batch(&self) -> CmdBatch {
         CmdBatch {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_create_consumer_group(&self) -> CmdCreateConsumerGroup {
+        CmdCreateConsumerGroup {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_commit_group_offset(&self) -> CmdCommitGroupOffset {
+        CmdCommitGroupOffset {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_join_consumer_group(&self) -> CmdJoinConsumerGroup {
+        CmdJoinConsumerGroup {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_sync_consumer_group(&self) -> CmdSyncConsumerGroup {
+        CmdSyncConsumerGroup {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_leave_consumer_group(&self) -> CmdLeaveConsumerGroup {
+        CmdLeaveConsumerGroup {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_heartbeat_consumer_group(&self) -> CmdHeartbeatConsumerGroup {
+        CmdHeartbeatConsumerGroup {
             buf: self.buf.clone(),
         }
     }
@@ -1901,6 +2071,271 @@ impl CmdBatch {
 }
 
 // =============================================================================
+// Consumer Group view structs
+// =============================================================================
+
+/// Zero-copy view over a CreateConsumerGroup command.
+/// Layout: `[48][name:str][auto_offset_reset:u8]`
+pub struct CmdCreateConsumerGroup {
+    buf: Bytes,
+}
+
+impl CmdCreateConsumerGroup {
+    pub fn name(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[1..5].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[5..5 + len]).unwrap_or("")
+    }
+
+    pub fn auto_offset_reset(&self) -> u8 {
+        let name_len = u32::from_le_bytes(self.buf[1..5].try_into().unwrap()) as usize;
+        self.buf[5 + name_len]
+    }
+}
+
+/// Zero-copy view over a CommitGroupOffset command.
+/// Layout: `[50][group_id:u64][generation:i32][topic_id:u64][partition:u32][offset:u64][metadata:opt_str][timestamp:u64]`
+pub struct CmdCommitGroupOffset {
+    buf: Bytes,
+}
+
+impl CmdCommitGroupOffset {
+    pub fn group_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn generation(&self) -> i32 {
+        i32::from_le_bytes(self.buf[9..13].try_into().unwrap())
+    }
+
+    pub fn topic_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[13..21].try_into().unwrap())
+    }
+
+    pub fn partition_index(&self) -> u32 {
+        u32::from_le_bytes(self.buf[21..25].try_into().unwrap())
+    }
+
+    pub fn offset(&self) -> u64 {
+        u64::from_le_bytes(self.buf[25..33].try_into().unwrap())
+    }
+
+    pub fn metadata(&self) -> Option<&str> {
+        let flag = self.buf[33];
+        if flag == 0 {
+            None
+        } else {
+            let len = u32::from_le_bytes(self.buf[34..38].try_into().unwrap()) as usize;
+            Some(std::str::from_utf8(&self.buf[38..38 + len]).unwrap_or(""))
+        }
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        // After opt_str: flag(1) + if present: len(4) + data(len)
+        let flag = self.buf[33];
+        let offset = if flag == 0 {
+            34
+        } else {
+            let len = u32::from_le_bytes(self.buf[34..38].try_into().unwrap()) as usize;
+            38 + len
+        };
+        u64::from_le_bytes(self.buf[offset..offset + 8].try_into().unwrap())
+    }
+}
+
+/// Zero-copy view over a JoinConsumerGroup command.
+/// Layout: `[51][group_id:u64][member_id:str][client_id:str][session_timeout_ms:i32]
+///          [rebalance_timeout_ms:i32][protocol_type:str][protocols_count:u32]
+///          [protocol_name:str][protocol_metadata:bytes]...`
+pub struct CmdJoinConsumerGroup {
+    buf: Bytes,
+}
+
+impl CmdJoinConsumerGroup {
+    pub fn group_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    fn member_id_range(&self) -> (usize, usize) {
+        let len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        (13, len)
+    }
+
+    pub fn member_id(&self) -> &str {
+        let (start, len) = self.member_id_range();
+        std::str::from_utf8(&self.buf[start..start + len]).unwrap_or("")
+    }
+
+    fn client_id_offset(&self) -> usize {
+        let (start, len) = self.member_id_range();
+        start + len
+    }
+
+    pub fn client_id(&self) -> &str {
+        let off = self.client_id_offset();
+        let len = u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[off + 4..off + 4 + len]).unwrap_or("")
+    }
+
+    fn timeouts_offset(&self) -> usize {
+        let off = self.client_id_offset();
+        let len = u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap()) as usize;
+        off + 4 + len
+    }
+
+    pub fn session_timeout_ms(&self) -> i32 {
+        let off = self.timeouts_offset();
+        i32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
+    }
+
+    pub fn rebalance_timeout_ms(&self) -> i32 {
+        let off = self.timeouts_offset() + 4;
+        i32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
+    }
+
+    fn protocol_type_offset(&self) -> usize {
+        self.timeouts_offset() + 8
+    }
+
+    pub fn protocol_type(&self) -> &str {
+        let off = self.protocol_type_offset();
+        let len = u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[off + 4..off + 4 + len]).unwrap_or("")
+    }
+
+    fn protocols_offset(&self) -> usize {
+        let off = self.protocol_type_offset();
+        let len = u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap()) as usize;
+        off + 4 + len
+    }
+
+    pub fn protocols_count(&self) -> u32 {
+        let off = self.protocols_offset();
+        u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
+    }
+
+    /// Returns `(protocol_name, metadata_bytes)` pairs.
+    pub fn protocols(&self) -> Vec<(String, Bytes)> {
+        let count = self.protocols_count() as usize;
+        let mut offset = self.protocols_offset() + 4;
+        let mut result = Vec::with_capacity(count);
+        for _ in 0..count {
+            // Read string: [len:4][data]
+            let name_len =
+                u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let name = std::str::from_utf8(&self.buf[offset..offset + name_len]).unwrap_or("");
+            offset += name_len;
+            // Read bytes: [len:4][data]
+            let meta_len =
+                u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let meta = self.buf.slice(offset..offset + meta_len);
+            offset += meta_len;
+            result.push((name.to_string(), meta));
+        }
+        result
+    }
+}
+
+/// Zero-copy view over a SyncConsumerGroup command.
+/// Layout: `[52][group_id:u64][generation:i32][member_id:str][assignments_count:u32]
+///          [member_id:str][assignment:bytes]...`
+pub struct CmdSyncConsumerGroup {
+    buf: Bytes,
+}
+
+impl CmdSyncConsumerGroup {
+    pub fn group_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn generation(&self) -> i32 {
+        i32::from_le_bytes(self.buf[9..13].try_into().unwrap())
+    }
+
+    fn member_id_range(&self) -> (usize, usize) {
+        let len = u32::from_le_bytes(self.buf[13..17].try_into().unwrap()) as usize;
+        (17, len)
+    }
+
+    pub fn member_id(&self) -> &str {
+        let (start, len) = self.member_id_range();
+        std::str::from_utf8(&self.buf[start..start + len]).unwrap_or("")
+    }
+
+    fn assignments_offset(&self) -> usize {
+        let (start, len) = self.member_id_range();
+        start + len
+    }
+
+    pub fn assignments_count(&self) -> u32 {
+        let off = self.assignments_offset();
+        u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
+    }
+
+    /// Returns `(member_id, assignment_bytes)` pairs.
+    pub fn assignments(&self) -> Vec<(String, Vec<u8>)> {
+        let count = self.assignments_count() as usize;
+        let mut offset = self.assignments_offset() + 4;
+        let mut result = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mid_len =
+                u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let mid = std::str::from_utf8(&self.buf[offset..offset + mid_len]).unwrap_or("");
+            offset += mid_len;
+            let data_len =
+                u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let data = self.buf[offset..offset + data_len].to_vec();
+            offset += data_len;
+            result.push((mid.to_string(), data));
+        }
+        result
+    }
+}
+
+/// Zero-copy view over a LeaveConsumerGroup command.
+/// Layout: `[53][group_id:u64][member_id:str]`
+pub struct CmdLeaveConsumerGroup {
+    buf: Bytes,
+}
+
+impl CmdLeaveConsumerGroup {
+    pub fn group_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn member_id(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[13..13 + len]).unwrap_or("")
+    }
+}
+
+/// Zero-copy view over a HeartbeatConsumerGroup command.
+/// Layout: `[54][group_id:u64][member_id:str][generation:i32]`
+pub struct CmdHeartbeatConsumerGroup {
+    buf: Bytes,
+}
+
+impl CmdHeartbeatConsumerGroup {
+    pub fn group_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn member_id(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[13..13 + len]).unwrap_or("")
+    }
+
+    pub fn generation(&self) -> i32 {
+        let len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        let off = 13 + len;
+        i32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
+    }
+}
+
+// =============================================================================
 // BatchIter — zero-copy iterator over length-prefixed sub-commands
 // =============================================================================
 
@@ -2201,6 +2636,70 @@ pub fn fmt_mq_command(cmd: &MqCommand, f: &mut std::fmt::Formatter<'_>) -> std::
             let v = cmd.as_batch();
             write!(f, "Batch(count={})", v.count())
         }
+        MqCommand::TAG_CREATE_CONSUMER_GROUP => {
+            let v = cmd.as_create_consumer_group();
+            write!(f, "CreateConsumerGroup(name={})", v.name())
+        }
+        MqCommand::TAG_DELETE_CONSUMER_GROUP => {
+            write!(f, "DeleteConsumerGroup({})", cmd.field_u64(1))
+        }
+        MqCommand::TAG_COMMIT_GROUP_OFFSET => {
+            let v = cmd.as_commit_group_offset();
+            write!(
+                f,
+                "CommitGroupOffset(group={}, gen={}, topic={}, part={}, offset={})",
+                v.group_id(),
+                v.generation(),
+                v.topic_id(),
+                v.partition_index(),
+                v.offset()
+            )
+        }
+        MqCommand::TAG_JOIN_CONSUMER_GROUP => {
+            let v = cmd.as_join_consumer_group();
+            write!(
+                f,
+                "JoinConsumerGroup(group={}, member={}, client={})",
+                v.group_id(),
+                v.member_id(),
+                v.client_id()
+            )
+        }
+        MqCommand::TAG_SYNC_CONSUMER_GROUP => {
+            let v = cmd.as_sync_consumer_group();
+            write!(
+                f,
+                "SyncConsumerGroup(group={}, gen={}, member={})",
+                v.group_id(),
+                v.generation(),
+                v.member_id()
+            )
+        }
+        MqCommand::TAG_LEAVE_CONSUMER_GROUP => {
+            let v = cmd.as_leave_consumer_group();
+            write!(
+                f,
+                "LeaveConsumerGroup(group={}, member={})",
+                v.group_id(),
+                v.member_id()
+            )
+        }
+        MqCommand::TAG_HEARTBEAT_CONSUMER_GROUP => {
+            let v = cmd.as_heartbeat_consumer_group();
+            write!(
+                f,
+                "HeartbeatConsumerGroup(group={}, member={}, gen={})",
+                v.group_id(),
+                v.member_id(),
+                v.generation()
+            )
+        }
+        MqCommand::TAG_EXPIRE_GROUP_OFFSETS => {
+            write!(f, "ExpireGroupOffsets(before={})", cmd.field_u64(1))
+        }
+        MqCommand::TAG_EXPIRE_GROUP_SESSIONS => {
+            write!(f, "ExpireGroupSessions(now={})", cmd.field_u64(1))
+        }
         _ => write!(f, "MqCommand(tag={})", cmd.tag()),
     }
 }
@@ -2229,13 +2728,10 @@ impl Encode for MqResponse {
                 }
                 Ok(())
             }
-            MqResponse::Published { offsets } => {
+            MqResponse::Published { base_offset, count } => {
                 TAG_RESP_PUBLISHED.encode(w)?;
-                (offsets.len() as u32).encode(w)?;
-                for &o in offsets.iter() {
-                    o.encode(w)?;
-                }
-                Ok(())
+                base_offset.encode(w)?;
+                count.encode(w)
             }
             MqResponse::Stats(stats) => {
                 TAG_RESP_STATS.encode(w)?;
@@ -2248,6 +2744,36 @@ impl Encode for MqResponse {
                     resp.encode(w)?;
                 }
                 Ok(())
+            }
+            MqResponse::GroupJoined {
+                generation,
+                leader,
+                member_id,
+                protocol_name,
+                is_leader,
+                members,
+                phase_complete,
+            } => {
+                TAG_RESP_GROUP_JOINED.encode(w)?;
+                generation.encode(w)?;
+                leader.encode(w)?;
+                member_id.encode(w)?;
+                protocol_name.encode(w)?;
+                (*is_leader as u8).encode(w)?;
+                (members.len() as u32).encode(w)?;
+                for (mid, meta) in members {
+                    mid.encode(w)?;
+                    encode_bytes(w, meta)?;
+                }
+                (*phase_complete as u8).encode(w)
+            }
+            MqResponse::GroupSynced {
+                assignment,
+                phase_complete,
+            } => {
+                TAG_RESP_GROUP_SYNCED.encode(w)?;
+                encode_bytes(w, assignment)?;
+                (*phase_complete as u8).encode(w)
             }
             MqResponse::DeadLettered {
                 dead_letter_ids,
@@ -2268,11 +2794,28 @@ impl Encode for MqResponse {
             MqResponse::Messages { messages } => {
                 4 + messages.iter().map(|m| m.encoded_size()).sum::<usize>()
             }
-            MqResponse::Published { offsets } => 4 + offsets.len() * 8,
+            MqResponse::Published { .. } => 8 + 8,
             MqResponse::Stats(stats) => stats.encoded_size(),
             MqResponse::BatchResponse(resps) => {
                 4 + resps.iter().map(|r| r.encoded_size()).sum::<usize>()
             }
+            MqResponse::GroupJoined {
+                generation: _,
+                leader,
+                member_id,
+                protocol_name,
+                members,
+                ..
+            } => {
+                4 + leader.encoded_size()
+                    + member_id.encoded_size()
+                    + protocol_name.encoded_size()
+                    + 1 // is_leader
+                    + 4 // members count
+                    + members.iter().map(|(mid, meta)| mid.encoded_size() + 4 + meta.len()).sum::<usize>()
+                    + 1 // phase_complete
+            }
+            MqResponse::GroupSynced { assignment, .. } => 4 + assignment.len() + 1,
             MqResponse::DeadLettered {
                 dead_letter_ids, ..
             } => 4 + dead_letter_ids.len() * 8 + 8,
@@ -2296,14 +2839,10 @@ impl Decode for MqResponse {
                 }
                 Ok(MqResponse::Messages { messages })
             }
-            TAG_RESP_PUBLISHED => {
-                let count = u32::decode(r)? as usize;
-                let mut offsets = SmallVec::with_capacity(count.min(256));
-                for _ in 0..count {
-                    offsets.push(u64::decode(r)?);
-                }
-                Ok(MqResponse::Published { offsets })
-            }
+            TAG_RESP_PUBLISHED => Ok(MqResponse::Published {
+                base_offset: u64::decode(r)?,
+                count: u64::decode(r)?,
+            }),
             TAG_RESP_STATS => Ok(MqResponse::Stats(EntityStats::decode(r)?)),
             TAG_RESP_BATCH => {
                 let count = u32::decode(r)? as usize;
@@ -2312,6 +2851,38 @@ impl Decode for MqResponse {
                     resps.push(MqResponse::decode(r)?);
                 }
                 Ok(MqResponse::BatchResponse(resps))
+            }
+            TAG_RESP_GROUP_JOINED => {
+                let generation = i32::decode(r)?;
+                let leader = String::decode(r)?;
+                let member_id = String::decode(r)?;
+                let protocol_name = String::decode(r)?;
+                let is_leader = u8::decode(r)? != 0;
+                let count = u32::decode(r)? as usize;
+                let mut members = Vec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    let mid = String::decode(r)?;
+                    let meta = decode_bytes_owned(r)?;
+                    members.push((mid, meta));
+                }
+                let phase_complete = u8::decode(r)? != 0;
+                Ok(MqResponse::GroupJoined {
+                    generation,
+                    leader,
+                    member_id,
+                    protocol_name,
+                    is_leader,
+                    members,
+                    phase_complete,
+                })
+            }
+            TAG_RESP_GROUP_SYNCED => {
+                let assignment = decode_bytes(r)?;
+                let phase_complete = u8::decode(r)? != 0;
+                Ok(MqResponse::GroupSynced {
+                    assignment,
+                    phase_complete,
+                })
             }
             TAG_RESP_DEAD_LETTERED => Ok(MqResponse::DeadLettered {
                 dead_letter_ids: decode_vec_u64(r)?,
@@ -2472,7 +3043,8 @@ mod tests {
             }),
             MqResponse::EntityCreated { id: 7 },
             MqResponse::Published {
-                offsets: SmallVec::from_vec(vec![1, 2, 3]),
+                base_offset: 1,
+                count: 3,
             },
             MqResponse::DeadLettered {
                 dead_letter_ids: vec![10, 20],
@@ -2688,5 +3260,302 @@ mod tests {
         for (cmd, expected) in cases {
             assert_eq!(format!("{}", cmd), expected);
         }
+    }
+
+    #[test]
+    fn consumer_group_command_roundtrips() {
+        // CreateConsumerGroup
+        let cmd = MqCommand::create_consumer_group("my-group", 1);
+        let v = cmd.as_create_consumer_group();
+        assert_eq!(v.name(), "my-group");
+        assert_eq!(v.auto_offset_reset(), 1);
+        assert_eq!(format!("{}", cmd), "CreateConsumerGroup(name=my-group)");
+
+        // DeleteConsumerGroup
+        let cmd = MqCommand::delete_consumer_group(42);
+        assert_eq!(cmd.field_u64(1), 42);
+        assert_eq!(format!("{}", cmd), "DeleteConsumerGroup(42)");
+
+        // CommitGroupOffset
+        let cmd = MqCommand::commit_group_offset(10, 3, 20, 0, 100, Some("md"), 5000);
+        let v = cmd.as_commit_group_offset();
+        assert_eq!(v.group_id(), 10);
+        assert_eq!(v.generation(), 3);
+        assert_eq!(v.topic_id(), 20);
+        assert_eq!(v.partition_index(), 0);
+        assert_eq!(v.offset(), 100);
+        assert_eq!(v.metadata(), Some("md"));
+        assert_eq!(v.timestamp(), 5000);
+
+        // CommitGroupOffset without metadata
+        let cmd = MqCommand::commit_group_offset(10, 3, 20, 0, 100, None, 5000);
+        let v = cmd.as_commit_group_offset();
+        assert_eq!(v.metadata(), None);
+        assert_eq!(v.timestamp(), 5000);
+
+        // JoinConsumerGroup
+        let cmd = MqCommand::join_consumer_group(
+            10,
+            "member-1",
+            "client-1",
+            30_000,
+            60_000,
+            "consumer",
+            &[("range", b"\x01\x02"), ("roundrobin", b"\x03")],
+        );
+        let v = cmd.as_join_consumer_group();
+        assert_eq!(v.group_id(), 10);
+        assert_eq!(v.member_id(), "member-1");
+        assert_eq!(v.client_id(), "client-1");
+        assert_eq!(v.session_timeout_ms(), 30_000);
+        assert_eq!(v.rebalance_timeout_ms(), 60_000);
+        assert_eq!(v.protocol_type(), "consumer");
+        assert_eq!(v.protocols_count(), 2);
+        let protocols = v.protocols();
+        assert_eq!(protocols[0].0, "range");
+        assert_eq!(protocols[0].1.as_ref(), b"\x01\x02");
+        assert_eq!(protocols[1].0, "roundrobin");
+        assert_eq!(protocols[1].1.as_ref(), b"\x03");
+
+        // SyncConsumerGroup
+        let cmd = MqCommand::sync_consumer_group(
+            10,
+            5,
+            "member-1",
+            &[("member-1", b"assign-1"), ("member-2", b"assign-2")],
+        );
+        let v = cmd.as_sync_consumer_group();
+        assert_eq!(v.group_id(), 10);
+        assert_eq!(v.generation(), 5);
+        assert_eq!(v.member_id(), "member-1");
+        assert_eq!(v.assignments_count(), 2);
+        let assignments = v.assignments();
+        assert_eq!(assignments[0].0, "member-1");
+        assert_eq!(assignments[0].1, b"assign-1");
+        assert_eq!(assignments[1].0, "member-2");
+        assert_eq!(assignments[1].1, b"assign-2");
+
+        // LeaveConsumerGroup
+        let cmd = MqCommand::leave_consumer_group(10, "member-1");
+        let v = cmd.as_leave_consumer_group();
+        assert_eq!(v.group_id(), 10);
+        assert_eq!(v.member_id(), "member-1");
+
+        // HeartbeatConsumerGroup
+        let cmd = MqCommand::heartbeat_consumer_group(10, "member-1", 7);
+        let v = cmd.as_heartbeat_consumer_group();
+        assert_eq!(v.group_id(), 10);
+        assert_eq!(v.member_id(), "member-1");
+        assert_eq!(v.generation(), 7);
+
+        // ExpireGroupOffsets
+        let cmd = MqCommand::expire_group_offsets(9999);
+        assert_eq!(cmd.field_u64(1), 9999);
+
+        // ExpireGroupSessions
+        let cmd = MqCommand::expire_group_sessions(12345);
+        assert_eq!(cmd.field_u64(1), 12345);
+    }
+
+    #[test]
+    fn consumer_group_response_roundtrips() {
+        // GroupJoined
+        let resp = MqResponse::GroupJoined {
+            generation: 3,
+            leader: "m-1".to_string(),
+            member_id: "m-2".to_string(),
+            protocol_name: "range".to_string(),
+            is_leader: false,
+            members: vec![("m-1".to_string(), Bytes::from_static(&[1, 2, 3]))],
+            phase_complete: true,
+        };
+        let decoded = roundtrip_resp(&resp);
+        match decoded {
+            MqResponse::GroupJoined {
+                generation,
+                leader,
+                member_id,
+                protocol_name,
+                is_leader,
+                members,
+                phase_complete,
+            } => {
+                assert_eq!(generation, 3);
+                assert_eq!(leader, "m-1");
+                assert_eq!(member_id, "m-2");
+                assert_eq!(protocol_name, "range");
+                assert!(!is_leader);
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].0, "m-1");
+                assert_eq!(members[0].1.as_ref(), &[1, 2, 3]);
+                assert!(phase_complete);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // GroupSynced
+        let resp = MqResponse::GroupSynced {
+            assignment: vec![4, 5, 6],
+            phase_complete: false,
+        };
+        let decoded = roundtrip_resp(&resp);
+        match decoded {
+            MqResponse::GroupSynced {
+                assignment,
+                phase_complete,
+            } => {
+                assert_eq!(assignment, vec![4, 5, 6]);
+                assert!(!phase_complete);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // New MqError variants
+        let resp = MqResponse::Error(MqError::IllegalGeneration);
+        match roundtrip_resp(&resp) {
+            MqResponse::Error(MqError::IllegalGeneration) => {}
+            _ => panic!("wrong variant"),
+        }
+
+        let resp = MqResponse::Error(MqError::RebalanceInProgress);
+        match roundtrip_resp(&resp) {
+            MqResponse::Error(MqError::RebalanceInProgress) => {}
+            _ => panic!("wrong variant"),
+        }
+
+        let resp = MqResponse::Error(MqError::UnknownMemberId);
+        match roundtrip_resp(&resp) {
+            MqResponse::Error(MqError::UnknownMemberId) => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_cg_codec_batch_roundtrip() {
+        let cmds = vec![
+            MqCommand::create_consumer_group("batch-g", 1),
+            MqCommand::join_consumer_group(
+                42,
+                "m1",
+                "c1",
+                30000,
+                60000,
+                "consumer",
+                &[("range", b"\x01")],
+            ),
+            MqCommand::sync_consumer_group(42, 1, "m1", &[("m1", b"assign")]),
+            MqCommand::heartbeat_consumer_group(42, "m1", 1),
+            MqCommand::leave_consumer_group(42, "m1"),
+        ];
+        let batch = MqCommand::batch(&cmds);
+        let v = batch.as_batch();
+        assert_eq!(v.count(), 5);
+
+        let sub: Vec<MqCommand> = v.commands().collect();
+        assert_eq!(sub[0].tag(), MqCommand::TAG_CREATE_CONSUMER_GROUP);
+        assert_eq!(sub[0].as_create_consumer_group().name(), "batch-g");
+
+        assert_eq!(sub[1].tag(), MqCommand::TAG_JOIN_CONSUMER_GROUP);
+        let join = sub[1].as_join_consumer_group();
+        assert_eq!(join.group_id(), 42);
+        assert_eq!(join.member_id(), "m1");
+
+        assert_eq!(sub[2].tag(), MqCommand::TAG_SYNC_CONSUMER_GROUP);
+        assert_eq!(sub[3].tag(), MqCommand::TAG_HEARTBEAT_CONSUMER_GROUP);
+        assert_eq!(sub[4].tag(), MqCommand::TAG_LEAVE_CONSUMER_GROUP);
+    }
+
+    #[test]
+    fn test_cg_codec_join_many_protocols() {
+        let protocols: Vec<(&str, &[u8])> = (0..15)
+            .map(|i| {
+                // Leak strings so they live long enough
+                let name: &'static str = Box::leak(format!("proto-{i}").into_boxed_str());
+                let meta: &'static [u8] = Box::leak(vec![i as u8; 10].into_boxed_slice());
+                (name, meta)
+            })
+            .collect();
+
+        let cmd = MqCommand::join_consumer_group(
+            100, "member-x", "client-y", 30000, 60000, "consumer", &protocols,
+        );
+        let v = cmd.as_join_consumer_group();
+        assert_eq!(v.group_id(), 100);
+        assert_eq!(v.member_id(), "member-x");
+        assert_eq!(v.client_id(), "client-y");
+        let parsed = v.protocols();
+        assert_eq!(parsed.len(), 15);
+        for (i, (name, meta)) in parsed.iter().enumerate() {
+            assert_eq!(name, &format!("proto-{i}"));
+            assert_eq!(meta.len(), 10);
+            assert!(meta.iter().all(|&b| b == i as u8));
+        }
+    }
+
+    #[test]
+    fn test_cg_codec_sync_many_assignments() {
+        let assignments: Vec<(&str, &[u8])> = (0..12)
+            .map(|i| {
+                let mid: &'static str = Box::leak(format!("m-{i}").into_boxed_str());
+                let data: &'static [u8] = Box::leak(vec![i as u8; 20].into_boxed_slice());
+                (mid, data)
+            })
+            .collect();
+
+        let cmd = MqCommand::sync_consumer_group(50, 3, "leader-m", &assignments);
+        let v = cmd.as_sync_consumer_group();
+        assert_eq!(v.group_id(), 50);
+        assert_eq!(v.generation(), 3);
+        assert_eq!(v.member_id(), "leader-m");
+        let parsed = v.assignments();
+        assert_eq!(parsed.len(), 12);
+        for (i, (mid, data)) in parsed.iter().enumerate() {
+            assert_eq!(mid, &format!("m-{i}"));
+            assert_eq!(data.len(), 20);
+        }
+    }
+
+    #[test]
+    fn test_cg_codec_commit_with_long_metadata() {
+        let long_meta = "x".repeat(10_000);
+        let cmd = MqCommand::commit_group_offset(42, 1, 100, 0, 999, Some(&long_meta), 5000);
+        let v = cmd.as_commit_group_offset();
+        assert_eq!(v.group_id(), 42);
+        assert_eq!(v.generation(), 1);
+        assert_eq!(v.topic_id(), 100);
+        assert_eq!(v.partition_index(), 0);
+        assert_eq!(v.offset(), 999);
+        assert_eq!(v.metadata().unwrap(), long_meta);
+        assert_eq!(v.timestamp(), 5000);
+    }
+
+    #[test]
+    fn test_cg_codec_empty_strings() {
+        // Empty member_id, client_id, protocol_type
+        let cmd = MqCommand::join_consumer_group(1, "", "", 5000, 10000, "", &[]);
+        let v = cmd.as_join_consumer_group();
+        assert_eq!(v.group_id(), 1);
+        assert_eq!(v.member_id(), "");
+        assert_eq!(v.client_id(), "");
+        assert_eq!(v.protocol_type(), "");
+        assert_eq!(v.protocols().len(), 0);
+
+        // Empty member_id in leave
+        let cmd = MqCommand::leave_consumer_group(1, "");
+        let v = cmd.as_leave_consumer_group();
+        assert_eq!(v.member_id(), "");
+
+        // Commit with no metadata
+        let cmd = MqCommand::commit_group_offset(1, 0, 10, 0, 0, None, 0);
+        let v = cmd.as_commit_group_offset();
+        assert!(v.metadata().is_none());
+    }
+
+    #[test]
+    fn test_cg_codec_unicode_metadata() {
+        let unicode_meta = "日本語テスト 🎉 مرحبا";
+        let cmd = MqCommand::commit_group_offset(42, 1, 100, 0, 50, Some(unicode_meta), 9999);
+        let v = cmd.as_commit_group_offset();
+        assert_eq!(v.metadata().unwrap(), unicode_meta);
     }
 }

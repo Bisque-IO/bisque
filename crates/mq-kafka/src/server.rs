@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -18,7 +17,6 @@ pub struct KafkaServerConfig {
     pub bind_addr: SocketAddr,
     pub max_connections: usize,
     pub read_buffer_size: usize,
-    pub session_expiry_interval: Duration,
 }
 
 impl Default for KafkaServerConfig {
@@ -27,7 +25,6 @@ impl Default for KafkaServerConfig {
             bind_addr: "0.0.0.0:9092".parse().unwrap(),
             max_connections: 10_000,
             read_buffer_size: 65536,
-            session_expiry_interval: Duration::from_secs(10),
         }
     }
 }
@@ -85,21 +82,8 @@ impl KafkaServer {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
-        // Periodic session expiry task
-        let handler_clone = Arc::clone(&self.handler);
-        let mut expiry_rx = shutdown_rx.clone();
-        let expiry_interval = self.config.session_expiry_interval;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(expiry_interval);
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        handler_clone.expire_sessions();
-                    }
-                    _ = expiry_rx.changed() => break,
-                }
-            }
-        });
+        // Session expiry is handled by the Raft leader task (TAG_EXPIRE_GROUP_SESSIONS)
+        // — no local expiry loop needed here.
 
         let max_conns = self.config.max_connections;
         let read_buf_size = self.config.read_buffer_size;

@@ -33,8 +33,11 @@ pub struct ConsumerSession {
 }
 
 impl ConsumerSession {
-    pub fn new(consumer_id: u64, session_token: Bytes) -> Self {
-        let labels = [("consumer", consumer_id.to_string())];
+    pub fn new(consumer_id: u64, session_token: Bytes, catalog_name: &str) -> Self {
+        let labels = [
+            ("catalog", catalog_name.to_owned()),
+            ("consumer", consumer_id.to_string()),
+        ];
         Self {
             consumer_id,
             session_token,
@@ -185,7 +188,7 @@ mod tests {
     use crate::subscription::{ENTITY_TYPE_QUEUE, ENTITY_TYPE_TOPIC};
 
     fn make_session() -> ConsumerSession {
-        ConsumerSession::new(42, Bytes::from_static(b"token"))
+        ConsumerSession::new(42, Bytes::from_static(b"token"), "test")
     }
 
     fn topic_sub(sub_id: u32) -> SubscriptionState {

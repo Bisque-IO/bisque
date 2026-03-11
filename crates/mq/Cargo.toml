@@ -7,25 +7,30 @@ description = "Distributed messaging engine for bisque: topics, queues, actors, 
 license.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
+bincode = { workspace = true }
+bisque-mq-protocol = { workspace = true }
 bisque-raft = { workspace = true }
-openraft = { workspace = true, features = ["tokio-rt"] }
-tokio = { workspace = true, features = ["full"] }
+bytes = { workspace = true }
+chrono = { workspace = true }
+crc64fast-nvme = { workspace = true }
+cron = { workspace = true }
+crossfire = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
 libmdbx = { workspace = true }
+metrics = { workspace = true }
+openraft = { workspace = true, features = ["tokio-rt"] }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-bincode = { workspace = true }
-bytes = { workspace = true }
-metrics = { workspace = true }
-tracing = { workspace = true }
+smallvec = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
-parking_lot = { workspace = true }
-crossfire = { workspace = true }
-futures = { workspace = true }
-smallvec = { version = "1", features = ["serde"] }
-crc64fast-nvme = { workspace = true }
-dashmap = { workspace = true }
-cron = "0.15"
-chrono = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+
+[features]
+test-util = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

@@ -21,42 +21,8 @@ pub fn name_hash_bytes(b: &[u8]) -> u64 {
 }
 
 // =============================================================================
-// Message Payload
+// Delivered Message
 // =============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessagePayload {
-    #[serde(default)]
-    pub key: Option<Bytes>,
-    pub value: Bytes,
-    #[serde(default)]
-    pub headers: Vec<(String, Bytes)>,
-    pub timestamp: u64,
-    /// Per-message time-to-live in milliseconds.
-    /// If set, the message expires at `enqueue_time + ttl_ms` regardless of retries.
-    #[serde(default)]
-    pub ttl_ms: Option<u64>,
-    /// Routing key for exchange-based routing (AMQP/MQTT topic patterns).
-    #[serde(default)]
-    pub routing_key: Option<String>,
-    /// Topic name to publish a response to (request/response pattern).
-    #[serde(default)]
-    pub reply_to: Option<String>,
-    /// Client-specified correlation identifier for request/response matching.
-    #[serde(default)]
-    pub correlation_id: Option<String>,
-    /// Per-message delay in milliseconds before the message becomes eligible
-    /// for delivery. Overrides the queue-level `delay_default_ms` when set.
-    #[serde(default)]
-    pub delay_ms: Option<u64>,
-}
-
-impl MessagePayload {
-    /// Encode this payload into the flat binary format for raft log storage.
-    pub fn encode_flat(&self) -> Bytes {
-        crate::flat::FlatMessageBuilder::from(self).build()
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveredMessage {
@@ -219,7 +185,7 @@ pub struct QueueMessageMeta {
     #[serde(default)]
     pub dedup_key: Option<Bytes>,
     /// Absolute timestamp (ms) when this message expires regardless of retries.
-    /// Computed at enqueue time from `MessagePayload.ttl_ms`.
+    /// Computed at enqueue time from the flat message's `ttl_ms` field.
     #[serde(default)]
     pub expires_at: Option<u64>,
     /// Topic name to publish a response to on ACK (request/reply pattern).
@@ -230,6 +196,9 @@ pub struct QueueMessageMeta {
     /// Extracted from the flat message header at enqueue time (zero-copy `Bytes`).
     #[serde(default)]
     pub correlation_id: Option<Bytes>,
+    /// Value payload size in bytes, stored for byte-level accounting.
+    #[serde(default)]
+    pub value_len: u32,
 }
 
 // =============================================================================
@@ -397,6 +366,16 @@ impl MqCommand {
     pub const TAG_DISCONNECT_PRODUCER: u8 = 46;
     // -- Batch --
     pub const TAG_BATCH: u8 = 47;
+    // -- Consumer Groups --
+    pub const TAG_CREATE_CONSUMER_GROUP: u8 = 48;
+    pub const TAG_DELETE_CONSUMER_GROUP: u8 = 49;
+    pub const TAG_COMMIT_GROUP_OFFSET: u8 = 50;
+    pub const TAG_JOIN_CONSUMER_GROUP: u8 = 51;
+    pub const TAG_SYNC_CONSUMER_GROUP: u8 = 52;
+    pub const TAG_LEAVE_CONSUMER_GROUP: u8 = 53;
+    pub const TAG_HEARTBEAT_CONSUMER_GROUP: u8 = 54;
+    pub const TAG_EXPIRE_GROUP_OFFSETS: u8 = 55;
+    pub const TAG_EXPIRE_GROUP_SESSIONS: u8 = 56;
 }
 
 impl MqCommand {
@@ -477,6 +456,7 @@ pub enum EntityKind {
     Consumer,
     Exchange,
     Binding,
+    ConsumerGroup,
 }
 
 impl fmt::Display for EntityKind {
@@ -489,6 +469,7 @@ impl fmt::Display for EntityKind {
             Self::Consumer => f.write_str("consumer"),
             Self::Exchange => f.write_str("exchange"),
             Self::Binding => f.write_str("binding"),
+            Self::ConsumerGroup => f.write_str("consumer group"),
         }
     }
 }
@@ -501,6 +482,12 @@ pub enum MqError {
     AlreadyExists { entity: EntityKind, id: u64 },
     /// Actor mailbox is full
     MailboxFull { pending: u32 },
+    /// Generation mismatch on offset commit or heartbeat
+    IllegalGeneration,
+    /// A rebalance is in progress — consumer should re-join
+    RebalanceInProgress,
+    /// Unknown member ID in a consumer group operation
+    UnknownMemberId,
     /// Dynamic error message (escape hatch)
     Custom(String),
 }
@@ -513,6 +500,9 @@ impl fmt::Display for MqError {
                 write!(f, "{} already exists (id={})", entity, id)
             }
             Self::MailboxFull { pending } => write!(f, "mailbox full ({} messages)", pending),
+            Self::IllegalGeneration => f.write_str("illegal generation"),
+            Self::RebalanceInProgress => f.write_str("rebalance in progress"),
+            Self::UnknownMemberId => f.write_str("unknown member id"),
             Self::Custom(msg) => f.write_str(msg),
         }
     }
@@ -533,10 +523,31 @@ pub enum MqResponse {
         messages: SmallVec<[DeliveredMessage; 8]>,
     },
     Published {
-        offsets: SmallVec<[u64; 16]>,
+        /// First dense offset assigned.
+        base_offset: u64,
+        /// Number of messages published.
+        count: u64,
     },
     Stats(EntityStats),
     BatchResponse(Vec<MqResponse>),
+    /// Consumer group join completed (or partially — check `phase_complete`).
+    GroupJoined {
+        generation: i32,
+        leader: String,
+        member_id: String,
+        protocol_name: String,
+        is_leader: bool,
+        /// `(member_id, protocol_metadata)` — only populated for the leader.
+        members: Vec<(String, Bytes)>,
+        /// `true` if all members joined and generation was bumped.
+        phase_complete: bool,
+    },
+    /// Consumer group sync completed.
+    GroupSynced {
+        assignment: Vec<u8>,
+        /// `true` if group transitioned to `Stable`.
+        phase_complete: bool,
+    },
     /// Messages were dead-lettered. The caller (background timer) should read
     /// the original message bytes from the raft log and issue `PublishToDlq`.
     DeadLettered {
@@ -554,8 +565,25 @@ impl fmt::Display for MqResponse {
             Self::Error(e) => write!(f, "Error({})", e),
             Self::EntityCreated { id } => write!(f, "EntityCreated({})", id),
             Self::Messages { messages } => write!(f, "Messages(count={})", messages.len()),
-            Self::Published { offsets } => write!(f, "Published(count={})", offsets.len()),
+            Self::Published { base_offset, count } => {
+                write!(f, "Published(base={base_offset}, count={count})")
+            }
             Self::Stats(_) => write!(f, "Stats"),
+            Self::GroupJoined {
+                generation,
+                member_id,
+                is_leader,
+                phase_complete,
+                ..
+            } => {
+                write!(
+                    f,
+                    "GroupJoined(gen={generation}, member={member_id}, leader={is_leader}, complete={phase_complete})"
+                )
+            }
+            Self::GroupSynced { phase_complete, .. } => {
+                write!(f, "GroupSynced(complete={phase_complete})")
+            }
             Self::BatchResponse(resps) => write!(f, "BatchResponse(count={})", resps.len()),
             Self::DeadLettered {
                 dead_letter_ids,
@@ -586,6 +614,8 @@ pub struct MqSnapshotData {
     pub producers: Vec<ProducerSnapshot>,
     #[serde(default)]
     pub exchanges: Vec<ExchangeSnapshot>,
+    #[serde(default)]
+    pub consumer_groups: Vec<crate::consumer_group::ConsumerGroupSnapshot>,
     pub next_id: u64,
     /// Manifest of raft log segment files the follower needs to sync.
     #[serde(default)]
@@ -702,39 +732,17 @@ mod tests {
             format!(
                 "{}",
                 MqResponse::Published {
-                    offsets: smallvec::smallvec![1u64, 2, 3]
+                    base_offset: 1,
+                    count: 3,
                 }
             ),
-            "Published(count=3)"
+            "Published(base=1, count=3)"
         );
     }
 
     // =========================================================================
     // Serde roundtrips
     // =========================================================================
-
-    #[test]
-    fn test_message_payload_serde() {
-        let payload = MessagePayload {
-            key: Some(Bytes::from_static(b"key")),
-            value: Bytes::from_static(b"value"),
-            headers: vec![("h1".to_string(), Bytes::from_static(b"v1"))],
-            timestamp: 12345,
-            ttl_ms: None,
-            routing_key: None,
-            reply_to: None,
-            correlation_id: None,
-            delay_ms: None,
-        };
-        let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
-        let (decoded, _): (MessagePayload, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-
-        assert_eq!(decoded.key.as_deref(), Some(&b"key"[..]));
-        assert_eq!(decoded.value.as_ref(), b"value");
-        assert_eq!(decoded.headers.len(), 1);
-        assert_eq!(decoded.timestamp, 12345);
-    }
 
     #[test]
     fn test_retention_policy_serde() {
@@ -775,6 +783,7 @@ mod tests {
             expires_at: Some(60000),
             reply_to: Some(Bytes::from_static(b"reply-topic")),
             correlation_id: Some(Bytes::from_static(b"corr-123")),
+            value_len: 256,
         };
         let bytes = bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap();
         let (decoded, _): (QueueMessageMeta, _) =
@@ -878,6 +887,7 @@ mod tests {
             file_manifest: Vec::new(),
             sync_addr: None,
             exchanges: Vec::new(),
+            consumer_groups: Vec::new(),
         };
         let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
         let (decoded, _): (MqSnapshotData, _) =
