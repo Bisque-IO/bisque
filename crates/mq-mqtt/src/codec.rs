@@ -55,6 +55,8 @@ pub enum CodecError {
     DuplicateProperty(u8),
     #[error("invalid property value for property id: {0}")]
     InvalidPropertyValue(u8),
+    #[error("protocol error")]
+    ProtocolError,
 }
 
 // =============================================================================
@@ -297,9 +299,13 @@ fn write_mqtt_bytes(data: &[u8], buf: &mut BytesMut) {
 // =============================================================================
 
 /// Read a variable byte integer (used for property lengths in MQTT 5.0).
+///
+/// MQTT 5.0 SS 1.5.5-1: The encoded value MUST use the minimum number of bytes
+/// necessary. Non-minimal encodings are treated as malformed.
 fn read_variable_int(buf: &mut &[u8]) -> Result<u32, CodecError> {
     let mut multiplier: u32 = 1;
     let mut value: u32 = 0;
+    let mut bytes_used: u32 = 0;
 
     for _ in 0..4 {
         if !buf.has_remaining() {
@@ -307,7 +313,21 @@ fn read_variable_int(buf: &mut &[u8]) -> Result<u32, CodecError> {
         }
         let byte = buf.get_u8();
         value += (byte as u32 & 0x7F) * multiplier;
+        bytes_used += 1;
         if byte & 0x80 == 0 {
+            // Validate minimum encoding: check that the value could not fit in fewer bytes.
+            let min_bytes = if value < 128 {
+                1
+            } else if value < 16_384 {
+                2
+            } else if value < 2_097_152 {
+                3
+            } else {
+                4
+            };
+            if bytes_used > min_bytes {
+                return Err(CodecError::MalformedRemainingLength);
+            }
             return Ok(value);
         }
         multiplier *= 128;
@@ -779,6 +799,18 @@ pub fn decode_packet(buf: &[u8]) -> Result<(MqttPacket, usize), CodecError> {
         PacketType::Auth => decode_auth(&mut cursor, remaining_length)?,
     };
 
+    // MQTT 5.0: Validate no trailing bytes in the packet payload.
+    // Some packet types (DISCONNECT, AUTH) may legitimately consume fewer bytes
+    // when remaining_length is 0, but for all others the cursor should be empty.
+    if !cursor.is_empty()
+        && !matches!(
+            packet_type,
+            PacketType::Disconnect | PacketType::Auth | PacketType::Publish
+        )
+    {
+        return Err(CodecError::ProtocolError);
+    }
+
     Ok((packet, total_size))
 }
 
@@ -878,6 +910,10 @@ fn decode_publish_zero_copy_v(
             return Err(CodecError::UnexpectedEof);
         }
         let id = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        // GAP-1: MQTT 3.1.1 SS 2.3.1 — packet identifier must be non-zero.
+        if id == 0 {
+            return Err(CodecError::ProtocolError);
+        }
         pos += 2;
         Some(id)
     } else {
@@ -1048,7 +1084,12 @@ fn decode_publish_v(buf: &mut &[u8], flags: u8, is_v5: bool) -> Result<MqttPacke
         if buf.remaining() < 2 {
             return Err(CodecError::UnexpectedEof);
         }
-        Some(buf.get_u16())
+        let id = buf.get_u16();
+        // GAP-1: MQTT 3.1.1 SS 2.3.1 — packet identifier must be non-zero.
+        if id == 0 {
+            return Err(CodecError::ProtocolError);
+        }
+        Some(id)
     } else {
         None
     };
@@ -1193,6 +1234,10 @@ fn decode_subscribe_v(buf: &mut &[u8], is_v5: bool) -> Result<MqttPacket, CodecE
         return Err(CodecError::UnexpectedEof);
     }
     let packet_id = buf.get_u16();
+    // GAP-1: MQTT 3.1.1 §2.3.1 — packet identifier must be non-zero.
+    if packet_id == 0 {
+        return Err(CodecError::ProtocolError);
+    }
 
     // MQTT 5.0 properties sit between packet_id and topic filters.
     let properties = if is_v5 {
@@ -1201,6 +1246,11 @@ fn decode_subscribe_v(buf: &mut &[u8], is_v5: bool) -> Result<MqttPacket, CodecE
         Properties::default()
     };
 
+    // GAP-5: MQTT 3.1.1 §3.8.3-3 — SUBSCRIBE must contain at least one topic filter.
+    if !buf.has_remaining() {
+        return Err(CodecError::ProtocolError);
+    }
+
     let mut filters = SmallVec::new();
     while buf.has_remaining() {
         let filter = read_mqtt_string(buf)?;
@@ -1208,6 +1258,10 @@ fn decode_subscribe_v(buf: &mut &[u8], is_v5: bool) -> Result<MqttPacket, CodecE
             return Err(CodecError::UnexpectedEof);
         }
         let options_byte = buf.get_u8();
+        // GAP-6: MQTT 3.1.1 §3.8.3-4 — reserved bits [7:2] of options byte must be zero in v3.1.1.
+        if !is_v5 && (options_byte & 0xFC) != 0 {
+            return Err(CodecError::ProtocolError);
+        }
         let qos = QoS::from_u8(options_byte & 0x03).ok_or(CodecError::InvalidQoS(options_byte))?;
         let no_local = options_byte & 0x04 != 0;
         let retain_as_published = options_byte & 0x08 != 0;
@@ -1266,12 +1320,21 @@ fn decode_unsubscribe_v(buf: &mut &[u8], is_v5: bool) -> Result<MqttPacket, Code
         return Err(CodecError::UnexpectedEof);
     }
     let packet_id = buf.get_u16();
+    // GAP-1: MQTT 3.1.1 §2.3.1 — packet identifier must be non-zero.
+    if packet_id == 0 {
+        return Err(CodecError::ProtocolError);
+    }
 
     let properties = if is_v5 {
         read_properties(buf)?
     } else {
         Properties::default()
     };
+
+    // GAP-7: MQTT 3.1.1 §3.10.3-2 — UNSUBSCRIBE must contain at least one topic filter.
+    if !buf.has_remaining() {
+        return Err(CodecError::ProtocolError);
+    }
 
     let mut filters = SmallVec::new();
     while buf.has_remaining() {
@@ -4249,5 +4312,211 @@ mod tests {
             }
             other => panic!("expected ConnAck, got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // MQTT 3.1.1 Conformance Tests (GAP fixes)
+    // =========================================================================
+
+    /// Helper: build a raw MQTT packet from a type/flags nibble and payload.
+    fn build_raw_packet(type_nibble: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push((type_nibble << 4) | (flags & 0x0F));
+        // Encode remaining length.
+        let mut len = payload.len();
+        loop {
+            let mut byte = (len & 0x7F) as u8;
+            len >>= 7;
+            if len > 0 {
+                byte |= 0x80;
+            }
+            buf.push(byte);
+            if len == 0 {
+                break;
+            }
+        }
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    // GAP-1: Zero packet ID must be rejected.
+
+    #[test]
+    fn test_gap1_publish_qos1_zero_packet_id_rejected() {
+        // PUBLISH QoS 1, topic "a", packet_id=0
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x01, b'a']); // topic len + topic
+        payload.extend_from_slice(&[0x00, 0x00]); // packet_id = 0
+        // flags: QoS 1 = 0x02
+        let raw = build_raw_packet(3, 0x02, &payload);
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::ProtocolError)),
+            "zero packet ID in QoS 1 PUBLISH should be rejected, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gap1_subscribe_zero_packet_id_rejected() {
+        // SUBSCRIBE: packet_id=0, one filter "a" with QoS 0
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00]); // packet_id = 0
+        payload.extend_from_slice(&[0x00, 0x01, b'a']); // filter "a"
+        payload.push(0x00); // QoS 0
+        // SUBSCRIBE type=8, flags=0x02 (required)
+        let raw = build_raw_packet(8, 0x02, &payload);
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::ProtocolError)),
+            "zero packet ID in SUBSCRIBE should be rejected, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gap1_unsubscribe_zero_packet_id_rejected() {
+        // UNSUBSCRIBE: packet_id=0, one filter "a"
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x00]); // packet_id = 0
+        payload.extend_from_slice(&[0x00, 0x01, b'a']); // filter "a"
+        // UNSUBSCRIBE type=10, flags=0x02 (required)
+        let raw = build_raw_packet(10, 0x02, &payload);
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::ProtocolError)),
+            "zero packet ID in UNSUBSCRIBE should be rejected, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gap1_valid_nonzero_packet_ids_accepted() {
+        // SUBSCRIBE with packet_id=1 should decode fine.
+        let subscribe = MqttPacket::Subscribe(Subscribe {
+            packet_id: 1,
+            filters: smallvec![TopicFilter {
+                filter: "test/topic".to_string(),
+                qos: QoS::AtLeastOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            }],
+            properties: Properties::default(),
+        });
+        let mut buf = BytesMut::new();
+        encode_packet(&subscribe, &mut buf);
+        let (decoded, _) = decode_packet(&buf).unwrap();
+        match decoded {
+            MqttPacket::Subscribe(s) => assert_eq!(s.packet_id, 1),
+            other => panic!("expected Subscribe, got {:?}", other),
+        }
+    }
+
+    // GAP-5: Empty SUBSCRIBE payload must be rejected.
+
+    #[test]
+    fn test_gap5_subscribe_empty_payload_rejected() {
+        // SUBSCRIBE with packet_id=1 but no topic filters.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x01]); // packet_id = 1
+        // No filters follow.
+        let raw = build_raw_packet(8, 0x02, &payload);
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::ProtocolError)),
+            "empty SUBSCRIBE payload should be rejected, got {:?}",
+            result
+        );
+    }
+
+    // GAP-6: V3.1.1 SUBSCRIBE options byte reserved bits must be zero.
+
+    #[test]
+    fn test_gap6_subscribe_v311_reserved_bits_rejected() {
+        // SUBSCRIBE with reserved bits set in options byte (0x04 = no_local, v5 only).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x01]); // packet_id = 1
+        payload.extend_from_slice(&[0x00, 0x01, b'a']); // filter "a"
+        payload.push(0x04); // no_local bit set — invalid in v3.1.1
+        let raw = build_raw_packet(8, 0x02, &payload);
+        // decode_packet uses the v3.1.1 path (is_v5=false).
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::ProtocolError)),
+            "v3.1.1 SUBSCRIBE with reserved bits should be rejected, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gap6_subscribe_v311_valid_qos_accepted() {
+        // SUBSCRIBE with valid QoS 2 (options byte 0x02) should succeed.
+        let subscribe = MqttPacket::Subscribe(Subscribe {
+            packet_id: 1,
+            filters: smallvec![TopicFilter {
+                filter: "a".to_string(),
+                qos: QoS::ExactlyOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            }],
+            properties: Properties::default(),
+        });
+        let mut buf = BytesMut::new();
+        encode_packet(&subscribe, &mut buf);
+        assert!(decode_packet(&buf).is_ok());
+    }
+
+    // GAP-7: Empty UNSUBSCRIBE payload must be rejected.
+
+    #[test]
+    fn test_gap7_unsubscribe_empty_payload_rejected() {
+        // UNSUBSCRIBE with packet_id=1 but no topic filters.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x01]); // packet_id = 1
+        // No filters follow.
+        let raw = build_raw_packet(10, 0x02, &payload);
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::ProtocolError)),
+            "empty UNSUBSCRIBE payload should be rejected, got {:?}",
+            result
+        );
+    }
+
+    // GAP-1: Zero-copy PUBLISH path also rejects zero packet IDs.
+
+    #[test]
+    fn test_gap1_publish_zero_copy_qos1_zero_packet_id_rejected() {
+        // PUBLISH QoS 1, topic "a", packet_id=0 — via the Bytes path.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x01, b'a']); // topic
+        payload.extend_from_slice(&[0x00, 0x00]); // packet_id = 0
+        let raw = build_raw_packet(3, 0x02, &payload);
+        let buf = Bytes::from(raw);
+        let result = decode_packet_from_bytes(&buf);
+        assert!(
+            matches!(result, Err(CodecError::ProtocolError)),
+            "zero-copy path: zero packet ID in QoS 1 PUBLISH should be rejected, got {:?}",
+            result
+        );
+    }
+
+    // Versioned path: zero packet ID in QoS 2 PUBLISH.
+
+    #[test]
+    fn test_gap1_publish_qos2_zero_packet_id_rejected() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x01, b'a']); // topic
+        payload.extend_from_slice(&[0x00, 0x00]); // packet_id = 0
+        // flags: QoS 2 = 0x04
+        let raw = build_raw_packet(3, 0x04, &payload);
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::ProtocolError)),
+            "zero packet ID in QoS 2 PUBLISH should be rejected, got {:?}",
+            result
+        );
     }
 }

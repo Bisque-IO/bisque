@@ -155,7 +155,7 @@ pub const SASL_HEADER: [u8; 8] = [b'A', b'M', b'Q', b'P', 3, 1, 0, 0];
 /// Minimum frame size (8-byte header).
 pub const MIN_FRAME_SIZE: u32 = 512;
 /// Default max frame size.
-pub const DEFAULT_MAX_FRAME_SIZE: u32 = 65536;
+pub const DEFAULT_MAX_FRAME_SIZE: u32 = u32::MAX;
 /// Default channel max.
 pub const DEFAULT_CHANNEL_MAX: u16 = 255;
 /// Default idle timeout in milliseconds (0 = disabled).
@@ -185,6 +185,14 @@ pub enum AmqpValue {
     Long(i64),
     Float(f32),
     Double(f64),
+    /// IEEE 754-2008 decimal32 (opaque 4 bytes).
+    Decimal32([u8; 4]),
+    /// IEEE 754-2008 decimal64 (opaque 8 bytes).
+    Decimal64([u8; 8]),
+    /// IEEE 754-2008 decimal128 (opaque 16 bytes).
+    Decimal128([u8; 16]),
+    /// UTF-32BE Unicode character.
+    Char(char),
     /// Milliseconds since Unix epoch.
     Timestamp(i64),
     Uuid([u8; 16]),
@@ -314,6 +322,10 @@ impl fmt::Display for AmqpValue {
             Self::Long(v) => write!(f, "{v}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::Double(v) => write!(f, "{v}"),
+            Self::Decimal32(v) => write!(f, "decimal32({v:02x?})"),
+            Self::Decimal64(v) => write!(f, "decimal64({v:02x?})"),
+            Self::Decimal128(v) => write!(f, "decimal128({v:02x?})"),
+            Self::Char(v) => write!(f, "char({v})"),
             Self::Timestamp(v) => write!(f, "timestamp({v})"),
             Self::Uuid(v) => write!(f, "uuid({v:02x?})"),
             Self::Binary(v) => write!(f, "binary({})", v.len()),
@@ -375,6 +387,12 @@ pub mod descriptor {
 
     // Error
     pub const ERROR: u64 = 0x0000_0000_0000_001D;
+
+    // Lifetime policies for dynamic nodes
+    pub const DELETE_ON_CLOSE: u64 = 0x0000_0000_0000_002B;
+    pub const DELETE_ON_NO_LINKS: u64 = 0x0000_0000_0000_002C;
+    pub const DELETE_ON_NO_MESSAGES: u64 = 0x0000_0000_0000_002D;
+    pub const DELETE_ON_NO_LINKS_OR_MESSAGES: u64 = 0x0000_0000_0000_002E;
 }
 
 // =============================================================================
@@ -544,6 +562,7 @@ pub struct Source {
     pub expiry_policy: Option<WireString>,
     pub timeout: u32,
     pub dynamic: bool,
+    pub dynamic_node_properties: Option<AmqpValue>,
     pub distribution_mode: Option<WireString>,
     pub filter: Option<AmqpValue>,
     pub default_outcome: Option<AmqpValue>,
@@ -559,6 +578,7 @@ pub struct Target {
     pub expiry_policy: Option<WireString>,
     pub timeout: u32,
     pub dynamic: bool,
+    pub dynamic_node_properties: Option<AmqpValue>,
     pub capabilities: SmallVec<[WireString; 4]>,
 }
 
@@ -578,6 +598,8 @@ pub struct Attach {
     pub offered_capabilities: SmallVec<[WireString; 4]>,
     pub desired_capabilities: SmallVec<[WireString; 4]>,
     pub properties: Option<AmqpValue>,
+    /// Gap X1: True if the target is a Coordinator (descriptor 0x30).
+    pub coordinator_target: Option<Coordinator>,
 }
 
 impl Default for Attach {
@@ -597,6 +619,7 @@ impl Default for Attach {
             offered_capabilities: SmallVec::new(),
             desired_capabilities: SmallVec::new(),
             properties: None,
+            coordinator_target: None,
         }
     }
 }
@@ -701,6 +724,10 @@ pub enum DeliveryState {
     },
     /// Transactional delivery state (descriptor 0x34).
     Transactional(TransactionalState),
+    /// Declared outcome (descriptor 0x33) — response to a txn Declare.
+    Declared {
+        txn_id: Bytes,
+    },
 }
 
 // =============================================================================
@@ -767,6 +794,21 @@ pub mod condition {
     pub const SESSION_ERRANT_LINK: &str = "amqp:session:errant-link";
     pub const SESSION_HANDLE_IN_USE: &str = "amqp:session:handle-in-use";
     pub const SESSION_UNATTACHED_HANDLE: &str = "amqp:session:unattached-handle";
+
+    // Missing spec-required error conditions (Gap E1)
+    pub const FRAME_SIZE_TOO_SMALL: &str = "amqp:frame-size-too-small";
+    pub const UNKNOWN_ERROR: &str = "amqp:unknown-error";
+    pub const POLICY_VIOLATION: &str = "amqp:policy-violation";
+    pub const CONNECTION_REDIRECT: &str = "amqp:connection:redirect";
+    pub const CONNECTION_RESET: &str = "amqp:connection:reset";
+    pub const SESSION_UNDECLARED_LINK_HANDLE: &str = "amqp:session:undeclared-link-handle";
+    pub const LINK_SOURCE_RANK_TOO_HIGH: &str = "amqp:link:source-rank-too-high";
+    pub const LINK_AMBIGUOUS_COMMIT: &str = "amqp:link:ambiguous-commit";
+
+    // Transaction error conditions (Gap X2)
+    pub const TXN_UNKNOWN_ID: &str = "amqp:transaction:unknown-id";
+    pub const TXN_ROLLBACK: &str = "amqp:transaction:rollback";
+    pub const TXN_TIMEOUT: &str = "amqp:transaction:timeout";
 }
 
 // =============================================================================
@@ -912,6 +954,81 @@ pub struct AmqpMessage {
     pub application_properties: Option<AmqpValue>,
     pub body: SmallVec<[Bytes; 1]>,
     pub footer: Option<AmqpValue>,
+}
+
+// =============================================================================
+// Lifetime Policies (AMQP 1.0 Section 3.5.9-3.5.12)
+// =============================================================================
+
+/// Lifetime policy for dynamically created nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifetimePolicy {
+    /// Delete the node when the link that created it is closed.
+    DeleteOnClose,
+    /// Delete the node when it has no links.
+    DeleteOnNoLinks,
+    /// Delete the node when it has no messages.
+    DeleteOnNoMessages,
+    /// Delete the node when it has no links or messages.
+    DeleteOnNoLinksOrMessages,
+}
+
+impl LifetimePolicy {
+    /// Get the descriptor code for this lifetime policy.
+    pub fn descriptor(&self) -> u64 {
+        match self {
+            Self::DeleteOnClose => descriptor::DELETE_ON_CLOSE,
+            Self::DeleteOnNoLinks => descriptor::DELETE_ON_NO_LINKS,
+            Self::DeleteOnNoMessages => descriptor::DELETE_ON_NO_MESSAGES,
+            Self::DeleteOnNoLinksOrMessages => descriptor::DELETE_ON_NO_LINKS_OR_MESSAGES,
+        }
+    }
+
+    /// Parse from a descriptor code.
+    pub fn from_descriptor(d: u64) -> Option<Self> {
+        match d {
+            descriptor::DELETE_ON_CLOSE => Some(Self::DeleteOnClose),
+            descriptor::DELETE_ON_NO_LINKS => Some(Self::DeleteOnNoLinks),
+            descriptor::DELETE_ON_NO_MESSAGES => Some(Self::DeleteOnNoMessages),
+            descriptor::DELETE_ON_NO_LINKS_OR_MESSAGES => Some(Self::DeleteOnNoLinksOrMessages),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// Message State Machine (AMQP 1.0 Section 3.4)
+// =============================================================================
+
+/// Node-level message state (AMQP 1.0 Section 3.4).
+///
+/// State transitions driven by terminal delivery outcomes:
+/// - `AVAILABLE` → `ACQUIRED` (transfer to consumer)
+/// - `ACQUIRED` → `ARCHIVED` (Accepted or Rejected)
+/// - `ACQUIRED` → `AVAILABLE` (Released or Modified)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageState {
+    /// Message is available for acquisition by a consumer.
+    Available,
+    /// Message has been transferred to a consumer but not yet settled.
+    Acquired,
+    /// Message has been terminally settled (Accepted/Rejected) and archived.
+    Archived,
+}
+
+impl MessageState {
+    /// Compute the next state given a terminal delivery outcome.
+    pub fn transition(self, outcome: &DeliveryState) -> Self {
+        match outcome {
+            DeliveryState::Accepted | DeliveryState::Rejected { .. } => Self::Archived,
+            DeliveryState::Released => Self::Available,
+            DeliveryState::Modified { .. } => Self::Available,
+            // Received is not terminal; Transactional defers to discharge
+            DeliveryState::Received { .. } => self,
+            DeliveryState::Transactional(_) => self,
+            DeliveryState::Declared { .. } => self,
+        }
+    }
 }
 
 // =============================================================================

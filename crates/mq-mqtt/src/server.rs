@@ -19,10 +19,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
+use dashmap::DashMap;
+
 use crate::codec::{self, CodecError};
 use crate::session::{MqttSession, MqttSessionConfig, PublishPlan, RetainedPlan, SubscribePlan};
 use crate::session_store::{self, SessionStore};
 use crate::types::{MqttPacket, ProtocolVersion, QoS};
+
+/// Registry of active MQTT sessions keyed by client_id.
+/// Used for session takeover: when a new connection arrives with the same
+/// client_id, we send a shutdown signal to the old connection (MQTT 5.0 SS 3.1.4).
+type ActiveSessions = Arc<DashMap<String, tokio::sync::oneshot::Sender<()>>>;
+
+/// Registry of pending delayed will messages keyed by client_id.
+/// On reconnect, the pending will is cancelled (MQTT 5.0 SS 3.1.2.11.2).
+type PendingWills = Arc<DashMap<String, tokio::task::JoinHandle<()>>>;
 
 // =============================================================================
 // Pre-initialized Metrics (OnceLock pattern — zero cost after first init)
@@ -157,6 +168,8 @@ pub struct MqttServer {
     log_reader: Arc<MqReader>,
     stats: Arc<MqttServerStats>,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    active_sessions: ActiveSessions,
+    pending_wills: PendingWills,
 }
 
 impl MqttServer {
@@ -175,6 +188,8 @@ impl MqttServer {
             log_reader,
             stats: Arc::new(MqttServerStats::new()),
             shutdown_tx: None,
+            active_sessions: Arc::new(DashMap::new()),
+            pending_wills: Arc::new(DashMap::new()),
         }
     }
 
@@ -197,6 +212,8 @@ impl MqttServer {
         let batcher = Arc::clone(&self.batcher);
         let log_reader = Arc::clone(&self.log_reader);
         let stats = Arc::clone(&self.stats);
+        let active_sessions = Arc::clone(&self.active_sessions);
+        let pending_wills = Arc::clone(&self.pending_wills);
 
         let handle = tokio::spawn(accept_loop(
             listener,
@@ -205,6 +222,8 @@ impl MqttServer {
             log_reader,
             stats,
             shutdown_rx,
+            active_sessions,
+            pending_wills,
         ));
 
         Ok(handle)
@@ -229,6 +248,8 @@ async fn accept_loop(
     log_reader: Arc<MqReader>,
     stats: Arc<MqttServerStats>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    active_sessions: ActiveSessions,
+    pending_wills: PendingWills,
 ) {
     // Periodic session expiry sweep (every 60 seconds).
     let mut expiry_interval = tokio::time::interval(Duration::from_secs(60));
@@ -252,6 +273,8 @@ async fn accept_loop(
                         let batcher = Arc::clone(&batcher);
                         let log_reader = Arc::clone(&log_reader);
                         let stats = Arc::clone(&stats);
+                        let active_sessions = Arc::clone(&active_sessions);
+                        let pending_wills = Arc::clone(&pending_wills);
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(
@@ -261,6 +284,8 @@ async fn accept_loop(
                                 &batcher,
                                 &log_reader,
                                 &stats,
+                                &active_sessions,
+                                &pending_wills,
                             ).await {
                                 debug!(peer = %peer_addr, error = %e, "connection closed with error");
                             }
@@ -604,6 +629,9 @@ struct SubDeliveryInfo {
     max_qos: QoS,
     no_local: bool,
     retain_as_published: bool,
+    /// GAP-8: True if the subscription filter starts with a wildcard (+ or #).
+    /// Topics starting with $ must not be delivered to such subscriptions.
+    filter_starts_with_wildcard: bool,
 }
 
 /// Extract the publisher session ID from a FlatMessage header.
@@ -652,12 +680,14 @@ async fn deliver_outbound(
     sub_buf.extend(
         session
             .subscriptions_iter()
-            .filter_map(|(_filter, mapping)| {
+            .filter_map(|(filter, mapping)| {
                 mapping.queue_id.map(|qid| SubDeliveryInfo {
                     queue_id: qid,
                     max_qos: mapping.max_qos,
                     no_local: mapping.no_local,
                     retain_as_published: mapping.retain_as_published,
+                    // GAP-8: Check if filter starts with wildcard character.
+                    filter_starts_with_wildcard: filter.starts_with('+') || filter.starts_with('#'),
                 })
             }),
     );
@@ -670,6 +700,7 @@ async fn deliver_outbound(
         max_qos,
         no_local,
         retain_as_published,
+        filter_starts_with_wildcard,
     } in sub_buf.iter()
     {
         if session.is_inflight_full() {
@@ -702,6 +733,24 @@ async fn deliver_outbound(
 
                 for flat_bytes in flat_messages_buf.iter() {
                     if let Some(flat) = FlatMessage::new(flat_bytes.clone()) {
+                        // GAP-8: $-topic filtering (MQTT 3.1.1 SS 4.7.2).
+                        // Topics starting with $ must not be delivered to subscriptions
+                        // whose filter starts with a wildcard (+ or #).
+                        if filter_starts_with_wildcard {
+                            if let Some(topic) = flat.routing_key() {
+                                if topic.first() == Some(&b'$') {
+                                    let _ = batcher
+                                        .submit(MqCommand::ack(
+                                            queue_id,
+                                            &[delivered.message_id],
+                                            None,
+                                        ))
+                                        .await;
+                                    continue;
+                                }
+                            }
+                        }
+
                         // No Local enforcement (M6): skip messages published by this session.
                         if no_local {
                             if let Some(pub_session_id) = extract_publisher_session_id(&flat) {
@@ -749,13 +798,16 @@ async fn deliver_outbound(
                             None
                         };
 
+                        // GAP-4: Set DUP=1 on first delivery after session resume.
+                        let dup = session.session_resumed && max_qos != QoS::AtMostOnce;
+
                         // Maximum Packet Size enforcement — outbound (M10).
                         let buf_before = write_buf.len();
                         codec::encode_publish_from_flat(
                             &flat,
                             max_qos,
                             retain_flag,
-                            false,
+                            dup,
                             packet_id,
                             is_v5,
                             subscription_id,
@@ -788,6 +840,12 @@ async fn deliver_outbound(
         }
     }
 
+    // GAP-4: Clear session_resumed after first delivery cycle so subsequent
+    // deliveries don't set DUP=1.
+    if session.session_resumed {
+        session.session_resumed = false;
+    }
+
     // Batch write: flush all encoded packets in a single write_all.
     if !write_buf.is_empty() {
         let len = write_buf.len();
@@ -811,6 +869,8 @@ async fn handle_connection(
     batcher: &Arc<MqWriteBatcher>,
     log_reader: &Arc<MqReader>,
     stats: &Arc<MqttServerStats>,
+    active_sessions: &ActiveSessions,
+    pending_wills: &PendingWills,
 ) -> Result<(), ConnectionError> {
     let mut read_buf = BytesMut::with_capacity(config.read_buffer_size);
     // Reusable write buffer — cleared between uses, never re-allocated.
@@ -831,6 +891,21 @@ async fn handle_connection(
                     return Ok(packet);
                 }
                 Err(CodecError::Incomplete) => continue,
+                // GAP-2: Unsupported protocol version → send CONNACK 0x01 before disconnect.
+                Err(CodecError::UnsupportedProtocolVersion(_)) => {
+                    let connack = MqttPacket::ConnAck(crate::types::ConnAck {
+                        session_present: false,
+                        return_code: crate::types::ConnectReturnCode::UnacceptableProtocolVersion
+                            as u8,
+                        properties: crate::types::Properties::default(),
+                    });
+                    write_buf.clear();
+                    codec::encode_packet(&connack, &mut write_buf);
+                    let _ = stream.write_all(&write_buf).await;
+                    return Err(ConnectionError::Codec(
+                        CodecError::UnsupportedProtocolVersion(0),
+                    ));
+                }
                 Err(e) => return Err(ConnectionError::Codec(e)),
             }
         }
@@ -859,6 +934,8 @@ async fn handle_connection(
                 );
                 // Re-create subscriptions from persisted state.
                 restore_plans = session.restore_subscriptions(&persisted.subscriptions);
+                // GAP-4: Mark session as resumed so outbound deliveries set DUP=1.
+                session.session_resumed = true;
             }
         }
     } else if let Some(ref store) = config.session_store {
@@ -878,16 +955,21 @@ async fn handle_connection(
         }
     }
 
+    // Collect pending retransmits before sending CONNACK (MQTT 5.0 SS 4.4).
+    let retransmits = if session_resumed {
+        session.pending_retransmits()
+    } else {
+        smallvec::SmallVec::new()
+    };
+
     // Send CONNACK using reusable write buffer (version-aware encoding).
-    // Patch session_present if we actually found a persisted session.
+    // GAP-3: Patch session_present based on whether a stored session was actually found.
+    // - session_resumed=true  → session_present=true  (stored session exists)
+    // - session_resumed=false → session_present=false  (no stored session, even if CleanSession=0)
     for response in responses {
-        let response = if session_resumed {
-            if let MqttPacket::ConnAck(mut connack) = response {
-                connack.session_present = true;
-                MqttPacket::ConnAck(connack)
-            } else {
-                response
-            }
+        let response = if let MqttPacket::ConnAck(mut connack) = response {
+            connack.session_present = session_resumed;
+            MqttPacket::ConnAck(connack)
         } else {
             response
         };
@@ -902,11 +984,51 @@ async fn handle_connection(
         .total_packets_received
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    // Send pending retransmits after CONNACK (MQTT 5.0 SS 4.4).
+    if !retransmits.is_empty() {
+        debug!(
+            client_id = %session.client_id,
+            count = retransmits.len(),
+            "retransmitting pending QoS messages on session resume"
+        );
+        send_packets(
+            &mut stream,
+            &retransmits,
+            stats,
+            &mut write_buf,
+            session.protocol_version,
+        )
+        .await?;
+    }
+
     info!(
         peer = %peer_addr,
         client_id = %session.client_id,
         "MQTT client connected"
     );
+
+    // Session Takeover (MQTT 5.0 SS 3.1.4): if another connection with the same
+    // ClientID exists, signal it to disconnect with reason 0x8E (Session Taken Over).
+    if let Some((_, old_tx)) = active_sessions.remove(&session.client_id) {
+        debug!(
+            client_id = %session.client_id,
+            "session takeover: signaling old connection to disconnect"
+        );
+        let _ = old_tx.send(());
+    }
+
+    // Cancel any pending delayed will from a previous connection (MQTT 5.0 SS 3.1.2.11.2).
+    if let Some((_, handle)) = pending_wills.remove(&session.client_id) {
+        debug!(
+            client_id = %session.client_id,
+            "cancelling pending delayed will on reconnect"
+        );
+        handle.abort();
+    }
+
+    // Register this connection in the active sessions registry.
+    let (takeover_tx, takeover_rx) = tokio::sync::oneshot::channel::<()>();
+    active_sessions.insert(session.client_id.clone(), takeover_tx);
 
     // Main bidirectional loop.
     let result = connection_loop(
@@ -919,8 +1041,14 @@ async fn handle_connection(
         &mut write_buf,
         config.delivery_poll_ms,
         config.delivery_batch_size,
+        takeover_rx,
     )
     .await;
+
+    // Remove from active sessions on disconnect.
+    // The entry might already have been replaced by a new connection (takeover),
+    // so this is a best-effort cleanup.
+    active_sessions.remove(&session.client_id);
 
     // Handle disconnect.
     match &result {
@@ -929,12 +1057,37 @@ async fn handle_connection(
         }
         Err(_) => {
             // Unclean disconnect.
+            let will_delay = session.will_delay_interval();
             let (will_plan, commands) = session.handle_unclean_disconnect();
 
             // Publish will message if present.
             if let Some(plan) = will_plan {
-                if let Err(e) = orchestrate_publish(&mut session, batcher, plan).await {
-                    warn!(error = %e, "failed to publish will message");
+                if will_delay > 0 {
+                    // MQTT 5.0 SS 3.1.3.9.2: Delay will publication.
+                    // Spawn a task that sleeps for the delay interval and then publishes.
+                    // The task is registered in pending_wills so it can be cancelled
+                    // if the client reconnects before the delay expires.
+                    let batcher = Arc::clone(batcher);
+                    let client_id = session.client_id.clone();
+                    let pw = Arc::clone(pending_wills);
+                    let handle = tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(will_delay as u64)).await;
+                        // Delay expired — publish the will.
+                        // We can't use orchestrate_publish here (needs session),
+                        // so we submit the flat_message directly if exchange is known.
+                        if !plan.flat_message.is_empty() {
+                            if let Some(eid) = plan.cached_exchange_id {
+                                let cmd = MqCommand::publish_to_exchange(eid, &[plan.flat_message]);
+                                let _ = batcher.submit(cmd).await;
+                            }
+                        }
+                        pw.remove(&client_id);
+                    });
+                    pending_wills.insert(session.client_id.clone(), handle);
+                } else {
+                    if let Err(e) = orchestrate_publish(&mut session, batcher, plan).await {
+                        warn!(error = %e, "failed to publish will message");
+                    }
                 }
             }
 
@@ -979,6 +1132,7 @@ async fn connection_loop(
     write_buf: &mut BytesMut,
     delivery_poll_ms: u64,
     delivery_batch_size: u32,
+    mut takeover_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), ConnectionError> {
     let keep_alive_timeout = if session.keep_alive > 0 {
         Duration::from_secs(session.keep_alive as u64 * 3 / 2)
@@ -1096,6 +1250,23 @@ async fn connection_loop(
             _ = delivery_interval.tick(), if !session.is_inflight_full() && session.subscription_count() > 0 => {
                 deliver_outbound(session, batcher, log_reader.as_ref(), stream, stats, delivery_batch_size, write_buf, &mut sub_buf, &mut flat_messages_buf).await?;
             }
+
+            // Session takeover: another connection with the same ClientID connected.
+            _ = &mut takeover_rx => {
+                warn!(
+                    client_id = %session.client_id,
+                    "session taken over by new connection"
+                );
+                // Send DISCONNECT with reason 0x8E (Session Taken Over) for MQTT 5.0.
+                return Err(send_disconnect_and_close(
+                    stream,
+                    stats,
+                    write_buf,
+                    session.protocol_version,
+                    crate::types::ReasonCode::SESSION_TAKEN_OVER.0,
+                    Some("session taken over"),
+                ).await);
+            }
         }
     }
 }
@@ -1149,6 +1320,20 @@ async fn process_inbound_packet(
 
             // Send immediate responses (PUBACK/PUBREC) before orchestrating.
             send_packets(stream, &plan.responses, stats, write_buf, version).await?;
+
+            // If the session flagged a disconnect (e.g., receive maximum exceeded,
+            // topic alias 0), send the DISCONNECT and close.
+            if let Some(ref disconnect_pkt) = plan.disconnect {
+                send_packets(
+                    stream,
+                    std::slice::from_ref(disconnect_pkt),
+                    stats,
+                    write_buf,
+                    version,
+                )
+                .await?;
+                return Err(ConnectionError::Codec(CodecError::ProtocolError));
+            }
 
             // Orchestrate the actual publish through the exchange.
             orchestrate_publish(session, batcher, plan).await?;

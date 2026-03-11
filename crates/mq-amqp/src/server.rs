@@ -13,6 +13,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::broker::{BrokerAction, MessageBroker, NoopBroker};
 use crate::connection::{AmqpConnection, ConnectionError, ConnectionPhase};
+use crate::transport::AmqpStream;
+#[cfg(feature = "tls")]
+use crate::transport::TlsConfig;
 use crate::types::{AmqpMessage, condition};
 
 // =============================================================================
@@ -22,8 +25,11 @@ use crate::types::{AmqpMessage, condition};
 /// Configuration for the AMQP 1.0 server.
 #[derive(Debug, Clone)]
 pub struct AmqpServerConfig {
-    /// Address to bind to.
+    /// Address to bind to for plain TCP (port 5672 by default).
     pub bind_addr: SocketAddr,
+    /// Address to bind to for TLS (port 5671 by default). Only used when TLS is configured.
+    #[cfg(feature = "tls")]
+    pub tls_bind_addr: Option<SocketAddr>,
     /// TCP read buffer size.
     pub read_buf_size: usize,
     /// Maximum number of concurrent connections (0 = unlimited).
@@ -36,6 +42,8 @@ impl Default for AmqpServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: "0.0.0.0:5672".parse().unwrap(),
+            #[cfg(feature = "tls")]
+            tls_bind_addr: None,
             read_buf_size: 8192,
             max_connections: 0,
             catalog_name: String::new(),
@@ -46,6 +54,12 @@ impl Default for AmqpServerConfig {
 impl AmqpServerConfig {
     pub fn with_bind_addr(mut self, addr: SocketAddr) -> Self {
         self.bind_addr = addr;
+        self
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn with_tls_bind_addr(mut self, addr: SocketAddr) -> Self {
+        self.tls_bind_addr = Some(addr);
         self
     }
 
@@ -78,6 +92,9 @@ pub struct AmqpServer<B: MessageBroker = NoopBroker> {
     active_connections: Arc<AtomicUsize>,
     /// Message broker for engine integration.
     broker: Arc<B>,
+    /// Optional TLS configuration.
+    #[cfg(feature = "tls")]
+    tls_config: Option<Arc<TlsConfig>>,
 }
 
 impl AmqpServer<NoopBroker> {
@@ -87,6 +104,8 @@ impl AmqpServer<NoopBroker> {
             config,
             active_connections: Arc::new(AtomicUsize::new(0)),
             broker: Arc::new(NoopBroker),
+            #[cfg(feature = "tls")]
+            tls_config: None,
         }
     }
 }
@@ -98,58 +117,52 @@ impl<B: MessageBroker> AmqpServer<B> {
             config,
             active_connections: Arc::new(AtomicUsize::new(0)),
             broker: Arc::new(broker),
+            #[cfg(feature = "tls")]
+            tls_config: None,
         }
+    }
+
+    /// Configure TLS for this server.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls_config: TlsConfig) -> Self {
+        self.tls_config = Some(Arc::new(tls_config));
+        self
     }
 
     /// Run the server, accepting connections until the shutdown signal fires.
     pub async fn run(&self, shutdown: tokio::sync::watch::Receiver<bool>) -> std::io::Result<()> {
         let listener = TcpListener::bind(self.config.bind_addr).await?;
-        info!(addr = %self.config.bind_addr, "AMQP 1.0 server listening");
+        info!(addr = %self.config.bind_addr, "AMQP 1.0 server listening (plain TCP)");
+
+        // Optionally start a TLS listener.
+        #[cfg(feature = "tls")]
+        let tls_listener = if let (Some(tls_addr), Some(_)) =
+            (self.config.tls_bind_addr, self.tls_config.as_ref())
+        {
+            let tl = TcpListener::bind(tls_addr).await?;
+            info!(addr = %tls_addr, "AMQP 1.0 server listening (TLS)");
+            Some(tl)
+        } else {
+            None
+        };
 
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, peer_addr)) => {
-                            if self.config.max_connections > 0 {
-                                let current = self.active_connections.load(Ordering::Relaxed);
-                                if current >= self.config.max_connections {
-                                    warn!(
-                                        peer = %peer_addr,
-                                        current,
-                                        max = self.config.max_connections,
-                                        "rejecting connection: limit reached"
-                                    );
-                                    drop(stream);
-                                    continue;
-                                }
-                            }
-
-                            let active = self.active_connections.clone();
-                            let read_buf_size = self.config.read_buf_size;
-                            let mut shutdown_rx = shutdown.clone();
-                            let broker = self.broker.clone();
-                            let catalog_name = self.config.catalog_name.clone();
-
-                            active.fetch_add(1, Ordering::Relaxed);
-
-                            tokio::spawn(async move {
-                                debug!(peer = %peer_addr, "accepted AMQP 1.0 connection");
-                                match handle_connection(stream, peer_addr, read_buf_size, broker, &catalog_name, &mut shutdown_rx).await {
-                                    Ok(()) => {
-                                        debug!(peer = %peer_addr, "AMQP connection closed normally");
-                                    }
-                                    Err(e) => {
-                                        warn!(peer = %peer_addr, error = %e, "AMQP connection error");
-                                    }
-                                }
-                                active.fetch_sub(1, Ordering::Relaxed);
-                            });
+                            self.spawn_connection(AmqpStream::Tcp(stream), peer_addr, None, shutdown.clone());
                         }
                         Err(e) => {
                             error!(error = %e, "failed to accept TCP connection");
                         }
                     }
+                }
+                accept_result = self.accept_tls(
+                    #[cfg(feature = "tls")]
+                    tls_listener.as_ref(),
+                ) => {
+                    self.handle_tls_accept(accept_result, shutdown.clone());
                 }
                 _ = wait_for_shutdown(&shutdown) => {
                     info!("AMQP 1.0 server shutting down");
@@ -159,6 +172,150 @@ impl<B: MessageBroker> AmqpServer<B> {
         }
 
         Ok(())
+    }
+
+    /// Accept a TLS connection. Returns pending forever if TLS is not configured.
+    #[cfg(feature = "tls")]
+    async fn accept_tls(
+        &self,
+        tls_listener: Option<&TcpListener>,
+    ) -> std::io::Result<(TcpStream, SocketAddr)> {
+        match tls_listener {
+            Some(tl) => tl.accept().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    #[cfg(not(feature = "tls"))]
+    async fn accept_tls(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        std::future::pending().await
+    }
+
+    /// Handle TLS accept result.
+    #[cfg(feature = "tls")]
+    fn handle_tls_accept(
+        &self,
+        result: std::io::Result<(TcpStream, SocketAddr)>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        match result {
+            Ok((stream, peer_addr)) => {
+                if let Some(tls_config) = self.tls_config.clone() {
+                    let active = self.active_connections.clone();
+                    let read_buf_size = self.config.read_buf_size;
+                    let broker = self.broker.clone();
+                    let catalog_name = self.config.catalog_name.clone();
+                    let mut shutdown_rx = shutdown;
+
+                    if self.config.max_connections > 0 {
+                        let current = active.load(Ordering::Relaxed);
+                        if current >= self.config.max_connections {
+                            warn!(peer = %peer_addr, "rejecting TLS connection: limit reached");
+                            drop(stream);
+                            return;
+                        }
+                    }
+
+                    active.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        match tls_config.accept(stream).await {
+                            Ok(tls_stream) => {
+                                let peer_subject = tls_stream.peer_cert_subject();
+                                debug!(peer = %peer_addr, tls = true, "accepted AMQP 1.0 TLS connection");
+                                match handle_connection(
+                                    tls_stream,
+                                    peer_addr,
+                                    read_buf_size,
+                                    broker,
+                                    &catalog_name,
+                                    peer_subject.as_deref(),
+                                    &mut shutdown_rx,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        debug!(peer = %peer_addr, "AMQP TLS connection closed normally")
+                                    }
+                                    Err(e) => {
+                                        warn!(peer = %peer_addr, error = %e, "AMQP TLS connection error")
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                            }
+                        }
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    });
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to accept TLS connection");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "tls"))]
+    fn handle_tls_accept(
+        &self,
+        _result: std::io::Result<(TcpStream, SocketAddr)>,
+        _shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        // TLS not enabled; unreachable since accept_tls is always pending.
+    }
+
+    /// Spawn a plain TCP connection handler.
+    fn spawn_connection(
+        &self,
+        stream: AmqpStream,
+        peer_addr: SocketAddr,
+        peer_cert_subject: Option<String>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        if self.config.max_connections > 0 {
+            let current = self.active_connections.load(Ordering::Relaxed);
+            if current >= self.config.max_connections {
+                warn!(
+                    peer = %peer_addr,
+                    current,
+                    max = self.config.max_connections,
+                    "rejecting connection: limit reached"
+                );
+                drop(stream);
+                return;
+            }
+        }
+
+        let active = self.active_connections.clone();
+        let read_buf_size = self.config.read_buf_size;
+        let mut shutdown_rx = shutdown;
+        let broker = self.broker.clone();
+        let catalog_name = self.config.catalog_name.clone();
+
+        active.fetch_add(1, Ordering::Relaxed);
+
+        tokio::spawn(async move {
+            debug!(peer = %peer_addr, "accepted AMQP 1.0 connection");
+            match handle_connection(
+                stream,
+                peer_addr,
+                read_buf_size,
+                broker,
+                &catalog_name,
+                peer_cert_subject.as_deref(),
+                &mut shutdown_rx,
+            )
+            .await
+            {
+                Ok(()) => {
+                    debug!(peer = %peer_addr, "AMQP connection closed normally");
+                }
+                Err(e) => {
+                    warn!(peer = %peer_addr, error = %e, "AMQP connection error");
+                }
+            }
+            active.fetch_sub(1, Ordering::Relaxed);
+        });
     }
 
     /// Get the current number of active connections.
@@ -173,14 +330,20 @@ impl<B: MessageBroker> AmqpServer<B> {
 
 /// Handle a single AMQP 1.0 connection.
 async fn handle_connection<B: MessageBroker>(
-    mut stream: TcpStream,
+    mut stream: AmqpStream,
     peer_addr: SocketAddr,
     read_buf_size: usize,
     broker: Arc<B>,
     catalog_name: &str,
+    peer_cert_subject: Option<&str>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ConnectionError> {
     let mut conn = AmqpConnection::new(catalog_name);
+
+    // SEC3: If TLS provided a client certificate, store subject for SASL EXTERNAL.
+    if let Some(subject) = peer_cert_subject {
+        conn.set_peer_cert_subject(subject);
+    }
     // Reusable read buffer — allocated once per connection, reused for every read.
     let mut read_buf = vec![0u8; read_buf_size];
 
@@ -421,6 +584,52 @@ async fn execute_broker_action<B: MessageBroker>(
         BrokerAction::DisconnectConsumer { consumer_id } => {
             if let Err(e) = broker.disconnect_consumer(consumer_id).await {
                 warn!(consumer_id, error = %e, "failed to disconnect consumer");
+            }
+        }
+        BrokerAction::CommitTransaction {
+            txn_id,
+            session_channel,
+            coordinator_handle,
+        } => {
+            debug!(
+                ?txn_id,
+                session_channel,
+                coordinator_handle,
+                "transaction committed (broker actions already dispatched)"
+            );
+        }
+        BrokerAction::RollbackTransaction {
+            txn_id,
+            session_channel,
+            coordinator_handle,
+        } => {
+            debug!(
+                ?txn_id,
+                session_channel, coordinator_handle, "transaction rolled back"
+            );
+        }
+        BrokerAction::CreateDynamicNode {
+            link_handle,
+            session_channel,
+            lifetime_policy,
+        } => match broker.create_dynamic_node(lifetime_policy).await {
+            Ok((entity_type, entity_id, address)) => {
+                if let Some(session) = conn.sessions.get_mut(&session_channel) {
+                    if let Some(link) = session.links.get_mut(&link_handle) {
+                        link.entity_type = Some(entity_type);
+                        link.entity_id = Some(entity_id);
+                        link.dynamic_node_address = Some(address);
+                        debug!(link_handle, entity_type, entity_id, "dynamic node created");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(link_handle, error = %e, "failed to create dynamic node");
+            }
+        },
+        BrokerAction::DestroyDynamicNode { entity_id } => {
+            if let Err(e) = broker.destroy_dynamic_node(entity_id).await {
+                warn!(entity_id, error = %e, "failed to destroy dynamic node");
             }
         }
     }

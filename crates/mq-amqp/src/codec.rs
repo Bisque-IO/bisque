@@ -7,7 +7,6 @@
 //! directly from the input `Bytes` buffer with no intermediate allocations.
 
 use bytes::{BufMut, Bytes, BytesMut};
-#[cfg(test)]
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -81,6 +80,10 @@ mod format_code {
     pub const MAP32: u8 = 0xd1;
     pub const ARRAY8: u8 = 0xe0;
     pub const ARRAY32: u8 = 0xf0;
+    pub const DECIMAL32: u8 = 0x74;
+    pub const DECIMAL64: u8 = 0x84;
+    pub const DECIMAL128: u8 = 0x94;
+    pub const CHAR: u8 = 0x73;
     pub const DESCRIBED: u8 = 0x00;
 }
 
@@ -266,6 +269,33 @@ pub fn decode_value(cur: &mut BytesCursor) -> Result<AmqpValue, CodecError> {
             let bits = cur.read_u64()?;
             Ok(AmqpValue::Double(f64::from_bits(bits)))
         }
+        format_code::DECIMAL32 => {
+            cur.ensure(4)?;
+            let mut v = [0u8; 4];
+            v.copy_from_slice(cur.read_slice(4)?);
+            cur.advance(4);
+            Ok(AmqpValue::Decimal32(v))
+        }
+        format_code::DECIMAL64 => {
+            cur.ensure(8)?;
+            let mut v = [0u8; 8];
+            v.copy_from_slice(cur.read_slice(8)?);
+            cur.advance(8);
+            Ok(AmqpValue::Decimal64(v))
+        }
+        format_code::DECIMAL128 => {
+            cur.ensure(16)?;
+            let mut v = [0u8; 16];
+            v.copy_from_slice(cur.read_slice(16)?);
+            cur.advance(16);
+            Ok(AmqpValue::Decimal128(v))
+        }
+        format_code::CHAR => {
+            let code_point = cur.read_u32()?;
+            let ch = char::from_u32(code_point)
+                .ok_or(CodecError::InvalidFormatCode(format_code::CHAR))?;
+            Ok(AmqpValue::Char(ch))
+        }
         format_code::TIMESTAMP => Ok(AmqpValue::Timestamp(cur.read_i64()?)),
         format_code::UUID => {
             cur.ensure(16)?;
@@ -412,6 +442,33 @@ fn decode_array_element(cur: &mut BytesCursor, code: u8) -> Result<AmqpValue, Co
         format_code::LONG_SMALL => Ok(AmqpValue::Long(cur.read_u8()? as i8 as i64)),
         format_code::FLOAT => Ok(AmqpValue::Float(f32::from_bits(cur.read_u32()?))),
         format_code::DOUBLE => Ok(AmqpValue::Double(f64::from_bits(cur.read_u64()?))),
+        format_code::DECIMAL32 => {
+            cur.ensure(4)?;
+            let mut v = [0u8; 4];
+            v.copy_from_slice(cur.read_slice(4)?);
+            cur.advance(4);
+            Ok(AmqpValue::Decimal32(v))
+        }
+        format_code::DECIMAL64 => {
+            cur.ensure(8)?;
+            let mut v = [0u8; 8];
+            v.copy_from_slice(cur.read_slice(8)?);
+            cur.advance(8);
+            Ok(AmqpValue::Decimal64(v))
+        }
+        format_code::DECIMAL128 => {
+            cur.ensure(16)?;
+            let mut v = [0u8; 16];
+            v.copy_from_slice(cur.read_slice(16)?);
+            cur.advance(16);
+            Ok(AmqpValue::Decimal128(v))
+        }
+        format_code::CHAR => {
+            let code_point = cur.read_u32()?;
+            let ch = char::from_u32(code_point)
+                .ok_or(CodecError::InvalidFormatCode(format_code::CHAR))?;
+            Ok(AmqpValue::Char(ch))
+        }
         format_code::TIMESTAMP => Ok(AmqpValue::Timestamp(cur.read_i64()?)),
         format_code::UUID => {
             cur.ensure(16)?;
@@ -521,6 +578,22 @@ pub fn encode_value(buf: &mut BytesMut, value: &AmqpValue) {
         AmqpValue::Double(v) => {
             buf.put_u8(format_code::DOUBLE);
             buf.put_f64(*v);
+        }
+        AmqpValue::Decimal32(v) => {
+            buf.put_u8(format_code::DECIMAL32);
+            buf.put_slice(v);
+        }
+        AmqpValue::Decimal64(v) => {
+            buf.put_u8(format_code::DECIMAL64);
+            buf.put_slice(v);
+        }
+        AmqpValue::Decimal128(v) => {
+            buf.put_u8(format_code::DECIMAL128);
+            buf.put_slice(v);
+        }
+        AmqpValue::Char(v) => {
+            buf.put_u8(format_code::CHAR);
+            buf.put_u32(*v as u32);
         }
         AmqpValue::Timestamp(v) => {
             buf.put_u8(format_code::TIMESTAMP);
@@ -1094,6 +1167,7 @@ fn decode_source_owned(value: AmqpValue) -> Option<Source> {
                 expiry_policy: list_get_opt_wire_string(&fields, 2),
                 timeout: list_get(&fields, 3).as_u32().unwrap_or(0),
                 dynamic: list_get(&fields, 4).as_bool().unwrap_or(false),
+                dynamic_node_properties: list_take_opt(&mut fields, 5),
                 distribution_mode: list_get_opt_wire_string(&fields, 6),
                 filter: list_take_opt(&mut fields, 7),
                 default_outcome: list_take_opt(&mut fields, 8),
@@ -1108,14 +1182,17 @@ fn decode_source_owned(value: AmqpValue) -> Option<Source> {
 fn decode_target_owned(value: AmqpValue) -> Option<Target> {
     match value {
         AmqpValue::Described(_, inner) => {
-            let fields = match inner.as_list() {
-                Some(l) => l,
-                None => return Some(Target::default()),
+            let mut fields = match *inner {
+                AmqpValue::List(l) => l,
+                _ => return Some(Target::default()),
             };
             Some(Target {
-                address: list_get_opt_wire_string(fields, 0),
-                durable: list_get(fields, 1).as_u32().unwrap_or(0),
-                dynamic: list_get(fields, 4).as_bool().unwrap_or(false),
+                address: list_get_opt_wire_string(&fields, 0),
+                durable: list_get(&fields, 1).as_u32().unwrap_or(0),
+                expiry_policy: list_get_opt_wire_string(&fields, 2),
+                timeout: list_get(&fields, 3).as_u32().unwrap_or(0),
+                dynamic: list_get(&fields, 4).as_bool().unwrap_or(false),
+                dynamic_node_properties: list_take_opt(&mut fields, 5),
                 ..Default::default()
             })
         }
@@ -1125,6 +1202,14 @@ fn decode_target_owned(value: AmqpValue) -> Option<Target> {
 }
 
 fn decode_attach(fields: &mut [AmqpValue]) -> Result<Attach, CodecError> {
+    // Gap X1: Check if target is a Coordinator (descriptor 0x30) before parsing as Target
+    let target_val = list_take(fields, 6);
+    let (target, coordinator_target) = match &target_val {
+        AmqpValue::Described(desc, _) if desc.as_u64() == Some(txn_descriptor::COORDINATOR) => {
+            (None, decode_coordinator(&target_val))
+        }
+        _ => (decode_target_owned(target_val), None),
+    };
     Ok(Attach {
         name: list_get_wire_string(fields, 0),
         handle: list_get(fields, 1).as_u32().unwrap_or(0),
@@ -1132,7 +1217,8 @@ fn decode_attach(fields: &mut [AmqpValue]) -> Result<Attach, CodecError> {
         snd_settle_mode: SndSettleMode::from_u8(list_get(fields, 3).as_u32().unwrap_or(2) as u8),
         rcv_settle_mode: RcvSettleMode::from_u8(list_get(fields, 4).as_u32().unwrap_or(0) as u8),
         source: decode_source_owned(list_take(fields, 5)),
-        target: decode_target_owned(list_take(fields, 6)),
+        target,
+        coordinator_target,
         unsettled: list_take_opt(fields, 7),
         incomplete_unsettled: list_get(fields, 8).as_bool().unwrap_or(false),
         initial_delivery_count: list_get(fields, 10).as_u32(),
@@ -1177,8 +1263,7 @@ fn decode_transfer(fields: &[AmqpValue], payload: Bytes) -> Result<Transfer, Cod
     })
 }
 
-#[cfg(test)]
-fn decode_delivery_state(value: &AmqpValue) -> Option<DeliveryState> {
+pub fn decode_delivery_state(value: &AmqpValue) -> Option<DeliveryState> {
     match value {
         AmqpValue::Described(desc, inner) => {
             let d = desc.as_u64()?;
@@ -1222,6 +1307,14 @@ fn decode_delivery_state(value: &AmqpValue) -> Option<DeliveryState> {
                         txn_id,
                         outcome,
                     }))
+                }
+                txn_descriptor::DECLARED => {
+                    let fields = match inner.as_ref() {
+                        AmqpValue::List(l) => l.as_slice(),
+                        _ => &[],
+                    };
+                    let txn_id = list_get(fields, 0).as_binary().cloned().unwrap_or_default();
+                    Some(DeliveryState::Declared { txn_id })
                 }
                 _ => None,
             }
@@ -1277,6 +1370,14 @@ fn decode_delivery_state_owned(value: AmqpValue) -> Option<DeliveryState> {
                         outcome,
                     }))
                 }
+                txn_descriptor::DECLARED => {
+                    let fields = match inner.as_ref() {
+                        AmqpValue::List(l) => l.as_slice(),
+                        _ => &[],
+                    };
+                    let txn_id = list_get(fields, 0).as_binary().cloned().unwrap_or_default();
+                    Some(DeliveryState::Declared { txn_id })
+                }
                 _ => None,
             }
         }
@@ -1286,8 +1387,7 @@ fn decode_delivery_state_owned(value: AmqpValue) -> Option<DeliveryState> {
 }
 
 /// Decode a Coordinator target from a described list.
-#[cfg(test)]
-fn decode_coordinator(value: &AmqpValue) -> Option<Coordinator> {
+pub fn decode_coordinator(value: &AmqpValue) -> Option<Coordinator> {
     match value {
         AmqpValue::Described(desc, inner) => {
             if desc.as_u64()? != txn_descriptor::COORDINATOR {
@@ -1607,6 +1707,8 @@ fn encode_source(buf: &mut BytesMut, s: &Source) {
         8
     } else if s.distribution_mode.is_some() {
         7
+    } else if s.dynamic_node_properties.is_some() {
+        6
     } else {
         5
     };
@@ -1621,8 +1723,14 @@ fn encode_source(buf: &mut BytesMut, s: &Source) {
     }
     put_uint(buf, s.timeout); // 3: timeout
     put_bool(buf, s.dynamic); // 4: dynamic
+    if count >= 6 {
+        // 5: dynamic-node-properties
+        match &s.dynamic_node_properties {
+            Some(v) => encode_value(buf, v),
+            None => put_null(buf),
+        }
+    }
     if count >= 7 {
-        put_null(buf); // 5: dynamic-node-properties
         // 6: distribution-mode
         if let Some(ref dm) = s.distribution_mode {
             put_symbol(buf, dm);
@@ -1647,21 +1755,58 @@ fn encode_source(buf: &mut BytesMut, s: &Source) {
         }
     }
     if count >= 10 {
-        put_null(buf); // 9: outcomes (TODO: encode symbol array)
+        // 9: outcomes
+        if !s.outcomes.is_empty() {
+            encode_wire_string_symbol_array(buf, &s.outcomes);
+        } else {
+            put_null(buf);
+        }
     }
     if count >= 11 {
-        put_null(buf); // 10: capabilities (TODO: encode symbol array)
+        // 10: capabilities
+        if !s.capabilities.is_empty() {
+            encode_wire_string_symbol_array(buf, &s.capabilities);
+        } else {
+            put_null(buf);
+        }
     }
     finish_described_list(buf, sp, bs);
 }
 
 fn encode_target(buf: &mut BytesMut, t: &Target) {
-    let (sp, bs) = begin_described_list(buf, descriptor::TARGET, 5);
-    put_opt_string(buf, t.address.as_ref());
-    put_uint(buf, t.durable);
-    put_null(buf); // expiry-policy
-    put_uint(buf, t.timeout);
-    put_bool(buf, t.dynamic);
+    let count = if !t.capabilities.is_empty() {
+        7u32
+    } else if t.dynamic_node_properties.is_some() {
+        6
+    } else {
+        5
+    };
+    let (sp, bs) = begin_described_list(buf, descriptor::TARGET, count);
+    put_opt_string(buf, t.address.as_ref()); // 0: address
+    put_uint(buf, t.durable); // 1: durable
+    // 2: expiry-policy
+    if let Some(ref ep) = t.expiry_policy {
+        put_symbol(buf, ep);
+    } else {
+        put_null(buf);
+    }
+    put_uint(buf, t.timeout); // 3: timeout
+    put_bool(buf, t.dynamic); // 4: dynamic
+    if count >= 6 {
+        // 5: dynamic-node-properties
+        match &t.dynamic_node_properties {
+            Some(v) => encode_value(buf, v),
+            None => put_null(buf),
+        }
+    }
+    if count >= 7 {
+        // 6: capabilities
+        if !t.capabilities.is_empty() {
+            encode_wire_string_symbol_array(buf, &t.capabilities);
+        } else {
+            put_null(buf);
+        }
+    }
     finish_described_list(buf, sp, bs);
 }
 
@@ -1690,7 +1835,10 @@ fn encode_attach(buf: &mut BytesMut, p: &Attach) {
     } else {
         put_null(buf);
     }
-    if let Some(t) = &p.target {
+    if let Some(ref coord) = p.coordinator_target {
+        // 6: target (Coordinator)
+        encode_coordinator(buf, coord);
+    } else if let Some(t) = &p.target {
         // 6: target
         encode_target(buf, t);
     } else {
@@ -1819,6 +1967,9 @@ fn encode_delivery_state(buf: &mut BytesMut, state: &DeliveryState) {
         DeliveryState::Transactional(ts) => {
             let ds = ts.outcome.as_ref().map(|o| o.to_delivery_state());
             encode_transactional_state(buf, &ts.txn_id, ds.as_ref());
+        }
+        DeliveryState::Declared { txn_id } => {
+            encode_txn_declared(buf, txn_id);
         }
     }
 }
@@ -4356,5 +4507,120 @@ mod tests {
         let mut cur = BytesCursor::new(bytes);
         let decoded = decode_value(&mut cur).unwrap();
         assert!(matches!(decoded, AmqpValue::Timestamp(-1_000_000)));
+    }
+
+    // =========================================================================
+    // Declared delivery state encode/decode
+    // =========================================================================
+
+    #[test]
+    fn test_declared_delivery_state_roundtrip() {
+        let state = DeliveryState::Declared {
+            txn_id: Bytes::from_static(b"my-txn-id"),
+        };
+        let mut buf = BytesMut::new();
+        encode_delivery_state(&mut buf, &state);
+
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let decoded = decode_delivery_state(&value);
+        assert!(decoded.is_some());
+        match decoded.unwrap() {
+            DeliveryState::Declared { txn_id } => {
+                assert_eq!(txn_id, Bytes::from_static(b"my-txn-id"));
+            }
+            other => panic!("expected Declared, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_disposition_with_declared_state() {
+        let disp = Disposition {
+            role: Role::Receiver,
+            first: 0,
+            last: None,
+            settled: true,
+            state: Some(DeliveryState::Declared {
+                txn_id: Bytes::from_static(b"txn-42"),
+            }),
+            batchable: false,
+        };
+        let mut buf = BytesMut::new();
+        encode_disposition(&mut buf, &disp);
+        // Just verify it encodes without panic
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_coordinator_target_encode_roundtrip() {
+        let coord = Coordinator {
+            capabilities: SmallVec::new(),
+        };
+        let mut buf = BytesMut::new();
+        encode_coordinator(&mut buf, &coord);
+
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let decoded = decode_coordinator(&value);
+        assert!(decoded.is_some());
+    }
+
+    #[test]
+    fn test_attach_with_coordinator_roundtrip() {
+        let attach = Attach {
+            name: WireString::from("txn-ctrl"),
+            handle: 5,
+            role: Role::Sender,
+            initial_delivery_count: Some(0),
+            coordinator_target: Some(Coordinator::default()),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_framed_performative(&mut buf, 0, FRAME_TYPE_AMQP, &Performative::Attach(attach));
+
+        let bytes = buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        if let FrameBody::Amqp(Performative::Attach(decoded)) = frame.body {
+            assert_eq!(decoded.name, WireString::from("txn-ctrl"));
+            assert_eq!(decoded.handle, 5);
+            assert!(decoded.coordinator_target.is_some());
+            assert!(decoded.target.is_none());
+        } else {
+            panic!("expected Attach performative");
+        }
+    }
+
+    // =========================================================================
+    // Lifetime policy descriptors
+    // =========================================================================
+
+    #[test]
+    fn test_lifetime_policy_enum() {
+        use crate::types::{LifetimePolicy, descriptor};
+
+        assert_eq!(
+            LifetimePolicy::from_descriptor(descriptor::DELETE_ON_CLOSE),
+            Some(LifetimePolicy::DeleteOnClose)
+        );
+        assert_eq!(
+            LifetimePolicy::from_descriptor(descriptor::DELETE_ON_NO_LINKS),
+            Some(LifetimePolicy::DeleteOnNoLinks)
+        );
+        assert_eq!(
+            LifetimePolicy::from_descriptor(descriptor::DELETE_ON_NO_MESSAGES),
+            Some(LifetimePolicy::DeleteOnNoMessages)
+        );
+        assert_eq!(
+            LifetimePolicy::from_descriptor(descriptor::DELETE_ON_NO_LINKS_OR_MESSAGES),
+            Some(LifetimePolicy::DeleteOnNoLinksOrMessages)
+        );
+        assert_eq!(LifetimePolicy::from_descriptor(0x99), None);
+
+        assert_eq!(
+            LifetimePolicy::DeleteOnClose.descriptor(),
+            descriptor::DELETE_ON_CLOSE
+        );
     }
 }

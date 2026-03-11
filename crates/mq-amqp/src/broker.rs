@@ -59,6 +59,7 @@ impl SettleAction {
                     None => Self::Accept,
                 }
             }
+            DeliveryState::Declared { .. } => Self::Accept,
         }
     }
 }
@@ -139,6 +140,19 @@ pub trait MessageBroker: Send + Sync + 'static {
         &self,
         consumer_id: u64,
     ) -> impl std::future::Future<Output = Result<(), BrokerError>> + Send;
+
+    /// Create a dynamic node (temporary queue/topic) with a lifetime policy.
+    /// Returns `(entity_type, entity_id, address)` for the new node.
+    fn create_dynamic_node(
+        &self,
+        lifetime_policy: Option<crate::types::LifetimePolicy>,
+    ) -> impl std::future::Future<Output = Result<(&'static str, u64, String), BrokerError>> + Send;
+
+    /// Destroy a dynamic node (called when lifetime policy triggers deletion).
+    fn destroy_dynamic_node(
+        &self,
+        entity_id: u64,
+    ) -> impl std::future::Future<Output = Result<(), BrokerError>> + Send;
 }
 
 // =============================================================================
@@ -148,7 +162,7 @@ pub trait MessageBroker: Send + Sync + 'static {
 /// Actions queued by the synchronous connection processor for async execution
 /// by the server event loop. This bridges the sync `AmqpConnection::process()`
 /// with the async `MessageBroker` trait methods.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BrokerAction {
     /// Resolve an AMQP address to a broker entity (on ATTACH).
     ResolveAddress {
@@ -197,6 +211,26 @@ pub enum BrokerAction {
     },
     /// Disconnect a consumer (on DETACH).
     DisconnectConsumer { consumer_id: u64 },
+    /// Commit a transaction — apply all buffered work (Gap X1).
+    CommitTransaction {
+        txn_id: Bytes,
+        session_channel: u16,
+        coordinator_handle: u32,
+    },
+    /// Rollback a transaction — discard all buffered work (Gap X1).
+    RollbackTransaction {
+        txn_id: Bytes,
+        session_channel: u16,
+        coordinator_handle: u32,
+    },
+    /// Create a dynamic node (on ATTACH with dynamic=true) (Gap M5).
+    CreateDynamicNode {
+        link_handle: u32,
+        session_channel: u16,
+        lifetime_policy: Option<crate::types::LifetimePolicy>,
+    },
+    /// Destroy a dynamic node (on link close for delete-on-close policy) (Gap M5).
+    DestroyDynamicNode { entity_id: u64 },
 }
 
 /// A no-op broker for protocol testing. Accepts all messages, returns empty results.
@@ -266,6 +300,20 @@ impl MessageBroker for NoopBroker {
     }
 
     async fn disconnect_consumer(&self, _consumer_id: u64) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    async fn create_dynamic_node(
+        &self,
+        _lifetime_policy: Option<crate::types::LifetimePolicy>,
+    ) -> Result<(&'static str, u64, String), BrokerError> {
+        // Auto-create a queue with a generated name
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(("queue", id, format!("dynamic-{id}")))
+    }
+
+    async fn destroy_dynamic_node(&self, _entity_id: u64) -> Result<(), BrokerError> {
         Ok(())
     }
 }
@@ -481,5 +529,54 @@ mod tests {
         // Just "/" -> defaults to queue
         let (ty, _) = broker.resolve_address("/").await.unwrap();
         assert_eq!(ty, "queue");
+    }
+
+    #[test]
+    fn test_settle_action_from_declared() {
+        let declared = DeliveryState::Declared {
+            txn_id: Bytes::from_static(b"txn-1"),
+        };
+        assert_eq!(
+            SettleAction::from_delivery_state(&declared),
+            SettleAction::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn test_noop_broker_create_dynamic_node() {
+        let broker = NoopBroker;
+        let (ty, id, addr) = broker.create_dynamic_node(None).await.unwrap();
+        assert_eq!(ty, "queue");
+        assert!(id > 0);
+        assert!(addr.starts_with("dynamic-"));
+    }
+
+    #[tokio::test]
+    async fn test_noop_broker_destroy_dynamic_node() {
+        let broker = NoopBroker;
+        let result = broker.destroy_dynamic_node(1).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_broker_action_clone() {
+        let action = BrokerAction::Settle {
+            entity_id: 1,
+            message_ids: SmallVec::from_vec(vec![1, 2, 3]),
+            action: SettleAction::Accept,
+        };
+        let cloned = action.clone();
+        match cloned {
+            BrokerAction::Settle {
+                entity_id,
+                message_ids,
+                action,
+            } => {
+                assert_eq!(entity_id, 1);
+                assert_eq!(message_ids.len(), 3);
+                assert_eq!(action, SettleAction::Accept);
+            }
+            _ => panic!("expected Settle"),
+        }
     }
 }

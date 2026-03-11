@@ -114,6 +114,12 @@ pub struct AmqpLink {
     pub section_number: u32,
     /// Current section offset during multi-frame reassembly.
     pub section_offset: u64,
+
+    // === M5: Dynamic node support ===
+    /// Address assigned to a dynamically created node.
+    pub dynamic_node_address: Option<String>,
+    /// Lifetime policy for dynamic nodes (for cleanup on detach).
+    pub lifetime_policy: Option<crate::types::LifetimePolicy>,
 }
 
 /// An unsettled delivery tracked by the link.
@@ -122,6 +128,10 @@ pub struct UnsettledDelivery {
     pub delivery_id: u32,
     pub delivery_tag: Bytes,
     pub settled: bool,
+    /// L5: Delivery state for exactly-once (rcv-settle-mode=second) two-phase settlement.
+    /// When set, the receiver has sent a Disposition with settled=false; waiting for
+    /// the sender to settle.
+    pub state: Option<crate::types::DeliveryState>,
 }
 
 /// Partial delivery being accumulated during multi-frame transfer.
@@ -175,6 +185,8 @@ impl AmqpLink {
             paired: None,
             section_number: 0,
             section_offset: 0,
+            dynamic_node_address: None,
+            lifetime_policy: None,
         }
     }
 
@@ -207,6 +219,7 @@ impl AmqpLink {
                     delivery_id: id,
                     delivery_tag: transfer.delivery_tag.clone().unwrap_or_default(),
                     settled: false,
+                    state: None,
                 });
             }
         }
@@ -504,6 +517,9 @@ pub enum LinkError {
 
     #[error("session window violation")]
     WindowViolation,
+
+    #[error("protocol error: {0}")]
+    ProtocolError(String),
 }
 
 // =============================================================================
@@ -567,16 +583,19 @@ mod tests {
             delivery_id: 0,
             delivery_tag: Bytes::from_static(b"a"),
             settled: false,
+            state: None,
         });
         link.unsettled.push(UnsettledDelivery {
             delivery_id: 1,
             delivery_tag: Bytes::from_static(b"b"),
             settled: false,
+            state: None,
         });
         link.unsettled.push(UnsettledDelivery {
             delivery_id: 2,
             delivery_tag: Bytes::from_static(b"c"),
             settled: false,
+            state: None,
         });
 
         link.settle_range(0, 1);
@@ -903,16 +922,19 @@ mod tests {
             delivery_id: 0,
             delivery_tag: Bytes::from_static(b"a"),
             settled: false,
+            state: None,
         });
         link.unsettled.push(UnsettledDelivery {
             delivery_id: 1,
             delivery_tag: Bytes::from_static(b"b"),
             settled: false,
+            state: None,
         });
         link.unsettled.push(UnsettledDelivery {
             delivery_id: 2,
             delivery_tag: Bytes::from_static(b"c"),
             settled: false,
+            state: None,
         });
 
         // Peer only has 1 and 2 — 0 should be removed from ours
@@ -934,6 +956,7 @@ mod tests {
             delivery_id: 1,
             delivery_tag: Bytes::from_static(b"b"),
             settled: false,
+            state: None,
         });
 
         // Peer has delivery 1 and 5 — we don't have 5
@@ -1203,11 +1226,13 @@ mod tests {
             delivery_id: 5,
             delivery_tag: Bytes::from_static(b"a"),
             settled: false,
+            state: None,
         });
         link.unsettled.push(UnsettledDelivery {
             delivery_id: 10,
             delivery_tag: Bytes::from_static(b"b"),
             settled: false,
+            state: None,
         });
 
         // first > last: the condition (id >= 10 && id <= 5) is always false.
@@ -1227,6 +1252,7 @@ mod tests {
                 delivery_id: id,
                 delivery_tag: Bytes::copy_from_slice(&id.to_be_bytes()),
                 settled: false,
+                state: None,
             });
         }
 
@@ -1317,11 +1343,13 @@ mod tests {
             delivery_id: 1,
             delivery_tag: Bytes::from_static(b"a"),
             settled: false,
+            state: None,
         });
         link.unsettled.push(UnsettledDelivery {
             delivery_id: 2,
             delivery_tag: Bytes::from_static(b"b"),
             settled: false,
+            state: None,
         });
 
         // Empty peer map: peer has nothing.

@@ -241,17 +241,29 @@ impl ReasonCode {
     pub const NOT_AUTHORIZED: Self = Self(0x87);
     pub const SERVER_UNAVAILABLE: Self = Self(0x88);
     pub const SERVER_BUSY: Self = Self(0x89);
+    pub const BANNED: Self = Self(0x8A);
+    pub const SERVER_SHUTTING_DOWN: Self = Self(0x8B);
+    pub const BAD_AUTHENTICATION_METHOD: Self = Self(0x8C);
+    pub const KEEP_ALIVE_TIMEOUT: Self = Self(0x8D);
+    pub const SESSION_TAKEN_OVER: Self = Self(0x8E);
     pub const TOPIC_FILTER_INVALID: Self = Self(0x8F);
     pub const TOPIC_NAME_INVALID: Self = Self(0x90);
     pub const PACKET_IDENTIFIER_IN_USE: Self = Self(0x91);
     pub const PACKET_IDENTIFIER_NOT_FOUND: Self = Self(0x92);
+    pub const RECEIVE_MAXIMUM_EXCEEDED: Self = Self(0x93);
     pub const TOPIC_ALIAS_INVALID: Self = Self(0x94);
     pub const PACKET_TOO_LARGE: Self = Self(0x95);
+    pub const MESSAGE_RATE_TOO_HIGH: Self = Self(0x96);
     pub const QUOTA_EXCEEDED: Self = Self(0x97);
+    pub const ADMINISTRATIVE_ACTION: Self = Self(0x98);
     pub const PAYLOAD_FORMAT_INVALID: Self = Self(0x99);
     pub const RETAIN_NOT_SUPPORTED: Self = Self(0x9A);
     pub const QOS_NOT_SUPPORTED: Self = Self(0x9B);
+    pub const USE_ANOTHER_SERVER: Self = Self(0x9D);
     pub const SHARED_SUBSCRIPTIONS_NOT_SUPPORTED: Self = Self(0x9E);
+    pub const SERVER_MOVED: Self = Self(0x9E); // Same as SHARED_SUBSCRIPTIONS_NOT_SUPPORTED (context-dependent)
+    pub const CONNECTION_RATE_EXCEEDED: Self = Self(0x9F);
+    pub const MAXIMUM_CONNECT_TIME: Self = Self(0xA0);
     pub const SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED: Self = Self(0xA1);
     pub const WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED: Self = Self(0xA2);
 }
@@ -813,6 +825,17 @@ mod tests {
         assert_eq!(ReasonCode::TOPIC_ALIAS_INVALID.0, 0x94);
         assert_eq!(ReasonCode::PACKET_TOO_LARGE.0, 0x95);
         assert_eq!(ReasonCode::PAYLOAD_FORMAT_INVALID.0, 0x99);
+        assert_eq!(ReasonCode::BANNED.0, 0x8A);
+        assert_eq!(ReasonCode::SERVER_SHUTTING_DOWN.0, 0x8B);
+        assert_eq!(ReasonCode::BAD_AUTHENTICATION_METHOD.0, 0x8C);
+        assert_eq!(ReasonCode::KEEP_ALIVE_TIMEOUT.0, 0x8D);
+        assert_eq!(ReasonCode::SESSION_TAKEN_OVER.0, 0x8E);
+        assert_eq!(ReasonCode::RECEIVE_MAXIMUM_EXCEEDED.0, 0x93);
+        assert_eq!(ReasonCode::MESSAGE_RATE_TOO_HIGH.0, 0x96);
+        assert_eq!(ReasonCode::ADMINISTRATIVE_ACTION.0, 0x98);
+        assert_eq!(ReasonCode::USE_ANOTHER_SERVER.0, 0x9D);
+        assert_eq!(ReasonCode::CONNECTION_RATE_EXCEEDED.0, 0x9F);
+        assert_eq!(ReasonCode::MAXIMUM_CONNECT_TIME.0, 0xA0);
     }
 
     #[test]

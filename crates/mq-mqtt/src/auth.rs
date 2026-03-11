@@ -92,6 +92,31 @@ pub trait AuthProvider: Send + Sync {
         auth_data: Option<&[u8]>,
         step: u32,
     ) -> AuthResult;
+
+    /// GAP-9: Authorize a PUBLISH or SUBSCRIBE operation on a specific topic.
+    ///
+    /// Called before accepting a client PUBLISH or processing a SUBSCRIBE filter.
+    /// Returns `true` if the client is allowed to perform the operation.
+    ///
+    /// Default implementation allows all operations.
+    fn authorize_topic(
+        &self,
+        _client_id: &str,
+        _username: Option<&str>,
+        _topic: &str,
+        _action: TopicAction,
+    ) -> bool {
+        true
+    }
+}
+
+/// The type of topic operation being authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicAction {
+    /// Client is publishing to this topic.
+    Publish,
+    /// Client is subscribing to this topic filter.
+    Subscribe,
 }
 
 // =============================================================================

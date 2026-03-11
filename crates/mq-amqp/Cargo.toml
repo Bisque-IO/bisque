@@ -6,6 +6,10 @@ authors.workspace = true
 description = "AMQP 1.0 protocol adapter for bisque-mq"
 license.workspace = true
 
+[features]
+default = ["tls"]
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
+
 [dependencies]
 bisque-mq = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
@@ -16,6 +20,9 @@ parking_lot = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
