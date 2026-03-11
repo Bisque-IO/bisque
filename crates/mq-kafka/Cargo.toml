@@ -18,6 +18,11 @@ serde_json = { workspace = true }
 metrics = { workspace = true }
 crc32fast = { workspace = true }
 arc-swap = { workspace = true }
+smallvec = { workspace = true }
+snap = { workspace = true }
+zstd = { workspace = true }
+flate2 = "1"
+lz4_flex = "0.11"
 
 [dev-dependencies]
 bisque-mq = { workspace = true, features = ["test-util"] }

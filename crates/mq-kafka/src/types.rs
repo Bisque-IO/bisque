@@ -1,6 +1,7 @@
 use std::fmt;
 
 use bytes::{Buf, Bytes, BytesMut};
+use smallvec::SmallVec;
 
 // =============================================================================
 // WireString — zero-copy UTF-8 string backed by Bytes
@@ -134,7 +135,7 @@ impl From<String> for WireString {
 impl From<&str> for WireString {
     #[inline]
     fn from(s: &str) -> Self {
-        Self(Bytes::from(s.to_owned()))
+        Self(Bytes::copy_from_slice(s.as_bytes()))
     }
 }
 
@@ -285,9 +286,22 @@ pub enum ApiKey {
     SyncGroup = 14,
     DescribeGroups = 15,
     ListGroups = 16,
+    SaslHandshake = 17,
     ApiVersions = 18,
     CreateTopics = 19,
     DeleteTopics = 20,
+    DeleteRecords = 21,
+    InitProducerId = 22,
+    AddPartitionsToTxn = 24,
+    AddOffsetsToTxn = 25,
+    EndTxn = 26,
+    TxnOffsetCommit = 28,
+    DescribeConfigs = 32,
+    AlterConfigs = 33,
+    SaslAuthenticate = 36,
+    CreatePartitions = 37,
+    DeleteGroups = 42,
+    OffsetDelete = 47,
 }
 
 impl ApiKey {
@@ -306,9 +320,22 @@ impl ApiKey {
             14 => Some(Self::SyncGroup),
             15 => Some(Self::DescribeGroups),
             16 => Some(Self::ListGroups),
+            17 => Some(Self::SaslHandshake),
             18 => Some(Self::ApiVersions),
             19 => Some(Self::CreateTopics),
             20 => Some(Self::DeleteTopics),
+            21 => Some(Self::DeleteRecords),
+            22 => Some(Self::InitProducerId),
+            24 => Some(Self::AddPartitionsToTxn),
+            25 => Some(Self::AddOffsetsToTxn),
+            26 => Some(Self::EndTxn),
+            28 => Some(Self::TxnOffsetCommit),
+            32 => Some(Self::DescribeConfigs),
+            33 => Some(Self::AlterConfigs),
+            36 => Some(Self::SaslAuthenticate),
+            37 => Some(Self::CreatePartitions),
+            42 => Some(Self::DeleteGroups),
+            47 => Some(Self::OffsetDelete),
             _ => None,
         }
     }
@@ -322,16 +349,29 @@ impl ApiKey {
             Self::Metadata => (0, 1),
             Self::OffsetCommit => (0, 2),
             Self::OffsetFetch => (0, 1),
-            Self::FindCoordinator => (0, 0),
+            Self::FindCoordinator => (0, 1),
             Self::JoinGroup => (0, 1),
             Self::Heartbeat => (0, 0),
             Self::LeaveGroup => (0, 0),
             Self::SyncGroup => (0, 0),
             Self::DescribeGroups => (0, 0),
             Self::ListGroups => (0, 0),
+            Self::SaslHandshake => (0, 1),
             Self::ApiVersions => (0, 0),
             Self::CreateTopics => (0, 0),
             Self::DeleteTopics => (0, 0),
+            Self::DeleteRecords => (0, 0),
+            Self::InitProducerId => (0, 0),
+            Self::AddPartitionsToTxn => (0, 0),
+            Self::AddOffsetsToTxn => (0, 0),
+            Self::EndTxn => (0, 0),
+            Self::TxnOffsetCommit => (0, 0),
+            Self::DescribeConfigs => (0, 0),
+            Self::AlterConfigs => (0, 0),
+            Self::SaslAuthenticate => (0, 1),
+            Self::CreatePartitions => (0, 0),
+            Self::DeleteGroups => (0, 0),
+            Self::OffsetDelete => (0, 0),
         }
     }
 }
@@ -368,10 +408,23 @@ pub enum ErrorCode {
     UnknownMemberId = 25,
     InvalidSessionTimeout = 26,
     RebalanceInProgress = 27,
+    UnsupportedVersion = 35,
     TopicAlreadyExists = 36,
     InvalidPartitions = 37,
+    InvalidTransactionTimeout = 38,
+    ConcurrentTransactions = 39,
+    TransactionCoordinatorFenced = 40,
+    TransactionalIdAuthorizationFailed = 53,
+    SecurityDisabled = 54,
+    OperationNotAttempted = 55,
+    GroupNotEmpty = 68,
     MemberIdRequired = 79,
-    UnsupportedVersion = 35,
+    GroupIdNotFound = 69,
+    InvalidProducerEpoch = 47,
+    UnknownProducerId = 59,
+    ProducerFenced = 90,
+    InvalidTxnState = 48,
+    SaslAuthenticationFailed = 58,
 }
 
 impl ErrorCode {
@@ -414,6 +467,19 @@ pub enum KafkaRequest {
     DeleteTopics(DeleteTopicsRequest),
     DescribeGroups(DescribeGroupsRequest),
     ListGroups,
+    SaslHandshake(SaslHandshakeRequest),
+    SaslAuthenticate(SaslAuthenticateRequest),
+    DeleteRecords(DeleteRecordsRequest),
+    InitProducerId(InitProducerIdRequest),
+    AddPartitionsToTxn(AddPartitionsToTxnRequest),
+    AddOffsetsToTxn(AddOffsetsToTxnRequest),
+    EndTxn(EndTxnRequest),
+    TxnOffsetCommit(TxnOffsetCommitRequest),
+    DescribeConfigs(DescribeConfigsRequest),
+    AlterConfigs(AlterConfigsRequest),
+    CreatePartitions(CreatePartitionsRequest),
+    DeleteGroups(DeleteGroupsRequest),
+    OffsetDelete(OffsetDeleteRequest),
 }
 
 // -- Metadata --
@@ -616,6 +682,185 @@ pub struct DescribeGroupsRequest {
     pub group_ids: Vec<WireString>,
 }
 
+// -- SaslHandshake --
+
+#[derive(Debug, Clone)]
+pub struct SaslHandshakeRequest {
+    pub mechanism: WireString,
+}
+
+// -- SaslAuthenticate --
+
+#[derive(Debug, Clone)]
+pub struct SaslAuthenticateRequest {
+    pub auth_bytes: Bytes,
+}
+
+// -- DeleteRecords --
+
+#[derive(Debug, Clone)]
+pub struct DeleteRecordsRequest {
+    pub topics: Vec<DeleteRecordsTopicData>,
+    pub timeout_ms: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteRecordsTopicData {
+    pub topic_name: WireString,
+    pub partitions: Vec<DeleteRecordsPartitionData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteRecordsPartitionData {
+    pub partition_index: i32,
+    pub offset: i64,
+}
+
+// -- InitProducerId --
+
+#[derive(Debug, Clone)]
+pub struct InitProducerIdRequest {
+    pub transactional_id: Option<WireString>,
+    pub transaction_timeout_ms: i32,
+}
+
+// -- AddPartitionsToTxn --
+
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnRequest {
+    pub transactional_id: WireString,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub topics: Vec<AddPartitionsToTxnTopicData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnTopicData {
+    pub topic_name: WireString,
+    pub partitions: Vec<i32>,
+}
+
+// -- AddOffsetsToTxn --
+
+#[derive(Debug, Clone)]
+pub struct AddOffsetsToTxnRequest {
+    pub transactional_id: WireString,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub group_id: WireString,
+}
+
+// -- EndTxn --
+
+#[derive(Debug, Clone)]
+pub struct EndTxnRequest {
+    pub transactional_id: WireString,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub committed: bool,
+}
+
+// -- TxnOffsetCommit --
+
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitRequest {
+    pub transactional_id: WireString,
+    pub group_id: WireString,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub topics: Vec<TxnOffsetCommitTopicData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitTopicData {
+    pub topic_name: WireString,
+    pub partitions: Vec<TxnOffsetCommitPartitionData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitPartitionData {
+    pub partition_index: i32,
+    pub offset: i64,
+    pub metadata: Option<WireString>,
+}
+
+// -- DescribeConfigs --
+
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsRequest {
+    pub resources: Vec<DescribeConfigsResource>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsResource {
+    /// 2 = topic, 4 = broker
+    pub resource_type: i8,
+    pub resource_name: WireString,
+    pub config_names: Option<Vec<WireString>>,
+}
+
+// -- AlterConfigs --
+
+#[derive(Debug, Clone)]
+pub struct AlterConfigsRequest {
+    pub resources: Vec<AlterConfigsResource>,
+    pub validate_only: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterConfigsResource {
+    pub resource_type: i8,
+    pub resource_name: WireString,
+    pub configs: Vec<AlterConfigEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterConfigEntry {
+    pub name: WireString,
+    pub value: Option<WireString>,
+}
+
+// -- CreatePartitions --
+
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsRequest {
+    pub topics: Vec<CreatePartitionsTopic>,
+    pub timeout_ms: i32,
+    pub validate_only: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsTopic {
+    pub name: WireString,
+    pub count: i32,
+}
+
+// -- DeleteGroups --
+
+#[derive(Debug, Clone)]
+pub struct DeleteGroupsRequest {
+    pub group_ids: Vec<WireString>,
+}
+
+// -- OffsetDelete --
+
+#[derive(Debug, Clone)]
+pub struct OffsetDeleteRequest {
+    pub group_id: WireString,
+    pub topics: Vec<OffsetDeleteTopicData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetDeleteTopicData {
+    pub topic_name: WireString,
+    pub partitions: Vec<OffsetDeletePartitionData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetDeletePartitionData {
+    pub partition_index: i32,
+}
+
 // =============================================================================
 // Responses — WireString for string fields (zero-copy echo from requests)
 // =============================================================================
@@ -638,6 +883,19 @@ pub enum KafkaResponse {
     DeleteTopics(DeleteTopicsResponse),
     DescribeGroups(DescribeGroupsResponse),
     ListGroups(ListGroupsResponse),
+    SaslHandshake(SaslHandshakeResponse),
+    SaslAuthenticate(SaslAuthenticateResponse),
+    DeleteRecords(DeleteRecordsResponse),
+    InitProducerId(InitProducerIdResponse),
+    AddPartitionsToTxn(AddPartitionsToTxnResponse),
+    AddOffsetsToTxn(AddOffsetsToTxnResponse),
+    EndTxn(EndTxnResponse),
+    TxnOffsetCommit(TxnOffsetCommitResponse),
+    DescribeConfigs(DescribeConfigsResponse),
+    AlterConfigs(AlterConfigsResponse),
+    CreatePartitions(CreatePartitionsResponse),
+    DeleteGroups(DeleteGroupsResponse),
+    OffsetDelete(OffsetDeleteResponse),
 }
 
 // -- ApiVersions --
@@ -682,8 +940,8 @@ pub struct PartitionMetadata {
     pub error_code: i16,
     pub partition_index: i32,
     pub leader: i32,
-    pub replicas: Vec<i32>,
-    pub isr: Vec<i32>,
+    pub replicas: SmallVec<[i32; 1]>,
+    pub isr: SmallVec<[i32; 1]>,
 }
 
 // -- Produce --
@@ -905,6 +1163,191 @@ pub struct ListedGroup {
     pub protocol_type: WireString,
 }
 
+// -- SaslHandshake --
+
+#[derive(Debug, Clone)]
+pub struct SaslHandshakeResponse {
+    pub error_code: i16,
+    pub mechanisms: Vec<WireString>,
+}
+
+// -- SaslAuthenticate --
+
+#[derive(Debug, Clone)]
+pub struct SaslAuthenticateResponse {
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+    pub auth_bytes: Bytes,
+}
+
+// -- DeleteRecords --
+
+#[derive(Debug, Clone)]
+pub struct DeleteRecordsResponse {
+    pub topics: Vec<DeleteRecordsTopicResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteRecordsTopicResponse {
+    pub topic_name: WireString,
+    pub partitions: Vec<DeleteRecordsPartitionResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteRecordsPartitionResponse {
+    pub partition_index: i32,
+    pub low_watermark: i64,
+    pub error_code: i16,
+}
+
+// -- InitProducerId --
+
+#[derive(Debug, Clone)]
+pub struct InitProducerIdResponse {
+    pub error_code: i16,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+}
+
+// -- AddPartitionsToTxn --
+
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnResponse {
+    pub topics: Vec<AddPartitionsToTxnTopicResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnTopicResponse {
+    pub topic_name: WireString,
+    pub partitions: Vec<AddPartitionsToTxnPartitionResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnPartitionResponse {
+    pub partition_index: i32,
+    pub error_code: i16,
+}
+
+// -- AddOffsetsToTxn --
+
+#[derive(Debug, Clone)]
+pub struct AddOffsetsToTxnResponse {
+    pub error_code: i16,
+}
+
+// -- EndTxn --
+
+#[derive(Debug, Clone)]
+pub struct EndTxnResponse {
+    pub error_code: i16,
+}
+
+// -- TxnOffsetCommit --
+
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitResponse {
+    pub topics: Vec<TxnOffsetCommitTopicResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitTopicResponse {
+    pub topic_name: WireString,
+    pub partitions: Vec<TxnOffsetCommitPartitionResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitPartitionResponse {
+    pub partition_index: i32,
+    pub error_code: i16,
+}
+
+// -- DescribeConfigs --
+
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsResponse {
+    pub resources: Vec<DescribeConfigsResourceResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsResourceResult {
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+    pub resource_type: i8,
+    pub resource_name: WireString,
+    pub configs: Vec<DescribeConfigEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DescribeConfigEntry {
+    pub name: WireString,
+    pub value: Option<WireString>,
+    pub read_only: bool,
+    pub is_default: bool,
+    pub is_sensitive: bool,
+}
+
+// -- AlterConfigs --
+
+#[derive(Debug, Clone)]
+pub struct AlterConfigsResponse {
+    pub resources: Vec<AlterConfigsResourceResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterConfigsResourceResult {
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+    pub resource_type: i8,
+    pub resource_name: WireString,
+}
+
+// -- CreatePartitions --
+
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsResponse {
+    pub topics: Vec<CreatePartitionsTopicResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsTopicResponse {
+    pub name: WireString,
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+}
+
+// -- DeleteGroups --
+
+#[derive(Debug, Clone)]
+pub struct DeleteGroupsResponse {
+    pub results: Vec<DeleteGroupResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteGroupResult {
+    pub group_id: WireString,
+    pub error_code: i16,
+}
+
+// -- OffsetDelete --
+
+#[derive(Debug, Clone)]
+pub struct OffsetDeleteResponse {
+    pub error_code: i16,
+    pub topics: Vec<OffsetDeleteTopicResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetDeleteTopicResponse {
+    pub topic_name: WireString,
+    pub partitions: Vec<OffsetDeletePartitionResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetDeletePartitionResponse {
+    pub partition_index: i32,
+    pub error_code: i16,
+}
+
 // =============================================================================
 // RecordBatch (Kafka v2 message format)
 // =============================================================================
@@ -981,6 +1424,19 @@ mod tests {
             ApiKey::OffsetFetch,
             ApiKey::CreateTopics,
             ApiKey::DeleteTopics,
+            ApiKey::SaslHandshake,
+            ApiKey::SaslAuthenticate,
+            ApiKey::DeleteRecords,
+            ApiKey::InitProducerId,
+            ApiKey::AddPartitionsToTxn,
+            ApiKey::AddOffsetsToTxn,
+            ApiKey::EndTxn,
+            ApiKey::TxnOffsetCommit,
+            ApiKey::DescribeConfigs,
+            ApiKey::AlterConfigs,
+            ApiKey::CreatePartitions,
+            ApiKey::DeleteGroups,
+            ApiKey::OffsetDelete,
         ];
         for key in keys {
             let i = key as i16;
@@ -1072,5 +1528,313 @@ mod tests {
         let slice = cur.read_slice(3);
         // slice should share underlying allocation with data
         assert_eq!(&slice[..], &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_wire_string_empty() {
+        let ws = WireString::empty();
+        assert!(ws.is_empty());
+        assert_eq!(ws.len(), 0);
+        assert_eq!(ws.as_str(), "");
+        assert_eq!(ws.as_bytes(), b"");
+    }
+
+    #[test]
+    fn test_wire_string_into_bytes() {
+        let ws = WireString::from("hello");
+        let b = ws.into_bytes();
+        assert_eq!(&b[..], b"hello");
+    }
+
+    #[test]
+    fn test_wire_string_bytes() {
+        let ws = WireString::from("world");
+        let b = ws.bytes();
+        assert_eq!(&b[..], b"world");
+    }
+
+    #[test]
+    fn test_wire_string_as_ref_str() {
+        let ws = WireString::from("test");
+        let s: &str = ws.as_ref();
+        assert_eq!(s, "test");
+    }
+
+    #[test]
+    fn test_wire_string_as_ref_u8() {
+        let ws = WireString::from("abc");
+        let b: &[u8] = ws.as_ref();
+        assert_eq!(b, b"abc");
+    }
+
+    #[test]
+    fn test_wire_string_borrow() {
+        use std::borrow::Borrow;
+        let ws = WireString::from("borrow");
+        let s: &str = ws.borrow();
+        assert_eq!(s, "borrow");
+    }
+
+    #[test]
+    fn test_wire_string_display() {
+        let ws = WireString::from("display");
+        assert_eq!(format!("{ws}"), "display");
+    }
+
+    #[test]
+    fn test_wire_string_from_string() {
+        let s = String::from("owned");
+        let ws = WireString::from(s);
+        assert_eq!(ws.as_str(), "owned");
+    }
+
+    #[test]
+    fn test_wire_string_partial_eq_ref_str() {
+        let ws = WireString::from("cmp");
+        assert_eq!(ws, "cmp");
+        let s: &str = "cmp";
+        assert!(ws == s);
+    }
+
+    #[test]
+    fn test_wire_string_is_empty() {
+        assert!(WireString::empty().is_empty());
+        assert!(!WireString::from("x").is_empty());
+    }
+
+    #[test]
+    fn test_wire_string_len() {
+        assert_eq!(WireString::from("hello").len(), 5);
+        assert_eq!(WireString::from("").len(), 0);
+        assert_eq!(WireString::from("日本語").len(), 9); // 3 chars × 3 bytes
+    }
+
+    #[test]
+    fn test_bytes_cursor_read_i8() {
+        let data = Bytes::from_static(&[0xFF]);
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.read_i8(), -1);
+        assert_eq!(cur.remaining(), 0);
+    }
+
+    #[test]
+    fn test_bytes_cursor_read_i16() {
+        let data = Bytes::from_static(&[0x00, 0x2A]); // 42
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.read_i16(), 42);
+        assert_eq!(cur.remaining(), 0);
+    }
+
+    #[test]
+    fn test_bytes_cursor_read_i16_negative() {
+        let data = Bytes::from_static(&[0xFF, 0xFE]); // -2
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.read_i16(), -2);
+    }
+
+    #[test]
+    fn test_bytes_cursor_read_i32() {
+        let data = Bytes::from_static(&[0x00, 0x00, 0x01, 0x00]); // 256
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.read_i32(), 256);
+    }
+
+    #[test]
+    fn test_bytes_cursor_read_i32_negative() {
+        let data = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]); // -1
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.read_i32(), -1);
+    }
+
+    #[test]
+    fn test_bytes_cursor_read_i64() {
+        let val: i64 = 0x0102030405060708;
+        let data = Bytes::from(val.to_be_bytes().to_vec());
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.read_i64(), val);
+    }
+
+    #[test]
+    fn test_bytes_cursor_read_u32() {
+        let data = Bytes::from_static(&[0x00, 0x00, 0x00, 0xFF]); // 255
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.read_u32(), 255);
+    }
+
+    #[test]
+    fn test_bytes_cursor_as_slice() {
+        let data = Bytes::from_static(&[1, 2, 3, 4, 5]);
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.as_slice(), &[1, 2, 3, 4, 5]);
+        cur.advance(2);
+        assert_eq!(cur.as_slice(), &[3, 4, 5]);
+    }
+
+    #[test]
+    fn test_bytes_cursor_advance() {
+        let data = Bytes::from_static(&[1, 2, 3, 4, 5]);
+        let mut cur = BytesCursor::new(data);
+        cur.advance(3);
+        assert_eq!(cur.remaining(), 2);
+        assert_eq!(cur.read_u8(), 4);
+    }
+
+    #[test]
+    fn test_bytes_cursor_slice() {
+        let data = Bytes::from_static(&[10, 20, 30, 40, 50]);
+        let mut cur = BytesCursor::new(data);
+        cur.advance(1); // skip first byte
+        let s = cur.slice(3);
+        assert_eq!(&s[..], &[20, 30, 40]);
+    }
+
+    #[test]
+    fn test_bytes_cursor_sequential_reads() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&42i16.to_be_bytes());
+        buf.extend_from_slice(&1000i32.to_be_bytes());
+        buf.extend_from_slice(&(-1i64).to_be_bytes());
+        buf.push(0xAB);
+        let data = Bytes::from(buf);
+        let mut cur = BytesCursor::new(data);
+        assert_eq!(cur.read_i16(), 42);
+        assert_eq!(cur.read_i32(), 1000);
+        assert_eq!(cur.read_i64(), -1);
+        assert_eq!(cur.read_u8(), 0xAB);
+        assert_eq!(cur.remaining(), 0);
+    }
+
+    #[test]
+    fn test_error_code_all_values() {
+        // Verify a selection of error codes have correct i16 values
+        assert_eq!(ErrorCode::None.as_i16(), 0);
+        assert_eq!(ErrorCode::OffsetOutOfRange.as_i16(), 1);
+        assert_eq!(ErrorCode::CorruptMessage.as_i16(), 2);
+        assert_eq!(ErrorCode::UnknownTopicOrPartition.as_i16(), 3);
+        assert_eq!(ErrorCode::InvalidFetchSize.as_i16(), 4);
+        assert_eq!(ErrorCode::LeaderNotAvailable.as_i16(), 5);
+        assert_eq!(ErrorCode::NotLeaderOrFollower.as_i16(), 6);
+        assert_eq!(ErrorCode::RequestTimedOut.as_i16(), 7);
+        assert_eq!(ErrorCode::MessageTooLarge.as_i16(), 10);
+        assert_eq!(ErrorCode::GroupLoadInProgress.as_i16(), 14);
+        assert_eq!(ErrorCode::GroupCoordinatorNotAvailable.as_i16(), 15);
+        assert_eq!(ErrorCode::InvalidTopicException.as_i16(), 17);
+        assert_eq!(ErrorCode::IllegalGeneration.as_i16(), 22);
+        assert_eq!(ErrorCode::InvalidGroupId.as_i16(), 24);
+        assert_eq!(ErrorCode::UnknownMemberId.as_i16(), 25);
+        assert_eq!(ErrorCode::RebalanceInProgress.as_i16(), 27);
+        assert_eq!(ErrorCode::UnsupportedVersion.as_i16(), 35);
+        assert_eq!(ErrorCode::TopicAlreadyExists.as_i16(), 36);
+        assert_eq!(ErrorCode::InvalidPartitions.as_i16(), 37);
+        assert_eq!(ErrorCode::InvalidTxnState.as_i16(), 48);
+        assert_eq!(ErrorCode::InvalidProducerEpoch.as_i16(), 47);
+        assert_eq!(ErrorCode::SaslAuthenticationFailed.as_i16(), 58);
+        assert_eq!(ErrorCode::GroupNotEmpty.as_i16(), 68);
+        assert_eq!(ErrorCode::GroupIdNotFound.as_i16(), 69);
+        assert_eq!(ErrorCode::MemberIdRequired.as_i16(), 79);
+        assert_eq!(ErrorCode::ProducerFenced.as_i16(), 90);
+    }
+
+    #[test]
+    fn test_api_key_from_i16_all_valid() {
+        let valid_keys = [
+            (0, ApiKey::Produce),
+            (1, ApiKey::Fetch),
+            (2, ApiKey::ListOffsets),
+            (3, ApiKey::Metadata),
+            (8, ApiKey::OffsetCommit),
+            (9, ApiKey::OffsetFetch),
+            (10, ApiKey::FindCoordinator),
+            (11, ApiKey::JoinGroup),
+            (12, ApiKey::Heartbeat),
+            (13, ApiKey::LeaveGroup),
+            (14, ApiKey::SyncGroup),
+            (15, ApiKey::DescribeGroups),
+            (16, ApiKey::ListGroups),
+            (17, ApiKey::SaslHandshake),
+            (18, ApiKey::ApiVersions),
+            (19, ApiKey::CreateTopics),
+            (20, ApiKey::DeleteTopics),
+            (21, ApiKey::DeleteRecords),
+            (22, ApiKey::InitProducerId),
+            (24, ApiKey::AddPartitionsToTxn),
+            (25, ApiKey::AddOffsetsToTxn),
+            (26, ApiKey::EndTxn),
+            (28, ApiKey::TxnOffsetCommit),
+            (32, ApiKey::DescribeConfigs),
+            (33, ApiKey::AlterConfigs),
+            (36, ApiKey::SaslAuthenticate),
+            (37, ApiKey::CreatePartitions),
+            (42, ApiKey::DeleteGroups),
+            (47, ApiKey::OffsetDelete),
+        ];
+        for (i, expected) in &valid_keys {
+            assert_eq!(ApiKey::from_i16(*i), Some(*expected), "ApiKey {i}");
+        }
+    }
+
+    #[test]
+    fn test_api_key_from_i16_invalid() {
+        assert!(ApiKey::from_i16(-1).is_none());
+        assert!(ApiKey::from_i16(4).is_none()); // gap
+        assert!(ApiKey::from_i16(23).is_none()); // gap
+        assert!(ApiKey::from_i16(100).is_none());
+        assert!(ApiKey::from_i16(i16::MAX).is_none());
+        assert!(ApiKey::from_i16(i16::MIN).is_none());
+    }
+
+    #[test]
+    fn test_api_key_version_range_all() {
+        // Every valid ApiKey should return a valid range where min <= max
+        let keys = [
+            ApiKey::Produce,
+            ApiKey::Fetch,
+            ApiKey::ListOffsets,
+            ApiKey::Metadata,
+            ApiKey::OffsetCommit,
+            ApiKey::OffsetFetch,
+            ApiKey::FindCoordinator,
+            ApiKey::JoinGroup,
+            ApiKey::Heartbeat,
+            ApiKey::LeaveGroup,
+            ApiKey::SyncGroup,
+            ApiKey::DescribeGroups,
+            ApiKey::ListGroups,
+            ApiKey::SaslHandshake,
+            ApiKey::ApiVersions,
+            ApiKey::CreateTopics,
+            ApiKey::DeleteTopics,
+            ApiKey::DeleteRecords,
+            ApiKey::InitProducerId,
+            ApiKey::AddPartitionsToTxn,
+            ApiKey::AddOffsetsToTxn,
+            ApiKey::EndTxn,
+            ApiKey::TxnOffsetCommit,
+            ApiKey::DescribeConfigs,
+            ApiKey::AlterConfigs,
+            ApiKey::SaslAuthenticate,
+            ApiKey::CreatePartitions,
+            ApiKey::DeleteGroups,
+            ApiKey::OffsetDelete,
+        ];
+        for key in &keys {
+            let (min, max) = key.version_range();
+            assert!(min <= max, "ApiKey {:?}: min={min} > max={max}", key);
+            assert!(min >= 0, "ApiKey {:?}: negative min version", key);
+        }
+    }
+
+    #[test]
+    fn test_wire_string_default() {
+        let ws = WireString::default();
+        assert!(ws.is_empty());
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn test_wire_string_from_unchecked() {
+        let b = Bytes::from_static(b"safe");
+        let ws = WireString::from_utf8_unchecked(b);
+        assert_eq!(ws.as_str(), "safe");
     }
 }

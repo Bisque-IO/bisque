@@ -39,10 +39,12 @@ impl PartitionMap {
         self.topics.clear();
         for (name, topic_id) in mq_topics {
             if let Some((kafka_name, partition)) = parse_partition_topic(name) {
-                self.topics
-                    .entry(kafka_name.to_string())
-                    .or_default()
-                    .push((partition, *topic_id));
+                if let Some(parts) = self.topics.get_mut(kafka_name) {
+                    parts.push((partition, *topic_id));
+                } else {
+                    self.topics
+                        .insert(kafka_name.to_string(), vec![(partition, *topic_id)]);
+                }
             }
         }
         // Sort each partition list by index
@@ -51,9 +53,14 @@ impl PartitionMap {
         }
     }
 
-    /// Get the Kafka topic names.
+    /// Get the Kafka topic names as a collected Vec.
     pub fn kafka_topics(&self) -> Vec<&str> {
         self.topics.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Iterate Kafka topic names without allocating a Vec.
+    pub fn kafka_topic_names(&self) -> impl Iterator<Item = &str> {
+        self.topics.keys().map(|s| s.as_str())
     }
 
     /// Get the partition list for a Kafka topic.
@@ -182,5 +189,110 @@ mod tests {
             assert_eq!(map.resolve("t", i), Some(i as u64 + 1000));
         }
         assert_eq!(map.resolve("t", 100), None);
+    }
+
+    #[test]
+    fn test_kafka_topic_names_iterator() {
+        let mut map = PartitionMap::new();
+        let mq_topics = vec![("alpha-0".to_string(), 1), ("beta-0".to_string(), 2)];
+        map.refresh(&mq_topics);
+
+        let mut names: Vec<&str> = map.kafka_topic_names().collect();
+        names.sort();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn test_contains() {
+        let mut map = PartitionMap::new();
+        let mq_topics = vec![("events-0".to_string(), 100)];
+        map.refresh(&mq_topics);
+
+        assert!(map.contains("events"));
+        assert!(!map.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_resolve_sparse_partitions() {
+        let mut map = PartitionMap::new();
+        // Sparse: partitions 0, 2, 5 (gaps at 1, 3, 4)
+        let mq_topics = vec![
+            ("sparse-0".to_string(), 10),
+            ("sparse-2".to_string(), 12),
+            ("sparse-5".to_string(), 15),
+        ];
+        map.refresh(&mq_topics);
+
+        assert_eq!(map.resolve("sparse", 0), Some(10));
+        assert_eq!(map.resolve("sparse", 2), Some(12));
+        assert_eq!(map.resolve("sparse", 5), Some(15));
+        // Gaps should return None
+        assert_eq!(map.resolve("sparse", 1), None);
+        assert_eq!(map.resolve("sparse", 3), None);
+        assert_eq!(map.resolve("sparse", 4), None);
+    }
+
+    #[test]
+    fn test_refresh_empty() {
+        let mut map = PartitionMap::new();
+        map.refresh(&[]);
+        assert!(map.kafka_topics().is_empty());
+        assert_eq!(map.partition_count("anything"), None);
+    }
+
+    #[test]
+    fn test_refresh_clears_old_data() {
+        let mut map = PartitionMap::new();
+        let topics1 = vec![("old-0".to_string(), 1)];
+        map.refresh(&topics1);
+        assert!(map.contains("old"));
+
+        let topics2 = vec![("new-0".to_string(), 2)];
+        map.refresh(&topics2);
+        assert!(!map.contains("old"));
+        assert!(map.contains("new"));
+    }
+
+    #[test]
+    fn test_refresh_no_partition_suffix() {
+        let mut map = PartitionMap::new();
+        // Topics without dash-digit suffix should be skipped
+        let mq_topics = vec![
+            ("standalone".to_string(), 100),
+            ("no-suffix".to_string(), 200), // "no" is not a digit suffix either... wait "suffix" is not digits
+        ];
+        map.refresh(&mq_topics);
+        // Neither should appear since "standalone" has no dash-digit and
+        // "no-suffix" suffix is not digits
+        assert!(map.kafka_topics().is_empty());
+    }
+
+    #[test]
+    fn test_partition_count_none() {
+        let map = PartitionMap::new();
+        assert_eq!(map.partition_count("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_partitions_none() {
+        let map = PartitionMap::new();
+        assert!(map.partitions("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_resolve_nonexistent_topic() {
+        let map = PartitionMap::new();
+        assert_eq!(map.resolve("nope", 0), None);
+    }
+
+    #[test]
+    fn test_refresh_duplicate_partition_names() {
+        let mut map = PartitionMap::new();
+        // Same partition appears twice — later one should be appended
+        let mq_topics = vec![("dup-0".to_string(), 10), ("dup-0".to_string(), 20)];
+        map.refresh(&mq_topics);
+        // Should have 2 entries for partition 0 (both get added)
+        let parts = map.partitions("dup").unwrap();
+        assert_eq!(parts.len(), 2);
     }
 }

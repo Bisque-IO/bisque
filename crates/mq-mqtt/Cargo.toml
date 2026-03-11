@@ -6,14 +6,25 @@ authors.workspace = true
 description = "MQTT 3.1.1/5.0 protocol adapter for bisque-mq"
 license.workspace = true
 
+[features]
+default = ["tls", "websocket"]
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
+websocket = ["dep:fastwebsockets"]
+
 [dependencies]
 bisque-mq = { workspace = true }
 bytes = { workspace = true }
+dashmap = { workspace = true }
+fastwebsockets = { workspace = true, optional = true }
+memchr = { workspace = true }
 metrics = { workspace = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 serde = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tokio-rustls = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

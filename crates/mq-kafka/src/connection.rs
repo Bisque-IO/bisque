@@ -206,4 +206,109 @@ mod tests {
 
         assert!(conn.try_decode_request().unwrap().is_none());
     }
+
+    #[test]
+    fn test_connection_unique_ids() {
+        let c1 = KafkaConnection::new();
+        let c2 = KafkaConnection::new();
+        assert_ne!(c1.id, c2.id);
+    }
+
+    #[test]
+    fn test_client_id_set_on_first_request() {
+        let mut conn = KafkaConnection::new();
+        assert!(conn.client_id.is_none());
+
+        // Build a valid ApiVersions request with client_id "my-client"
+        let mut payload = BytesMut::new();
+        payload.put_i16(18); // api_key = ApiVersions
+        payload.put_i16(0); // api_version
+        payload.put_i32(1); // correlation_id
+        // client_id: length-prefixed string
+        let cid = b"my-client";
+        payload.put_i16(cid.len() as i16);
+        payload.extend_from_slice(cid);
+
+        let mut frame = BytesMut::new();
+        frame.put_i32(payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        conn.feed_data(&frame);
+        let result = conn.try_decode_request().unwrap();
+        assert!(result.is_some());
+
+        assert!(conn.client_id.is_some());
+        assert_eq!(conn.client_id.as_ref().unwrap().as_str(), "my-client");
+    }
+
+    #[test]
+    fn test_feed_data_accumulates() {
+        let mut conn = KafkaConnection::new();
+        conn.feed_data(&[0, 0]);
+        conn.feed_data(&[0, 8]); // frame size = 8
+        // Not enough data yet
+        assert!(conn.try_decode_request().unwrap().is_none());
+        assert_eq!(conn.read_buf.len(), 4);
+    }
+
+    #[test]
+    fn test_take_write_buf_clears() {
+        let mut conn = KafkaConnection::new();
+        let resp = KafkaResponse::Heartbeat(HeartbeatResponse { error_code: 0 });
+        conn.encode_response(1, &resp);
+        assert!(conn.has_pending_writes());
+
+        let buf = conn.take_write_buf();
+        assert!(!buf.is_empty());
+        assert!(!conn.has_pending_writes());
+
+        // Second take returns empty
+        let buf2 = conn.take_write_buf();
+        assert!(buf2.is_empty());
+    }
+
+    #[test]
+    fn test_consumer_member_ids_tracking() {
+        let mut conn = KafkaConnection::new();
+        assert!(conn.consumer_member_ids.is_empty());
+        conn.consumer_member_ids.push(WireString::from("member-1"));
+        conn.consumer_member_ids.push(WireString::from("member-2"));
+        assert_eq!(conn.consumer_member_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_partial_frame_split_across_feeds() {
+        let mut conn = KafkaConnection::new();
+
+        // Build a complete ApiVersions frame
+        let mut payload = BytesMut::new();
+        payload.put_i16(18); // ApiVersions
+        payload.put_i16(0);
+        payload.put_i32(99);
+        payload.put_i16(-1); // null client_id
+
+        let mut frame = BytesMut::new();
+        frame.put_i32(payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let mid = frame.len() / 2;
+        let (first_half, second_half) = frame.split_at(mid);
+
+        // Feed first half
+        conn.feed_data(first_half);
+        assert!(conn.try_decode_request().unwrap().is_none());
+
+        // Feed second half
+        conn.feed_data(second_half);
+        let result = conn.try_decode_request().unwrap();
+        assert!(result.is_some());
+        let (header, _) = result.unwrap();
+        assert_eq!(header.correlation_id, 99);
+    }
+
+    #[test]
+    fn test_init_conn_metrics() {
+        // Just verify it doesn't panic
+        init_conn_metrics("test-catalog");
+    }
 }

@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::codec::{self, CodecError};
 use crate::session::{MqttSession, MqttSessionConfig, PublishPlan, RetainedPlan, SubscribePlan};
+use crate::session_store::{self, SessionStore};
 use crate::types::{MqttPacket, ProtocolVersion, QoS};
 
 // =============================================================================
@@ -67,7 +68,7 @@ fn shared_metrics() -> &'static MqttMetrics {
 // =============================================================================
 
 /// Configuration for the MQTT server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MqttServerConfig {
     /// Address to bind the TCP listener.
     pub bind_addr: SocketAddr,
@@ -83,6 +84,8 @@ pub struct MqttServerConfig {
     pub delivery_poll_ms: u64,
     /// Maximum messages to deliver per poll cycle per subscription.
     pub delivery_batch_size: u32,
+    /// Optional session store for persistence across reconnects.
+    pub session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl Default for MqttServerConfig {
@@ -95,6 +98,7 @@ impl Default for MqttServerConfig {
             tcp_keepalive: Some(Duration::from_secs(60)),
             delivery_poll_ms: 50,
             delivery_batch_size: 10,
+            session_store: None,
         }
     }
 }
@@ -226,6 +230,10 @@ async fn accept_loop(
     stats: Arc<MqttServerStats>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Periodic session expiry sweep (every 60 seconds).
+    let mut expiry_interval = tokio::time::interval(Duration::from_secs(60));
+    expiry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -263,6 +271,14 @@ async fn accept_loop(
                     Err(e) => {
                         error!(error = %e, "failed to accept connection");
                         tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            _ = expiry_interval.tick() => {
+                if let Some(ref store) = config.session_store {
+                    let expired = store.expire();
+                    if expired > 0 {
+                        debug!(expired, "expired stale MQTT sessions");
                     }
                 }
             }
@@ -581,6 +597,39 @@ async fn orchestrate_subscribe(
 ///
 /// The `sub_buf` and `flat_messages_buf` are caller-owned reusable buffers
 /// to avoid per-cycle allocations.
+/// Per-subscription delivery metadata, collected into a reusable buffer.
+#[derive(Clone, Copy)]
+struct SubDeliveryInfo {
+    queue_id: u64,
+    max_qos: QoS,
+    no_local: bool,
+    retain_as_published: bool,
+}
+
+/// Extract the publisher session ID from a FlatMessage header.
+fn extract_publisher_session_id(flat: &FlatMessage) -> Option<u64> {
+    for i in 0..flat.header_count() {
+        let (k, v) = flat.header(i);
+        if &k[..] == b"mqtt.publisher_session_id" && v.len() == 8 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&v);
+            return Some(u64::from_be_bytes(buf));
+        }
+    }
+    None
+}
+
+/// Check if the original retain flag was set in a FlatMessage header.
+fn extract_original_retain(flat: &FlatMessage) -> bool {
+    for i in 0..flat.header_count() {
+        let (k, v) = flat.header(i);
+        if &k[..] == b"mqtt.original_retain" && !v.is_empty() {
+            return v[0] != 0;
+        }
+    }
+    false
+}
+
 async fn deliver_outbound(
     session: &mut MqttSession,
     batcher: &MqWriteBatcher,
@@ -589,7 +638,7 @@ async fn deliver_outbound(
     stats: &MqttServerStats,
     batch_size: u32,
     write_buf: &mut BytesMut,
-    sub_buf: &mut Vec<(u64, QoS)>,
+    sub_buf: &mut Vec<SubDeliveryInfo>,
     flat_messages_buf: &mut Vec<Bytes>,
 ) -> Result<(), ConnectionError> {
     if session.is_inflight_full() {
@@ -598,17 +647,31 @@ async fn deliver_outbound(
 
     let m = shared_metrics();
 
-    // Collect (queue_id, max_qos) into reusable buffer to avoid borrow conflict.
+    // Collect subscription info into reusable buffer to avoid borrow conflict.
     sub_buf.clear();
     sub_buf.extend(
         session
             .subscriptions_iter()
-            .filter_map(|(_filter, mapping)| mapping.queue_id.map(|qid| (qid, mapping.max_qos))),
+            .filter_map(|(_filter, mapping)| {
+                mapping.queue_id.map(|qid| SubDeliveryInfo {
+                    queue_id: qid,
+                    max_qos: mapping.max_qos,
+                    no_local: mapping.no_local,
+                    retain_as_published: mapping.retain_as_published,
+                })
+            }),
     );
 
     let is_v5 = session.protocol_version == ProtocolVersion::V5;
+    let my_session_id = session.session_id;
 
-    for &(queue_id, max_qos) in sub_buf.iter() {
+    for &SubDeliveryInfo {
+        queue_id,
+        max_qos,
+        no_local,
+        retain_as_published,
+    } in sub_buf.iter()
+    {
         if session.is_inflight_full() {
             break;
         }
@@ -639,6 +702,30 @@ async fn deliver_outbound(
 
                 for flat_bytes in flat_messages_buf.iter() {
                     if let Some(flat) = FlatMessage::new(flat_bytes.clone()) {
+                        // No Local enforcement (M6): skip messages published by this session.
+                        if no_local {
+                            if let Some(pub_session_id) = extract_publisher_session_id(&flat) {
+                                if pub_session_id == my_session_id {
+                                    // ACK the message so it's removed from the queue.
+                                    let _ = batcher
+                                        .submit(MqCommand::ack(
+                                            queue_id,
+                                            &[delivered.message_id],
+                                            None,
+                                        ))
+                                        .await;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Retain As Published enforcement (M7): determine retain flag.
+                        let retain_flag = if retain_as_published {
+                            extract_original_retain(&flat)
+                        } else {
+                            false
+                        };
+
                         // Zero-alloc outbound: track inflight + encode directly from FlatMessage.
                         let tracking = session.track_outbound_delivery(
                             max_qos,
@@ -657,15 +744,17 @@ async fn deliver_outbound(
                             None
                         };
                         let subscription_id = if is_v5 {
-                            session.find_subscription_id()
+                            session.find_subscription_id_for_queue(queue_id)
                         } else {
                             None
                         };
 
+                        // Maximum Packet Size enforcement — outbound (M10).
+                        let buf_before = write_buf.len();
                         codec::encode_publish_from_flat(
                             &flat,
                             max_qos,
-                            false,
+                            retain_flag,
                             false,
                             packet_id,
                             is_v5,
@@ -673,6 +762,22 @@ async fn deliver_outbound(
                             topic_alias,
                             write_buf,
                         );
+                        let client_max = session.client_maximum_packet_size;
+                        let encoded_size = write_buf.len() - buf_before;
+                        if client_max > 0 && encoded_size > client_max as usize {
+                            // Roll back the encoded packet — skip delivery.
+                            write_buf.truncate(buf_before);
+                            debug!(
+                                encoded_size,
+                                client_max,
+                                "outbound PUBLISH exceeds client maximum_packet_size, skipping"
+                            );
+                            // ACK the message so the queue doesn't retry.
+                            let _ = batcher
+                                .submit(MqCommand::ack(queue_id, &[delivered.message_id], None))
+                                .await;
+                            continue;
+                        }
                         stats
                             .total_packets_sent
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -740,15 +845,54 @@ async fn handle_connection(
     // Process CONNECT via session.
     let (commands, responses) = session.process_packet(&first_packet);
 
+    // Check session store for persisted session (MQTT 5.0 session resumption).
+    let mut session_resumed = false;
+    let mut restore_plans = smallvec::SmallVec::<[SubscribePlan; 4]>::new();
+    if !session.clean_session {
+        if let Some(ref store) = config.session_store {
+            if let Some(persisted) = store.load(&session.client_id) {
+                session_resumed = true;
+                debug!(
+                    client_id = %session.client_id,
+                    subscriptions = persisted.subscriptions.len(),
+                    "restoring persisted session"
+                );
+                // Re-create subscriptions from persisted state.
+                restore_plans = session.restore_subscriptions(&persisted.subscriptions);
+            }
+        }
+    } else if let Some(ref store) = config.session_store {
+        // Clean session: remove any persisted state.
+        store.remove(&session.client_id);
+    }
+
     // Submit registration commands.
     for cmd in commands {
         let _ = batcher.submit(cmd).await;
     }
 
-    // Send CONNACK using reusable write buffer.
+    // Re-create queues and bindings for restored subscriptions.
+    for plan in &restore_plans {
+        if let Err(e) = orchestrate_subscribe(&mut session, batcher, plan).await {
+            warn!(error = %e, "failed to restore subscription");
+        }
+    }
+
+    // Send CONNACK using reusable write buffer (version-aware encoding).
+    // Patch session_present if we actually found a persisted session.
     for response in responses {
+        let response = if session_resumed {
+            if let MqttPacket::ConnAck(mut connack) = response {
+                connack.session_present = true;
+                MqttPacket::ConnAck(connack)
+            } else {
+                response
+            }
+        } else {
+            response
+        };
         write_buf.clear();
-        codec::encode_packet(&response, &mut write_buf);
+        codec::encode_packet_versioned(&response, session.protocol_version, &mut write_buf);
         stream.write_all(&write_buf).await?;
         stats
             .total_packets_sent
@@ -801,6 +945,16 @@ async fn handle_connection(
         }
     }
 
+    // Persist session state if applicable (MQTT 5.0 session expiry).
+    if let Some(ref store) = config.session_store {
+        if session_store::should_persist(&session) {
+            store.save(session_store::extract_session_state(&session));
+            debug!(client_id = %session.client_id, "session state persisted");
+        } else if session.clean_session {
+            store.remove(&session.client_id);
+        }
+    }
+
     info!(
         peer = %peer_addr,
         client_id = %session.client_id,
@@ -836,7 +990,7 @@ async fn connection_loop(
     delivery_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Reusable buffers for deliver_outbound — hoisted to avoid per-cycle allocation.
-    let mut sub_buf: Vec<(u64, QoS)> = Vec::new();
+    let mut sub_buf: Vec<SubDeliveryInfo> = Vec::new();
     let mut flat_messages_buf: Vec<Bytes> = Vec::new();
 
     let m = shared_metrics();
@@ -859,9 +1013,27 @@ async fn connection_loop(
                                     if read_buf.len() < total_size {
                                         break; // incomplete
                                     }
+
+                                    // Maximum Packet Size enforcement — inbound (M10).
+                                    let max_size = session.config.max_packet_size;
+                                    if total_size > max_size {
+                                        warn!(
+                                            client_id = %session.client_id,
+                                            packet_size = total_size,
+                                            max = max_size,
+                                            "inbound packet exceeds maximum packet size"
+                                        );
+                                        return Err(send_disconnect_and_close(
+                                            stream, stats, write_buf,
+                                            session.protocol_version,
+                                            crate::types::ReasonCode::PACKET_TOO_LARGE.0,
+                                            Some("packet too large"),
+                                        ).await);
+                                    }
+
                                     // Freeze exactly the packet bytes for zero-copy slicing.
                                     let packet_bytes: Bytes = read_buf.split_to(total_size).freeze();
-                                    match codec::decode_packet_from_bytes(&packet_bytes) {
+                                    match codec::decode_packet_from_bytes_versioned(&packet_bytes, session.protocol_version) {
                                         Ok((packet, _)) => {
                                             stats.total_packets_received
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -877,11 +1049,26 @@ async fn connection_loop(
                                                 return Ok(());
                                             }
                                         }
-                                        Err(e) => return Err(ConnectionError::Codec(e)),
+                                        Err(e) => {
+                                            // Send server-initiated DISCONNECT for protocol errors (M12).
+                                            return Err(send_disconnect_and_close(
+                                                stream, stats, write_buf,
+                                                session.protocol_version,
+                                                crate::types::ReasonCode::MALFORMED_PACKET.0,
+                                                Some(&e.to_string()),
+                                            ).await);
+                                        }
                                     }
                                 }
                                 Err(CodecError::Incomplete) => break,
-                                Err(e) => return Err(ConnectionError::Codec(e)),
+                                Err(e) => {
+                                    return Err(send_disconnect_and_close(
+                                        stream, stats, write_buf,
+                                        session.protocol_version,
+                                        crate::types::ReasonCode::MALFORMED_PACKET.0,
+                                        Some(&e.to_string()),
+                                    ).await);
+                                }
                             }
                         }
                     }
@@ -892,7 +1079,15 @@ async fn connection_loop(
                             timeout_secs = keep_alive_timeout.as_secs(),
                             "keep-alive timeout, disconnecting"
                         );
-                        return Err(ConnectionError::Closed);
+                        // Send server-initiated DISCONNECT for V5 (M12).
+                        return Err(send_disconnect_and_close(
+                            stream,
+                            stats,
+                            write_buf,
+                            session.protocol_version,
+                            crate::types::ReasonCode::PROTOCOL_ERROR.0,
+                            Some("keep-alive timeout"),
+                        ).await);
                     }
                 }
             }
@@ -920,15 +1115,40 @@ async fn process_inbound_packet(
     write_buf: &mut BytesMut,
 ) -> Result<(), ConnectionError> {
     let m = shared_metrics();
+    let version = session.protocol_version;
 
     match packet {
+        // Second CONNECT rejection (m11): a connected session must not receive another CONNECT.
+        MqttPacket::Connect(_) => {
+            warn!(client_id = %session.client_id, "received second CONNECT, disconnecting");
+            // Send DISCONNECT with PROTOCOL_ERROR reason code.
+            let disconnect = MqttPacket::Disconnect(crate::types::Disconnect {
+                reason_code: Some(crate::types::ReasonCode::PROTOCOL_ERROR.0),
+                properties: crate::types::Properties {
+                    reason_string: Some("second CONNECT not allowed".into()),
+                    ..Default::default()
+                },
+            });
+            send_packets(
+                stream,
+                std::slice::from_ref(&disconnect),
+                stats,
+                write_buf,
+                version,
+            )
+            .await?;
+            return Err(ConnectionError::Codec(CodecError::InvalidFixedHeaderFlags(
+                1,
+            )));
+        }
+
         MqttPacket::Publish(publish) => {
             m.publishes_in.increment(1);
             // Full orchestration: session builds plan, server resolves IDs.
             let plan = session.handle_publish(publish);
 
             // Send immediate responses (PUBACK/PUBREC) before orchestrating.
-            send_packets(stream, &plan.responses, stats, write_buf).await?;
+            send_packets(stream, &plan.responses, stats, write_buf, version).await?;
 
             // Orchestrate the actual publish through the exchange.
             orchestrate_publish(session, batcher, plan).await?;
@@ -949,7 +1169,14 @@ async fn process_inbound_packet(
             }
 
             // Send SUBACK after orchestration so IDs are resolved.
-            send_packets(stream, std::slice::from_ref(&plan.suback), stats, write_buf).await?;
+            send_packets(
+                stream,
+                std::slice::from_ref(&plan.suback),
+                stats,
+                write_buf,
+                version,
+            )
+            .await?;
 
             // Deliver retained messages for the newly subscribed filters.
             if let Err(e) = deliver_retained_on_subscribe(
@@ -966,11 +1193,17 @@ async fn process_inbound_packet(
             }
         }
 
-        MqttPacket::Disconnect(_) => {
-            // Session handles state cleanup.
-            let cmds = session.handle_disconnect();
+        MqttPacket::Disconnect(disconnect) => {
+            // Session handles state cleanup; M11: will on V5 DISCONNECT reason 0x04.
+            let (will_plan, cmds) = session.handle_disconnect(Some(disconnect));
             for cmd in cmds {
                 let _ = batcher.submit(cmd).await;
+            }
+            // Publish will message if DISCONNECT with Will Message (0x04).
+            if let Some(plan) = will_plan {
+                if let Err(e) = orchestrate_publish(session, batcher, plan).await {
+                    warn!(error = %e, "failed to publish will on V5 disconnect");
+                }
             }
         }
 
@@ -983,12 +1216,26 @@ async fn process_inbound_packet(
 
         MqttPacket::PubRec(pubrec) => {
             let pubrel = session.handle_pubrec(pubrec.packet_id);
-            send_packets(stream, std::slice::from_ref(&pubrel), stats, write_buf).await?;
+            send_packets(
+                stream,
+                std::slice::from_ref(&pubrel),
+                stats,
+                write_buf,
+                version,
+            )
+            .await?;
         }
 
         MqttPacket::PubRel(pubrel) => {
             let pubcomp = session.handle_pubrel(pubrel.packet_id);
-            send_packets(stream, std::slice::from_ref(&pubcomp), stats, write_buf).await?;
+            send_packets(
+                stream,
+                std::slice::from_ref(&pubcomp),
+                stats,
+                write_buf,
+                version,
+            )
+            .await?;
         }
 
         MqttPacket::PubComp(pubcomp) => {
@@ -1000,7 +1247,14 @@ async fn process_inbound_packet(
         MqttPacket::PingReq => {
             let (cmd, pong) = session.handle_pingreq();
             let _ = batcher.submit(cmd).await;
-            send_packets(stream, std::slice::from_ref(&pong), stats, write_buf).await?;
+            send_packets(
+                stream,
+                std::slice::from_ref(&pong),
+                stats,
+                write_buf,
+                version,
+            )
+            .await?;
         }
 
         // Remaining packet types (ConnAck, SubAck, UnsubAck, PingResp, Auth)
@@ -1012,7 +1266,7 @@ async fn process_inbound_packet(
                     warn!(error = %e, "failed to submit command");
                 }
             }
-            send_packets(stream, &responses, stats, write_buf).await?;
+            send_packets(stream, &responses, stats, write_buf, version).await?;
         }
     }
 
@@ -1025,11 +1279,12 @@ async fn send_packets(
     packets: &[MqttPacket],
     stats: &MqttServerStats,
     write_buf: &mut BytesMut,
+    version: ProtocolVersion,
 ) -> Result<(), ConnectionError> {
     // Batch-encode all packets into the reusable buffer, then flush once.
     write_buf.clear();
     for packet in packets {
-        codec::encode_packet(packet, write_buf);
+        codec::encode_packet_versioned(packet, version, write_buf);
     }
     if !write_buf.is_empty() {
         stream.write_all(write_buf).await?;
@@ -1038,6 +1293,41 @@ async fn send_packets(
             .fetch_add(packets.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Send a DISCONNECT packet with the given reason code and close (M12).
+///
+/// For MQTT 5.0, this sends a proper DISCONNECT before returning an error.
+/// For MQTT 3.1.1, DISCONNECT from server is not part of the spec, so we
+/// just return the error (the connection will be dropped).
+async fn send_disconnect_and_close(
+    stream: &mut TcpStream,
+    stats: &MqttServerStats,
+    write_buf: &mut BytesMut,
+    version: ProtocolVersion,
+    reason_code: u8,
+    reason_string: Option<&str>,
+) -> ConnectionError {
+    if version == ProtocolVersion::V5 {
+        let mut properties = crate::types::Properties::default();
+        if let Some(rs) = reason_string {
+            properties.reason_string = Some(rs.to_string());
+        }
+        let disconnect = MqttPacket::Disconnect(crate::types::Disconnect {
+            reason_code: Some(reason_code),
+            properties,
+        });
+        // Best-effort send; ignore errors since we're closing anyway.
+        let _ = send_packets(
+            stream,
+            std::slice::from_ref(&disconnect),
+            stats,
+            write_buf,
+            version,
+        )
+        .await;
+    }
+    ConnectionError::Codec(CodecError::InvalidFixedHeaderFlags(reason_code))
 }
 
 // =============================================================================
@@ -1061,6 +1351,16 @@ async fn deliver_retained_on_subscribe(
     let retained_prefix = session.config.retained_prefix.clone();
 
     for filter_plan in &plan.filters {
+        // Retain Handling enforcement (M8):
+        // 0 = send retained at subscribe time (default)
+        // 1 = send only if this is a new subscription
+        // 2 = do not send retained messages at subscribe time
+        match filter_plan.retain_handling {
+            2 => continue,                                     // Never send retained
+            1 if !filter_plan.is_new_subscription => continue, // Only new subs
+            _ => {}                                            // 0 or 1-with-new: proceed
+        }
+
         let filter = &filter_plan.filter;
 
         if !filter.contains('+') && !filter.contains('#') {
@@ -1170,6 +1470,13 @@ async fn deliver_single_retained(
 /// - `+` matches a single topic level
 /// - `#` matches zero or more remaining levels (must be the last segment)
 fn mqtt_topic_matches_filter(topic: &str, filter: &str) -> bool {
+    // MQTT 3.1.1 SS 4.7.2 / MQTT 5.0 SS 4.7.2: Topics starting with '$' MUST NOT
+    // be matched by subscriptions starting with '#' or '+'. A client must subscribe
+    // to a filter that explicitly starts with '$' to receive such topics.
+    if topic.starts_with('$') && !filter.starts_with('$') {
+        return false;
+    }
+
     let mut topic_iter = topic.split('/');
     let mut filter_iter = filter.split('/');
 
@@ -1259,6 +1566,166 @@ mod tests {
         assert!(mqtt_topic_matches_filter("a", "a/#"));
         assert!(mqtt_topic_matches_filter("a/b/c/d/e", "#"));
         assert!(!mqtt_topic_matches_filter("b/c", "a/#"));
+    }
+
+    #[test]
+    fn test_mqtt_topic_matches_filter_dollar_prefix() {
+        // $-prefixed topics MUST NOT match wildcard filters that don't start with $.
+        assert!(!mqtt_topic_matches_filter("$SYS/broker/clients", "#"));
+        assert!(!mqtt_topic_matches_filter(
+            "$SYS/broker/clients",
+            "+/broker/clients"
+        ));
+        assert!(!mqtt_topic_matches_filter("$SYS/info", "+/info"));
+        // But explicit $SYS subscriptions must work.
+        assert!(mqtt_topic_matches_filter("$SYS/broker/clients", "$SYS/#"));
+        assert!(mqtt_topic_matches_filter(
+            "$SYS/broker/clients",
+            "$SYS/broker/clients"
+        ));
+        assert!(mqtt_topic_matches_filter("$SYS/info", "$SYS/+"));
+        // Non-$ topics still match wildcards normally.
+        assert!(mqtt_topic_matches_filter("a/b/c", "#"));
+        assert!(mqtt_topic_matches_filter("a/b/c", "+/b/c"));
+    }
+
+    fn build_flat(builder: bisque_mq::flat::FlatMessageBuilder) -> FlatMessage {
+        FlatMessage::new(builder.build()).expect("valid FlatMessage")
+    }
+
+    #[test]
+    fn test_extract_publisher_session_id_present() {
+        use bisque_mq::flat::FlatMessageBuilder;
+        let msg = build_flat(
+            FlatMessageBuilder::new(Bytes::from_static(b"payload")).header(
+                Bytes::from_static(b"mqtt.publisher_session_id"),
+                Bytes::copy_from_slice(&42u64.to_be_bytes()),
+            ),
+        );
+        assert_eq!(extract_publisher_session_id(&msg), Some(42));
+    }
+
+    #[test]
+    fn test_extract_publisher_session_id_absent() {
+        use bisque_mq::flat::FlatMessageBuilder;
+        let msg = build_flat(FlatMessageBuilder::new(Bytes::from_static(b"payload")));
+        assert_eq!(extract_publisher_session_id(&msg), None);
+    }
+
+    #[test]
+    fn test_extract_publisher_session_id_wrong_length() {
+        use bisque_mq::flat::FlatMessageBuilder;
+        let msg = build_flat(
+            FlatMessageBuilder::new(Bytes::from_static(b"payload")).header(
+                Bytes::from_static(b"mqtt.publisher_session_id"),
+                Bytes::from_static(b"short"),
+            ),
+        );
+        assert_eq!(extract_publisher_session_id(&msg), None);
+    }
+
+    #[test]
+    fn test_extract_original_retain_true() {
+        use bisque_mq::flat::FlatMessageBuilder;
+        let msg = build_flat(
+            FlatMessageBuilder::new(Bytes::from_static(b"payload")).header(
+                Bytes::from_static(b"mqtt.original_retain"),
+                Bytes::from_static(&[1]),
+            ),
+        );
+        assert!(extract_original_retain(&msg));
+    }
+
+    #[test]
+    fn test_extract_original_retain_false() {
+        use bisque_mq::flat::FlatMessageBuilder;
+        let msg = build_flat(
+            FlatMessageBuilder::new(Bytes::from_static(b"payload")).header(
+                Bytes::from_static(b"mqtt.original_retain"),
+                Bytes::from_static(&[0]),
+            ),
+        );
+        assert!(!extract_original_retain(&msg));
+    }
+
+    #[test]
+    fn test_extract_original_retain_absent() {
+        use bisque_mq::flat::FlatMessageBuilder;
+        let msg = build_flat(FlatMessageBuilder::new(Bytes::from_static(b"payload")));
+        assert!(!extract_original_retain(&msg));
+    }
+
+    #[test]
+    fn test_extract_original_retain_empty_value() {
+        use bisque_mq::flat::FlatMessageBuilder;
+        let msg = build_flat(
+            FlatMessageBuilder::new(Bytes::from_static(b"payload"))
+                .header(Bytes::from_static(b"mqtt.original_retain"), Bytes::new()),
+        );
+        assert!(!extract_original_retain(&msg));
+    }
+
+    #[test]
+    fn test_server_stats_all_getters() {
+        let stats = MqttServerStats::new();
+
+        // Initially all zero.
+        assert_eq!(stats.active_connections(), 0);
+        assert_eq!(stats.total_connections(), 0);
+        assert_eq!(stats.total_packets_received(), 0);
+        assert_eq!(stats.total_packets_sent(), 0);
+
+        // Increment each counter.
+        stats
+            .active_connections
+            .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .total_connections
+            .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .total_packets_received
+            .fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .total_packets_sent
+            .fetch_add(50, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(stats.active_connections(), 5);
+        assert_eq!(stats.total_connections(), 10);
+        assert_eq!(stats.total_packets_received(), 100);
+        assert_eq!(stats.total_packets_sent(), 50);
+    }
+
+    #[test]
+    fn test_mqtt_topic_matches_filter_empty_levels() {
+        // Empty level matches empty level.
+        assert!(mqtt_topic_matches_filter("/a", "/a"));
+        assert!(mqtt_topic_matches_filter("a/", "a/"));
+        assert!(!mqtt_topic_matches_filter("a", "a/"));
+        assert!(!mqtt_topic_matches_filter("a/", "a"));
+    }
+
+    #[test]
+    fn test_mqtt_topic_matches_filter_hash_at_root() {
+        assert!(mqtt_topic_matches_filter("anything", "#"));
+        assert!(mqtt_topic_matches_filter("a/b/c/d/e/f", "#"));
+    }
+
+    #[test]
+    fn test_mqtt_topic_matches_filter_plus_single_level() {
+        assert!(mqtt_topic_matches_filter("a", "+"));
+        assert!(!mqtt_topic_matches_filter("a/b", "+"));
+    }
+
+    #[test]
+    fn test_extract_entity_id_other_responses() {
+        assert_eq!(extract_entity_id(&MqResponse::Ok), None);
+        assert_eq!(
+            extract_entity_id(&MqResponse::Error(MqError::NotFound {
+                entity: bisque_mq::types::EntityKind::Queue,
+                id: 1,
+            })),
+            None
+        );
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 //! over bisque-mq's Raft-replicated topic/queue engine. AMQP 1.0 clients
 //! connect to bisque-mq as a standard AMQP 1.0 broker.
 
+pub mod broker;
 pub mod codec;
 pub mod connection;
 pub mod link;

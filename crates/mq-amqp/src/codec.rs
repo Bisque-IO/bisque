@@ -7,6 +7,8 @@
 //! directly from the input `Bytes` buffer with no intermediate allocations.
 
 use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(test)]
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::types::*;
@@ -695,6 +697,17 @@ fn put_opt_string(buf: &mut BytesMut, v: Option<&WireString>) {
 }
 
 #[inline(always)]
+fn put_binary(buf: &mut BytesMut, b: &[u8]) {
+    if b.len() <= 255 {
+        buf.put_u8(format_code::BINARY8);
+        buf.put_u8(b.len() as u8);
+    } else {
+        buf.put_u8(format_code::BINARY32);
+        buf.put_u32(b.len() as u32);
+    }
+    buf.put_slice(b);
+}
+
 fn put_opt_binary(buf: &mut BytesMut, v: Option<&Bytes>) {
     match v {
         Some(b) => {
@@ -757,6 +770,53 @@ fn encode_str_symbol_array(buf: &mut BytesMut, symbols: &[&str]) {
     for s in symbols {
         buf.put_u8(s.len() as u8);
         buf.put_slice(s.as_bytes());
+    }
+    let size = (buf.len() - after_size) as u32;
+    buf[size_pos..size_pos + 4].copy_from_slice(&size.to_be_bytes());
+}
+
+/// Encode an array of WireString as AMQP symbol array.
+fn encode_wire_string_symbol_array(buf: &mut BytesMut, symbols: &[WireString]) {
+    if symbols.is_empty() {
+        buf.put_u8(format_code::ARRAY8);
+        buf.put_u8(1);
+        buf.put_u8(0);
+        buf.put_u8(format_code::SYMBOL8);
+        return;
+    }
+    buf.put_u8(format_code::ARRAY32);
+    let size_pos = buf.len();
+    buf.put_u32(0);
+    let after_size = buf.len();
+    buf.put_u32(symbols.len() as u32);
+    buf.put_u8(format_code::SYMBOL8);
+    for s in symbols {
+        buf.put_u8(s.len() as u8);
+        buf.put_slice(s.as_bytes().as_ref());
+    }
+    let size = (buf.len() - after_size) as u32;
+    buf[size_pos..size_pos + 4].copy_from_slice(&size.to_be_bytes());
+}
+
+/// Encode an array of WireString as AMQP string array (for locales).
+#[allow(dead_code)]
+fn encode_wire_string_array(buf: &mut BytesMut, strings: &[WireString]) {
+    if strings.is_empty() {
+        buf.put_u8(format_code::ARRAY8);
+        buf.put_u8(1);
+        buf.put_u8(0);
+        buf.put_u8(format_code::STRING8);
+        return;
+    }
+    buf.put_u8(format_code::ARRAY32);
+    let size_pos = buf.len();
+    buf.put_u32(0);
+    let after_size = buf.len();
+    buf.put_u32(strings.len() as u32);
+    buf.put_u8(format_code::STRING8);
+    for s in strings {
+        buf.put_u8(s.len() as u8);
+        buf.put_slice(s.as_bytes().as_ref());
     }
     let size = (buf.len() - after_size) as u32;
     buf[size_pos..size_pos + 4].copy_from_slice(&size.to_be_bytes());
@@ -877,13 +937,6 @@ pub fn decode_frame(data: &Bytes) -> Result<(AmqpFrame, usize), CodecError> {
     ))
 }
 
-/// Backwards-compatible: decode from a byte slice (copies into Bytes first).
-pub fn decode_frame_slice(data: &[u8]) -> Result<(AmqpFrame, usize), CodecError> {
-    // For BytesMut read buffers, we freeze first for zero-copy
-    let bytes = Bytes::copy_from_slice(data);
-    decode_frame(&bytes)
-}
-
 /// Encode a frame into the buffer.
 #[inline]
 pub fn encode_frame(buf: &mut BytesMut, channel: u16, frame_type: u8, payload: &[u8]) {
@@ -930,12 +983,31 @@ pub fn encode_empty_frame(buf: &mut BytesMut) {
 // Performative Decode
 // =============================================================================
 
+/// Borrow a value from a list field (read-only access for scalars).
 #[inline]
 fn list_get(list: &[AmqpValue], idx: usize) -> &AmqpValue {
     list.get(idx).unwrap_or(&AmqpValue::Null)
 }
 
-/// Extract a WireString from a list field, or return an empty WireString.
+/// Take a value from a list field by swapping with Null (zero-copy move).
+/// Use this instead of `list_get(...).clone()` to avoid deep clones.
+#[inline]
+fn list_take(list: &mut [AmqpValue], idx: usize) -> AmqpValue {
+    list.get_mut(idx)
+        .map(|v| std::mem::replace(v, AmqpValue::Null))
+        .unwrap_or(AmqpValue::Null)
+}
+
+/// Take an optional non-null value from a list field (zero-copy move).
+#[inline]
+fn list_take_opt(list: &mut [AmqpValue], idx: usize) -> Option<AmqpValue> {
+    match list.get_mut(idx) {
+        Some(AmqpValue::Null) | None => None,
+        Some(v) => Some(std::mem::replace(v, AmqpValue::Null)),
+    }
+}
+
+/// Extract a WireString from a list field (O(1) Bytes refcount bump).
 #[inline]
 fn list_get_wire_string(list: &[AmqpValue], idx: usize) -> WireString {
     list.get(idx)
@@ -944,7 +1016,7 @@ fn list_get_wire_string(list: &[AmqpValue], idx: usize) -> WireString {
         .unwrap_or_default()
 }
 
-/// Extract an optional WireString from a list field.
+/// Extract an optional WireString from a list field (O(1) Bytes refcount bump).
 #[inline]
 fn list_get_opt_wire_string(list: &[AmqpValue], idx: usize) -> Option<WireString> {
     list.get(idx).and_then(|v| v.as_wire_string()).cloned()
@@ -956,24 +1028,24 @@ fn decode_performative(value: AmqpValue, payload: Bytes) -> Result<Performative,
             let descriptor = desc.as_u64().ok_or(CodecError::InvalidPerformative(
                 "non-numeric descriptor".into(),
             ))?;
-            let fields = match *inner {
+            let mut fields = match *inner {
                 AmqpValue::List(l) => l,
                 _ => Vec::new(),
             };
             match descriptor {
                 descriptor::OPEN => Ok(Performative::Open(decode_open(&fields)?)),
                 descriptor::BEGIN => Ok(Performative::Begin(decode_begin(&fields)?)),
-                descriptor::ATTACH => Ok(Performative::Attach(decode_attach(&fields)?)),
-                descriptor::FLOW => Ok(Performative::Flow(decode_flow(&fields)?)),
+                descriptor::ATTACH => Ok(Performative::Attach(decode_attach(&mut fields)?)),
+                descriptor::FLOW => Ok(Performative::Flow(decode_flow(&mut fields)?)),
                 descriptor::TRANSFER => {
                     Ok(Performative::Transfer(decode_transfer(&fields, payload)?))
                 }
                 descriptor::DISPOSITION => {
-                    Ok(Performative::Disposition(decode_disposition(&fields)?))
+                    Ok(Performative::Disposition(decode_disposition(&mut fields)?))
                 }
-                descriptor::DETACH => Ok(Performative::Detach(decode_detach(&fields)?)),
-                descriptor::END => Ok(Performative::End(decode_end(&fields)?)),
-                descriptor::CLOSE => Ok(Performative::Close(decode_close(&fields)?)),
+                descriptor::DETACH => Ok(Performative::Detach(decode_detach(&mut fields)?)),
+                descriptor::END => Ok(Performative::End(decode_end(&mut fields)?)),
+                descriptor::CLOSE => Ok(Performative::Close(decode_close(&mut fields)?)),
                 _ => Err(CodecError::UnknownDescriptor(descriptor)),
             }
         }
@@ -1009,15 +1081,22 @@ fn decode_begin(fields: &[AmqpValue]) -> Result<Begin, CodecError> {
     })
 }
 
-fn decode_source(value: &AmqpValue) -> Option<Source> {
+fn decode_source_owned(value: AmqpValue) -> Option<Source> {
     match value {
         AmqpValue::Described(_, inner) => {
-            let fields = inner.as_list().unwrap_or(&[]);
+            let mut fields = match *inner {
+                AmqpValue::List(l) => l,
+                _ => return Some(Source::default()),
+            };
             Some(Source {
-                address: list_get_opt_wire_string(fields, 0),
-                durable: list_get(fields, 1).as_u32().unwrap_or(0),
-                dynamic: list_get(fields, 4).as_bool().unwrap_or(false),
-                distribution_mode: list_get_opt_wire_string(fields, 6),
+                address: list_get_opt_wire_string(&fields, 0),
+                durable: list_get(&fields, 1).as_u32().unwrap_or(0),
+                expiry_policy: list_get_opt_wire_string(&fields, 2),
+                timeout: list_get(&fields, 3).as_u32().unwrap_or(0),
+                dynamic: list_get(&fields, 4).as_bool().unwrap_or(false),
+                distribution_mode: list_get_opt_wire_string(&fields, 6),
+                filter: list_take_opt(&mut fields, 7),
+                default_outcome: list_take_opt(&mut fields, 8),
                 ..Default::default()
             })
         }
@@ -1026,10 +1105,13 @@ fn decode_source(value: &AmqpValue) -> Option<Source> {
     }
 }
 
-fn decode_target(value: &AmqpValue) -> Option<Target> {
+fn decode_target_owned(value: AmqpValue) -> Option<Target> {
     match value {
         AmqpValue::Described(_, inner) => {
-            let fields = inner.as_list().unwrap_or(&[]);
+            let fields = match inner.as_list() {
+                Some(l) => l,
+                None => return Some(Target::default()),
+            };
             Some(Target {
                 address: list_get_opt_wire_string(fields, 0),
                 durable: list_get(fields, 1).as_u32().unwrap_or(0),
@@ -1042,22 +1124,25 @@ fn decode_target(value: &AmqpValue) -> Option<Target> {
     }
 }
 
-fn decode_attach(fields: &[AmqpValue]) -> Result<Attach, CodecError> {
+fn decode_attach(fields: &mut [AmqpValue]) -> Result<Attach, CodecError> {
     Ok(Attach {
         name: list_get_wire_string(fields, 0),
         handle: list_get(fields, 1).as_u32().unwrap_or(0),
         role: Role::from_bool(list_get(fields, 2).as_bool().unwrap_or(false)),
         snd_settle_mode: SndSettleMode::from_u8(list_get(fields, 3).as_u32().unwrap_or(2) as u8),
         rcv_settle_mode: RcvSettleMode::from_u8(list_get(fields, 4).as_u32().unwrap_or(0) as u8),
-        source: decode_source(list_get(fields, 5)),
-        target: decode_target(list_get(fields, 6)),
+        source: decode_source_owned(list_take(fields, 5)),
+        target: decode_target_owned(list_take(fields, 6)),
+        unsettled: list_take_opt(fields, 7),
+        incomplete_unsettled: list_get(fields, 8).as_bool().unwrap_or(false),
         initial_delivery_count: list_get(fields, 10).as_u32(),
         max_message_size: list_get(fields, 11).as_u64(),
+        properties: list_take_opt(fields, 14),
         ..Default::default()
     })
 }
 
-fn decode_flow(fields: &[AmqpValue]) -> Result<Flow, CodecError> {
+fn decode_flow(fields: &mut [AmqpValue]) -> Result<Flow, CodecError> {
     Ok(Flow {
         next_incoming_id: list_get(fields, 0).as_u32(),
         incoming_window: list_get(fields, 1).as_u32().unwrap_or(2048),
@@ -1069,10 +1154,7 @@ fn decode_flow(fields: &[AmqpValue]) -> Result<Flow, CodecError> {
         available: list_get(fields, 7).as_u32(),
         drain: list_get(fields, 8).as_bool().unwrap_or(false),
         echo: list_get(fields, 9).as_bool().unwrap_or(false),
-        properties: match list_get(fields, 10) {
-            AmqpValue::Null => None,
-            v => Some(v.clone()),
-        },
+        properties: list_take_opt(fields, 10),
     })
 }
 
@@ -1095,19 +1177,52 @@ fn decode_transfer(fields: &[AmqpValue], payload: Bytes) -> Result<Transfer, Cod
     })
 }
 
+#[cfg(test)]
 fn decode_delivery_state(value: &AmqpValue) -> Option<DeliveryState> {
     match value {
-        AmqpValue::Described(desc, _inner) => {
+        AmqpValue::Described(desc, inner) => {
             let d = desc.as_u64()?;
             match d {
                 descriptor::ACCEPTED => Some(DeliveryState::Accepted),
                 descriptor::REJECTED => Some(DeliveryState::Rejected { error: None }),
                 descriptor::RELEASED => Some(DeliveryState::Released),
-                descriptor::MODIFIED => Some(DeliveryState::Modified {
-                    delivery_failed: false,
-                    undeliverable_here: false,
-                    message_annotations: None,
-                }),
+                descriptor::MODIFIED => {
+                    let fields = match inner.as_ref() {
+                        AmqpValue::List(l) => l.as_slice(),
+                        _ => &[],
+                    };
+                    Some(DeliveryState::Modified {
+                        delivery_failed: list_get(fields, 0).as_bool().unwrap_or(false),
+                        undeliverable_here: list_get(fields, 1).as_bool().unwrap_or(false),
+                        message_annotations: match list_get(fields, 2) {
+                            AmqpValue::Null => None,
+                            v => Some(v.clone()),
+                        },
+                    })
+                }
+                descriptor::RECEIVED => {
+                    let fields = match inner.as_ref() {
+                        AmqpValue::List(l) => l.as_slice(),
+                        _ => &[],
+                    };
+                    Some(DeliveryState::Received {
+                        section_number: list_get(fields, 0).as_u32().unwrap_or(0),
+                        section_offset: list_get(fields, 1).as_u64().unwrap_or(0),
+                    })
+                }
+                txn_descriptor::TRANSACTIONAL_STATE => {
+                    let fields = match inner.as_ref() {
+                        AmqpValue::List(l) => l.as_slice(),
+                        _ => &[],
+                    };
+                    let txn_id = list_get(fields, 0).as_binary().cloned().unwrap_or_default();
+                    let outcome = decode_delivery_state(list_get(fields, 1))
+                        .and_then(|ds| Outcome::from_delivery_state(&ds));
+                    Some(DeliveryState::Transactional(TransactionalState {
+                        txn_id,
+                        outcome,
+                    }))
+                }
                 _ => None,
             }
         }
@@ -1116,13 +1231,165 @@ fn decode_delivery_state(value: &AmqpValue) -> Option<DeliveryState> {
     }
 }
 
-fn decode_disposition(fields: &[AmqpValue]) -> Result<Disposition, CodecError> {
+/// Owned variant — takes AmqpValue by value, moves inner data without cloning.
+fn decode_delivery_state_owned(value: AmqpValue) -> Option<DeliveryState> {
+    match value {
+        AmqpValue::Described(desc, inner) => {
+            let d = desc.as_u64()?;
+            match d {
+                descriptor::ACCEPTED => Some(DeliveryState::Accepted),
+                descriptor::REJECTED => Some(DeliveryState::Rejected { error: None }),
+                descriptor::RELEASED => Some(DeliveryState::Released),
+                descriptor::MODIFIED => {
+                    let mut fields = match *inner {
+                        AmqpValue::List(l) => l,
+                        _ => Vec::new(),
+                    };
+                    Some(DeliveryState::Modified {
+                        delivery_failed: list_get(&fields, 0).as_bool().unwrap_or(false),
+                        undeliverable_here: list_get(&fields, 1).as_bool().unwrap_or(false),
+                        message_annotations: list_take_opt(&mut fields, 2),
+                    })
+                }
+                descriptor::RECEIVED => {
+                    let fields = match inner.as_ref() {
+                        AmqpValue::List(l) => l.as_slice(),
+                        _ => &[],
+                    };
+                    Some(DeliveryState::Received {
+                        section_number: list_get(fields, 0).as_u32().unwrap_or(0),
+                        section_offset: list_get(fields, 1).as_u64().unwrap_or(0),
+                    })
+                }
+                txn_descriptor::TRANSACTIONAL_STATE => {
+                    let mut fields = match *inner {
+                        AmqpValue::List(l) => l,
+                        _ => Vec::new(),
+                    };
+                    let txn_id = list_get(&fields, 0)
+                        .as_binary()
+                        .cloned()
+                        .unwrap_or_default();
+                    let outcome = decode_delivery_state_owned(list_take(&mut fields, 1))
+                        .and_then(|ds| Outcome::from_delivery_state(&ds));
+                    Some(DeliveryState::Transactional(TransactionalState {
+                        txn_id,
+                        outcome,
+                    }))
+                }
+                _ => None,
+            }
+        }
+        AmqpValue::Null => None,
+        _ => None,
+    }
+}
+
+/// Decode a Coordinator target from a described list.
+#[cfg(test)]
+fn decode_coordinator(value: &AmqpValue) -> Option<Coordinator> {
+    match value {
+        AmqpValue::Described(desc, inner) => {
+            if desc.as_u64()? != txn_descriptor::COORDINATOR {
+                return None;
+            }
+            let fields = match inner.as_ref() {
+                AmqpValue::List(l) => l.as_slice(),
+                _ => &[],
+            };
+            let mut caps = SmallVec::new();
+            if let AmqpValue::Array(arr) = list_get(fields, 0) {
+                for v in arr {
+                    if let Some(s) = v.as_wire_string() {
+                        caps.push(s.clone());
+                    }
+                }
+            }
+            Some(Coordinator { capabilities: caps })
+        }
+        _ => None,
+    }
+}
+
+/// Decode TxnDeclare from a Transfer payload body.
+pub fn decode_txn_declare(value: &AmqpValue) -> Option<TxnDeclare> {
+    match value {
+        AmqpValue::Described(desc, inner) => {
+            if desc.as_u64()? != txn_descriptor::DECLARE {
+                return None;
+            }
+            let fields = match inner.as_ref() {
+                AmqpValue::List(l) => l.as_slice(),
+                _ => &[],
+            };
+            Some(TxnDeclare {
+                global_id: list_get(fields, 0).as_binary().cloned(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Decode TxnDischarge from a Transfer payload body.
+pub fn decode_txn_discharge(value: &AmqpValue) -> Option<TxnDischarge> {
+    match value {
+        AmqpValue::Described(desc, inner) => {
+            if desc.as_u64()? != txn_descriptor::DISCHARGE {
+                return None;
+            }
+            let fields = match inner.as_ref() {
+                AmqpValue::List(l) => l.as_slice(),
+                _ => &[],
+            };
+            Some(TxnDischarge {
+                txn_id: list_get(fields, 0).as_binary().cloned().unwrap_or_default(),
+                fail: list_get(fields, 1).as_bool().unwrap_or(false),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Encode a TxnDeclared outcome.
+pub fn encode_txn_declared(buf: &mut BytesMut, txn_id: &[u8]) {
+    let (sp, bs) = begin_described_list(buf, txn_descriptor::DECLARED, 1);
+    put_binary(buf, txn_id);
+    finish_described_list(buf, sp, bs);
+}
+
+/// Encode a TransactionalState delivery state.
+pub fn encode_transactional_state(
+    buf: &mut BytesMut,
+    txn_id: &[u8],
+    outcome: Option<&DeliveryState>,
+) {
+    let count = if outcome.is_some() { 2u32 } else { 1 };
+    let (sp, bs) = begin_described_list(buf, txn_descriptor::TRANSACTIONAL_STATE, count);
+    put_binary(buf, txn_id);
+    if let Some(state) = outcome {
+        encode_delivery_state(buf, state);
+    }
+    finish_described_list(buf, sp, bs);
+}
+
+/// Encode a Coordinator target.
+pub fn encode_coordinator(buf: &mut BytesMut, coord: &Coordinator) {
+    if coord.capabilities.is_empty() {
+        put_empty_described_list(buf, txn_descriptor::COORDINATOR);
+    } else {
+        let (sp, bs) = begin_described_list(buf, txn_descriptor::COORDINATOR, 1);
+        encode_wire_string_symbol_array(buf, &coord.capabilities);
+        finish_described_list(buf, sp, bs);
+    }
+}
+
+fn decode_disposition(fields: &mut [AmqpValue]) -> Result<Disposition, CodecError> {
     Ok(Disposition {
         role: Role::from_bool(list_get(fields, 0).as_bool().unwrap_or(false)),
         first: list_get(fields, 1).as_u32().unwrap_or(0),
         last: list_get(fields, 2).as_u32(),
         settled: list_get(fields, 3).as_bool().unwrap_or(false),
-        state: decode_delivery_state(list_get(fields, 4)),
+        state: decode_delivery_state_owned(list_take(fields, 4)),
         batchable: list_get(fields, 5).as_bool().unwrap_or(false),
     })
 }
@@ -1142,7 +1409,7 @@ fn decode_error(value: &AmqpValue) -> Option<AmqpError> {
     }
 }
 
-fn decode_detach(fields: &[AmqpValue]) -> Result<Detach, CodecError> {
+fn decode_detach(fields: &mut [AmqpValue]) -> Result<Detach, CodecError> {
     Ok(Detach {
         handle: list_get(fields, 0).as_u32().unwrap_or(0),
         closed: list_get(fields, 1).as_bool().unwrap_or(false),
@@ -1150,13 +1417,13 @@ fn decode_detach(fields: &[AmqpValue]) -> Result<Detach, CodecError> {
     })
 }
 
-fn decode_end(fields: &[AmqpValue]) -> Result<End, CodecError> {
+fn decode_end(fields: &mut [AmqpValue]) -> Result<End, CodecError> {
     Ok(End {
         error: decode_error(list_get(fields, 0)),
     })
 }
 
-fn decode_close(fields: &[AmqpValue]) -> Result<Close, CodecError> {
+fn decode_close(fields: &mut [AmqpValue]) -> Result<Close, CodecError> {
     Ok(Close {
         error: decode_error(list_get(fields, 0)),
     })
@@ -1199,6 +1466,20 @@ fn decode_sasl_performative(value: AmqpValue) -> Result<SaslPerformative, CodecE
                     initial_response: list_get(&fields, 1).as_binary().cloned(),
                     hostname: list_get_opt_wire_string(&fields, 2),
                 })),
+                descriptor::SASL_CHALLENGE => {
+                    let challenge = list_get(&fields, 0)
+                        .as_binary()
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(SaslPerformative::Challenge(SaslChallenge { challenge }))
+                }
+                descriptor::SASL_RESPONSE => {
+                    let response = list_get(&fields, 0)
+                        .as_binary()
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(SaslPerformative::Response(SaslResponse { response }))
+                }
                 descriptor::SASL_OUTCOME => {
                     let code = list_get(&fields, 0).as_u32().unwrap_or(0) as u8;
                     Ok(SaslPerformative::Outcome(SaslOutcome {
@@ -1235,14 +1516,71 @@ pub fn encode_performative(buf: &mut BytesMut, perf: &Performative) {
 }
 
 fn encode_open(buf: &mut BytesMut, p: &Open) {
-    let count = if p.idle_timeout.is_some() { 5u32 } else { 4 };
+    // Determine field count based on last non-default field
+    let count = if p.properties.is_some() {
+        10u32
+    } else if !p.desired_capabilities.is_empty() {
+        9
+    } else if !p.offered_capabilities.is_empty() {
+        8
+    } else if !p.incoming_locales.is_empty() {
+        7
+    } else if !p.outgoing_locales.is_empty() {
+        6
+    } else if p.idle_timeout.is_some() {
+        5
+    } else {
+        4
+    };
     let (sp, bs) = begin_described_list(buf, descriptor::OPEN, count);
-    put_string(buf, &p.container_id);
-    put_opt_string(buf, p.hostname.as_ref());
-    put_uint(buf, p.max_frame_size);
-    put_ushort(buf, p.channel_max);
-    if let Some(timeout) = p.idle_timeout {
-        put_uint(buf, timeout);
+    put_string(buf, &p.container_id); // 0
+    put_opt_string(buf, p.hostname.as_ref()); // 1
+    put_uint(buf, p.max_frame_size); // 2
+    put_ushort(buf, p.channel_max); // 3
+    if count >= 5 {
+        match p.idle_timeout {
+            Some(timeout) => put_uint(buf, timeout),
+            None => put_null(buf),
+        }
+    }
+    if count >= 6 {
+        // outgoing-locales
+        if p.outgoing_locales.is_empty() {
+            put_null(buf);
+        } else {
+            encode_wire_string_array(buf, &p.outgoing_locales);
+        }
+    }
+    if count >= 7 {
+        // incoming-locales
+        if p.incoming_locales.is_empty() {
+            put_null(buf);
+        } else {
+            encode_wire_string_array(buf, &p.incoming_locales);
+        }
+    }
+    if count >= 8 {
+        // offered-capabilities
+        if p.offered_capabilities.is_empty() {
+            put_null(buf);
+        } else {
+            encode_wire_string_symbol_array(buf, &p.offered_capabilities);
+        }
+    }
+    if count >= 9 {
+        // desired-capabilities
+        if p.desired_capabilities.is_empty() {
+            put_null(buf);
+        } else {
+            encode_wire_string_symbol_array(buf, &p.desired_capabilities);
+        }
+    }
+    if count >= 10 {
+        // properties
+        match &p.properties {
+            Some(v) => encode_value(buf, v),
+            None => put_null(buf),
+        }
     }
     finish_described_list(buf, sp, bs);
 }
@@ -1258,12 +1596,62 @@ fn encode_begin(buf: &mut BytesMut, p: &Begin) {
 }
 
 fn encode_source(buf: &mut BytesMut, s: &Source) {
-    let (sp, bs) = begin_described_list(buf, descriptor::SOURCE, 5);
-    put_opt_string(buf, s.address.as_ref());
-    put_uint(buf, s.durable);
-    put_null(buf); // expiry-policy
-    put_uint(buf, s.timeout);
-    put_bool(buf, s.dynamic);
+    // Determine field count based on last non-default field
+    let count = if !s.capabilities.is_empty() {
+        11u32
+    } else if !s.outcomes.is_empty() {
+        10
+    } else if s.default_outcome.is_some() {
+        9
+    } else if s.filter.is_some() {
+        8
+    } else if s.distribution_mode.is_some() {
+        7
+    } else {
+        5
+    };
+    let (sp, bs) = begin_described_list(buf, descriptor::SOURCE, count);
+    put_opt_string(buf, s.address.as_ref()); // 0: address
+    put_uint(buf, s.durable); // 1: durable
+    // 2: expiry-policy
+    if let Some(ref ep) = s.expiry_policy {
+        put_symbol(buf, ep);
+    } else {
+        put_null(buf);
+    }
+    put_uint(buf, s.timeout); // 3: timeout
+    put_bool(buf, s.dynamic); // 4: dynamic
+    if count >= 7 {
+        put_null(buf); // 5: dynamic-node-properties
+        // 6: distribution-mode
+        if let Some(ref dm) = s.distribution_mode {
+            put_symbol(buf, dm);
+        } else {
+            put_null(buf);
+        }
+    }
+    if count >= 8 {
+        // 7: filter
+        if let Some(ref filter) = s.filter {
+            encode_value(buf, filter);
+        } else {
+            put_null(buf);
+        }
+    }
+    if count >= 9 {
+        // 8: default-outcome
+        if let Some(ref outcome) = s.default_outcome {
+            encode_value(buf, outcome);
+        } else {
+            put_null(buf);
+        }
+    }
+    if count >= 10 {
+        put_null(buf); // 9: outcomes (TODO: encode symbol array)
+    }
+    if count >= 11 {
+        put_null(buf); // 10: capabilities (TODO: encode symbol array)
+    }
     finish_described_list(buf, sp, bs);
 }
 
@@ -1278,7 +1666,19 @@ fn encode_target(buf: &mut BytesMut, t: &Target) {
 }
 
 fn encode_attach(buf: &mut BytesMut, p: &Attach) {
-    let (sp, bs) = begin_described_list(buf, descriptor::ATTACH, 11);
+    // Determine field count based on last non-default field present
+    let count = if p.properties.is_some() {
+        15u32
+    } else if !p.desired_capabilities.is_empty() {
+        14
+    } else if !p.offered_capabilities.is_empty() {
+        13
+    } else if p.max_message_size.is_some() {
+        12
+    } else {
+        11
+    };
+    let (sp, bs) = begin_described_list(buf, descriptor::ATTACH, count);
     put_string(buf, &p.name); // 0: name
     put_uint(buf, p.handle); // 1: handle
     put_bool(buf, p.role.as_bool()); // 2: role
@@ -1296,10 +1696,36 @@ fn encode_attach(buf: &mut BytesMut, p: &Attach) {
     } else {
         put_null(buf);
     }
-    put_null(buf); // 7: unsettled
+    // 7: unsettled
+    if let Some(ref unsettled) = p.unsettled {
+        encode_value(buf, unsettled);
+    } else {
+        put_null(buf);
+    }
     put_bool(buf, p.incomplete_unsettled); // 8: incomplete-unsettled
-    put_null(buf); // 9: reserved
+    put_null(buf); // 9: reserved (initial-delivery-count is field 10, not 9)
     put_opt_uint(buf, p.initial_delivery_count); // 10: initial-delivery-count
+    if count >= 12 {
+        // 11: max-message-size
+        match p.max_message_size {
+            Some(v) => put_ulong(buf, v),
+            None => put_null(buf),
+        }
+    }
+    if count >= 13 {
+        put_null(buf); // 12: offered-capabilities (TODO: encode array)
+    }
+    if count >= 14 {
+        put_null(buf); // 13: desired-capabilities (TODO: encode array)
+    }
+    if count >= 15 {
+        // 14: properties
+        if let Some(ref props) = p.properties {
+            encode_value(buf, props);
+        } else {
+            put_null(buf);
+        }
+    }
     finish_described_list(buf, sp, bs);
 }
 
@@ -1319,13 +1745,48 @@ fn encode_flow(buf: &mut BytesMut, p: &Flow) {
 }
 
 fn encode_transfer(buf: &mut BytesMut, p: &Transfer) {
-    let (sp, bs) = begin_described_list(buf, descriptor::TRANSFER, 6);
-    put_uint(buf, p.handle);
-    put_opt_uint(buf, p.delivery_id);
-    put_opt_binary(buf, p.delivery_tag.as_ref());
-    put_opt_uint(buf, p.message_format);
-    put_opt_bool(buf, p.settled);
-    put_bool(buf, p.more);
+    // Determine field count based on last non-default field
+    let count = if p.batchable {
+        11u32
+    } else if p.aborted {
+        10
+    } else if p.resume {
+        9
+    } else if p.state.is_some() {
+        8
+    } else if p.rcv_settle_mode.is_some() {
+        7
+    } else {
+        6
+    };
+    let (sp, bs) = begin_described_list(buf, descriptor::TRANSFER, count);
+    put_uint(buf, p.handle); // 0
+    put_opt_uint(buf, p.delivery_id); // 1
+    put_opt_binary(buf, p.delivery_tag.as_ref()); // 2
+    put_opt_uint(buf, p.message_format); // 3
+    put_opt_bool(buf, p.settled); // 4
+    put_bool(buf, p.more); // 5
+    if count >= 7 {
+        match p.rcv_settle_mode {
+            Some(mode) => put_ubyte(buf, mode as u8),
+            None => put_null(buf),
+        }
+    }
+    if count >= 8 {
+        match &p.state {
+            Some(state) => encode_delivery_state(buf, state),
+            None => put_null(buf),
+        }
+    }
+    if count >= 9 {
+        put_bool(buf, p.resume); // 8
+    }
+    if count >= 10 {
+        put_bool(buf, p.aborted); // 9
+    }
+    if count >= 11 {
+        put_bool(buf, p.batchable); // 10
+    }
     finish_described_list(buf, sp, bs);
     // Payload follows the performative in the same frame
     buf.put_slice(&p.payload);
@@ -1355,6 +1816,10 @@ fn encode_delivery_state(buf: &mut BytesMut, state: &DeliveryState) {
             put_ulong(buf, *section_offset);
             finish_described_list(buf, sp, bs);
         }
+        DeliveryState::Transactional(ts) => {
+            let ds = ts.outcome.as_ref().map(|o| o.to_delivery_state());
+            encode_transactional_state(buf, &ts.txn_id, ds.as_ref());
+        }
     }
 }
 
@@ -1373,11 +1838,26 @@ fn encode_disposition(buf: &mut BytesMut, p: &Disposition) {
 }
 
 fn encode_error(buf: &mut BytesMut, err: &AmqpError) {
-    let count = if err.description.is_some() { 2u32 } else { 1 };
+    let count = if err.info.is_some() {
+        3u32
+    } else if err.description.is_some() {
+        2
+    } else {
+        1
+    };
     let (sp, bs) = begin_described_list(buf, descriptor::ERROR, count);
     put_symbol(buf, &err.condition);
-    if let Some(desc) = &err.description {
-        put_string(buf, desc);
+    if count >= 2 {
+        match &err.description {
+            Some(desc) => put_string(buf, desc),
+            None => put_null(buf),
+        }
+    }
+    if count >= 3 {
+        match &err.info {
+            Some(info) => encode_value(buf, info),
+            None => put_null(buf),
+        }
     }
     finish_described_list(buf, sp, bs);
 }
@@ -1414,6 +1894,330 @@ fn encode_close(buf: &mut BytesMut, p: &Close) {
 }
 
 // =============================================================================
+// Message Section Decode/Encode
+// =============================================================================
+
+/// Decode an AMQP 1.0 message from a Transfer payload.
+///
+/// Parses described sections: Header (0x70), DeliveryAnnotations (0x71),
+/// MessageAnnotations (0x72), Properties (0x73), ApplicationProperties (0x74),
+/// Body: Data (0x75), AmqpSequence (0x76), AmqpValue (0x77), Footer (0x78).
+///
+/// Zero-copy: body DATA sections reference the original Bytes buffer.
+pub fn decode_message(payload: Bytes) -> Result<AmqpMessage, CodecError> {
+    if payload.is_empty() {
+        return Ok(AmqpMessage::default());
+    }
+
+    let mut msg = AmqpMessage::default();
+    let mut cur = BytesCursor::new(payload);
+
+    while cur.remaining() > 0 {
+        let value = decode_value(&mut cur)?;
+        match value {
+            AmqpValue::Described(desc, inner) => {
+                let d = desc.as_u64().unwrap_or(0);
+                match d {
+                    descriptor::HEADER => {
+                        msg.header = Some(decode_message_header(&inner));
+                    }
+                    descriptor::DELIVERY_ANNOTATIONS => {
+                        msg.delivery_annotations = Some(*inner);
+                    }
+                    descriptor::MESSAGE_ANNOTATIONS => {
+                        msg.message_annotations = Some(*inner);
+                    }
+                    descriptor::PROPERTIES => {
+                        msg.properties = Some(decode_message_properties(*inner));
+                    }
+                    descriptor::APPLICATION_PROPERTIES => {
+                        msg.application_properties = Some(*inner);
+                    }
+                    descriptor::DATA => {
+                        // DATA section body is binary
+                        match *inner {
+                            AmqpValue::Binary(b) => msg.body.push(b),
+                            other => {
+                                // Encode non-binary data section as bytes
+                                let mut tmp = BytesMut::new();
+                                encode_value(&mut tmp, &other);
+                                msg.body.push(tmp.freeze());
+                            }
+                        }
+                    }
+                    descriptor::AMQP_SEQUENCE => {
+                        // Store sequence as encoded bytes
+                        let mut tmp = BytesMut::new();
+                        encode_value(&mut tmp, &inner);
+                        msg.body.push(tmp.freeze());
+                    }
+                    descriptor::AMQP_VALUE => {
+                        // Store value section as encoded bytes
+                        let mut tmp = BytesMut::new();
+                        encode_value(&mut tmp, &inner);
+                        msg.body.push(tmp.freeze());
+                    }
+                    descriptor::FOOTER => {
+                        msg.footer = Some(*inner);
+                    }
+                    _ => {
+                        // Unknown section — skip
+                    }
+                }
+            }
+            _ => {
+                // Non-described value in message payload — skip
+            }
+        }
+    }
+
+    Ok(msg)
+}
+
+fn decode_message_header(value: &AmqpValue) -> MessageHeader {
+    let fields = match value {
+        AmqpValue::List(l) => l.as_slice(),
+        _ => &[],
+    };
+    MessageHeader {
+        durable: list_get(fields, 0).as_bool().unwrap_or(false),
+        priority: list_get(fields, 1).as_u32().unwrap_or(4) as u8,
+        ttl: list_get(fields, 2).as_u32(),
+        first_acquirer: list_get(fields, 3).as_bool().unwrap_or(false),
+        delivery_count: list_get(fields, 4).as_u32().unwrap_or(0),
+    }
+}
+
+fn decode_message_properties(value: AmqpValue) -> MessageProperties {
+    let mut fields = match value {
+        AmqpValue::List(l) => l,
+        _ => return MessageProperties::default(),
+    };
+    MessageProperties {
+        message_id: list_take_opt(&mut fields, 0),
+        user_id: list_get(&fields, 1).as_binary().cloned(),
+        to: list_get_opt_wire_string(&fields, 2),
+        subject: list_get_opt_wire_string(&fields, 3),
+        reply_to: list_get_opt_wire_string(&fields, 4),
+        correlation_id: list_take_opt(&mut fields, 5),
+        content_type: list_get_opt_wire_string(&fields, 6),
+        content_encoding: list_get_opt_wire_string(&fields, 7),
+        absolute_expiry_time: list_get(&fields, 8).as_i64(),
+        creation_time: list_get(&fields, 9).as_i64(),
+        group_id: list_get_opt_wire_string(&fields, 10),
+        group_sequence: list_get(&fields, 11).as_u32(),
+        reply_to_group_id: list_get_opt_wire_string(&fields, 12),
+    }
+}
+
+/// Encode an AMQP 1.0 message into a buffer (for Transfer payload).
+pub fn encode_message(buf: &mut BytesMut, msg: &AmqpMessage) {
+    // Header section
+    if let Some(header) = &msg.header {
+        encode_message_header(buf, header);
+    }
+    // Delivery annotations
+    if let Some(da) = &msg.delivery_annotations {
+        buf.put_u8(format_code::DESCRIBED);
+        put_ulong(buf, descriptor::DELIVERY_ANNOTATIONS);
+        encode_value(buf, da);
+    }
+    // Message annotations
+    if let Some(ma) = &msg.message_annotations {
+        buf.put_u8(format_code::DESCRIBED);
+        put_ulong(buf, descriptor::MESSAGE_ANNOTATIONS);
+        encode_value(buf, ma);
+    }
+    // Properties section
+    if let Some(props) = &msg.properties {
+        encode_message_properties(buf, props);
+    }
+    // Application properties
+    if let Some(ap) = &msg.application_properties {
+        buf.put_u8(format_code::DESCRIBED);
+        put_ulong(buf, descriptor::APPLICATION_PROPERTIES);
+        encode_value(buf, ap);
+    }
+    // Body sections (DATA)
+    for data in &msg.body {
+        buf.put_u8(format_code::DESCRIBED);
+        put_ulong(buf, descriptor::DATA);
+        if data.len() <= 255 {
+            buf.put_u8(format_code::BINARY8);
+            buf.put_u8(data.len() as u8);
+        } else {
+            buf.put_u8(format_code::BINARY32);
+            buf.put_u32(data.len() as u32);
+        }
+        buf.put_slice(data);
+    }
+    // Footer
+    if let Some(footer) = &msg.footer {
+        buf.put_u8(format_code::DESCRIBED);
+        put_ulong(buf, descriptor::FOOTER);
+        encode_value(buf, footer);
+    }
+}
+
+fn encode_message_header(buf: &mut BytesMut, h: &MessageHeader) {
+    // Determine field count (trim trailing defaults)
+    let count = if h.delivery_count != 0 {
+        5u32
+    } else if h.first_acquirer {
+        4
+    } else if h.ttl.is_some() {
+        3
+    } else if h.priority != 4 {
+        2
+    } else if h.durable {
+        1
+    } else {
+        0
+    };
+    if count == 0 {
+        put_empty_described_list(buf, descriptor::HEADER);
+        return;
+    }
+    let (sp, bs) = begin_described_list(buf, descriptor::HEADER, count);
+    if count >= 1 {
+        put_bool(buf, h.durable);
+    }
+    if count >= 2 {
+        put_ubyte(buf, h.priority);
+    }
+    if count >= 3 {
+        put_opt_uint(buf, h.ttl);
+    }
+    if count >= 4 {
+        put_bool(buf, h.first_acquirer);
+    }
+    if count >= 5 {
+        put_uint(buf, h.delivery_count);
+    }
+    finish_described_list(buf, sp, bs);
+}
+
+fn encode_message_properties(buf: &mut BytesMut, p: &MessageProperties) {
+    // Find last non-null field
+    let mut count = 0u32;
+    if p.message_id.is_some() {
+        count = 1;
+    }
+    if p.user_id.is_some() {
+        count = 2;
+    }
+    if p.to.is_some() {
+        count = 3;
+    }
+    if p.subject.is_some() {
+        count = 4;
+    }
+    if p.reply_to.is_some() {
+        count = 5;
+    }
+    if p.correlation_id.is_some() {
+        count = 6;
+    }
+    if p.content_type.is_some() {
+        count = 7;
+    }
+    if p.content_encoding.is_some() {
+        count = 8;
+    }
+    if p.absolute_expiry_time.is_some() {
+        count = 9;
+    }
+    if p.creation_time.is_some() {
+        count = 10;
+    }
+    if p.group_id.is_some() {
+        count = 11;
+    }
+    if p.group_sequence.is_some() {
+        count = 12;
+    }
+    if p.reply_to_group_id.is_some() {
+        count = 13;
+    }
+    if count == 0 {
+        put_empty_described_list(buf, descriptor::PROPERTIES);
+        return;
+    }
+    let (sp, bs) = begin_described_list(buf, descriptor::PROPERTIES, count);
+    // 0: message-id
+    if count >= 1 {
+        match &p.message_id {
+            Some(v) => encode_value(buf, v),
+            None => put_null(buf),
+        }
+    }
+    // 1: user-id
+    if count >= 2 {
+        put_opt_binary(buf, p.user_id.as_ref());
+    }
+    // 2: to
+    if count >= 3 {
+        put_opt_string(buf, p.to.as_ref());
+    }
+    // 4: subject
+    if count >= 4 {
+        put_opt_string(buf, p.subject.as_ref());
+    }
+    // 5: reply-to
+    if count >= 5 {
+        put_opt_string(buf, p.reply_to.as_ref());
+    }
+    // 6: correlation-id
+    if count >= 6 {
+        match &p.correlation_id {
+            Some(v) => encode_value(buf, v),
+            None => put_null(buf),
+        }
+    }
+    // 7: content-type
+    if count >= 7 {
+        put_opt_string(buf, p.content_type.as_ref());
+    }
+    // 8: content-encoding
+    if count >= 8 {
+        put_opt_string(buf, p.content_encoding.as_ref());
+    }
+    // 9: absolute-expiry-time
+    if count >= 9 {
+        match p.absolute_expiry_time {
+            Some(t) => {
+                buf.put_u8(format_code::TIMESTAMP);
+                buf.put_i64(t);
+            }
+            None => put_null(buf),
+        }
+    }
+    // 10: creation-time
+    if count >= 10 {
+        match p.creation_time {
+            Some(t) => {
+                buf.put_u8(format_code::TIMESTAMP);
+                buf.put_i64(t);
+            }
+            None => put_null(buf),
+        }
+    }
+    // 11: group-id
+    if count >= 11 {
+        put_opt_string(buf, p.group_id.as_ref());
+    }
+    // 12: group-sequence
+    if count >= 12 {
+        put_opt_uint(buf, p.group_sequence);
+    }
+    // 13: reply-to-group-id
+    if count >= 13 {
+        put_opt_string(buf, p.reply_to_group_id.as_ref());
+    }
+    finish_described_list(buf, sp, bs);
+}
+
+// =============================================================================
 // SASL Encode
 // =============================================================================
 
@@ -1429,6 +2233,88 @@ pub fn encode_sasl_outcome(buf: &mut BytesMut, code: SaslCode) {
     let (sp, bs) = begin_described_list(buf, descriptor::SASL_OUTCOME, 1);
     put_ubyte(buf, code as u8);
     finish_described_list(buf, sp, bs);
+}
+
+/// Encode SASL challenge body (no frame header).
+pub fn encode_sasl_challenge(buf: &mut BytesMut, challenge: &[u8]) {
+    let (sp, bs) = begin_described_list(buf, descriptor::SASL_CHALLENGE, 1);
+    put_binary(buf, challenge);
+    finish_described_list(buf, sp, bs);
+}
+
+/// Encode SASL response body (no frame header).
+pub fn encode_sasl_response(buf: &mut BytesMut, response: &[u8]) {
+    let (sp, bs) = begin_described_list(buf, descriptor::SASL_RESPONSE, 1);
+    put_binary(buf, response);
+    finish_described_list(buf, sp, bs);
+}
+
+/// Encode SASL challenge as a complete framed SASL frame.
+pub fn encode_framed_sasl_challenge(buf: &mut BytesMut, challenge: &[u8]) {
+    let frame_start = buf.len();
+    buf.put_u32(0);
+    buf.put_u8(2);
+    buf.put_u8(FRAME_TYPE_SASL);
+    buf.put_u16(0);
+    encode_sasl_challenge(buf, challenge);
+    let frame_size = (buf.len() - frame_start) as u32;
+    buf[frame_start..frame_start + 4].copy_from_slice(&frame_size.to_be_bytes());
+}
+
+/// Encode SASL outcome as a complete framed SASL frame with optional additional data.
+pub fn encode_framed_sasl_outcome_with_data(
+    buf: &mut BytesMut,
+    code: SaslCode,
+    additional_data: Option<&[u8]>,
+) {
+    let frame_start = buf.len();
+    buf.put_u32(0);
+    buf.put_u8(2);
+    buf.put_u8(FRAME_TYPE_SASL);
+    buf.put_u16(0);
+    let count = if additional_data.is_some() { 2u32 } else { 1 };
+    let (sp, bs) = begin_described_list(buf, descriptor::SASL_OUTCOME, count);
+    put_ubyte(buf, code as u8);
+    if let Some(data) = additional_data {
+        put_binary(buf, data);
+    }
+    finish_described_list(buf, sp, bs);
+    let frame_size = (buf.len() - frame_start) as u32;
+    buf[frame_start..frame_start + 4].copy_from_slice(&frame_size.to_be_bytes());
+}
+
+/// Encode SASL-INIT as a complete framed SASL frame.
+pub fn encode_framed_sasl_init(
+    buf: &mut BytesMut,
+    mechanism: &str,
+    initial_response: Option<&[u8]>,
+) {
+    let frame_start = buf.len();
+    buf.put_u32(0);
+    buf.put_u8(2);
+    buf.put_u8(FRAME_TYPE_SASL);
+    buf.put_u16(0);
+    let count = if initial_response.is_some() { 2u32 } else { 1 };
+    let (sp, bs) = begin_described_list(buf, descriptor::SASL_INIT, count);
+    put_symbol(buf, &WireString::from(mechanism));
+    if let Some(data) = initial_response {
+        put_binary(buf, data);
+    }
+    finish_described_list(buf, sp, bs);
+    let frame_size = (buf.len() - frame_start) as u32;
+    buf[frame_start..frame_start + 4].copy_from_slice(&frame_size.to_be_bytes());
+}
+
+/// Encode SASL-RESPONSE as a complete framed SASL frame.
+pub fn encode_framed_sasl_response(buf: &mut BytesMut, response: &[u8]) {
+    let frame_start = buf.len();
+    buf.put_u32(0);
+    buf.put_u8(2);
+    buf.put_u8(FRAME_TYPE_SASL);
+    buf.put_u16(0);
+    encode_sasl_response(buf, response);
+    let frame_size = (buf.len() - frame_start) as u32;
+    buf[frame_start..frame_start + 4].copy_from_slice(&frame_size.to_be_bytes());
 }
 
 /// Encode SASL mechanisms as a complete framed SASL frame (no intermediate allocation).
@@ -1852,5 +2738,1623 @@ mod tests {
             }
             _ => panic!("expected String"),
         }
+    }
+
+    // =========================================================================
+    // Message Section Codec Tests
+    // =========================================================================
+
+    #[test]
+    fn test_decode_empty_message() {
+        let msg = decode_message(Bytes::new()).unwrap();
+        assert!(msg.header.is_none());
+        assert!(msg.properties.is_none());
+        assert!(msg.body.is_empty());
+    }
+
+    #[test]
+    fn test_message_header_roundtrip() {
+        let header = MessageHeader {
+            durable: true,
+            priority: 7,
+            ttl: Some(60000),
+            first_acquirer: true,
+            delivery_count: 3,
+        };
+        let msg = AmqpMessage {
+            header: Some(header),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        let h = decoded.header.unwrap();
+        assert!(h.durable);
+        assert_eq!(h.priority, 7);
+        assert_eq!(h.ttl, Some(60000));
+        assert!(h.first_acquirer);
+        assert_eq!(h.delivery_count, 3);
+    }
+
+    #[test]
+    fn test_message_header_defaults() {
+        let header = MessageHeader::default();
+        let msg = AmqpMessage {
+            header: Some(header),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        let h = decoded.header.unwrap();
+        assert!(!h.durable);
+        assert_eq!(h.priority, 4);
+        assert_eq!(h.ttl, None);
+        assert!(!h.first_acquirer);
+        assert_eq!(h.delivery_count, 0);
+    }
+
+    #[test]
+    fn test_message_properties_roundtrip() {
+        let props = MessageProperties {
+            message_id: Some(AmqpValue::String(WireString::from("msg-001"))),
+            user_id: Some(Bytes::from_static(b"guest")),
+            to: Some(WireString::from("queue/tasks")),
+            subject: Some(WireString::from("task.created")),
+            reply_to: Some(WireString::from("queue/replies")),
+            correlation_id: Some(AmqpValue::String(WireString::from("corr-001"))),
+            content_type: Some(WireString::from("application/json")),
+            content_encoding: Some(WireString::from("utf-8")),
+            absolute_expiry_time: Some(1709654400000),
+            creation_time: Some(1709650800000),
+            group_id: Some(WireString::from("group-1")),
+            group_sequence: Some(42),
+            reply_to_group_id: Some(WireString::from("reply-group-1")),
+        };
+        let msg = AmqpMessage {
+            properties: Some(props),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        let p = decoded.properties.unwrap();
+        assert_eq!(p.message_id.unwrap().as_str(), Some("msg-001"));
+        assert_eq!(p.user_id.unwrap().as_ref(), b"guest");
+        assert_eq!(p.to.as_deref(), Some("queue/tasks"));
+        assert_eq!(p.subject.as_deref(), Some("task.created"));
+        assert_eq!(p.reply_to.as_deref(), Some("queue/replies"));
+        assert_eq!(p.correlation_id.unwrap().as_str(), Some("corr-001"));
+        assert_eq!(p.content_type.as_deref(), Some("application/json"));
+        assert_eq!(p.content_encoding.as_deref(), Some("utf-8"));
+        assert_eq!(p.absolute_expiry_time, Some(1709654400000));
+        assert_eq!(p.creation_time, Some(1709650800000));
+        assert_eq!(p.group_id.as_deref(), Some("group-1"));
+        assert_eq!(p.group_sequence, Some(42));
+        assert_eq!(p.reply_to_group_id.as_deref(), Some("reply-group-1"));
+    }
+
+    #[test]
+    fn test_message_data_body_roundtrip() {
+        let msg = AmqpMessage {
+            body: smallvec::smallvec![Bytes::from_static(b"hello world")],
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        assert_eq!(decoded.body.len(), 1);
+        assert_eq!(decoded.body[0].as_ref(), b"hello world");
+    }
+
+    #[test]
+    fn test_message_multiple_data_sections() {
+        let msg = AmqpMessage {
+            body: smallvec::smallvec![
+                Bytes::from_static(b"part1"),
+                Bytes::from_static(b"part2"),
+                Bytes::from_static(b"part3"),
+            ],
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        assert_eq!(decoded.body.len(), 3);
+        assert_eq!(decoded.body[0].as_ref(), b"part1");
+        assert_eq!(decoded.body[1].as_ref(), b"part2");
+        assert_eq!(decoded.body[2].as_ref(), b"part3");
+    }
+
+    #[test]
+    fn test_message_full_roundtrip() {
+        let msg = AmqpMessage {
+            header: Some(MessageHeader {
+                durable: true,
+                priority: 5,
+                ttl: Some(30000),
+                ..Default::default()
+            }),
+            properties: Some(MessageProperties {
+                message_id: Some(AmqpValue::String(WireString::from("id-1"))),
+                content_type: Some(WireString::from("text/plain")),
+                ..Default::default()
+            }),
+            application_properties: Some(AmqpValue::Map(vec![(
+                AmqpValue::String(WireString::from("key")),
+                AmqpValue::String(WireString::from("value")),
+            )])),
+            body: smallvec::smallvec![Bytes::from_static(b"Hello, AMQP!")],
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+
+        let h = decoded.header.unwrap();
+        assert!(h.durable);
+        assert_eq!(h.priority, 5);
+        assert_eq!(h.ttl, Some(30000));
+
+        let p = decoded.properties.unwrap();
+        assert_eq!(p.message_id.unwrap().as_str(), Some("id-1"));
+        assert_eq!(p.content_type.as_deref(), Some("text/plain"));
+
+        assert!(decoded.application_properties.is_some());
+        assert_eq!(decoded.body.len(), 1);
+        assert_eq!(decoded.body[0].as_ref(), b"Hello, AMQP!");
+    }
+
+    #[test]
+    fn test_message_annotations_roundtrip() {
+        let annotations = AmqpValue::Map(vec![(
+            AmqpValue::Symbol(WireString::from("x-opt-routing-key")),
+            AmqpValue::String(WireString::from("events.user.created")),
+        )]);
+        let msg = AmqpMessage {
+            message_annotations: Some(annotations),
+            body: smallvec::smallvec![Bytes::from_static(b"data")],
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        assert!(decoded.message_annotations.is_some());
+    }
+
+    #[test]
+    fn test_message_footer_roundtrip() {
+        let footer = AmqpValue::Map(vec![(
+            AmqpValue::Symbol(WireString::from("x-checksum")),
+            AmqpValue::Uint(0xDEADBEEF),
+        )]);
+        let msg = AmqpMessage {
+            body: smallvec::smallvec![Bytes::from_static(b"data")],
+            footer: Some(footer),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        assert!(decoded.footer.is_some());
+    }
+
+    #[test]
+    fn test_message_body_only() {
+        let msg = AmqpMessage {
+            body: smallvec::smallvec![Bytes::from_static(b"just body")],
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        assert!(decoded.header.is_none());
+        assert!(decoded.properties.is_none());
+        assert_eq!(decoded.body.len(), 1);
+        assert_eq!(decoded.body[0].as_ref(), b"just body");
+    }
+
+    #[test]
+    fn test_txn_declared_roundtrip() {
+        let mut buf = BytesMut::new();
+        encode_txn_declared(&mut buf, b"txn-123");
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        // Should be a described type with descriptor 0x33
+        match &value {
+            AmqpValue::Described(desc, inner) => {
+                assert_eq!(desc.as_u64(), Some(txn_descriptor::DECLARED));
+                let fields = inner.as_list().unwrap();
+                assert_eq!(fields[0].as_binary().unwrap().as_ref(), b"txn-123");
+            }
+            _ => panic!("expected described type"),
+        }
+    }
+
+    #[test]
+    fn test_transactional_state_roundtrip() {
+        let mut buf = BytesMut::new();
+        encode_transactional_state(&mut buf, b"txn-456", Some(&DeliveryState::Accepted));
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let state = decode_delivery_state(&value);
+        match state {
+            Some(DeliveryState::Transactional(ts)) => {
+                assert_eq!(ts.txn_id.as_ref(), b"txn-456");
+                assert_eq!(ts.outcome.unwrap(), Outcome::Accepted);
+            }
+            other => panic!("expected TransactionalState, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_txn_declare_decode() {
+        // Build a described list for Declare with global_id = None
+        let mut buf = BytesMut::new();
+        put_empty_described_list(&mut buf, txn_descriptor::DECLARE);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let declare = decode_txn_declare(&value);
+        assert!(declare.is_some());
+        assert!(declare.unwrap().global_id.is_none());
+    }
+
+    #[test]
+    fn test_txn_discharge_decode() {
+        let mut buf = BytesMut::new();
+        let (sp, bs) = begin_described_list(&mut buf, txn_descriptor::DISCHARGE, 2);
+        put_binary(&mut buf, b"my-txn");
+        put_bool(&mut buf, true); // fail = true (rollback)
+        finish_described_list(&mut buf, sp, bs);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let discharge = decode_txn_discharge(&value).unwrap();
+        assert_eq!(discharge.txn_id.as_ref(), b"my-txn");
+        assert!(discharge.fail);
+    }
+
+    #[test]
+    fn test_coordinator_encode_roundtrip() {
+        let coord = Coordinator::default();
+        let mut buf = BytesMut::new();
+        encode_coordinator(&mut buf, &coord);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let decoded = decode_coordinator(&value);
+        assert!(decoded.is_some());
+        assert!(decoded.unwrap().capabilities.is_empty());
+    }
+
+    // =========================================================================
+    // Gap 1: UUID type encode/decode roundtrip
+    // =========================================================================
+
+    #[test]
+    fn test_uuid_roundtrip() {
+        let uuid_bytes: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
+        let val = AmqpValue::Uuid(uuid_bytes);
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &val);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        assert!(matches!(decoded, AmqpValue::Uuid(v) if v == uuid_bytes));
+    }
+
+    #[test]
+    fn test_uuid_all_zeros() {
+        let uuid_bytes = [0u8; 16];
+        let val = AmqpValue::Uuid(uuid_bytes);
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &val);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        assert!(matches!(decoded, AmqpValue::Uuid(v) if v == [0u8; 16]));
+    }
+
+    #[test]
+    fn test_uuid_all_ff() {
+        let uuid_bytes = [0xFFu8; 16];
+        let val = AmqpValue::Uuid(uuid_bytes);
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &val);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        assert!(matches!(decoded, AmqpValue::Uuid(v) if v == [0xFFu8; 16]));
+    }
+
+    // =========================================================================
+    // Gap 2: Array type encode/decode roundtrip
+    // =========================================================================
+
+    #[test]
+    fn test_empty_array_roundtrip() {
+        let val = AmqpValue::Array(Vec::new());
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &val);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        match decoded {
+            AmqpValue::Array(items) => assert!(items.is_empty()),
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn test_array_of_uints_roundtrip() {
+        // Encode a symbol array using encode_str_symbol_array and decode it
+        let mut buf = BytesMut::new();
+        encode_str_symbol_array(&mut buf, &["alpha", "beta", "gamma"]);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        match decoded {
+            AmqpValue::Array(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0].as_str(), Some("alpha"));
+                assert_eq!(items[1].as_str(), Some("beta"));
+                assert_eq!(items[2].as_str(), Some("gamma"));
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn test_empty_symbol_array_roundtrip() {
+        let mut buf = BytesMut::new();
+        encode_str_symbol_array(&mut buf, &[]);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        match decoded {
+            AmqpValue::Array(items) => assert!(items.is_empty()),
+            _ => panic!("expected Array"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 3: Error paths — invalid format codes, truncated payloads, oversized frames
+    // =========================================================================
+
+    #[test]
+    fn test_invalid_format_code() {
+        let bytes = Bytes::from_static(&[0xFF]); // not a valid AMQP format code
+        let mut cur = BytesCursor::new(bytes);
+        let result = decode_value(&mut cur);
+        assert!(matches!(result, Err(CodecError::InvalidFormatCode(0xFF))));
+    }
+
+    #[test]
+    fn test_truncated_uint_payload() {
+        // UINT format code followed by only 2 bytes instead of 4
+        let bytes = Bytes::from_static(&[format_code::UINT, 0x00, 0x01]);
+        let mut cur = BytesCursor::new(bytes);
+        let result = decode_value(&mut cur);
+        assert!(matches!(result, Err(CodecError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn test_truncated_string_payload() {
+        // STRING8 with length 10, but only 3 bytes of data
+        let bytes = Bytes::from_static(&[format_code::STRING8, 10, b'a', b'b', b'c']);
+        let mut cur = BytesCursor::new(bytes);
+        let result = decode_value(&mut cur);
+        assert!(matches!(result, Err(CodecError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn test_oversized_frame() {
+        // Frame claiming to be 32 MB (over MAX_FRAME_SIZE of 16 MB)
+        let mut data = vec![0u8; 8];
+        let size: u32 = 32 * 1024 * 1024;
+        data[..4].copy_from_slice(&size.to_be_bytes());
+        data[4] = 2; // doff
+        data[5] = 0; // frame type
+        let bytes = Bytes::from(data);
+        let result = decode_frame(&bytes);
+        assert!(matches!(result, Err(CodecError::FrameTooLarge(_))));
+    }
+
+    #[test]
+    fn test_frame_too_small() {
+        // Frame size < 8 is invalid
+        let mut data = vec![0u8; 8];
+        data[..4].copy_from_slice(&4u32.to_be_bytes()); // size = 4
+        data[4] = 2;
+        let bytes = Bytes::from(data);
+        let result = decode_frame(&bytes);
+        assert!(matches!(result, Err(CodecError::InvalidFrameHeader)));
+    }
+
+    #[test]
+    fn test_empty_cursor() {
+        let bytes = Bytes::new();
+        let mut cur = BytesCursor::new(bytes);
+        let result = decode_value(&mut cur);
+        assert!(matches!(result, Err(CodecError::UnexpectedEof)));
+    }
+
+    // =========================================================================
+    // Gap 4: encode_attach/decode_attach roundtrip with all fields populated
+    // =========================================================================
+
+    #[test]
+    fn test_attach_full_roundtrip() {
+        let attach = Attach {
+            name: WireString::from("my-link"),
+            handle: 7,
+            role: Role::Receiver,
+            snd_settle_mode: SndSettleMode::Settled,
+            rcv_settle_mode: RcvSettleMode::Second,
+            source: Some(Source {
+                address: Some(WireString::from("queue/input")),
+                durable: 2,
+                expiry_policy: Some(WireString::from("session-end")),
+                timeout: 60,
+                dynamic: false,
+                distribution_mode: Some(WireString::from("move")),
+                ..Default::default()
+            }),
+            target: Some(Target {
+                address: Some(WireString::from("queue/output")),
+                durable: 1,
+                timeout: 30,
+                dynamic: true,
+                ..Default::default()
+            }),
+            unsettled: None,
+            incomplete_unsettled: true,
+            initial_delivery_count: Some(42),
+            max_message_size: Some(1024 * 1024),
+            properties: Some(AmqpValue::Map(vec![(
+                AmqpValue::Symbol(WireString::from("x-opt")),
+                AmqpValue::String(WireString::from("val")),
+            )])),
+            ..Default::default()
+        };
+
+        let mut payload = BytesMut::new();
+        encode_attach(&mut payload, &attach);
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 3, FRAME_TYPE_AMQP, &payload);
+
+        let frame_bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&frame_bytes).unwrap();
+        assert_eq!(frame.channel, 3);
+        match frame.body {
+            FrameBody::Amqp(Performative::Attach(decoded)) => {
+                assert_eq!(&*decoded.name, "my-link");
+                assert_eq!(decoded.handle, 7);
+                assert_eq!(decoded.role, Role::Receiver);
+                assert_eq!(decoded.snd_settle_mode, SndSettleMode::Settled);
+                assert_eq!(decoded.rcv_settle_mode, RcvSettleMode::Second);
+                assert!(decoded.incomplete_unsettled);
+                assert_eq!(decoded.initial_delivery_count, Some(42));
+                assert_eq!(decoded.max_message_size, Some(1024 * 1024));
+
+                let src = decoded.source.unwrap();
+                assert_eq!(src.address.as_deref(), Some("queue/input"));
+                assert_eq!(src.durable, 2);
+                assert_eq!(src.timeout, 60);
+                assert_eq!(src.expiry_policy.as_deref(), Some("session-end"));
+                assert_eq!(src.distribution_mode.as_deref(), Some("move"));
+
+                let tgt = decoded.target.unwrap();
+                assert_eq!(tgt.address.as_deref(), Some("queue/output"));
+                assert_eq!(tgt.durable, 1);
+                assert!(tgt.dynamic);
+
+                assert!(decoded.properties.is_some());
+            }
+            _ => panic!("expected Attach"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 5: encode_transfer/decode roundtrip
+    // =========================================================================
+
+    #[test]
+    fn test_transfer_roundtrip() {
+        let transfer = Transfer {
+            handle: 3,
+            delivery_id: Some(99),
+            delivery_tag: Some(Bytes::from_static(b"tag-1")),
+            message_format: Some(0),
+            settled: Some(true),
+            more: false,
+            rcv_settle_mode: None,
+            state: None,
+            resume: false,
+            aborted: false,
+            batchable: false,
+            payload: Bytes::from_static(b"hello-payload"),
+        };
+
+        let mut payload_buf = BytesMut::new();
+        encode_transfer(&mut payload_buf, &transfer);
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload_buf);
+
+        let frame_bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&frame_bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Transfer(decoded)) => {
+                assert_eq!(decoded.handle, 3);
+                assert_eq!(decoded.delivery_id, Some(99));
+                assert_eq!(decoded.delivery_tag.as_deref(), Some(b"tag-1".as_ref()));
+                assert_eq!(decoded.message_format, Some(0));
+                assert_eq!(decoded.settled, Some(true));
+                assert!(!decoded.more);
+                assert_eq!(decoded.payload.as_ref(), b"hello-payload");
+            }
+            _ => panic!("expected Transfer"),
+        }
+    }
+
+    #[test]
+    fn test_transfer_with_all_flags() {
+        let transfer = Transfer {
+            handle: 0,
+            delivery_id: Some(1),
+            delivery_tag: Some(Bytes::from_static(b"t")),
+            message_format: Some(0),
+            settled: Some(false),
+            more: true,
+            rcv_settle_mode: Some(RcvSettleMode::Second),
+            state: None,
+            resume: true,
+            aborted: true,
+            batchable: true,
+            payload: Bytes::new(),
+        };
+
+        let mut payload_buf = BytesMut::new();
+        encode_transfer(&mut payload_buf, &transfer);
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload_buf);
+
+        let frame_bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&frame_bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Transfer(decoded)) => {
+                assert!(decoded.more);
+                assert!(decoded.resume);
+                assert!(decoded.aborted);
+                assert!(decoded.batchable);
+                assert_eq!(decoded.rcv_settle_mode, Some(RcvSettleMode::Second));
+            }
+            _ => panic!("expected Transfer"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 6: encode_detach/decode_detach roundtrip
+    // =========================================================================
+
+    #[test]
+    fn test_detach_roundtrip_no_error() {
+        let detach = Detach {
+            handle: 5,
+            closed: true,
+            error: None,
+        };
+
+        let mut payload = BytesMut::new();
+        encode_detach(&mut payload, &detach);
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+
+        let frame_bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&frame_bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Detach(decoded)) => {
+                assert_eq!(decoded.handle, 5);
+                assert!(decoded.closed);
+                assert!(decoded.error.is_none());
+            }
+            _ => panic!("expected Detach"),
+        }
+    }
+
+    #[test]
+    fn test_detach_roundtrip_with_error() {
+        let detach = Detach {
+            handle: 2,
+            closed: true,
+            error: Some(AmqpError::new(
+                condition::LINK_DETACH_FORCED,
+                "forced detach",
+            )),
+        };
+
+        let mut payload = BytesMut::new();
+        encode_detach(&mut payload, &detach);
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+
+        let frame_bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&frame_bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Detach(decoded)) => {
+                assert_eq!(decoded.handle, 2);
+                assert!(decoded.closed);
+                let err = decoded.error.unwrap();
+                assert_eq!(&*err.condition, condition::LINK_DETACH_FORCED);
+                assert_eq!(err.description.as_deref(), Some("forced detach"));
+            }
+            _ => panic!("expected Detach"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 7: encode_end/decode_end roundtrip
+    // =========================================================================
+
+    #[test]
+    fn test_end_roundtrip_no_error() {
+        let end = End { error: None };
+
+        let mut payload = BytesMut::new();
+        encode_end(&mut payload, &end);
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+
+        let frame_bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&frame_bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::End(decoded)) => {
+                assert!(decoded.error.is_none());
+            }
+            _ => panic!("expected End"),
+        }
+    }
+
+    #[test]
+    fn test_end_roundtrip_with_error() {
+        let end = End {
+            error: Some(AmqpError::new(
+                condition::SESSION_WINDOW_VIOLATION,
+                "window exceeded",
+            )),
+        };
+
+        let mut payload = BytesMut::new();
+        encode_end(&mut payload, &end);
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+
+        let frame_bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&frame_bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::End(decoded)) => {
+                let err = decoded.error.unwrap();
+                assert_eq!(&*err.condition, condition::SESSION_WINDOW_VIOLATION);
+                assert_eq!(err.description.as_deref(), Some("window exceeded"));
+            }
+            _ => panic!("expected End"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 8: encode_close/decode_close roundtrip
+    // =========================================================================
+
+    #[test]
+    fn test_close_roundtrip_no_error() {
+        let close = Close { error: None };
+
+        let mut payload = BytesMut::new();
+        encode_close(&mut payload, &close);
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+
+        let frame_bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&frame_bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Close(decoded)) => {
+                assert!(decoded.error.is_none());
+            }
+            _ => panic!("expected Close"),
+        }
+    }
+
+    #[test]
+    fn test_close_roundtrip_with_error() {
+        let close = Close {
+            error: Some(AmqpError::new(
+                condition::CONNECTION_FORCED,
+                "server shutting down",
+            )),
+        };
+
+        let mut payload = BytesMut::new();
+        encode_close(&mut payload, &close);
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+
+        let frame_bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&frame_bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Close(decoded)) => {
+                let err = decoded.error.unwrap();
+                assert_eq!(&*err.condition, condition::CONNECTION_FORCED);
+                assert_eq!(err.description.as_deref(), Some("server shutting down"));
+            }
+            _ => panic!("expected Close"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 9: Frame DOFF validation
+    // =========================================================================
+
+    #[test]
+    fn test_frame_doff_too_small() {
+        // doff=1 means 4 bytes header, but minimum is 8 (doff=2)
+        let mut data = vec![0u8; 12];
+        data[..4].copy_from_slice(&12u32.to_be_bytes());
+        data[4] = 1; // doff = 1 -> header_size = 4 < 8
+        data[5] = 0;
+        let bytes = Bytes::from(data);
+        let result = decode_frame(&bytes);
+        assert!(matches!(result, Err(CodecError::InvalidFrameHeader)));
+    }
+
+    #[test]
+    fn test_frame_doff_larger_than_size() {
+        // doff=10 means 40 bytes header, but frame is only 12 bytes
+        let mut data = vec![0u8; 12];
+        data[..4].copy_from_slice(&12u32.to_be_bytes());
+        data[4] = 10; // doff = 10 -> header_size = 40 > 12
+        data[5] = 0;
+        let bytes = Bytes::from(data);
+        let result = decode_frame(&bytes);
+        assert!(matches!(result, Err(CodecError::InvalidFrameHeader)));
+    }
+
+    #[test]
+    fn test_frame_doff_valid_with_extended_header() {
+        // doff=3 means 12 bytes header with 4 extra extended header bytes
+        // Frame size 12, so payload is empty -> heartbeat
+        let mut data = vec![0u8; 12];
+        data[..4].copy_from_slice(&12u32.to_be_bytes());
+        data[4] = 3; // doff = 3 -> header_size = 12
+        data[5] = FRAME_TYPE_AMQP;
+        let bytes = Bytes::from(data);
+        let (frame, consumed) = decode_frame(&bytes).unwrap();
+        assert_eq!(consumed, 12);
+        assert!(matches!(frame.body, FrameBody::Empty));
+    }
+
+    // =========================================================================
+    // Gap 10: Frame size boundary (MAX_FRAME_SIZE)
+    // =========================================================================
+
+    #[test]
+    fn test_frame_at_max_size_boundary() {
+        // A frame exactly at MAX_FRAME_SIZE (16 MB) should be accepted if data is present
+        // We just test the size check without providing all the data
+        let size: u32 = 16 * 1024 * 1024; // exactly MAX_FRAME_SIZE
+        let mut data = vec![0u8; 8];
+        data[..4].copy_from_slice(&size.to_be_bytes());
+        data[4] = 2; // doff
+        data[5] = 0;
+        let bytes = Bytes::from(data);
+        // Should be Incomplete, not FrameTooLarge (size == MAX is allowed)
+        let result = decode_frame(&bytes);
+        assert!(matches!(result, Err(CodecError::Incomplete)));
+    }
+
+    #[test]
+    fn test_frame_one_over_max_size() {
+        let size: u32 = 16 * 1024 * 1024 + 1; // one over MAX_FRAME_SIZE
+        let mut data = vec![0u8; 8];
+        data[..4].copy_from_slice(&size.to_be_bytes());
+        data[4] = 2;
+        data[5] = 0;
+        let bytes = Bytes::from(data);
+        let result = decode_frame(&bytes);
+        assert!(matches!(result, Err(CodecError::FrameTooLarge(_))));
+    }
+
+    // =========================================================================
+    // Gap 11: decode_performative with unknown descriptor
+    // =========================================================================
+
+    #[test]
+    fn test_decode_performative_unknown_descriptor() {
+        // Encode a described type with an unknown descriptor
+        let mut buf = BytesMut::new();
+        encode_value(
+            &mut buf,
+            &AmqpValue::Described(
+                Box::new(AmqpValue::Ulong(0xDEAD)),
+                Box::new(AmqpValue::List(vec![])),
+            ),
+        );
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &buf);
+
+        let frame_bytes = frame_buf.freeze();
+        let result = decode_frame(&frame_bytes);
+        assert!(matches!(result, Err(CodecError::UnknownDescriptor(0xDEAD))));
+    }
+
+    #[test]
+    fn test_decode_performative_non_described() {
+        // A frame payload that is NOT a described type should fail
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Uint(42));
+
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &buf);
+
+        let frame_bytes = frame_buf.freeze();
+        let result = decode_frame(&frame_bytes);
+        assert!(matches!(result, Err(CodecError::InvalidPerformative(_))));
+    }
+
+    // =========================================================================
+    // Gap 12: Zero-copy verification for binary and symbol types
+    // =========================================================================
+
+    #[test]
+    fn test_zero_copy_binary_decode() {
+        let mut buf = BytesMut::new();
+        encode_value(
+            &mut buf,
+            &AmqpValue::Binary(Bytes::from_static(b"binary-data")),
+        );
+        let bytes = buf.freeze();
+        let original_ptr = bytes.as_ptr();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        match decoded {
+            AmqpValue::Binary(b) => {
+                assert_eq!(b.as_ref(), b"binary-data");
+                // Decoded binary should point into original buffer
+                let b_ptr = b.as_ptr();
+                assert!(b_ptr >= original_ptr);
+            }
+            _ => panic!("expected Binary"),
+        }
+    }
+
+    #[test]
+    fn test_zero_copy_symbol_decode() {
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Symbol(WireString::from("amqp:test")));
+        let bytes = buf.freeze();
+        let original_ptr = bytes.as_ptr();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        match decoded {
+            AmqpValue::Symbol(ws) => {
+                assert_eq!(&*ws, "amqp:test");
+                let ws_ptr = ws.as_bytes().as_ptr();
+                assert!(ws_ptr >= original_ptr);
+            }
+            _ => panic!("expected Symbol"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 13: SASL outcome encoding
+    // =========================================================================
+
+    #[test]
+    fn test_sasl_outcome_encode_decode() {
+        for code in [
+            SaslCode::Ok,
+            SaslCode::Auth,
+            SaslCode::Sys,
+            SaslCode::SysPerm,
+            SaslCode::SysTemp,
+        ] {
+            let mut buf = BytesMut::new();
+            encode_framed_sasl_outcome(&mut buf, code);
+            let bytes = buf.freeze();
+            let (frame, _) = decode_frame(&bytes).unwrap();
+            match frame.body {
+                FrameBody::Sasl(SaslPerformative::Outcome(outcome)) => {
+                    assert_eq!(outcome.code, code);
+                    assert!(outcome.additional_data.is_none());
+                }
+                _ => panic!("expected SASL Outcome"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_sasl_outcome_with_additional_data() {
+        let mut buf = BytesMut::new();
+        encode_framed_sasl_outcome_with_data(&mut buf, SaslCode::Ok, Some(b"extra-data"));
+        let bytes = buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Sasl(SaslPerformative::Outcome(outcome)) => {
+                assert_eq!(outcome.code, SaslCode::Ok);
+                assert_eq!(
+                    outcome.additional_data.as_deref(),
+                    Some(b"extra-data".as_ref())
+                );
+            }
+            _ => panic!("expected SASL Outcome"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 14: encode_sasl_challenge, encode_sasl_response roundtrips
+    // =========================================================================
+
+    #[test]
+    fn test_sasl_challenge_roundtrip() {
+        let mut buf = BytesMut::new();
+        encode_framed_sasl_challenge(&mut buf, b"challenge-data-here");
+        let bytes = buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Sasl(SaslPerformative::Challenge(ch)) => {
+                assert_eq!(ch.challenge.as_ref(), b"challenge-data-here");
+            }
+            _ => panic!("expected SASL Challenge"),
+        }
+    }
+
+    #[test]
+    fn test_sasl_response_roundtrip() {
+        let mut buf = BytesMut::new();
+        encode_framed_sasl_response(&mut buf, b"response-data-here");
+        let bytes = buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Sasl(SaslPerformative::Response(resp)) => {
+                assert_eq!(resp.response.as_ref(), b"response-data-here");
+            }
+            _ => panic!("expected SASL Response"),
+        }
+    }
+
+    #[test]
+    fn test_sasl_challenge_empty() {
+        let mut buf = BytesMut::new();
+        encode_framed_sasl_challenge(&mut buf, b"");
+        let bytes = buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Sasl(SaslPerformative::Challenge(ch)) => {
+                assert!(ch.challenge.is_empty());
+            }
+            _ => panic!("expected SASL Challenge"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 15: Nested described types
+    // =========================================================================
+
+    #[test]
+    fn test_nested_described_types() {
+        let inner = AmqpValue::Described(
+            Box::new(AmqpValue::Ulong(0x01)),
+            Box::new(AmqpValue::String(WireString::from("inner"))),
+        );
+        let outer = AmqpValue::Described(Box::new(AmqpValue::Ulong(0x02)), Box::new(inner));
+
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &outer);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+
+        match decoded {
+            AmqpValue::Described(d_outer, v_outer) => {
+                assert_eq!(d_outer.as_u64(), Some(0x02));
+                match *v_outer {
+                    AmqpValue::Described(d_inner, v_inner) => {
+                        assert_eq!(d_inner.as_u64(), Some(0x01));
+                        assert_eq!(v_inner.as_str(), Some("inner"));
+                    }
+                    _ => panic!("expected inner described type"),
+                }
+            }
+            _ => panic!("expected outer described type"),
+        }
+    }
+
+    // =========================================================================
+    // Gap 16: Empty list/map encoding
+    // =========================================================================
+
+    #[test]
+    fn test_empty_map_roundtrip() {
+        let map = AmqpValue::Map(Vec::new());
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &map);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        match decoded {
+            AmqpValue::Map(pairs) => assert!(pairs.is_empty()),
+            _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn test_empty_list_uses_list0_encoding() {
+        let list = AmqpValue::List(Vec::new());
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &list);
+        // LIST0 is a single byte: 0x45
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0], format_code::LIST0);
+    }
+
+    // =========================================================================
+    // Gap 17: decode_value with invalid UTF-8 (CodecError::InvalidUtf8)
+    // =========================================================================
+
+    #[test]
+    fn test_invalid_utf8_string() {
+        // STRING8, length=2, followed by invalid UTF-8 bytes
+        let bytes = Bytes::from_static(&[format_code::STRING8, 2, 0xFF, 0xFE]);
+        let mut cur = BytesCursor::new(bytes);
+        let result = decode_value(&mut cur);
+        assert!(matches!(result, Err(CodecError::InvalidUtf8)));
+    }
+
+    #[test]
+    fn test_invalid_utf8_symbol() {
+        // SYMBOL8, length=3, followed by invalid UTF-8 bytes
+        let bytes = Bytes::from_static(&[format_code::SYMBOL8, 3, 0xC0, 0x80, 0xFF]);
+        let mut cur = BytesCursor::new(bytes);
+        let result = decode_value(&mut cur);
+        assert!(matches!(result, Err(CodecError::InvalidUtf8)));
+    }
+
+    // =========================================================================
+    // Gap 18: Smallint/smalluint/smalllong encoding paths (compact encoding forms)
+    // =========================================================================
+
+    #[test]
+    fn test_uint_compact_encoding_zero() {
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Uint(0));
+        // UINT_ZERO is a single byte
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0], format_code::UINT_ZERO);
+    }
+
+    #[test]
+    fn test_uint_compact_encoding_small() {
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Uint(200));
+        // UINT_SMALL: 1 byte code + 1 byte value
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], format_code::UINT_SMALL);
+        assert_eq!(buf[1], 200);
+    }
+
+    #[test]
+    fn test_uint_full_encoding() {
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Uint(1000));
+        // UINT: 1 byte code + 4 byte value
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf[0], format_code::UINT);
+    }
+
+    #[test]
+    fn test_ulong_compact_encoding_zero() {
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Ulong(0));
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0], format_code::ULONG_ZERO);
+    }
+
+    #[test]
+    fn test_ulong_compact_encoding_small() {
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Ulong(100));
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], format_code::ULONG_SMALL);
+        assert_eq!(buf[1], 100);
+    }
+
+    #[test]
+    fn test_ulong_full_encoding() {
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Ulong(256));
+        assert_eq!(buf.len(), 9);
+        assert_eq!(buf[0], format_code::ULONG);
+    }
+
+    #[test]
+    fn test_int_compact_encoding_small() {
+        // Values -128..127 use INT_SMALL
+        for v in [-128i32, -1, 0, 1, 127] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Int(v));
+            assert_eq!(buf.len(), 2, "INT_SMALL for value {v}");
+            assert_eq!(buf[0], format_code::INT_SMALL);
+            // Roundtrip check
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert_eq!(decoded, AmqpValue::Int(v));
+        }
+    }
+
+    #[test]
+    fn test_int_full_encoding() {
+        for v in [-129i32, 128, i32::MAX, i32::MIN] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Int(v));
+            assert_eq!(buf.len(), 5, "INT for value {v}");
+            assert_eq!(buf[0], format_code::INT);
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert_eq!(decoded, AmqpValue::Int(v));
+        }
+    }
+
+    #[test]
+    fn test_long_compact_encoding_small() {
+        for v in [-128i64, -1, 0, 1, 127] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Long(v));
+            assert_eq!(buf.len(), 2, "LONG_SMALL for value {v}");
+            assert_eq!(buf[0], format_code::LONG_SMALL);
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert_eq!(decoded, AmqpValue::Long(v));
+        }
+    }
+
+    #[test]
+    fn test_long_full_encoding() {
+        for v in [-129i64, 128, i64::MAX, i64::MIN] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Long(v));
+            assert_eq!(buf.len(), 9, "LONG for value {v}");
+            assert_eq!(buf[0], format_code::LONG);
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert_eq!(decoded, AmqpValue::Long(v));
+        }
+    }
+
+    // =========================================================================
+    // Gap 19: Byte, Short, Long, Float, Double edge cases
+    // =========================================================================
+
+    #[test]
+    fn test_byte_edge_cases() {
+        for v in [i8::MIN, -1, 0, 1, i8::MAX] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Byte(v));
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert!(matches!(decoded, AmqpValue::Byte(x) if x == v));
+        }
+    }
+
+    #[test]
+    fn test_short_edge_cases() {
+        for v in [i16::MIN, -1, 0, 1, i16::MAX] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Short(v));
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert!(matches!(decoded, AmqpValue::Short(x) if x == v));
+        }
+    }
+
+    #[test]
+    fn test_float_special_values() {
+        for v in [
+            0.0f32,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN,
+            f32::MAX,
+        ] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Float(v));
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            match decoded {
+                AmqpValue::Float(x) => assert_eq!(x.to_bits(), v.to_bits()),
+                _ => panic!("expected Float"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_float_nan() {
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Float(f32::NAN));
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        match decoded {
+            AmqpValue::Float(x) => assert!(x.is_nan()),
+            _ => panic!("expected Float"),
+        }
+    }
+
+    #[test]
+    fn test_double_special_values() {
+        for v in [
+            0.0f64,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN,
+            f64::MAX,
+        ] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Double(v));
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            match decoded {
+                AmqpValue::Double(x) => assert_eq!(x.to_bits(), v.to_bits()),
+                _ => panic!("expected Double"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_double_nan() {
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &AmqpValue::Double(f64::NAN));
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        match decoded {
+            AmqpValue::Double(x) => assert!(x.is_nan()),
+            _ => panic!("expected Double"),
+        }
+    }
+
+    #[test]
+    fn test_long_negative_values() {
+        for v in [i64::MIN, -1_000_000_000_000i64, -1] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Long(v));
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert!(matches!(decoded, AmqpValue::Long(x) if x == v));
+        }
+    }
+
+    // =========================================================================
+    // Gap 20: Message with application_properties roundtrip
+    // =========================================================================
+
+    #[test]
+    fn test_message_with_application_properties_roundtrip() {
+        let app_props = AmqpValue::Map(vec![
+            (
+                AmqpValue::String(WireString::from("prop1")),
+                AmqpValue::Uint(100),
+            ),
+            (
+                AmqpValue::String(WireString::from("prop2")),
+                AmqpValue::String(WireString::from("hello")),
+            ),
+            (
+                AmqpValue::String(WireString::from("prop3")),
+                AmqpValue::Boolean(true),
+            ),
+        ]);
+        let msg = AmqpMessage {
+            application_properties: Some(app_props),
+            body: smallvec::smallvec![Bytes::from_static(b"body")],
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        let ap = decoded.application_properties.unwrap();
+        let pairs = ap.as_map().unwrap();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0.as_str(), Some("prop1"));
+        assert_eq!(pairs[0].1.as_u32(), Some(100));
+        assert_eq!(pairs[1].0.as_str(), Some("prop2"));
+        assert_eq!(pairs[1].1.as_str(), Some("hello"));
+    }
+
+    // =========================================================================
+    // Gap 21: Message with delivery_annotations roundtrip
+    // =========================================================================
+
+    #[test]
+    fn test_message_with_delivery_annotations_roundtrip() {
+        let da = AmqpValue::Map(vec![(
+            AmqpValue::Symbol(WireString::from("x-opt-delivery-delay")),
+            AmqpValue::Uint(5000),
+        )]);
+        let msg = AmqpMessage {
+            delivery_annotations: Some(da),
+            body: smallvec::smallvec![Bytes::from_static(b"body")],
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        let decoded_da = decoded.delivery_annotations.unwrap();
+        let pairs = decoded_da.as_map().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0.as_str(), Some("x-opt-delivery-delay"));
+        assert_eq!(pairs[0].1.as_u32(), Some(5000));
+    }
+
+    // =========================================================================
+    // Gap 22: Message properties with correlation_id as different AmqpValue types
+    // =========================================================================
+
+    #[test]
+    fn test_message_properties_correlation_id_as_uint() {
+        let msg = AmqpMessage {
+            properties: Some(MessageProperties {
+                correlation_id: Some(AmqpValue::Uint(12345)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        let p = decoded.properties.unwrap();
+        assert_eq!(p.correlation_id.unwrap().as_u32(), Some(12345));
+    }
+
+    #[test]
+    fn test_message_properties_correlation_id_as_binary() {
+        let msg = AmqpMessage {
+            properties: Some(MessageProperties {
+                correlation_id: Some(AmqpValue::Binary(Bytes::from_static(b"corr-bin"))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        let p = decoded.properties.unwrap();
+        assert_eq!(
+            p.correlation_id.unwrap().as_binary().unwrap().as_ref(),
+            b"corr-bin"
+        );
+    }
+
+    #[test]
+    fn test_message_properties_correlation_id_as_uuid() {
+        let uuid = [0xAAu8; 16];
+        let msg = AmqpMessage {
+            properties: Some(MessageProperties {
+                correlation_id: Some(AmqpValue::Uuid(uuid)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze()).unwrap();
+        let p = decoded.properties.unwrap();
+        assert!(matches!(p.correlation_id, Some(AmqpValue::Uuid(v)) if v == uuid));
+    }
+
+    // =========================================================================
+    // Gap 23: decode_txn_discharge with fail=false
+    // =========================================================================
+
+    #[test]
+    fn test_txn_discharge_fail_false() {
+        let mut buf = BytesMut::new();
+        let (sp, bs) = begin_described_list(&mut buf, txn_descriptor::DISCHARGE, 2);
+        put_binary(&mut buf, b"commit-txn");
+        put_bool(&mut buf, false); // fail = false (commit)
+        finish_described_list(&mut buf, sp, bs);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let discharge = decode_txn_discharge(&value).unwrap();
+        assert_eq!(discharge.txn_id.as_ref(), b"commit-txn");
+        assert!(!discharge.fail);
+    }
+
+    #[test]
+    fn test_txn_discharge_default_fail() {
+        // Discharge with only txn_id (no fail field) -> defaults to false
+        let mut buf = BytesMut::new();
+        let (sp, bs) = begin_described_list(&mut buf, txn_descriptor::DISCHARGE, 1);
+        put_binary(&mut buf, b"txn-default");
+        finish_described_list(&mut buf, sp, bs);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let discharge = decode_txn_discharge(&value).unwrap();
+        assert_eq!(discharge.txn_id.as_ref(), b"txn-default");
+        assert!(!discharge.fail);
+    }
+
+    // =========================================================================
+    // Gap 24: encode_transactional_state with outcome=None
+    // =========================================================================
+
+    #[test]
+    fn test_transactional_state_no_outcome() {
+        let mut buf = BytesMut::new();
+        encode_transactional_state(&mut buf, b"txn-no-outcome", None);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let state = decode_delivery_state(&value);
+        match state {
+            Some(DeliveryState::Transactional(ts)) => {
+                assert_eq!(ts.txn_id.as_ref(), b"txn-no-outcome");
+                assert!(ts.outcome.is_none());
+            }
+            other => panic!("expected TransactionalState, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_transactional_state_with_released_outcome() {
+        let mut buf = BytesMut::new();
+        encode_transactional_state(&mut buf, b"txn-rel", Some(&DeliveryState::Released));
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let value = decode_value(&mut cur).unwrap();
+        let state = decode_delivery_state(&value);
+        match state {
+            Some(DeliveryState::Transactional(ts)) => {
+                assert_eq!(ts.txn_id.as_ref(), b"txn-rel");
+                assert_eq!(ts.outcome, Some(Outcome::Released));
+            }
+            other => panic!("expected TransactionalState, got {:?}", other),
+        }
+    }
+
+    // =========================================================================
+    // Additional edge-case coverage
+    // =========================================================================
+
+    #[test]
+    fn test_ubyte_roundtrip() {
+        for v in [0u8, 1, 127, 128, 255] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Ubyte(v));
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert!(matches!(decoded, AmqpValue::Ubyte(x) if x == v));
+        }
+    }
+
+    #[test]
+    fn test_ushort_roundtrip() {
+        for v in [0u16, 1, 255, 256, u16::MAX] {
+            let mut buf = BytesMut::new();
+            encode_value(&mut buf, &AmqpValue::Ushort(v));
+            let bytes = buf.freeze();
+            let mut cur = BytesCursor::new(bytes);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert!(matches!(decoded, AmqpValue::Ushort(x) if x == v));
+        }
+    }
+
+    #[test]
+    fn test_sasl_init_roundtrip() {
+        let mut buf = BytesMut::new();
+        encode_framed_sasl_init(&mut buf, "PLAIN", Some(b"\x00user\x00pass"));
+        let bytes = buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Sasl(SaslPerformative::Init(init)) => {
+                assert_eq!(&*init.mechanism, "PLAIN");
+                assert_eq!(
+                    init.initial_response.as_deref(),
+                    Some(b"\x00user\x00pass".as_ref())
+                );
+            }
+            _ => panic!("expected SASL Init"),
+        }
+    }
+
+    #[test]
+    fn test_sasl_mechanisms_roundtrip() {
+        let mut buf = BytesMut::new();
+        encode_framed_sasl_mechanisms(&mut buf, &["PLAIN", "ANONYMOUS", "SCRAM-SHA-256"]);
+        let bytes = buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Sasl(SaslPerformative::Mechanisms(mechs)) => {
+                assert_eq!(mechs.mechanisms.len(), 3);
+                assert_eq!(&*mechs.mechanisms[0], "PLAIN");
+                assert_eq!(&*mechs.mechanisms[1], "ANONYMOUS");
+                assert_eq!(&*mechs.mechanisms[2], "SCRAM-SHA-256");
+            }
+            _ => panic!("expected SASL Mechanisms"),
+        }
+    }
+
+    #[test]
+    fn test_large_binary_roundtrip() {
+        // Test binary > 255 bytes uses BINARY32 encoding
+        let large_data = vec![0xABu8; 500];
+        let val = AmqpValue::Binary(Bytes::from(large_data.clone()));
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &val);
+        assert_eq!(buf[0], format_code::BINARY32);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        match decoded {
+            AmqpValue::Binary(b) => assert_eq!(b.as_ref(), large_data.as_slice()),
+            _ => panic!("expected Binary"),
+        }
+    }
+
+    #[test]
+    fn test_large_string_roundtrip() {
+        // Test string > 255 bytes uses STRING32 encoding
+        let large_str = "x".repeat(300);
+        let val = AmqpValue::String(WireString::from(large_str.as_str()));
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &val);
+        assert_eq!(buf[0], format_code::STRING32);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        assert_eq!(
+            decoded,
+            AmqpValue::String(WireString::from(large_str.as_str()))
+        );
+    }
+
+    #[test]
+    fn test_timestamp_negative() {
+        // Negative timestamp (before epoch)
+        let val = AmqpValue::Timestamp(-1_000_000);
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &val);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        assert!(matches!(decoded, AmqpValue::Timestamp(-1_000_000)));
     }
 }

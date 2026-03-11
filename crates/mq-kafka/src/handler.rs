@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,11 +9,33 @@ use bisque_mq::flat::FlatMessageBuilder;
 use bisque_mq::types::{MqCommand, MqError, MqResponse, RetentionPolicy, name_hash};
 use bisque_mq::write_batcher::MqWriteBatcher;
 use bytes::Bytes;
+use smallvec::smallvec;
 use tracing::{debug, warn};
 
-use crate::codec;
+use crate::auth::{self, KafkaAuthenticator};
+use crate::codec::{self, CodecError};
 use crate::partition::{self, PartitionMap};
+use crate::txn::TxnCoordinator;
 use crate::types::*;
+
+/// Zero-allocation error type for produce path (avoids `format!()` on every error).
+enum ProduceError {
+    Codec(CodecError),
+    Mq(MqError),
+    Raft(bisque_mq::write_batcher::MqBatcherError),
+    UnexpectedResponse,
+}
+
+impl fmt::Display for ProduceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProduceError::Codec(e) => write!(f, "codec: {e}"),
+            ProduceError::Mq(e) => write!(f, "mq: {e}"),
+            ProduceError::Raft(e) => write!(f, "raft: {e}"),
+            ProduceError::UnexpectedResponse => f.write_str("unexpected response"),
+        }
+    }
+}
 
 // =============================================================================
 // Log Reader Trait
@@ -75,6 +98,13 @@ pub struct KafkaHandler {
     advertised_host: WireString,
     advertised_port: i32,
 
+    /// Transaction coordinator for PID allocation and transaction lifecycle.
+    txn_coordinator: TxnCoordinator,
+    /// Pluggable SASL authenticator.
+    authenticator: Arc<dyn KafkaAuthenticator>,
+    /// Notification channel for new data (fetch long-polling).
+    data_notify: Arc<tokio::sync::Notify>,
+
     // Pre-initialized metrics handles
     m_produce_requests: metrics::Counter,
     m_produce_messages: metrics::Counter,
@@ -105,6 +135,9 @@ impl KafkaHandler {
             broker_id,
             advertised_host: WireString::from(advertised_host),
             advertised_port,
+            txn_coordinator: TxnCoordinator::new(),
+            authenticator: Arc::new(auth::AllowAllAuthenticator),
+            data_notify: Arc::new(tokio::sync::Notify::new()),
             m_produce_requests: metrics::counter!("kafka.produce.requests", &labels),
             m_produce_messages: metrics::counter!("kafka.produce.messages", &labels),
             m_fetch_requests: metrics::counter!("kafka.fetch.requests", &labels),
@@ -114,6 +147,16 @@ impl KafkaHandler {
             m_group_heartbeats: metrics::counter!("kafka.group.heartbeats", &labels),
             m_group_leaves: metrics::counter!("kafka.group.leaves", &labels),
         }
+    }
+
+    /// Set a custom authenticator for SASL/PLAIN.
+    pub fn set_authenticator(&mut self, auth: Arc<dyn KafkaAuthenticator>) {
+        self.authenticator = auth;
+    }
+
+    /// Get the data notification handle (for signaling new data availability).
+    pub fn data_notify(&self) -> &Arc<tokio::sync::Notify> {
+        &self.data_notify
     }
 
     /// Refresh the partition map from the engine's topic list.
@@ -131,7 +174,7 @@ impl KafkaHandler {
             KafkaRequest::ApiVersions => self.handle_api_versions(),
             KafkaRequest::Metadata(req) => self.handle_metadata(req),
             KafkaRequest::Produce(req) => self.handle_produce(req).await,
-            KafkaRequest::Fetch(req) => self.handle_fetch(req),
+            KafkaRequest::Fetch(req) => self.handle_fetch(req).await,
             KafkaRequest::ListOffsets(req) => self.handle_list_offsets(req),
             KafkaRequest::FindCoordinator(req) => self.handle_find_coordinator(req),
             KafkaRequest::JoinGroup(req) => self.handle_join_group(req).await,
@@ -144,6 +187,19 @@ impl KafkaHandler {
             KafkaRequest::DeleteTopics(req) => self.handle_delete_topics(req).await,
             KafkaRequest::DescribeGroups(req) => self.handle_describe_groups(req),
             KafkaRequest::ListGroups => self.handle_list_groups(),
+            KafkaRequest::SaslHandshake(req) => self.handle_sasl_handshake(req),
+            KafkaRequest::SaslAuthenticate(req) => self.handle_sasl_authenticate(req),
+            KafkaRequest::DeleteRecords(req) => self.handle_delete_records(req).await,
+            KafkaRequest::InitProducerId(req) => self.handle_init_producer_id(req),
+            KafkaRequest::AddPartitionsToTxn(req) => self.handle_add_partitions_to_txn(req),
+            KafkaRequest::AddOffsetsToTxn(req) => self.handle_add_offsets_to_txn(req),
+            KafkaRequest::EndTxn(req) => self.handle_end_txn(req),
+            KafkaRequest::TxnOffsetCommit(req) => self.handle_txn_offset_commit(req).await,
+            KafkaRequest::DescribeConfigs(req) => self.handle_describe_configs(req),
+            KafkaRequest::AlterConfigs(req) => self.handle_alter_configs(req),
+            KafkaRequest::CreatePartitions(req) => self.handle_create_partitions(req).await,
+            KafkaRequest::DeleteGroups(req) => self.handle_delete_groups(req).await,
+            KafkaRequest::OffsetDelete(req) => self.handle_offset_delete(req).await,
         }
     }
 
@@ -189,9 +245,22 @@ impl KafkaHandler {
             ApiKey::SyncGroup,
             ApiKey::DescribeGroups,
             ApiKey::ListGroups,
+            ApiKey::SaslHandshake,
             ApiKey::ApiVersions,
             ApiKey::CreateTopics,
             ApiKey::DeleteTopics,
+            ApiKey::DeleteRecords,
+            ApiKey::InitProducerId,
+            ApiKey::AddPartitionsToTxn,
+            ApiKey::AddOffsetsToTxn,
+            ApiKey::EndTxn,
+            ApiKey::TxnOffsetCommit,
+            ApiKey::DescribeConfigs,
+            ApiKey::AlterConfigs,
+            ApiKey::SaslAuthenticate,
+            ApiKey::CreatePartitions,
+            ApiKey::DeleteGroups,
+            ApiKey::OffsetDelete,
         ];
 
         let api_keys = supported
@@ -236,8 +305,8 @@ impl KafkaHandler {
                             error_code: ErrorCode::None.as_i16(),
                             partition_index: idx,
                             leader: self.broker_id,
-                            replicas: vec![self.broker_id],
-                            isr: vec![self.broker_id],
+                            replicas: smallvec![self.broker_id],
+                            isr: smallvec![self.broker_id],
                         })
                         .collect(),
                     name,
@@ -252,8 +321,7 @@ impl KafkaHandler {
 
         let topics = match req.topics {
             None => pmap
-                .kafka_topics()
-                .into_iter()
+                .kafka_topic_names()
                 .map(|s| build_topic_meta(WireString::from(s)))
                 .collect(),
             Some(names) => names.into_iter().map(build_topic_meta).collect(),
@@ -324,10 +392,14 @@ impl KafkaHandler {
         })
     }
 
-    async fn produce_records(&self, topic_id: u64, record_set_bytes: Bytes) -> Result<i64, String> {
+    async fn produce_records(
+        &self,
+        topic_id: u64,
+        record_set_bytes: Bytes,
+    ) -> Result<i64, ProduceError> {
         // Zero-copy decode — consumes Bytes directly, no clone needed
         let batch =
-            codec::decode_record_batch_bytes(record_set_bytes).map_err(|e| format!("{e}"))?;
+            codec::decode_record_batch_bytes(record_set_bytes).map_err(ProduceError::Codec)?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -360,10 +432,14 @@ impl KafkaHandler {
         let cmd = MqCommand::publish(topic_id, &messages);
 
         match self.batcher.submit(cmd).await {
-            Ok(MqResponse::Published { base_offset, .. }) => Ok(base_offset as i64),
-            Ok(MqResponse::Error(e)) => Err(format!("{e}")),
-            Ok(other) => Err(format!("unexpected response: {other}")),
-            Err(e) => Err(format!("{e}")),
+            Ok(MqResponse::Published { base_offset, .. }) => {
+                // Wake up any long-polling fetch requests
+                self.data_notify.notify_waiters();
+                Ok(base_offset as i64)
+            }
+            Ok(MqResponse::Error(e)) => Err(ProduceError::Mq(e)),
+            Ok(_) => Err(ProduceError::UnexpectedResponse),
+            Err(e) => Err(ProduceError::Raft(e)),
         }
     }
 
@@ -371,12 +447,38 @@ impl KafkaHandler {
     // Fetch
     // -------------------------------------------------------------------------
 
-    fn handle_fetch(&self, req: FetchRequest) -> KafkaResponse {
+    async fn handle_fetch(&self, req: FetchRequest) -> KafkaResponse {
         self.m_fetch_requests.increment(1);
+
+        let response = self.do_fetch(&req);
+
+        // Long-polling: if no data returned and max_wait_ms > 0, wait for notification
+        if req.max_wait_ms > 0 {
+            let has_data = response
+                .topics
+                .iter()
+                .any(|t| t.partitions.iter().any(|p| !p.record_set.is_empty()));
+
+            if !has_data {
+                let wait = Duration::from_millis(req.max_wait_ms.max(0) as u64);
+                let notified = self.data_notify.notified();
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(wait) => {}
+                }
+                // Re-fetch after notification or timeout
+                return KafkaResponse::Fetch(self.do_fetch(&req));
+            }
+        }
+
+        KafkaResponse::Fetch(response)
+    }
+
+    fn do_fetch(&self, req: &FetchRequest) -> FetchResponse {
         let pmap = self.partition_map.load();
         let mut topic_responses = Vec::with_capacity(req.topics.len());
 
-        for topic_data in req.topics {
+        for topic_data in &req.topics {
             let mut part_responses = Vec::with_capacity(topic_data.partitions.len());
 
             for part_data in &topic_data.partitions {
@@ -418,14 +520,14 @@ impl KafkaHandler {
             }
 
             topic_responses.push(FetchTopicResponse {
-                topic_name: topic_data.topic_name,
+                topic_name: topic_data.topic_name.clone(),
                 partitions: part_responses,
             });
         }
 
-        KafkaResponse::Fetch(FetchResponse {
+        FetchResponse {
             topics: topic_responses,
-        })
+        }
     }
 
     fn build_record_batch(&self, messages: &[FetchedMessage], base_offset: i64) -> Bytes {
@@ -1278,6 +1380,557 @@ impl KafkaHandler {
     }
 
     // -------------------------------------------------------------------------
+    // SASL Authentication
+    // -------------------------------------------------------------------------
+
+    fn handle_sasl_handshake(&self, req: SaslHandshakeRequest) -> KafkaResponse {
+        let mechanisms = vec![WireString::from_static("PLAIN")];
+        let error_code = if req.mechanism.as_str() == "PLAIN" {
+            ErrorCode::None.as_i16()
+        } else {
+            ErrorCode::UnsupportedVersion.as_i16()
+        };
+        KafkaResponse::SaslHandshake(SaslHandshakeResponse {
+            error_code,
+            mechanisms,
+        })
+    }
+
+    fn handle_sasl_authenticate(&self, req: SaslAuthenticateRequest) -> KafkaResponse {
+        match auth::parse_sasl_plain(&req.auth_bytes) {
+            Some((username, password)) => match self.authenticator.authenticate(username, password)
+            {
+                Ok(()) => KafkaResponse::SaslAuthenticate(SaslAuthenticateResponse {
+                    error_code: ErrorCode::None.as_i16(),
+                    error_message: None,
+                    auth_bytes: Bytes::new(),
+                }),
+                Err(msg) => KafkaResponse::SaslAuthenticate(SaslAuthenticateResponse {
+                    error_code: ErrorCode::SaslAuthenticationFailed.as_i16(),
+                    error_message: Some(WireString::from_static(msg)),
+                    auth_bytes: Bytes::new(),
+                }),
+            },
+            None => KafkaResponse::SaslAuthenticate(SaslAuthenticateResponse {
+                error_code: ErrorCode::SaslAuthenticationFailed.as_i16(),
+                error_message: Some(WireString::from_static("invalid SASL/PLAIN payload")),
+                auth_bytes: Bytes::new(),
+            }),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // InitProducerId
+    // -------------------------------------------------------------------------
+
+    fn handle_init_producer_id(&self, req: InitProducerIdRequest) -> KafkaResponse {
+        let txn_id = req.transactional_id.as_deref();
+        let (producer_id, producer_epoch) = self.txn_coordinator.init_producer_id(txn_id);
+        KafkaResponse::InitProducerId(InitProducerIdResponse {
+            error_code: ErrorCode::None.as_i16(),
+            producer_id,
+            producer_epoch,
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // Transaction APIs
+    // -------------------------------------------------------------------------
+
+    fn handle_add_partitions_to_txn(&self, req: AddPartitionsToTxnRequest) -> KafkaResponse {
+        let mut topic_responses = Vec::with_capacity(req.topics.len());
+
+        for topic_data in &req.topics {
+            let partitions: Vec<_> = topic_data
+                .partitions
+                .iter()
+                .map(|&p| {
+                    let error_code = match self.txn_coordinator.add_partitions(
+                        &req.transactional_id,
+                        req.producer_id,
+                        req.producer_epoch,
+                        &topic_data.topic_name,
+                        &[p],
+                    ) {
+                        Ok(()) => ErrorCode::None.as_i16(),
+                        Err(ec) => ec,
+                    };
+                    AddPartitionsToTxnPartitionResponse {
+                        partition_index: p,
+                        error_code,
+                    }
+                })
+                .collect();
+
+            topic_responses.push(AddPartitionsToTxnTopicResponse {
+                topic_name: topic_data.topic_name.clone(),
+                partitions,
+            });
+        }
+
+        KafkaResponse::AddPartitionsToTxn(AddPartitionsToTxnResponse {
+            topics: topic_responses,
+        })
+    }
+
+    fn handle_add_offsets_to_txn(&self, req: AddOffsetsToTxnRequest) -> KafkaResponse {
+        let error_code = match self.txn_coordinator.add_offsets_to_txn(
+            &req.transactional_id,
+            req.producer_id,
+            req.producer_epoch,
+            &req.group_id,
+        ) {
+            Ok(()) => ErrorCode::None.as_i16(),
+            Err(ec) => ec,
+        };
+        KafkaResponse::AddOffsetsToTxn(AddOffsetsToTxnResponse { error_code })
+    }
+
+    fn handle_end_txn(&self, req: EndTxnRequest) -> KafkaResponse {
+        let error_code = match self.txn_coordinator.end_txn(
+            &req.transactional_id,
+            req.producer_id,
+            req.producer_epoch,
+            req.committed,
+        ) {
+            Ok(()) => ErrorCode::None.as_i16(),
+            Err(ec) => ec,
+        };
+        KafkaResponse::EndTxn(EndTxnResponse { error_code })
+    }
+
+    async fn handle_txn_offset_commit(&self, req: TxnOffsetCommitRequest) -> KafkaResponse {
+        if let Err(ec) = self.txn_coordinator.validate_txn_offset_commit(
+            &req.transactional_id,
+            req.producer_id,
+            req.producer_epoch,
+        ) {
+            // Return error for all partitions
+            let topics = req
+                .topics
+                .iter()
+                .map(|t| TxnOffsetCommitTopicResponse {
+                    topic_name: t.topic_name.clone(),
+                    partitions: t
+                        .partitions
+                        .iter()
+                        .map(|p| TxnOffsetCommitPartitionResponse {
+                            partition_index: p.partition_index,
+                            error_code: ec,
+                        })
+                        .collect(),
+                })
+                .collect();
+            return KafkaResponse::TxnOffsetCommit(TxnOffsetCommitResponse { topics });
+        }
+
+        // Commit offsets via the group-based path
+        let group_id = match self.resolve_group_id(&req.group_id) {
+            Some(id) => id,
+            None => {
+                let topics = req
+                    .topics
+                    .iter()
+                    .map(|t| TxnOffsetCommitTopicResponse {
+                        topic_name: t.topic_name.clone(),
+                        partitions: t
+                            .partitions
+                            .iter()
+                            .map(|p| TxnOffsetCommitPartitionResponse {
+                                partition_index: p.partition_index,
+                                error_code: ErrorCode::GroupIdNotFound.as_i16(),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                return KafkaResponse::TxnOffsetCommit(TxnOffsetCommitResponse { topics });
+            }
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let pmap = self.partition_map.load();
+        let mut topic_responses = Vec::with_capacity(req.topics.len());
+
+        for topic_data in &req.topics {
+            let mut part_responses = Vec::with_capacity(topic_data.partitions.len());
+            for part_data in &topic_data.partitions {
+                let topic_id = pmap.resolve(&topic_data.topic_name, part_data.partition_index);
+                match topic_id {
+                    None => {
+                        part_responses.push(TxnOffsetCommitPartitionResponse {
+                            partition_index: part_data.partition_index,
+                            error_code: ErrorCode::UnknownTopicOrPartition.as_i16(),
+                        });
+                    }
+                    Some(topic_id) => {
+                        let cmd = MqCommand::commit_group_offset(
+                            group_id,
+                            -1, // generation not checked for txn commits
+                            topic_id,
+                            part_data.partition_index as u32,
+                            part_data.offset as u64,
+                            None,
+                            now,
+                        );
+                        let error_code = match self.batcher.submit(cmd).await {
+                            Ok(MqResponse::Ok) => ErrorCode::None.as_i16(),
+                            Ok(MqResponse::Error(e)) => {
+                                debug!("txn offset commit error: {e}");
+                                mq_error_to_kafka_i16(&e)
+                            }
+                            _ => ErrorCode::UnknownTopicOrPartition.as_i16(),
+                        };
+                        part_responses.push(TxnOffsetCommitPartitionResponse {
+                            partition_index: part_data.partition_index,
+                            error_code,
+                        });
+                    }
+                }
+            }
+            topic_responses.push(TxnOffsetCommitTopicResponse {
+                topic_name: topic_data.topic_name.clone(),
+                partitions: part_responses,
+            });
+        }
+
+        KafkaResponse::TxnOffsetCommit(TxnOffsetCommitResponse {
+            topics: topic_responses,
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // DeleteRecords
+    // -------------------------------------------------------------------------
+
+    async fn handle_delete_records(&self, req: DeleteRecordsRequest) -> KafkaResponse {
+        let pmap = self.partition_map.load();
+        let mut topic_responses = Vec::with_capacity(req.topics.len());
+
+        for topic_data in &req.topics {
+            let mut part_responses = Vec::with_capacity(topic_data.partitions.len());
+            for part_data in &topic_data.partitions {
+                let topic_id = pmap.resolve(&topic_data.topic_name, part_data.partition_index);
+                match topic_id {
+                    None => {
+                        part_responses.push(DeleteRecordsPartitionResponse {
+                            partition_index: part_data.partition_index,
+                            low_watermark: -1,
+                            error_code: ErrorCode::UnknownTopicOrPartition.as_i16(),
+                        });
+                    }
+                    Some(_topic_id) => {
+                        // bisque-mq doesn't support log truncation yet — accept the
+                        // request and report the target offset as the new low watermark
+                        part_responses.push(DeleteRecordsPartitionResponse {
+                            partition_index: part_data.partition_index,
+                            low_watermark: part_data.offset,
+                            error_code: ErrorCode::None.as_i16(),
+                        });
+                    }
+                }
+            }
+            topic_responses.push(DeleteRecordsTopicResponse {
+                topic_name: topic_data.topic_name.clone(),
+                partitions: part_responses,
+            });
+        }
+
+        KafkaResponse::DeleteRecords(DeleteRecordsResponse {
+            topics: topic_responses,
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // DescribeConfigs / AlterConfigs
+    // -------------------------------------------------------------------------
+
+    fn handle_describe_configs(&self, req: DescribeConfigsRequest) -> KafkaResponse {
+        let resources = req
+            .resources
+            .into_iter()
+            .map(|res| {
+                // Return default config entries for topics
+                let configs = if res.resource_type == 2 {
+                    // Topic resource
+                    vec![
+                        DescribeConfigEntry {
+                            name: WireString::from_static("cleanup.policy"),
+                            value: Some(WireString::from_static("delete")),
+                            read_only: false,
+                            is_default: true,
+                            is_sensitive: false,
+                        },
+                        DescribeConfigEntry {
+                            name: WireString::from_static("retention.ms"),
+                            value: Some(WireString::from_static("604800000")),
+                            read_only: false,
+                            is_default: true,
+                            is_sensitive: false,
+                        },
+                        DescribeConfigEntry {
+                            name: WireString::from_static("segment.bytes"),
+                            value: Some(WireString::from_static("1073741824")),
+                            read_only: false,
+                            is_default: true,
+                            is_sensitive: false,
+                        },
+                        DescribeConfigEntry {
+                            name: WireString::from_static("max.message.bytes"),
+                            value: Some(WireString::from_static("1048576")),
+                            read_only: false,
+                            is_default: true,
+                            is_sensitive: false,
+                        },
+                        DescribeConfigEntry {
+                            name: WireString::from_static("compression.type"),
+                            value: Some(WireString::from_static("producer")),
+                            read_only: false,
+                            is_default: true,
+                            is_sensitive: false,
+                        },
+                    ]
+                } else if res.resource_type == 4 {
+                    // Broker resource
+                    vec![
+                        DescribeConfigEntry {
+                            name: WireString::from_static("log.retention.hours"),
+                            value: Some(WireString::from_static("168")),
+                            read_only: false,
+                            is_default: true,
+                            is_sensitive: false,
+                        },
+                        DescribeConfigEntry {
+                            name: WireString::from_static("num.partitions"),
+                            value: Some(WireString::from_static("1")),
+                            read_only: false,
+                            is_default: true,
+                            is_sensitive: false,
+                        },
+                    ]
+                } else {
+                    vec![]
+                };
+
+                DescribeConfigsResourceResult {
+                    error_code: ErrorCode::None.as_i16(),
+                    error_message: None,
+                    resource_type: res.resource_type,
+                    resource_name: res.resource_name,
+                    configs,
+                }
+            })
+            .collect();
+
+        KafkaResponse::DescribeConfigs(DescribeConfigsResponse { resources })
+    }
+
+    fn handle_alter_configs(&self, req: AlterConfigsRequest) -> KafkaResponse {
+        // Accept but no-op (single-node, configs are not persisted)
+        let resources = req
+            .resources
+            .into_iter()
+            .map(|res| AlterConfigsResourceResult {
+                error_code: ErrorCode::None.as_i16(),
+                error_message: None,
+                resource_type: res.resource_type,
+                resource_name: res.resource_name,
+            })
+            .collect();
+        KafkaResponse::AlterConfigs(AlterConfigsResponse { resources })
+    }
+
+    // -------------------------------------------------------------------------
+    // CreatePartitions
+    // -------------------------------------------------------------------------
+
+    async fn handle_create_partitions(&self, req: CreatePartitionsRequest) -> KafkaResponse {
+        let mut topic_responses = Vec::with_capacity(req.topics.len());
+
+        for ct in req.topics {
+            let pmap = self.partition_map.load();
+            let current_count = pmap.partition_count(&ct.name).unwrap_or(0);
+            let new_total = ct.count as usize;
+
+            if new_total <= current_count {
+                topic_responses.push(CreatePartitionsTopicResponse {
+                    name: ct.name,
+                    error_code: ErrorCode::InvalidPartitions.as_i16(),
+                    error_message: Some(WireString::from(
+                        "new partition count must be greater than current",
+                    )),
+                });
+                continue;
+            }
+
+            if req.validate_only {
+                topic_responses.push(CreatePartitionsTopicResponse {
+                    name: ct.name,
+                    error_code: ErrorCode::None.as_i16(),
+                    error_message: None,
+                });
+                continue;
+            }
+
+            let mut error_code = ErrorCode::None.as_i16();
+            let mut error_message = None;
+
+            for i in current_count..new_total {
+                let mq_name = partition::partition_topic_name(&ct.name, i as i32);
+                let cmd = MqCommand::create_topic(&mq_name, RetentionPolicy::default(), 0);
+                match self.batcher.submit(cmd).await {
+                    Ok(MqResponse::EntityCreated { .. }) => {}
+                    Ok(MqResponse::Error(MqError::AlreadyExists { .. })) => {}
+                    Ok(MqResponse::Error(e)) => {
+                        warn!("create partition error: {e}");
+                        error_code = ErrorCode::InvalidTopicException.as_i16();
+                        error_message = Some(WireString::from(format!("{e}")));
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("create partition batcher error: {e}");
+                        error_code = ErrorCode::InvalidTopicException.as_i16();
+                        error_message = Some(WireString::from(format!("{e}")));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            self.refresh_partitions();
+            topic_responses.push(CreatePartitionsTopicResponse {
+                name: ct.name,
+                error_code,
+                error_message,
+            });
+        }
+
+        KafkaResponse::CreatePartitions(CreatePartitionsResponse {
+            topics: topic_responses,
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // DeleteGroups
+    // -------------------------------------------------------------------------
+
+    async fn handle_delete_groups(&self, req: DeleteGroupsRequest) -> KafkaResponse {
+        let mut results = Vec::with_capacity(req.group_ids.len());
+
+        for group_name in &req.group_ids {
+            let group_id = match self.resolve_group_id(group_name) {
+                Some(id) => id,
+                None => {
+                    results.push(DeleteGroupResult {
+                        group_id: group_name.clone(),
+                        error_code: ErrorCode::GroupIdNotFound.as_i16(),
+                    });
+                    continue;
+                }
+            };
+
+            // Check if group is empty
+            if let Some(group) = self.metadata.get_consumer_group(group_id) {
+                let phase = group.phase();
+                if phase != GroupPhase::Empty && phase != GroupPhase::Dead {
+                    results.push(DeleteGroupResult {
+                        group_id: group_name.clone(),
+                        error_code: ErrorCode::GroupNotEmpty.as_i16(),
+                    });
+                    continue;
+                }
+            }
+
+            let cmd = MqCommand::delete_consumer_group(group_id);
+            let error_code = match self.batcher.submit(cmd).await {
+                Ok(MqResponse::Ok) => ErrorCode::None.as_i16(),
+                Ok(MqResponse::Error(e)) => {
+                    debug!("delete group error: {e}");
+                    mq_error_to_kafka_i16(&e)
+                }
+                _ => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
+            };
+
+            results.push(DeleteGroupResult {
+                group_id: group_name.clone(),
+                error_code,
+            });
+        }
+
+        KafkaResponse::DeleteGroups(DeleteGroupsResponse { results })
+    }
+
+    // -------------------------------------------------------------------------
+    // OffsetDelete
+    // -------------------------------------------------------------------------
+
+    async fn handle_offset_delete(&self, req: OffsetDeleteRequest) -> KafkaResponse {
+        let group_id = match self.resolve_group_id(&req.group_id) {
+            Some(id) => id,
+            None => {
+                return KafkaResponse::OffsetDelete(OffsetDeleteResponse {
+                    error_code: ErrorCode::GroupIdNotFound.as_i16(),
+                    topics: Vec::new(),
+                });
+            }
+        };
+
+        let pmap = self.partition_map.load();
+        let mut topic_responses = Vec::with_capacity(req.topics.len());
+
+        for topic_data in &req.topics {
+            let mut part_responses = Vec::with_capacity(topic_data.partitions.len());
+            for part_data in &topic_data.partitions {
+                let topic_id = pmap.resolve(&topic_data.topic_name, part_data.partition_index);
+                match topic_id {
+                    None => {
+                        part_responses.push(OffsetDeletePartitionResponse {
+                            partition_index: part_data.partition_index,
+                            error_code: ErrorCode::UnknownTopicOrPartition.as_i16(),
+                        });
+                    }
+                    Some(topic_id) => {
+                        // Delete the committed offset by committing offset -1
+                        let cmd = MqCommand::commit_group_offset(
+                            group_id,
+                            -1,
+                            topic_id,
+                            part_data.partition_index as u32,
+                            0, // reset to 0
+                            None,
+                            0,
+                        );
+                        let error_code = match self.batcher.submit(cmd).await {
+                            Ok(MqResponse::Ok) => ErrorCode::None.as_i16(),
+                            Ok(MqResponse::Error(e)) => {
+                                debug!("offset delete error: {e}");
+                                mq_error_to_kafka_i16(&e)
+                            }
+                            _ => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
+                        };
+                        part_responses.push(OffsetDeletePartitionResponse {
+                            partition_index: part_data.partition_index,
+                            error_code,
+                        });
+                    }
+                }
+            }
+            topic_responses.push(OffsetDeleteTopicResponse {
+                topic_name: topic_data.topic_name.clone(),
+                partitions: part_responses,
+            });
+        }
+
+        KafkaResponse::OffsetDelete(OffsetDeleteResponse {
+            error_code: ErrorCode::None.as_i16(),
+            topics: topic_responses,
+        })
+    }
+
+    // -------------------------------------------------------------------------
     // Connection disconnect — submit leave via Raft
     // -------------------------------------------------------------------------
 
@@ -1763,6 +2416,1964 @@ mod tests {
                 assert_eq!(r.error_code, ErrorCode::UnknownMemberId.as_i16());
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_api_versions() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(&default_header(), KafkaRequest::ApiVersions)
+            .await;
+
+        match resp {
+            KafkaResponse::ApiVersions(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+                assert_eq!(r.api_keys.len(), 29);
+                for key in &r.api_keys {
+                    assert!(
+                        ApiKey::from_i16(key.api_key).is_some(),
+                        "unexpected api_key {}",
+                        key.api_key
+                    );
+                    assert!(key.min_version <= key.max_version);
+                }
+            }
+            other => panic!("expected ApiVersions, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_metadata_empty() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::Metadata(MetadataRequest { topics: None }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::Metadata(r) => {
+                assert_eq!(r.brokers.len(), 1);
+                assert_eq!(r.brokers[0].node_id, 1);
+                assert_eq!(r.brokers[0].host, "localhost");
+                assert_eq!(r.brokers[0].port, 9092);
+                assert!(r.topics.is_empty());
+            }
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_metadata_unknown_topic() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::Metadata(MetadataRequest {
+                    topics: Some(vec![WireString::from("nonexistent-topic")]),
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::Metadata(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(
+                    r.topics[0].error_code,
+                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                );
+                assert_eq!(r.topics[0].name, "nonexistent-topic");
+                assert!(r.topics[0].partitions.is_empty());
+            }
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_find_coordinator() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::FindCoordinator(FindCoordinatorRequest {
+                    key: WireString::from("my-group"),
+                    key_type: 0,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::FindCoordinator(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+                assert_eq!(r.node_id, 1);
+                assert_eq!(r.host, "localhost");
+                assert_eq!(r.port, 9092);
+            }
+            other => panic!("expected FindCoordinator, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_list_offsets_unknown_topic() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::ListOffsets(ListOffsetsRequest {
+                    replica_id: -1,
+                    topics: vec![ListOffsetsTopicData {
+                        topic_name: WireString::from("no-such-topic"),
+                        partitions: vec![ListOffsetsPartitionData {
+                            partition_index: 0,
+                            timestamp: -1,
+                        }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::ListOffsets(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].partitions.len(), 1);
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                );
+                assert_eq!(r.topics[0].partitions[0].offset, -1);
+            }
+            other => panic!("expected ListOffsets, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_create_topics() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::CreateTopics(CreateTopicsRequest {
+                    topics: vec![CreateTopicRequest {
+                        name: WireString::from("test-topic"),
+                        num_partitions: 3,
+                        replication_factor: 1,
+                    }],
+                    timeout_ms: 5000,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::CreateTopics(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].name, "test-topic");
+                // Either None (success) or TopicAlreadyExists if re-run
+                assert!(
+                    r.topics[0].error_code == ErrorCode::None.as_i16()
+                        || r.topics[0].error_code == ErrorCode::TopicAlreadyExists.as_i16()
+                );
+            }
+            other => panic!("expected CreateTopics, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_delete_topics_unknown() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DeleteTopics(DeleteTopicsRequest {
+                    topic_names: vec![WireString::from("nonexistent-topic")],
+                    timeout_ms: 5000,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DeleteTopics(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].name, "nonexistent-topic");
+                assert_eq!(
+                    r.topics[0].error_code,
+                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                );
+            }
+            other => panic!("expected DeleteTopics, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_sasl_handshake_plain() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::SaslHandshake(SaslHandshakeRequest {
+                    mechanism: WireString::from("PLAIN"),
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::SaslHandshake(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+                assert_eq!(r.mechanisms.len(), 1);
+                assert_eq!(r.mechanisms[0], "PLAIN");
+            }
+            other => panic!("expected SaslHandshake, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_sasl_handshake_unsupported() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::SaslHandshake(SaslHandshakeRequest {
+                    mechanism: WireString::from("GSSAPI"),
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::SaslHandshake(r) => {
+                assert_eq!(r.error_code, ErrorCode::UnsupportedVersion.as_i16());
+                // Still returns supported mechanisms
+                assert_eq!(r.mechanisms.len(), 1);
+                assert_eq!(r.mechanisms[0], "PLAIN");
+            }
+            other => panic!("expected SaslHandshake, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_sasl_authenticate_success() {
+        let (handler, _, _) = make_test_handler();
+        // SASL/PLAIN format: \0username\0password
+        let auth_bytes = Bytes::from_static(b"\0user\0pass");
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::SaslAuthenticate(SaslAuthenticateRequest { auth_bytes }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::SaslAuthenticate(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+                assert!(r.error_message.is_none());
+            }
+            other => panic!("expected SaslAuthenticate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_sasl_authenticate_bad_payload() {
+        let (handler, _, _) = make_test_handler();
+        // Empty bytes — cannot be parsed as SASL/PLAIN
+        let auth_bytes = Bytes::new();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::SaslAuthenticate(SaslAuthenticateRequest { auth_bytes }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::SaslAuthenticate(r) => {
+                assert_eq!(r.error_code, ErrorCode::SaslAuthenticationFailed.as_i16());
+                assert!(r.error_message.is_some());
+            }
+            other => panic!("expected SaslAuthenticate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_init_producer_id() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::InitProducerId(InitProducerIdRequest {
+                    transactional_id: None,
+                    transaction_timeout_ms: 60000,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::InitProducerId(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+                assert!(r.producer_id >= 0);
+                assert_eq!(r.producer_epoch, 0);
+            }
+            other => panic!("expected InitProducerId, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_init_producer_id_transactional() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::InitProducerId(InitProducerIdRequest {
+                    transactional_id: Some(WireString::from("my-txn-id")),
+                    transaction_timeout_ms: 60000,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::InitProducerId(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+                assert!(r.producer_id >= 0);
+                assert_eq!(r.producer_epoch, 0);
+            }
+            other => panic!("expected InitProducerId, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_describe_configs_topic() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DescribeConfigs(DescribeConfigsRequest {
+                    resources: vec![DescribeConfigsResource {
+                        resource_type: 2, // topic
+                        resource_name: WireString::from("my-topic"),
+                        config_names: None,
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DescribeConfigs(r) => {
+                assert_eq!(r.resources.len(), 1);
+                assert_eq!(r.resources[0].error_code, ErrorCode::None.as_i16());
+                assert_eq!(r.resources[0].resource_type, 2);
+                assert_eq!(r.resources[0].resource_name, "my-topic");
+                let config_names: Vec<&str> = r.resources[0]
+                    .configs
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                assert!(config_names.contains(&"cleanup.policy"));
+                assert!(config_names.contains(&"retention.ms"));
+                assert!(config_names.contains(&"segment.bytes"));
+                assert!(config_names.contains(&"max.message.bytes"));
+                assert!(config_names.contains(&"compression.type"));
+            }
+            other => panic!("expected DescribeConfigs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_describe_configs_broker() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DescribeConfigs(DescribeConfigsRequest {
+                    resources: vec![DescribeConfigsResource {
+                        resource_type: 4, // broker
+                        resource_name: WireString::from("1"),
+                        config_names: None,
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DescribeConfigs(r) => {
+                assert_eq!(r.resources.len(), 1);
+                assert_eq!(r.resources[0].error_code, ErrorCode::None.as_i16());
+                assert_eq!(r.resources[0].resource_type, 4);
+                let config_names: Vec<&str> = r.resources[0]
+                    .configs
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                assert!(config_names.contains(&"log.retention.hours"));
+                assert!(config_names.contains(&"num.partitions"));
+            }
+            other => panic!("expected DescribeConfigs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_alter_configs() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::AlterConfigs(AlterConfigsRequest {
+                    resources: vec![
+                        AlterConfigsResource {
+                            resource_type: 2,
+                            resource_name: WireString::from("topic-a"),
+                            configs: vec![AlterConfigEntry {
+                                name: WireString::from("retention.ms"),
+                                value: Some(WireString::from("86400000")),
+                            }],
+                        },
+                        AlterConfigsResource {
+                            resource_type: 4,
+                            resource_name: WireString::from("1"),
+                            configs: vec![],
+                        },
+                    ],
+                    validate_only: false,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::AlterConfigs(r) => {
+                assert_eq!(r.resources.len(), 2);
+                for res in &r.resources {
+                    assert_eq!(res.error_code, ErrorCode::None.as_i16());
+                    assert!(res.error_message.is_none());
+                }
+                assert_eq!(r.resources[0].resource_type, 2);
+                assert_eq!(r.resources[0].resource_name, "topic-a");
+                assert_eq!(r.resources[1].resource_type, 4);
+                assert_eq!(r.resources[1].resource_name, "1");
+            }
+            other => panic!("expected AlterConfigs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_list_groups_empty() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(&default_header(), KafkaRequest::ListGroups)
+            .await;
+
+        match resp {
+            KafkaResponse::ListGroups(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+                assert!(r.groups.is_empty());
+            }
+            other => panic!("expected ListGroups, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_describe_groups_nonexistent() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DescribeGroups(DescribeGroupsRequest {
+                    group_ids: vec![WireString::from("no-such-group")],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DescribeGroups(r) => {
+                assert_eq!(r.groups.len(), 1);
+                assert_eq!(r.groups[0].error_code, ErrorCode::InvalidGroupId.as_i16());
+                assert_eq!(r.groups[0].group_id, "no-such-group");
+                assert_eq!(r.groups[0].state, "Dead");
+                assert!(r.groups[0].members.is_empty());
+            }
+            other => panic!("expected DescribeGroups, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_leave_group() {
+        let (handler, _, _) = make_test_handler();
+
+        // First join a group
+        let join_resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::JoinGroup(JoinGroupRequest {
+                    group_id: WireString::from("leave-test"),
+                    session_timeout_ms: 30000,
+                    rebalance_timeout_ms: 60000,
+                    member_id: WireString::empty(),
+                    protocol_type: WireString::from("consumer"),
+                    protocols: vec![JoinGroupProtocol {
+                        name: WireString::from("range"),
+                        metadata: Bytes::new(),
+                    }],
+                }),
+            )
+            .await;
+
+        let member_id = match join_resp {
+            KafkaResponse::JoinGroup(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+                r.member_id
+            }
+            other => panic!("expected JoinGroup, got {other:?}"),
+        };
+
+        // Now leave the group
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::LeaveGroup(LeaveGroupRequest {
+                    group_id: WireString::from("leave-test"),
+                    member_id,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::LeaveGroup(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+            }
+            other => panic!("expected LeaveGroup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_offset_commit_unknown_group() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::OffsetCommit(OffsetCommitRequest {
+                    group_id: WireString::from("nonexistent-group"),
+                    generation_id: -1,
+                    member_id: WireString::empty(),
+                    topics: vec![OffsetCommitTopicData {
+                        topic_name: WireString::from("some-topic"),
+                        partitions: vec![OffsetCommitPartitionData {
+                            partition_index: 0,
+                            offset: 42,
+                            metadata: None,
+                        }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::OffsetCommit(r) => {
+                // Falls through to legacy path; topic is unknown so partition error
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].partitions.len(), 1);
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                );
+            }
+            other => panic!("expected OffsetCommit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_offset_fetch_unknown_group() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::OffsetFetch(OffsetFetchRequest {
+                    group_id: WireString::from("nonexistent-group"),
+                    topics: vec![OffsetFetchTopicData {
+                        topic_name: WireString::from("some-topic"),
+                        partitions: vec![0],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::OffsetFetch(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].partitions.len(), 1);
+                // Topic doesn't exist in partition map, so UnknownTopicOrPartition
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                );
+            }
+            other => panic!("expected OffsetFetch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_fetch_unknown_topic() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::Fetch(FetchRequest {
+                    max_wait_ms: 0,
+                    min_bytes: 1,
+                    topics: vec![FetchTopicData {
+                        topic_name: WireString::from("unknown-topic"),
+                        partitions: vec![FetchPartitionData {
+                            partition_index: 0,
+                            fetch_offset: 0,
+                            max_bytes: 1048576,
+                        }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::Fetch(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].partitions.len(), 1);
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                );
+                assert_eq!(r.topics[0].partitions[0].high_watermark, -1);
+                assert!(r.topics[0].partitions[0].record_set.is_empty());
+            }
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_fetch_empty() {
+        let (handler, _, log_reader) = make_test_handler();
+        // Add topic using partition naming convention: "kafka-name-{partition}"
+        log_reader.add_topic("fetch-empty-0", 42);
+        handler.refresh_partitions();
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::Fetch(FetchRequest {
+                    max_wait_ms: 0,
+                    min_bytes: 1,
+                    topics: vec![FetchTopicData {
+                        topic_name: WireString::from("fetch-empty"),
+                        partitions: vec![FetchPartitionData {
+                            partition_index: 0,
+                            fetch_offset: 0,
+                            max_bytes: 1048576,
+                        }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::Fetch(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].partitions.len(), 1);
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::None.as_i16()
+                );
+                assert!(r.topics[0].partitions[0].record_set.is_empty());
+            }
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_delete_groups_not_found() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DeleteGroups(DeleteGroupsRequest {
+                    group_ids: vec![WireString::from("no-such-group")],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DeleteGroups(r) => {
+                assert_eq!(r.results.len(), 1);
+                assert_eq!(r.results[0].group_id, "no-such-group");
+                assert_eq!(r.results[0].error_code, ErrorCode::GroupIdNotFound.as_i16());
+            }
+            other => panic!("expected DeleteGroups, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_create_partitions_invalid() {
+        let (handler, _, log_reader) = make_test_handler();
+        // Add a topic using partition naming convention so partition map resolves it
+        log_reader.add_topic("cp-topic-0", 100);
+        handler.refresh_partitions();
+
+        // Try to set count to 1 (equal to current 1), should get InvalidPartitions
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::CreatePartitions(CreatePartitionsRequest {
+                    topics: vec![CreatePartitionsTopic {
+                        name: WireString::from("cp-topic"),
+                        count: 1,
+                    }],
+                    timeout_ms: 5000,
+                    validate_only: false,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::CreatePartitions(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].name, "cp-topic");
+                assert_eq!(
+                    r.topics[0].error_code,
+                    ErrorCode::InvalidPartitions.as_i16()
+                );
+                assert!(r.topics[0].error_message.is_some());
+            }
+            other => panic!("expected CreatePartitions, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // Transaction API handler tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_add_partitions_to_txn() {
+        let (handler, _, _) = make_test_handler();
+        // Init a transactional producer first
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::InitProducerId(InitProducerIdRequest {
+                    transactional_id: Some(WireString::from("txn-1")),
+                    transaction_timeout_ms: 60000,
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::AddPartitionsToTxn(AddPartitionsToTxnRequest {
+                    transactional_id: WireString::from("txn-1"),
+                    producer_id: 1,
+                    producer_epoch: 0,
+                    topics: vec![AddPartitionsToTxnTopicData {
+                        topic_name: WireString::from("topic-a"),
+                        partitions: vec![0, 1],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::AddPartitionsToTxn(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].partitions.len(), 2);
+                for p in &r.topics[0].partitions {
+                    assert_eq!(p.error_code, ErrorCode::None.as_i16());
+                }
+            }
+            other => panic!("expected AddPartitionsToTxn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_partitions_to_txn_unknown() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::AddPartitionsToTxn(AddPartitionsToTxnRequest {
+                    transactional_id: WireString::from("no-such-txn"),
+                    producer_id: 999,
+                    producer_epoch: 0,
+                    topics: vec![AddPartitionsToTxnTopicData {
+                        topic_name: WireString::from("t"),
+                        partitions: vec![0],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::AddPartitionsToTxn(r) => {
+                assert_ne!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::None.as_i16()
+                );
+            }
+            other => panic!("expected AddPartitionsToTxn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_offsets_to_txn() {
+        let (handler, _, _) = make_test_handler();
+        let init_resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::InitProducerId(InitProducerIdRequest {
+                    transactional_id: Some(WireString::from("txn-offsets")),
+                    transaction_timeout_ms: 60000,
+                }),
+            )
+            .await;
+        let (pid, epoch) = match init_resp {
+            KafkaResponse::InitProducerId(r) => (r.producer_id, r.producer_epoch),
+            other => panic!("{other:?}"),
+        };
+        // Must add partitions first to transition to Ongoing
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::AddPartitionsToTxn(AddPartitionsToTxnRequest {
+                    transactional_id: WireString::from("txn-offsets"),
+                    producer_id: pid,
+                    producer_epoch: epoch,
+                    topics: vec![AddPartitionsToTxnTopicData {
+                        topic_name: WireString::from("t"),
+                        partitions: vec![0],
+                    }],
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::AddOffsetsToTxn(AddOffsetsToTxnRequest {
+                    transactional_id: WireString::from("txn-offsets"),
+                    producer_id: pid,
+                    producer_epoch: epoch,
+                    group_id: WireString::from("my-group"),
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::AddOffsetsToTxn(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+            }
+            other => panic!("expected AddOffsetsToTxn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_offsets_to_txn_unknown() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::AddOffsetsToTxn(AddOffsetsToTxnRequest {
+                    transactional_id: WireString::from("no-txn"),
+                    producer_id: 999,
+                    producer_epoch: 0,
+                    group_id: WireString::from("g"),
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::AddOffsetsToTxn(r) => {
+                assert_ne!(r.error_code, ErrorCode::None.as_i16());
+            }
+            other => panic!("expected AddOffsetsToTxn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_end_txn_commit() {
+        let (handler, _, _) = make_test_handler();
+        let init_resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::InitProducerId(InitProducerIdRequest {
+                    transactional_id: Some(WireString::from("txn-end")),
+                    transaction_timeout_ms: 60000,
+                }),
+            )
+            .await;
+        let (pid, epoch) = match init_resp {
+            KafkaResponse::InitProducerId(r) => (r.producer_id, r.producer_epoch),
+            other => panic!("{other:?}"),
+        };
+        // Transition to Ongoing via add_partitions
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::AddPartitionsToTxn(AddPartitionsToTxnRequest {
+                    transactional_id: WireString::from("txn-end"),
+                    producer_id: pid,
+                    producer_epoch: epoch,
+                    topics: vec![AddPartitionsToTxnTopicData {
+                        topic_name: WireString::from("t"),
+                        partitions: vec![0],
+                    }],
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::EndTxn(EndTxnRequest {
+                    transactional_id: WireString::from("txn-end"),
+                    producer_id: pid,
+                    producer_epoch: epoch,
+                    committed: true,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::EndTxn(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+            }
+            other => panic!("expected EndTxn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_end_txn_abort() {
+        let (handler, _, _) = make_test_handler();
+        let init_resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::InitProducerId(InitProducerIdRequest {
+                    transactional_id: Some(WireString::from("txn-abort")),
+                    transaction_timeout_ms: 60000,
+                }),
+            )
+            .await;
+        let (pid, epoch) = match init_resp {
+            KafkaResponse::InitProducerId(r) => (r.producer_id, r.producer_epoch),
+            other => panic!("{other:?}"),
+        };
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::AddPartitionsToTxn(AddPartitionsToTxnRequest {
+                    transactional_id: WireString::from("txn-abort"),
+                    producer_id: pid,
+                    producer_epoch: epoch,
+                    topics: vec![AddPartitionsToTxnTopicData {
+                        topic_name: WireString::from("t"),
+                        partitions: vec![0],
+                    }],
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::EndTxn(EndTxnRequest {
+                    transactional_id: WireString::from("txn-abort"),
+                    producer_id: pid,
+                    producer_epoch: epoch,
+                    committed: false,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::EndTxn(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+            }
+            other => panic!("expected EndTxn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_end_txn_unknown() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::EndTxn(EndTxnRequest {
+                    transactional_id: WireString::from("no-txn"),
+                    producer_id: 999,
+                    producer_epoch: 0,
+                    committed: true,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::EndTxn(r) => {
+                assert_ne!(r.error_code, ErrorCode::None.as_i16());
+            }
+            other => panic!("expected EndTxn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_txn_offset_commit_no_txn() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::TxnOffsetCommit(TxnOffsetCommitRequest {
+                    transactional_id: WireString::from("no-txn"),
+                    group_id: WireString::from("g1"),
+                    producer_id: 999,
+                    producer_epoch: 0,
+                    topics: vec![TxnOffsetCommitTopicData {
+                        topic_name: WireString::from("t1"),
+                        partitions: vec![TxnOffsetCommitPartitionData {
+                            partition_index: 0,
+                            offset: 10,
+                            metadata: None,
+                        }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::TxnOffsetCommit(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_ne!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::None.as_i16()
+                );
+            }
+            other => panic!("expected TxnOffsetCommit, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // DeleteRecords handler tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_delete_records_unknown_topic() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DeleteRecords(DeleteRecordsRequest {
+                    topics: vec![DeleteRecordsTopicData {
+                        topic_name: WireString::from("no-topic"),
+                        partitions: vec![DeleteRecordsPartitionData {
+                            partition_index: 0,
+                            offset: 5,
+                        }],
+                    }],
+                    timeout_ms: 1000,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DeleteRecords(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                );
+                assert_eq!(r.topics[0].partitions[0].low_watermark, -1);
+            }
+            other => panic!("expected DeleteRecords, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_delete_records_known_topic() {
+        let (handler, _, log_reader) = make_test_handler();
+        log_reader.add_topic("dr-topic-0", 500);
+        handler.refresh_partitions();
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DeleteRecords(DeleteRecordsRequest {
+                    topics: vec![DeleteRecordsTopicData {
+                        topic_name: WireString::from("dr-topic"),
+                        partitions: vec![DeleteRecordsPartitionData {
+                            partition_index: 0,
+                            offset: 42,
+                        }],
+                    }],
+                    timeout_ms: 1000,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DeleteRecords(r) => {
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::None.as_i16()
+                );
+                assert_eq!(r.topics[0].partitions[0].low_watermark, 42);
+            }
+            other => panic!("expected DeleteRecords, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // OffsetDelete handler tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_offset_delete_unknown_group() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::OffsetDelete(OffsetDeleteRequest {
+                    group_id: WireString::from("no-group"),
+                    topics: vec![OffsetDeleteTopicData {
+                        topic_name: WireString::from("t1"),
+                        partitions: vec![OffsetDeletePartitionData { partition_index: 0 }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::OffsetDelete(r) => {
+                assert_eq!(r.error_code, ErrorCode::GroupIdNotFound.as_i16());
+                assert!(r.topics.is_empty());
+            }
+            other => panic!("expected OffsetDelete, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // Metadata with existing topics
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_metadata_with_topics() {
+        let (handler, _, log_reader) = make_test_handler();
+        log_reader.add_topic("my-topic-0", 10);
+        log_reader.add_topic("my-topic-1", 11);
+        handler.refresh_partitions();
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::Metadata(MetadataRequest { topics: None }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::Metadata(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].name, "my-topic");
+                assert_eq!(r.topics[0].error_code, ErrorCode::None.as_i16());
+                assert_eq!(r.topics[0].partitions.len(), 2);
+            }
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_metadata_specific_topic() {
+        let (handler, _, log_reader) = make_test_handler();
+        log_reader.add_topic("exist-0", 20);
+        handler.refresh_partitions();
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::Metadata(MetadataRequest {
+                    topics: Some(vec![WireString::from("exist"), WireString::from("nope")]),
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::Metadata(r) => {
+                assert_eq!(r.topics.len(), 2);
+                // First topic exists
+                assert_eq!(r.topics[0].error_code, ErrorCode::None.as_i16());
+                // Second doesn't
+                assert_eq!(
+                    r.topics[1].error_code,
+                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                );
+            }
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // ListOffsets with known topic
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_list_offsets_known_topic() {
+        let (handler, _, log_reader) = make_test_handler();
+        log_reader.add_topic("lo-topic-0", 30);
+        handler.refresh_partitions();
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::ListOffsets(ListOffsetsRequest {
+                    replica_id: -1,
+                    topics: vec![ListOffsetsTopicData {
+                        topic_name: WireString::from("lo-topic"),
+                        partitions: vec![
+                            ListOffsetsPartitionData {
+                                partition_index: 0,
+                                timestamp: -1,
+                            },
+                            ListOffsetsPartitionData {
+                                partition_index: 0,
+                                timestamp: -2,
+                            },
+                        ],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::ListOffsets(r) => {
+                assert_eq!(r.topics.len(), 1);
+                for p in &r.topics[0].partitions {
+                    assert_eq!(p.error_code, ErrorCode::None.as_i16());
+                }
+            }
+            other => panic!("expected ListOffsets, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // DescribeGroups with existing group, ListGroups with groups
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_describe_groups_existing() {
+        let (handler, _, _) = make_test_handler();
+        // Create a group by joining
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::JoinGroup(JoinGroupRequest {
+                    group_id: WireString::from("desc-group"),
+                    session_timeout_ms: 30000,
+                    rebalance_timeout_ms: 60000,
+                    member_id: WireString::empty(),
+                    protocol_type: WireString::from("consumer"),
+                    protocols: vec![JoinGroupProtocol {
+                        name: WireString::from("range"),
+                        metadata: Bytes::new(),
+                    }],
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DescribeGroups(DescribeGroupsRequest {
+                    group_ids: vec![WireString::from("desc-group")],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DescribeGroups(r) => {
+                assert_eq!(r.groups.len(), 1);
+                assert_eq!(r.groups[0].error_code, ErrorCode::None.as_i16());
+                assert_eq!(r.groups[0].group_id, "desc-group");
+                assert!(!r.groups[0].members.is_empty());
+            }
+            other => panic!("expected DescribeGroups, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_list_groups_with_groups() {
+        let (handler, _, _) = make_test_handler();
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::JoinGroup(JoinGroupRequest {
+                    group_id: WireString::from("lg-group"),
+                    session_timeout_ms: 30000,
+                    rebalance_timeout_ms: 60000,
+                    member_id: WireString::empty(),
+                    protocol_type: WireString::from("consumer"),
+                    protocols: vec![JoinGroupProtocol {
+                        name: WireString::from("range"),
+                        metadata: Bytes::new(),
+                    }],
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(&default_header(), KafkaRequest::ListGroups)
+            .await;
+
+        match resp {
+            KafkaResponse::ListGroups(r) => {
+                assert_eq!(r.error_code, ErrorCode::None.as_i16());
+                assert!(!r.groups.is_empty());
+                assert!(r.groups.iter().any(|g| g.group_id == "lg-group"));
+            }
+            other => panic!("expected ListGroups, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // CreatePartitions success and validate_only
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_create_partitions_success() {
+        let (handler, _, _) = make_test_handler();
+        // First create the topic
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::CreateTopics(CreateTopicsRequest {
+                    topics: vec![CreateTopicRequest {
+                        name: WireString::from("cp-ok"),
+                        num_partitions: 1,
+                        replication_factor: 1,
+                    }],
+                    timeout_ms: 5000,
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::CreatePartitions(CreatePartitionsRequest {
+                    topics: vec![CreatePartitionsTopic {
+                        name: WireString::from("cp-ok"),
+                        count: 3,
+                    }],
+                    timeout_ms: 5000,
+                    validate_only: false,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::CreatePartitions(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].error_code, ErrorCode::None.as_i16());
+            }
+            other => panic!("expected CreatePartitions, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_create_partitions_validate_only() {
+        let (handler, _, _) = make_test_handler();
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::CreateTopics(CreateTopicsRequest {
+                    topics: vec![CreateTopicRequest {
+                        name: WireString::from("cp-val"),
+                        num_partitions: 1,
+                        replication_factor: 1,
+                    }],
+                    timeout_ms: 5000,
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::CreatePartitions(CreatePartitionsRequest {
+                    topics: vec![CreatePartitionsTopic {
+                        name: WireString::from("cp-val"),
+                        count: 5,
+                    }],
+                    timeout_ms: 5000,
+                    validate_only: true,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::CreatePartitions(r) => {
+                assert_eq!(r.topics[0].error_code, ErrorCode::None.as_i16());
+                assert!(r.topics[0].error_message.is_none());
+            }
+            other => panic!("expected CreatePartitions, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // DeleteTopics success path
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_delete_topics_success() {
+        let (handler, _, log_reader) = make_test_handler();
+        // Add the topic to the log reader so partition map can resolve it
+        log_reader.add_topic("del-me-0", 200);
+        handler.refresh_partitions();
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DeleteTopics(DeleteTopicsRequest {
+                    topic_names: vec![WireString::from("del-me")],
+                    timeout_ms: 5000,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DeleteTopics(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(r.topics[0].error_code, ErrorCode::None.as_i16());
+            }
+            other => panic!("expected DeleteTopics, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // DescribeConfigs unknown resource type
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_describe_configs_unknown_type() {
+        let (handler, _, _) = make_test_handler();
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DescribeConfigs(DescribeConfigsRequest {
+                    resources: vec![DescribeConfigsResource {
+                        resource_type: 99,
+                        resource_name: WireString::from("whatever"),
+                        config_names: None,
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DescribeConfigs(r) => {
+                assert_eq!(r.resources.len(), 1);
+                assert!(r.resources[0].configs.is_empty());
+            }
+            other => panic!("expected DescribeConfigs, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // SASL authenticate with custom rejecting authenticator
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_sasl_authenticate_rejected() {
+        let (mut handler, _, _) = make_test_handler();
+        struct RejectAuth;
+        impl KafkaAuthenticator for RejectAuth {
+            fn authenticate(&self, _: &str, _: &str) -> Result<(), &'static str> {
+                Err("denied")
+            }
+        }
+        handler.set_authenticator(Arc::new(RejectAuth));
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::SaslAuthenticate(SaslAuthenticateRequest {
+                    auth_bytes: Bytes::from_static(b"\0user\0pass"),
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::SaslAuthenticate(r) => {
+                assert_eq!(r.error_code, ErrorCode::SaslAuthenticationFailed.as_i16());
+                assert!(r.error_message.is_some());
+            }
+            other => panic!("expected SaslAuthenticate, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // mq_error_to_kafka_i16 coverage
+    // =========================================================================
+
+    #[test]
+    fn test_mq_error_to_kafka_i16() {
+        use bisque_mq::types::EntityKind;
+        assert_eq!(
+            mq_error_to_kafka_i16(&MqError::IllegalGeneration),
+            ErrorCode::IllegalGeneration.as_i16()
+        );
+        assert_eq!(
+            mq_error_to_kafka_i16(&MqError::UnknownMemberId),
+            ErrorCode::UnknownMemberId.as_i16()
+        );
+        assert_eq!(
+            mq_error_to_kafka_i16(&MqError::RebalanceInProgress),
+            ErrorCode::RebalanceInProgress.as_i16()
+        );
+        assert_eq!(
+            mq_error_to_kafka_i16(&MqError::NotFound {
+                entity: EntityKind::Topic,
+                id: 1
+            }),
+            ErrorCode::GroupCoordinatorNotAvailable.as_i16()
+        );
+        assert_eq!(
+            mq_error_to_kafka_i16(&MqError::AlreadyExists {
+                entity: EntityKind::Topic,
+                id: 1
+            }),
+            ErrorCode::TopicAlreadyExists.as_i16()
+        );
+    }
+
+    // =========================================================================
+    // ProduceError Display
+    // =========================================================================
+
+    #[test]
+    fn test_produce_error_display() {
+        let e = ProduceError::UnexpectedResponse;
+        assert_eq!(format!("{e}"), "unexpected response");
+
+        let e = ProduceError::Codec(CodecError::Incomplete);
+        assert!(format!("{e}").contains("codec:"));
+    }
+
+    // =========================================================================
+    // data_notify and set_authenticator
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_data_notify() {
+        let (handler, _, _) = make_test_handler();
+        let notify = handler.data_notify();
+        // Just verify it returns a valid Arc
+        notify.notify_waiters();
+    }
+
+    // =========================================================================
+    // refresh_partitions
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_refresh_partitions() {
+        let (handler, _, log_reader) = make_test_handler();
+        log_reader.add_topic("rp-topic-0", 50);
+        log_reader.add_topic("rp-topic-1", 51);
+        handler.refresh_partitions();
+
+        let pmap = handler.partition_map.load();
+        assert_eq!(pmap.partition_count("rp-topic"), Some(2));
+    }
+
+    // =========================================================================
+    // on_disconnect with empty member IDs
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_on_disconnect_empty() {
+        let (handler, _, _) = make_test_handler();
+        // Should not panic with empty list
+        handler.on_disconnect(&[]);
+    }
+
+    // =========================================================================
+    // Fetch with existing topic (empty data)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_fetch_known_topic_empty() {
+        let (handler, _, log_reader) = make_test_handler();
+        log_reader.add_topic("ft-topic-0", 60);
+        handler.refresh_partitions();
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::Fetch(FetchRequest {
+                    max_wait_ms: 0,
+                    min_bytes: 0,
+                    topics: vec![FetchTopicData {
+                        topic_name: WireString::from("ft-topic"),
+                        partitions: vec![FetchPartitionData {
+                            partition_index: 0,
+                            fetch_offset: 0,
+                            max_bytes: 1048576,
+                        }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::Fetch(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::None.as_i16()
+                );
+                assert!(r.topics[0].partitions[0].record_set.is_empty());
+            }
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // Produce with unknown topic
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_produce_unknown_topic() {
+        let (handler, _, _) = make_test_handler();
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::Produce(ProduceRequest {
+                    acks: 1,
+                    timeout_ms: 1000,
+                    topics: vec![ProduceTopicData {
+                        topic_name: WireString::from("no-topic"),
+                        partitions: vec![ProducePartitionData {
+                            partition_index: 0,
+                            record_set: None,
+                        }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::Produce(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                );
+            }
+            other => panic!("expected Produce, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_produce_no_record_set() {
+        let (handler, _, log_reader) = make_test_handler();
+        log_reader.add_topic("prd-topic-0", 70);
+        handler.refresh_partitions();
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::Produce(ProduceRequest {
+                    acks: 1,
+                    timeout_ms: 1000,
+                    topics: vec![ProduceTopicData {
+                        topic_name: WireString::from("prd-topic"),
+                        partitions: vec![ProducePartitionData {
+                            partition_index: 0,
+                            record_set: None,
+                        }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::Produce(r) => {
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::None.as_i16()
+                );
+                assert_eq!(r.topics[0].partitions[0].base_offset, 0);
+            }
+            other => panic!("expected Produce, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // OffsetCommit/Fetch with created group
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_offset_commit_known_group() {
+        let (handler, _, log_reader) = make_test_handler();
+        log_reader.add_topic("oc-topic-0", 80);
+        handler.refresh_partitions();
+
+        // Create group
+        let join_resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::JoinGroup(JoinGroupRequest {
+                    group_id: WireString::from("oc-group"),
+                    session_timeout_ms: 30000,
+                    rebalance_timeout_ms: 60000,
+                    member_id: WireString::empty(),
+                    protocol_type: WireString::from("consumer"),
+                    protocols: vec![JoinGroupProtocol {
+                        name: WireString::from("range"),
+                        metadata: Bytes::new(),
+                    }],
+                }),
+            )
+            .await;
+        let (mid, generation) = match join_resp {
+            KafkaResponse::JoinGroup(r) => (r.member_id, r.generation_id),
+            other => panic!("{other:?}"),
+        };
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::SyncGroup(SyncGroupRequest {
+                    group_id: WireString::from("oc-group"),
+                    generation_id: generation,
+                    member_id: mid.clone(),
+                    assignments: vec![SyncGroupAssignment {
+                        member_id: mid,
+                        assignment: Bytes::new(),
+                    }],
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::OffsetCommit(OffsetCommitRequest {
+                    group_id: WireString::from("oc-group"),
+                    generation_id: generation,
+                    member_id: WireString::empty(),
+                    topics: vec![OffsetCommitTopicData {
+                        topic_name: WireString::from("oc-topic"),
+                        partitions: vec![OffsetCommitPartitionData {
+                            partition_index: 0,
+                            offset: 42,
+                            metadata: None,
+                        }],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::OffsetCommit(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::None.as_i16()
+                );
+            }
+            other => panic!("expected OffsetCommit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_offset_fetch_known_group() {
+        let (handler, _, log_reader) = make_test_handler();
+        log_reader.add_topic("of-topic-0", 90);
+        handler.refresh_partitions();
+
+        // Create group
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::JoinGroup(JoinGroupRequest {
+                    group_id: WireString::from("of-group"),
+                    session_timeout_ms: 30000,
+                    rebalance_timeout_ms: 60000,
+                    member_id: WireString::empty(),
+                    protocol_type: WireString::from("consumer"),
+                    protocols: vec![JoinGroupProtocol {
+                        name: WireString::from("range"),
+                        metadata: Bytes::new(),
+                    }],
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::OffsetFetch(OffsetFetchRequest {
+                    group_id: WireString::from("of-group"),
+                    topics: vec![OffsetFetchTopicData {
+                        topic_name: WireString::from("of-topic"),
+                        partitions: vec![0],
+                    }],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::OffsetFetch(r) => {
+                assert_eq!(r.topics.len(), 1);
+                assert_eq!(
+                    r.topics[0].partitions[0].error_code,
+                    ErrorCode::None.as_i16()
+                );
+                // No committed offset yet, should be -1
+                assert_eq!(r.topics[0].partitions[0].offset, -1);
+            }
+            other => panic!("expected OffsetFetch, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // DeleteGroups success (empty group)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_delete_groups_success() {
+        let (handler, _, _) = make_test_handler();
+        // Create and then leave the group so it becomes empty
+        let join_resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::JoinGroup(JoinGroupRequest {
+                    group_id: WireString::from("dg-empty"),
+                    session_timeout_ms: 30000,
+                    rebalance_timeout_ms: 60000,
+                    member_id: WireString::empty(),
+                    protocol_type: WireString::from("consumer"),
+                    protocols: vec![JoinGroupProtocol {
+                        name: WireString::from("range"),
+                        metadata: Bytes::new(),
+                    }],
+                }),
+            )
+            .await;
+        let mid = match join_resp {
+            KafkaResponse::JoinGroup(r) => r.member_id,
+            other => panic!("{other:?}"),
+        };
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::LeaveGroup(LeaveGroupRequest {
+                    group_id: WireString::from("dg-empty"),
+                    member_id: mid,
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DeleteGroups(DeleteGroupsRequest {
+                    group_ids: vec![WireString::from("dg-empty")],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DeleteGroups(r) => {
+                assert_eq!(r.results.len(), 1);
+                assert_eq!(r.results[0].error_code, ErrorCode::None.as_i16());
+            }
+            other => panic!("expected DeleteGroups, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // DeleteGroups non-empty group
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_delete_groups_not_empty() {
+        let (handler, _, _) = make_test_handler();
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::JoinGroup(JoinGroupRequest {
+                    group_id: WireString::from("dg-active"),
+                    session_timeout_ms: 30000,
+                    rebalance_timeout_ms: 60000,
+                    member_id: WireString::empty(),
+                    protocol_type: WireString::from("consumer"),
+                    protocols: vec![JoinGroupProtocol {
+                        name: WireString::from("range"),
+                        metadata: Bytes::new(),
+                    }],
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::DeleteGroups(DeleteGroupsRequest {
+                    group_ids: vec![WireString::from("dg-active")],
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::DeleteGroups(r) => {
+                assert_eq!(r.results.len(), 1);
+                assert_eq!(r.results[0].error_code, ErrorCode::GroupNotEmpty.as_i16());
+            }
+            other => panic!("expected DeleteGroups, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // CreateTopics already exists
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handler_create_topics_already_exists() {
+        let (handler, _, _) = make_test_handler();
+        handler
+            .handle(
+                &default_header(),
+                KafkaRequest::CreateTopics(CreateTopicsRequest {
+                    topics: vec![CreateTopicRequest {
+                        name: WireString::from("dup-topic"),
+                        num_partitions: 1,
+                        replication_factor: 1,
+                    }],
+                    timeout_ms: 5000,
+                }),
+            )
+            .await;
+
+        let resp = handler
+            .handle(
+                &default_header(),
+                KafkaRequest::CreateTopics(CreateTopicsRequest {
+                    topics: vec![CreateTopicRequest {
+                        name: WireString::from("dup-topic"),
+                        num_partitions: 1,
+                        replication_factor: 1,
+                    }],
+                    timeout_ms: 5000,
+                }),
+            )
+            .await;
+
+        match resp {
+            KafkaResponse::CreateTopics(r) => {
+                assert_eq!(
+                    r.topics[0].error_code,
+                    ErrorCode::TopicAlreadyExists.as_i16()
+                );
+            }
+            other => panic!("expected CreateTopics, got {other:?}"),
         }
     }
 }

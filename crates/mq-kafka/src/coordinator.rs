@@ -669,4 +669,309 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.error_code, ErrorCode::InvalidGroupId.as_i16());
     }
+
+    #[test]
+    fn test_group_phase_as_str() {
+        assert_eq!(GroupPhase::Empty.as_str(), "Empty");
+        assert_eq!(
+            GroupPhase::PreparingRebalance.as_str(),
+            "PreparingRebalance"
+        );
+        assert_eq!(
+            GroupPhase::CompletingRebalance.as_str(),
+            "CompletingRebalance"
+        );
+        assert_eq!(GroupPhase::Stable.as_str(), "Stable");
+        assert_eq!(GroupPhase::Dead.as_str(), "Dead");
+    }
+
+    #[test]
+    fn test_list_groups_empty() {
+        let coord = GroupCoordinator::new();
+        assert!(coord.list_groups().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_groups_after_join() {
+        let mut coord = GroupCoordinator::new();
+        let _rx = coord.join_group(&make_join_req("g1", "", "range")).unwrap();
+
+        let groups = coord.list_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_id, "g1");
+        assert_eq!(groups[0].protocol_type, "consumer");
+    }
+
+    #[tokio::test]
+    async fn test_describe_group_after_join() {
+        let mut coord = GroupCoordinator::new();
+        let rx = coord
+            .join_group(&make_join_req("desc-g", "", "range"))
+            .unwrap();
+        let resp = rx.await.unwrap();
+
+        let desc = coord.describe_group("desc-g");
+        assert_eq!(desc.error_code, ErrorCode::None.as_i16());
+        assert_eq!(desc.group_id, "desc-g");
+        // After join completes, should be in CompletingRebalance
+        assert_eq!(desc.state.as_str(), "CompletingRebalance");
+        assert_eq!(desc.members.len(), 1);
+        assert_eq!(desc.members[0].member_id, resp.member_id);
+    }
+
+    #[tokio::test]
+    async fn test_remove_member() {
+        let mut coord = GroupCoordinator::new();
+        let rx = coord
+            .join_group(&make_join_req("rm-g", "", "range"))
+            .unwrap();
+        let resp = rx.await.unwrap();
+
+        coord.remove_member(resp.member_id.as_str());
+
+        // Group should be cleaned up after last member removed
+        assert!(coord.list_groups().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_remove_member_unknown() {
+        let mut coord = GroupCoordinator::new();
+        // Should be a no-op
+        coord.remove_member("nonexistent-member");
+        assert!(coord.list_groups().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_wrong_generation() {
+        let mut coord = GroupCoordinator::new();
+        let rx = coord
+            .join_group(&make_join_req("hb-gen", "", "range"))
+            .unwrap();
+        let resp = rx.await.unwrap();
+
+        let hb_resp = coord.heartbeat(&HeartbeatRequest {
+            group_id: WireString::from("hb-gen"),
+            generation_id: 999, // wrong generation
+            member_id: resp.member_id,
+        });
+        assert_eq!(hb_resp.error_code, ErrorCode::IllegalGeneration.as_i16());
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_unknown_member() {
+        let mut coord = GroupCoordinator::new();
+        let _rx = coord
+            .join_group(&make_join_req("hb-unk", "", "range"))
+            .unwrap();
+
+        let hb_resp = coord.heartbeat(&HeartbeatRequest {
+            group_id: WireString::from("hb-unk"),
+            generation_id: 1,
+            member_id: WireString::from("unknown-member"),
+        });
+        assert_eq!(hb_resp.error_code, ErrorCode::UnknownMemberId.as_i16());
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_success() {
+        let mut coord = GroupCoordinator::new();
+        let rx = coord
+            .join_group(&make_join_req("hb-ok", "", "range"))
+            .unwrap();
+        let resp = rx.await.unwrap();
+
+        // Sync to move to Stable
+        let sync_rx = coord
+            .sync_group(&SyncGroupRequest {
+                group_id: WireString::from("hb-ok"),
+                generation_id: resp.generation_id,
+                member_id: resp.member_id.clone(),
+                assignments: vec![SyncGroupAssignment {
+                    member_id: resp.member_id.clone(),
+                    assignment: Bytes::from_static(b"a"),
+                }],
+            })
+            .unwrap();
+        let _ = sync_rx.await.unwrap();
+
+        let hb_resp = coord.heartbeat(&HeartbeatRequest {
+            group_id: WireString::from("hb-ok"),
+            generation_id: resp.generation_id,
+            member_id: resp.member_id,
+        });
+        assert_eq!(hb_resp.error_code, ErrorCode::None.as_i16());
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_during_rebalance() {
+        let mut coord = GroupCoordinator::new();
+        let rx = coord
+            .join_group(&make_join_req("hb-reb", "", "range"))
+            .unwrap();
+        let resp = rx.await.unwrap();
+
+        // Sync to Stable
+        let sync_rx = coord
+            .sync_group(&SyncGroupRequest {
+                group_id: WireString::from("hb-reb"),
+                generation_id: resp.generation_id,
+                member_id: resp.member_id.clone(),
+                assignments: vec![SyncGroupAssignment {
+                    member_id: resp.member_id.clone(),
+                    assignment: Bytes::from_static(b"a"),
+                }],
+            })
+            .unwrap();
+        let _ = sync_rx.await.unwrap();
+
+        // Second member joins, triggering rebalance (phase → PreparingRebalance)
+        let _rx2 = coord
+            .join_group(&make_join_req("hb-reb", "", "range"))
+            .unwrap();
+
+        // Now heartbeat from first member during rebalance
+        let hb_resp = coord.heartbeat(&HeartbeatRequest {
+            group_id: WireString::from("hb-reb"),
+            generation_id: resp.generation_id,
+            member_id: resp.member_id,
+        });
+        assert_eq!(hb_resp.error_code, ErrorCode::RebalanceInProgress.as_i16());
+    }
+
+    #[tokio::test]
+    async fn test_sync_group_wrong_generation() {
+        let mut coord = GroupCoordinator::new();
+        let rx = coord
+            .join_group(&make_join_req("sg-gen", "", "range"))
+            .unwrap();
+        let resp = rx.await.unwrap();
+
+        let result = coord.sync_group(&SyncGroupRequest {
+            group_id: WireString::from("sg-gen"),
+            generation_id: 999,
+            member_id: resp.member_id,
+            assignments: vec![],
+        });
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.error_code, ErrorCode::IllegalGeneration.as_i16());
+    }
+
+    #[tokio::test]
+    async fn test_sync_group_unknown_member() {
+        let mut coord = GroupCoordinator::new();
+        let rx = coord
+            .join_group(&make_join_req("sg-unk", "", "range"))
+            .unwrap();
+        let resp = rx.await.unwrap();
+
+        let result = coord.sync_group(&SyncGroupRequest {
+            group_id: WireString::from("sg-unk"),
+            generation_id: resp.generation_id,
+            member_id: WireString::from("not-a-member"),
+            assignments: vec![],
+        });
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.error_code, ErrorCode::UnknownMemberId.as_i16());
+    }
+
+    #[test]
+    fn test_leave_group_nonexistent() {
+        let mut coord = GroupCoordinator::new();
+        let resp = coord.leave_group(&LeaveGroupRequest {
+            group_id: WireString::from("nonexistent"),
+            member_id: WireString::from("m1"),
+        });
+        assert_eq!(resp.error_code, ErrorCode::InvalidGroupId.as_i16());
+    }
+
+    #[tokio::test]
+    async fn test_expire_sessions_no_groups() {
+        let mut coord = GroupCoordinator::new();
+        let rebalanced = coord.expire_sessions();
+        assert!(rebalanced.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_expire_sessions_within_timeout() {
+        let mut coord = GroupCoordinator::new();
+        let rx = coord
+            .join_group(&make_join_req("exp-ok", "", "range"))
+            .unwrap();
+        let resp = rx.await.unwrap();
+
+        // Sync to Stable
+        let sync_rx = coord
+            .sync_group(&SyncGroupRequest {
+                group_id: WireString::from("exp-ok"),
+                generation_id: resp.generation_id,
+                member_id: resp.member_id.clone(),
+                assignments: vec![SyncGroupAssignment {
+                    member_id: resp.member_id.clone(),
+                    assignment: Bytes::new(),
+                }],
+            })
+            .unwrap();
+        let _ = sync_rx.await.unwrap();
+
+        // No time has passed, should not expire
+        let rebalanced = coord.expire_sessions();
+        assert!(rebalanced.is_empty());
+        assert!(!coord.list_groups().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_groups() {
+        let mut coord = GroupCoordinator::new();
+
+        let rx1 = coord.join_group(&make_join_req("g1", "", "range")).unwrap();
+        let _ = rx1.await.unwrap();
+
+        let rx2 = coord.join_group(&make_join_req("g2", "", "range")).unwrap();
+        let _ = rx2.await.unwrap();
+
+        let groups = coord.list_groups();
+        assert_eq!(groups.len(), 2);
+
+        let mut names: Vec<String> = groups
+            .iter()
+            .map(|g| g.group_id.as_str().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["g1", "g2"]);
+    }
+
+    #[tokio::test]
+    async fn test_rejoin_existing_member() {
+        let mut coord = GroupCoordinator::new();
+        let rx = coord
+            .join_group(&make_join_req("rejoin", "", "range"))
+            .unwrap();
+        let resp = rx.await.unwrap();
+        let mid = resp.member_id.clone();
+
+        // Sync to Stable
+        let sync_rx = coord
+            .sync_group(&SyncGroupRequest {
+                group_id: WireString::from("rejoin"),
+                generation_id: resp.generation_id,
+                member_id: mid.clone(),
+                assignments: vec![SyncGroupAssignment {
+                    member_id: mid.clone(),
+                    assignment: Bytes::new(),
+                }],
+            })
+            .unwrap();
+        let _ = sync_rx.await.unwrap();
+
+        // Rejoin with known member_id
+        let rx2 = coord
+            .join_group(&make_join_req("rejoin", &mid, "range"))
+            .unwrap();
+        let resp2 = rx2.await.unwrap();
+        assert_eq!(resp2.error_code, ErrorCode::None.as_i16());
+        assert_eq!(resp2.generation_id, 2);
+        assert_eq!(resp2.member_id, mid);
+    }
 }

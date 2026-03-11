@@ -217,4 +217,42 @@ mod tests {
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
         assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
     }
+
+    #[test]
+    fn test_custom_config() {
+        let config = KafkaServerConfig {
+            bind_addr: "127.0.0.1:19092".parse().unwrap(),
+            max_connections: 100,
+            read_buffer_size: 4096,
+        };
+        assert_eq!(config.bind_addr.port(), 19092);
+        assert_eq!(config.max_connections, 100);
+        assert_eq!(config.read_buffer_size, 4096);
+    }
+
+    #[test]
+    fn test_server_stats_all_counters() {
+        let stats = KafkaServerStats::new();
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 0);
+        stats.total_connections.fetch_add(5, Ordering::Relaxed);
+        stats.total_requests.fetch_add(100, Ordering::Relaxed);
+        assert_eq!(stats.total_connections.load(Ordering::Relaxed), 5);
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn test_server_stats_active_connection_lifecycle() {
+        let stats = KafkaServerStats::new();
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 2);
+        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_default_config_read_buffer_size() {
+        let config = KafkaServerConfig::default();
+        assert_eq!(config.read_buffer_size, 65536);
+    }
 }

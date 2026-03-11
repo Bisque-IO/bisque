@@ -1,3 +1,5 @@
+use std::io::Read as IoRead;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
@@ -407,6 +409,106 @@ fn record_body_size(record: &Record) -> usize {
 }
 
 // =============================================================================
+// Compression
+// =============================================================================
+
+/// Kafka compression types (lower 3 bits of record batch attributes).
+const COMPRESSION_NONE: i16 = 0;
+const COMPRESSION_GZIP: i16 = 1;
+const COMPRESSION_SNAPPY: i16 = 2;
+const COMPRESSION_LZ4: i16 = 3;
+const COMPRESSION_ZSTD: i16 = 4;
+
+/// Decompress record batch payload according to compression type.
+fn decompress_records(compression: i16, data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    // Pre-allocate output at 2x compressed size as a reasonable estimate
+    let estimated = data.len() * 2;
+
+    match compression {
+        COMPRESSION_GZIP => {
+            let mut decoder = flate2::read::GzDecoder::new(data);
+            let mut out = Vec::with_capacity(estimated);
+            decoder
+                .read_to_end(&mut out)
+                .map_err(|e| CodecError::InvalidRecordBatch(format!("gzip decompress: {e}")))?;
+            Ok(out)
+        }
+        COMPRESSION_SNAPPY => {
+            // Kafka uses Xerial Snappy framing: [magic:8][version:4][compat:4][chunks...]
+            // Each chunk: [compressed_len:4][compressed_data]
+            // Standard snappy raw block is also accepted (librdkafka sends raw).
+            if data.len() >= 16 && data[..8] == [0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00] {
+                // Xerial framing — decode directly into output buffer
+                let mut out = Vec::with_capacity(estimated);
+                let mut decoder = snap::raw::Decoder::new();
+                let mut pos = 16; // skip magic + version + compat
+                while pos < data.len() {
+                    if pos + 4 > data.len() {
+                        return Err(CodecError::InvalidRecordBatch(
+                            "snappy: truncated chunk header".into(),
+                        ));
+                    }
+                    let chunk_len = u32::from_be_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]) as usize;
+                    pos += 4;
+                    if pos + chunk_len > data.len() {
+                        return Err(CodecError::InvalidRecordBatch(
+                            "snappy: truncated chunk data".into(),
+                        ));
+                    }
+                    let chunk_data = &data[pos..pos + chunk_len];
+                    let decompressed_len = snap::raw::decompress_len(chunk_data).map_err(|e| {
+                        CodecError::InvalidRecordBatch(format!("snappy decompress: {e}"))
+                    })?;
+                    let prev_len = out.len();
+                    out.reserve(decompressed_len);
+                    // SAFETY: we reserved exactly decompressed_len bytes above
+                    unsafe {
+                        out.set_len(prev_len + decompressed_len);
+                    }
+                    decoder
+                        .decompress(chunk_data, &mut out[prev_len..])
+                        .map_err(|e| {
+                            CodecError::InvalidRecordBatch(format!("snappy decompress: {e}"))
+                        })?;
+                    pos += chunk_len;
+                }
+                Ok(out)
+            } else {
+                // Raw snappy (no framing) — decompress directly into pre-sized buffer
+                let decompressed_len = snap::raw::decompress_len(data).map_err(|e| {
+                    CodecError::InvalidRecordBatch(format!("snappy decompress: {e}"))
+                })?;
+                let mut out = vec![0u8; decompressed_len];
+                snap::raw::Decoder::new()
+                    .decompress(data, &mut out)
+                    .map_err(|e| {
+                        CodecError::InvalidRecordBatch(format!("snappy decompress: {e}"))
+                    })?;
+                Ok(out)
+            }
+        }
+        COMPRESSION_LZ4 => {
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
+            let mut out = Vec::with_capacity(estimated);
+            decoder
+                .read_to_end(&mut out)
+                .map_err(|e| CodecError::InvalidRecordBatch(format!("lz4 decompress: {e}")))?;
+            Ok(out)
+        }
+        COMPRESSION_ZSTD => zstd::stream::decode_all(data)
+            .map_err(|e| CodecError::InvalidRecordBatch(format!("zstd decompress: {e}"))),
+        other => Err(CodecError::InvalidRecordBatch(format!(
+            "unknown compression type: {other}"
+        ))),
+    }
+}
+
+// =============================================================================
 // RecordBatch Encode/Decode
 // =============================================================================
 
@@ -501,16 +603,19 @@ pub fn decode_record_batch(data: &[u8]) -> Result<RecordBatch, CodecError> {
     let record_count = read_i32(buf)?;
 
     let compression = attributes & 0x07;
-    if compression != 0 {
-        return Err(CodecError::InvalidRecordBatch(format!(
-            "compression type {} not yet supported",
-            compression
-        )));
-    }
-
     let mut records = Vec::with_capacity(record_count as usize);
-    for _ in 0..record_count {
-        records.push(decode_record(buf)?);
+
+    if compression != COMPRESSION_NONE {
+        // Decompress remaining bytes, then decode records from decompressed data
+        let decompressed = decompress_records(compression, buf)?;
+        let buf2 = &mut &decompressed[..];
+        for _ in 0..record_count {
+            records.push(decode_record(buf2)?);
+        }
+    } else {
+        for _ in 0..record_count {
+            records.push(decode_record(buf)?);
+        }
     }
 
     Ok(RecordBatch {
@@ -558,16 +663,20 @@ pub fn decode_record_batch_bytes(data: Bytes) -> Result<RecordBatch, CodecError>
     let record_count = cursor_read_i32(&mut cur)?;
 
     let compression = attributes & 0x07;
-    if compression != 0 {
-        return Err(CodecError::InvalidRecordBatch(format!(
-            "compression type {} not yet supported",
-            compression
-        )));
-    }
-
     let mut records = Vec::with_capacity(record_count as usize);
-    for _ in 0..record_count {
-        records.push(decode_record_cursor(&mut cur)?);
+
+    if compression != COMPRESSION_NONE {
+        // Decompress remaining bytes, then decode records from decompressed data
+        let remaining = cur.as_slice();
+        let decompressed = decompress_records(compression, remaining)?;
+        let buf2 = &mut &decompressed[..];
+        for _ in 0..record_count {
+            records.push(decode_record(buf2)?);
+        }
+    } else {
+        for _ in 0..record_count {
+            records.push(decode_record_cursor(&mut cur)?);
+        }
     }
 
     Ok(RecordBatch {
@@ -984,6 +1093,244 @@ pub fn decode_request_bytes(frame: Bytes) -> Result<(RequestHeader, KafkaRequest
         }
 
         ApiKey::ListGroups => KafkaRequest::ListGroups,
+
+        ApiKey::SaslHandshake => {
+            let mechanism = cursor_read_string(&mut cur)?;
+            KafkaRequest::SaslHandshake(SaslHandshakeRequest { mechanism })
+        }
+
+        ApiKey::SaslAuthenticate => {
+            let auth_bytes = cursor_read_bytes(&mut cur)?;
+            KafkaRequest::SaslAuthenticate(SaslAuthenticateRequest { auth_bytes })
+        }
+
+        ApiKey::DeleteRecords => {
+            let topic_count = cursor_read_array_len(&mut cur)?;
+            let mut topics = Vec::with_capacity(topic_count.max(0) as usize);
+            for _ in 0..topic_count {
+                let topic_name = cursor_read_string(&mut cur)?;
+                let part_count = cursor_read_array_len(&mut cur)?;
+                let mut partitions = Vec::with_capacity(part_count.max(0) as usize);
+                for _ in 0..part_count {
+                    let partition_index = cursor_read_i32(&mut cur)?;
+                    let offset = cursor_read_i64(&mut cur)?;
+                    partitions.push(DeleteRecordsPartitionData {
+                        partition_index,
+                        offset,
+                    });
+                }
+                topics.push(DeleteRecordsTopicData {
+                    topic_name,
+                    partitions,
+                });
+            }
+            let timeout_ms = cursor_read_i32(&mut cur)?;
+            KafkaRequest::DeleteRecords(DeleteRecordsRequest { topics, timeout_ms })
+        }
+
+        ApiKey::InitProducerId => {
+            let transactional_id = cursor_read_nullable_string(&mut cur)?;
+            let transaction_timeout_ms = cursor_read_i32(&mut cur)?;
+            KafkaRequest::InitProducerId(InitProducerIdRequest {
+                transactional_id,
+                transaction_timeout_ms,
+            })
+        }
+
+        ApiKey::AddPartitionsToTxn => {
+            let transactional_id = cursor_read_string(&mut cur)?;
+            let producer_id = cursor_read_i64(&mut cur)?;
+            let producer_epoch = cursor_read_i16(&mut cur)?;
+            let topic_count = cursor_read_array_len(&mut cur)?;
+            let mut topics = Vec::with_capacity(topic_count.max(0) as usize);
+            for _ in 0..topic_count {
+                let topic_name = cursor_read_string(&mut cur)?;
+                let part_count = cursor_read_array_len(&mut cur)?;
+                let mut partitions = Vec::with_capacity(part_count.max(0) as usize);
+                for _ in 0..part_count {
+                    partitions.push(cursor_read_i32(&mut cur)?);
+                }
+                topics.push(AddPartitionsToTxnTopicData {
+                    topic_name,
+                    partitions,
+                });
+            }
+            KafkaRequest::AddPartitionsToTxn(AddPartitionsToTxnRequest {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                topics,
+            })
+        }
+
+        ApiKey::AddOffsetsToTxn => {
+            let transactional_id = cursor_read_string(&mut cur)?;
+            let producer_id = cursor_read_i64(&mut cur)?;
+            let producer_epoch = cursor_read_i16(&mut cur)?;
+            let group_id = cursor_read_string(&mut cur)?;
+            KafkaRequest::AddOffsetsToTxn(AddOffsetsToTxnRequest {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                group_id,
+            })
+        }
+
+        ApiKey::EndTxn => {
+            let transactional_id = cursor_read_string(&mut cur)?;
+            let producer_id = cursor_read_i64(&mut cur)?;
+            let producer_epoch = cursor_read_i16(&mut cur)?;
+            let committed = cursor_read_i8(&mut cur)? != 0;
+            KafkaRequest::EndTxn(EndTxnRequest {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                committed,
+            })
+        }
+
+        ApiKey::TxnOffsetCommit => {
+            let transactional_id = cursor_read_string(&mut cur)?;
+            let group_id = cursor_read_string(&mut cur)?;
+            let producer_id = cursor_read_i64(&mut cur)?;
+            let producer_epoch = cursor_read_i16(&mut cur)?;
+            let topic_count = cursor_read_array_len(&mut cur)?;
+            let mut topics = Vec::with_capacity(topic_count.max(0) as usize);
+            for _ in 0..topic_count {
+                let topic_name = cursor_read_string(&mut cur)?;
+                let part_count = cursor_read_array_len(&mut cur)?;
+                let mut partitions = Vec::with_capacity(part_count.max(0) as usize);
+                for _ in 0..part_count {
+                    let partition_index = cursor_read_i32(&mut cur)?;
+                    let offset = cursor_read_i64(&mut cur)?;
+                    let metadata = cursor_read_nullable_string(&mut cur)?;
+                    partitions.push(TxnOffsetCommitPartitionData {
+                        partition_index,
+                        offset,
+                        metadata,
+                    });
+                }
+                topics.push(TxnOffsetCommitTopicData {
+                    topic_name,
+                    partitions,
+                });
+            }
+            KafkaRequest::TxnOffsetCommit(TxnOffsetCommitRequest {
+                transactional_id,
+                group_id,
+                producer_id,
+                producer_epoch,
+                topics,
+            })
+        }
+
+        ApiKey::DescribeConfigs => {
+            let count = cursor_read_array_len(&mut cur)?;
+            let mut resources = Vec::with_capacity(count.max(0) as usize);
+            for _ in 0..count {
+                let resource_type = cursor_read_i8(&mut cur)?;
+                let resource_name = cursor_read_string(&mut cur)?;
+                let name_count = cursor_read_array_len(&mut cur)?;
+                let config_names = if name_count < 0 {
+                    None
+                } else {
+                    let mut names = Vec::with_capacity(name_count as usize);
+                    for _ in 0..name_count {
+                        names.push(cursor_read_string(&mut cur)?);
+                    }
+                    Some(names)
+                };
+                resources.push(DescribeConfigsResource {
+                    resource_type,
+                    resource_name,
+                    config_names,
+                });
+            }
+            KafkaRequest::DescribeConfigs(DescribeConfigsRequest { resources })
+        }
+
+        ApiKey::AlterConfigs => {
+            let count = cursor_read_array_len(&mut cur)?;
+            let mut resources = Vec::with_capacity(count.max(0) as usize);
+            for _ in 0..count {
+                let resource_type = cursor_read_i8(&mut cur)?;
+                let resource_name = cursor_read_string(&mut cur)?;
+                let config_count = cursor_read_array_len(&mut cur)?;
+                let mut configs = Vec::with_capacity(config_count.max(0) as usize);
+                for _ in 0..config_count {
+                    let name = cursor_read_string(&mut cur)?;
+                    let value = cursor_read_nullable_string(&mut cur)?;
+                    configs.push(AlterConfigEntry { name, value });
+                }
+                resources.push(AlterConfigsResource {
+                    resource_type,
+                    resource_name,
+                    configs,
+                });
+            }
+            let validate_only = cursor_read_i8(&mut cur)? != 0;
+            KafkaRequest::AlterConfigs(AlterConfigsRequest {
+                resources,
+                validate_only,
+            })
+        }
+
+        ApiKey::CreatePartitions => {
+            let count = cursor_read_array_len(&mut cur)?;
+            let mut topics = Vec::with_capacity(count.max(0) as usize);
+            for _ in 0..count {
+                let name = cursor_read_string(&mut cur)?;
+                let new_count = cursor_read_i32(&mut cur)?;
+                // Skip assignments array (nullable)
+                let assign_count = cursor_read_array_len(&mut cur)?;
+                for _ in 0..assign_count.max(0) {
+                    let inner = cursor_read_array_len(&mut cur)?;
+                    for _ in 0..inner.max(0) {
+                        let _broker = cursor_read_i32(&mut cur)?;
+                    }
+                }
+                topics.push(CreatePartitionsTopic {
+                    name,
+                    count: new_count,
+                });
+            }
+            let timeout_ms = cursor_read_i32(&mut cur)?;
+            let validate_only = cursor_read_i8(&mut cur)? != 0;
+            KafkaRequest::CreatePartitions(CreatePartitionsRequest {
+                topics,
+                timeout_ms,
+                validate_only,
+            })
+        }
+
+        ApiKey::DeleteGroups => {
+            let count = cursor_read_array_len(&mut cur)?;
+            let mut group_ids = Vec::with_capacity(count.max(0) as usize);
+            for _ in 0..count {
+                group_ids.push(cursor_read_string(&mut cur)?);
+            }
+            KafkaRequest::DeleteGroups(DeleteGroupsRequest { group_ids })
+        }
+
+        ApiKey::OffsetDelete => {
+            let group_id = cursor_read_string(&mut cur)?;
+            let topic_count = cursor_read_array_len(&mut cur)?;
+            let mut topics = Vec::with_capacity(topic_count.max(0) as usize);
+            for _ in 0..topic_count {
+                let topic_name = cursor_read_string(&mut cur)?;
+                let part_count = cursor_read_array_len(&mut cur)?;
+                let mut partitions = Vec::with_capacity(part_count.max(0) as usize);
+                for _ in 0..part_count {
+                    let partition_index = cursor_read_i32(&mut cur)?;
+                    partitions.push(OffsetDeletePartitionData { partition_index });
+                }
+                topics.push(OffsetDeleteTopicData {
+                    topic_name,
+                    partitions,
+                });
+            }
+            KafkaRequest::OffsetDelete(OffsetDeleteRequest { group_id, topics })
+        }
     };
 
     Ok((header, request))
@@ -1198,6 +1545,129 @@ pub fn encode_response(correlation_id: i32, response: &KafkaResponse, buf: &mut 
             for g in &r.groups {
                 write_string(buf, g.group_id.as_bytes());
                 write_string(buf, g.protocol_type.as_bytes());
+            }
+        }
+
+        KafkaResponse::SaslHandshake(r) => {
+            write_i16(buf, r.error_code);
+            write_i32(buf, r.mechanisms.len() as i32);
+            for m in &r.mechanisms {
+                write_string(buf, m.as_bytes());
+            }
+        }
+
+        KafkaResponse::SaslAuthenticate(r) => {
+            write_i16(buf, r.error_code);
+            write_nullable_string(buf, &r.error_message);
+            write_bytes(buf, &r.auth_bytes);
+        }
+
+        KafkaResponse::DeleteRecords(r) => {
+            write_i32(buf, r.topics.len() as i32);
+            for t in &r.topics {
+                write_string(buf, t.topic_name.as_bytes());
+                write_i32(buf, t.partitions.len() as i32);
+                for p in &t.partitions {
+                    write_i32(buf, p.partition_index);
+                    write_i64(buf, p.low_watermark);
+                    write_i16(buf, p.error_code);
+                }
+            }
+        }
+
+        KafkaResponse::InitProducerId(r) => {
+            write_i16(buf, r.error_code);
+            write_i64(buf, r.producer_id);
+            write_i16(buf, r.producer_epoch);
+        }
+
+        KafkaResponse::AddPartitionsToTxn(r) => {
+            write_i32(buf, r.topics.len() as i32);
+            for t in &r.topics {
+                write_string(buf, t.topic_name.as_bytes());
+                write_i32(buf, t.partitions.len() as i32);
+                for p in &t.partitions {
+                    write_i32(buf, p.partition_index);
+                    write_i16(buf, p.error_code);
+                }
+            }
+        }
+
+        KafkaResponse::AddOffsetsToTxn(r) => {
+            write_i16(buf, r.error_code);
+        }
+
+        KafkaResponse::EndTxn(r) => {
+            write_i16(buf, r.error_code);
+        }
+
+        KafkaResponse::TxnOffsetCommit(r) => {
+            write_i32(buf, r.topics.len() as i32);
+            for t in &r.topics {
+                write_string(buf, t.topic_name.as_bytes());
+                write_i32(buf, t.partitions.len() as i32);
+                for p in &t.partitions {
+                    write_i32(buf, p.partition_index);
+                    write_i16(buf, p.error_code);
+                }
+            }
+        }
+
+        KafkaResponse::DescribeConfigs(r) => {
+            write_i32(buf, r.resources.len() as i32);
+            for res in &r.resources {
+                write_i16(buf, res.error_code);
+                write_nullable_string(buf, &res.error_message);
+                write_i8(buf, res.resource_type);
+                write_string(buf, res.resource_name.as_bytes());
+                write_i32(buf, res.configs.len() as i32);
+                for c in &res.configs {
+                    write_string(buf, c.name.as_bytes());
+                    write_nullable_string(buf, &c.value);
+                    buf.put_u8(c.read_only as u8);
+                    buf.put_u8(c.is_default as u8);
+                    buf.put_u8(c.is_sensitive as u8);
+                }
+            }
+        }
+
+        KafkaResponse::AlterConfigs(r) => {
+            write_i32(buf, r.resources.len() as i32);
+            for res in &r.resources {
+                write_i16(buf, res.error_code);
+                write_nullable_string(buf, &res.error_message);
+                write_i8(buf, res.resource_type);
+                write_string(buf, res.resource_name.as_bytes());
+            }
+        }
+
+        KafkaResponse::CreatePartitions(r) => {
+            write_i32(buf, r.topics.len() as i32);
+            for t in &r.topics {
+                write_string(buf, t.name.as_bytes());
+                write_i16(buf, t.error_code);
+                write_nullable_string(buf, &t.error_message);
+            }
+        }
+
+        KafkaResponse::DeleteGroups(r) => {
+            write_i32(buf, r.results.len() as i32);
+            for g in &r.results {
+                write_string(buf, g.group_id.as_bytes());
+                write_i16(buf, g.error_code);
+            }
+        }
+
+        KafkaResponse::OffsetDelete(r) => {
+            write_i16(buf, r.error_code);
+            write_i32(buf, r.topics.len() as i32);
+            for t in &r.topics {
+                write_string(buf, t.topic_name.as_bytes());
+                write_i32(buf, t.partitions.len() as i32);
+                for p in &t.partitions {
+                    write_i32(buf, p.partition_index);
+                    write_i16(buf, p.error_code);
+                }
             }
         }
     }
@@ -1502,8 +1972,8 @@ mod tests {
                     error_code: 0,
                     partition_index: 0,
                     leader: 1,
-                    replicas: vec![1],
-                    isr: vec![1],
+                    replicas: smallvec::smallvec![1],
+                    isr: smallvec::smallvec![1],
                 }],
             }],
         });
@@ -1550,5 +2020,1248 @@ mod tests {
         assert_eq!(decoded.key, Some(Bytes::from_static(b"k")));
         assert_eq!(decoded.value, Some(Bytes::from_static(b"v")));
         assert_eq!(decoded.headers.len(), 1);
+    }
+
+    // =========================================================================
+    // peek_frame_size tests
+    // =========================================================================
+
+    #[test]
+    fn test_peek_frame_size_valid() {
+        let data = 100i32.to_be_bytes();
+        let size = peek_frame_size(&data).unwrap();
+        assert_eq!(size, 104); // 4 + 100
+    }
+
+    #[test]
+    fn test_peek_frame_size_incomplete() {
+        assert!(matches!(
+            peek_frame_size(&[0, 0]),
+            Err(CodecError::Incomplete)
+        ));
+        assert!(matches!(peek_frame_size(&[]), Err(CodecError::Incomplete)));
+        assert!(matches!(
+            peek_frame_size(&[0, 0, 0]),
+            Err(CodecError::Incomplete)
+        ));
+    }
+
+    #[test]
+    fn test_peek_frame_size_too_large() {
+        // MAX_FRAME_SIZE is 100MB = 104857600
+        let huge = (MAX_FRAME_SIZE as i32 + 1).to_be_bytes();
+        assert!(matches!(
+            peek_frame_size(&huge),
+            Err(CodecError::FrameTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn test_peek_frame_size_zero() {
+        let data = 0i32.to_be_bytes();
+        let size = peek_frame_size(&data).unwrap();
+        assert_eq!(size, 4); // 4 + 0
+    }
+
+    // =========================================================================
+    // decode_request_bytes tests
+    // =========================================================================
+
+    #[test]
+    fn test_decode_request_bytes_api_versions() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 18); // ApiVersions
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 42);
+        write_i16(&mut payload, -1); // null client_id
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (header, req) = decode_request_bytes(frame.freeze()).unwrap();
+        assert_eq!(header.correlation_id, 42);
+        assert!(matches!(req, KafkaRequest::ApiVersions));
+    }
+
+    #[test]
+    fn test_decode_request_bytes_unsupported_api_key() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 999); // invalid api key
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 1);
+        write_i16(&mut payload, -1);
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let result = decode_request_bytes(frame.freeze());
+        assert!(matches!(result, Err(CodecError::UnsupportedApiKey(999))));
+    }
+
+    #[test]
+    fn test_decode_request_bytes_truncated() {
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, 2); // claims 2 bytes of payload
+        write_i16(&mut frame, 18); // only api_key, missing rest
+
+        let result = decode_request_bytes(frame.freeze());
+        assert!(matches!(result, Err(CodecError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn test_decode_request_bytes_fetch() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 1); // Fetch
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 10);
+        write_i16(&mut payload, -1); // null client_id
+        write_i32(&mut payload, -1); // replica_id
+        write_i32(&mut payload, 500); // max_wait_ms
+        write_i32(&mut payload, 1); // min_bytes
+        write_i32(&mut payload, 0); // topic count
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (header, req) = decode_request_bytes(frame.freeze()).unwrap();
+        assert_eq!(header.correlation_id, 10);
+        match req {
+            KafkaRequest::Fetch(f) => {
+                assert_eq!(f.max_wait_ms, 500);
+                assert_eq!(f.min_bytes, 1);
+                assert!(f.topics.is_empty());
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn test_decode_request_bytes_heartbeat() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 12); // Heartbeat
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 5);
+        write_i16(&mut payload, -1);
+        write_string(&mut payload, b"my-group");
+        write_i32(&mut payload, 3); // generation_id
+        write_string(&mut payload, b"member-1");
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (_, req) = decode_request_bytes(frame.freeze()).unwrap();
+        match req {
+            KafkaRequest::Heartbeat(h) => {
+                assert_eq!(h.group_id.as_str(), "my-group");
+                assert_eq!(h.generation_id, 3);
+                assert_eq!(h.member_id.as_str(), "member-1");
+            }
+            _ => panic!("expected Heartbeat"),
+        }
+    }
+
+    #[test]
+    fn test_decode_request_bytes_find_coordinator() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 10); // FindCoordinator
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 8);
+        write_i16(&mut payload, -1);
+        write_string(&mut payload, b"my-group");
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (_, req) = decode_request_bytes(frame.freeze()).unwrap();
+        match req {
+            KafkaRequest::FindCoordinator(f) => {
+                assert_eq!(f.key.as_str(), "my-group");
+            }
+            _ => panic!("expected FindCoordinator"),
+        }
+    }
+
+    #[test]
+    fn test_decode_request_bytes_sasl_handshake() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 17); // SaslHandshake
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 1);
+        write_i16(&mut payload, -1);
+        write_string(&mut payload, b"PLAIN");
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (_, req) = decode_request_bytes(frame.freeze()).unwrap();
+        match req {
+            KafkaRequest::SaslHandshake(s) => {
+                assert_eq!(s.mechanism.as_str(), "PLAIN");
+            }
+            _ => panic!("expected SaslHandshake"),
+        }
+    }
+
+    #[test]
+    fn test_decode_request_bytes_init_producer_id() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 22); // InitProducerId
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 1);
+        write_i16(&mut payload, -1); // null client_id
+        write_i16(&mut payload, -1); // null transactional_id
+        write_i32(&mut payload, 5000); // txn timeout
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (_, req) = decode_request_bytes(frame.freeze()).unwrap();
+        match req {
+            KafkaRequest::InitProducerId(r) => {
+                assert!(r.transactional_id.is_none());
+                assert_eq!(r.transaction_timeout_ms, 5000);
+            }
+            _ => panic!("expected InitProducerId"),
+        }
+    }
+
+    // =========================================================================
+    // Response encode tests for various response types
+    // =========================================================================
+
+    #[test]
+    fn test_encode_heartbeat_response() {
+        let resp = KafkaResponse::Heartbeat(HeartbeatResponse { error_code: 0 });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        // frame_len(4) + correlation_id(4) + error_code(2) = 10
+        assert_eq!(buf.len(), 10);
+    }
+
+    #[test]
+    fn test_encode_find_coordinator_response() {
+        let resp = KafkaResponse::FindCoordinator(FindCoordinatorResponse {
+            error_code: 0,
+            node_id: 1,
+            host: WireString::from("localhost"),
+            port: 9092,
+        });
+        let mut buf = BytesMut::new();
+        encode_response(2, &resp, &mut buf);
+        assert!(buf.len() > 8);
+        let cid = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        assert_eq!(cid, 2);
+    }
+
+    #[test]
+    fn test_encode_produce_response() {
+        let resp = KafkaResponse::Produce(ProduceResponse {
+            topics: vec![ProduceTopicResponse {
+                topic_name: WireString::from("t"),
+                partitions: vec![ProducePartitionResponse {
+                    partition_index: 0,
+                    error_code: 0,
+                    base_offset: 42,
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(3, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_fetch_response() {
+        let resp = KafkaResponse::Fetch(FetchResponse {
+            topics: vec![FetchTopicResponse {
+                topic_name: WireString::from("t"),
+                partitions: vec![FetchPartitionResponse {
+                    partition_index: 0,
+                    error_code: 0,
+                    high_watermark: 10,
+                    record_set: Bytes::new(),
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(4, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_list_offsets_response() {
+        let resp = KafkaResponse::ListOffsets(ListOffsetsResponse {
+            topics: vec![ListOffsetsTopicResponse {
+                topic_name: WireString::from("t"),
+                partitions: vec![ListOffsetsPartitionResponse {
+                    partition_index: 0,
+                    error_code: 0,
+                    timestamp: 1000,
+                    offset: 5,
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(5, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_join_group_response() {
+        let resp = KafkaResponse::JoinGroup(JoinGroupResponse {
+            error_code: 0,
+            generation_id: 1,
+            protocol_name: WireString::from("range"),
+            leader: WireString::from("leader-1"),
+            member_id: WireString::from("member-1"),
+            members: vec![JoinGroupMember {
+                member_id: WireString::from("member-1"),
+                metadata: Bytes::from_static(b"meta"),
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(6, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_sync_group_response() {
+        let resp = KafkaResponse::SyncGroup(SyncGroupResponse {
+            error_code: 0,
+            assignment: Bytes::from_static(b"assignment-data"),
+        });
+        let mut buf = BytesMut::new();
+        encode_response(7, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_leave_group_response() {
+        let resp = KafkaResponse::LeaveGroup(LeaveGroupResponse { error_code: 0 });
+        let mut buf = BytesMut::new();
+        encode_response(8, &resp, &mut buf);
+        assert_eq!(buf.len(), 10); // frame_len(4) + cid(4) + error(2)
+    }
+
+    #[test]
+    fn test_encode_create_topics_response() {
+        let resp = KafkaResponse::CreateTopics(CreateTopicsResponse {
+            topics: vec![CreateTopicResponse {
+                name: WireString::from("new-topic"),
+                error_code: 0,
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(9, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_delete_topics_response() {
+        let resp = KafkaResponse::DeleteTopics(DeleteTopicsResponse {
+            topics: vec![DeleteTopicResponse {
+                name: WireString::from("del-topic"),
+                error_code: 0,
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(10, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_list_groups_response() {
+        let resp = KafkaResponse::ListGroups(ListGroupsResponse {
+            error_code: 0,
+            groups: vec![ListedGroup {
+                group_id: WireString::from("g1"),
+                protocol_type: WireString::from("consumer"),
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(11, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_describe_groups_response() {
+        let resp = KafkaResponse::DescribeGroups(DescribeGroupsResponse {
+            groups: vec![DescribedGroup {
+                error_code: 0,
+                group_id: WireString::from("g1"),
+                state: WireString::from_static("Stable"),
+                protocol_type: WireString::from("consumer"),
+                protocol: WireString::from("range"),
+                members: vec![],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(12, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_sasl_handshake_response() {
+        let resp = KafkaResponse::SaslHandshake(SaslHandshakeResponse {
+            error_code: 0,
+            mechanisms: vec![WireString::from_static("PLAIN")],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(13, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_sasl_authenticate_response() {
+        let resp = KafkaResponse::SaslAuthenticate(SaslAuthenticateResponse {
+            error_code: 0,
+            error_message: None,
+            auth_bytes: Bytes::new(),
+        });
+        let mut buf = BytesMut::new();
+        encode_response(14, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    #[test]
+    fn test_encode_init_producer_id_response() {
+        let resp = KafkaResponse::InitProducerId(InitProducerIdResponse {
+            error_code: 0,
+            producer_id: 42,
+            producer_epoch: 0,
+        });
+        let mut buf = BytesMut::new();
+        encode_response(15, &resp, &mut buf);
+        // frame(4) + cid(4) + error(2) + pid(8) + epoch(2) = 20
+        assert_eq!(buf.len(), 20);
+    }
+
+    #[test]
+    fn test_encode_end_txn_response() {
+        let resp = KafkaResponse::EndTxn(EndTxnResponse { error_code: 0 });
+        let mut buf = BytesMut::new();
+        encode_response(16, &resp, &mut buf);
+        assert_eq!(buf.len(), 10);
+    }
+
+    #[test]
+    fn test_encode_delete_groups_response() {
+        let resp = KafkaResponse::DeleteGroups(DeleteGroupsResponse {
+            results: vec![DeleteGroupResult {
+                group_id: WireString::from("g1"),
+                error_code: 0,
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(17, &resp, &mut buf);
+        assert!(buf.len() > 8);
+    }
+
+    // =========================================================================
+    // Varint/Varlong edge cases with cursor-based decode
+    // =========================================================================
+
+    #[test]
+    fn test_cursor_varint_boundary_values() {
+        for val in [
+            0i32,
+            1,
+            -1,
+            63,
+            -64,
+            64,
+            -65,
+            8191,
+            -8192,
+            i32::MAX,
+            i32::MIN,
+        ] {
+            let mut buf = BytesMut::new();
+            write_varint(&mut buf, val);
+            let frame = buf.freeze();
+            let mut cur = BytesCursor::new(frame);
+            let decoded = cursor_read_varint(&mut cur).unwrap();
+            assert_eq!(val, decoded, "cursor varint failed for {val}");
+        }
+    }
+
+    #[test]
+    fn test_cursor_varlong_boundary_values() {
+        for val in [0i64, 1, -1, 127, -128, i64::MAX, i64::MIN, 100_000_000] {
+            let mut buf = BytesMut::new();
+            write_varlong(&mut buf, val);
+            let frame = buf.freeze();
+            let mut cur = BytesCursor::new(frame);
+            let decoded = cursor_read_varlong(&mut cur).unwrap();
+            assert_eq!(val, decoded, "cursor varlong failed for {val}");
+        }
+    }
+
+    #[test]
+    fn test_cursor_varint_empty_input() {
+        let frame = Bytes::new();
+        let mut cur = BytesCursor::new(frame);
+        let result = cursor_read_varint(&mut cur);
+        assert!(matches!(result, Err(CodecError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn test_cursor_read_nullable_string_valid() {
+        let mut buf = BytesMut::new();
+        write_string(&mut buf, b"hello");
+        let frame = buf.freeze();
+        let mut cur = BytesCursor::new(frame);
+        let s = cursor_read_nullable_string(&mut cur).unwrap();
+        assert_eq!(s.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_cursor_read_nullable_string_null() {
+        let mut buf = BytesMut::new();
+        write_i16(&mut buf, -1); // null marker
+        let frame = buf.freeze();
+        let mut cur = BytesCursor::new(frame);
+        let s = cursor_read_nullable_string(&mut cur).unwrap();
+        assert!(s.is_none());
+    }
+
+    #[test]
+    fn test_cursor_read_nullable_bytes_null() {
+        let mut buf = BytesMut::new();
+        write_i32(&mut buf, -1); // null marker
+        let frame = buf.freeze();
+        let mut cur = BytesCursor::new(frame);
+        let b = cursor_read_nullable_bytes(&mut cur).unwrap();
+        assert!(b.is_none());
+    }
+
+    #[test]
+    fn test_cursor_read_nullable_bytes_valid() {
+        let mut buf = BytesMut::new();
+        write_bytes(&mut buf, b"data");
+        let frame = buf.freeze();
+        let mut cur = BytesCursor::new(frame);
+        let b = cursor_read_nullable_bytes(&mut cur).unwrap();
+        assert_eq!(b.as_deref(), Some(b"data".as_ref()));
+    }
+
+    #[test]
+    fn test_cursor_read_varint_bytes_null() {
+        let mut buf = BytesMut::new();
+        write_varint(&mut buf, -1);
+        let frame = buf.freeze();
+        let mut cur = BytesCursor::new(frame);
+        let b = cursor_read_varint_bytes(&mut cur).unwrap();
+        assert!(b.is_none());
+    }
+
+    #[test]
+    fn test_cursor_read_varint_bytes_valid() {
+        let mut buf = BytesMut::new();
+        write_varint(&mut buf, 3);
+        buf.extend_from_slice(b"abc");
+        let frame = buf.freeze();
+        let mut cur = BytesCursor::new(frame);
+        let b = cursor_read_varint_bytes(&mut cur).unwrap();
+        assert_eq!(b.as_deref(), Some(b"abc".as_ref()));
+    }
+
+    #[test]
+    fn test_cursor_read_varint_bytes_raw_valid() {
+        let mut buf = BytesMut::new();
+        write_varint(&mut buf, 5);
+        buf.extend_from_slice(b"hello");
+        let frame = buf.freeze();
+        let mut cur = BytesCursor::new(frame);
+        let b = cursor_read_varint_bytes_raw(&mut cur).unwrap();
+        assert_eq!(&b[..], b"hello");
+    }
+
+    #[test]
+    fn test_cursor_read_varint_bytes_raw_negative_len() {
+        let mut buf = BytesMut::new();
+        write_varint(&mut buf, -1);
+        let frame = buf.freeze();
+        let mut cur = BytesCursor::new(frame);
+        let result = cursor_read_varint_bytes_raw(&mut cur);
+        assert!(matches!(result, Err(CodecError::UnexpectedEof)));
+    }
+
+    // =========================================================================
+    // Record batch with multiple records
+    // =========================================================================
+
+    #[test]
+    fn test_record_batch_roundtrip_no_records() {
+        let batch = RecordBatch {
+            base_offset: 0,
+            partition_leader_epoch: 0,
+            attributes: 0,
+            last_offset_delta: 0,
+            first_timestamp: 0,
+            max_timestamp: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            records: vec![],
+        };
+
+        let mut buf = BytesMut::new();
+        encode_record_batch(&batch, &mut buf);
+        let data = buf.freeze();
+        let decoded = decode_record_batch_bytes(data).unwrap();
+        assert!(decoded.records.is_empty());
+    }
+
+    #[test]
+    fn test_record_batch_roundtrip_null_key_value() {
+        let batch = RecordBatch {
+            base_offset: 0,
+            partition_leader_epoch: 0,
+            attributes: 0,
+            last_offset_delta: 0,
+            first_timestamp: 0,
+            max_timestamp: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            records: vec![Record {
+                offset_delta: 0,
+                timestamp_delta: 0,
+                key: None,
+                value: None,
+                headers: vec![],
+            }],
+        };
+
+        let mut buf = BytesMut::new();
+        encode_record_batch(&batch, &mut buf);
+        let data = buf.freeze();
+        let decoded = decode_record_batch_bytes(data).unwrap();
+        assert_eq!(decoded.records.len(), 1);
+        assert!(decoded.records[0].key.is_none());
+        assert!(decoded.records[0].value.is_none());
+    }
+
+    #[test]
+    fn test_record_batch_roundtrip_with_headers() {
+        let batch = RecordBatch {
+            base_offset: 0,
+            partition_leader_epoch: 0,
+            attributes: 0,
+            last_offset_delta: 0,
+            first_timestamp: 0,
+            max_timestamp: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            records: vec![Record {
+                offset_delta: 0,
+                timestamp_delta: 0,
+                key: None,
+                value: Some(Bytes::from_static(b"val")),
+                headers: vec![
+                    RecordHeader {
+                        key: Bytes::from_static(b"h1"),
+                        value: Bytes::from_static(b"v1"),
+                    },
+                    RecordHeader {
+                        key: Bytes::from_static(b"h2"),
+                        value: Bytes::from_static(b"v2"),
+                    },
+                ],
+            }],
+        };
+
+        let mut buf = BytesMut::new();
+        encode_record_batch(&batch, &mut buf);
+        let data = buf.freeze();
+        let decoded = decode_record_batch_bytes(data).unwrap();
+        assert_eq!(decoded.records[0].headers.len(), 2);
+        assert_eq!(&decoded.records[0].headers[0].key[..], b"h1");
+        assert_eq!(&decoded.records[0].headers[1].key[..], b"h2");
+    }
+
+    #[test]
+    fn test_record_encode_decode_roundtrip() {
+        let record = Record {
+            offset_delta: 5,
+            timestamp_delta: 100,
+            key: Some(Bytes::from_static(b"mykey")),
+            value: Some(Bytes::from_static(b"myvalue")),
+            headers: vec![RecordHeader {
+                key: Bytes::from_static(b"hdr"),
+                value: Bytes::from_static(b"val"),
+            }],
+        };
+
+        let mut buf = BytesMut::new();
+        encode_record(&mut buf, &record);
+
+        let mut slice: &[u8] = &buf;
+        let decoded = decode_record(&mut slice).unwrap();
+        assert_eq!(decoded.offset_delta, 5);
+        assert_eq!(decoded.timestamp_delta, 100);
+        assert_eq!(decoded.key.as_deref(), Some(b"mykey".as_ref()));
+        assert_eq!(decoded.value.as_deref(), Some(b"myvalue".as_ref()));
+        assert_eq!(decoded.headers.len(), 1);
+    }
+
+    // =========================================================================
+    // CodecError display
+    // =========================================================================
+
+    #[test]
+    fn test_codec_error_display() {
+        assert_eq!(
+            format!("{}", CodecError::Incomplete),
+            "incomplete frame: need more data"
+        );
+        assert_eq!(
+            format!("{}", CodecError::UnsupportedApiKey(99)),
+            "unsupported API key: 99"
+        );
+        assert_eq!(
+            format!("{}", CodecError::FrameTooLarge(999)),
+            "frame too large: 999 bytes"
+        );
+        assert_eq!(
+            format!("{}", CodecError::InvalidUtf8),
+            "invalid utf-8 in string"
+        );
+        assert_eq!(
+            format!("{}", CodecError::UnexpectedEof),
+            "unexpected end of frame"
+        );
+    }
+
+    // =========================================================================
+    // Decode all request types via decode_request_bytes
+    // =========================================================================
+
+    #[test]
+    fn test_decode_list_offsets_request() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 2); // ListOffsets
+        write_i16(&mut payload, 1); // version 1 (no max_num_offsets field)
+        write_i32(&mut payload, 1);
+        write_i16(&mut payload, -1);
+        write_i32(&mut payload, -1); // replica_id
+        write_i32(&mut payload, 1); // topic count
+        write_string(&mut payload, b"topic-a");
+        write_i32(&mut payload, 1); // partition count
+        write_i32(&mut payload, 0); // partition_index
+        write_i64(&mut payload, -1); // timestamp (latest)
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (_, req) = decode_request_bytes(frame.freeze()).unwrap();
+        match req {
+            KafkaRequest::ListOffsets(lo) => {
+                assert_eq!(lo.topics.len(), 1);
+                assert_eq!(lo.topics[0].topic_name.as_str(), "topic-a");
+                assert_eq!(lo.topics[0].partitions[0].timestamp, -1);
+            }
+            _ => panic!("expected ListOffsets"),
+        }
+    }
+
+    #[test]
+    fn test_decode_leave_group_request() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 13); // LeaveGroup
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 1);
+        write_i16(&mut payload, -1);
+        write_string(&mut payload, b"my-group");
+        write_string(&mut payload, b"member-1");
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (_, req) = decode_request_bytes(frame.freeze()).unwrap();
+        match req {
+            KafkaRequest::LeaveGroup(l) => {
+                assert_eq!(l.group_id.as_str(), "my-group");
+                assert_eq!(l.member_id.as_str(), "member-1");
+            }
+            _ => panic!("expected LeaveGroup"),
+        }
+    }
+
+    #[test]
+    fn test_decode_describe_groups_request() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 15); // DescribeGroups
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 1);
+        write_i16(&mut payload, -1);
+        write_i32(&mut payload, 2); // 2 groups
+        write_string(&mut payload, b"g1");
+        write_string(&mut payload, b"g2");
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (_, req) = decode_request_bytes(frame.freeze()).unwrap();
+        match req {
+            KafkaRequest::DescribeGroups(d) => {
+                assert_eq!(d.group_ids.len(), 2);
+                assert_eq!(d.group_ids[0].as_str(), "g1");
+                assert_eq!(d.group_ids[1].as_str(), "g2");
+            }
+            _ => panic!("expected DescribeGroups"),
+        }
+    }
+
+    #[test]
+    fn test_decode_list_groups_request() {
+        let mut payload = BytesMut::new();
+        write_i16(&mut payload, 16); // ListGroups
+        write_i16(&mut payload, 0);
+        write_i32(&mut payload, 1);
+        write_i16(&mut payload, -1);
+
+        let mut frame = BytesMut::new();
+        write_i32(&mut frame, payload.len() as i32);
+        frame.extend_from_slice(&payload);
+
+        let (_, req) = decode_request_bytes(frame.freeze()).unwrap();
+        assert!(matches!(req, KafkaRequest::ListGroups));
+    }
+
+    // =========================================================================
+    // Response encode tests for remaining types
+    // =========================================================================
+
+    #[test]
+    fn test_encode_offset_commit_response() {
+        let resp = KafkaResponse::OffsetCommit(OffsetCommitResponse {
+            topics: vec![OffsetCommitTopicResponse {
+                topic_name: WireString::from("t1"),
+                partitions: vec![OffsetCommitPartitionResponse {
+                    partition_index: 0,
+                    error_code: 0,
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_offset_fetch_response() {
+        let resp = KafkaResponse::OffsetFetch(OffsetFetchResponse {
+            topics: vec![OffsetFetchTopicResponse {
+                topic_name: WireString::from("t1"),
+                partitions: vec![OffsetFetchPartitionResponse {
+                    partition_index: 0,
+                    offset: 42,
+                    metadata: Some(WireString::from("meta")),
+                    error_code: 0,
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_offset_fetch_response_null_metadata() {
+        let resp = KafkaResponse::OffsetFetch(OffsetFetchResponse {
+            topics: vec![OffsetFetchTopicResponse {
+                topic_name: WireString::from("t1"),
+                partitions: vec![OffsetFetchPartitionResponse {
+                    partition_index: 0,
+                    offset: -1,
+                    metadata: None,
+                    error_code: 0,
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_add_partitions_to_txn_response() {
+        let resp = KafkaResponse::AddPartitionsToTxn(AddPartitionsToTxnResponse {
+            topics: vec![AddPartitionsToTxnTopicResponse {
+                topic_name: WireString::from("txn-topic"),
+                partitions: vec![
+                    AddPartitionsToTxnPartitionResponse {
+                        partition_index: 0,
+                        error_code: 0,
+                    },
+                    AddPartitionsToTxnPartitionResponse {
+                        partition_index: 1,
+                        error_code: 0,
+                    },
+                ],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_add_offsets_to_txn_response() {
+        let resp = KafkaResponse::AddOffsetsToTxn(AddOffsetsToTxnResponse { error_code: 0 });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_txn_offset_commit_response() {
+        let resp = KafkaResponse::TxnOffsetCommit(TxnOffsetCommitResponse {
+            topics: vec![TxnOffsetCommitTopicResponse {
+                topic_name: WireString::from("t1"),
+                partitions: vec![TxnOffsetCommitPartitionResponse {
+                    partition_index: 0,
+                    error_code: 0,
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_delete_records_response() {
+        let resp = KafkaResponse::DeleteRecords(DeleteRecordsResponse {
+            topics: vec![DeleteRecordsTopicResponse {
+                topic_name: WireString::from("t1"),
+                partitions: vec![DeleteRecordsPartitionResponse {
+                    partition_index: 0,
+                    low_watermark: 42,
+                    error_code: 0,
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_describe_configs_response() {
+        let resp = KafkaResponse::DescribeConfigs(DescribeConfigsResponse {
+            resources: vec![DescribeConfigsResourceResult {
+                error_code: 0,
+                error_message: None,
+                resource_type: 2,
+                resource_name: WireString::from("my-topic"),
+                configs: vec![DescribeConfigEntry {
+                    name: WireString::from_static("cleanup.policy"),
+                    value: Some(WireString::from_static("delete")),
+                    read_only: false,
+                    is_default: true,
+                    is_sensitive: false,
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_describe_configs_response_with_error() {
+        let resp = KafkaResponse::DescribeConfigs(DescribeConfigsResponse {
+            resources: vec![DescribeConfigsResourceResult {
+                error_code: 3,
+                error_message: Some(WireString::from("oops")),
+                resource_type: 99,
+                resource_name: WireString::from("x"),
+                configs: vec![],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_alter_configs_response() {
+        let resp = KafkaResponse::AlterConfigs(AlterConfigsResponse {
+            resources: vec![AlterConfigsResourceResult {
+                error_code: 0,
+                error_message: None,
+                resource_type: 2,
+                resource_name: WireString::from("t1"),
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_create_partitions_response() {
+        let resp = KafkaResponse::CreatePartitions(CreatePartitionsResponse {
+            topics: vec![CreatePartitionsTopicResponse {
+                name: WireString::from("t1"),
+                error_code: 0,
+                error_message: None,
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_create_partitions_response_with_error() {
+        let resp = KafkaResponse::CreatePartitions(CreatePartitionsResponse {
+            topics: vec![CreatePartitionsTopicResponse {
+                name: WireString::from("t1"),
+                error_code: 37, // InvalidPartitions
+                error_message: Some(WireString::from("bad")),
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_offset_delete_response() {
+        let resp = KafkaResponse::OffsetDelete(OffsetDeleteResponse {
+            error_code: 0,
+            topics: vec![OffsetDeleteTopicResponse {
+                topic_name: WireString::from("t1"),
+                partitions: vec![OffsetDeletePartitionResponse {
+                    partition_index: 0,
+                    error_code: 0,
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_metadata_response() {
+        let resp = KafkaResponse::Metadata(MetadataResponse {
+            brokers: vec![BrokerMeta {
+                node_id: 1,
+                host: WireString::from("localhost"),
+                port: 9092,
+            }],
+            topics: vec![TopicMetadata {
+                error_code: 0,
+                name: WireString::from("t1"),
+                partitions: vec![PartitionMetadata {
+                    error_code: 0,
+                    partition_index: 0,
+                    leader: 1,
+                    replicas: smallvec::smallvec![1],
+                    isr: smallvec::smallvec![1],
+                }],
+            }],
+        });
+        let mut buf = BytesMut::new();
+        encode_response(1, &resp, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    // =========================================================================
+    // Decompression tests
+    // =========================================================================
+
+    #[test]
+    fn test_decompress_none_passthrough() {
+        // COMPRESSION_NONE is handled at the caller level (not by decompress_records).
+        // decompress_records treats 0 as unknown.
+        let data = b"hello";
+        let result = decompress_records(COMPRESSION_NONE, data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_gzip_roundtrip() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let original = b"test data for gzip compression";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decompressed = decompress_records(COMPRESSION_GZIP, &compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_decompress_snappy_raw_roundtrip() {
+        let original = b"test data for snappy raw compression!!";
+        let mut encoder = snap::raw::Encoder::new();
+        let compressed = encoder.compress_vec(original).unwrap();
+
+        let decompressed = decompress_records(COMPRESSION_SNAPPY, &compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_decompress_snappy_xerial_roundtrip() {
+        let original = b"test data for snappy xerial framing!!";
+        let mut encoder = snap::raw::Encoder::new();
+        let compressed_chunk = encoder.compress_vec(original).unwrap();
+
+        // Build Xerial framed snappy
+        let mut framed = Vec::new();
+        // Magic
+        framed.extend_from_slice(&[0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00]);
+        // Version
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        // Compat
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        // Chunk: [len:4][data]
+        framed.extend_from_slice(&(compressed_chunk.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&compressed_chunk);
+
+        let decompressed = decompress_records(COMPRESSION_SNAPPY, &framed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_decompress_snappy_xerial_multiple_chunks() {
+        let chunk1 = b"first chunk data";
+        let chunk2 = b"second chunk data";
+        let mut encoder = snap::raw::Encoder::new();
+        let c1 = encoder.compress_vec(chunk1).unwrap();
+        let c2 = encoder.compress_vec(chunk2).unwrap();
+
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&[0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00]);
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        framed.extend_from_slice(&(c1.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&c1);
+        framed.extend_from_slice(&(c2.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&c2);
+
+        let decompressed = decompress_records(COMPRESSION_SNAPPY, &framed).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(chunk1);
+        expected.extend_from_slice(chunk2);
+        assert_eq!(decompressed, expected);
+    }
+
+    #[test]
+    fn test_decompress_snappy_xerial_truncated_header() {
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&[0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00]);
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        // Add partial chunk header (only 2 bytes instead of 4)
+        framed.extend_from_slice(&[0, 0]);
+
+        let result = decompress_records(COMPRESSION_SNAPPY, &framed);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_snappy_xerial_truncated_data() {
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&[0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00]);
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        // Chunk header says 100 bytes but only 5 follow
+        framed.extend_from_slice(&100u32.to_be_bytes());
+        framed.extend_from_slice(&[1, 2, 3, 4, 5]);
+
+        let result = decompress_records(COMPRESSION_SNAPPY, &framed);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_lz4_roundtrip() {
+        use lz4_flex::frame::FrameEncoder;
+        use std::io::Write;
+
+        let original = b"test data for lz4 frame compression";
+        let mut encoder = FrameEncoder::new(Vec::new());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decompressed = decompress_records(COMPRESSION_LZ4, &compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_decompress_zstd_roundtrip() {
+        let original = b"test data for zstd compression roundtrip!";
+        let compressed = zstd::stream::encode_all(&original[..], 3).unwrap();
+
+        let decompressed = decompress_records(COMPRESSION_ZSTD, &compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_decompress_unknown_compression() {
+        let result = decompress_records(99, b"data");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(format!("{err}").contains("unknown compression"));
+    }
+
+    #[test]
+    fn test_decompress_gzip_invalid_data() {
+        let result = decompress_records(COMPRESSION_GZIP, b"not gzip data");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_zstd_invalid_data() {
+        let result = decompress_records(COMPRESSION_ZSTD, b"not zstd data");
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // varint_size / varlong_size tests
+    // =========================================================================
+
+    #[test]
+    fn test_varint_size_all_ranges() {
+        assert_eq!(varint_size(0), 1);
+        assert_eq!(varint_size(1), 1);
+        assert_eq!(varint_size(-1), 1);
+        assert_eq!(varint_size(63), 1);
+        assert_eq!(varint_size(-64), 1);
+        assert_eq!(varint_size(64), 2);
+        assert_eq!(varint_size(-65), 2);
+        assert_eq!(varint_size(i32::MAX), 5);
+        assert_eq!(varint_size(i32::MIN), 5);
+    }
+
+    #[test]
+    fn test_varlong_size_all_ranges() {
+        assert_eq!(varlong_size(0), 1);
+        assert_eq!(varlong_size(1), 1);
+        assert_eq!(varlong_size(-1), 1);
+        assert_eq!(varlong_size(63), 1);
+        assert_eq!(varlong_size(64), 2);
+        assert_eq!(varlong_size(i64::MAX), 10);
+        assert_eq!(varlong_size(i64::MIN), 10);
     }
 }

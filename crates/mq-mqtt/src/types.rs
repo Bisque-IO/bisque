@@ -144,12 +144,20 @@ impl ConnectFlags {
             return None;
         }
         let will_qos = QoS::from_u8((byte >> 3) & 0x03)?;
+        let will = byte & 0x04 != 0;
+        let will_retain = byte & 0x20 != 0;
+
+        // If will flag is false, will_qos must be 0 and will_retain must be false.
+        if !will && (will_qos != QoS::AtMostOnce || will_retain) {
+            return None;
+        }
+
         Some(Self {
             username: byte & 0x80 != 0,
             password: byte & 0x40 != 0,
-            will_retain: byte & 0x20 != 0,
+            will_retain,
             will_qos,
-            will: byte & 0x04 != 0,
+            will,
             clean_session: byte & 0x02 != 0,
         })
     }
@@ -520,6 +528,26 @@ pub struct Disconnect {
     pub properties: Properties,
 }
 
+/// AUTH packet (MQTT 5.0 only — Enhanced Authentication).
+///
+/// Used for multi-step SASL-like authentication flows (SCRAM, Kerberos, etc.).
+/// Reason codes: 0x00 (Success), 0x18 (Continue Authentication), 0x19 (Re-authenticate).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Auth {
+    pub reason_code: u8,
+    #[serde(default)]
+    pub properties: Properties,
+}
+
+impl Auth {
+    /// Success — authentication complete.
+    pub const SUCCESS: u8 = 0x00;
+    /// Continue Authentication — server sends challenge, client sends response.
+    pub const CONTINUE_AUTHENTICATION: u8 = 0x18;
+    /// Re-authenticate — client initiates re-authentication on an existing connection.
+    pub const RE_AUTHENTICATE: u8 = 0x19;
+}
+
 // =============================================================================
 // Top-Level Packet Enum
 // =============================================================================
@@ -541,7 +569,7 @@ pub enum MqttPacket {
     PingReq,
     PingResp,
     Disconnect(Disconnect),
-    Auth, // MQTT 5.0 placeholder
+    Auth(Auth),
 }
 
 impl MqttPacket {
@@ -562,7 +590,7 @@ impl MqttPacket {
             Self::PingReq => PacketType::PingReq,
             Self::PingResp => PacketType::PingResp,
             Self::Disconnect(_) => PacketType::Disconnect,
-            Self::Auth => PacketType::Auth,
+            Self::Auth(_) => PacketType::Auth,
         }
     }
 }
@@ -690,5 +718,244 @@ mod tests {
         assert_eq!(decoded.filter, "sensor/+/data");
         assert_eq!(decoded.qos, QoS::ExactlyOnce);
         assert!(decoded.no_local);
+    }
+
+    // ---- Will flags validation (M15) ----
+
+    #[test]
+    fn test_will_false_with_qos_nonzero_rejected() {
+        // will=false (bit 2 clear), will_qos=1 (bits 4:3 = 01), will_retain=false
+        // Byte: 0b0000_1000 = 0x08 (will_qos=1 without will set)
+        assert!(ConnectFlags::from_byte(0x08).is_none());
+    }
+
+    #[test]
+    fn test_will_false_with_retain_rejected() {
+        // will=false, will_qos=0, will_retain=true
+        // Byte: 0b0010_0000 = 0x20 (will_retain without will set)
+        assert!(ConnectFlags::from_byte(0x20).is_none());
+    }
+
+    #[test]
+    fn test_will_false_with_qos_and_retain_rejected() {
+        // will=false, will_qos=2, will_retain=true
+        // Byte: 0b0011_0000 = 0x30
+        assert!(ConnectFlags::from_byte(0x30).is_none());
+    }
+
+    #[test]
+    fn test_will_true_with_qos_and_retain_accepted() {
+        // will=true, will_qos=2, will_retain=true, clean_session=true
+        // Byte: 0b0011_0110 = 0x36
+        let flags = ConnectFlags::from_byte(0x36).unwrap();
+        assert!(flags.will);
+        assert_eq!(flags.will_qos, QoS::ExactlyOnce);
+        assert!(flags.will_retain);
+        assert!(flags.clean_session);
+    }
+
+    // ---- Additional coverage tests ----
+
+    #[test]
+    fn test_connect_return_code_all_variants() {
+        assert_eq!(
+            ConnectReturnCode::from_u8(0x00),
+            Some(ConnectReturnCode::Accepted)
+        );
+        assert_eq!(
+            ConnectReturnCode::from_u8(0x01),
+            Some(ConnectReturnCode::UnacceptableProtocolVersion)
+        );
+        assert_eq!(
+            ConnectReturnCode::from_u8(0x02),
+            Some(ConnectReturnCode::IdentifierRejected)
+        );
+        assert_eq!(
+            ConnectReturnCode::from_u8(0x03),
+            Some(ConnectReturnCode::ServerUnavailable)
+        );
+        assert_eq!(
+            ConnectReturnCode::from_u8(0x04),
+            Some(ConnectReturnCode::BadUserNameOrPassword)
+        );
+        assert_eq!(
+            ConnectReturnCode::from_u8(0x05),
+            Some(ConnectReturnCode::NotAuthorized)
+        );
+        assert_eq!(ConnectReturnCode::from_u8(0x06), None);
+        assert_eq!(ConnectReturnCode::from_u8(0xFF), None);
+    }
+
+    #[test]
+    fn test_qos_from_u8_invalid() {
+        assert_eq!(QoS::from_u8(3), None);
+        assert_eq!(QoS::from_u8(4), None);
+        assert_eq!(QoS::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_reason_code_constants() {
+        assert_eq!(ReasonCode::SUCCESS.0, 0x00);
+        assert_eq!(ReasonCode::NORMAL_DISCONNECTION.0, 0x00);
+        assert_eq!(ReasonCode::GRANTED_QOS0.0, 0x00);
+        assert_eq!(ReasonCode::GRANTED_QOS1.0, 0x01);
+        assert_eq!(ReasonCode::GRANTED_QOS2.0, 0x02);
+        assert_eq!(ReasonCode::NO_MATCHING_SUBSCRIBERS.0, 0x10);
+        assert_eq!(ReasonCode::UNSPECIFIED_ERROR.0, 0x80);
+        assert_eq!(ReasonCode::MALFORMED_PACKET.0, 0x81);
+        assert_eq!(ReasonCode::PROTOCOL_ERROR.0, 0x82);
+        assert_eq!(ReasonCode::BAD_USER_NAME_OR_PASSWORD.0, 0x86);
+        assert_eq!(ReasonCode::NOT_AUTHORIZED.0, 0x87);
+        assert_eq!(ReasonCode::TOPIC_FILTER_INVALID.0, 0x8F);
+        assert_eq!(ReasonCode::TOPIC_NAME_INVALID.0, 0x90);
+        assert_eq!(ReasonCode::PACKET_IDENTIFIER_IN_USE.0, 0x91);
+        assert_eq!(ReasonCode::PACKET_IDENTIFIER_NOT_FOUND.0, 0x92);
+        assert_eq!(ReasonCode::TOPIC_ALIAS_INVALID.0, 0x94);
+        assert_eq!(ReasonCode::PACKET_TOO_LARGE.0, 0x95);
+        assert_eq!(ReasonCode::PAYLOAD_FORMAT_INVALID.0, 0x99);
+    }
+
+    #[test]
+    fn test_mqtt_packet_type_all_variants() {
+        use super::*;
+        let packets: Vec<MqttPacket> = vec![
+            MqttPacket::Connect(Connect {
+                protocol_name: "MQTT".into(),
+                protocol_version: ProtocolVersion::V311,
+                flags: ConnectFlags::from_byte(0x02).unwrap(),
+                keep_alive: 60,
+                client_id: "c".into(),
+                will: None,
+                username: None,
+                password: None,
+                properties: Properties::default(),
+            }),
+            MqttPacket::ConnAck(ConnAck {
+                session_present: false,
+                return_code: 0,
+                properties: Properties::default(),
+            }),
+            MqttPacket::Publish(Publish {
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: Bytes::new(),
+                packet_id: None,
+                payload: Bytes::new(),
+                properties: Properties::default(),
+            }),
+            MqttPacket::PubAck(PubAck {
+                packet_id: 1,
+                reason_code: None,
+                properties: Properties::default(),
+            }),
+            MqttPacket::PubRec(PubRec {
+                packet_id: 1,
+                reason_code: None,
+                properties: Properties::default(),
+            }),
+            MqttPacket::PubRel(PubRel {
+                packet_id: 1,
+                reason_code: None,
+                properties: Properties::default(),
+            }),
+            MqttPacket::PubComp(PubComp {
+                packet_id: 1,
+                reason_code: None,
+                properties: Properties::default(),
+            }),
+            MqttPacket::Subscribe(Subscribe {
+                packet_id: 1,
+                filters: SmallVec::new(),
+                properties: Properties::default(),
+            }),
+            MqttPacket::SubAck(SubAck {
+                packet_id: 1,
+                return_codes: SmallVec::new(),
+                properties: Properties::default(),
+            }),
+            MqttPacket::Unsubscribe(Unsubscribe {
+                packet_id: 1,
+                filters: SmallVec::new(),
+                properties: Properties::default(),
+            }),
+            MqttPacket::UnsubAck(UnsubAck {
+                packet_id: 1,
+                reason_codes: SmallVec::new(),
+                properties: Properties::default(),
+            }),
+            MqttPacket::PingReq,
+            MqttPacket::PingResp,
+            MqttPacket::Disconnect(Disconnect {
+                reason_code: None,
+                properties: Properties::default(),
+            }),
+            MqttPacket::Auth(Auth {
+                reason_code: 0,
+                properties: Properties::default(),
+            }),
+        ];
+
+        let expected_types = vec![
+            PacketType::Connect,
+            PacketType::ConnAck,
+            PacketType::Publish,
+            PacketType::PubAck,
+            PacketType::PubRec,
+            PacketType::PubRel,
+            PacketType::PubComp,
+            PacketType::Subscribe,
+            PacketType::SubAck,
+            PacketType::Unsubscribe,
+            PacketType::UnsubAck,
+            PacketType::PingReq,
+            PacketType::PingResp,
+            PacketType::Disconnect,
+            PacketType::Auth,
+        ];
+
+        for (pkt, expected) in packets.iter().zip(expected_types.iter()) {
+            assert_eq!(pkt.packet_type(), *expected);
+        }
+    }
+
+    #[test]
+    fn test_protocol_version_from_level_invalid() {
+        assert_eq!(ProtocolVersion::from_level(0), None);
+        assert_eq!(ProtocolVersion::from_level(3), None);
+        assert_eq!(ProtocolVersion::from_level(6), None);
+    }
+
+    #[test]
+    fn test_packet_type_from_u8_boundaries() {
+        assert_eq!(PacketType::from_u8(0), None);
+        assert_eq!(PacketType::from_u8(1), Some(PacketType::Connect));
+        assert_eq!(PacketType::from_u8(15), Some(PacketType::Auth));
+        assert_eq!(PacketType::from_u8(16), None);
+    }
+
+    #[test]
+    fn test_auth_constants() {
+        assert_eq!(Auth::SUCCESS, 0x00);
+        assert_eq!(Auth::CONTINUE_AUTHENTICATION, 0x18);
+        assert_eq!(Auth::RE_AUTHENTICATE, 0x19);
+    }
+
+    #[test]
+    fn test_connect_flags_with_username_password() {
+        // username=true, password=true, clean_session=true
+        let byte = 0xC2; // 1100_0010
+        let flags = ConnectFlags::from_byte(byte).unwrap();
+        assert!(flags.username);
+        assert!(flags.password);
+        assert!(flags.clean_session);
+        assert!(!flags.will);
+        assert_eq!(flags.to_byte(), byte);
+    }
+
+    #[test]
+    fn test_connect_flags_invalid_qos3() {
+        // will=true, will_qos=3 (invalid), Byte: 0b0001_1100 = 0x1C
+        assert!(ConnectFlags::from_byte(0x1C).is_none());
     }
 }
