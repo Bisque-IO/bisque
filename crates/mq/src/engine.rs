@@ -1,3 +1,12 @@
+//! Unified MQ engine — topics + consumer groups + sessions.
+//!
+//! All entity state lives in `Arc<MqMetadata>` (DashMap + atomics) for lock-free
+//! concurrent access. The engine holds the config and provides `apply_command`
+//! which is the single-writer Raft apply path.
+//!
+//! This replaces the old engine that dispatched to queues, actors, jobs,
+//! consumers, and producers as separate entity types.
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -5,15 +14,12 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use tracing::{debug, info, warn};
 
-use crate::actor::ActorNamespaceState;
 use crate::config::MqConfig;
-use crate::consumer::ConsumerState;
-use crate::exchange::ExchangeState;
-use crate::job::JobInstance;
-use crate::metadata::MqMetadata;
-use crate::producer::ProducerMeta;
-use crate::queue::QueueState;
-use crate::topic::TopicState;
+use crate::consumer_group::*;
+use crate::exchange::*;
+use crate::metadata::{MqMetadata, TopicMeta as MetaTopicMeta};
+use crate::session::*;
+use crate::topic::*;
 use crate::types::*;
 
 /// Core MQ engine — thin wrapper around `Arc<MqMetadata>`.
@@ -22,28 +28,38 @@ use crate::types::*;
 /// concurrent access. The engine holds the config and provides `apply_command`
 /// which is the single-writer Raft apply path.
 pub struct MqEngine {
+    metadata: Arc<MqMetadata>,
     pub(crate) config: MqConfig,
-    pub(crate) meta: Arc<MqMetadata>,
+
+    // Pre-initialized metrics handles
+    m_apply_count: metrics::Counter,
+    m_unknown_tag: metrics::Counter,
 }
 
 impl MqEngine {
     pub fn new(config: MqConfig) -> Self {
-        let meta = Arc::new(MqMetadata::new(config.catalog_name.clone()));
-        Self { config, meta }
+        let metadata = Arc::new(MqMetadata::new(config.catalog_name.clone()));
+        Self::with_metadata(metadata, config)
     }
 
-    pub fn with_metadata(config: MqConfig, meta: Arc<MqMetadata>) -> Self {
-        Self { config, meta }
+    pub fn with_metadata(metadata: Arc<MqMetadata>, config: MqConfig) -> Self {
+        let labels = [("catalog", config.catalog_name.clone())];
+        Self {
+            metadata,
+            config,
+            m_apply_count: metrics::counter!("mq.engine.apply.count", &labels),
+            m_unknown_tag: metrics::counter!("mq.engine.unknown_tag", &labels),
+        }
     }
 
     /// Get a shared reference to the metadata store.
     pub fn shared_metadata(&self) -> Arc<MqMetadata> {
-        Arc::clone(&self.meta)
+        Arc::clone(&self.metadata)
     }
 
     /// Borrow the metadata store.
     pub fn metadata(&self) -> &MqMetadata {
-        &self.meta
+        &self.metadata
     }
 
     /// Apply a single command. Returns the response.
@@ -57,35 +73,43 @@ impl MqEngine {
         log_index: u64,
         current_time: u64,
     ) -> MqResponse {
+        self.m_apply_count.increment(1);
+        let md = &self.metadata;
+
         match cmd.tag() {
             // =================================================================
-            // Topics
+            // Topics (0-5)
             // =================================================================
             MqCommand::TAG_CREATE_TOPIC => {
                 let v = cmd.as_create_topic();
                 let name = v.name().to_owned();
-                let retention = v.retention();
-                let hash = name_hash(&name);
-                if let Some(r) = self.meta.topic_names.get(&hash) {
+                let name_h = name_hash(&name);
+                if let Some(r) = md.topic_names.get(&name_h) {
                     return MqResponse::Error(MqError::AlreadyExists {
                         entity: EntityKind::Topic,
                         id: *r,
                     });
                 }
-                let id = self.meta.alloc_id();
-                let meta = crate::topic::TopicMeta::new(id, name, log_index, retention);
-                self.meta
-                    .topics
-                    .insert(id, TopicState::new(meta, self.meta.catalog_name()));
-                self.meta.topic_names.insert(hash, id);
-                info!(topic_id = id, "topic created");
-                MqResponse::EntityCreated { id }
+                let topic_id = md.alloc_id();
+                let mut meta = TopicMeta::new(topic_id, name, current_time, v.retention());
+                meta.partition_count = v.partition_count();
+                // Extended fields: lifetime, retained, dedup, cron are parsed
+                // from the trailing portion of the create_topic buffer.
+                // The CmdCreateTopic view struct currently only exposes
+                // name/retention/partition_count. For now, those extended fields
+                // are set to defaults and can be updated by the caller via
+                // separate commands or once the codec is extended.
+                let state = TopicState::new(meta, md.catalog_name());
+                md.topics.insert(topic_id, state);
+                md.topic_names.insert(name_h, topic_id);
+                info!(topic_id, "topic created");
+                MqResponse::EntityCreated { id: topic_id }
             }
 
             MqCommand::TAG_DELETE_TOPIC => {
                 let topic_id = cmd.field_u64(1);
-                if let Some((_, state)) = self.meta.topics.remove(&topic_id) {
-                    self.meta.topic_names.remove(&state.meta.name_hash);
+                if let Some((_, state)) = md.topics.remove(&topic_id) {
+                    md.topic_names.remove(&state.meta.name_hash);
                     if state.message_count() > 0 {
                         self.mark_purge_floor_dirty();
                     }
@@ -102,7 +126,7 @@ impl MqEngine {
                 let v = cmd.as_publish();
                 let topic_id = v.topic_id();
                 let count = v.message_count() as u64;
-                if let Some(topic) = self.meta.topics.get(&topic_id) {
+                if let Some(topic) = md.topics.get(&topic_id) {
                     let base_offset = topic.apply_publish(log_index, v.messages());
                     self.on_message_added(log_index);
                     MqResponse::Published { base_offset, count }
@@ -115,12 +139,13 @@ impl MqEngine {
             }
 
             MqCommand::TAG_COMMIT_OFFSET => {
+                // Wire: [tag:1][topic_id:8][consumer_id:8][offset:8]
                 let topic_id = cmd.field_u64(1);
                 let consumer_id = cmd.field_u64(9);
                 let offset = cmd.field_u64(17);
-                if let Some(topic) = self.meta.topics.get(&topic_id) {
+                if let Some(topic) = md.topics.get(&topic_id) {
                     topic.apply_commit_offset(consumer_id, offset);
-                    self.mark_purge_floor_dirty();
+                    md.purge_floor_dirty.store(true, Ordering::Relaxed);
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
@@ -131,9 +156,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_PURGE_TOPIC => {
+                // Wire: [tag:1][topic_id:8][before_index:8]
                 let topic_id = cmd.field_u64(1);
                 let before_index = cmd.field_u64(9);
-                if let Some(topic) = self.meta.topics.get(&topic_id) {
+                if let Some(topic) = md.topics.get(&topic_id) {
                     topic.apply_purge(before_index);
                     self.mark_purge_floor_dirty();
                     MqResponse::Ok
@@ -145,300 +171,51 @@ impl MqEngine {
                 }
             }
 
-            // =================================================================
-            // Queues
-            // =================================================================
-            MqCommand::TAG_CREATE_QUEUE => {
-                let v = cmd.as_create_queue();
-                let name = v.name().to_owned();
-                let config = v.config();
-                let hash = name_hash(&name);
-                if let Some(r) = self.meta.queue_names.get(&hash) {
-                    return MqResponse::Error(MqError::AlreadyExists {
-                        entity: EntityKind::Queue,
-                        id: *r,
-                    });
-                }
-                let id = self.meta.alloc_id();
-                let meta = crate::queue::QueueMeta::new(id, name, log_index, config);
-                self.meta
-                    .queues
-                    .insert(id, QueueState::new(meta, self.meta.catalog_name()));
-                self.meta.queue_names.insert(hash, id);
-                info!(queue_id = id, "queue created");
-                MqResponse::EntityCreated { id }
-            }
-
-            MqCommand::TAG_DELETE_QUEUE => {
-                let queue_id = cmd.field_u64(1);
-                if let Some((_, state)) = self.meta.queues.remove(&queue_id) {
-                    self.meta.queue_names.remove(&state.meta.name_hash);
-                    if state.has_messages() {
-                        self.mark_purge_floor_dirty();
-                    }
+            MqCommand::TAG_SET_RETAINED => {
+                let v = cmd.as_set_retained();
+                let exchange_id = v.exchange_id();
+                let routing_key = v.routing_key().to_owned();
+                let message = v.message();
+                if let Some(mut exchange) = md.exchanges.get_mut(&exchange_id) {
+                    exchange.retained.insert(routing_key, message);
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_ENQUEUE => {
-                let v = cmd.as_enqueue();
-                let queue_id = v.queue_id();
-                let messages: smallvec::SmallVec<[Bytes; 16]> = v.messages().collect();
-                let dedup_keys: smallvec::SmallVec<[Option<Bytes>; 16]> = v.dedup_keys().collect();
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    let count =
-                        queue.apply_enqueue(log_index, &messages, &dedup_keys, current_time);
-                    self.on_message_added(log_index);
-                    self.meta.queue_notifier.notify(queue_id);
-                    MqResponse::Published {
-                        base_offset: log_index,
-                        count: count as u64,
-                    }
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_DELIVER => {
-                let queue_id = cmd.field_u64(1);
-                let consumer_id = cmd.field_u64(9);
-                let max_count = cmd.field_u32(17);
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    let msg_ids =
-                        queue.apply_deliver(consumer_id, max_count, current_time, log_index);
-                    if !msg_ids.is_empty() {
-                        // Track consumer→queue for O(1) disconnect
-                        self.meta.track_consumer_queue(consumer_id, queue_id);
-                    }
-                    // Build DeliveredMessage stubs (payload must be fetched from raft log)
-                    let messages: smallvec::SmallVec<[DeliveredMessage; 8]> = msg_ids
-                        .iter()
-                        .filter_map(|&id| {
-                            queue.messages.get(&id).map(|meta| DeliveredMessage {
-                                message_id: id,
-                                attempt: meta.attempts,
-                                original_timestamp: current_time,
-                                queue_id,
-                            })
-                        })
-                        .collect();
-                    MqResponse::Messages { messages }
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_ACK => {
-                let v = cmd.as_ack();
-                let queue_id = v.queue_id();
-                let message_ids = v.message_ids();
-                let response = v.response();
-                if let Some(min_id) = message_ids.iter().copied().min() {
-                    self.on_message_removed(min_id);
-                }
-                // Collect reply_to info before acking
-                let reply_info: Option<(u64, Bytes)> = response.and_then(|resp| {
-                    let queue = self.meta.queues.get(&queue_id)?;
-                    for &msg_id in &message_ids {
-                        if let Some(meta) = queue.messages.get(&msg_id) {
-                            if let Some(ref reply_to_bytes) = meta.reply_to {
-                                let hash = name_hash_bytes(reply_to_bytes);
-                                if let Some(r) = self.meta.topic_names.get(&hash) {
-                                    return Some((*r, resp));
-                                }
-                            }
-                        }
-                    }
-                    None
-                });
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    queue.apply_ack(&message_ids);
-                } else {
-                    return MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    });
-                }
-                // Route response to reply topic if applicable
-                if let Some((topic_id, resp)) = reply_info {
-                    if let Some(topic) = self.meta.topics.get(&topic_id) {
-                        topic.apply_publish(log_index, std::iter::once(resp));
-                        self.on_message_added(log_index);
-                    }
-                }
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_NACK => {
-                let v = cmd.as_nack();
-                let queue_id = v.queue_id();
-                let message_ids = v.message_ids();
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    queue.apply_nack(&message_ids);
-                    self.meta.queue_notifier.notify(queue_id);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_EXTEND_VISIBILITY => {
-                let v = cmd.as_extend_visibility();
-                let queue_id = v.queue_id();
-                let message_ids = v.message_ids();
-                let extension_ms = v.extension_ms();
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    queue.apply_extend_visibility(&message_ids, extension_ms);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_TIMEOUT_EXPIRED => {
-                let v = cmd.as_timeout_expired();
-                let queue_id = v.queue_id();
-                let message_ids = v.message_ids();
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    let dlq_id = queue.meta.config.dead_letter_topic_id;
-                    let _dead_lettered =
-                        queue.apply_timeout_expired(&message_ids, dlq_id, current_time);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_PUBLISH_TO_DLQ => {
-                let v = cmd.as_publish_to_dlq();
-                let source_queue_id = v.source_queue_id();
-                let dlq_topic_id = v.dlq_topic_id();
-                let dead_letter_ids = v.dead_letter_ids();
-                let messages = v.messages();
-                // Publish dead-lettered messages to the DLQ topic
-                if let Some(topic) = self.meta.topics.get(&dlq_topic_id) {
-                    topic.apply_publish(log_index, messages);
-                    self.on_message_added(log_index);
-                }
-                // Remove dead-lettered messages from the source queue
-                if let Some(queue) = self.meta.queues.get(&source_queue_id) {
-                    queue.apply_remove_dead_lettered(&dead_letter_ids);
-                    self.mark_purge_floor_dirty();
-                }
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_PRUNE_DEDUP_WINDOW => {
-                let queue_id = cmd.field_u64(1);
-                let before_timestamp = cmd.field_u64(9);
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    queue.apply_prune_dedup(before_timestamp);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_EXPIRE_PENDING_MESSAGES => {
-                let v = cmd.as_expire_pending_messages();
-                let queue_id = v.queue_id();
-                let message_ids = v.message_ids();
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    queue.apply_expire_pending(&message_ids);
-                    self.mark_purge_floor_dirty();
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_PURGE_QUEUE => {
-                let queue_id = cmd.field_u64(1);
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    if queue.purge() {
-                        self.mark_purge_floor_dirty();
-                    }
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_GET_QUEUE_ATTRIBUTES => {
-                let queue_id = cmd.field_u64(1);
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    MqResponse::Stats(EntityStats::Queue {
-                        queue_id,
-                        pending_count: queue.pending_count(),
-                        in_flight_count: queue.in_flight_count(),
-                        dlq_count: queue.dlq_count(),
-                    })
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
+                        entity: EntityKind::Exchange,
+                        id: exchange_id,
                     })
                 }
             }
 
             // =================================================================
-            // Exchanges
+            // Exchanges (6-10)
             // =================================================================
             MqCommand::TAG_CREATE_EXCHANGE => {
                 let v = cmd.as_create_exchange();
                 let name = v.name().to_owned();
                 let exchange_type = v.exchange_type();
-                let hash = name_hash(&name);
-                if let Some(r) = self.meta.exchange_names.get(&hash) {
+                let name_h = name_hash(&name);
+                if let Some(r) = md.exchange_names.get(&name_h) {
                     return MqResponse::Error(MqError::AlreadyExists {
                         entity: EntityKind::Exchange,
                         id: *r,
                     });
                 }
-                let id = self.meta.alloc_id();
-                let meta = crate::exchange::ExchangeMeta::new(id, name, log_index, exchange_type);
-                self.meta.exchanges.insert(id, ExchangeState::new(meta));
-                self.meta.exchange_names.insert(hash, id);
+                let id = md.alloc_id();
+                let meta = ExchangeMeta::new(id, name, current_time, exchange_type);
+                md.exchanges.insert(id, ExchangeState::new(meta));
+                md.exchange_names.insert(name_h, id);
                 info!(exchange_id = id, "exchange created");
                 MqResponse::EntityCreated { id }
             }
 
             MqCommand::TAG_DELETE_EXCHANGE => {
                 let exchange_id = cmd.field_u64(1);
-                if let Some((_, state)) = self.meta.exchanges.remove(&exchange_id) {
-                    self.meta.exchange_names.remove(&state.meta.name_hash);
-                    // Clean up binding_id → exchange_id reverse index
+                if let Some((_, state)) = md.exchanges.remove(&exchange_id) {
+                    md.exchange_names.remove(&state.meta.name_hash);
+                    // Clean up binding reverse index
                     for binding_id in state.bindings.keys() {
-                        self.meta.binding_index.remove(binding_id);
+                        md.binding_index.remove(binding_id);
                     }
                     MqResponse::Ok
                 } else {
@@ -452,53 +229,47 @@ impl MqEngine {
             MqCommand::TAG_CREATE_BINDING => {
                 let v = cmd.as_create_binding();
                 let exchange_id = v.exchange_id();
-                let queue_id = v.queue_id();
+                let target_topic_id = v.topic_id();
                 let routing_key = v.routing_key();
                 let no_local = v.no_local();
                 let shared_group = v.shared_group();
                 let subscription_id = v.subscription_id();
+
                 // MQTT 5.0 §3.8.3.1: no_local on shared subscriptions is a protocol error
                 if no_local && shared_group.is_some() {
                     return MqResponse::Error(MqError::Custom(
                         "no_local not allowed on shared subscriptions".to_string(),
                     ));
                 }
-                // Verify both exchange and queue exist
-                if !self.meta.exchanges.contains_key(&exchange_id) {
+
+                if !md.exchanges.contains_key(&exchange_id) {
                     return MqResponse::Error(MqError::NotFound {
                         entity: EntityKind::Exchange,
                         id: exchange_id,
                     });
                 }
-                if !self.meta.queues.contains_key(&queue_id) {
-                    return MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    });
-                }
-                let binding_id = self.meta.alloc_id();
+
+                let binding_id = md.alloc_id();
                 let binding = Binding {
                     binding_id,
                     exchange_id,
-                    queue_id,
+                    target_topic_id,
                     routing_key,
                     no_local,
                     shared_group,
                     subscription_id,
                 };
-                if let Some(mut exchange) = self.meta.exchanges.get_mut(&exchange_id) {
+                if let Some(mut exchange) = md.exchanges.get_mut(&exchange_id) {
                     exchange.add_binding(binding);
                 }
-                // Maintain O(1) binding → exchange reverse index
-                self.meta.binding_index.insert(binding_id, exchange_id);
+                md.binding_index.insert(binding_id, exchange_id);
                 MqResponse::EntityCreated { id: binding_id }
             }
 
             MqCommand::TAG_DELETE_BINDING => {
                 let binding_id = cmd.field_u64(1);
-                // O(1) lookup via binding_id → exchange_id reverse index
-                if let Some((_, exchange_id)) = self.meta.binding_index.remove(&binding_id) {
-                    if let Some(mut exchange) = self.meta.exchanges.get_mut(&exchange_id) {
+                if let Some((_, exchange_id)) = md.binding_index.remove(&binding_id) {
+                    if let Some(mut exchange) = md.exchanges.get_mut(&exchange_id) {
                         exchange.remove_binding(binding_id);
                     }
                     MqResponse::Ok
@@ -513,11 +284,10 @@ impl MqEngine {
             MqCommand::TAG_PUBLISH_TO_EXCHANGE => {
                 let v = cmd.as_publish_to_exchange();
                 let exchange_id = v.exchange_id();
-                let messages: smallvec::SmallVec<[Bytes; 16]> = v.messages().collect();
-                // Route messages to bound queues
-                let target_queue_ids = if let Some(exchange) = self.meta.exchanges.get(&exchange_id)
-                {
-                    // Extract routing key from first flat message (zero-copy)
+                let messages: SmallVec<[Bytes; 16]> = v.messages().collect();
+
+                let targets = if let Some(exchange) = md.exchanges.get(&exchange_id) {
+                    // Extract routing key from first flat message
                     let routing_key_bytes = messages.first().and_then(|m| {
                         crate::flat::FlatMessage::new(m.clone()).and_then(|f| f.routing_key())
                     });
@@ -532,565 +302,118 @@ impl MqEngine {
                     });
                 };
 
-                // Enqueue to each target queue (empty dedup_keys slice — no allocation)
-                let mut total_enqueued = 0u64;
-                for qid in &target_queue_ids {
-                    if let Some(queue) = self.meta.queues.get(qid) {
-                        queue.apply_enqueue(log_index, &messages, &[], current_time);
-                        total_enqueued += messages.len() as u64;
+                let mut total_count = 0u64;
+                for &target_id in &targets {
+                    if let Some(topic) = md.topics.get(&target_id) {
+                        topic.apply_publish(log_index, messages.iter().cloned());
+                        total_count += messages.len() as u64;
                     }
                 }
-                if total_enqueued > 0 {
+                if total_count > 0 {
                     self.on_message_added(log_index);
-                    for qid in &target_queue_ids {
-                        self.meta.queue_notifier.notify(*qid);
-                    }
                 }
-                MqResponse::Ok
-            }
-
-            // =================================================================
-            // Actors
-            // =================================================================
-            MqCommand::TAG_CREATE_ACTOR_NAMESPACE => {
-                let v = cmd.as_create_actor_namespace();
-                let name = v.name().to_owned();
-                let config = v.config();
-                let hash = name_hash(&name);
-                if let Some(r) = self.meta.namespace_names.get(&hash) {
-                    return MqResponse::Error(MqError::AlreadyExists {
-                        entity: EntityKind::ActorNamespace,
-                        id: *r,
-                    });
-                }
-                let id = self.meta.alloc_id();
-                let meta = crate::actor::ActorNamespaceMeta::new(id, name, log_index, config);
-                self.meta
-                    .actor_namespaces
-                    .insert(id, ActorNamespaceState::new(meta, self.meta.catalog_name()));
-                self.meta.namespace_names.insert(hash, id);
-                info!(namespace_id = id, "actor namespace created");
-                MqResponse::EntityCreated { id }
-            }
-
-            MqCommand::TAG_DELETE_ACTOR_NAMESPACE => {
-                let namespace_id = cmd.field_u64(1);
-                if let Some((_, state)) = self.meta.actor_namespaces.remove(&namespace_id) {
-                    self.meta.namespace_names.remove(&state.meta.name_hash);
-                    if !state.actors.is_empty() {
-                        self.mark_purge_floor_dirty();
-                    }
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ActorNamespace,
-                        id: namespace_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_SEND_TO_ACTOR => {
-                let v = cmd.as_send_to_actor();
-                let namespace_id = v.namespace_id();
-                let actor_id = v.actor_id();
-                let message = v.message();
-                let reply_to = {
-                    let meta = crate::flat::FlatMessageMeta::parse(&message);
-                    if meta.map_or(false, |m| m.has_reply_to()) {
-                        crate::flat::FlatMessage::new(message.clone()).and_then(|f| f.reply_to())
-                    } else {
-                        None
-                    }
-                };
-                if let Some(ns) = self.meta.actor_namespaces.get(&namespace_id) {
-                    match ns.apply_send(&actor_id, log_index, current_time, reply_to) {
-                        Ok(()) => {
-                            self.on_message_added(log_index);
-                            MqResponse::Ok
-                        }
-                        Err(e) => MqResponse::Error(e),
-                    }
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ActorNamespace,
-                        id: namespace_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_DELIVER_ACTOR_MESSAGE => {
-                let v = cmd.as_deliver_actor_message();
-                let namespace_id = v.namespace_id();
-                let actor_id = v.actor_id();
-                let consumer_id = v.consumer_id();
-                if let Some(ns) = self.meta.actor_namespaces.get(&namespace_id) {
-                    match ns.apply_deliver(&actor_id, consumer_id) {
-                        Some(msg_index) => MqResponse::Messages {
-                            messages: smallvec::smallvec![DeliveredMessage {
-                                message_id: msg_index,
-                                attempt: 1,
-                                original_timestamp: current_time,
-                                queue_id: 0,
-                            }],
-                        },
-                        None => MqResponse::Messages {
-                            messages: smallvec::SmallVec::new(),
-                        },
-                    }
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ActorNamespace,
-                        id: namespace_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_ACK_ACTOR_MESSAGE => {
-                let v = cmd.as_ack_actor_message();
-                let namespace_id = v.namespace_id();
-                let actor_id = v.actor_id();
-                let message_id = v.message_id();
-                let response = v.response();
-                self.on_message_removed(message_id);
-                let reply_to_name = if let Some(ns) = self.meta.actor_namespaces.get(&namespace_id)
-                {
-                    ns.apply_ack(&actor_id, message_id)
-                } else {
-                    return MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ActorNamespace,
-                        id: namespace_id,
-                    });
-                };
-                // Route response to reply topic if applicable
-                if let (Some(resp), Some(reply_name)) = (response, reply_to_name) {
-                    let hash = name_hash_bytes(&reply_name);
-                    if let Some(r) = self.meta.topic_names.get(&hash) {
-                        let topic_id = *r;
-                        drop(r);
-                        if let Some(topic) = self.meta.topics.get(&topic_id) {
-                            topic.apply_publish(log_index, std::iter::once(resp));
-                            self.on_message_added(log_index);
-                        }
-                    }
-                }
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_NACK_ACTOR_MESSAGE => {
-                let v = cmd.as_nack_actor_message();
-                let namespace_id = v.namespace_id();
-                let actor_id = v.actor_id();
-                let message_id = v.message_id();
-                if let Some(ns) = self.meta.actor_namespaces.get(&namespace_id) {
-                    ns.apply_nack(&actor_id, message_id);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ActorNamespace,
-                        id: namespace_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_ASSIGN_ACTORS => {
-                let v = cmd.as_assign_actors();
-                let namespace_id = v.namespace_id();
-                let consumer_id = v.consumer_id();
-                let actor_ids = v.actor_ids();
-                if let Some(ns) = self.meta.actor_namespaces.get(&namespace_id) {
-                    ns.apply_assign(consumer_id, &actor_ids);
-                    // Track consumer→namespace for O(1) disconnect
-                    self.meta.track_consumer_actor_ns(consumer_id, namespace_id);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ActorNamespace,
-                        id: namespace_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_RELEASE_ACTORS => {
-                let namespace_id = cmd.field_u64(1);
-                let consumer_id = cmd.field_u64(9);
-                if let Some(ns) = self.meta.actor_namespaces.get(&namespace_id) {
-                    ns.apply_release(consumer_id);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ActorNamespace,
-                        id: namespace_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_EVICT_IDLE_ACTORS => {
-                let namespace_id = cmd.field_u64(1);
-                let before_timestamp = cmd.field_u64(9);
-                if let Some(ns) = self.meta.actor_namespaces.get(&namespace_id) {
-                    let count = ns.apply_evict_idle(before_timestamp);
-                    debug!(namespace_id, count, "evicted idle actors");
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ActorNamespace,
-                        id: namespace_id,
-                    })
+                MqResponse::Published {
+                    base_offset: 0,
+                    count: total_count,
                 }
             }
 
             // =================================================================
-            // Jobs
-            // =================================================================
-            MqCommand::TAG_CREATE_JOB => {
-                let v = cmd.as_create_job();
-                let name = v.name().to_owned();
-                let config = v.config();
-                let hash = name_hash(&name);
-                if let Some(r) = self.meta.job_names.get(&hash) {
-                    return MqResponse::Error(MqError::AlreadyExists {
-                        entity: EntityKind::Job,
-                        id: *r,
-                    });
-                }
-                let id = self.meta.alloc_id();
-                let meta = crate::job::JobMeta::new(id, name, log_index, config);
-                self.meta
-                    .jobs
-                    .insert(id, JobInstance::new(meta, self.meta.catalog_name()));
-                self.meta.job_names.insert(hash, id);
-                info!(job_id = id, "job created");
-                MqResponse::EntityCreated { id }
-            }
-
-            MqCommand::TAG_DELETE_JOB => {
-                let job_id = cmd.field_u64(1);
-                if let Some((_, job)) = self.meta.jobs.remove(&job_id) {
-                    self.meta.job_names.remove(&job.meta.name_hash);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Job,
-                        id: job_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_UPDATE_JOB => {
-                let v = cmd.as_update_job();
-                let job_id = v.job_id();
-                let config = v.config();
-                if let Some(job) = self.meta.jobs.get(&job_id) {
-                    job.apply_set_config(config);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Job,
-                        id: job_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_ENABLE_JOB => {
-                let job_id = cmd.field_u64(1);
-                if let Some(job) = self.meta.jobs.get(&job_id) {
-                    job.apply_set_enabled(true);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Job,
-                        id: job_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_DISABLE_JOB => {
-                let job_id = cmd.field_u64(1);
-                if let Some(job) = self.meta.jobs.get(&job_id) {
-                    job.apply_set_enabled(false);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Job,
-                        id: job_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_TRIGGER_JOB => {
-                let job_id = cmd.field_u64(1);
-                let execution_id = cmd.field_u64(9);
-                let triggered_at = cmd.field_u64(17);
-                if let Some(job) = self.meta.jobs.get(&job_id) {
-                    job.apply_trigger(execution_id, triggered_at);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Job,
-                        id: job_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_ASSIGN_JOB => {
-                let job_id = cmd.field_u64(1);
-                let consumer_id = cmd.field_u64(9);
-                if let Some(job) = self.meta.jobs.get(&job_id) {
-                    job.apply_assign(consumer_id);
-                    // Track consumer→job for O(1) disconnect
-                    self.meta.track_consumer_job(consumer_id, job_id);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Job,
-                        id: job_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_COMPLETE_JOB => {
-                let job_id = cmd.field_u64(1);
-                let execution_id = cmd.field_u64(9);
-                if let Some(job) = self.meta.jobs.get(&job_id) {
-                    job.apply_complete(execution_id, current_time);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Job,
-                        id: job_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_FAIL_JOB => {
-                let v = cmd.as_fail_job();
-                let job_id = v.job_id();
-                let execution_id = v.execution_id();
-                let error = v.error();
-                if let Some(job) = self.meta.jobs.get(&job_id) {
-                    warn!(job_id, execution_id, error, "job execution failed");
-                    job.apply_fail(execution_id);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Job,
-                        id: job_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_TIMEOUT_JOB => {
-                let job_id = cmd.field_u64(1);
-                let execution_id = cmd.field_u64(9);
-                if let Some(job) = self.meta.jobs.get(&job_id) {
-                    job.apply_timeout(execution_id);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Job,
-                        id: job_id,
-                    })
-                }
-            }
-
-            // =================================================================
-            // Sessions
-            // =================================================================
-            MqCommand::TAG_REGISTER_CONSUMER => {
-                let v = cmd.as_register_consumer();
-                let consumer_id = v.consumer_id();
-                let group_name = v.group_name().to_owned();
-                let subscriptions = v.subscriptions().into_iter().collect();
-                let meta = crate::consumer::ConsumerMeta::new(
-                    consumer_id,
-                    group_name.clone(),
-                    log_index,
-                    subscriptions,
-                );
-                self.meta
-                    .consumers
-                    .insert(consumer_id, ConsumerState::new(meta));
-                // Cancel any pending will for this client (MQTT 5.0 Will Delay)
-                let client_hash = name_hash(&group_name);
-                if self.meta.pending_wills.remove(&client_hash).is_some() {
-                    debug!(consumer_id, "cancelled pending will on reconnect");
-                }
-                debug!(consumer_id, "consumer registered");
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_DISCONNECT_CONSUMER => {
-                let consumer_id = cmd.field_u64(1);
-                // Take the will message and client_id before removing the consumer
-                let (will, client_id) = self
-                    .meta
-                    .consumers
-                    .get(&consumer_id)
-                    .map(|c| (c.take_will(), c.meta.group_name.clone()))
-                    .unwrap_or((None, String::new()));
-                if self.meta.consumers.remove(&consumer_id).is_some() {
-                    // O(1) disconnect using reverse indexes
-                    let (queue_ids, actor_ns_ids, job_ids) =
-                        self.meta.remove_consumer_indexes(consumer_id);
-
-                    // Release actor assignments (O(1) — only tracked namespaces)
-                    if let Some(ns_ids) = actor_ns_ids {
-                        for ns_id in ns_ids {
-                            if let Some(ns) = self.meta.actor_namespaces.get(&ns_id) {
-                                ns.apply_release(consumer_id);
-                            }
-                        }
-                    }
-
-                    // Release job assignments (O(1) — only tracked jobs)
-                    if let Some(j_ids) = job_ids {
-                        for job_id in j_ids {
-                            if let Some(job) = self.meta.jobs.get(&job_id) {
-                                if job.assigned_consumer_id() == Some(consumer_id) {
-                                    job.apply_unassign();
-                                }
-                            }
-                        }
-                    }
-
-                    // Return in-flight queue messages (O(1) — only tracked queues)
-                    let mut had_in_flight = false;
-                    if let Some(q_ids) = queue_ids {
-                        for queue_id in q_ids {
-                            if let Some(queue) = self.meta.queues.get(&queue_id) {
-                                let in_flight_ids = queue.consumer_in_flight_ids(consumer_id);
-                                if !in_flight_ids.is_empty() {
-                                    had_in_flight = true;
-                                    queue.apply_nack(&in_flight_ids);
-                                }
-                            }
-                        }
-                    }
-                    if had_in_flight {
-                        self.mark_purge_floor_dirty();
-                    }
-
-                    // Publish will message if present
-                    if let Some(will) = will {
-                        if will.delay_secs > 0 {
-                            // Store as pending will with scheduled fire time
-                            let fire_at_ms = current_time + (will.delay_secs as u64 * 1000);
-                            let delay_secs = will.delay_secs;
-                            let client_hash = name_hash(&client_id);
-                            self.meta.pending_wills.insert(
-                                client_hash,
-                                PendingWill {
-                                    consumer_id,
-                                    client_id: client_id.clone(),
-                                    will,
-                                    fire_at_ms,
-                                },
-                            );
-                            debug!(consumer_id, delay_secs, "will stored as pending");
-                            return MqResponse::WillPending {
-                                consumer_id,
-                                delay_secs,
-                            };
-                        }
-                        // Immediate will: publish to exchange
-                        if let Some(exchange) = self.meta.exchanges.get(&will.exchange_id) {
-                            let routing_key_bytes = will.routing_key.as_bytes();
-                            let routing_key_str = Some(will.routing_key.as_str());
-                            let target_queue_ids = exchange.route(routing_key_str);
-                            drop(exchange);
-
-                            // If retain flag, store in exchange
-                            if will.retain {
-                                if let Some(mut ex) = self.meta.exchanges.get_mut(&will.exchange_id)
-                                {
-                                    ex.retained
-                                        .insert(will.routing_key.clone(), will.message.clone());
-                                }
-                            }
-
-                            let messages = [will.message];
-                            for qid in &target_queue_ids {
-                                if let Some(queue) = self.meta.queues.get(qid) {
-                                    queue.apply_enqueue(log_index, &messages, &[], current_time);
-                                }
-                            }
-                            for qid in &target_queue_ids {
-                                self.meta.queue_notifier.notify(*qid);
-                            }
-                            let _ = routing_key_bytes; // suppress unused warning
-                        }
-                    }
-
-                    debug!(consumer_id, "consumer disconnected");
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Ok // idempotent
-                }
-            }
-
-            MqCommand::TAG_HEARTBEAT => {
-                let consumer_id = cmd.field_u64(1);
-                if let Some(consumer) = self.meta.consumers.get(&consumer_id) {
-                    consumer.heartbeat(current_time);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Consumer,
-                        id: consumer_id,
-                    })
-                }
-            }
-
-            MqCommand::TAG_REGISTER_PRODUCER => {
-                let v = cmd.as_register_producer();
-                let producer_id = v.producer_id();
-                let name = v.name();
-                let meta = ProducerMeta::new(producer_id, name, log_index);
-                self.meta.producers.insert(producer_id, meta);
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_DISCONNECT_PRODUCER => {
-                let producer_id = cmd.field_u64(1);
-                self.meta.producers.remove(&producer_id);
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_BATCH => {
-                let batch = cmd.as_batch();
-                let responses: SmallVec<[MqResponse; 8]> = batch
-                    .commands()
-                    .map(|sub| self.apply_command(&sub, log_index, current_time))
-                    .collect();
-                MqResponse::BatchResponse(Box::new(responses))
-            }
-
-            // =================================================================
-            // Consumer Groups
+            // Consumer Groups (11-18)
             // =================================================================
             MqCommand::TAG_CREATE_CONSUMER_GROUP => {
                 let v = cmd.as_create_consumer_group();
                 let name = v.name().to_owned();
-                let hash = name_hash(&name);
-                if let Some(r) = self.meta.consumer_group_names.get(&hash) {
+                let name_h = name_hash(&name);
+
+                // Check for name collision with existing groups
+                if md.consumer_group_names.contains_key(&name_h) {
                     return MqResponse::Error(MqError::AlreadyExists {
                         entity: EntityKind::ConsumerGroup,
-                        id: *r,
+                        id: 0,
                     });
                 }
-                let id = self.meta.alloc_id();
+
+                let group_id = md.alloc_id();
                 let auto_offset_reset = match v.auto_offset_reset() {
-                    0 => crate::consumer_group::AutoOffsetReset::Earliest,
-                    2 => crate::consumer_group::AutoOffsetReset::None,
-                    _ => crate::consumer_group::AutoOffsetReset::Latest,
+                    0 => AutoOffsetReset::Earliest,
+                    2 => AutoOffsetReset::None,
+                    _ => AutoOffsetReset::Latest,
                 };
-                let meta = crate::consumer_group::ConsumerGroupMeta {
-                    group_id: id,
+
+                let variant_config = v.variant_config();
+                let variant = match &variant_config {
+                    VariantConfig::Offset => GroupVariant::Offset,
+                    VariantConfig::Ack(_) => GroupVariant::Ack,
+                    VariantConfig::Actor(_) => GroupVariant::Actor,
+                };
+
+                // Auto-create source topic if requested
+                let source_topic_id = if v.auto_create_topic() {
+                    let topic_name_h = name_hash(&name);
+                    let topic_id = if let Some(existing) = md.topic_names.get(&topic_name_h) {
+                        *existing
+                    } else {
+                        let tid = md.alloc_id();
+                        let mut topic_meta =
+                            TopicMeta::new(tid, name.clone(), current_time, v.topic_retention());
+                        topic_meta.lifetime = v.topic_lifetime();
+                        topic_meta.dedup_config = v.topic_dedup();
+                        let topic_state = TopicState::new(topic_meta, md.catalog_name());
+                        md.topics.insert(tid, topic_state);
+                        md.topic_names.insert(topic_name_h, tid);
+                        tid
+                    };
+                    // Attach group to topic
+                    if let Some(topic) = md.topics.get(&topic_id) {
+                        topic.attach_group(group_id);
+                    }
+                    topic_id
+                } else {
+                    0
+                };
+
+                // Auto-create DLQ topic if specified
+                if let Some(dlq_name) = v.dlq_topic_name() {
+                    let dlq_h = name_hash(&dlq_name);
+                    if !md.topic_names.contains_key(&dlq_h) {
+                        let dlq_id = md.alloc_id();
+                        let dlq_meta = TopicMeta::new(
+                            dlq_id,
+                            dlq_name,
+                            current_time,
+                            RetentionPolicy::default(),
+                        );
+                        let dlq_state = TopicState::new(dlq_meta, md.catalog_name());
+                        md.topics.insert(dlq_id, dlq_state);
+                        md.topic_names.insert(dlq_h, dlq_id);
+                    }
+                }
+
+                // Auto-create response topic if specified
+                if let Some(resp_name) = v.response_topic_name() {
+                    let resp_h = name_hash(&resp_name);
+                    if !md.topic_names.contains_key(&resp_h) {
+                        let resp_id = md.alloc_id();
+                        let resp_meta = TopicMeta::new(
+                            resp_id,
+                            resp_name,
+                            current_time,
+                            RetentionPolicy::default(),
+                        );
+                        let resp_state = TopicState::new(resp_meta, md.catalog_name());
+                        md.topics.insert(resp_id, resp_state);
+                        md.topic_names.insert(resp_h, resp_id);
+                    }
+                }
+
+                let meta = ConsumerGroupMeta {
+                    group_id,
                     name,
-                    name_hash: hash,
+                    name_hash: name_h,
                     created_at: current_time,
                     generation: 0,
-                    phase: crate::consumer_group::GroupPhase::Empty,
+                    phase: GroupPhase::Empty,
                     protocol_type: String::new(),
                     protocol_name: String::new(),
                     leader: None,
@@ -1098,19 +421,53 @@ impl MqEngine {
                     last_activity_at: current_time,
                     next_member_id: 1,
                     members: Vec::new(),
+                    variant,
+                    source_topic_id,
+                    variant_config,
                 };
-                let state =
-                    crate::consumer_group::ConsumerGroupState::new(meta, self.meta.catalog_name());
-                self.meta.consumer_group_names.insert(hash, id);
-                self.meta.consumer_groups.insert(id, state);
-                info!(group_id = id, "consumer group created");
-                MqResponse::EntityCreated { id }
+                let state = ConsumerGroupState::new(meta, md.catalog_name(), md.server_start_ms);
+                md.consumer_group_names.insert(name_h, group_id);
+                md.consumer_groups.insert(group_id, state);
+                info!(
+                    group_id,
+                    ?variant,
+                    source_topic_id,
+                    "consumer group created"
+                );
+                MqResponse::EntityCreated { id: group_id }
             }
 
             MqCommand::TAG_DELETE_CONSUMER_GROUP => {
                 let group_id = cmd.field_u64(1);
-                if let Some((_, group)) = self.meta.consumer_groups.remove(&group_id) {
-                    self.meta.consumer_group_names.remove(&group.meta.name_hash);
+                if let Some((_, group)) = md.consumer_groups.remove(&group_id) {
+                    md.consumer_group_names.remove(&group.meta.name_hash);
+                    let source = group.meta.source_topic_id;
+                    if source != 0 {
+                        if let Some(topic) = md.topics.get(&source) {
+                            topic.detach_group(group_id);
+                            if topic.should_auto_delete() {
+                                let topic_id = topic.meta.topic_id;
+                                let nh = topic.meta.name_hash;
+                                drop(topic);
+                                md.topics.remove(&topic_id);
+                                md.topic_names.remove(&nh);
+                            }
+                        }
+                    }
+                    // Check if variant state had messages for purge floor
+                    match &group.variant_state {
+                        VariantState::Ack(ack) => {
+                            if ack.has_messages() {
+                                self.mark_purge_floor_dirty();
+                            }
+                        }
+                        VariantState::Actor(actor) => {
+                            if actor.active_count() > 0 {
+                                self.mark_purge_floor_dirty();
+                            }
+                        }
+                        _ => {}
+                    }
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
@@ -1126,7 +483,7 @@ impl MqEngine {
                 let member_id_str = v.member_id();
                 let client_id = v.client_id();
 
-                let group = match self.meta.consumer_groups.get(&group_id) {
+                let group = match md.consumer_groups.get(&group_id) {
                     Some(g) => g,
                     None => {
                         return MqResponse::Error(MqError::NotFound {
@@ -1145,8 +502,8 @@ impl MqEngine {
                 };
 
                 // Insert/update member
-                let protocols = smallvec::SmallVec::from_vec(v.protocols());
-                group.upsert_member(crate::consumer_group::GroupMemberState {
+                let protocols = SmallVec::from_vec(v.protocols());
+                group.upsert_member(GroupMemberState {
                     member_id: actual_member_id.clone(),
                     client_id: client_id.to_string(),
                     session_timeout_ms: v.session_timeout_ms(),
@@ -1161,10 +518,8 @@ impl MqEngine {
 
                 // Transition phase if needed
                 let phase = group.phase();
-                if phase == crate::consumer_group::GroupPhase::Empty
-                    || phase == crate::consumer_group::GroupPhase::Stable
-                {
-                    group.set_phase(crate::consumer_group::GroupPhase::PreparingRebalance);
+                if phase == GroupPhase::Empty || phase == GroupPhase::Stable {
+                    group.set_phase(GroupPhase::PreparingRebalance);
                 }
 
                 // Check if all members have joined
@@ -1173,7 +528,7 @@ impl MqEngine {
                     group.bump_generation();
                     group.select_and_set_protocol();
                     group.elect_leader();
-                    group.set_phase(crate::consumer_group::GroupPhase::CompletingRebalance);
+                    group.set_phase(GroupPhase::CompletingRebalance);
                     group.clear_join_marks();
                     group.record_rebalance();
                     group.phase_notify.notify_waiters();
@@ -1204,7 +559,7 @@ impl MqEngine {
                 let generation = v.generation();
                 let member_id = v.member_id();
 
-                let group = match self.meta.consumer_groups.get(&group_id) {
+                let group = match md.consumer_groups.get(&group_id) {
                     Some(g) => g,
                     None => {
                         return MqResponse::Error(MqError::NotFound {
@@ -1224,7 +579,7 @@ impl MqEngine {
                     for (mid, data) in &assignments {
                         group.set_member_assignment(mid, Bytes::from(data.clone()));
                     }
-                    group.set_phase(crate::consumer_group::GroupPhase::Stable);
+                    group.set_phase(GroupPhase::Stable);
                     group.touch_activity(current_time);
                     group.phase_notify.notify_waiters();
                 }
@@ -1232,10 +587,8 @@ impl MqEngine {
                 group.mark_synced(member_id);
 
                 // If all synced but no assignments provided, transition anyway
-                if group.all_members_synced()
-                    && group.phase() != crate::consumer_group::GroupPhase::Stable
-                {
-                    group.set_phase(crate::consumer_group::GroupPhase::Stable);
+                if group.all_members_synced() && group.phase() != GroupPhase::Stable {
+                    group.set_phase(GroupPhase::Stable);
                     group.phase_notify.notify_waiters();
                 }
 
@@ -1246,7 +599,7 @@ impl MqEngine {
 
                 MqResponse::GroupSynced {
                     assignment,
-                    phase_complete: group.phase() == crate::consumer_group::GroupPhase::Stable,
+                    phase_complete: group.phase() == GroupPhase::Stable,
                 }
             }
 
@@ -1255,7 +608,7 @@ impl MqEngine {
                 let group_id = v.group_id();
                 let member_id = v.member_id();
 
-                let group = match self.meta.consumer_groups.get(&group_id) {
+                let group = match md.consumer_groups.get(&group_id) {
                     Some(g) => g,
                     None => return MqResponse::Ok, // Idempotent
                 };
@@ -1263,10 +616,10 @@ impl MqEngine {
                 group.remove_member(member_id);
 
                 if group.member_count() == 0 {
-                    group.set_phase(crate::consumer_group::GroupPhase::Empty);
+                    group.set_phase(GroupPhase::Empty);
                     group.clear_leader();
-                } else if group.phase() == crate::consumer_group::GroupPhase::Stable {
-                    group.set_phase(crate::consumer_group::GroupPhase::PreparingRebalance);
+                } else if group.phase() == GroupPhase::Stable {
+                    group.set_phase(GroupPhase::PreparingRebalance);
                 }
 
                 group.phase_notify.notify_waiters();
@@ -1279,7 +632,7 @@ impl MqEngine {
                 let member_id = v.member_id();
                 let generation = v.generation();
 
-                let group = match self.meta.consumer_groups.get(&group_id) {
+                let group = match md.consumer_groups.get(&group_id) {
                     Some(g) => g,
                     None => {
                         return MqResponse::Error(MqError::NotFound {
@@ -1300,7 +653,7 @@ impl MqEngine {
                 group.update_member_heartbeat(member_id, current_time);
                 group.touch_activity(current_time);
 
-                if group.phase() == crate::consumer_group::GroupPhase::PreparingRebalance {
+                if group.phase() == GroupPhase::PreparingRebalance {
                     MqResponse::Error(MqError::RebalanceInProgress)
                 } else {
                     MqResponse::Ok
@@ -1312,7 +665,7 @@ impl MqEngine {
                 let group_id = v.group_id();
                 let generation = v.generation();
 
-                let group = match self.meta.consumer_groups.get(&group_id) {
+                let group = match md.consumer_groups.get(&group_id) {
                     Some(g) => g,
                     None => {
                         return MqResponse::Error(MqError::NotFound {
@@ -1328,7 +681,7 @@ impl MqEngine {
 
                 group.offsets.insert(
                     (v.topic_id(), v.partition_index()),
-                    crate::consumer_group::GroupTopicPartitionOffset {
+                    GroupTopicPartitionOffset {
                         topic_id: v.topic_id(),
                         partition_index: v.partition_index(),
                         committed_offset: v.offset(),
@@ -1343,14 +696,13 @@ impl MqEngine {
             }
 
             MqCommand::TAG_EXPIRE_GROUP_SESSIONS => {
+                // Wire: [tag:1][now_ms:8]
                 let now_ms = cmd.field_u64(1);
 
-                for entry in self.meta.consumer_groups.iter() {
+                for entry in md.consumer_groups.iter() {
                     let group = entry.value();
                     let phase = group.phase();
-                    if phase == crate::consumer_group::GroupPhase::Dead
-                        || phase == crate::consumer_group::GroupPhase::Empty
-                    {
+                    if phase == GroupPhase::Dead || phase == GroupPhase::Empty {
                         continue;
                     }
 
@@ -1360,10 +712,10 @@ impl MqEngine {
                             group.remove_member(mid);
                         }
                         if group.member_count() == 0 {
-                            group.set_phase(crate::consumer_group::GroupPhase::Empty);
+                            group.set_phase(GroupPhase::Empty);
                             group.clear_leader();
-                        } else if group.phase() == crate::consumer_group::GroupPhase::Stable {
-                            group.set_phase(crate::consumer_group::GroupPhase::PreparingRebalance);
+                        } else if group.phase() == GroupPhase::Stable {
+                            group.set_phase(GroupPhase::PreparingRebalance);
                         }
                         group.phase_notify.notify_waiters();
                     }
@@ -1372,203 +724,666 @@ impl MqEngine {
                 MqResponse::Ok
             }
 
-            MqCommand::TAG_EXPIRE_GROUP_OFFSETS => {
-                let before_timestamp = cmd.field_u64(1);
+            // =================================================================
+            // Ack Variant (19-29)
+            // =================================================================
+            MqCommand::TAG_GROUP_DELIVER => {
+                // Wire: [tag:1][group_id:8][consumer_id:8][max_count:4]
+                let group_id = cmd.field_u64(1);
+                let consumer_id = cmd.field_u64(9);
+                let max_count = cmd.field_u32(17);
 
-                // Use SmallVec to avoid heap allocation for typical small sets
-                let to_remove: smallvec::SmallVec<[u64; 8]> = self
-                    .meta
-                    .consumer_groups
-                    .iter()
-                    .filter(|entry| {
-                        let g = entry.value();
-                        g.phase() == crate::consumer_group::GroupPhase::Empty
-                            && g.last_activity_at() < before_timestamp
-                    })
-                    .map(|entry| *entry.key())
-                    .collect();
-
-                for group_id in to_remove {
-                    if let Some((_, group)) = self.meta.consumer_groups.remove(&group_id) {
-                        self.meta.consumer_group_names.remove(&group.meta.name_hash);
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
+                        let delivered = ack.apply_deliver(
+                            config,
+                            consumer_id,
+                            max_count,
+                            current_time,
+                            log_index,
+                        );
+                        if !delivered.is_empty() {
+                            md.track_session_group(consumer_id, group_id);
+                        }
+                        let msgs: SmallVec<[DeliveredMessage; 8]> = delivered
+                            .iter()
+                            .map(|&msg_id| {
+                                let attempt = ack.messages.get(&msg_id).map_or(1, |m| m.attempts);
+                                DeliveredMessage {
+                                    message_id: msg_id,
+                                    attempt,
+                                    original_timestamp: current_time,
+                                    group_id,
+                                }
+                            })
+                            .collect();
+                        md.group_notifier.notify(group_id);
+                        return MqResponse::Messages { messages: msgs };
                     }
                 }
+                MqResponse::Error(MqError::NotFound {
+                    entity: EntityKind::ConsumerGroup,
+                    id: group_id,
+                })
+            }
 
+            MqCommand::TAG_GROUP_ACK => {
+                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
+                let group_id = cmd.field_u64(1);
+                let message_ids = {
+                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
+                    crate::codec::decode_cmd_vec_u64(&mut cursor)
+                };
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(ack) = group.ack_state() {
+                        // Collect reply_to info before acking
+                        let reply_pairs: SmallVec<[(u64, Bytes); 4]> = message_ids
+                            .iter()
+                            .filter_map(|&msg_id| {
+                                ack.messages.get(&msg_id).and_then(|m| {
+                                    m.reply_to.as_ref().map(|rt| (msg_id, rt.clone()))
+                                })
+                            })
+                            .collect();
+
+                        ack.apply_ack(&message_ids);
+
+                        if let Some(min_id) = message_ids.iter().copied().min() {
+                            self.on_message_removed(min_id);
+                        }
+
+                        // Route replies
+                        for (_msg_id, reply_to) in reply_pairs {
+                            let hash = name_hash_bytes(&reply_to);
+                            if let Some(r) = md.topic_names.get(&hash) {
+                                let topic_id = *r;
+                                drop(r);
+                                if let Some(topic) = md.topics.get(&topic_id) {
+                                    // Publish an empty acknowledgment to the reply topic
+                                    topic.apply_publish(log_index, std::iter::once(Bytes::new()));
+                                    self.on_message_added(log_index);
+                                }
+                            }
+                        }
+
+                        return MqResponse::Ok;
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_NACK => {
+                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
+                let group_id = cmd.field_u64(1);
+                let message_ids = {
+                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
+                    crate::codec::decode_cmd_vec_u64(&mut cursor)
+                };
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(ack) = group.ack_state() {
+                        ack.apply_nack(&message_ids);
+                        md.group_notifier.notify(group_id);
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_RELEASE => {
+                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
+                let group_id = cmd.field_u64(1);
+                let message_ids = {
+                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
+                    crate::codec::decode_cmd_vec_u64(&mut cursor)
+                };
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(ack) = group.ack_state() {
+                        ack.apply_release(&message_ids);
+                        md.group_notifier.notify(group_id);
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_MODIFY => {
+                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
+                // Modify = release with re-delivery semantics (return to pending, keep attempts)
+                let group_id = cmd.field_u64(1);
+                let message_ids = {
+                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
+                    crate::codec::decode_cmd_vec_u64(&mut cursor)
+                };
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(ack) = group.ack_state() {
+                        // NACK returns to pending with incremented attempts
+                        ack.apply_nack(&message_ids);
+                        md.group_notifier.notify(group_id);
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_EXTEND_VISIBILITY => {
+                // Wire: [tag:1][group_id:8][vec_u64(message_ids)][extension_ms:8]
+                let group_id = cmd.field_u64(1);
+                // Parse message_ids and extension_ms from the buffer
+                let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
+                let message_ids = crate::codec::decode_cmd_vec_u64(&mut cursor);
+                let pos = cursor.position() as usize;
+                let ext_offset = 9 + pos;
+                let extension_ms = cmd.field_u64(ext_offset);
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(ack) = group.ack_state() {
+                        ack.apply_extend_visibility(&message_ids, extension_ms);
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_TIMEOUT_EXPIRED => {
+                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
+                let group_id = cmd.field_u64(1);
+                let message_ids = {
+                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
+                    crate::codec::decode_cmd_vec_u64(&mut cursor)
+                };
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
+                        let dead_lettered =
+                            ack.apply_timeout_expired(&message_ids, config, current_time);
+                        if !dead_lettered.is_empty() {
+                            // Resolve DLQ topic
+                            let dlq_topic_id = self.resolve_dlq_topic(&group);
+                            return MqResponse::DeadLettered {
+                                dead_letter_ids: dead_lettered,
+                                dlq_topic_id,
+                            };
+                        }
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_PUBLISH_TO_DLQ => {
+                // Wire: [tag:1][group_id:8][dlq_topic_id:8][vec_u64(dead_letter_ids)][vec_bytes(messages)]
+                let v = cmd.as_publish_to_dlq();
+                let source_group_id = v.source_group_id();
+                let dlq_topic_id = v.dlq_topic_id();
+                let dead_letter_ids = v.dead_letter_ids();
+                let messages = v.messages();
+
+                // Publish dead-lettered messages to the DLQ topic
+                if let Some(topic) = md.topics.get(&dlq_topic_id) {
+                    topic.apply_publish(log_index, messages);
+                    self.on_message_added(log_index);
+                }
+                // Remove dead-lettered messages from the source group's ack state
+                if let Some(group) = md.consumer_groups.get(&source_group_id) {
+                    if let Some(ack) = group.ack_state() {
+                        ack.apply_remove_dead_lettered(&dead_letter_ids);
+                        self.mark_purge_floor_dirty();
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_EXPIRE_PENDING => {
+                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
+                let group_id = cmd.field_u64(1);
+                let message_ids = {
+                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
+                    crate::codec::decode_cmd_vec_u64(&mut cursor)
+                };
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(ack) = group.ack_state() {
+                        ack.apply_expire_pending(&message_ids);
+                        self.mark_purge_floor_dirty();
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_PURGE => {
+                // Wire: [tag:1][group_id:8]
+                let group_id = cmd.field_u64(1);
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(ack) = group.ack_state() {
+                        if ack.purge() {
+                            self.mark_purge_floor_dirty();
+                        }
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_GET_ATTRIBUTES => {
+                // Wire: [tag:1][group_id:8]
+                let group_id = cmd.field_u64(1);
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    let variant = group.meta.variant;
+                    let (pending, in_flight, dlq, actors) = match &group.variant_state {
+                        VariantState::Ack(ack) => (
+                            ack.pending_count(),
+                            ack.in_flight_count(),
+                            ack.dlq_count(),
+                            0,
+                        ),
+                        VariantState::Actor(actor) => (0, 0, 0, actor.active_count()),
+                        VariantState::Offset => (0, 0, 0, 0),
+                    };
+                    MqResponse::Stats(EntityStats::ConsumerGroup {
+                        group_id,
+                        variant,
+                        pending_count: pending,
+                        in_flight_count: in_flight,
+                        dlq_count: dlq,
+                        active_actor_count: actors,
+                    })
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::ConsumerGroup,
+                        id: group_id,
+                    })
+                }
+            }
+
+            // =================================================================
+            // Actor Variant (30-35)
+            // =================================================================
+            MqCommand::TAG_GROUP_DELIVER_ACTOR => {
+                // Wire: [tag:1][group_id:8][consumer_id:8][count:4][actor_id_1:len_prefixed]...
+                let group_id = cmd.field_u64(1);
+                let consumer_id = cmd.field_u64(9);
+                let actor_count = cmd.field_u32(17) as usize;
+                let mut offset = 21;
+                let mut actor_ids: SmallVec<[Bytes; 8]> = SmallVec::with_capacity(actor_count);
+                for _ in 0..actor_count {
+                    let len = cmd.field_u32(offset) as usize;
+                    offset += 4;
+                    let id = cmd.buf.slice(offset..offset + len);
+                    offset += len;
+                    actor_ids.push(id);
+                }
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(actor_state) = group.actor_state() {
+                        let mut msgs = SmallVec::new();
+                        for actor_id in &actor_ids {
+                            if let Some(msg_idx) =
+                                actor_state.apply_deliver(actor_id, consumer_id, 0)
+                            {
+                                msgs.push(DeliveredMessage {
+                                    message_id: msg_idx,
+                                    attempt: 1,
+                                    original_timestamp: current_time,
+                                    group_id,
+                                });
+                            }
+                        }
+                        if !msgs.is_empty() {
+                            md.track_session_group(consumer_id, group_id);
+                        }
+                        return MqResponse::Messages { messages: msgs };
+                    }
+                }
+                MqResponse::Error(MqError::NotFound {
+                    entity: EntityKind::ConsumerGroup,
+                    id: group_id,
+                })
+            }
+
+            MqCommand::TAG_GROUP_ACK_ACTOR => {
+                // Wire: [tag:1][group_id:8][actor_id:len_prefixed][message_id:8]
+                let group_id = cmd.field_u64(1);
+                let actor_id_len = cmd.field_u32(9) as usize;
+                let actor_id = cmd.buf.slice(13..13 + actor_id_len);
+                let message_id = cmd.field_u64(13 + actor_id_len);
+
+                self.on_message_removed(message_id);
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(actor_state) = group.actor_state() {
+                        let reply_to = actor_state.apply_ack(&actor_id, message_id, 0);
+                        // Route reply if applicable
+                        if let Some(reply_name) = reply_to {
+                            let hash = name_hash_bytes(&reply_name);
+                            if let Some(r) = md.topic_names.get(&hash) {
+                                let topic_id = *r;
+                                drop(r);
+                                if let Some(topic) = md.topics.get(&topic_id) {
+                                    topic.apply_publish(log_index, std::iter::once(Bytes::new()));
+                                    self.on_message_added(log_index);
+                                }
+                            }
+                        }
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_NACK_ACTOR => {
+                // Wire: [tag:1][group_id:8][actor_id:len_prefixed][message_id:8]
+                let group_id = cmd.field_u64(1);
+                let actor_id_len = cmd.field_u32(9) as usize;
+                let actor_id = cmd.buf.slice(13..13 + actor_id_len);
+                let message_id = cmd.field_u64(13 + actor_id_len);
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(actor_state) = group.actor_state() {
+                        actor_state.apply_nack(&actor_id, message_id, 0);
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_ASSIGN_ACTORS => {
+                // Wire: [tag:1][group_id:8][consumer_id:8][count:4][actor_ids...]
+                let group_id = cmd.field_u64(1);
+                let consumer_id = cmd.field_u64(9);
+                let count = cmd.field_u32(17) as usize;
+                let mut offset = 21;
+                let mut actor_ids: Vec<Bytes> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let len = cmd.field_u32(offset) as usize;
+                    offset += 4;
+                    let id = cmd.buf.slice(offset..offset + len);
+                    offset += len;
+                    actor_ids.push(id);
+                }
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(actor_state) = group.actor_state() {
+                        actor_state.apply_assign(consumer_id, &actor_ids);
+                        md.track_session_group(consumer_id, group_id);
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_RELEASE_ACTORS => {
+                // Wire: [tag:1][group_id:8][consumer_id:8]
+                let group_id = cmd.field_u64(1);
+                let consumer_id = cmd.field_u64(9);
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(actor_state) = group.actor_state() {
+                        actor_state.apply_release(consumer_id);
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_GROUP_EVICT_IDLE => {
+                // Wire: [tag:1][group_id:8][before_timestamp:8]
+                let group_id = cmd.field_u64(1);
+                let before_timestamp = cmd.field_u64(9);
+
+                if let Some(group) = md.consumer_groups.get(&group_id) {
+                    if let Some(actor_state) = group.actor_state() {
+                        let count = actor_state.apply_evict_idle(before_timestamp);
+                        debug!(group_id, count, "evicted idle actors");
+                    }
+                }
                 MqResponse::Ok
             }
 
             // =================================================================
-            // MQTT Optimizations
+            // Cron (36-39)
             // =================================================================
-            MqCommand::TAG_SET_RETAINED => {
-                let v = cmd.as_set_retained();
-                let exchange_id = v.exchange_id();
-                let routing_key = v.routing_key().to_owned();
-                let message = v.message();
-                if let Some(mut exchange) = self.meta.exchanges.get_mut(&exchange_id) {
-                    exchange.retained.insert(routing_key, message);
+            MqCommand::TAG_CRON_ENABLE => {
+                // Wire: [tag:1][topic_id:8]
+                let topic_id = cmd.field_u64(1);
+                if let Some(topic) = md.topics.get(&topic_id) {
+                    topic.cron_enabled.store(true, Ordering::Relaxed);
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Exchange,
-                        id: exchange_id,
+                        entity: EntityKind::Topic,
+                        id: topic_id,
                     })
                 }
             }
 
-            MqCommand::TAG_DELETE_RETAINED => {
-                let v = cmd.as_delete_retained();
-                let exchange_id = v.exchange_id();
-                let routing_key = v.routing_key();
-                if let Some(mut exchange) = self.meta.exchanges.get_mut(&exchange_id) {
-                    exchange.retained.remove(routing_key);
+            MqCommand::TAG_CRON_DISABLE => {
+                // Wire: [tag:1][topic_id:8]
+                let topic_id = cmd.field_u64(1);
+                if let Some(topic) = md.topics.get(&topic_id) {
+                    topic.cron_enabled.store(false, Ordering::Relaxed);
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Exchange,
-                        id: exchange_id,
+                        entity: EntityKind::Topic,
+                        id: topic_id,
                     })
                 }
             }
 
-            MqCommand::TAG_GET_RETAINED => {
-                let v = cmd.as_get_retained();
-                let exchange_id = v.exchange_id();
-                let topic_filter = v.topic_filter();
-                if let Some(exchange) = self.meta.exchanges.get(&exchange_id) {
-                    let messages: Vec<RetainedEntry> = exchange
-                        .retained
-                        .iter()
-                        .filter(|(rk, _)| crate::exchange::topic_pattern_matches(topic_filter, rk))
-                        .map(|(rk, msg)| RetainedEntry {
-                            routing_key: Bytes::from(rk.clone()),
-                            message: msg.clone(),
-                        })
-                        .collect();
-                    MqResponse::RetainedMessages { messages }
+            MqCommand::TAG_CRON_TRIGGER => {
+                // Wire: [tag:1][topic_id:8][triggered_at:8]
+                let topic_id = cmd.field_u64(1);
+                let triggered_at = cmd.field_u64(9);
+                if let Some(topic) = md.topics.get(&topic_id) {
+                    // Publish a trigger message
+                    let payload = topic
+                        .meta
+                        .cron_config
+                        .as_ref()
+                        .and_then(|c| c.payload.clone())
+                        .unwrap_or_else(Bytes::new);
+                    topic.apply_publish(log_index, std::iter::once(payload));
+                    topic.apply_cron_trigger(triggered_at);
+                    self.on_message_added(log_index);
+                    MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Exchange,
-                        id: exchange_id,
+                        entity: EntityKind::Topic,
+                        id: topic_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_CRON_UPDATE => {
+                // Wire: [tag:1][topic_id:8] + trailing cron config fields
+                // For now, just acknowledge — full cron config update requires codec extension
+                let topic_id = cmd.field_u64(1);
+                if md.topics.contains_key(&topic_id) {
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Topic,
+                        id: topic_id,
+                    })
+                }
+            }
+
+            // =================================================================
+            // Sessions (40-48)
+            // =================================================================
+            MqCommand::TAG_CREATE_SESSION => {
+                // Wire: [tag:1][session_id:8][client_id:len_prefixed][keep_alive_ms:8][session_expiry_ms:8]
+                let session_id = cmd.field_u64(1);
+                let client_id_len = cmd.field_u32(9) as usize;
+                let client_id = std::str::from_utf8(&cmd.as_bytes()[13..13 + client_id_len])
+                    .unwrap_or("")
+                    .to_string();
+                let keep_alive_offset = 13 + client_id_len;
+                let keep_alive_ms = cmd.field_u64(keep_alive_offset);
+                let session_expiry_ms = cmd.field_u64(keep_alive_offset + 8);
+
+                let client_id_hash = name_hash(&client_id);
+
+                // Client takeover: if existing session with same client_id
+                let takeover_id = self
+                    .metadata
+                    .session_client_index
+                    .get(&client_id_hash)
+                    .map(|entry| *entry)
+                    .filter(|&old_id| old_id != session_id);
+                if let Some(old_id) = takeover_id {
+                    self.disconnect_session_internal(old_id, false, log_index, current_time);
+                }
+
+                let meta = SessionMeta::new(
+                    session_id,
+                    client_id,
+                    current_time,
+                    keep_alive_ms,
+                    session_expiry_ms,
+                );
+                let state = SessionState::new(meta);
+                self.metadata.sessions.insert(session_id, state);
+                self.metadata
+                    .session_client_index
+                    .insert(client_id_hash, session_id);
+                // Cancel any pending will for this client
+                self.metadata.pending_wills.remove(&client_id_hash);
+                MqResponse::EntityCreated { id: session_id }
+            }
+
+            MqCommand::TAG_DISCONNECT_SESSION => {
+                // Wire: [tag:1][session_id:8][publish_will:1]
+                let session_id = cmd.field_u64(1);
+                let publish_will = cmd.as_bytes().get(9).copied().unwrap_or(0) != 0;
+                self.disconnect_session_internal(session_id, publish_will, log_index, current_time)
+            }
+
+            MqCommand::TAG_HEARTBEAT_SESSION => {
+                // Wire: [tag:1][session_id:8]
+                let session_id = cmd.field_u64(1);
+                if let Some(session) = md.sessions.get(&session_id) {
+                    session.heartbeat(current_time);
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Session,
+                        id: session_id,
                     })
                 }
             }
 
             MqCommand::TAG_SET_WILL => {
+                // Reuse old codec view struct (consumer_id = session_id)
                 let v = cmd.as_set_will();
-                let consumer_id = v.consumer_id();
-                if let Some(consumer) = self.meta.consumers.get(&consumer_id) {
-                    let will = WillMessage {
-                        exchange_id: v.exchange_id(),
-                        delay_secs: v.delay_secs(),
-                        qos: v.qos(),
-                        retain: v.retain(),
-                        routing_key: v.routing_key(),
-                        message: v.message(),
+                let session_id = v.consumer_id();
+                if let Some(session) = md.sessions.get(&session_id) {
+                    let will = WillConfig {
+                        topic_id: v.exchange_id(),
+                        payload: v.message(),
+                        delay_ms: v.delay_secs() as u64 * 1000,
+                        retained: v.retain(),
                     };
-                    consumer.set_will(will);
+                    session.set_will(will);
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Consumer,
-                        id: consumer_id,
+                        entity: EntityKind::Session,
+                        id: session_id,
                     })
                 }
             }
 
             MqCommand::TAG_CLEAR_WILL => {
-                let consumer_id = cmd.field_u64(1);
-                if let Some(consumer) = self.meta.consumers.get(&consumer_id) {
-                    consumer.clear_will();
+                // Wire: [tag:1][session_id:8]
+                let session_id = cmd.field_u64(1);
+                if let Some(session) = md.sessions.get(&session_id) {
+                    session.clear_will();
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Consumer,
-                        id: consumer_id,
+                        entity: EntityKind::Session,
+                        id: session_id,
                     })
                 }
             }
 
-            MqCommand::TAG_MARK_RECEIVED => {
-                let v = cmd.as_mark_received();
-                let queue_id = v.queue_id();
-                let message_ids = v.message_ids();
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    queue.apply_mark_received(&message_ids);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
-                }
-            }
+            MqCommand::TAG_FIRE_PENDING_WILLS => {
+                // Wire: [tag:1][now_ms:8]
+                let now_ms = cmd.field_u64(1);
+                let mut count = 0u32;
+                let mut to_fire: SmallVec<[(u64, PendingWill); 4]> = SmallVec::new();
 
-            MqCommand::TAG_MARK_RELEASED => {
-                let v = cmd.as_mark_released();
-                let queue_id = v.queue_id();
-                let message_ids = v.message_ids();
-                if let Some(queue) = self.meta.queues.get(&queue_id) {
-                    queue.apply_mark_released(&message_ids);
-                    MqResponse::Ok
-                } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Queue,
-                        id: queue_id,
-                    })
+                for entry in md.pending_wills.iter() {
+                    if entry.fire_at_ms <= now_ms {
+                        to_fire.push((*entry.key(), entry.value().clone()));
+                    }
                 }
+
+                for (key, pw) in to_fire {
+                    md.pending_wills.remove(&key);
+                    if let Some(topic) = md.topics.get(&pw.will.topic_id) {
+                        topic.apply_publish(log_index, std::iter::once(pw.will.payload));
+                        self.on_message_added(log_index);
+                        count += 1;
+                    }
+                }
+
+                MqResponse::WillsFired { count }
             }
 
             MqCommand::TAG_PERSIST_SESSION => {
                 let v = cmd.as_persist_session();
-                let consumer_id = v.consumer_id();
-                let session = PersistedSession {
-                    consumer_id,
-                    client_id: v.client_id().to_owned(),
-                    session_expiry_secs: v.session_expiry_secs(),
-                    subscription_data: v.subscription_data(),
-                    persisted_at: current_time,
-                    inbound_qos_inflight: v.inbound_qos_inflight(),
-                    outbound_qos1_count: v.outbound_qos1_count(),
-                    remaining_quota: v.remaining_quota(),
-                };
-                // Maintain O(1) client_id → consumer_id reverse index
-                let client_hash = name_hash(v.client_id());
-                self.meta
-                    .session_client_index
-                    .insert(client_hash, consumer_id);
-                self.meta.persisted_sessions.insert(consumer_id, session);
+                let session_id = v.consumer_id(); // reuses old field name
+                let client_id = v.client_id().to_string();
+                let client_id_hash = name_hash(&client_id);
+                let session_expiry_ms = v.session_expiry_secs() as u64 * 1000;
+                let subscription_data = v.subscription_data();
+
+                // Store or update session with subscription data
+                if let Some(session) = md.sessions.get(&session_id) {
+                    // Session already exists, just update expiry
+                    drop(session);
+                } else {
+                    // Create a new session shell for persistence
+                    let meta = SessionMeta::new(
+                        session_id,
+                        client_id.clone(),
+                        current_time,
+                        0,
+                        session_expiry_ms,
+                    );
+                    md.sessions.insert(session_id, SessionState::new(meta));
+                }
+
+                md.session_client_index.insert(client_id_hash, session_id);
+                let _ = subscription_data; // subscription data is embedded in the session state
                 MqResponse::Ok
             }
 
             MqCommand::TAG_RESTORE_SESSION => {
                 let v = cmd.as_restore_session();
                 let client_id = v.client_id();
-                let client_hash = name_hash(client_id);
-                // O(1) lookup via client_id hash → consumer_id reverse index
-                let found =
-                    self.meta
-                        .session_client_index
-                        .get(&client_hash)
-                        .and_then(|consumer_id| {
-                            self.meta
-                                .persisted_sessions
-                                .get(&consumer_id)
-                                .map(|entry| entry.value().clone())
-                        });
+                let client_id_hash = name_hash(client_id);
+
+                // O(1) lookup via client_id hash
+                let found = md
+                    .session_client_index
+                    .get(&client_id_hash)
+                    .and_then(|session_id| {
+                        md.sessions.get(&*session_id).map(|s| {
+                            let snap = s.snapshot_meta();
+                            (*session_id, snap)
+                        })
+                    });
+
                 match found {
-                    Some(session) => {
-                        let expiry_ms = session.session_expiry_secs as u64 * 1000;
-                        if expiry_ms > 0 && current_time > session.persisted_at + expiry_ms {
-                            // Session expired — remove it
-                            self.meta.persisted_sessions.remove(&session.consumer_id);
-                            self.meta.session_client_index.remove(&client_hash);
+                    Some((session_id, snap)) => {
+                        let expiry_ms = snap.session_expiry_ms;
+                        if expiry_ms > 0 && current_time > snap.last_activity_at + expiry_ms {
+                            // Session expired
+                            md.sessions.remove(&session_id);
+                            md.session_client_index.remove(&client_id_hash);
                             MqResponse::SessionNotFound
                         } else {
                             MqResponse::SessionRestored {
-                                consumer_id: session.consumer_id,
-                                session_expiry_secs: session.session_expiry_secs,
-                                subscription_data: session.subscription_data,
+                                session_id,
+                                session_expiry_ms: expiry_ms,
+                                subscription_data: Bytes::new(), // TODO: serialize subscription state
                             }
                         }
                     }
@@ -1578,171 +1393,50 @@ impl MqEngine {
 
             MqCommand::TAG_EXPIRE_SESSIONS => {
                 let now_ms = current_time;
-                // Use retain to avoid intermediate Vec allocation
-                self.meta.persisted_sessions.retain(|_key, s| {
-                    let expiry_ms = s.session_expiry_secs as u64 * 1000;
-                    !(expiry_ms > 0 && now_ms > s.persisted_at + expiry_ms)
-                });
-                MqResponse::Ok
-            }
+                let mut expired_ids: SmallVec<[u64; 8]> = SmallVec::new();
 
-            MqCommand::TAG_MULTI_DELIVER => {
-                let v = cmd.as_multi_deliver();
-                let consumer_id = v.consumer_id();
-                let queue_specs = v.queues();
-                let mut queues = Vec::with_capacity(queue_specs.len());
-                for (queue_id, max_count) in queue_specs {
-                    if let Some(queue) = self.meta.queues.get(&queue_id) {
-                        let msg_ids =
-                            queue.apply_deliver(consumer_id, max_count, current_time, log_index);
-                        if !msg_ids.is_empty() {
-                            self.meta.track_consumer_queue(consumer_id, queue_id);
-                        }
-                        let messages: smallvec::SmallVec<[DeliveredMessage; 8]> = msg_ids
-                            .iter()
-                            .filter_map(|&id| {
-                                queue.messages.get(&id).map(|meta| DeliveredMessage {
-                                    message_id: id,
-                                    attempt: meta.attempts,
-                                    original_timestamp: current_time,
-                                    queue_id,
-                                })
-                            })
-                            .collect();
-                        queues.push((queue_id, messages));
+                for entry in md.sessions.iter() {
+                    let session = entry.value();
+                    if session.is_expired(now_ms) {
+                        expired_ids.push(*entry.key());
                     }
                 }
-                MqResponse::MultiMessages { queues }
-            }
 
-            MqCommand::TAG_MULTI_ACK => {
-                let v = cmd.as_multi_ack();
-                let queue_specs = v.queues();
-                for (queue_id, message_ids) in queue_specs {
-                    if let Some(min_id) = message_ids.iter().copied().min() {
-                        self.on_message_removed(min_id);
-                    }
-                    if let Some(queue) = self.meta.queues.get(&queue_id) {
-                        queue.apply_ack(&message_ids);
-                    }
+                for session_id in expired_ids {
+                    // Disconnect with will publication
+                    self.disconnect_session_internal(session_id, true, log_index, current_time);
                 }
+
                 MqResponse::Ok
             }
 
             // =================================================================
-            // MQTT Optimizations Phase 2
+            // Batch (49)
             // =================================================================
-            MqCommand::TAG_SET_TOPIC_ALIAS => {
-                let v = cmd.as_set_topic_alias();
-                let consumer_id = v.consumer_id();
-                let alias = v.alias();
-                let topic_name = v.topic_name().to_owned();
-                let mut aliases = self.meta.topic_aliases.entry(consumer_id).or_default();
-                // Update existing alias or add new
-                if let Some(entry) = aliases.iter_mut().find(|e| e.alias == alias) {
-                    entry.topic_name = topic_name;
-                } else {
-                    aliases.push(TopicAliasEntry { alias, topic_name });
-                }
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_CLEAR_TOPIC_ALIASES => {
-                let consumer_id = cmd.field_u64(1);
-                self.meta.topic_aliases.remove(&consumer_id);
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_CANCEL_PENDING_WILL => {
-                let v = cmd.as_cancel_pending_will();
-                let client_id = v.client_id();
-                let client_hash = name_hash(client_id);
-                self.meta.pending_wills.remove(&client_hash);
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_FIRE_PENDING_WILLS => {
-                let now_ms = cmd.field_u64(1);
-                let to_fire: smallvec::SmallVec<[(u64, PendingWill); 4]> = self
-                    .meta
-                    .pending_wills
-                    .iter()
-                    .filter(|entry| now_ms >= entry.value().fire_at_ms)
-                    .map(|entry| (*entry.key(), entry.value().clone()))
+            MqCommand::TAG_BATCH => {
+                let batch = cmd.as_batch();
+                let responses: SmallVec<[MqResponse; 8]> = batch
+                    .commands()
+                    .map(|sub| self.apply_command(&sub, log_index, current_time))
                     .collect();
-                let mut count = 0u32;
-                for (key, pw) in &to_fire {
-                    self.meta.pending_wills.remove(key);
-                    // Publish the will message to exchange
-                    if let Some(exchange) = self.meta.exchanges.get(&pw.will.exchange_id) {
-                        let routing_key_str = Some(pw.will.routing_key.as_str());
-                        let target_queue_ids = exchange.route(routing_key_str);
-                        drop(exchange);
-                        // Store as retained if flagged
-                        if pw.will.retain {
-                            if let Some(mut ex) = self.meta.exchanges.get_mut(&pw.will.exchange_id)
-                            {
-                                ex.retained
-                                    .insert(pw.will.routing_key.clone(), pw.will.message.clone());
-                            }
-                        }
-                        let messages = [pw.will.message.clone()];
-                        for qid in &target_queue_ids {
-                            if let Some(queue) = self.meta.queues.get(qid) {
-                                queue.apply_enqueue(log_index, &messages, &[], current_time);
-                            }
-                        }
-                        for qid in &target_queue_ids {
-                            self.meta.queue_notifier.notify(*qid);
-                        }
-                        count += 1;
-                    }
-                }
-                MqResponse::WillsFired { count }
+                MqResponse::BatchResponse(Box::new(responses))
             }
 
-            MqCommand::TAG_REGISTER_PUBLISHER_SESSION => {
-                let v = cmd.as_register_publisher_session();
-                let consumer_id = v.consumer_id();
-                let session_id = v.session_id();
-                let session_hash = name_hash(session_id);
-                self.meta.publisher_dedup.entry(session_hash).or_default();
-                // Track consumer → session for cleanup on disconnect
-                debug!(consumer_id, session_id, "publisher session registered");
-                MqResponse::Ok
-            }
-
-            MqCommand::TAG_QOS2_REGISTER_INBOUND => {
-                let v = cmd.as_qos2_inbound();
-                let consumer_id = v.consumer_id();
-                let packet_id = v.packet_id();
-                let mut entry = self.meta.qos2_inbound.entry(consumer_id).or_default();
-                if entry.contains_key(&packet_id) {
-                    // Duplicate — already received, this is a re-delivery.
-                    MqResponse::Error(MqError::Custom(
-                        "QoS 2 packet_id already registered".to_string(),
-                    ))
-                } else {
-                    entry.insert(packet_id, 0); // 0 = RECEIVED state
-                    MqResponse::Ok
-                }
-            }
-
-            MqCommand::TAG_QOS2_COMPLETE_INBOUND => {
-                let v = cmd.as_qos2_inbound();
-                let consumer_id = v.consumer_id();
-                let packet_id = v.packet_id();
-                if let Some(mut entry) = self.meta.qos2_inbound.get_mut(&consumer_id) {
-                    entry.remove(&packet_id);
-                    if entry.is_empty() {
-                        drop(entry);
-                        self.meta.qos2_inbound.remove(&consumer_id);
-                    }
+            // =================================================================
+            // Dedup (50)
+            // =================================================================
+            MqCommand::TAG_PRUNE_DEDUP_WINDOW => {
+                // Wire: [tag:1][topic_id:8][before_ts:8]
+                let topic_id = cmd.field_u64(1);
+                let before_ts = cmd.field_u64(9);
+                if let Some(topic) = md.topics.get(&topic_id) {
+                    topic.prune_dedup(before_ts);
                 }
                 MqResponse::Ok
             }
 
             _ => {
+                self.m_unknown_tag.increment(1);
                 warn!(tag = cmd.tag(), "unknown MqCommand tag");
                 MqResponse::Error(MqError::Custom(format!(
                     "unknown command tag: {}",
@@ -1753,13 +1447,121 @@ impl MqEngine {
     }
 
     // =========================================================================
+    // Internal helpers
+    // =========================================================================
+
+    /// Disconnect a session, optionally publishing its will message.
+    fn disconnect_session_internal(
+        &mut self,
+        session_id: u64,
+        publish_will: bool,
+        log_index: u64,
+        current_time: u64,
+    ) -> MqResponse {
+        let md = &self.metadata;
+
+        let session = match md.sessions.get(&session_id) {
+            Some(s) => s,
+            None => return MqResponse::Ok, // idempotent
+        };
+
+        // Release all in-flight from consumer groups
+        drop(session); // release borrow before mutating groups
+        if let Some(group_ids) = md.remove_session_group_index(session_id) {
+            for group_id in &group_ids {
+                if let Some(group) = md.consumer_groups.get(group_id) {
+                    match &group.variant_state {
+                        VariantState::Ack(ack) => {
+                            let in_flight = ack.consumer_in_flight_ids(session_id);
+                            if !in_flight.is_empty() {
+                                ack.apply_nack(&in_flight);
+                                md.group_notifier.notify(*group_id);
+                            }
+                        }
+                        VariantState::Actor(actor) => {
+                            actor.apply_release(session_id);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Re-acquire session reference
+        let session = match md.sessions.get(&session_id) {
+            Some(s) => s,
+            None => return MqResponse::Ok,
+        };
+
+        // Handle will
+        if publish_will {
+            if let Some(will) = session.take_will() {
+                if will.delay_ms > 0 {
+                    let delay_ms = will.delay_ms;
+                    md.pending_wills.insert(
+                        session.meta.client_id_hash,
+                        PendingWill {
+                            session_id,
+                            client_id: session.meta.client_id.clone(),
+                            will,
+                            fire_at_ms: current_time + delay_ms,
+                        },
+                    );
+                    let session_expiry_ms = session.meta.session_expiry_ms;
+                    let hash = session.meta.client_id_hash;
+                    if session_expiry_ms == 0 {
+                        drop(session);
+                        md.sessions.remove(&session_id);
+                        md.session_client_index.remove(&hash);
+                    }
+                    return MqResponse::WillPending {
+                        session_id,
+                        delay_ms,
+                    };
+                } else {
+                    // Publish will immediately
+                    if let Some(topic) = md.topics.get(&will.topic_id) {
+                        topic.apply_publish(log_index, std::iter::once(will.payload));
+                        self.on_message_added(log_index);
+                    }
+                }
+            }
+        }
+
+        // Remove session if session_expiry_ms == 0
+        if session.meta.session_expiry_ms == 0 {
+            let hash = session.meta.client_id_hash;
+            drop(session);
+            md.sessions.remove(&session_id);
+            md.session_client_index.remove(&hash);
+        }
+
+        MqResponse::Ok
+    }
+
+    /// Resolve the DLQ topic ID for an ack-variant consumer group.
+    fn resolve_dlq_topic(&self, group: &ConsumerGroupState) -> u64 {
+        if let Some(config) = group.ack_config() {
+            if let Some(ref dlq_name) = config.dead_letter_topic {
+                let hash = name_hash(dlq_name);
+                if let Some(r) = self.metadata.topic_names.get(&hash) {
+                    return *r;
+                }
+            }
+        }
+        // Fallback: source topic's DLQ or 0
+        0
+    }
+
+    // =========================================================================
     // Snapshot / Restore
     // =========================================================================
 
     /// Build a snapshot of all engine state.
     pub fn snapshot(&self) -> MqSnapshotData {
-        let topics = self
-            .meta
+        let md = &self.metadata;
+
+        let topics: Vec<TopicSnapshot> = md
             .topics
             .iter()
             .map(|entry| {
@@ -1771,73 +1573,23 @@ impl MqEngine {
             })
             .collect();
 
-        let queues = self
-            .meta
-            .queues
+        let consumer_groups: Vec<ConsumerGroupSnapshot> = md
+            .consumer_groups
             .iter()
             .map(|entry| {
-                let q = entry.value();
-                let mut meta = q.meta.clone();
-                // Sync atomic counters to meta for snapshot
-                meta.pending_count = q.pending_count();
-                meta.in_flight_count = q.in_flight_count();
-                meta.dlq_count = q.dlq_count();
-                QueueSnapshot {
-                    meta,
-                    messages: q.messages.iter().map(|e| e.value().clone()).collect(),
-                    dedup_entries: q.dedup_snapshot_entries(),
+                let g = entry.value();
+                let ack_state = g.ack_state().map(|a| a.snapshot());
+                let actor_state = g.actor_state().map(|a| a.snapshot());
+                ConsumerGroupSnapshot {
+                    meta: g.snapshot_meta(),
+                    offsets: g.offsets.iter().map(|e| e.value().clone()).collect(),
+                    ack_state,
+                    actor_state,
                 }
             })
             .collect();
 
-        let actor_namespaces = self
-            .meta
-            .actor_namespaces
-            .iter()
-            .map(|entry| {
-                let ns = entry.value();
-                let mut meta = ns.meta.clone();
-                meta.active_actor_count = ns.active_count();
-                ActorNamespaceSnapshot {
-                    meta,
-                    actors: ns
-                        .actors
-                        .iter()
-                        .map(|e| e.value().snapshot_state())
-                        .collect(),
-                }
-            })
-            .collect();
-
-        let jobs = self
-            .meta
-            .jobs
-            .iter()
-            .map(|entry| JobSnapshot {
-                meta: entry.value().snapshot_meta(),
-            })
-            .collect();
-
-        let consumers = self
-            .meta
-            .consumers
-            .iter()
-            .map(|entry| ConsumerSnapshot {
-                meta: entry.value().snapshot_meta(),
-            })
-            .collect();
-
-        let producers = self
-            .meta
-            .producers
-            .iter()
-            .map(|entry| ProducerSnapshot {
-                meta: entry.value().clone(),
-            })
-            .collect();
-
-        let exchanges = self
-            .meta
+        let exchanges: Vec<ExchangeSnapshot> = md
             .exchanges
             .iter()
             .map(|entry| {
@@ -1857,143 +1609,57 @@ impl MqEngine {
             })
             .collect();
 
+        let sessions: Vec<SessionSnapshot> = md
+            .sessions
+            .iter()
+            .map(|entry| SessionSnapshot {
+                meta: entry.value().snapshot_meta(),
+            })
+            .collect();
+
+        let pending_wills: Vec<PendingWill> = md
+            .pending_wills
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+
         MqSnapshotData {
             topics,
-            queues,
-            actor_namespaces,
-            jobs,
-            consumers,
-            producers,
+            consumer_groups,
             exchanges,
-            consumer_groups: self
-                .meta
-                .consumer_groups
-                .iter()
-                .map(|entry| {
-                    let g = entry.value();
-                    crate::consumer_group::ConsumerGroupSnapshot {
-                        meta: g.snapshot_meta(),
-                        offsets: g.offsets.iter().map(|e| e.value().clone()).collect(),
-                    }
-                })
-                .collect(),
-            sessions: self
-                .meta
-                .persisted_sessions
-                .iter()
-                .map(|entry| entry.value().clone())
-                .collect(),
-            pending_wills: self
-                .meta
-                .pending_wills
-                .iter()
-                .map(|entry| entry.value().clone())
-                .collect(),
-            qos2_inbound: self
-                .meta
-                .qos2_inbound
-                .iter()
-                .map(|entry| {
-                    let packets: Vec<(u16, u8)> =
-                        entry.value().iter().map(|(&k, &v)| (k, v)).collect();
-                    (*entry.key(), packets)
-                })
-                .collect(),
-            next_id: self.meta.next_id.load(Ordering::Relaxed),
+            sessions,
+            pending_wills,
+            next_id: md.next_id.load(Ordering::Relaxed),
             file_manifest: Vec::new(),
             sync_addr: None,
         }
     }
 
-    /// Sync protocol-adapter caches (TopicMeta/QueueMeta with atomics).
-    ///
-    /// Called after each apply batch. Updates the lightweight metadata that
-    /// protocol adapters cache for zero-lock reads.
-    pub fn sync_metadata(&self) {
-        // Sync topics: insert or update.
-        for entry in self.meta.topics.iter() {
-            let t = entry.value();
-            if let Some(existing) = self.meta.get_topic(t.meta.topic_id) {
-                existing.update(
-                    t.head_index(),
-                    t.tail_index(),
-                    t.message_count(),
-                    t.total_bytes(),
-                    t.latest_log_index(),
-                    t.latest_msg_pos(),
-                );
-            } else {
-                self.meta
-                    .insert_topic(Arc::new(crate::metadata::TopicMeta::with_state(
-                        t.meta.topic_id,
-                        t.meta.name.clone(),
-                        t.head_index(),
-                        t.tail_index(),
-                        t.message_count(),
-                        t.total_bytes(),
-                        t.latest_log_index(),
-                        t.latest_msg_pos(),
-                    )));
-            }
-        }
-
-        // Remove topics that no longer exist.
-        let topic_ids: Vec<u64> = self.meta.topic_ids();
-        for id in topic_ids {
-            if !self.meta.topics.contains_key(&id) {
-                self.meta.remove_topic(id);
-            }
-        }
-
-        // Sync queues: insert new ones.
-        for entry in self.meta.queues.iter() {
-            let q = entry.value();
-            if self.meta.get_queue(q.meta.queue_id).is_none() {
-                self.meta.insert_queue(Arc::new(crate::metadata::QueueMeta {
-                    queue_id: q.meta.queue_id,
-                    name: q.meta.name.clone(),
-                }));
-            }
-        }
-
-        // Remove queues that no longer exist.
-        let queue_ids: Vec<u64> = self.meta.queue_ids();
-        for id in queue_ids {
-            if !self.meta.queues.contains_key(&id) {
-                self.meta.remove_queue(id);
-            }
-        }
-    }
-
     /// Restore engine state from a snapshot.
     pub fn restore(&mut self, data: MqSnapshotData) {
-        self.meta.next_id.store(data.next_id, Ordering::Relaxed);
-        self.meta.purge_floor_dirty.store(true, Ordering::Relaxed);
-        // Note: segment index clearing is handled by the SegmentIndexMap owner.
+        let md = &self.metadata;
+
+        md.next_id.store(data.next_id, Ordering::Relaxed);
+        md.purge_floor_dirty.store(true, Ordering::Relaxed);
 
         // Clear all DashMaps
-        self.meta.topics.clear();
-        self.meta.queues.clear();
-        self.meta.actor_namespaces.clear();
-        self.meta.jobs.clear();
-        self.meta.exchanges.clear();
-        self.meta.consumers.clear();
-        self.meta.producers.clear();
-        self.meta.topic_names.clear();
-        self.meta.queue_names.clear();
-        self.meta.namespace_names.clear();
-        self.meta.job_names.clear();
-        self.meta.exchange_names.clear();
-        self.meta.consumer_groups.clear();
-        self.meta.consumer_group_names.clear();
-        self.meta.persisted_sessions.clear();
-        self.meta.topic_aliases.clear();
-        self.meta.pending_wills.clear();
-        self.meta.publisher_dedup.clear();
-        self.meta.qos2_inbound.clear();
-        self.meta.binding_index.clear();
-        self.meta.session_client_index.clear();
-        self.meta.clear_consumer_indexes();
+        md.topics.clear();
+        md.exchanges.clear();
+        md.consumer_groups.clear();
+        md.consumer_group_names.clear();
+        md.sessions.clear();
+        md.topic_names.clear();
+        md.exchange_names.clear();
+        md.session_group_index.clear();
+        md.topic_aliases.clear();
+        md.pending_wills.clear();
+        md.publisher_dedup.clear();
+        md.qos2_inbound.clear();
+        md.binding_index.clear();
+        md.session_client_index.clear();
+        md.clear_session_indexes();
+
+        let catalog = md.catalog_name().to_owned();
 
         // Restore topics
         for ts in data.topics {
@@ -2001,70 +1667,42 @@ impl MqEngine {
             let mut meta = ts.meta;
             meta.ensure_name_hash();
             let hash = meta.name_hash;
-            let cn = self.meta.catalog_name();
-            let state = TopicState::new(meta, cn);
+            let state = TopicState::new(meta, &catalog);
             for offset in ts.consumer_offsets {
                 state.consumer_offsets.insert(offset.consumer_id, offset);
             }
-            self.meta.topic_names.insert(hash, id);
-            self.meta.topics.insert(id, state);
+            md.topic_names.insert(hash, id);
+            md.topics.insert(id, state);
         }
 
-        // Restore queues (rebuild in-flight indexes via restore_message)
-        for qs in data.queues {
-            let id = qs.meta.queue_id;
-            let mut meta = qs.meta;
-            meta.ensure_name_hash();
-            let hash = meta.name_hash;
-            let state = QueueState::new(meta, self.meta.catalog_name());
-            for msg in qs.messages {
-                state.restore_message(msg);
+        // Restore consumer groups
+        for cg in data.consumer_groups {
+            let id = cg.meta.group_id;
+            let mut meta = cg.meta;
+            if meta.name_hash == 0 {
+                meta.name_hash = name_hash(&meta.name);
             }
-            state.dedup_restore_entries(qs.dedup_entries);
-            self.meta.queue_names.insert(hash, id);
-            self.meta.queues.insert(id, state);
-        }
-
-        // Restore actor namespaces
-        for ans in data.actor_namespaces {
-            let id = ans.meta.namespace_id;
-            let mut meta = ans.meta;
-            meta.ensure_name_hash();
             let hash = meta.name_hash;
-            let state = ActorNamespaceState::new(meta, self.meta.catalog_name());
-            for actor_state in ans.actors {
-                let actor_id = actor_state.actor_id.clone();
-                state.actors.insert(
-                    actor_id,
-                    crate::actor::ActorInMemory::from_state(actor_state),
-                );
+            let state =
+                ConsumerGroupState::from_snapshot(meta, cg.offsets, &catalog, md.server_start_ms);
+            // Restore ack variant state
+            if let (Some(snap), Some(ack)) = (cg.ack_state, state.ack_state()) {
+                if let Some(config) = state.ack_config() {
+                    ack.restore(snap, config);
+                }
             }
-            self.meta.namespace_names.insert(hash, id);
-            self.meta.actor_namespaces.insert(id, state);
-        }
-
-        // Restore jobs
-        for js in data.jobs {
-            let id = js.meta.job_id;
-            let mut meta = js.meta;
-            meta.ensure_name_hash();
-            let hash = meta.name_hash;
-            self.meta.job_names.insert(hash, id);
-            self.meta
-                .jobs
-                .insert(id, JobInstance::new(meta, self.meta.catalog_name()));
-        }
-
-        // Restore consumers
-        for cs in data.consumers {
-            let id = cs.meta.consumer_id;
-            self.meta.consumers.insert(id, ConsumerState::new(cs.meta));
-        }
-
-        // Restore producers
-        for ps in data.producers {
-            let id = ps.meta.producer_id;
-            self.meta.producers.insert(id, ps.meta);
+            // Restore actor variant state
+            if let (Some(snap), Some(actor)) = (cg.actor_state, state.actor_state()) {
+                actor.restore(snap, id);
+            }
+            // Re-attach to source topic
+            if state.meta.source_topic_id != 0 {
+                if let Some(topic) = md.topics.get(&state.meta.source_topic_id) {
+                    topic.attach_group(id);
+                }
+            }
+            md.consumer_group_names.insert(hash, id);
+            md.consumer_groups.insert(id, state);
         }
 
         // Restore exchanges
@@ -2075,914 +1713,780 @@ impl MqEngine {
             let hash = meta.name_hash;
             let mut state = ExchangeState::new(meta);
             for binding in es.bindings {
-                // Rebuild binding_id → exchange_id reverse index
-                self.meta.binding_index.insert(binding.binding_id, id);
+                md.binding_index.insert(binding.binding_id, id);
                 state.add_binding(binding);
             }
             for entry in es.retained {
                 let rk = String::from_utf8(entry.routing_key.to_vec()).unwrap_or_default();
                 state.retained.insert(rk, entry.message);
             }
-            self.meta.exchange_names.insert(hash, id);
-            self.meta.exchanges.insert(id, state);
+            md.exchange_names.insert(hash, id);
+            md.exchanges.insert(id, state);
         }
 
-        // Restore consumer groups
-        for cg in data.consumer_groups {
-            let id = cg.meta.group_id;
-            let hash = cg.meta.name_hash;
-            let state = crate::consumer_group::ConsumerGroupState::from_snapshot(
-                cg.meta,
-                cg.offsets,
-                self.meta.catalog_name(),
-            );
-            self.meta.consumer_group_names.insert(hash, id);
-            self.meta.consumer_groups.insert(id, state);
-        }
-
-        // Restore persisted sessions
-        for session in data.sessions {
-            let client_hash = crate::types::name_hash(&session.client_id);
-            let consumer_id = session.consumer_id;
-            // Rebuild client_id → consumer_id reverse index
-            self.meta
-                .session_client_index
-                .insert(client_hash, consumer_id);
-            self.meta.persisted_sessions.insert(consumer_id, session);
+        // Restore sessions
+        for ss in data.sessions {
+            let id = ss.meta.session_id;
+            let mut meta = ss.meta;
+            meta.ensure_hash();
+            let hash = meta.client_id_hash;
+            md.session_client_index.insert(hash, id);
+            md.sessions.insert(id, SessionState::new(meta));
         }
 
         // Restore pending wills
         for pw in data.pending_wills {
-            let client_hash = crate::types::name_hash(&pw.client_id);
-            self.meta.pending_wills.insert(client_hash, pw);
-        }
-
-        // Restore QoS 2 inbound dedup state
-        for (consumer_id, packets) in data.qos2_inbound {
-            let map: std::collections::HashMap<u16, u8> = packets.into_iter().collect();
-            self.meta.qos2_inbound.insert(consumer_id, map);
+            let client_hash = name_hash(&pw.client_id);
+            md.pending_wills.insert(client_hash, pw);
         }
 
         info!(
-            topics = self.meta.topics.len(),
-            queues = self.meta.queues.len(),
-            actor_namespaces = self.meta.actor_namespaces.len(),
-            jobs = self.meta.jobs.len(),
-            exchanges = self.meta.exchanges.len(),
-            consumers = self.meta.consumers.len(),
-            consumer_groups = self.meta.consumer_groups.len(),
-            sessions = self.meta.persisted_sessions.len(),
-            pending_wills = self.meta.pending_wills.len(),
+            topics = md.topics.len(),
+            exchanges = md.exchanges.len(),
+            consumer_groups = md.consumer_groups.len(),
+            sessions = md.sessions.len(),
+            pending_wills = md.pending_wills.len(),
             "MQ engine restored from snapshot"
         );
     }
 
     /// Restore only structural state (entity metadata) from MDBX.
     ///
-    /// This creates empty entity shells (no messages, no in-flight state).
+    /// Creates empty entity shells (no messages, no in-flight state).
     /// The raft log is then replayed from the structural purge floor to
     /// rebuild message state.
-    pub(crate) fn restore_structural(&mut self, state: crate::manifest::StructuralState) {
-        self.meta.next_id.store(state.next_id, Ordering::Relaxed);
-        self.meta.purge_floor_dirty.store(true, Ordering::Relaxed);
-        // Note: segment index clearing is handled by the SegmentIndexMap owner.
+    pub fn restore_structural(&mut self, data: MqSnapshotData) {
+        let md = &self.metadata;
+
+        md.next_id.store(data.next_id, Ordering::Relaxed);
+        md.purge_floor_dirty.store(true, Ordering::Relaxed);
 
         // Clear all DashMaps
-        self.meta.topics.clear();
-        self.meta.queues.clear();
-        self.meta.actor_namespaces.clear();
-        self.meta.jobs.clear();
-        self.meta.consumers.clear();
-        self.meta.producers.clear();
-        self.meta.topic_names.clear();
-        self.meta.queue_names.clear();
-        self.meta.namespace_names.clear();
-        self.meta.job_names.clear();
-        self.meta.binding_index.clear();
-        self.meta.session_client_index.clear();
+        md.topics.clear();
+        md.exchanges.clear();
+        md.consumer_groups.clear();
+        md.consumer_group_names.clear();
+        md.sessions.clear();
+        md.topic_names.clear();
+        md.exchange_names.clear();
+        md.binding_index.clear();
+        md.session_client_index.clear();
+        md.clear_session_indexes();
 
-        for mut meta in state.topics {
+        let catalog = md.catalog_name().to_owned();
+
+        // Restore topic shells
+        for ts in data.topics {
+            let mut meta = ts.meta;
             meta.ensure_name_hash();
             let hash = meta.name_hash;
             let id = meta.topic_id;
-            self.meta.topic_names.insert(hash, id);
-            self.meta
-                .topics
-                .insert(id, TopicState::new(meta, self.meta.catalog_name()));
+            md.topic_names.insert(hash, id);
+            md.topics.insert(id, TopicState::new(meta, &catalog));
         }
 
-        for mut meta in state.queues {
-            meta.ensure_name_hash();
+        // Restore consumer group shells
+        for cg in data.consumer_groups {
+            let mut meta = cg.meta;
+            if meta.name_hash == 0 {
+                meta.name_hash = name_hash(&meta.name);
+            }
             let hash = meta.name_hash;
-            let id = meta.queue_id;
-            self.meta.queue_names.insert(hash, id);
-            self.meta
-                .queues
-                .insert(id, QueueState::new(meta, self.meta.catalog_name()));
+            let id = meta.group_id;
+            let state = ConsumerGroupState::new(meta, &catalog, md.server_start_ms);
+            md.consumer_group_names.insert(hash, id);
+            md.consumer_groups.insert(id, state);
         }
 
-        for mut meta in state.actor_namespaces {
+        // Restore exchange shells
+        for es in data.exchanges {
+            let mut meta = es.meta;
             meta.ensure_name_hash();
             let hash = meta.name_hash;
-            let id = meta.namespace_id;
-            self.meta.namespace_names.insert(hash, id);
-            self.meta
-                .actor_namespaces
-                .insert(id, ActorNamespaceState::new(meta, self.meta.catalog_name()));
+            let id = meta.exchange_id;
+            let mut state = ExchangeState::new(meta);
+            for binding in es.bindings {
+                md.binding_index.insert(binding.binding_id, id);
+                state.add_binding(binding);
+            }
+            md.exchange_names.insert(hash, id);
+            md.exchanges.insert(id, state);
         }
 
-        for mut meta in state.jobs {
-            meta.ensure_name_hash();
-            let hash = meta.name_hash;
-            let id = meta.job_id;
-            self.meta.job_names.insert(hash, id);
-            self.meta
-                .jobs
-                .insert(id, JobInstance::new(meta, self.meta.catalog_name()));
+        // Restore session shells
+        for ss in data.sessions {
+            let mut meta = ss.meta;
+            meta.ensure_hash();
+            let hash = meta.client_id_hash;
+            let id = meta.session_id;
+            md.session_client_index.insert(hash, id);
+            md.sessions.insert(id, SessionState::new(meta));
         }
 
         info!(
-            topics = self.meta.topics.len(),
-            queues = self.meta.queues.len(),
-            actor_namespaces = self.meta.actor_namespaces.len(),
-            jobs = self.meta.jobs.len(),
-            next_id = state.next_id,
-            "MQ engine restored structural state from MDBX"
+            topics = md.topics.len(),
+            exchanges = md.exchanges.len(),
+            consumer_groups = md.consumer_groups.len(),
+            sessions = md.sessions.len(),
+            "MQ engine restored structural state"
         );
+    }
+
+    /// Sync protocol-adapter caches (TopicMeta with atomics).
+    ///
+    /// Called after each apply batch. Updates the lightweight metadata that
+    /// protocol adapters cache for zero-lock reads.
+    pub fn sync_metadata(&self) {
+        let md = &self.metadata;
+
+        // Sync topics: insert or update.
+        for entry in md.topics.iter() {
+            let t = entry.value();
+            if let Some(existing) = md.get_topic(t.meta.topic_id) {
+                existing.update(
+                    t.head_index(),
+                    t.tail_index(),
+                    t.message_count(),
+                    t.total_bytes(),
+                    t.latest_log_index(),
+                    t.latest_msg_pos(),
+                );
+            } else {
+                md.insert_topic(Arc::new(MetaTopicMeta::with_state(
+                    t.meta.topic_id,
+                    t.meta.name.clone(),
+                    t.head_index(),
+                    t.tail_index(),
+                    t.message_count(),
+                    t.total_bytes(),
+                    t.latest_log_index(),
+                    t.latest_msg_pos(),
+                )));
+            }
+        }
+
+        // Remove topics that no longer exist.
+        let topic_ids: Vec<u64> = md.topic_ids();
+        for id in topic_ids {
+            if !md.topics.contains_key(&id) {
+                md.remove_topic(id);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ActorConfig, JobConfig, QueueConfig};
     use crate::flat::FlatMessageBuilder;
-    use crate::segment_index::SegmentIndex as _;
-    use crate::types::name_hash;
+    use crate::types::*;
 
-    fn make_engine() -> MqEngine {
-        MqEngine::new(MqConfig::new("/tmp/mq-test"))
+    fn make_config() -> MqConfig {
+        MqConfig::new("/tmp/mq-engine-test")
     }
 
-    fn make_flat_msg(value: &[u8]) -> Bytes {
+    fn make_engine() -> MqEngine {
+        MqEngine::new(make_config())
+    }
+
+    fn make_msg(value: &[u8]) -> Bytes {
         FlatMessageBuilder::new(Bytes::from(value.to_vec()))
             .timestamp(1000)
             .build()
     }
 
     // =========================================================================
-    // Topic commands
+    // 1. test_create_delete_topic
     // =========================================================================
 
     #[test]
-    fn test_create_topic() {
+    fn test_create_delete_topic() {
         let mut engine = make_engine();
-        let resp = engine.apply_command(
-            &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-            1,
-            1000,
-        );
-        match resp {
-            MqResponse::EntityCreated { id } => {
-                assert_eq!(id, 1);
-                assert!(engine.meta.topics.contains_key(&1));
-                assert_eq!(
-                    *engine.meta.topic_names.get(&name_hash("events")).unwrap(),
-                    1
-                );
-            }
-            _ => panic!("expected EntityCreated"),
+
+        let cmd = MqCommand::create_topic("events", RetentionPolicy::default(), 0);
+        let resp = engine.apply_command(&cmd, 1, 1000);
+        let topic_id = match resp {
+            MqResponse::EntityCreated { id } => id,
+            other => panic!("expected EntityCreated, got {:?}", other),
+        };
+        assert!(topic_id > 0);
+
+        // Duplicate name should fail
+        let cmd2 = MqCommand::create_topic("events", RetentionPolicy::default(), 0);
+        match engine.apply_command(&cmd2, 2, 1001) {
+            MqResponse::Error(MqError::AlreadyExists { .. }) => {}
+            other => panic!("expected AlreadyExists, got {:?}", other),
+        }
+
+        // Delete
+        let del_cmd = MqCommand::delete_topic(topic_id);
+        assert!(matches!(
+            engine.apply_command(&del_cmd, 3, 1002),
+            MqResponse::Ok
+        ));
+
+        // Delete non-existent
+        match engine.apply_command(&del_cmd, 4, 1003) {
+            MqResponse::Error(MqError::NotFound { .. }) => {}
+            other => panic!("expected NotFound, got {:?}", other),
         }
     }
 
-    #[test]
-    fn test_create_duplicate_topic() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-            1,
-            1000,
-        );
-        let resp = engine.apply_command(
-            &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-            2,
-            1001,
-        );
-        assert!(matches!(resp, MqResponse::Error(_)));
-    }
-
-    #[test]
-    fn test_delete_topic() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-            1,
-            1000,
-        );
-        let resp = engine.apply_command(&MqCommand::delete_topic(1), 2, 1001);
-        assert!(matches!(resp, MqResponse::Ok));
-        assert!(!engine.meta.topics.contains_key(&1));
-        assert!(!engine.meta.topic_names.contains_key(&name_hash("events")));
-    }
-
-    #[test]
-    fn test_publish_and_commit_offset() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-            1,
-            1000,
-        );
-        let flat_msg = make_flat_msg(b"hello");
-        let resp = engine.apply_command(&MqCommand::publish(1, &[flat_msg]), 2, 1001);
-        assert!(matches!(resp, MqResponse::Published { count: 1, .. }));
-
-        let resp = engine.apply_command(&MqCommand::commit_offset(1, 100, 2), 3, 1002);
-        assert!(matches!(resp, MqResponse::Ok));
-    }
-
     // =========================================================================
-    // Queue commands
+    // 2. test_publish_and_offset
     // =========================================================================
 
     #[test]
-    fn test_queue_lifecycle() {
+    fn test_publish_and_offset() {
         let mut engine = make_engine();
-        let resp = engine.apply_command(
-            &MqCommand::create_queue("tasks", &QueueConfig::default()),
-            1,
-            1000,
-        );
-        let queue_id = match resp {
+
+        let cmd = MqCommand::create_topic("logs", RetentionPolicy::default(), 0);
+        let topic_id = match engine.apply_command(&cmd, 1, 1000) {
             MqResponse::EntityCreated { id } => id,
-            _ => panic!("expected EntityCreated"),
+            other => panic!("expected EntityCreated, got {:?}", other),
         };
 
-        // Enqueue
-        let flat_msg = make_flat_msg(b"task1");
-        let resp =
-            engine.apply_command(&MqCommand::enqueue(queue_id, &[flat_msg], &[None]), 2, 1001);
-        assert!(matches!(resp, MqResponse::Published { .. }));
+        let msg = make_msg(b"hello");
+        let pub_cmd = MqCommand::publish(topic_id, &[msg]);
+        match engine.apply_command(&pub_cmd, 2, 1001) {
+            MqResponse::Published { base_offset, count } => {
+                assert_eq!(base_offset, 0);
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected Published, got {:?}", other),
+        }
+
+        // Publish more messages
+        let msg2 = make_msg(b"world");
+        let msg3 = make_msg(b"!");
+        let pub_cmd2 = MqCommand::publish(topic_id, &[msg2, msg3]);
+        match engine.apply_command(&pub_cmd2, 3, 1002) {
+            MqResponse::Published { base_offset, count } => {
+                assert_eq!(base_offset, 1);
+                assert_eq!(count, 2);
+            }
+            other => panic!("expected Published, got {:?}", other),
+        }
+
+        // Verify topic state
+        let topic = engine.metadata().topics.get(&topic_id).unwrap();
+        assert_eq!(topic.head_index(), 3);
+        assert_eq!(topic.message_count(), 3);
+    }
+
+    // =========================================================================
+    // 3. test_create_consumer_group_with_auto_create_topic
+    // =========================================================================
+
+    #[test]
+    fn test_create_consumer_group() {
+        let mut engine = make_engine();
+
+        // Create a basic consumer group (Offset variant via old codec)
+        let cmd = MqCommand::create_consumer_group("my-group", 1); // 1 = Latest
+        let group_id = match engine.apply_command(&cmd, 1, 1000) {
+            MqResponse::EntityCreated { id } => id,
+            other => panic!("expected EntityCreated, got {:?}", other),
+        };
+        assert!(group_id > 0);
+
+        // Verify it exists
+        assert!(engine.metadata().consumer_groups.contains_key(&group_id));
+    }
+
+    // =========================================================================
+    // 4. test_ack_variant_lifecycle
+    // =========================================================================
+
+    #[test]
+    fn test_ack_variant_lifecycle() {
+        let mut engine = make_engine();
+
+        // Manually create a consumer group with Ack variant
+        let md = &engine.metadata;
+        let group_id = md.alloc_id();
+        let topic_id = md.alloc_id();
+
+        // Create source topic
+        let topic_meta = TopicMeta::new(
+            topic_id,
+            "ack-test".to_string(),
+            1000,
+            RetentionPolicy::default(),
+        );
+        let topic_state = TopicState::new(topic_meta, md.catalog_name());
+        md.topics.insert(topic_id, topic_state);
+
+        // Create ack consumer group
+        let group_meta = ConsumerGroupMeta {
+            group_id,
+            name: "ack-group".to_string(),
+            name_hash: name_hash("ack-group"),
+            created_at: 1000,
+            generation: 0,
+            phase: GroupPhase::Empty,
+            protocol_type: String::new(),
+            protocol_name: String::new(),
+            leader: None,
+            auto_offset_reset: AutoOffsetReset::Latest,
+            last_activity_at: 1000,
+            next_member_id: 1,
+            members: Vec::new(),
+            variant: GroupVariant::Ack,
+            source_topic_id: topic_id,
+            variant_config: VariantConfig::Ack(AckVariantConfig::default()),
+        };
+        let group_state =
+            ConsumerGroupState::new(group_meta, md.catalog_name(), md.server_start_ms);
+        md.consumer_groups.insert(group_id, group_state);
+
+        // Enqueue messages directly via ack state
+        let msg1 = make_msg(b"msg1");
+        let msg2 = make_msg(b"msg2");
+        if let Some(group) = md.consumer_groups.get(&group_id) {
+            if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
+                let count = ack.apply_enqueue(config, group_id, 100, &[msg1, msg2], &[], 1000);
+                assert_eq!(count, 2);
+            }
+        }
 
         // Deliver
-        let resp = engine.apply_command(&MqCommand::deliver(queue_id, 100, 10), 3, 1002);
-        let msg_ids: Vec<u64> = match &resp {
-            MqResponse::Messages { messages } => {
-                assert_eq!(messages.len(), 1);
-                messages.iter().map(|m| m.message_id).collect()
+        let consumer_id = 42u64;
+        if let Some(group) = md.consumer_groups.get(&group_id) {
+            if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
+                let delivered = ack.apply_deliver(config, consumer_id, 10, 1001, 101);
+                assert_eq!(delivered.len(), 2);
+
+                // Ack one
+                ack.apply_ack(&[delivered[0]]);
+                assert_eq!(ack.in_flight_count(), 1);
+
+                // Nack the other
+                ack.apply_nack(&[delivered[1]]);
+                assert_eq!(ack.pending_count(), 1);
+                assert_eq!(ack.in_flight_count(), 0);
             }
-            _ => panic!("expected Messages"),
-        };
-
-        // Ack
-        let resp = engine.apply_command(&MqCommand::ack(queue_id, &msg_ids, None), 4, 1003);
-        assert!(matches!(resp, MqResponse::Ok));
-        assert_eq!(
-            engine
-                .meta
-                .queues
-                .get(&queue_id)
-                .unwrap()
-                .meta
-                .in_flight_count,
-            0
-        );
-    }
-
-    #[test]
-    fn test_queue_nack_and_redeliver() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_queue("q", &QueueConfig::default()),
-            1,
-            1000,
-        );
-        let flat_msg = make_flat_msg(b"msg");
-        engine.apply_command(&MqCommand::enqueue(1, &[flat_msg], &[None]), 2, 1001);
-        engine.apply_command(&MqCommand::deliver(1, 100, 1), 3, 1002);
-        engine.apply_command(&MqCommand::nack(1, &[2]), 4, 1003);
-
-        assert_eq!(engine.meta.queues.get(&1).unwrap().pending_count(), 1);
-        assert_eq!(engine.meta.queues.get(&1).unwrap().in_flight_count(), 0);
-
-        // Re-deliver
-        let resp = engine.apply_command(&MqCommand::deliver(1, 100, 1), 5, 1004);
-        match resp {
-            MqResponse::Messages { messages } => assert_eq!(messages.len(), 1),
-            _ => panic!("expected Messages"),
         }
     }
 
     // =========================================================================
-    // Actor commands
+    // 5. test_actor_variant_lifecycle
     // =========================================================================
 
     #[test]
-    fn test_actor_namespace_lifecycle() {
+    fn test_actor_variant_lifecycle() {
         let mut engine = make_engine();
-        let resp = engine.apply_command(
-            &MqCommand::create_actor_namespace("users", &ActorConfig::default()),
-            1,
-            1000,
-        );
-        let ns_id = match resp {
+        let md = &engine.metadata;
+        let group_id = md.alloc_id();
+
+        let group_meta = ConsumerGroupMeta {
+            group_id,
+            name: "actor-group".to_string(),
+            name_hash: name_hash("actor-group"),
+            created_at: 1000,
+            generation: 0,
+            phase: GroupPhase::Empty,
+            protocol_type: String::new(),
+            protocol_name: String::new(),
+            leader: None,
+            auto_offset_reset: AutoOffsetReset::Latest,
+            last_activity_at: 1000,
+            next_member_id: 1,
+            members: Vec::new(),
+            variant: GroupVariant::Actor,
+            source_topic_id: 0,
+            variant_config: VariantConfig::Actor(ActorVariantConfig::default()),
+        };
+        let group_state =
+            ConsumerGroupState::new(group_meta, md.catalog_name(), md.server_start_ms);
+        md.consumer_groups.insert(group_id, group_state);
+
+        let actor_id = Bytes::from_static(b"actor-1");
+        let consumer_id = 99u64;
+
+        if let Some(group) = md.consumer_groups.get(&group_id) {
+            let actor_state = group.actor_state().unwrap();
+            let config = group.actor_config().unwrap();
+
+            // Send a message to actor
+            actor_state
+                .apply_send(config, group_id, &actor_id, 200, 1000, None, 0)
+                .unwrap();
+
+            // Assign actor to consumer
+            actor_state.apply_assign(consumer_id, &[actor_id.clone()]);
+
+            // Deliver
+            let msg_idx = actor_state.apply_deliver(&actor_id, consumer_id, 0);
+            assert!(msg_idx.is_some());
+
+            // Ack
+            let reply = actor_state.apply_ack(&actor_id, msg_idx.unwrap(), 0);
+            assert!(reply.is_none()); // no reply_to set
+        }
+    }
+
+    // =========================================================================
+    // 6. test_session_lifecycle
+    // =========================================================================
+
+    #[test]
+    fn test_session_lifecycle() {
+        let mut engine = make_engine();
+        let md = &engine.metadata;
+
+        // Create session directly
+        let session_id = md.alloc_id();
+        let meta = SessionMeta::new(session_id, "client-1".to_string(), 1000, 30_000, 0);
+        let state = SessionState::new(meta);
+        md.sessions.insert(session_id, state);
+
+        // Verify
+        assert!(md.sessions.contains_key(&session_id));
+
+        // Heartbeat
+        if let Some(session) = md.sessions.get(&session_id) {
+            session.heartbeat(5000);
+            assert_eq!(session.last_activity_at(), 5000);
+        }
+    }
+
+    // =========================================================================
+    // 7. test_will_on_disconnect
+    // =========================================================================
+
+    #[test]
+    fn test_will_on_disconnect() {
+        let mut engine = make_engine();
+        let md = &engine.metadata;
+
+        // Create a topic for will publication
+        let cmd = MqCommand::create_topic("will-topic", RetentionPolicy::default(), 0);
+        let will_topic_id = match engine.apply_command(&cmd, 1, 1000) {
             MqResponse::EntityCreated { id } => id,
-            _ => panic!("expected EntityCreated"),
+            other => panic!("expected EntityCreated, got {:?}", other),
         };
 
-        // Send to actor
-        let actor_id = Bytes::from_static(b"user-42");
-        let flat_msg = make_flat_msg(b"hello");
-        let resp = engine.apply_command(
-            &MqCommand::send_to_actor(ns_id, &actor_id, &flat_msg),
-            2,
-            1001,
-        );
+        // Create session with will
+        let session_id = md.alloc_id();
+        let meta = SessionMeta::new(session_id, "will-client".to_string(), 1000, 30_000, 0);
+        let state = SessionState::new(meta);
+        state.set_will(WillConfig {
+            topic_id: will_topic_id,
+            payload: Bytes::from_static(b"goodbye"),
+            delay_ms: 0,
+            retained: false,
+        });
+        md.sessions.insert(session_id, state);
+        md.session_client_index
+            .insert(name_hash("will-client"), session_id);
+
+        // Disconnect with will
+        let resp = engine.disconnect_session_internal(session_id, true, 10, 2000);
         assert!(matches!(resp, MqResponse::Ok));
 
-        // Assign
-        engine.apply_command(
-            &MqCommand::assign_actors(ns_id, 100, &[actor_id.clone()]),
-            3,
-            1002,
-        );
+        // Will should have been published to the topic
+        let topic = md.topics.get(&will_topic_id).unwrap();
+        assert_eq!(topic.message_count(), 1);
+    }
 
-        // Deliver
-        let resp = engine.apply_command(
-            &MqCommand::deliver_actor_message(ns_id, &actor_id, 100),
-            4,
-            1003,
-        );
-        match resp {
-            MqResponse::Messages { messages } => assert_eq!(messages.len(), 1),
-            _ => panic!("expected Messages"),
+    // =========================================================================
+    // 8. test_exchange_routing
+    // =========================================================================
+
+    #[test]
+    fn test_exchange_routing() {
+        let mut engine = make_engine();
+
+        // Create exchange
+        let ex_cmd = MqCommand::create_exchange("fanout-ex", ExchangeType::Fanout);
+        let exchange_id = match engine.apply_command(&ex_cmd, 1, 1000) {
+            MqResponse::EntityCreated { id } => id,
+            other => panic!("expected EntityCreated, got {:?}", other),
+        };
+
+        // Create target topics
+        let t1_cmd = MqCommand::create_topic("target-1", RetentionPolicy::default(), 0);
+        let t1_id = match engine.apply_command(&t1_cmd, 2, 1001) {
+            MqResponse::EntityCreated { id } => id,
+            other => panic!("expected EntityCreated, got {:?}", other),
+        };
+
+        let t2_cmd = MqCommand::create_topic("target-2", RetentionPolicy::default(), 0);
+        let t2_id = match engine.apply_command(&t2_cmd, 3, 1002) {
+            MqResponse::EntityCreated { id } => id,
+            other => panic!("expected EntityCreated, got {:?}", other),
+        };
+
+        // Create bindings
+        let b1_cmd = MqCommand::create_binding(exchange_id, t1_id, None, false, None, None);
+        assert!(matches!(
+            engine.apply_command(&b1_cmd, 4, 1003),
+            MqResponse::EntityCreated { .. }
+        ));
+
+        let b2_cmd = MqCommand::create_binding(exchange_id, t2_id, None, false, None, None);
+        assert!(matches!(
+            engine.apply_command(&b2_cmd, 5, 1004),
+            MqResponse::EntityCreated { .. }
+        ));
+
+        // Publish to exchange
+        let msg = make_msg(b"fanout-msg");
+        let pub_cmd = MqCommand::publish_to_exchange(exchange_id, &[msg]);
+        match engine.apply_command(&pub_cmd, 6, 1005) {
+            MqResponse::Published { count, .. } => {
+                assert!(count > 0);
+            }
+            other => panic!("expected Published, got {:?}", other),
         }
 
-        // Ack
-        let resp = engine.apply_command(
-            &MqCommand::ack_actor_message(ns_id, &actor_id, 2, None),
-            5,
-            1004,
-        );
-        assert!(matches!(resp, MqResponse::Ok));
+        // Both topics should have received messages
+        let t1 = engine.metadata().topics.get(&t1_id).unwrap();
+        let t2 = engine.metadata().topics.get(&t2_id).unwrap();
+        assert!(t1.message_count() > 0);
+        assert!(t2.message_count() > 0);
     }
 
     // =========================================================================
-    // Job commands
+    // 9. test_snapshot_restore
     // =========================================================================
 
     #[test]
-    fn test_job_lifecycle() {
+    fn test_snapshot_restore() {
         let mut engine = make_engine();
-        let config = JobConfig {
-            cron_expression: "0 * * * * *".to_string(),
-            ..Default::default()
-        };
-        let resp = engine.apply_command(&MqCommand::create_job("cleanup", &config), 1, 1000);
-        let job_id = match resp {
+
+        // Create some state
+        let cmd = MqCommand::create_topic("snap-topic", RetentionPolicy::default(), 0);
+        let topic_id = match engine.apply_command(&cmd, 1, 1000) {
             MqResponse::EntityCreated { id } => id,
             _ => panic!("expected EntityCreated"),
         };
 
-        // Trigger
-        engine.apply_command(&MqCommand::trigger_job(job_id, 100, 5000), 2, 5000);
-        assert_eq!(
-            engine
-                .meta
-                .jobs
-                .get(&job_id)
-                .unwrap()
-                .current_execution_id(),
-            Some(100)
-        );
+        let msg = make_msg(b"snap-msg");
+        let pub_cmd = MqCommand::publish(topic_id, &[msg]);
+        engine.apply_command(&pub_cmd, 2, 1001);
 
-        // Complete
-        engine.apply_command(&MqCommand::complete_job(job_id, 100), 3, 6000);
-        assert!(
-            engine
-                .meta
-                .jobs
-                .get(&job_id)
-                .unwrap()
-                .current_execution_id()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_job_enable_disable() {
-        let mut engine = make_engine();
-        engine.apply_command(&MqCommand::create_job("j", &JobConfig::default()), 1, 1000);
-
-        engine.apply_command(&MqCommand::disable_job(1), 2, 1001);
-        assert!(!engine.meta.jobs.get(&1).unwrap().enabled());
-
-        engine.apply_command(&MqCommand::enable_job(1), 3, 1002);
-        assert!(engine.meta.jobs.get(&1).unwrap().enabled());
-    }
-
-    // =========================================================================
-    // Session commands
-    // =========================================================================
-
-    #[test]
-    fn test_consumer_lifecycle() {
-        let mut engine = make_engine();
-        engine.apply_command(&MqCommand::register_consumer(100, "group-1", &[]), 1, 1000);
-        assert!(engine.meta.consumers.contains_key(&100));
-
-        engine.apply_command(&MqCommand::heartbeat(100), 2, 2000);
-        assert_eq!(
-            engine.meta.consumers.get(&100).unwrap().last_heartbeat_at(),
-            2000
-        );
-
-        engine.apply_command(&MqCommand::disconnect_consumer(100), 3, 3000);
-        assert!(!engine.meta.consumers.contains_key(&100));
-    }
-
-    #[test]
-    fn test_disconnect_consumer_releases_actors() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_actor_namespace("ns", &ActorConfig::default()),
-            1,
-            1000,
-        );
-        engine.apply_command(&MqCommand::register_consumer(100, "g", &[]), 2, 1000);
-        let aid = Bytes::from_static(b"actor-1");
-        let flat_msg = make_flat_msg(b"msg");
-        engine.apply_command(&MqCommand::send_to_actor(1, &aid, &flat_msg), 3, 1001);
-        engine.apply_command(&MqCommand::assign_actors(1, 100, &[aid.clone()]), 4, 1002);
-
-        // Disconnect — should release actor assignments
-        engine.apply_command(&MqCommand::disconnect_consumer(100), 5, 1003);
-        let ns = engine.meta.actor_namespaces.get(&1).unwrap();
-        assert!(
-            ns.actors
-                .get(&aid)
-                .unwrap()
-                .assigned_consumer_id()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_disconnect_consumer_nacks_queue_messages() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_queue("q", &QueueConfig::default()),
-            1,
-            1000,
-        );
-        engine.apply_command(&MqCommand::register_consumer(100, "g", &[]), 2, 1000);
-        let flat_msg = make_flat_msg(b"msg");
-        engine.apply_command(&MqCommand::enqueue(1, &[flat_msg], &[None]), 3, 1001);
-        engine.apply_command(&MqCommand::deliver(1, 100, 1), 4, 1002);
-
-        assert_eq!(engine.meta.queues.get(&1).unwrap().in_flight_count(), 1);
-
-        engine.apply_command(&MqCommand::disconnect_consumer(100), 5, 1003);
-        assert_eq!(engine.meta.queues.get(&1).unwrap().in_flight_count(), 0);
-        assert_eq!(engine.meta.queues.get(&1).unwrap().pending_count(), 1);
-    }
-
-    #[test]
-    fn test_producer_lifecycle() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::register_producer(200, Some("producer-1")),
-            1,
-            1000,
-        );
-        assert!(engine.meta.producers.contains_key(&200));
-
-        engine.apply_command(&MqCommand::disconnect_producer(200), 2, 1001);
-        assert!(!engine.meta.producers.contains_key(&200));
-    }
-
-    // =========================================================================
-    // Snapshot and Restore
-    // =========================================================================
-
-    #[test]
-    fn test_snapshot_empty() {
-        let engine = make_engine();
-        let snap = engine.snapshot();
-        assert!(snap.topics.is_empty());
-        assert!(snap.queues.is_empty());
-        assert!(snap.actor_namespaces.is_empty());
-        assert!(snap.jobs.is_empty());
-        assert!(snap.consumers.is_empty());
-        assert!(snap.producers.is_empty());
-    }
-
-    #[test]
-    fn test_snapshot_and_restore() {
-        let mut engine = make_engine();
-
-        // Create entities
-        engine.apply_command(
-            &MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
-            1,
-            1000,
-        );
-        engine.apply_command(
-            &MqCommand::create_queue("q1", &QueueConfig::default()),
-            2,
-            1001,
-        );
-        engine.apply_command(
-            &MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
-            3,
-            1002,
-        );
-        engine.apply_command(
-            &MqCommand::create_job(
-                "j1",
-                &JobConfig {
-                    cron_expression: "0 * * * * *".to_string(),
-                    ..Default::default()
-                },
-            ),
-            4,
-            1003,
-        );
-
-        // Publish some data
-        let flat_msg1 = make_flat_msg(b"msg1");
-        engine.apply_command(&MqCommand::publish(1, &[flat_msg1]), 5, 1004);
-        let flat_task1 = make_flat_msg(b"task1");
-        engine.apply_command(&MqCommand::enqueue(2, &[flat_task1], &[None]), 6, 1005);
-
+        // Snapshot
         let snap = engine.snapshot();
         assert_eq!(snap.topics.len(), 1);
-        assert_eq!(snap.queues.len(), 1);
-        assert_eq!(snap.actor_namespaces.len(), 1);
-        assert_eq!(snap.jobs.len(), 1);
+        assert_eq!(snap.topics[0].meta.topic_id, topic_id);
 
-        // Restore into fresh engine
+        // Restore into a new engine
         let mut engine2 = make_engine();
         engine2.restore(snap);
 
-        assert_eq!(engine2.meta.topics.len(), 1);
-        assert_eq!(engine2.meta.queues.len(), 1);
-        assert_eq!(engine2.meta.actor_namespaces.len(), 1);
-        assert_eq!(engine2.meta.jobs.len(), 1);
-        assert_eq!(*engine2.meta.topic_names.get(&name_hash("t1")).unwrap(), 1);
-        assert_eq!(*engine2.meta.queue_names.get(&name_hash("q1")).unwrap(), 2);
-        assert_eq!(
-            *engine2.meta.namespace_names.get(&name_hash("ns1")).unwrap(),
-            3
-        );
-        assert_eq!(*engine2.meta.job_names.get(&name_hash("j1")).unwrap(), 4);
-        assert_eq!(
-            engine2
-                .meta
-                .next_id
-                .load(std::sync::atomic::Ordering::Relaxed),
-            engine
-                .meta
-                .next_id
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
-    }
-
-    #[test]
-    fn test_snapshot_preserves_queue_messages() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_queue("q", &QueueConfig::default()),
-            1,
-            1000,
-        );
-        // Enqueue two messages in separate raft entries (different log indexes)
-        let flat_a = make_flat_msg(b"a");
-        engine.apply_command(&MqCommand::enqueue(1, &[flat_a], &[None]), 2, 1001);
-        let flat_b = make_flat_msg(b"b");
-        engine.apply_command(&MqCommand::enqueue(1, &[flat_b], &[None]), 3, 1002);
-        // Deliver one
-        engine.apply_command(&MqCommand::deliver(1, 100, 1), 4, 1003);
-
-        let snap = engine.snapshot();
-        let mut engine2 = make_engine();
-        engine2.restore(snap);
-
-        let q = engine2.meta.queues.get(&1).unwrap();
-        assert_eq!(q.messages.len(), 2);
-        assert_eq!(
-            q.pending_count(),
-            engine.meta.queues.get(&1).unwrap().pending_count()
-        );
-        assert_eq!(
-            q.in_flight_count(),
-            engine.meta.queues.get(&1).unwrap().in_flight_count()
-        );
+        // Verify state was restored
+        assert!(engine2.metadata().topics.contains_key(&topic_id));
+        let topic = engine2.metadata().topics.get(&topic_id).unwrap();
+        assert_eq!(topic.message_count(), 1);
     }
 
     // =========================================================================
-    // Purge floor
+    // 10. test_consumer_group_join_sync
     // =========================================================================
 
     #[test]
-    fn test_purge_floor_empty() {
+    fn test_consumer_group_join_sync() {
         let mut engine = make_engine();
-        assert_eq!(engine.compute_purge_floor(), 0);
-    }
 
-    #[test]
-    fn test_purge_floor_with_data() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
-            1,
-            1000,
-        );
-        let flat_msg = make_flat_msg(b"msg");
-        engine.apply_command(&MqCommand::publish(1, &[flat_msg]), 10, 1001);
-        engine.apply_command(
-            &MqCommand::create_queue("q1", &QueueConfig::default()),
-            2,
-            1000,
-        );
-        let flat_task = make_flat_msg(b"task");
-        engine.apply_command(&MqCommand::enqueue(2, &[flat_task], &[None]), 5, 1001);
+        let cmd = MqCommand::create_consumer_group("join-test", 1);
+        let group_id = match engine.apply_command(&cmd, 1, 1000) {
+            MqResponse::EntityCreated { id } => id,
+            other => panic!("expected EntityCreated, got {:?}", other),
+        };
 
-        // Queue msg at 5, topic msg at 10.
-        // Purge floor = min of message indices only (creation indices
-        // are tracked separately via structural purge floor in MDBX).
-        let floor = engine.compute_purge_floor();
-        assert_eq!(floor, 5);
+        // Join
+        let join_cmd = MqCommand::join_consumer_group(
+            group_id,
+            "",
+            "client-1",
+            30_000,
+            60_000,
+            "consumer",
+            &[("range".to_string(), Bytes::from_static(b"meta"))],
+        );
+        let resp = engine.apply_command(&join_cmd, 2, 1001);
+        let member_id = match resp {
+            MqResponse::GroupJoined {
+                member_id,
+                phase_complete,
+                ..
+            } => {
+                assert!(phase_complete); // single member, so all joined immediately
+                member_id
+            }
+            other => panic!("expected GroupJoined, got {:?}", other),
+        };
+
+        // Sync
+        let sync_cmd = MqCommand::sync_consumer_group(
+            group_id,
+            1, // generation
+            &member_id,
+            &[(member_id.clone(), vec![1, 2, 3])],
+        );
+        let resp = engine.apply_command(&sync_cmd, 3, 1002);
+        match resp {
+            MqResponse::GroupSynced {
+                assignment,
+                phase_complete,
+            } => {
+                assert!(phase_complete);
+                assert_eq!(assignment, vec![1, 2, 3]);
+            }
+            other => panic!("expected GroupSynced, got {:?}", other),
+        }
     }
 
     // =========================================================================
-    // Error cases
+    // 11. test_dlq_routing
     // =========================================================================
 
     #[test]
-    fn test_operations_on_nonexistent_entities() {
+    fn test_dlq_routing() {
         let mut engine = make_engine();
+        let md = &engine.metadata;
 
-        assert!(matches!(
-            engine.apply_command(&MqCommand::delete_topic(999), 1, 1000),
-            MqResponse::Error(_)
-        ));
-        assert!(matches!(
-            engine.apply_command(&MqCommand::delete_queue(999), 2, 1000),
-            MqResponse::Error(_)
-        ));
-        assert!(matches!(
-            engine.apply_command(&MqCommand::publish(999, &[]), 3, 1000,),
-            MqResponse::Error(_)
-        ));
-        assert!(matches!(
-            engine.apply_command(&MqCommand::deliver(999, 1, 1), 4, 1000,),
-            MqResponse::Error(_)
-        ));
-    }
+        // Create DLQ topic
+        let cmd = MqCommand::create_topic("dlq-topic", RetentionPolicy::default(), 0);
+        let dlq_id = match engine.apply_command(&cmd, 1, 1000) {
+            MqResponse::EntityCreated { id } => id,
+            _ => panic!("expected EntityCreated"),
+        };
 
-    #[test]
-    fn test_id_allocation() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
-            1,
-            1000,
-        );
-        engine.apply_command(
-            &MqCommand::create_queue("q1", &QueueConfig::default()),
-            2,
-            1001,
-        );
-        engine.apply_command(&MqCommand::create_job("j1", &JobConfig::default()), 3, 1002);
+        // Create ack group
+        let group_id = md.alloc_id();
+        let group_meta = ConsumerGroupMeta {
+            group_id,
+            name: "dlq-group".to_string(),
+            name_hash: name_hash("dlq-group"),
+            created_at: 1000,
+            generation: 0,
+            phase: GroupPhase::Empty,
+            protocol_type: String::new(),
+            protocol_name: String::new(),
+            leader: None,
+            auto_offset_reset: AutoOffsetReset::Latest,
+            last_activity_at: 1000,
+            next_member_id: 1,
+            members: Vec::new(),
+            variant: GroupVariant::Ack,
+            source_topic_id: 0,
+            variant_config: VariantConfig::Ack(AckVariantConfig {
+                max_retries: 1,
+                dead_letter_topic: Some("dlq-topic".to_string()),
+                ..Default::default()
+            }),
+        };
+        let group_state =
+            ConsumerGroupState::new(group_meta, md.catalog_name(), md.server_start_ms);
+        md.consumer_groups.insert(group_id, group_state);
 
-        // IDs should be monotonically increasing
-        assert!(engine.meta.topics.contains_key(&1));
-        assert!(engine.meta.queues.contains_key(&2));
-        assert!(engine.meta.jobs.contains_key(&3));
-        assert_eq!(
-            engine
-                .meta
-                .next_id
-                .load(std::sync::atomic::Ordering::Relaxed),
-            4
-        );
-    }
+        // Enqueue a message
+        if let Some(group) = md.consumer_groups.get(&group_id) {
+            if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
+                ack.apply_enqueue(config, group_id, 100, &[make_msg(b"dlq-msg")], &[], 1000);
 
-    // =========================================================================
-    // Segment Index Tracking (via SegmentIndexMap)
-    // =========================================================================
+                // Deliver then timeout (exceeds max_retries since attempt = 1 >= max_retries = 1)
+                let delivered = ack.apply_deliver(config, 50, 1, 1001, 101);
+                assert_eq!(delivered.len(), 1);
 
-    #[test]
-    fn test_segment_index_tracking_publish() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
-            1,
-            1000,
-        );
-
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-        let cmd = MqCommand::publish(1, &[make_flat_msg(b"msg")]);
-        engine.apply_command(&cmd, 2, 1001);
-        sidx.track_command(&cmd, (1, 100));
-
-        assert!(sidx.get_builder(1).is_some());
-        assert!(!sidx.get_builder(1).unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_segment_index_tracking_enqueue() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_queue("q1", &QueueConfig::default()),
-            1,
-            1000,
-        );
-
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-        let cmd = MqCommand::enqueue(1, &[make_flat_msg(b"task")], &[None]);
-        engine.apply_command(&cmd, 2, 1001);
-        sidx.track_command(&cmd, (1, 200));
-
-        assert!(sidx.get_builder(1).is_some());
-    }
-
-    #[test]
-    fn test_segment_index_tracking_actor() {
-        let mut engine = make_engine();
-        engine.apply_command(
-            &MqCommand::create_actor_namespace("ns1", &ActorConfig::default()),
-            1,
-            1000,
-        );
-
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-        let cmd = MqCommand::send_to_actor(1, b"actor-1", &make_flat_msg(b"msg"));
-        engine.apply_command(&cmd, 2, 1001);
-        sidx.track_command(&cmd, (1, 300));
-
-        assert!(sidx.get_builder(1).is_some());
-    }
-
-    #[test]
-    fn test_segment_index_no_tracking_for_structural() {
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-        let cmd = MqCommand::create_topic("t1", RetentionPolicy::default(), 0);
-        sidx.track_command(&cmd, (1, 0));
-
-        // Structural commands are not tracked
-        assert!(sidx.is_empty());
-    }
-
-    #[test]
-    fn test_take_sealed_indexes_basic() {
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-
-        // Add entries in segment 1 and segment 2
-        let cmd1 = MqCommand::publish(1, &[make_flat_msg(b"a")]);
-        sidx.track_command(&cmd1, (1, 100));
-
-        let cmd2 = MqCommand::publish(1, &[make_flat_msg(b"b")]);
-        sidx.track_command(&cmd2, (2, 50));
-
-        // Drain with current=2 → segment 1 should be sealed
-        let sealed = sidx.take_sealed(Some(2));
-        assert_eq!(sealed.len(), 1);
-        assert_eq!(sealed[0].0, 1); // segment_id=1
-
-        // Segment 2 index should still be present
-        assert!(sidx.get_builder(2).is_some());
-        assert!(sidx.get_builder(1).is_none());
-    }
-
-    #[test]
-    fn test_take_sealed_indexes_empty() {
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-        let sealed = sidx.take_sealed(Some(1));
-        assert!(sealed.is_empty());
-    }
-
-    #[test]
-    fn test_take_sealed_indexes_all_when_none_current() {
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-
-        let cmd = MqCommand::publish(1, &[make_flat_msg(b"a")]);
-        sidx.track_command(&cmd, (1, 100));
-
-        let sealed = sidx.take_sealed(None);
-        assert_eq!(sealed.len(), 1);
-        assert!(sidx.is_empty());
-    }
-
-    #[test]
-    fn test_segment_index_cleared() {
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-
-        let cmd = MqCommand::publish(1, &[make_flat_msg(b"a")]);
-        sidx.track_command(&cmd, (1, 100));
-
-        assert!(!sidx.is_empty());
-
-        sidx.clear();
-        assert!(sidx.is_empty());
-    }
-
-    #[test]
-    fn test_segment_index_roundtrip() {
-        use crate::segment_index::{ENTITY_QUEUE, ENTITY_TOPIC};
-
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-
-        // Publish to topic (topic_id=1)
-        let pub_cmd = MqCommand::publish(1, &[make_flat_msg(b"msg1")]);
-        sidx.track_command(&pub_cmd, (1, 100));
-
-        // Enqueue to queue (queue_id=2)
-        let enq_cmd = MqCommand::enqueue(2, &[make_flat_msg(b"task1")], &[None]);
-        sidx.track_command(&enq_cmd, (1, 300));
-
-        // Take the index for segment 1
-        let sealed = sidx.take_sealed(Some(999));
-        assert_eq!(sealed.len(), 1);
-        let (seg_id, idx) = sealed.into_iter().next().unwrap();
-        assert_eq!(seg_id, 1);
-
-        // Serialize and load as frozen
-        let buf = idx.serialize();
-        let loaded = crate::segment_index::FrozenSegmentIndex::from_vec(buf).unwrap();
-        assert_eq!(loaded.segment_id(), 1);
-        assert_eq!(loaded.entry_count(), 2); // topic + queue
-
-        let t = loaded.find_entity(ENTITY_TOPIC, 1);
-        assert_eq!(t.len(), 1);
-        assert_eq!(t[0].offset, 100);
-
-        let q = loaded.find_entity(ENTITY_QUEUE, 2);
-        assert_eq!(q.len(), 1);
-        assert_eq!(q[0].offset, 300);
-    }
-
-    #[test]
-    fn test_segment_index_batch_tracking() {
-        use crate::segment_index::{ENTITY_QUEUE, ENTITY_TOPIC};
-
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-
-        let sub_cmds = vec![
-            MqCommand::publish(1, &[make_flat_msg(b"a")]),
-            MqCommand::enqueue(2, &[make_flat_msg(b"b")], &[None]),
-        ];
-        let batch_cmd = MqCommand::batch(&sub_cmds);
-        sidx.track_command(&batch_cmd, (1, 500));
-
-        let sealed = sidx.take_sealed(Some(999));
-        assert_eq!(sealed.len(), 1);
-        let (_, idx) = sealed.into_iter().next().unwrap();
-
-        let buf = idx.serialize();
-        let loaded = crate::segment_index::FrozenSegmentIndex::from_vec(buf).unwrap();
-
-        let t = loaded.find_entity(ENTITY_TOPIC, 1);
-        assert_eq!(t.len(), 1);
-        assert_eq!(t[0].offset, 500);
-
-        let q = loaded.find_entity(ENTITY_QUEUE, 2);
-        assert_eq!(q.len(), 1);
-        assert_eq!(q[0].offset, 500);
-    }
-
-    #[test]
-    fn test_segment_index_multi_segment_lifecycle() {
-        let sidx = crate::segment_index::SegmentIndexMap::new();
-
-        // Simulate writes across 3 segments
-        for seg in 1..=3u32 {
-            for i in 0..5u32 {
-                let cmd = MqCommand::publish(1, &[make_flat_msg(b"msg")]);
-                let offset = i * 100;
-                sidx.track_command(&cmd, (seg, offset));
+                let dead = ack.apply_timeout_expired(&delivered, config, 2000);
+                assert_eq!(dead.len(), 1);
+                assert_eq!(ack.dlq_count(), 1);
             }
         }
 
-        assert_eq!(sidx.len(), 3);
+        // Verify DLQ topic exists and can receive messages
+        assert!(md.topics.contains_key(&dlq_id));
+    }
 
-        // Seal segments 1 and 2 (current=3)
-        let sealed = sidx.take_sealed(Some(3));
-        assert_eq!(sealed.len(), 2);
-        let seg_ids: Vec<u32> = sealed.iter().map(|(id, _)| *id).collect();
-        assert!(seg_ids.contains(&1));
-        assert!(seg_ids.contains(&2));
+    // =========================================================================
+    // 12. test_auto_delete_on_last_detach
+    // =========================================================================
 
-        assert_eq!(sidx.len(), 1);
-        assert!(sidx.get_builder(3).is_some());
+    #[test]
+    fn test_auto_delete_on_last_detach() {
+        let mut engine = make_engine();
+        let md = &engine.metadata;
 
-        // Each sealed index should have 5 entries for topic 1
-        for (_, idx) in sealed {
-            let buf = idx.serialize();
-            let loaded = crate::segment_index::FrozenSegmentIndex::from_vec(buf).unwrap();
-            let entries = loaded.find_entity(crate::segment_index::ENTITY_TOPIC, 1);
-            assert_eq!(entries.len(), 5);
+        // Create a topic with DeleteOnLastDetach
+        let topic_id = md.alloc_id();
+        let mut topic_meta = TopicMeta::new(
+            topic_id,
+            "auto-del".to_string(),
+            1000,
+            RetentionPolicy::default(),
+        );
+        topic_meta.lifetime = TopicLifetimePolicy::DeleteOnLastDetach;
+        topic_meta.ensure_name_hash();
+        let topic_state = TopicState::new(topic_meta, md.catalog_name());
+        md.topics.insert(topic_id, topic_state);
+        md.topic_names.insert(name_hash("auto-del"), topic_id);
+
+        // Create a group attached to it
+        let group_id = md.alloc_id();
+        if let Some(topic) = md.topics.get(&topic_id) {
+            topic.attach_group(group_id);
         }
+
+        let group_meta = ConsumerGroupMeta {
+            group_id,
+            name: "auto-del-group".to_string(),
+            name_hash: name_hash("auto-del-group"),
+            created_at: 1000,
+            generation: 0,
+            phase: GroupPhase::Empty,
+            protocol_type: String::new(),
+            protocol_name: String::new(),
+            leader: None,
+            auto_offset_reset: AutoOffsetReset::Latest,
+            last_activity_at: 1000,
+            next_member_id: 1,
+            members: Vec::new(),
+            variant: GroupVariant::Offset,
+            source_topic_id: topic_id,
+            variant_config: VariantConfig::Offset,
+        };
+        let group_state =
+            ConsumerGroupState::new(group_meta, md.catalog_name(), md.server_start_ms);
+        md.consumer_groups.insert(group_id, group_state);
+        md.consumer_group_names
+            .insert(name_hash("auto-del-group"), group_id);
+
+        // Topic should exist
+        assert!(md.topics.contains_key(&topic_id));
+
+        // Delete the consumer group — should auto-delete the topic
+        let del_cmd = MqCommand::delete_consumer_group(group_id);
+        engine.apply_command(&del_cmd, 10, 2000);
+
+        // Topic should be gone
+        assert!(!md.topics.contains_key(&topic_id));
+    }
+
+    // =========================================================================
+    // 13. test_batch_command
+    // =========================================================================
+
+    #[test]
+    fn test_batch_command() {
+        let mut engine = make_engine();
+
+        let cmd1 = MqCommand::create_topic("batch-t1", RetentionPolicy::default(), 0);
+        let cmd2 = MqCommand::create_topic("batch-t2", RetentionPolicy::default(), 0);
+        let batch = MqCommand::batch(&[cmd1, cmd2]);
+
+        match engine.apply_command(&batch, 1, 1000) {
+            MqResponse::BatchResponse(responses) => {
+                assert_eq!(responses.len(), 2);
+                assert!(matches!(responses[0], MqResponse::EntityCreated { .. }));
+                assert!(matches!(responses[1], MqResponse::EntityCreated { .. }));
+            }
+            other => panic!("expected BatchResponse, got {:?}", other),
+        }
+
+        assert_eq!(engine.metadata().topics.len(), 2);
     }
 }

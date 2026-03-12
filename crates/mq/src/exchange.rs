@@ -96,22 +96,22 @@ impl ExchangeState {
         }
     }
 
-    /// Route a message to target queue IDs based on exchange type and routing key.
+    /// Route a message to target topic IDs based on exchange type and routing key.
     pub fn route(&self, routing_key: Option<&str>) -> SmallVec<[u64; 8]> {
         match self.meta.exchange_type {
             ExchangeType::Fanout => {
-                // Deliver to all bound queues
-                self.bindings.values().map(|b| b.queue_id).collect()
+                // Deliver to all bound topics
+                self.bindings.values().map(|b| b.target_topic_id).collect()
             }
             ExchangeType::Direct => {
-                // Deliver to queues with exact routing key match
+                // Deliver to topics with exact routing key match
                 if let Some(key) = routing_key {
                     let hash = name_hash(key);
                     self.direct_index
                         .get(&hash)
                         .map(|ids| {
                             ids.iter()
-                                .filter_map(|id| self.bindings.get(id).map(|b| b.queue_id))
+                                .filter_map(|id| self.bindings.get(id).map(|b| b.target_topic_id))
                                 .collect()
                         })
                         .unwrap_or_default()
@@ -120,12 +120,12 @@ impl ExchangeState {
                     self.bindings
                         .values()
                         .filter(|b| b.routing_key.is_none())
-                        .map(|b| b.queue_id)
+                        .map(|b| b.target_topic_id)
                         .collect()
                 }
             }
             ExchangeType::Topic => {
-                // Deliver to queues whose binding pattern matches the routing key
+                // Deliver to topics whose binding pattern matches the routing key
                 let key = routing_key.unwrap_or("");
                 self.bindings
                     .values()
@@ -133,7 +133,7 @@ impl ExchangeState {
                         let pattern = b.routing_key.as_deref().unwrap_or("");
                         topic_pattern_matches(pattern, key)
                     })
-                    .map(|b| b.queue_id)
+                    .map(|b| b.target_topic_id)
                     .collect()
             }
         }
@@ -173,11 +173,9 @@ fn match_bytes(pattern: &[u8], key: &[u8], delim: u8) -> bool {
                 return true;
             }
             // Try matching rest of pattern starting from every possible position in key
-            // First try with current key (skip 0 segments)
             if match_bytes(p_rest, key, delim) {
                 return true;
             }
-            // Then try skipping segments
             let mut remaining = key;
             loop {
                 let (seg, rest) = split_first_segment(remaining, delim);
@@ -194,11 +192,7 @@ fn match_bytes(pattern: &[u8], key: &[u8], delim: u8) -> bool {
             }
             false
         }
-        (Some(_), None) => {
-            // Pattern has segment but key exhausted
-            // Check if pattern segment is # and there's nothing else
-            p_seg == Some(b"#") && p_rest.is_empty()
-        }
+        (Some(_), None) => p_seg == Some(b"#") && p_rest.is_empty(),
         (Some(p), Some(k)) => {
             if p == b"*" || p == b"+" {
                 match_bytes(p_rest, k_rest, delim)
@@ -212,8 +206,6 @@ fn match_bytes(pattern: &[u8], key: &[u8], delim: u8) -> bool {
 }
 
 /// Split on the first delimiter. Returns (first_segment, rest_after_delimiter).
-/// If no delimiter, returns (Some(input), &[]).
-/// If input is empty, returns (None, &[]).
 #[inline]
 fn split_first_segment<'a>(input: &'a [u8], delim: u8) -> (Option<&'a [u8]>, &'a [u8]) {
     if input.is_empty() {
@@ -281,7 +273,7 @@ mod tests {
         ex.add_binding(Binding {
             binding_id: 1,
             exchange_id: 1,
-            queue_id: 10,
+            target_topic_id: 10,
             routing_key: None,
             no_local: false,
             shared_group: None,
@@ -290,7 +282,7 @@ mod tests {
         ex.add_binding(Binding {
             binding_id: 2,
             exchange_id: 1,
-            queue_id: 20,
+            target_topic_id: 20,
             routing_key: None,
             no_local: false,
             shared_group: None,
@@ -310,7 +302,7 @@ mod tests {
         ex.add_binding(Binding {
             binding_id: 1,
             exchange_id: 1,
-            queue_id: 10,
+            target_topic_id: 10,
             routing_key: Some("error".to_string()),
             no_local: false,
             shared_group: None,
@@ -319,7 +311,7 @@ mod tests {
         ex.add_binding(Binding {
             binding_id: 2,
             exchange_id: 1,
-            queue_id: 20,
+            target_topic_id: 20,
             routing_key: Some("info".to_string()),
             no_local: false,
             shared_group: None,
@@ -338,7 +330,7 @@ mod tests {
         ex.add_binding(Binding {
             binding_id: 1,
             exchange_id: 1,
-            queue_id: 10,
+            target_topic_id: 10,
             routing_key: Some("logs.*".to_string()),
             no_local: false,
             shared_group: None,
@@ -347,7 +339,7 @@ mod tests {
         ex.add_binding(Binding {
             binding_id: 2,
             exchange_id: 1,
-            queue_id: 20,
+            target_topic_id: 20,
             routing_key: Some("logs.#".to_string()),
             no_local: false,
             shared_group: None,
@@ -370,7 +362,7 @@ mod tests {
         ex.add_binding(Binding {
             binding_id: 1,
             exchange_id: 1,
-            queue_id: 10,
+            target_topic_id: 10,
             routing_key: Some("key".to_string()),
             no_local: false,
             shared_group: None,

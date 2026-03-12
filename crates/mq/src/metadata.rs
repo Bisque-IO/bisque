@@ -20,16 +20,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use bytes::Bytes;
 use dashmap::DashMap;
 
-use crate::actor::ActorNamespaceState;
-use crate::consumer::ConsumerState;
 use crate::consumer_group::ConsumerGroupState;
 use crate::exchange::ExchangeState;
-use crate::job::JobInstance;
-use crate::notifier::QueueNotifier;
-use crate::producer::ProducerMeta;
-use crate::queue::QueueState;
+use crate::notifier::GroupNotifier;
+use crate::session::SessionState;
 use crate::topic::TopicState;
-use crate::types::{PendingWill, PersistedSession, TopicAliasEntry};
+use crate::types::{PendingWill, TopicAliasEntry};
 
 // ---------------------------------------------------------------------------
 // Atomic metadata entities
@@ -197,24 +193,6 @@ impl fmt::Debug for TopicMeta {
     }
 }
 
-/// Queue metadata.
-///
-/// Currently only structural (immutable) fields. Hot fields can be added
-/// as atomics later when needed.
-pub struct QueueMeta {
-    pub queue_id: u64,
-    pub name: String,
-}
-
-impl fmt::Debug for QueueMeta {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QueueMeta")
-            .field("queue_id", &self.queue_id)
-            .field("name", &self.name)
-            .finish()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // MqMetadata — DashMap + atomics
 // ---------------------------------------------------------------------------
@@ -237,49 +215,32 @@ pub struct MqMetadata {
     // -- Protocol adapter caches (lightweight, with atomics for hot fields) --
     topics_by_id: DashMap<u64, Arc<TopicMeta>>,
     topics_by_name: DashMap<String, u64>,
-    queues_by_id: DashMap<u64, Arc<QueueMeta>>,
-    queues_by_name: DashMap<String, u64>,
 
     // -- Full entity stores (DashMap replaces HashMap behind RwLock) --
     pub(crate) topics: DashMap<u64, TopicState>,
-    pub(crate) queues: DashMap<u64, QueueState>,
-    pub(crate) actor_namespaces: DashMap<u64, ActorNamespaceState>,
-    pub(crate) jobs: DashMap<u64, JobInstance>,
     pub(crate) exchanges: DashMap<u64, ExchangeState>,
 
-    // -- Session stores --
-    pub(crate) consumers: DashMap<u64, ConsumerState>,
-    pub(crate) producers: DashMap<u64, ProducerMeta>,
-
-    // -- Consumer groups (Raft-replicated coordinator state) --
+    // -- Consumer groups (unified — Offset, Ack, Actor variants) --
     pub(crate) consumer_groups: DashMap<u64, ConsumerGroupState>,
     pub(crate) consumer_group_names: DashMap<u64, u64>, // name_hash → group_id
 
+    // -- Sessions (unified, replaces consumers + producers) --
+    pub(crate) sessions: DashMap<u64, SessionState>,
+
     // -- Name hash (CRC64-NVME) → ID lookup indexes --
     pub(crate) topic_names: DashMap<u64, u64>,
-    pub(crate) queue_names: DashMap<u64, u64>,
-    pub(crate) namespace_names: DashMap<u64, u64>,
-    pub(crate) job_names: DashMap<u64, u64>,
     pub(crate) exchange_names: DashMap<u64, u64>,
 
-    // -- Consumer reverse indexes for O(1) disconnect --
-    /// consumer_id → set of queue_ids where the consumer has in-flight messages.
-    pub(crate) consumer_queue_index: DashMap<u64, HashSet<u64>>,
-    /// consumer_id → set of namespace_ids where the consumer has actor assignments.
-    pub(crate) consumer_actor_ns_index: DashMap<u64, HashSet<u64>>,
-    /// consumer_id → set of job_ids assigned to the consumer.
-    pub(crate) consumer_job_index: DashMap<u64, HashSet<u64>>,
+    // -- Consumer group reverse indexes for O(1) disconnect --
+    /// session_id → set of group_ids where the session has in-flight messages or assignments.
+    pub(crate) session_group_index: DashMap<u64, HashSet<u64>>,
 
-    // -- MQTT session persistence --
-    /// client_id name_hash → persisted session state.
-    pub(crate) persisted_sessions: DashMap<u64, PersistedSession>,
-
-    // -- Push-based queue delivery --
-    /// Notifies watchers when messages are enqueued to a queue.
-    pub queue_notifier: QueueNotifier,
+    // -- Push-based group delivery --
+    /// Notifies watchers when messages are available in a consumer group.
+    pub group_notifier: GroupNotifier,
 
     // -- Topic aliases (MQTT 5.0) --
-    /// consumer_id → list of topic alias entries.
+    /// session_id → list of topic alias entries.
     pub(crate) topic_aliases: DashMap<u64, Vec<TopicAliasEntry>>,
 
     // -- Pending will messages (MQTT 5.0 Will Delay Interval) --
@@ -291,19 +252,22 @@ pub struct MqMetadata {
     pub(crate) publisher_dedup: DashMap<u64, HashSet<u64>>,
 
     // -- QoS 2 inbound dedup (MQTT 5.0 exactly-once inbound) --
-    /// consumer_id → (packet_id → qos2 state: 0=RECEIVED, 1=COMPLETE).
+    /// session_id → (packet_id → qos2 state: 0=RECEIVED, 1=COMPLETE).
     pub(crate) qos2_inbound: DashMap<u64, HashMap<u16, u8>>,
 
     // -- O(1) reverse indexes --
     /// binding_id → exchange_id for O(1) delete-binding lookup.
     pub(crate) binding_index: DashMap<u64, u64>,
-    /// client_id name_hash → consumer_id for O(1) session restore.
+    /// client_id name_hash → session_id for O(1) session restore.
     pub(crate) session_client_index: DashMap<u64, u64>,
 
     // -- Atomic scalars --
     pub(crate) next_id: AtomicU64,
     pub(crate) cached_purge_floor: AtomicU64,
     pub(crate) purge_floor_dirty: AtomicBool,
+
+    /// Server start time (epoch ms) — used for compact delay index offsets.
+    pub(crate) server_start_ms: u64,
 }
 
 impl MqMetadata {
@@ -312,27 +276,15 @@ impl MqMetadata {
             catalog_name,
             topics_by_id: DashMap::new(),
             topics_by_name: DashMap::new(),
-            queues_by_id: DashMap::new(),
-            queues_by_name: DashMap::new(),
             topics: DashMap::new(),
-            queues: DashMap::new(),
-            actor_namespaces: DashMap::new(),
-            jobs: DashMap::new(),
             exchanges: DashMap::new(),
-            consumers: DashMap::new(),
-            producers: DashMap::new(),
             consumer_groups: DashMap::new(),
             consumer_group_names: DashMap::new(),
+            sessions: DashMap::new(),
             topic_names: DashMap::new(),
-            queue_names: DashMap::new(),
-            namespace_names: DashMap::new(),
-            job_names: DashMap::new(),
             exchange_names: DashMap::new(),
-            consumer_queue_index: DashMap::new(),
-            consumer_actor_ns_index: DashMap::new(),
-            consumer_job_index: DashMap::new(),
-            persisted_sessions: DashMap::new(),
-            queue_notifier: QueueNotifier::new(),
+            session_group_index: DashMap::new(),
+            group_notifier: GroupNotifier::new(),
             topic_aliases: DashMap::new(),
             pending_wills: DashMap::new(),
             publisher_dedup: DashMap::new(),
@@ -342,7 +294,17 @@ impl MqMetadata {
             next_id: AtomicU64::new(1),
             cached_purge_floor: AtomicU64::new(0),
             purge_floor_dirty: AtomicBool::new(true),
+            server_start_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
         }
+    }
+
+    /// Server start time in epoch milliseconds.
+    #[inline]
+    pub fn server_start_ms(&self) -> u64 {
+        self.server_start_ms
     }
 
     /// The catalog name for metrics labeling.
@@ -362,10 +324,8 @@ impl MqMetadata {
     pub fn resolve_entity(&self, entity_type: u8, name_hash: u64) -> Option<u64> {
         match entity_type {
             0 => self.topic_names.get(&name_hash).map(|r| *r),
-            1 => self.queue_names.get(&name_hash).map(|r| *r),
-            2 => self.namespace_names.get(&name_hash).map(|r| *r),
-            3 => self.job_names.get(&name_hash).map(|r| *r),
-            4 => self.exchange_names.get(&name_hash).map(|r| *r),
+            1 => self.exchange_names.get(&name_hash).map(|r| *r),
+            2 => self.consumer_group_names.get(&name_hash).map(|r| *r),
             _ => None,
         }
     }
@@ -449,7 +409,6 @@ impl MqMetadata {
         out.reserve(self.topics_by_id.len());
         for entry in self.topics_by_id.iter() {
             let t = entry.value();
-            // Use Bytes::copy_from_slice to avoid String clone + into Vec + into Bytes
             out.push((Bytes::copy_from_slice(t.name.as_bytes()), t.topic_id));
         }
     }
@@ -478,109 +437,30 @@ impl MqMetadata {
         self.topics_by_id.len()
     }
 
-    // -- Queue operations --
-
-    /// Insert or replace a queue.
-    pub fn insert_queue(&self, meta: Arc<QueueMeta>) -> Option<Arc<QueueMeta>> {
-        self.queues_by_name.insert(meta.name.clone(), meta.queue_id);
-        self.queues_by_id.insert(meta.queue_id, meta)
-    }
-
-    /// Remove a queue by ID.
-    pub fn remove_queue(&self, queue_id: u64) -> Option<Arc<QueueMeta>> {
-        if let Some((_, meta)) = self.queues_by_id.remove(&queue_id) {
-            self.queues_by_name.remove(&meta.name);
-            Some(meta)
-        } else {
-            None
-        }
-    }
-
-    /// Get queue metadata by ID.
-    #[inline]
-    pub fn get_queue(&self, queue_id: u64) -> Option<Arc<QueueMeta>> {
-        self.queues_by_id
-            .get(&queue_id)
-            .map(|r| Arc::clone(r.value()))
-    }
-
-    /// Find a queue by name.
-    pub fn find_queue_by_name(&self, name: &str) -> Option<Arc<QueueMeta>> {
-        let queue_id = *self.queues_by_name.get(name)?;
-        self.get_queue(queue_id)
-    }
-
-    /// Number of queues.
-    #[inline]
-    pub fn queue_count(&self) -> usize {
-        self.queues_by_id.len()
-    }
-
     /// Collect all topic IDs (for sync/removal checks).
     pub fn topic_ids(&self) -> Vec<u64> {
         self.topics_by_id.iter().map(|e| *e.key()).collect()
     }
 
-    /// Collect all queue IDs (for sync/removal checks).
-    pub fn queue_ids(&self) -> Vec<u64> {
-        self.queues_by_id.iter().map(|e| *e.key()).collect()
-    }
+    // -- Session / group reverse index operations --
 
-    // -- Consumer reverse index operations --
-
-    /// Track that a consumer has in-flight messages in a queue.
+    /// Track that a session has in-flight messages or assignments in a group.
     #[inline]
-    pub(crate) fn track_consumer_queue(&self, consumer_id: u64, queue_id: u64) {
-        self.consumer_queue_index
-            .entry(consumer_id)
+    pub(crate) fn track_session_group(&self, session_id: u64, group_id: u64) {
+        self.session_group_index
+            .entry(session_id)
             .or_default()
-            .insert(queue_id);
+            .insert(group_id);
     }
 
-    /// Track that a consumer has actor assignments in a namespace.
-    #[inline]
-    pub(crate) fn track_consumer_actor_ns(&self, consumer_id: u64, namespace_id: u64) {
-        self.consumer_actor_ns_index
-            .entry(consumer_id)
-            .or_default()
-            .insert(namespace_id);
+    /// Remove a session from the reverse index. Returns the tracked group set.
+    pub(crate) fn remove_session_group_index(&self, session_id: u64) -> Option<HashSet<u64>> {
+        self.session_group_index.remove(&session_id).map(|(_, v)| v)
     }
 
-    /// Track that a consumer has a job assignment.
-    #[inline]
-    pub(crate) fn track_consumer_job(&self, consumer_id: u64, job_id: u64) {
-        self.consumer_job_index
-            .entry(consumer_id)
-            .or_default()
-            .insert(job_id);
-    }
-
-    /// Remove a consumer from all reverse indexes. Returns the tracked sets.
-    pub(crate) fn remove_consumer_indexes(
-        &self,
-        consumer_id: u64,
-    ) -> (
-        Option<HashSet<u64>>,
-        Option<HashSet<u64>>,
-        Option<HashSet<u64>>,
-    ) {
-        let queues = self
-            .consumer_queue_index
-            .remove(&consumer_id)
-            .map(|(_, v)| v);
-        let actor_ns = self
-            .consumer_actor_ns_index
-            .remove(&consumer_id)
-            .map(|(_, v)| v);
-        let jobs = self.consumer_job_index.remove(&consumer_id).map(|(_, v)| v);
-        (queues, actor_ns, jobs)
-    }
-
-    /// Clear all consumer reverse indexes (used during snapshot restore).
-    pub(crate) fn clear_consumer_indexes(&self) {
-        self.consumer_queue_index.clear();
-        self.consumer_actor_ns_index.clear();
-        self.consumer_job_index.clear();
+    /// Clear all session reverse indexes (used during snapshot restore).
+    pub(crate) fn clear_session_indexes(&self) {
+        self.session_group_index.clear();
     }
 
     // -- Consumer group operations (public API for Kafka adapter) --
@@ -648,13 +528,6 @@ mod tests {
         ))
     }
 
-    fn make_queue(id: u64, name: &str) -> Arc<QueueMeta> {
-        Arc::new(QueueMeta {
-            queue_id: id,
-            name: name.into(),
-        })
-    }
-
     #[test]
     fn empty_metadata() {
         let meta = MqMetadata::default();
@@ -663,7 +536,6 @@ mod tests {
         assert!(meta.get_topic_tail(1).is_none());
         assert!(meta.get_topic_latest(1).is_none());
         assert_eq!(meta.topic_count(), 0);
-        assert_eq!(meta.queue_count(), 0);
     }
 
     #[test]
@@ -671,7 +543,6 @@ mod tests {
         let meta = MqMetadata::default();
         meta.insert_topic(make_topic_with_state(1, "events", 100, 50, 50, 999, 2));
         meta.insert_topic(make_topic_with_state(2, "events.clicks", 10, 0, 10, 500, 0));
-        meta.insert_queue(make_queue(10, "work-queue"));
 
         assert_eq!(meta.get_topic_head(1), Some(100));
         assert_eq!(meta.get_topic_tail(1), Some(50));
@@ -686,9 +557,6 @@ mod tests {
 
         let t = meta.find_topic_by_name("events").unwrap();
         assert_eq!(t.topic_id, 1);
-        let q = meta.find_queue_by_name("work-queue").unwrap();
-        assert_eq!(q.queue_id, 10);
-        assert!(meta.find_queue_by_name("nonexistent").is_none());
     }
 
     #[test]
@@ -696,12 +564,10 @@ mod tests {
         let meta = MqMetadata::default();
         meta.insert_topic(make_topic_with_state(1, "t", 10, 0, 10, 100, 0));
 
-        // Caller caches the Arc.
         let cached = meta.get_topic(1).unwrap();
         assert_eq!(cached.head_index(), 10);
         assert_eq!(cached.message_count(), 10);
 
-        // Writer updates atomics — cached Arc sees it immediately.
         cached.set_head_index(20);
         cached.set_message_count(20);
         cached.set_latest(200, 3);
@@ -710,7 +576,6 @@ mod tests {
         assert_eq!(cached.message_count(), 20);
         assert_eq!(cached.latest(), Some((200, 3)));
 
-        // A new lookup also sees the update (same Arc).
         let fresh = meta.get_topic(1).unwrap();
         assert_eq!(fresh.head_index(), 20);
     }
@@ -732,19 +597,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_queue() {
-        let meta = MqMetadata::default();
-        meta.insert_queue(make_queue(1, "q1"));
-        meta.insert_queue(make_queue(2, "q2"));
-        assert_eq!(meta.queue_count(), 2);
-
-        meta.remove_queue(1);
-        assert_eq!(meta.queue_count(), 1);
-        assert!(meta.find_queue_by_name("q1").is_none());
-        assert!(meta.find_queue_by_name("q2").is_some());
-    }
-
-    #[test]
     fn empty_topic_returns_none_for_head_tail() {
         let meta = MqMetadata::default();
         meta.insert_topic(make_topic(1, "empty-topic"));
@@ -752,7 +604,6 @@ mod tests {
         assert!(meta.get_topic_head(1).is_none());
         assert!(meta.get_topic_tail(1).is_none());
         assert!(meta.get_topic_latest(1).is_none());
-        // But findable by name.
         assert!(meta.find_topic_by_name("empty-topic").is_some());
     }
 
@@ -791,17 +642,13 @@ mod tests {
         let meta = Arc::new(MqMetadata::default());
         meta.insert_topic(make_topic_with_state(1, "v1", 10, 0, 10, 100, 0));
 
-        // Two readers cache the same Arc.
         let r1 = meta.get_topic(1).unwrap();
         let r2 = meta.get_topic(1).unwrap();
 
         assert_eq!(r1.head_index(), 10);
         assert_eq!(r2.head_index(), 10);
 
-        // Writer updates via r1's Arc.
         r1.set_head_index(20);
-
-        // r2 sees it immediately — same underlying AtomicU64.
         assert_eq!(r2.head_index(), 20);
     }
 
@@ -810,16 +657,10 @@ mod tests {
         let meta = MqMetadata::default();
         meta.insert_topic(make_topic(1, "foo"));
         meta.insert_topic(make_topic(2, "bar"));
-        meta.insert_queue(make_queue(10, "inbox"));
-        meta.insert_queue(make_queue(20, "outbox"));
 
         assert_eq!(meta.find_topic_by_name("foo").unwrap().topic_id, 1);
         assert_eq!(meta.find_topic_by_name("bar").unwrap().topic_id, 2);
         assert!(meta.find_topic_by_name("baz").is_none());
-
-        assert_eq!(meta.find_queue_by_name("inbox").unwrap().queue_id, 10);
-        assert_eq!(meta.find_queue_by_name("outbox").unwrap().queue_id, 20);
-        assert!(meta.find_queue_by_name("missing").is_none());
     }
 
     #[test]
@@ -827,7 +668,6 @@ mod tests {
         let meta = MqMetadata::default();
         meta.insert_topic(make_topic_with_state(1, "t", 10, 0, 10, 50, 0));
 
-        // Replace with new Arc.
         let new = make_topic_with_state(1, "t", 20, 0, 20, 100, 1);
         let old = meta.insert_topic(new).unwrap();
         assert_eq!(old.head_index(), 10);
@@ -853,8 +693,26 @@ mod tests {
         t.set_latest(42, 3);
         assert_eq!(t.latest(), Some((42, 3)));
 
-        // Setting back to 0 means None again.
         t.set_latest(0, 0);
         assert_eq!(t.latest(), None);
+    }
+
+    #[test]
+    fn session_group_tracking() {
+        let meta = MqMetadata::default();
+        meta.track_session_group(1, 10);
+        meta.track_session_group(1, 20);
+        meta.track_session_group(2, 10);
+
+        let groups = meta.remove_session_group_index(1).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains(&10));
+        assert!(groups.contains(&20));
+
+        assert!(meta.remove_session_group_index(1).is_none());
+
+        let groups = meta.remove_session_group_index(2).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains(&10));
     }
 }

@@ -214,8 +214,8 @@ impl MqSegmentCursor {
     /// Scan for the next record matching a specific entity.
     ///
     /// Filters by MqCommand tag and entity_id. For Publish commands the
-    /// entity_id is at bytes `[1..9]` (topic_id); for Enqueue it's also
-    /// at `[1..9]` (queue_id). Returns `None` when the segment is exhausted.
+    /// entity_id is at bytes `[1..9]` (topic_id). Returns `None` when the
+    /// segment is exhausted.
     ///
     /// `match_tag` should be one of the `MqCommand::TAG_*` constants.
     pub fn next_record_for_entity(
@@ -548,7 +548,7 @@ mod tests {
         let cmds = vec![
             MqCommand::publish(10, &[Bytes::from_static(b"hello")]),
             MqCommand::publish(20, &[Bytes::from_static(b"world")]),
-            MqCommand::enqueue(30, &[Bytes::from_static(b"msg")], &[]),
+            MqCommand::publish(30, &[Bytes::from_static(b"msg")]),
         ];
         let data = build_test_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(1, data);
@@ -565,8 +565,8 @@ mod tests {
 
         let rec3 = cursor.next_record().expect("should get record 3");
         assert_eq!(rec3.log_index, 3);
-        assert_eq!(rec3.command.tag(), MqCommand::TAG_ENQUEUE);
-        assert_eq!(rec3.command.as_enqueue().queue_id(), 30);
+        assert_eq!(rec3.command.tag(), MqCommand::TAG_PUBLISH);
+        assert_eq!(rec3.command.as_publish().topic_id(), 30);
 
         assert!(cursor.next_record().is_none());
         assert!(cursor.is_exhausted());
@@ -595,7 +595,7 @@ mod tests {
             MqCommand::publish(10, &[Bytes::from_static(b"a")]),
             MqCommand::publish(20, &[Bytes::from_static(b"b")]),
             MqCommand::publish(10, &[Bytes::from_static(b"c")]),
-            MqCommand::enqueue(10, &[Bytes::from_static(b"d")], &[]),
+            MqCommand::publish(30, &[Bytes::from_static(b"d")]),
             MqCommand::publish(10, &[Bytes::from_static(b"e")]),
         ];
         let data = build_test_segment(&cmds);
@@ -608,9 +608,9 @@ mod tests {
         assert_eq!(records[1].log_index, 3);
         assert_eq!(records[2].log_index, 5);
 
-        // Rewind and filter for Enqueue to queue 10.
+        // Rewind and filter for Publish to topic 30.
         cursor.rewind();
-        let records = cursor.collect_for_entity(MqCommand::TAG_ENQUEUE, 10);
+        let records = cursor.collect_for_entity(MqCommand::TAG_PUBLISH, 30);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].log_index, 4);
     }
@@ -708,7 +708,7 @@ mod tests {
         // A batch containing 3 sub-commands should yield 3 individual records.
         let sub1 = MqCommand::publish(10, &[Bytes::from_static(b"a")]);
         let sub2 = MqCommand::publish(20, &[Bytes::from_static(b"b")]);
-        let sub3 = MqCommand::enqueue(30, &[Bytes::from_static(b"c")], &[]);
+        let sub3 = MqCommand::publish(30, &[Bytes::from_static(b"c")]);
         let batch = MqCommand::batch(&[sub1, sub2, sub3]);
 
         let cmds = vec![
@@ -738,8 +738,8 @@ mod tests {
 
         let rec = cursor.next_record().unwrap();
         assert_eq!(rec.log_index, 2);
-        assert_eq!(rec.command.tag(), MqCommand::TAG_ENQUEUE);
-        assert_eq!(rec.command.as_enqueue().queue_id(), 30);
+        assert_eq!(rec.command.tag(), MqCommand::TAG_PUBLISH);
+        assert_eq!(rec.command.as_publish().topic_id(), 30);
 
         // Record 5: standalone publish after batch.
         let rec = cursor.next_record().unwrap();
@@ -854,13 +854,13 @@ mod tests {
     }
 
     #[test]
-    fn cursor_batch_with_mixed_command_types() {
-        // Batch containing different command types; entity filter picks the right ones.
+    fn cursor_batch_with_mixed_topics() {
+        // Batch containing publishes to different topics; entity filter picks the right ones.
         let batch = MqCommand::batch(&[
             MqCommand::publish(10, &[Bytes::from_static(b"p1")]),
-            MqCommand::enqueue(10, &[Bytes::from_static(b"e1")], &[]),
-            MqCommand::publish(10, &[Bytes::from_static(b"p2")]),
-            MqCommand::enqueue(20, &[Bytes::from_static(b"e2")], &[]),
+            MqCommand::publish(20, &[Bytes::from_static(b"p2")]),
+            MqCommand::publish(10, &[Bytes::from_static(b"p3")]),
+            MqCommand::publish(20, &[Bytes::from_static(b"p4")]),
         ]);
         let data = build_test_segment(&[batch]);
         let mut cursor = MqSegmentCursor::new(1, data);
@@ -869,15 +869,10 @@ mod tests {
         let pubs = cursor.collect_for_entity(MqCommand::TAG_PUBLISH, 10);
         assert_eq!(pubs.len(), 2);
 
-        // Rewind and filter for enqueue to queue 10.
+        // Rewind and filter for publishes to topic 20.
         cursor.rewind();
-        let enqueues = cursor.collect_for_entity(MqCommand::TAG_ENQUEUE, 10);
-        assert_eq!(enqueues.len(), 1);
-
-        // Rewind and filter for enqueue to queue 20.
-        cursor.rewind();
-        let enqueues = cursor.collect_for_entity(MqCommand::TAG_ENQUEUE, 20);
-        assert_eq!(enqueues.len(), 1);
+        let pubs = cursor.collect_for_entity(MqCommand::TAG_PUBLISH, 20);
+        assert_eq!(pubs.len(), 2);
     }
 
     #[test]

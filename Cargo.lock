@@ -1280,6 +1280,7 @@ dependencies = [
  "bisque-mq",
  "bytes",
  "crc32fast",
+ "dashmap",
  "flate2",
  "lz4_flex 0.11.5",
  "metrics",

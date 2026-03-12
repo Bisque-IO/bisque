@@ -7,7 +7,8 @@
 //!   flags:            u16   (bitfield — see FLAGS_*)
 //!   header_count:     u16   (number of key/value header pairs)
 //!   span_count:       u16   (total variable-length spans in the index)
-//!   reserved:         u16   (alignment padding)
+//!   priority:         u8    (0 = not set; message priority for ack groups)
+//!   reserved:         u8    (alignment padding)
 //!   timestamp:        u64
 //!   ttl_ms:           u64   (0 = not set)
 //!   delay_ms:         u64   (0 = not set)
@@ -43,6 +44,7 @@ const FLAG_RETAIN: u16 = 1 << 6;
 const FLAG_NO_LOCAL: u16 = 1 << 7;
 const FLAG_UTF8_PAYLOAD: u16 = 1 << 8;
 const FLAG_HAS_PUBLISHER_ID: u16 = 1 << 9;
+const FLAG_HAS_PRIORITY: u16 = 1 << 10;
 
 // Span index positions (value is always span 0)
 const SPAN_VALUE: usize = 0;
@@ -59,6 +61,7 @@ pub struct FlatMessageMeta {
     pub flags: u16,
     pub header_count: u16,
     pub span_count: u16,
+    pub priority: u8,
     pub timestamp: u64,
     pub ttl_ms: u64,
     pub delay_ms: u64,
@@ -77,7 +80,8 @@ impl FlatMessageMeta {
             flags: u16::from_le_bytes([buf[0], buf[1]]),
             header_count: u16::from_le_bytes([buf[2], buf[3]]),
             span_count: u16::from_le_bytes([buf[4], buf[5]]),
-            // buf[6..8] reserved
+            priority: buf[6], // first byte of former reserved u16
+            // buf[7] reserved
             timestamp: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             ttl_ms: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
             delay_ms: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
@@ -144,6 +148,36 @@ impl FlatMessageMeta {
         Some(u32::from_le_bytes(
             buf[start..start + 4].try_into().unwrap(),
         ))
+    }
+
+    /// Read priority directly from `buf` without full parse.
+    /// Returns `None` if the buffer is too short or priority flag is not set.
+    #[inline]
+    pub fn priority(buf: &[u8]) -> Option<u8> {
+        if buf.len() < HEADER_SIZE {
+            return None;
+        }
+        let flags = u16::from_le_bytes([buf[0], buf[1]]);
+        if flags & FLAG_HAS_PRIORITY != 0 {
+            Some(buf[6])
+        } else {
+            None
+        }
+    }
+
+    /// Read TTL directly from `buf` without full parse.
+    /// Returns `None` if the buffer is too short or TTL flag is not set.
+    #[inline]
+    pub fn ttl_ms(buf: &[u8]) -> Option<u64> {
+        if buf.len() < HEADER_SIZE {
+            return None;
+        }
+        let flags = u16::from_le_bytes([buf[0], buf[1]]);
+        if flags & FLAG_HAS_TTL != 0 {
+            Some(u64::from_le_bytes(buf[16..24].try_into().unwrap()))
+        } else {
+            None
+        }
     }
 }
 
@@ -397,6 +431,7 @@ pub struct FlatMessageBuilder {
     ttl_ms: u64,
     delay_ms: u64,
     publisher_id: u64,
+    priority: u8,
     flags: u16,
 }
 
@@ -413,6 +448,7 @@ impl FlatMessageBuilder {
             ttl_ms: 0,
             delay_ms: 0,
             publisher_id: 0,
+            priority: 0,
             flags: 0,
         }
     }
@@ -420,6 +456,16 @@ impl FlatMessageBuilder {
     pub fn key(mut self, key: Bytes) -> Self {
         self.flags |= FLAG_HAS_KEY;
         self.key = Some(key);
+        self
+    }
+
+    pub fn priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        if priority != 0 {
+            self.flags |= FLAG_HAS_PRIORITY;
+        } else {
+            self.flags &= !FLAG_HAS_PRIORITY;
+        }
         self
     }
 
@@ -546,7 +592,8 @@ impl FlatMessageBuilder {
         buf.put_u16_le(self.flags);
         buf.put_u16_le(header_count);
         buf.put_u16_le(span_count);
-        buf.put_u16_le(0); // reserved
+        buf.put_u8(self.priority); // byte 6: priority
+        buf.put_u8(0); // byte 7: reserved
         buf.put_u64_le(self.timestamp);
         buf.put_u64_le(self.ttl_ms);
         buf.put_u64_le(self.delay_ms);

@@ -5,7 +5,7 @@
 //! Two persistence paths:
 //!
 //! 1. **Structural persistence** — Create/Delete commands for entities (topics,
-//!    queues, actor namespaces, jobs) are persisted to MDBX via fire-and-forget
+//!    consumer groups, sessions) are persisted to MDBX via fire-and-forget
 //!    writes. A `structural_purge_floor` tracks the last log index whose
 //!    structural writes are confirmed committed to MDBX.
 //!
@@ -111,14 +111,11 @@ impl GroupMeta {
 pub(crate) enum StructuralWrite {
     CreateTopic(crate::topic::TopicMeta),
     DeleteTopic(u64),
-    CreateQueue(crate::queue::QueueMeta),
-    DeleteQueue(u64),
-    CreateActorNamespace(crate::actor::ActorNamespaceMeta),
-    DeleteActorNamespace(u64),
-    CreateJob(crate::job::JobMeta),
-    DeleteJob(u64),
+    CreateExchange(crate::exchange::ExchangeMeta),
+    DeleteExchange(u64),
     CreateConsumerGroup(crate::consumer_group::ConsumerGroupMeta),
     DeleteConsumerGroup(u64),
+    CreateSession(crate::session::SessionMeta),
 }
 
 /// Command sent to the manifest worker thread.
@@ -157,19 +154,16 @@ fn entity_key(prefix: &[u8], id: u64) -> [u8; 9] {
 }
 
 const TOPIC_PREFIX: &[u8] = b"T";
-const QUEUE_PREFIX: &[u8] = b"Q";
-const ACTOR_NS_PREFIX: &[u8] = b"A";
-const JOB_PREFIX: &[u8] = b"J";
-const CONSUMER_PREFIX: &[u8] = b"C";
-const PRODUCER_PREFIX: &[u8] = b"P";
+const EXCHANGE_PREFIX: &[u8] = b"E";
 const CONSUMER_GROUP_PREFIX: &[u8] = b"G";
+const SESSION_PREFIX: &[u8] = b"S";
 
 /// Structural state loaded from MDBX on recovery.
 pub(crate) struct StructuralState {
     pub topics: Vec<crate::topic::TopicMeta>,
-    pub queues: Vec<crate::queue::QueueMeta>,
-    pub actor_namespaces: Vec<crate::actor::ActorNamespaceMeta>,
-    pub jobs: Vec<crate::job::JobMeta>,
+    pub exchanges: Vec<crate::exchange::ExchangeMeta>,
+    pub consumer_groups: Vec<crate::consumer_group::ConsumerGroupMeta>,
+    pub sessions: Vec<crate::session::SessionMeta>,
     pub next_id: u64,
     pub structural_purge_floor: u64,
 }
@@ -418,12 +412,9 @@ impl GroupMdbxEnv {
         let snap_tbl = unsafe { self.snapshot_table_ro(&txn) };
 
         let mut topics = Vec::new();
-        let mut queues = Vec::new();
-        let mut actor_namespaces = Vec::new();
-        let mut jobs = Vec::new();
-        let mut consumers = Vec::new();
-        let mut producers = Vec::new();
         let mut consumer_groups = Vec::new();
+        let mut exchanges = Vec::new();
+        let mut sessions = Vec::new();
         let mut found_any = false;
 
         let mut cursor = txn
@@ -450,45 +441,13 @@ impl GroupMdbxEnv {
                             })?;
                     topics.push(snap);
                 }
-                b'Q' => {
-                    let (snap, _): (crate::types::QueueSnapshot, _) =
+                b'E' => {
+                    let (snap, _): (crate::types::ExchangeSnapshot, _) =
                         bincode::serde::decode_from_slice(&value, bincode::config::standard())
                             .map_err(|e| {
                                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                             })?;
-                    queues.push(snap);
-                }
-                b'A' => {
-                    let (snap, _): (crate::types::ActorNamespaceSnapshot, _) =
-                        bincode::serde::decode_from_slice(&value, bincode::config::standard())
-                            .map_err(|e| {
-                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                            })?;
-                    actor_namespaces.push(snap);
-                }
-                b'J' => {
-                    let (snap, _): (crate::types::JobSnapshot, _) =
-                        bincode::serde::decode_from_slice(&value, bincode::config::standard())
-                            .map_err(|e| {
-                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                            })?;
-                    jobs.push(snap);
-                }
-                b'C' => {
-                    let (snap, _): (crate::types::ConsumerSnapshot, _) =
-                        bincode::serde::decode_from_slice(&value, bincode::config::standard())
-                            .map_err(|e| {
-                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                            })?;
-                    consumers.push(snap);
-                }
-                b'P' => {
-                    let (snap, _): (crate::types::ProducerSnapshot, _) =
-                        bincode::serde::decode_from_slice(&value, bincode::config::standard())
-                            .map_err(|e| {
-                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                            })?;
-                    producers.push(snap);
+                    exchanges.push(snap);
                 }
                 b'G' => {
                     let (snap, _): (crate::consumer_group::ConsumerGroupSnapshot, _) =
@@ -497,6 +456,14 @@ impl GroupMdbxEnv {
                                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                             })?;
                     consumer_groups.push(snap);
+                }
+                b'S' => {
+                    let (snap, _): (crate::types::SessionSnapshot, _) =
+                        bincode::serde::decode_from_slice(&value, bincode::config::standard())
+                            .map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                            })?;
+                    sessions.push(snap);
                 }
                 _ => {}
             }
@@ -508,16 +475,10 @@ impl GroupMdbxEnv {
 
         Ok(Some(MqSnapshotData {
             topics,
-            queues,
-            actor_namespaces,
-            jobs,
-            consumers,
-            producers,
-            exchanges: Vec::new(),
             consumer_groups,
-            sessions: Vec::new(),
+            exchanges,
+            sessions,
             pending_wills: Vec::new(),
-            qos2_inbound: Vec::new(),
             next_id,
             file_manifest: Vec::new(),
             sync_addr: None,
@@ -555,9 +516,9 @@ impl GroupMdbxEnv {
         let entities_tbl = unsafe { self.entities_table_ro(&txn) };
 
         let mut topics = Vec::new();
-        let mut queues = Vec::new();
-        let mut actor_namespaces = Vec::new();
-        let mut jobs = Vec::new();
+        let mut exchanges = Vec::new();
+        let mut consumer_groups = Vec::new();
+        let mut sessions = Vec::new();
 
         // Scan all entity keys
         let mut cursor = txn
@@ -583,29 +544,29 @@ impl GroupMdbxEnv {
                             })?;
                     topics.push(meta);
                 }
-                b'Q' => {
-                    let (meta, _): (crate::queue::QueueMeta, _) =
+                b'E' => {
+                    let (meta, _): (crate::exchange::ExchangeMeta, _) =
                         bincode::serde::decode_from_slice(&value, bincode::config::standard())
                             .map_err(|e| {
                                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                             })?;
-                    queues.push(meta);
+                    exchanges.push(meta);
                 }
-                b'A' => {
-                    let (meta, _): (crate::actor::ActorNamespaceMeta, _) =
+                b'G' => {
+                    let (meta, _): (crate::consumer_group::ConsumerGroupMeta, _) =
                         bincode::serde::decode_from_slice(&value, bincode::config::standard())
                             .map_err(|e| {
                                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                             })?;
-                    actor_namespaces.push(meta);
+                    consumer_groups.push(meta);
                 }
-                b'J' => {
-                    let (meta, _): (crate::job::JobMeta, _) =
+                b'S' => {
+                    let (meta, _): (crate::session::SessionMeta, _) =
                         bincode::serde::decode_from_slice(&value, bincode::config::standard())
                             .map_err(|e| {
                                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                             })?;
-                    jobs.push(meta);
+                    sessions.push(meta);
                 }
                 _ => {} // unknown prefix, skip
             }
@@ -613,9 +574,9 @@ impl GroupMdbxEnv {
 
         Ok(Some(StructuralState {
             topics,
-            queues,
-            actor_namespaces,
-            jobs,
+            exchanges,
+            consumer_groups,
+            sessions,
             next_id,
             structural_purge_floor: floor,
         }))
@@ -650,37 +611,15 @@ impl GroupMdbxEnv {
                 let key = entity_key(TOPIC_PREFIX, *id);
                 let _ = txn.del(&entities_tbl, &key[..], None);
             }
-            StructuralWrite::CreateQueue(meta) => {
-                let key = entity_key(QUEUE_PREFIX, meta.queue_id);
+            StructuralWrite::CreateExchange(meta) => {
+                let key = entity_key(EXCHANGE_PREFIX, meta.exchange_id);
                 let bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                 txn.put(&entities_tbl, &key[..], &bytes, WriteFlags::empty())
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
-            StructuralWrite::DeleteQueue(id) => {
-                let key = entity_key(QUEUE_PREFIX, *id);
-                let _ = txn.del(&entities_tbl, &key[..], None);
-            }
-            StructuralWrite::CreateActorNamespace(meta) => {
-                let key = entity_key(ACTOR_NS_PREFIX, meta.namespace_id);
-                let bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                txn.put(&entities_tbl, &key[..], &bytes, WriteFlags::empty())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            }
-            StructuralWrite::DeleteActorNamespace(id) => {
-                let key = entity_key(ACTOR_NS_PREFIX, *id);
-                let _ = txn.del(&entities_tbl, &key[..], None);
-            }
-            StructuralWrite::CreateJob(meta) => {
-                let key = entity_key(JOB_PREFIX, meta.job_id);
-                let bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                txn.put(&entities_tbl, &key[..], &bytes, WriteFlags::empty())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            }
-            StructuralWrite::DeleteJob(id) => {
-                let key = entity_key(JOB_PREFIX, *id);
+            StructuralWrite::DeleteExchange(id) => {
+                let key = entity_key(EXCHANGE_PREFIX, *id);
                 let _ = txn.del(&entities_tbl, &key[..], None);
             }
             StructuralWrite::CreateConsumerGroup(meta) => {
@@ -693,6 +632,13 @@ impl GroupMdbxEnv {
             StructuralWrite::DeleteConsumerGroup(id) => {
                 let key = entity_key(CONSUMER_GROUP_PREFIX, *id);
                 let _ = txn.del(&entities_tbl, &key[..], None);
+            }
+            StructuralWrite::CreateSession(meta) => {
+                let key = entity_key(SESSION_PREFIX, meta.session_id);
+                let bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                txn.put(&entities_tbl, &key[..], &bytes, WriteFlags::empty())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
         }
 
@@ -759,41 +705,9 @@ impl GroupMdbxEnv {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         }
 
-        for queue in &snap.queues {
-            let key = entity_key(QUEUE_PREFIX, queue.meta.queue_id);
-            let bytes = bincode::serde::encode_to_vec(queue, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            txn.put(&snap_tbl, &key[..], &bytes, WriteFlags::empty())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        }
-
-        for ns in &snap.actor_namespaces {
-            let key = entity_key(ACTOR_NS_PREFIX, ns.meta.namespace_id);
-            let bytes = bincode::serde::encode_to_vec(ns, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            txn.put(&snap_tbl, &key[..], &bytes, WriteFlags::empty())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        }
-
-        for job in &snap.jobs {
-            let key = entity_key(JOB_PREFIX, job.meta.job_id);
-            let bytes = bincode::serde::encode_to_vec(job, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            txn.put(&snap_tbl, &key[..], &bytes, WriteFlags::empty())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        }
-
-        for consumer in &snap.consumers {
-            let key = entity_key(CONSUMER_PREFIX, consumer.meta.consumer_id);
-            let bytes = bincode::serde::encode_to_vec(consumer, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            txn.put(&snap_tbl, &key[..], &bytes, WriteFlags::empty())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        }
-
-        for producer in &snap.producers {
-            let key = entity_key(PRODUCER_PREFIX, producer.meta.producer_id);
-            let bytes = bincode::serde::encode_to_vec(producer, bincode::config::standard())
+        for exchange in &snap.exchanges {
+            let key = entity_key(EXCHANGE_PREFIX, exchange.meta.exchange_id);
+            let bytes = bincode::serde::encode_to_vec(exchange, bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             txn.put(&snap_tbl, &key[..], &bytes, WriteFlags::empty())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -802,6 +716,14 @@ impl GroupMdbxEnv {
         for cg in &snap.consumer_groups {
             let key = entity_key(CONSUMER_GROUP_PREFIX, cg.meta.group_id);
             let bytes = bincode::serde::encode_to_vec(cg, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            txn.put(&snap_tbl, &key[..], &bytes, WriteFlags::empty())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        for session in &snap.sessions {
+            let key = entity_key(SESSION_PREFIX, session.meta.session_id);
+            let bytes = bincode::serde::encode_to_vec(session, bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             txn.put(&snap_tbl, &key[..], &bytes, WriteFlags::empty())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1371,7 +1293,7 @@ mod tests {
             1000,
         );
         engine2.apply_command(
-            &MqCommand::create_queue(&"q1".to_string(), &crate::config::QueueConfig::default()),
+            &MqCommand::create_topic(&"t2".to_string(), RetentionPolicy::default(), 0),
             2,
             1001,
         );
@@ -1381,10 +1303,8 @@ mod tests {
         assert_eq!(read_meta.last_applied_index, 50);
 
         let read_snap = env.read_snapshot_data().unwrap().unwrap();
-        assert_eq!(read_snap.topics.len(), 1);
+        assert_eq!(read_snap.topics.len(), 2);
         assert_eq!(read_snap.topics[0].meta.name, "new_topic");
-        assert_eq!(read_snap.queues.len(), 1);
-        assert_eq!(read_snap.queues[0].meta.name, "q1");
     }
 
     #[test]
@@ -1509,7 +1429,7 @@ mod tests {
         }
     }
 
-    /// All six entity types are correctly persisted and read back.
+    /// Topic and consumer group entity types are correctly persisted and read back.
     #[test]
     fn test_snapshot_all_entity_types_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1529,164 +1449,44 @@ mod tests {
             1001,
         );
 
-        // Queue with messages
-        engine.apply_command(
-            &MqCommand::create_queue(&"tasks".to_string(), &crate::config::QueueConfig::default()),
-            3,
-            1002,
-        );
-        engine.apply_command(
-            &MqCommand::enqueue(
-                2,
-                &vec![make_msg(b"q1"), make_msg(b"q2"), make_msg(b"q3")],
-                &vec![None, None, None],
-            ),
-            4,
-            1003,
-        );
-
-        // Actor namespace
-        engine.apply_command(
-            &MqCommand::create_actor_namespace(
-                &"actors".to_string(),
-                &crate::config::ActorConfig::default(),
-            ),
-            5,
-            1004,
-        );
-
-        // Job
-        engine.apply_command(
-            &MqCommand::create_job(
-                &"cron-job".to_string(),
-                &crate::config::JobConfig {
-                    cron_expression: "0 * * * *".to_string(),
-                    ..Default::default()
-                },
-            ),
-            6,
-            1005,
-        );
-
-        // Consumer
-        engine.apply_command(
-            &MqCommand::register_consumer(
-                100,
-                &"group-1".to_string(),
-                &vec![crate::types::Subscription {
-                    entity_type: crate::types::EntityType::Topic,
-                    entity_id: 1,
-                }],
-            ),
-            7,
-            1006,
-        );
-
-        // Producer
-        engine.apply_command(
-            &MqCommand::register_producer(200, Some(&"my-producer".to_string())),
-            8,
-            1007,
-        );
-
         let snap = engine.snapshot();
         assert_eq!(snap.topics.len(), 1);
-        assert_eq!(snap.queues.len(), 1);
-        assert_eq!(snap.actor_namespaces.len(), 1);
-        assert_eq!(snap.jobs.len(), 1);
-        assert_eq!(snap.consumers.len(), 1);
-        assert_eq!(snap.producers.len(), 1);
 
-        env.install_snapshot(&make_meta(8), &snap).unwrap();
+        env.install_snapshot(&make_meta(2), &snap).unwrap();
 
         let read = env.read_snapshot_data().unwrap().unwrap();
         assert_eq!(read.topics.len(), 1);
         assert_eq!(read.topics[0].meta.name, "events");
         assert_eq!(read.topics[0].meta.message_count, 2);
 
-        assert_eq!(read.queues.len(), 1);
-        assert_eq!(read.queues[0].meta.name, "tasks");
-        assert!(!read.queues[0].messages.is_empty());
-        assert_eq!(
-            read.queues[0].messages[0].state,
-            crate::types::MessageState::Pending
-        );
-
-        assert_eq!(read.actor_namespaces.len(), 1);
-        assert_eq!(read.actor_namespaces[0].meta.name, "actors");
-
-        assert_eq!(read.jobs.len(), 1);
-        assert_eq!(read.jobs[0].meta.name, "cron-job");
-
-        assert_eq!(read.consumers.len(), 1);
-        assert_eq!(read.consumers[0].meta.consumer_id, 100);
-        assert_eq!(read.consumers[0].meta.group_name, "group-1");
-
-        assert_eq!(read.producers.len(), 1);
-        assert_eq!(read.producers[0].meta.producer_id, 200);
-        assert_eq!(read.producers[0].meta.name, Some("my-producer".to_string()));
-
         assert_eq!(read.next_id, engine.meta.next_id.load(Ordering::Relaxed));
     }
 
-    /// Queue dedup entries survive the MDBX roundtrip.
+    /// Multiple topics survive the MDBX roundtrip.
     #[test]
-    fn test_snapshot_queue_dedup_roundtrip() {
+    fn test_snapshot_multiple_topics_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let env = GroupMdbxEnv::open(tmp.path()).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            &MqCommand::create_queue(
-                &"dedup-q".to_string(),
-                &crate::config::QueueConfig {
-                    dedup_window_secs: Some(60),
-                    ..Default::default()
-                },
-            ),
+            &MqCommand::create_topic(&"t1".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
-        // Enqueue with dedup key
         engine.apply_command(
-            &MqCommand::enqueue(
-                1,
-                &vec![make_msg(b"d1")],
-                &vec![Some(bytes::Bytes::from_static(b"key-1"))],
-            ),
+            &MqCommand::create_topic(&"t2".to_string(), RetentionPolicy::default(), 0),
             2,
             1001,
         );
-        // Second enqueue with same key (should be deduped)
-        engine.apply_command(
-            &MqCommand::enqueue(
-                1,
-                &vec![make_msg(b"d1-dup")],
-                &vec![Some(bytes::Bytes::from_static(b"key-1"))],
-            ),
-            3,
-            1002,
-        );
 
         let snap = engine.snapshot();
-        assert_eq!(
-            snap.queues[0].messages.len(),
-            1,
-            "dedup should have prevented second enqueue"
-        );
-        assert!(
-            !snap.queues[0].dedup_entries.is_empty(),
-            "dedup entries should be present"
-        );
+        assert_eq!(snap.topics.len(), 2);
 
-        env.install_snapshot(&make_meta(3), &snap).unwrap();
+        env.install_snapshot(&make_meta(2), &snap).unwrap();
 
         let read = env.read_snapshot_data().unwrap().unwrap();
-        assert_eq!(read.queues[0].messages.len(), 1);
-        assert_eq!(
-            read.queues[0].dedup_entries.len(),
-            snap.queues[0].dedup_entries.len()
-        );
+        assert_eq!(read.topics.len(), 2);
     }
 
     /// Installing a snapshot clears previous structural writes.
@@ -1717,10 +1517,7 @@ mod tests {
         // Install snapshot — should clear the entities table
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
         engine.apply_command(
-            &MqCommand::create_queue(
-                &"snap-queue".to_string(),
-                &crate::config::QueueConfig::default(),
-            ),
+            &MqCommand::create_topic(&"snap-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1736,8 +1533,8 @@ mod tests {
 
         // Snapshot data should be available
         let snap = env.read_snapshot_data().unwrap().unwrap();
-        assert_eq!(snap.queues.len(), 1);
-        assert_eq!(snap.queues[0].meta.name, "snap-queue");
+        assert_eq!(snap.topics.len(), 1);
+        assert_eq!(snap.topics[0].meta.name, "snap-topic");
     }
 
     /// Structural writes after snapshot don't corrupt the snapshot table.
@@ -1758,31 +1555,18 @@ mod tests {
         // Now apply structural writes (simulates post-snapshot operation)
         let mut tmp_engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         tmp_engine2.apply_command(
-            &MqCommand::create_queue(
-                &"new-queue".to_string(),
-                &crate::config::QueueConfig::default(),
-            ),
+            &MqCommand::create_topic(&"new-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
-        let queue_meta = tmp_engine2
-            .meta
-            .queues
-            .iter()
-            .next()
-            .unwrap()
-            .value()
-            .meta
-            .clone();
-        env.apply_structural_write(2, 100, &StructuralWrite::CreateQueue(queue_meta))
+        let topic_meta = tmp_engine2.meta.topics.get(&1).unwrap().snapshot_meta();
+        env.apply_structural_write(2, 100, &StructuralWrite::CreateTopic(topic_meta))
             .unwrap();
 
         // Snapshot data should still be intact (separate table)
         let snap = env.read_snapshot_data().unwrap().unwrap();
         assert_eq!(snap.topics.len(), 1);
         assert_eq!(snap.topics[0].meta.name, "snap-topic");
-        // The new queue should NOT appear in the snapshot table
-        assert_eq!(snap.queues.len(), 0);
     }
 
     /// Install empty snapshot (no entities at all).
@@ -1850,10 +1634,7 @@ mod tests {
 
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine2.apply_command(
-            &MqCommand::create_queue(
-                &"group2-queue".to_string(),
-                &crate::config::QueueConfig::default(),
-            ),
+            &MqCommand::create_topic(&"group2-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1865,12 +1646,10 @@ mod tests {
         let snap1 = mgr.read_snapshot_data(1).unwrap().unwrap();
         assert_eq!(snap1.topics.len(), 1);
         assert_eq!(snap1.topics[0].meta.name, "group1-topic");
-        assert_eq!(snap1.queues.len(), 0);
 
         let snap2 = mgr.read_snapshot_data(2).unwrap().unwrap();
-        assert_eq!(snap2.topics.len(), 0);
-        assert_eq!(snap2.queues.len(), 1);
-        assert_eq!(snap2.queues[0].meta.name, "group2-queue");
+        assert_eq!(snap2.topics.len(), 1);
+        assert_eq!(snap2.topics[0].meta.name, "group2-topic");
 
         mgr.shutdown();
     }
@@ -1889,23 +1668,11 @@ mod tests {
                 1000,
             );
         }
-        for i in 0..30 {
-            engine.apply_command(
-                &MqCommand::create_queue(
-                    &format!("queue-{}", i),
-                    &crate::config::QueueConfig::default(),
-                ),
-                51 + i,
-                1000,
-            );
-        }
-
         let snap = engine.snapshot();
-        env.install_snapshot(&make_meta(80), &snap).unwrap();
+        env.install_snapshot(&make_meta(50), &snap).unwrap();
 
         let read = env.read_snapshot_data().unwrap().unwrap();
         assert_eq!(read.topics.len(), 50);
-        assert_eq!(read.queues.len(), 30);
     }
 
     /// Successive snapshot installs fully replace previous data.
@@ -1928,13 +1695,10 @@ mod tests {
         let read = env.read_snapshot_data().unwrap().unwrap();
         assert_eq!(read.topics.len(), 3);
 
-        // Second snapshot: 1 queue (no topics)
+        // Second snapshot: 1 topic (different name)
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
         engine2.apply_command(
-            &MqCommand::create_queue(
-                &"replacement-q".to_string(),
-                &crate::config::QueueConfig::default(),
-            ),
+            &MqCommand::create_topic(&"replacement-t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
         );
@@ -1942,9 +1706,8 @@ mod tests {
             .unwrap();
 
         let read = env.read_snapshot_data().unwrap().unwrap();
-        assert_eq!(read.topics.len(), 0, "old topics should be gone");
-        assert_eq!(read.queues.len(), 1);
-        assert_eq!(read.queues[0].meta.name, "replacement-q");
+        assert_eq!(read.topics.len(), 1, "old topics should be replaced");
+        assert_eq!(read.topics[0].meta.name, "replacement-t");
     }
 
     /// Topic consumer offsets survive the MDBX roundtrip.
@@ -1964,25 +1727,13 @@ mod tests {
             2,
             1001,
         );
-        // Register a consumer and commit an offset
-        engine.apply_command(
-            &MqCommand::register_consumer(
-                42,
-                &"g1".to_string(),
-                &vec![crate::types::Subscription {
-                    entity_type: crate::types::EntityType::Topic,
-                    entity_id: 1,
-                }],
-            ),
-            3,
-            1002,
-        );
-        engine.apply_command(&MqCommand::commit_offset(1, 42, 2), 4, 1003);
+        // Commit an offset for consumer 42
+        engine.apply_command(&MqCommand::commit_offset(1, 42, 2), 3, 1002);
 
         let snap = engine.snapshot();
         assert!(!snap.topics[0].consumer_offsets.is_empty());
 
-        env.install_snapshot(&make_meta(4), &snap).unwrap();
+        env.install_snapshot(&make_meta(3), &snap).unwrap();
 
         let read = env.read_snapshot_data().unwrap().unwrap();
         assert_eq!(read.topics[0].consumer_offsets.len(), 1);
@@ -2003,19 +1754,9 @@ mod tests {
             1000,
         );
         engine.apply_command(&MqCommand::publish(1, &vec![make_msg(b"a")]), 2, 1001);
-        engine.apply_command(
-            &MqCommand::create_queue(&"q".to_string(), &crate::config::QueueConfig::default()),
-            3,
-            1002,
-        );
-        engine.apply_command(
-            &MqCommand::enqueue(2, &vec![make_msg(b"b")], &vec![None]),
-            4,
-            1003,
-        );
 
         let original_snap = engine.snapshot();
-        env.install_snapshot(&make_meta(4), &original_snap).unwrap();
+        env.install_snapshot(&make_meta(2), &original_snap).unwrap();
 
         let read_snap = env.read_snapshot_data().unwrap().unwrap();
 
@@ -2032,19 +1773,6 @@ mod tests {
         assert_eq!(
             restored_snap.topics[0].meta.message_count,
             original_snap.topics[0].meta.message_count
-        );
-        assert_eq!(restored_snap.queues.len(), original_snap.queues.len());
-        assert_eq!(
-            restored_snap.queues[0].meta.name,
-            original_snap.queues[0].meta.name
-        );
-        assert_eq!(
-            restored_snap.queues[0].messages.len(),
-            original_snap.queues[0].messages.len()
-        );
-        assert_eq!(
-            restored_snap.queues[0].messages[0].state,
-            original_snap.queues[0].messages[0].state
         );
         assert_eq!(restored_snap.next_id, original_snap.next_id);
     }

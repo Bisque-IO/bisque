@@ -703,7 +703,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
             ENTITY_TYPE_QUEUE => {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
                     let _ = batcher
-                        .submit(MqCommand::ack(entity_id, &message_ids, None))
+                        .submit(MqCommand::group_ack(group_id, &message_ids, None))
                         .await;
                 }
             }
@@ -711,8 +711,8 @@ impl<R: MqRouter> ConsumerHandler<R> {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
                     for &msg_id in &message_ids {
                         let _ = batcher
-                            .submit(MqCommand::ack_actor_message(
-                                entity_id,
+                            .submit(MqCommand::group_ack_actor(
+                                group_id,
                                 &[], // TODO: track actor_id per in-flight message
                                 msg_id,
                                 None,
@@ -752,7 +752,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
             ENTITY_TYPE_QUEUE => {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
                     let _ = batcher
-                        .submit(MqCommand::nack(entity_id, &message_ids))
+                        .submit(MqCommand::group_nack(group_id, &message_ids))
                         .await;
                 }
             }
@@ -760,8 +760,8 @@ impl<R: MqRouter> ConsumerHandler<R> {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
                     for &msg_id in &message_ids {
                         let _ = batcher
-                            .submit(MqCommand::nack_actor_message(
-                                entity_id,
+                            .submit(MqCommand::group_nack_actor(
+                                group_id,
                                 &[], // TODO: track actor_id per in-flight message
                                 msg_id,
                             ))
@@ -1570,7 +1570,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         };
 
         let response = batcher
-            .submit(MqCommand::deliver(queue_id, consumer_id, max_count))
+            .submit(MqCommand::group_deliver(group_id, consumer_id, max_count))
             .await?;
 
         match response {
@@ -1607,10 +1607,10 @@ impl<R: MqRouter> ConsumerHandler<R> {
         };
 
         let response = batcher
-            .submit(MqCommand::deliver_actor_message(
-                namespace_id,
-                &[], // TODO: track assigned actors
+            .submit(MqCommand::group_deliver_actor(
+                group_id,
                 consumer_id,
+                &[], // TODO: track assigned actors
             ))
             .await?;
 
@@ -1732,7 +1732,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         for group_id in session.group_ids() {
             if let Some(batcher) = self.router.get_batcher(group_id) {
                 let _ = batcher
-                    .submit(MqCommand::disconnect_consumer(consumer_id))
+                    .submit(MqCommand::disconnect_session(consumer_id, false))
                     .await;
             }
         }

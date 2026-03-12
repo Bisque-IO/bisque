@@ -184,14 +184,53 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
             }
 
             // No snapshot — check for structural state persisted by normal operation.
-            // This loads entity metadata (topics, queues, actors, jobs) from MDBX
-            // and returns the structural_purge_floor so openraft replays only
-            // entries from that point forward.
+            // This loads entity metadata (topics, exchanges, consumer groups, sessions)
+            // from MDBX and returns the structural_purge_floor so openraft replays
+            // only entries from that point forward.
             if let Some(structural) = manifest.read_structural_state(self.group_id)? {
                 if structural.structural_purge_floor > 0 {
                     self.structural_purge_floor = structural.structural_purge_floor;
 
-                    self.engine.restore_structural(structural);
+                    // Convert StructuralState into MqSnapshotData for restore_structural.
+                    let snap = MqSnapshotData {
+                        topics: structural
+                            .topics
+                            .into_iter()
+                            .map(|meta| crate::types::TopicSnapshot {
+                                meta,
+                                consumer_offsets: Vec::new(),
+                            })
+                            .collect(),
+                        exchanges: structural
+                            .exchanges
+                            .into_iter()
+                            .map(|meta| crate::types::ExchangeSnapshot {
+                                meta,
+                                bindings: Vec::new(),
+                                retained: Vec::new(),
+                            })
+                            .collect(),
+                        consumer_groups: structural
+                            .consumer_groups
+                            .into_iter()
+                            .map(|meta| crate::consumer_group::ConsumerGroupSnapshot {
+                                meta,
+                                offsets: Vec::new(),
+                                ack_state: None,
+                                actor_state: None,
+                            })
+                            .collect(),
+                        sessions: structural
+                            .sessions
+                            .into_iter()
+                            .map(|meta| crate::types::SessionSnapshot { meta })
+                            .collect(),
+                        pending_wills: Vec::new(),
+                        next_id: structural.next_id,
+                        file_manifest: Vec::new(),
+                        sync_addr: None,
+                    };
+                    self.engine.restore_structural(snap);
                     self.segment_indexes.clear();
 
                     // Return a synthetic last_applied at structural_purge_floor
@@ -254,10 +293,12 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
 
                     // Fire-and-forget structural writes to MDBX after apply
                     if let Some(ref manifest) = self.manifest {
-                        if let Some(writes) =
-                            collect_structural_writes(&self.engine.meta, &response, structural_kind)
-                        {
-                            let next_id = self.engine.meta.next_id.load(Ordering::Relaxed);
+                        if let Some(writes) = collect_structural_writes(
+                            self.engine.metadata(),
+                            &response,
+                            structural_kind,
+                        ) {
+                            let next_id = self.engine.metadata().next_id.load(Ordering::Relaxed);
                             for w in writes {
                                 manifest.structural_update_fire_and_forget(
                                     self.group_id,
@@ -521,14 +562,11 @@ enum StructuralKind {
     None,
     CreateTopic,
     DeleteTopic(u64),
-    CreateQueue,
-    DeleteQueue(u64),
-    CreateActorNamespace,
-    DeleteActorNamespace(u64),
-    CreateJob,
-    DeleteJob(u64),
+    CreateExchange,
+    DeleteExchange(u64),
     CreateConsumerGroup,
     DeleteConsumerGroup(u64),
+    CreateSession,
     Batch(Vec<StructuralKind>),
 }
 
@@ -536,18 +574,13 @@ fn classify_structural(cmd: &MqCommand) -> StructuralKind {
     match cmd.tag() {
         MqCommand::TAG_CREATE_TOPIC => StructuralKind::CreateTopic,
         MqCommand::TAG_DELETE_TOPIC => StructuralKind::DeleteTopic(cmd.field_u64(1)),
-        MqCommand::TAG_CREATE_QUEUE => StructuralKind::CreateQueue,
-        MqCommand::TAG_DELETE_QUEUE => StructuralKind::DeleteQueue(cmd.field_u64(1)),
-        MqCommand::TAG_CREATE_ACTOR_NAMESPACE => StructuralKind::CreateActorNamespace,
-        MqCommand::TAG_DELETE_ACTOR_NAMESPACE => {
-            StructuralKind::DeleteActorNamespace(cmd.field_u64(1))
-        }
-        MqCommand::TAG_CREATE_JOB => StructuralKind::CreateJob,
-        MqCommand::TAG_DELETE_JOB => StructuralKind::DeleteJob(cmd.field_u64(1)),
+        MqCommand::TAG_CREATE_EXCHANGE => StructuralKind::CreateExchange,
+        MqCommand::TAG_DELETE_EXCHANGE => StructuralKind::DeleteExchange(cmd.field_u64(1)),
         MqCommand::TAG_CREATE_CONSUMER_GROUP => StructuralKind::CreateConsumerGroup,
         MqCommand::TAG_DELETE_CONSUMER_GROUP => {
             StructuralKind::DeleteConsumerGroup(cmd.field_u64(1))
         }
+        MqCommand::TAG_CREATE_SESSION => StructuralKind::CreateSession,
         MqCommand::TAG_BATCH => {
             let batch = cmd.as_batch();
             let kinds: Vec<StructuralKind> =
@@ -582,38 +615,16 @@ fn collect_structural_writes(
             }
         }
         StructuralKind::DeleteTopic(id) => Some(vec![StructuralWrite::DeleteTopic(id)]),
-        StructuralKind::CreateQueue => {
+        StructuralKind::CreateExchange => {
             if let MqResponse::EntityCreated { id } = response {
-                meta.queues
+                meta.exchanges
                     .get(id)
-                    .map(|q| vec![StructuralWrite::CreateQueue(q.meta.clone())])
+                    .map(|e| vec![StructuralWrite::CreateExchange(e.meta.clone())])
             } else {
                 None
             }
         }
-        StructuralKind::DeleteQueue(id) => Some(vec![StructuralWrite::DeleteQueue(id)]),
-        StructuralKind::CreateActorNamespace => {
-            if let MqResponse::EntityCreated { id } = response {
-                meta.actor_namespaces
-                    .get(id)
-                    .map(|ns| vec![StructuralWrite::CreateActorNamespace(ns.meta.clone())])
-            } else {
-                None
-            }
-        }
-        StructuralKind::DeleteActorNamespace(id) => {
-            Some(vec![StructuralWrite::DeleteActorNamespace(id)])
-        }
-        StructuralKind::CreateJob => {
-            if let MqResponse::EntityCreated { id } = response {
-                meta.jobs
-                    .get(id)
-                    .map(|j| vec![StructuralWrite::CreateJob(j.snapshot_meta())])
-            } else {
-                None
-            }
-        }
-        StructuralKind::DeleteJob(id) => Some(vec![StructuralWrite::DeleteJob(id)]),
+        StructuralKind::DeleteExchange(id) => Some(vec![StructuralWrite::DeleteExchange(id)]),
         StructuralKind::CreateConsumerGroup => {
             if let MqResponse::EntityCreated { id } = response {
                 meta.consumer_groups
@@ -625,6 +636,15 @@ fn collect_structural_writes(
         }
         StructuralKind::DeleteConsumerGroup(id) => {
             Some(vec![StructuralWrite::DeleteConsumerGroup(id)])
+        }
+        StructuralKind::CreateSession => {
+            if let MqResponse::EntityCreated { id } = response {
+                meta.sessions
+                    .get(id)
+                    .map(|s| vec![StructuralWrite::CreateSession(s.snapshot_meta())])
+            } else {
+                None
+            }
         }
         StructuralKind::Batch(kinds) => {
             let responses = if let MqResponse::BatchResponse(resps) = response {

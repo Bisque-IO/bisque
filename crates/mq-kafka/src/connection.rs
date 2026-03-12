@@ -35,6 +35,8 @@ pub struct KafkaConnection {
     /// bisque-mq consumer IDs registered via this connection (for cleanup on disconnect).
     pub consumer_member_ids: Vec<WireString>,
     metrics: &'static KafkaConnMetrics,
+    /// Exponential moving average of response sizes for adaptive buffer pre-sizing.
+    avg_response_size: u32,
 }
 
 // Use a lazily-initialized global for shared metrics to avoid passing through constructors.
@@ -60,6 +62,7 @@ impl KafkaConnection {
             write_buf: BytesMut::with_capacity(65536),
             consumer_member_ids: Vec::new(),
             metrics: shared_metrics(),
+            avg_response_size: 4096,
         }
     }
 
@@ -99,6 +102,7 @@ impl KafkaConnection {
     }
 
     /// Encode a response into the write buffer.
+    /// Pre-reserves capacity based on an adaptive moving average of response sizes.
     pub fn encode_response(
         &mut self,
         correlation_id: i32,
@@ -106,6 +110,9 @@ impl KafkaConnection {
         api_version: i16,
         response: &KafkaResponse,
     ) {
+        // Pre-reserve capacity based on adaptive average to reduce reallocs
+        self.write_buf.reserve(self.avg_response_size as usize);
+
         let before = self.write_buf.len();
         codec::encode_response(
             correlation_id,
@@ -114,9 +121,14 @@ impl KafkaConnection {
             response,
             &mut self.write_buf,
         );
-        self.metrics
-            .bytes_out
-            .increment((self.write_buf.len() - before) as u64);
+        let response_size = (self.write_buf.len() - before) as u32;
+
+        // Update exponential moving average: avg = avg * 7/8 + new * 1/8
+        // This adapts to the connection's typical response size pattern
+        self.avg_response_size =
+            (self.avg_response_size.saturating_mul(7) / 8) + (response_size / 8).max(128);
+
+        self.metrics.bytes_out.increment(response_size as u64);
     }
 
     /// Take the write buffer contents for sending over TCP.

@@ -26,13 +26,13 @@ pub fn name_hash_bytes(b: &[u8]) -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveredMessage {
-    /// Raft log index of this message.
+    /// Topic offset or raft log index of this message.
     pub message_id: u64,
     pub attempt: u32,
     pub original_timestamp: u64,
-    /// Queue ID this message was delivered from (for O(1) subscription lookup).
+    /// Consumer group ID this message was delivered from.
     #[serde(default)]
-    pub queue_id: u64,
+    pub group_id: u64,
 }
 
 // =============================================================================
@@ -42,10 +42,9 @@ pub struct DeliveredMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntityType {
     Topic,
-    Queue,
-    ActorNamespace,
-    Job,
     Exchange,
+    ConsumerGroup,
+    Session,
 }
 
 // =============================================================================
@@ -54,11 +53,11 @@ pub enum EntityType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExchangeType {
-    /// Delivers to all bound queues (fanout).
+    /// Delivers to all bound topics (fanout).
     Fanout,
-    /// Delivers to queues whose binding key exactly matches the routing key.
+    /// Delivers to topics whose binding key exactly matches the routing key.
     Direct,
-    /// Delivers to queues whose binding pattern matches the routing key
+    /// Delivers to topics whose binding pattern matches the routing key
     /// using AMQP-style wildcards (`*` = one word, `#` = zero or more words).
     /// Also supports MQTT-style (`+` = one level, `#` = multi-level).
     Topic,
@@ -79,12 +78,12 @@ pub struct ExchangePublishNotification {
     pub messages: SmallVec<[Bytes; 8]>,
 }
 
-/// A binding from an exchange to a queue with an optional routing key pattern.
+/// A binding from an exchange to a target topic with an optional routing key pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Binding {
     pub binding_id: u64,
     pub exchange_id: u64,
-    pub queue_id: u64,
+    pub target_topic_id: u64,
     /// Routing key pattern. For direct exchanges this is a literal match.
     /// For topic exchanges this supports `*` and `#` wildcards.
     #[serde(default)]
@@ -98,12 +97,6 @@ pub struct Binding {
     /// MQTT 5.0 subscription identifier (§3.8.2.1.2).
     #[serde(default)]
     pub subscription_id: Option<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Subscription {
-    pub entity_type: EntityType,
-    pub entity_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,9 +122,6 @@ pub enum PartitionStatus {
 }
 
 /// Metadata for a single partition of a partitioned topic.
-///
-/// Stored in the coordinator group's `TopicMeta.partitions` vector.
-/// The actual message data lives in the partition's own raft group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionInfo {
     /// Zero-based partition index within the topic.
@@ -167,9 +157,78 @@ impl Default for RetentionPolicy {
 }
 
 // =============================================================================
-// Queue Types
+// Topic Configuration
 // =============================================================================
 
+/// Topic lifetime policy — determines when a topic is auto-deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TopicLifetimePolicy {
+    /// Topic lives until explicitly deleted.
+    Permanent,
+    /// Topic is deleted when the last consumer group detaches.
+    DeleteOnLastDetach,
+}
+
+impl Default for TopicLifetimePolicy {
+    fn default() -> Self {
+        Self::Permanent
+    }
+}
+
+/// Dedup configuration for a topic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicDedupConfig {
+    /// Dedup window duration in seconds.
+    pub window_secs: u64,
+}
+
+/// Cron auto-publish configuration for a topic. Replaces the Job entity type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicCronConfig {
+    /// Cron expression (6-field: sec min hour day month weekday).
+    pub cron_expression: String,
+    /// Timezone for cron evaluation (default: "UTC").
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    /// Max pending trigger messages before skipping (overlap policy).
+    #[serde(default = "default_max_pending")]
+    pub max_pending: u32,
+    /// Optional payload bytes for the auto-published trigger message.
+    #[serde(default)]
+    pub payload: Option<Bytes>,
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
+fn default_max_pending() -> u32 {
+    10
+}
+
+// =============================================================================
+// Consumer Group Variant Types
+// =============================================================================
+
+/// Consumer group variant — set at creation time, immutable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum GroupVariant {
+    /// Kafka-compatible offset tracking.
+    Offset = 0,
+    /// Per-message ack/nack/release/modify (queue + job semantics).
+    Ack = 1,
+    /// Per-actor-key serialized delivery (mailbox semantics).
+    Actor = 2,
+}
+
+impl Default for GroupVariant {
+    fn default() -> Self {
+        Self::Offset
+    }
+}
+
+/// Per-message state in an Ack-variant consumer group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageState {
     Pending,
@@ -182,10 +241,13 @@ pub enum MessageState {
     Released,
 }
 
+/// Per-message metadata in an Ack-variant consumer group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueMessageMeta {
+pub struct AckMessageMeta {
+    /// Message ID = topic offset.
     pub message_id: u64,
-    pub queue_id: u64,
+    /// Consumer group ID this message belongs to.
+    pub group_id: u64,
     pub state: MessageState,
     #[serde(default)]
     pub priority: u8,
@@ -201,15 +263,12 @@ pub struct QueueMessageMeta {
     #[serde(default)]
     pub dedup_key: Option<Bytes>,
     /// Absolute timestamp (ms) when this message expires regardless of retries.
-    /// Computed at enqueue time from the flat message's `ttl_ms` field.
     #[serde(default)]
     pub expires_at: Option<u64>,
     /// Topic name to publish a response to on ACK (request/reply pattern).
-    /// Extracted from the flat message header at enqueue time (zero-copy `Bytes`).
     #[serde(default)]
     pub reply_to: Option<Bytes>,
     /// Correlation ID for request/reply matching.
-    /// Extracted from the flat message header at enqueue time (zero-copy `Bytes`).
     #[serde(default)]
     pub correlation_id: Option<Bytes>,
     /// Value payload size in bytes, stored for byte-level accounting.
@@ -217,67 +276,166 @@ pub struct QueueMessageMeta {
     pub value_len: u32,
 }
 
-// =============================================================================
-// Job Types
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OverlapPolicy {
-    Skip,
-    Queue,
-}
-
-impl Default for OverlapPolicy {
-    fn default() -> Self {
-        Self::Skip
-    }
-}
-
+/// Ack variant configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryConfig {
+pub struct AckVariantConfig {
+    #[serde(default = "default_visibility_timeout_ms")]
+    pub visibility_timeout_ms: u64,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
-    #[serde(default = "default_retry_delay_ms")]
-    pub retry_delay_ms: u64,
+    /// DLQ topic name. None = auto "{group}/dlq" when max_retries > 0.
+    #[serde(default)]
+    pub dead_letter_topic: Option<String>,
+    #[serde(default)]
+    pub delay_default_ms: u64,
+    #[serde(default = "default_max_in_flight")]
+    pub max_in_flight_per_consumer: u32,
+    /// Back-pressure: max unprocessed messages before rejecting publishes.
+    #[serde(default)]
+    pub max_pending_messages: Option<u64>,
+    /// Back-pressure: max unprocessed bytes before rejecting publishes.
+    #[serde(default)]
+    pub max_pending_bytes: Option<u64>,
+    /// Max total delayed messages in the delay index before rejecting.
+    #[serde(default)]
+    pub max_delayed_messages: Option<u64>,
+    /// Max total delayed bytes in the delay index before rejecting.
+    #[serde(default)]
+    pub max_delayed_bytes: Option<u64>,
 }
 
+fn default_visibility_timeout_ms() -> u64 {
+    30_000
+}
 fn default_max_retries() -> u32 {
     3
 }
-fn default_retry_delay_ms() -> u64 {
-    5000
+fn default_max_in_flight() -> u32 {
+    100
 }
 
-impl Default for RetryConfig {
+impl Default for AckVariantConfig {
     fn default() -> Self {
         Self {
+            visibility_timeout_ms: default_visibility_timeout_ms(),
             max_retries: default_max_retries(),
-            retry_delay_ms: default_retry_delay_ms(),
+            dead_letter_topic: None,
+            delay_default_ms: 0,
+            max_in_flight_per_consumer: default_max_in_flight(),
+            max_pending_messages: None,
+            max_pending_bytes: None,
+            max_delayed_messages: None,
+            max_delayed_bytes: None,
         }
     }
 }
 
+/// Actor variant configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputSource {
+pub struct ActorVariantConfig {
+    #[serde(default = "default_max_mailbox_depth")]
+    pub max_mailbox_depth: u32,
+    #[serde(default = "default_idle_eviction_secs")]
+    pub idle_eviction_secs: u64,
+    #[serde(default = "default_actor_ack_timeout_ms")]
+    pub ack_timeout_ms: u64,
+    #[serde(default = "default_actor_max_retries")]
+    pub max_retries: u32,
+    /// Back-pressure: max pending messages per actor before rejecting.
+    #[serde(default)]
+    pub max_pending_messages: Option<u64>,
+    /// Back-pressure: max pending bytes per actor before rejecting.
+    #[serde(default)]
+    pub max_pending_bytes: Option<u64>,
+}
+
+fn default_max_mailbox_depth() -> u32 {
+    10_000
+}
+fn default_idle_eviction_secs() -> u64 {
+    3600
+}
+fn default_actor_ack_timeout_ms() -> u64 {
+    30_000
+}
+fn default_actor_max_retries() -> u32 {
+    3
+}
+
+impl Default for ActorVariantConfig {
+    fn default() -> Self {
+        Self {
+            max_mailbox_depth: default_max_mailbox_depth(),
+            idle_eviction_secs: default_idle_eviction_secs(),
+            ack_timeout_ms: default_actor_ack_timeout_ms(),
+            max_retries: default_actor_max_retries(),
+            max_pending_messages: None,
+            max_pending_bytes: None,
+        }
+    }
+}
+
+/// Variant-specific configuration (set at creation, immutable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VariantConfig {
+    Offset,
+    Ack(AckVariantConfig),
+    Actor(ActorVariantConfig),
+}
+
+impl Default for VariantConfig {
+    fn default() -> Self {
+        Self::Offset
+    }
+}
+
+// =============================================================================
+// Session Types (unified, replaces ConsumerState + ProducerMeta)
+// =============================================================================
+
+/// Protocol-agnostic will message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WillConfig {
+    pub topic_id: u64,
+    pub payload: Bytes,
+    #[serde(default)]
+    pub delay_ms: u64,
+    #[serde(default)]
+    pub retained: bool,
+}
+
+/// A session subscription entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionSubscription {
     pub entity_type: EntityType,
     pub entity_id: u64,
 }
 
+/// Per-consumer topic alias entry (MQTT 5.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobState {
+pub struct TopicAliasEntry {
+    pub alias: u16,
+    pub topic_name: String,
+}
+
+/// A will message waiting to be fired after a delay (MQTT 5.0 Will Delay Interval).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingWill {
+    pub session_id: u64,
+    pub client_id: String,
+    pub will: WillConfig,
+    /// Absolute timestamp (ms) when the will should fire.
+    pub fire_at_ms: u64,
+}
+
+/// Unified name index entry — single namespace for all entity names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NameEntry {
+    pub name: String,
+    pub topic_id: u64,
+    /// Consumer group ID if this name is a consumer group (topic + group pair).
     #[serde(default)]
-    pub assigned_consumer_id: Option<u64>,
-    #[serde(default)]
-    pub last_triggered_at: Option<u64>,
-    #[serde(default)]
-    pub last_completed_at: Option<u64>,
-    pub next_trigger_at: u64,
-    #[serde(default)]
-    pub current_execution_id: Option<u64>,
-    #[serde(default)]
-    pub consecutive_failures: u32,
-    #[serde(default)]
-    pub queued_triggers: u32,
+    pub consumer_group_id: Option<u64>,
 }
 
 // =============================================================================
@@ -292,19 +450,17 @@ pub enum EntityStats {
         head_index: u64,
         tail_index: u64,
     },
-    Queue {
-        queue_id: u64,
+    ConsumerGroup {
+        group_id: u64,
+        variant: GroupVariant,
+        /// Ack variant: pending count.
         pending_count: u64,
+        /// Ack variant: in-flight count.
         in_flight_count: u64,
+        /// Ack variant: DLQ count.
         dlq_count: u64,
-    },
-    ActorNamespace {
-        namespace_id: u64,
+        /// Actor variant: active actor count.
         active_actor_count: u64,
-    },
-    Job {
-        job_id: u64,
-        state: JobState,
     },
 }
 
@@ -325,94 +481,76 @@ pub struct MqCommand {
     pub(crate) buf: Bytes,
 }
 
-// Tag constants for MqCommand discriminants.
+// Tag constants for MqCommand discriminants — unified allocation.
 impl MqCommand {
-    // -- Topics --
+    // -- Topics (0-5) --
     pub const TAG_CREATE_TOPIC: u8 = 0;
     pub const TAG_DELETE_TOPIC: u8 = 1;
     pub const TAG_PUBLISH: u8 = 2;
     pub const TAG_COMMIT_OFFSET: u8 = 3;
     pub const TAG_PURGE_TOPIC: u8 = 4;
-    // -- Queues --
-    pub const TAG_CREATE_QUEUE: u8 = 5;
-    pub const TAG_DELETE_QUEUE: u8 = 6;
-    pub const TAG_ENQUEUE: u8 = 7;
-    pub const TAG_DELIVER: u8 = 8;
-    pub const TAG_ACK: u8 = 9;
-    pub const TAG_NACK: u8 = 10;
-    pub const TAG_EXTEND_VISIBILITY: u8 = 11;
-    pub const TAG_TIMEOUT_EXPIRED: u8 = 12;
-    pub const TAG_PUBLISH_TO_DLQ: u8 = 13;
-    pub const TAG_PRUNE_DEDUP_WINDOW: u8 = 14;
-    pub const TAG_EXPIRE_PENDING_MESSAGES: u8 = 15;
-    pub const TAG_PURGE_QUEUE: u8 = 16;
-    pub const TAG_GET_QUEUE_ATTRIBUTES: u8 = 17;
-    // -- Exchanges --
-    pub const TAG_CREATE_EXCHANGE: u8 = 18;
-    pub const TAG_DELETE_EXCHANGE: u8 = 19;
-    pub const TAG_CREATE_BINDING: u8 = 20;
-    pub const TAG_DELETE_BINDING: u8 = 21;
-    pub const TAG_PUBLISH_TO_EXCHANGE: u8 = 22;
-    // -- Actors --
-    pub const TAG_CREATE_ACTOR_NAMESPACE: u8 = 23;
-    pub const TAG_DELETE_ACTOR_NAMESPACE: u8 = 24;
-    pub const TAG_SEND_TO_ACTOR: u8 = 25;
-    pub const TAG_DELIVER_ACTOR_MESSAGE: u8 = 26;
-    pub const TAG_ACK_ACTOR_MESSAGE: u8 = 27;
-    pub const TAG_NACK_ACTOR_MESSAGE: u8 = 28;
-    pub const TAG_ASSIGN_ACTORS: u8 = 29;
-    pub const TAG_RELEASE_ACTORS: u8 = 30;
-    pub const TAG_EVICT_IDLE_ACTORS: u8 = 31;
-    // -- Jobs --
-    pub const TAG_CREATE_JOB: u8 = 32;
-    pub const TAG_DELETE_JOB: u8 = 33;
-    pub const TAG_UPDATE_JOB: u8 = 34;
-    pub const TAG_ENABLE_JOB: u8 = 35;
-    pub const TAG_DISABLE_JOB: u8 = 36;
-    pub const TAG_TRIGGER_JOB: u8 = 37;
-    pub const TAG_ASSIGN_JOB: u8 = 38;
-    pub const TAG_COMPLETE_JOB: u8 = 39;
-    pub const TAG_FAIL_JOB: u8 = 40;
-    pub const TAG_TIMEOUT_JOB: u8 = 41;
-    // -- Sessions --
-    pub const TAG_REGISTER_CONSUMER: u8 = 42;
-    pub const TAG_DISCONNECT_CONSUMER: u8 = 43;
-    pub const TAG_HEARTBEAT: u8 = 44;
-    pub const TAG_REGISTER_PRODUCER: u8 = 45;
-    pub const TAG_DISCONNECT_PRODUCER: u8 = 46;
+    pub const TAG_SET_RETAINED: u8 = 5;
+
+    // -- Exchanges (6-10) --
+    pub const TAG_CREATE_EXCHANGE: u8 = 6;
+    pub const TAG_DELETE_EXCHANGE: u8 = 7;
+    pub const TAG_CREATE_BINDING: u8 = 8;
+    pub const TAG_DELETE_BINDING: u8 = 9;
+    pub const TAG_PUBLISH_TO_EXCHANGE: u8 = 10;
+
+    // -- Consumer Groups (11-18) --
+    pub const TAG_CREATE_CONSUMER_GROUP: u8 = 11;
+    pub const TAG_DELETE_CONSUMER_GROUP: u8 = 12;
+    pub const TAG_JOIN_CONSUMER_GROUP: u8 = 13;
+    pub const TAG_SYNC_CONSUMER_GROUP: u8 = 14;
+    pub const TAG_LEAVE_CONSUMER_GROUP: u8 = 15;
+    pub const TAG_HEARTBEAT_CONSUMER_GROUP: u8 = 16;
+    pub const TAG_COMMIT_GROUP_OFFSET: u8 = 17;
+    pub const TAG_EXPIRE_GROUP_SESSIONS: u8 = 18;
+
+    // -- Ack Variant (19-29) --
+    pub const TAG_GROUP_DELIVER: u8 = 19;
+    pub const TAG_GROUP_ACK: u8 = 20;
+    pub const TAG_GROUP_NACK: u8 = 21;
+    pub const TAG_GROUP_RELEASE: u8 = 22;
+    pub const TAG_GROUP_MODIFY: u8 = 23;
+    pub const TAG_GROUP_EXTEND_VISIBILITY: u8 = 24;
+    pub const TAG_GROUP_TIMEOUT_EXPIRED: u8 = 25;
+    pub const TAG_GROUP_PUBLISH_TO_DLQ: u8 = 26;
+    pub const TAG_GROUP_EXPIRE_PENDING: u8 = 27;
+    pub const TAG_GROUP_PURGE: u8 = 28;
+    pub const TAG_GROUP_GET_ATTRIBUTES: u8 = 29;
+
+    // -- Actor Variant (30-35) --
+    pub const TAG_GROUP_DELIVER_ACTOR: u8 = 30;
+    pub const TAG_GROUP_ACK_ACTOR: u8 = 31;
+    pub const TAG_GROUP_NACK_ACTOR: u8 = 32;
+    pub const TAG_GROUP_ASSIGN_ACTORS: u8 = 33;
+    pub const TAG_GROUP_RELEASE_ACTORS: u8 = 34;
+    pub const TAG_GROUP_EVICT_IDLE: u8 = 35;
+
+    // -- Cron (36-39) --
+    pub const TAG_CRON_ENABLE: u8 = 36;
+    pub const TAG_CRON_DISABLE: u8 = 37;
+    pub const TAG_CRON_TRIGGER: u8 = 38;
+    pub const TAG_CRON_UPDATE: u8 = 39;
+
+    // -- Sessions (40-48) --
+    pub const TAG_CREATE_SESSION: u8 = 40;
+    pub const TAG_DISCONNECT_SESSION: u8 = 41;
+    pub const TAG_HEARTBEAT_SESSION: u8 = 42;
+    pub const TAG_SET_WILL: u8 = 43;
+    pub const TAG_CLEAR_WILL: u8 = 44;
+    pub const TAG_FIRE_PENDING_WILLS: u8 = 45;
+    pub const TAG_PERSIST_SESSION: u8 = 46;
+    pub const TAG_RESTORE_SESSION: u8 = 47;
+    pub const TAG_EXPIRE_SESSIONS: u8 = 48;
+
     // -- Batch --
-    pub const TAG_BATCH: u8 = 47;
-    // -- Consumer Groups --
-    pub const TAG_CREATE_CONSUMER_GROUP: u8 = 48;
-    pub const TAG_DELETE_CONSUMER_GROUP: u8 = 49;
-    pub const TAG_COMMIT_GROUP_OFFSET: u8 = 50;
-    pub const TAG_JOIN_CONSUMER_GROUP: u8 = 51;
-    pub const TAG_SYNC_CONSUMER_GROUP: u8 = 52;
-    pub const TAG_LEAVE_CONSUMER_GROUP: u8 = 53;
-    pub const TAG_HEARTBEAT_CONSUMER_GROUP: u8 = 54;
-    pub const TAG_EXPIRE_GROUP_OFFSETS: u8 = 55;
-    pub const TAG_EXPIRE_GROUP_SESSIONS: u8 = 56;
-    // -- MQTT Optimizations --
-    pub const TAG_SET_RETAINED: u8 = 57;
-    pub const TAG_DELETE_RETAINED: u8 = 58;
-    pub const TAG_GET_RETAINED: u8 = 59;
-    pub const TAG_SET_WILL: u8 = 60;
-    pub const TAG_CLEAR_WILL: u8 = 61;
-    pub const TAG_MARK_RECEIVED: u8 = 62;
-    pub const TAG_MARK_RELEASED: u8 = 63;
-    pub const TAG_PERSIST_SESSION: u8 = 64;
-    pub const TAG_RESTORE_SESSION: u8 = 65;
-    pub const TAG_EXPIRE_SESSIONS: u8 = 66;
-    pub const TAG_MULTI_DELIVER: u8 = 67;
-    pub const TAG_MULTI_ACK: u8 = 68;
-    // -- MQTT Optimizations Phase 2 --
-    pub const TAG_SET_TOPIC_ALIAS: u8 = 69;
-    pub const TAG_CLEAR_TOPIC_ALIASES: u8 = 70;
-    pub const TAG_CANCEL_PENDING_WILL: u8 = 71;
-    pub const TAG_FIRE_PENDING_WILLS: u8 = 72;
-    pub const TAG_REGISTER_PUBLISHER_SESSION: u8 = 73;
-    pub const TAG_QOS2_REGISTER_INBOUND: u8 = 74;
-    pub const TAG_QOS2_COMPLETE_INBOUND: u8 = 75;
+    pub const TAG_BATCH: u8 = 49;
+
+    // -- Dedup --
+    pub const TAG_PRUNE_DEDUP_WINDOW: u8 = 50;
 }
 
 impl MqCommand {
@@ -477,9 +615,6 @@ impl<'de> Deserialize<'de> for MqCommand {
     }
 }
 
-// Note: Display impl for MqCommand is delegated to codec::fmt_mq_command
-// (defined in codec.rs since it needs access to the encoding format).
-
 // =============================================================================
 // MqError — zero-alloc error type for hot paths
 // =============================================================================
@@ -487,26 +622,20 @@ impl<'de> Deserialize<'de> for MqCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntityKind {
     Topic,
-    Queue,
-    ActorNamespace,
-    Job,
-    Consumer,
     Exchange,
     Binding,
     ConsumerGroup,
+    Session,
 }
 
 impl fmt::Display for EntityKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Topic => f.write_str("topic"),
-            Self::Queue => f.write_str("queue"),
-            Self::ActorNamespace => f.write_str("actor namespace"),
-            Self::Job => f.write_str("job"),
-            Self::Consumer => f.write_str("consumer"),
             Self::Exchange => f.write_str("exchange"),
             Self::Binding => f.write_str("binding"),
             Self::ConsumerGroup => f.write_str("consumer group"),
+            Self::Session => f.write_str("session"),
         }
     }
 }
@@ -519,6 +648,8 @@ pub enum MqError {
     AlreadyExists { entity: EntityKind, id: u64 },
     /// Actor mailbox is full
     MailboxFull { pending: u32 },
+    /// Back-pressure: consumer group has too many unprocessed messages/bytes.
+    BackPressure { group_id: u64 },
     /// Generation mismatch on offset commit or heartbeat
     IllegalGeneration,
     /// A rebalance is in progress — consumer should re-join
@@ -537,6 +668,13 @@ impl fmt::Display for MqError {
                 write!(f, "{} already exists (id={})", entity, id)
             }
             Self::MailboxFull { pending } => write!(f, "mailbox full ({} messages)", pending),
+            Self::BackPressure { group_id } => {
+                write!(
+                    f,
+                    "back-pressure: consumer group {} limit exceeded",
+                    group_id
+                )
+            }
             Self::IllegalGeneration => f.write_str("illegal generation"),
             Self::RebalanceInProgress => f.write_str("rebalance in progress"),
             Self::UnknownMemberId => f.write_str("unknown member id"),
@@ -549,61 +687,13 @@ impl fmt::Display for MqError {
 // MqResponse
 // =============================================================================
 
-/// A retained message entry stored per exchange.
+/// A retained message entry stored per topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetainedEntry {
     /// MQTT topic/routing key.
     pub routing_key: Bytes,
     /// The flat-encoded message bytes.
     pub message: Bytes,
-}
-
-/// Will/testament message attached to a consumer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WillMessage {
-    pub exchange_id: u64,
-    pub delay_secs: u32,
-    pub qos: u8,
-    pub retain: bool,
-    pub routing_key: String,
-    pub message: Bytes,
-}
-
-/// Per-consumer topic alias entry (MQTT 5.0).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopicAliasEntry {
-    pub alias: u16,
-    pub topic_name: String,
-}
-
-/// A will message waiting to be fired after a delay (MQTT 5.0 Will Delay Interval).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingWill {
-    pub consumer_id: u64,
-    pub client_id: String,
-    pub will: WillMessage,
-    /// Absolute timestamp (ms) when the will should fire.
-    pub fire_at_ms: u64,
-}
-
-/// Persisted MQTT session state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedSession {
-    pub consumer_id: u64,
-    pub client_id: String,
-    pub session_expiry_secs: u32,
-    pub subscription_data: Bytes,
-    /// Timestamp (ms) when the session was persisted.
-    pub persisted_at: u64,
-    /// MQTT 5.0: Inbound QoS 1/2 inflight count at time of persist.
-    #[serde(default)]
-    pub inbound_qos_inflight: u32,
-    /// MQTT 5.0: Outbound QoS 1 inflight count at time of persist.
-    #[serde(default)]
-    pub outbound_qos1_count: u32,
-    /// Rate limiting: remaining message quota at time of persist.
-    #[serde(default)]
-    pub remaining_quota: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -643,7 +733,7 @@ pub enum MqResponse {
         phase_complete: bool,
     },
     /// Messages were dead-lettered. The caller (background timer) should read
-    /// the original message bytes from the raft log and issue `PublishToDlq`.
+    /// the original message bytes from the raft log and issue `GroupPublishToDlq`.
     DeadLettered {
         /// Raft log indexes of the dead-lettered messages.
         dead_letter_ids: SmallVec<[u64; 8]>,
@@ -656,22 +746,22 @@ pub enum MqResponse {
     },
     /// Will message is pending (has a delay).
     WillPending {
-        consumer_id: u64,
-        delay_secs: u32,
+        session_id: u64,
+        delay_ms: u64,
     },
     /// Session restored successfully.
     SessionRestored {
-        consumer_id: u64,
-        session_expiry_secs: u32,
+        session_id: u64,
+        session_expiry_ms: u64,
         subscription_data: Bytes,
     },
     /// Session not found or expired.
     SessionNotFound,
-    /// Multi-queue deliver result.
+    /// Multi-group deliver result.
     MultiMessages {
-        queues: Vec<(u64, SmallVec<[DeliveredMessage; 8]>)>,
+        groups: Vec<(u64, SmallVec<[DeliveredMessage; 8]>)>,
     },
-    /// Topic aliases for a consumer.
+    /// Topic aliases for a session.
     TopicAliases {
         aliases: Vec<TopicAliasEntry>,
     },
@@ -723,19 +813,16 @@ impl fmt::Display for MqResponse {
                 write!(f, "RetainedMessages(count={})", messages.len())
             }
             Self::WillPending {
-                consumer_id,
-                delay_secs,
-            } => write!(
-                f,
-                "WillPending(consumer={consumer_id}, delay={delay_secs}s)"
-            ),
-            Self::SessionRestored { consumer_id, .. } => {
-                write!(f, "SessionRestored(consumer={consumer_id})")
+                session_id,
+                delay_ms,
+            } => write!(f, "WillPending(session={session_id}, delay={delay_ms}ms)"),
+            Self::SessionRestored { session_id, .. } => {
+                write!(f, "SessionRestored(session={session_id})")
             }
             Self::SessionNotFound => write!(f, "SessionNotFound"),
-            Self::MultiMessages { queues } => {
-                let total: usize = queues.iter().map(|(_, msgs)| msgs.len()).sum();
-                write!(f, "MultiMessages(queues={}, msgs={})", queues.len(), total)
+            Self::MultiMessages { groups } => {
+                let total: usize = groups.iter().map(|(_, msgs)| msgs.len()).sum();
+                write!(f, "MultiMessages(groups={}, msgs={})", groups.len(), total)
             }
             Self::TopicAliases { aliases } => {
                 write!(f, "TopicAliases(count={})", aliases.len())
@@ -752,21 +839,13 @@ impl fmt::Display for MqResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MqSnapshotData {
     pub topics: Vec<TopicSnapshot>,
-    pub queues: Vec<QueueSnapshot>,
-    pub actor_namespaces: Vec<ActorNamespaceSnapshot>,
-    pub jobs: Vec<JobSnapshot>,
-    pub consumers: Vec<ConsumerSnapshot>,
-    pub producers: Vec<ProducerSnapshot>,
+    pub consumer_groups: Vec<crate::consumer_group::ConsumerGroupSnapshot>,
     #[serde(default)]
     pub exchanges: Vec<ExchangeSnapshot>,
     #[serde(default)]
-    pub consumer_groups: Vec<crate::consumer_group::ConsumerGroupSnapshot>,
-    #[serde(default)]
-    pub sessions: Vec<PersistedSession>,
+    pub sessions: Vec<SessionSnapshot>,
     #[serde(default)]
     pub pending_wills: Vec<PendingWill>,
-    #[serde(default)]
-    pub qos2_inbound: Vec<(u64, Vec<(u16, u8)>)>,
     pub next_id: u64,
     /// Manifest of raft log segment files the follower needs to sync.
     #[serde(default)]
@@ -783,34 +862,6 @@ pub struct TopicSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueSnapshot {
-    pub meta: crate::queue::QueueMeta,
-    pub messages: Vec<QueueMessageMeta>,
-    pub dedup_entries: Vec<(u64, Vec<Bytes>)>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActorNamespaceSnapshot {
-    pub meta: crate::actor::ActorNamespaceMeta,
-    pub actors: Vec<crate::actor::ActorState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobSnapshot {
-    pub meta: crate::job::JobMeta,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsumerSnapshot {
-    pub meta: crate::consumer::ConsumerMeta,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProducerSnapshot {
-    pub meta: crate::producer::ProducerMeta,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeSnapshot {
     pub meta: crate::exchange::ExchangeMeta,
     pub bindings: Vec<Binding>,
@@ -818,44 +869,18 @@ pub struct ExchangeSnapshot {
     pub retained: Vec<RetainedEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub meta: crate::session::SessionMeta,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
-    use crate::config::{ActorConfig, JobConfig, QueueConfig};
 
     // =========================================================================
     // Display impls
     // =========================================================================
-
-    #[test]
-    fn test_mq_command_display() {
-        let cases: Vec<(MqCommand, &str)> = vec![
-            (
-                MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-                "CreateTopic(events)",
-            ),
-            (MqCommand::delete_topic(42), "DeleteTopic(42)"),
-            (
-                MqCommand::publish(
-                    1,
-                    &[crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"x")).build()],
-                ),
-                "Publish(topic=1, count=1)",
-            ),
-            (
-                MqCommand::create_queue("tasks", &QueueConfig::default()),
-                "CreateQueue(tasks)",
-            ),
-            (MqCommand::ack(5, &[1, 2, 3], None), "Ack(queue=5, count=3)"),
-            (MqCommand::heartbeat(99), "Heartbeat(99)"),
-            (MqCommand::disconnect_consumer(7), "DisconnectConsumer(7)"),
-        ];
-
-        for (cmd, expected) in cases {
-            assert_eq!(format!("{}", cmd), expected);
-        }
-    }
 
     #[test]
     fn test_mq_response_display() {
@@ -876,7 +901,7 @@ mod tests {
                         message_id: 1,
                         attempt: 1,
                         original_timestamp: 0,
-                        queue_id: 0,
+                        group_id: 0,
                     }]
                 }
             ),
@@ -922,10 +947,10 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_message_meta_serde() {
-        let meta = QueueMessageMeta {
+    fn test_ack_message_meta_serde() {
+        let meta = AckMessageMeta {
             message_id: 42,
-            queue_id: 1,
+            group_id: 1,
             state: MessageState::InFlight,
             priority: 5,
             deliver_after: 1000,
@@ -940,7 +965,7 @@ mod tests {
             value_len: 256,
         };
         let bytes = bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap();
-        let (decoded, _): (QueueMessageMeta, _) =
+        let (decoded, _): (AckMessageMeta, _) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
 
         assert_eq!(decoded.message_id, 42);
@@ -953,119 +978,33 @@ mod tests {
 
     #[test]
     fn test_entity_stats_serde() {
-        let stats = EntityStats::Queue {
-            queue_id: 1,
+        let stats = EntityStats::ConsumerGroup {
+            group_id: 1,
+            variant: GroupVariant::Ack,
             pending_count: 100,
             in_flight_count: 5,
             dlq_count: 2,
+            active_actor_count: 0,
         };
         let bytes = bincode::serde::encode_to_vec(&stats, bincode::config::standard()).unwrap();
         let (decoded, _): (EntityStats, _) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
 
         match decoded {
-            EntityStats::Queue {
-                queue_id,
+            EntityStats::ConsumerGroup {
+                group_id,
                 pending_count,
                 in_flight_count,
                 dlq_count,
+                ..
             } => {
-                assert_eq!(queue_id, 1);
+                assert_eq!(group_id, 1);
                 assert_eq!(pending_count, 100);
                 assert_eq!(in_flight_count, 5);
                 assert_eq!(dlq_count, 2);
             }
             _ => panic!("wrong variant"),
         }
-    }
-
-    #[test]
-    fn test_mq_command_serde_roundtrip() {
-        let flat_msg = crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"v"))
-            .key(Bytes::from_static(b"k"))
-            .timestamp(999)
-            .build();
-        let cmd = MqCommand::enqueue(5, &[flat_msg], &[Some(Bytes::from_static(b"dk"))]);
-        let bytes = bincode::serde::encode_to_vec(&cmd, bincode::config::standard()).unwrap();
-        let (decoded, _): (MqCommand, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-
-        assert_eq!(decoded.tag(), MqCommand::TAG_ENQUEUE);
-        let v = decoded.as_enqueue();
-        assert_eq!(v.queue_id(), 5);
-        assert_eq!(v.messages().count(), 1);
-        assert_eq!(v.dedup_keys().count(), 1);
-    }
-
-    #[test]
-    fn test_mq_response_serde_roundtrip() {
-        let resp = MqResponse::Messages {
-            messages: smallvec::smallvec![DeliveredMessage {
-                message_id: 42,
-                attempt: 2,
-                original_timestamp: 500,
-                queue_id: 0,
-            }],
-        };
-        let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
-        let (decoded, _): (MqResponse, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-
-        match decoded {
-            MqResponse::Messages { messages } => {
-                assert_eq!(messages.len(), 1);
-                assert_eq!(messages[0].message_id, 42);
-                assert_eq!(messages[0].attempt, 2);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_snapshot_data_serde_roundtrip() {
-        let snap = MqSnapshotData {
-            topics: vec![TopicSnapshot {
-                meta: crate::topic::TopicMeta::new(
-                    1,
-                    "t".to_string(),
-                    100,
-                    RetentionPolicy::default(),
-                ),
-                consumer_offsets: Vec::new(),
-            }],
-            queues: Vec::new(),
-            actor_namespaces: Vec::new(),
-            jobs: Vec::new(),
-            consumers: Vec::new(),
-            producers: Vec::new(),
-            next_id: 42,
-            file_manifest: Vec::new(),
-            sync_addr: None,
-            exchanges: Vec::new(),
-            consumer_groups: Vec::new(),
-            sessions: Vec::new(),
-            pending_wills: Vec::new(),
-            qos2_inbound: Vec::new(),
-        };
-        let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
-        let (decoded, _): (MqSnapshotData, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-
-        assert_eq!(decoded.topics.len(), 1);
-        assert_eq!(decoded.topics[0].meta.name, "t");
-        assert_eq!(decoded.next_id, 42);
-    }
-
-    #[test]
-    fn test_overlap_policy_default() {
-        assert_eq!(OverlapPolicy::default(), OverlapPolicy::Skip);
-    }
-
-    #[test]
-    fn test_retry_config_default() {
-        let rc = RetryConfig::default();
-        assert_eq!(rc.max_retries, 3);
-        assert_eq!(rc.retry_delay_ms, 5000);
     }
 
     #[test]
@@ -1087,60 +1026,34 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_serde_roundtrip() {
-        let sub_cmds = vec![
-            MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
-            MqCommand::publish(
-                1,
-                &[
-                    crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"data"))
-                        .timestamp(100)
-                        .build(),
-                ],
-            ),
-        ];
-        let cmd = MqCommand::batch(&sub_cmds);
-        let bytes = bincode::serde::encode_to_vec(&cmd, bincode::config::standard()).unwrap();
-        let (decoded, _): (MqCommand, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-        assert_eq!(decoded.tag(), MqCommand::TAG_BATCH);
-        let batch = decoded.as_batch();
-        assert_eq!(batch.count(), 2);
-        let cmds: Vec<MqCommand> = batch.commands().collect();
-        assert_eq!(cmds[0].tag(), MqCommand::TAG_CREATE_TOPIC);
-        assert_eq!(cmds[1].tag(), MqCommand::TAG_PUBLISH);
-
-        let resp = MqResponse::BatchResponse(Box::new(smallvec::smallvec![
-            MqResponse::Ok,
-            MqResponse::EntityCreated { id: 5 }
-        ]));
-        let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
-        let (decoded, _): (MqResponse, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-        match decoded {
-            MqResponse::BatchResponse(resps) => {
-                assert_eq!(resps.len(), 2);
-                assert!(matches!(resps[0], MqResponse::Ok));
-                assert!(matches!(resps[1], MqResponse::EntityCreated { id: 5 }));
-            }
-            _ => panic!("expected BatchResponse"),
-        }
+    fn test_group_variant_default() {
+        assert_eq!(GroupVariant::default(), GroupVariant::Offset);
     }
 
     #[test]
-    fn test_batch_display() {
-        let sub_cmds = vec![
-            MqCommand::delete_topic(1),
-            MqCommand::delete_queue(2),
-            MqCommand::heartbeat(3),
-        ];
-        let cmd = MqCommand::batch(&sub_cmds);
-        assert_eq!(format!("{}", cmd), "Batch(count=3)");
+    fn test_ack_variant_config_defaults() {
+        let config = AckVariantConfig::default();
+        assert_eq!(config.visibility_timeout_ms, 30_000);
+        assert_eq!(config.max_retries, 3);
+        assert!(config.dead_letter_topic.is_none());
+        assert_eq!(config.delay_default_ms, 0);
+        assert_eq!(config.max_in_flight_per_consumer, 100);
+    }
 
-        let resp = MqResponse::BatchResponse(Box::new(smallvec::smallvec![
-            MqResponse::Ok,
-            MqResponse::Ok
-        ]));
-        assert_eq!(format!("{}", resp), "BatchResponse(count=2)");
+    #[test]
+    fn test_actor_variant_config_defaults() {
+        let config = ActorVariantConfig::default();
+        assert_eq!(config.max_mailbox_depth, 10_000);
+        assert_eq!(config.idle_eviction_secs, 3600);
+        assert_eq!(config.ack_timeout_ms, 30_000);
+        assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn test_topic_lifetime_policy_default() {
+        assert_eq!(
+            TopicLifetimePolicy::default(),
+            TopicLifetimePolicy::Permanent
+        );
     }
 }

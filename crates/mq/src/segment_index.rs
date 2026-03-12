@@ -822,14 +822,6 @@ impl SegmentIndexMap {
                 let topic_id = cmd.field_u64(1);
                 self.add_entry(seg_id, ENTITY_TOPIC, topic_id, rec_offset, cmd_len);
             }
-            MqCommand::TAG_ENQUEUE => {
-                let queue_id = cmd.field_u64(1);
-                self.add_entry(seg_id, ENTITY_QUEUE, queue_id, rec_offset, cmd_len);
-            }
-            MqCommand::TAG_SEND_TO_ACTOR => {
-                let ns_id = cmd.field_u64(1);
-                self.add_entry(seg_id, ENTITY_ACTOR_NS, ns_id, rec_offset, cmd_len);
-            }
             MqCommand::TAG_PUBLISH_TO_EXCHANGE => {
                 let exchange_id = cmd.field_u64(1);
                 self.add_entry(seg_id, ENTITY_TOPIC, exchange_id, rec_offset, cmd_len);
@@ -841,14 +833,6 @@ impl SegmentIndexMap {
                         MqCommand::TAG_PUBLISH => {
                             let topic_id = sub_cmd.field_u64(1);
                             self.add_entry(seg_id, ENTITY_TOPIC, topic_id, rec_offset, cmd_len);
-                        }
-                        MqCommand::TAG_ENQUEUE => {
-                            let queue_id = sub_cmd.field_u64(1);
-                            self.add_entry(seg_id, ENTITY_QUEUE, queue_id, rec_offset, cmd_len);
-                        }
-                        MqCommand::TAG_SEND_TO_ACTOR => {
-                            let ns_id = sub_cmd.field_u64(1);
-                            self.add_entry(seg_id, ENTITY_ACTOR_NS, ns_id, rec_offset, cmd_len);
                         }
                         _ => {}
                     }

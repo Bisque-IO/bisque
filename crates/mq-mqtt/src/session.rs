@@ -299,8 +299,6 @@ pub struct SubscribeFilterPlan {
     pub cached_binding_id: Option<u64>,
     /// QoS for this subscription.
     pub qos: QoS,
-    /// Queue config (with dedup if needed).
-    pub queue_config: bisque_mq::config::QueueConfig,
     /// Whether this is a shared subscription.
     pub shared_group: Option<String>,
     /// MQTT 5.0 No Local option.
@@ -872,17 +870,12 @@ impl MqttSession {
         // Compute consumer/producer name once to avoid double format! allocation.
         let consumer_name = format!("mqtt/{}", self.client_id);
 
-        // Register this session as a bisque-mq consumer.
-        commands.push(MqCommand::register_consumer(
+        // Register this session with bisque-mq (unified consumer+producer).
+        commands.push(MqCommand::create_session(
             self.session_id,
             &consumer_name,
-            &[],
-        ));
-
-        // Register as a producer for publishing.
-        commands.push(MqCommand::register_producer(
-            self.session_id,
-            Some(&consumer_name),
+            (self.keep_alive as u64) * 1000,
+            (self.session_expiry_interval as u64) * 1000,
         ));
 
         // If clean session, clear any old subscription state.
@@ -1038,14 +1031,11 @@ impl MqttSession {
                 // Build CONNACK + registration commands (same as handle_connect completion).
                 let consumer_name = format!("mqtt/{}", self.client_id);
                 let mut commands = SmallVec::new();
-                commands.push(MqCommand::register_consumer(
+                commands.push(MqCommand::create_session(
                     self.session_id,
                     &consumer_name,
-                    &[],
-                ));
-                commands.push(MqCommand::register_producer(
-                    self.session_id,
-                    Some(&consumer_name),
+                    (self.keep_alive as u64) * 1000,
+                    (self.session_expiry_interval as u64) * 1000,
                 ));
 
                 let properties = Properties {
@@ -1540,7 +1530,7 @@ impl MqttSession {
                 if let (Some(queue_id), Some(message_id)) =
                     (inflight.mq_queue_id, inflight.mq_message_id)
                 {
-                    return Some(MqCommand::ack(queue_id, &[message_id], None));
+                    return Some(MqCommand::group_ack(queue_id, &[message_id], None));
                 }
             }
         } else {
@@ -1641,7 +1631,7 @@ impl MqttSession {
                 } => {
                     // QoS 2 delivery complete. ACK in bisque-mq.
                     debug!(packet_id, "QoS 2 outbound delivery complete");
-                    return Some(MqCommand::ack(mq_queue_id, &[mq_message_id], None));
+                    return Some(MqCommand::group_ack(mq_queue_id, &[mq_message_id], None));
                 }
                 QoS2OutboundState::PublishSent { .. } => {
                     warn!(
@@ -1733,8 +1723,6 @@ impl MqttSession {
                     .copied()
             });
 
-            let queue_config = bisque_mq::config::QueueConfig::default();
-
             // QoS downgrade (m8): clamp to server maximum_qos.
             let granted_qos = if filter.qos > self.config.maximum_qos {
                 self.config.maximum_qos
@@ -1752,7 +1740,6 @@ impl MqttSession {
                 routing_key,
                 cached_binding_id,
                 qos: granted_qos,
-                queue_config,
                 shared_group: shared_group.clone(),
                 no_local: filter.no_local,
                 subscription_id,
@@ -1843,7 +1830,7 @@ impl MqttSession {
                 // Delete subscription queue if clean session and not shared.
                 if self.clean_session && mapping.shared_group.is_none() {
                     if let Some(queue_id) = mapping.queue_id {
-                        commands.push(MqCommand::delete_queue(queue_id));
+                        commands.push(MqCommand::delete_consumer_group(queue_id));
                     }
                 }
                 // Remove from queue_to_sub_id reverse index.
@@ -1882,7 +1869,7 @@ impl MqttSession {
 
     /// Handle a PINGREQ packet.
     pub fn handle_pingreq(&self) -> (MqCommand, MqttPacket) {
-        let cmd = MqCommand::heartbeat(self.session_id);
+        let cmd = MqCommand::heartbeat_session(self.session_id);
         (cmd, MqttPacket::PingResp)
     }
 
@@ -2010,8 +1997,7 @@ impl MqttSession {
 
         let mut commands = SmallVec::new();
 
-        commands.push(MqCommand::disconnect_consumer(self.session_id));
-        commands.push(MqCommand::disconnect_producer(self.session_id));
+        commands.push(MqCommand::disconnect_session(self.session_id, publish_will));
 
         // If clean session, remove all subscription bindings and queues.
         if self.clean_session {
@@ -2021,7 +2007,7 @@ impl MqttSession {
                 }
                 if mapping.shared_group.is_none() {
                     if let Some(queue_id) = mapping.queue_id {
-                        commands.push(MqCommand::delete_queue(queue_id));
+                        commands.push(MqCommand::delete_consumer_group(queue_id));
                     }
                 }
             }
@@ -2082,10 +2068,8 @@ impl MqttSession {
         self.will = None;
         self.connected = false;
 
-        // Disconnect consumer/producer. DisconnectConsumer handles returning
-        // in-flight queue messages to pending automatically.
-        commands.push(MqCommand::disconnect_consumer(self.session_id));
-        commands.push(MqCommand::disconnect_producer(self.session_id));
+        // Disconnect session. For unclean disconnect, publish will message.
+        commands.push(MqCommand::disconnect_session(self.session_id, true));
 
         // Collect all outbound NACK message IDs, grouped by queue_id.
         // Uses SmallVec to avoid HashMap allocation for the common case.
@@ -2123,7 +2107,7 @@ impl MqttSession {
                 }
                 let mids: SmallVec<[u64; 8]> =
                     nack_pairs[start..i].iter().map(|(_, mid)| *mid).collect();
-                commands.push(MqCommand::nack(cur_qid, &mids));
+                commands.push(MqCommand::group_nack(cur_qid, &mids));
             }
         }
 

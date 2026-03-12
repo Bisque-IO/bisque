@@ -221,18 +221,16 @@ impl MqWriteBatcher {
 /// Returns `(merged_commands, response_slots)` where each slot knows how to
 /// distribute the raft response back to original callers.
 ///
-/// `publish_idx` and `enqueue_idx` are caller-owned scratch maps, reused across
-/// flushes to avoid per-flush HashMap allocation.
+/// `publish_idx` is a caller-owned scratch map, reused across flushes to avoid
+/// per-flush HashMap allocation.
 fn merge_pending(
     pending: &mut Vec<BatchedRequest>,
     publish_idx: &mut HashMap<u64, usize>,
-    enqueue_idx: &mut HashMap<u64, usize>,
 ) -> (Vec<MqCommand>, Vec<ResponseSlot>) {
     let mut commands = Vec::with_capacity(pending.len());
     let mut slots = Vec::with_capacity(pending.len());
 
     publish_idx.clear();
-    enqueue_idx.clear();
 
     for req in pending.drain(..) {
         match req.command.tag() {
@@ -240,7 +238,8 @@ fn merge_pending(
                 let v = req.command.as_publish();
                 let topic_id = v.topic_id();
                 if let Some(&idx) = publish_idx.get(&topic_id) {
-                    // Merge: collect messages from both and create new command
+                    // Merge: collect all messages from the existing command and
+                    // the new one, then re-encode a single publish.
                     let msg_count = v.message_count() as usize;
                     let existing: &MqCommand = &commands[idx];
                     let ex_v = existing.as_publish();
@@ -254,32 +253,6 @@ fn merge_pending(
                     let idx = commands.len();
                     let msg_count = v.message_count() as usize;
                     publish_idx.insert(topic_id, idx);
-                    commands.push(req.command);
-                    slots.push(ResponseSlot::MergedPublish(vec![(
-                        req.response_tx,
-                        msg_count,
-                    )]));
-                }
-            }
-            MqCommand::TAG_ENQUEUE => {
-                let v = req.command.as_enqueue();
-                let queue_id = v.queue_id();
-                if let Some(&idx) = enqueue_idx.get(&queue_id) {
-                    let msg_count = v.message_count() as usize;
-                    let existing = &commands[idx];
-                    let ex_v = existing.as_enqueue();
-                    let mut all_msgs: Vec<Bytes> = ex_v.messages().collect();
-                    all_msgs.extend(v.messages());
-                    let mut all_keys: Vec<Option<Bytes>> = ex_v.dedup_keys().collect();
-                    all_keys.extend(v.dedup_keys());
-                    commands[idx] = MqCommand::enqueue(queue_id, &all_msgs, &all_keys);
-                    if let ResponseSlot::MergedPublish(ref mut callers) = slots[idx] {
-                        callers.push((req.response_tx, msg_count));
-                    }
-                } else {
-                    let idx = commands.len();
-                    let msg_count = v.message_count() as usize;
-                    enqueue_idx.insert(queue_id, idx);
                     commands.push(req.command);
                     slots.push(ResponseSlot::MergedPublish(vec![(
                         req.response_tx,
@@ -346,9 +319,8 @@ async fn batcher_loop(
     m_commands_batched: metrics::Histogram,
 ) {
     let mut pending: Vec<BatchedRequest> = Vec::with_capacity(config.max_batch_count);
-    // Reusable scratch maps for merge_pending — avoids per-flush HashMap allocation.
+    // Reusable scratch map for merge_pending — avoids per-flush HashMap allocation.
     let mut publish_idx: HashMap<u64, usize> = HashMap::new();
-    let mut enqueue_idx: HashMap<u64, usize> = HashMap::new();
 
     loop {
         // Step 1: Block until the first request arrives.
@@ -383,8 +355,8 @@ async fn batcher_loop(
         let num_commands = pending.len();
         let flushed_by_count = num_commands >= config.max_batch_count;
 
-        // Step 3: Merge same-topic Publishes and same-queue Enqueues.
-        let (commands, slots) = merge_pending(&mut pending, &mut publish_idx, &mut enqueue_idx);
+        // Step 3: Merge same-topic Publishes.
+        let (commands, slots) = merge_pending(&mut pending, &mut publish_idx);
 
         // Step 4: Build command and propose through Raft.
         if commands.len() == 1 {

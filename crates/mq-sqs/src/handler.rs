@@ -2,17 +2,14 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Json;
-use base64::Engine as _;
-use bisque_mq::config::QueueConfig;
-use bisque_mq::flat::FlatMessageBuilder;
-use bisque_mq::types::{DeliveredMessage, MqCommand, MqError, MqResponse, name_hash};
-use bisque_mq::write_batcher::MqWriteBatcher;
-use bytes::Bytes;
-use serde::Deserialize;
-
 use crate::error::SqsError;
 use crate::types::*;
+use axum::Json;
+use base64::Engine as _;
+use bisque_mq::flat::FlatMessageBuilder;
+use bisque_mq::types::{DeliveredMessage, EntityStats, MqCommand, MqError, MqResponse, name_hash};
+use bisque_mq::write_batcher::MqWriteBatcher;
+use bytes::Bytes;
 
 /// Shared state for the SQS handler.
 pub struct SqsState {
@@ -120,33 +117,9 @@ impl SqsState {
         &self,
         req: CreateQueueRequest,
     ) -> Result<Json<CreateQueueResponse>, SqsError> {
-        let mut config = QueueConfig::default();
-
-        if let Some(ref attrs) = req.attributes {
-            if let Some(ref vt) = attrs.visibility_timeout {
-                if let Ok(secs) = vt.parse::<u64>() {
-                    config.visibility_timeout_ms = secs * 1000;
-                }
-            }
-            if let Some(ref ds) = attrs.delay_seconds {
-                if let Ok(secs) = ds.parse::<u64>() {
-                    config.delay_default_ms = secs * 1000;
-                }
-            }
-            if let Some(ref fifo) = attrs.fifo_queue {
-                if fifo == "true" {
-                    config.dedup_window_secs = Some(300); // 5 min default
-                }
-            }
-            if let Some(ref policy) = attrs.redrive_policy {
-                if let Ok(rp) = serde_json::from_str::<RedrivePolicy>(policy) {
-                    // TODO: Resolve DLQ ARN to topic_id and set config.dead_letter_topic_id
-                    config.max_retries = rp.max_receive_count;
-                }
-            }
-        }
-
-        let cmd = MqCommand::create_queue(&req.queue_name, &config);
+        // TODO: Map SQS-specific attributes (visibility_timeout, delay, dedup, redrive)
+        // to engine-level AckVariantConfig once the full integration is wired up.
+        let cmd = MqCommand::create_consumer_group(&req.queue_name, 0);
 
         let resp = self.batcher.submit(cmd).await?;
         match resp {
@@ -167,7 +140,7 @@ impl SqsState {
     pub async fn delete_queue(&self, req: DeleteQueueRequest) -> Result<Json<()>, SqsError> {
         let queue_name = self.parse_queue_name(&req.queue_url)?;
         let hash = name_hash(queue_name);
-        let cmd = MqCommand::delete_queue(hash);
+        let cmd = MqCommand::delete_consumer_group(hash);
         let resp = self.batcher.submit(cmd).await?;
         match resp {
             MqResponse::Ok => Ok(Json(())),
@@ -182,7 +155,7 @@ impl SqsState {
     ) -> Result<Json<GetQueueUrlResponse>, SqsError> {
         // Verify queue exists by getting attributes
         let hash = name_hash(&req.queue_name);
-        let cmd = MqCommand::get_queue_attributes(hash);
+        let cmd = MqCommand::group_get_attributes(hash);
         let resp = self.batcher.submit(cmd).await?;
         match resp {
             MqResponse::Stats(_) => Ok(Json(GetQueueUrlResponse {
@@ -206,10 +179,6 @@ impl SqsState {
 
         // Take ownership directly — no clone.
         let key = req.message_group_id.map(|s| Bytes::from(s.into_bytes()));
-        let dedup_key = req
-            .message_deduplication_id
-            .map(|s| Bytes::from(s.into_bytes()));
-
         let mut headers = Vec::new();
         if let Some(attrs) = req.message_attributes {
             for (k, v) in attrs {
@@ -238,7 +207,7 @@ impl SqsState {
         }
         let flat_msg = builder.build();
 
-        let cmd = MqCommand::enqueue(queue_id, &[flat_msg], &[dedup_key]);
+        let cmd = MqCommand::publish(queue_id, &[flat_msg]);
 
         let resp = self.batcher.submit(cmd).await?;
         self.m_send_count.increment(1);
@@ -268,7 +237,6 @@ impl SqsState {
 
         let len = req.entries.len();
         let mut messages = Vec::with_capacity(len);
-        let mut dedup_keys = Vec::with_capacity(len);
         let mut entry_ids = Vec::with_capacity(len);
         let mut md5s = Vec::with_capacity(len);
 
@@ -277,20 +245,15 @@ impl SqsState {
             md5s.push(Self::md5_hex(entry.message_body.as_bytes()));
             let value = Bytes::from(entry.message_body.into_bytes());
             let key = entry.message_group_id.map(|s| Bytes::from(s.into_bytes()));
-            let dedup = entry
-                .message_deduplication_id
-                .map(|s| Bytes::from(s.into_bytes()));
-
             let mut builder = FlatMessageBuilder::new(value).timestamp(now_ms);
             if let Some(k) = key {
                 builder = builder.key(k);
             }
             messages.push(builder.build());
-            dedup_keys.push(dedup);
             entry_ids.push(entry.id);
         }
 
-        let cmd = MqCommand::enqueue(queue_id, &messages, &dedup_keys);
+        let cmd = MqCommand::publish(queue_id, &messages);
 
         let resp = self.batcher.submit(cmd).await?;
         self.m_send_count.increment(entry_ids.len() as u64);
@@ -333,7 +296,7 @@ impl SqsState {
         // Generate a consumer ID for this receive operation.
         let consumer_id = rand_consumer_id();
 
-        let cmd = MqCommand::deliver(queue_id, consumer_id, max_count);
+        let cmd = MqCommand::group_deliver(queue_id, consumer_id, max_count);
 
         // Long-poll: retry up to wait_time seconds
         let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_time as u64);
@@ -372,7 +335,7 @@ impl SqsState {
     pub async fn delete_message(&self, req: DeleteMessageRequest) -> Result<Json<()>, SqsError> {
         let (queue_id, message_id) = Self::decode_receipt_handle(&req.receipt_handle)?;
 
-        let cmd = MqCommand::ack(queue_id, &[message_id], None);
+        let cmd = MqCommand::group_ack(queue_id, &[message_id], None);
 
         let resp = self.batcher.submit(cmd).await?;
         self.m_delete_count.increment(1);
@@ -417,7 +380,7 @@ impl SqsState {
         // Single Ack command per queue with all message_ids.
         for (queue_id, entries) in by_queue {
             let (ids, message_ids): (Vec<String>, Vec<u64>) = entries.into_iter().unzip();
-            let cmd = MqCommand::ack(queue_id, &message_ids, None);
+            let cmd = MqCommand::group_ack(queue_id, &message_ids, None);
             match self.batcher.submit(cmd).await {
                 Ok(MqResponse::Ok) => {
                     for id in ids {
@@ -458,7 +421,7 @@ impl SqsState {
     ) -> Result<Json<()>, SqsError> {
         let (queue_id, message_id) = Self::decode_receipt_handle(&req.receipt_handle)?;
 
-        let cmd = MqCommand::extend_visibility(
+        let cmd = MqCommand::group_extend_visibility(
             queue_id,
             &[message_id],
             req.visibility_timeout as u64 * 1000,
@@ -506,7 +469,7 @@ impl SqsState {
 
         for ((queue_id, extension_ms), entries) in by_key {
             let (ids, message_ids): (Vec<String>, Vec<u64>) = entries.into_iter().unzip();
-            let cmd = MqCommand::extend_visibility(queue_id, &message_ids, extension_ms);
+            let cmd = MqCommand::group_extend_visibility(queue_id, &message_ids, extension_ms);
             match self.batcher.submit(cmd).await {
                 Ok(MqResponse::Ok) => {
                     for id in ids {
@@ -536,7 +499,7 @@ impl SqsState {
         let queue_name = self.parse_queue_name(&req.queue_url)?;
         let queue_id = name_hash(queue_name);
 
-        let cmd = MqCommand::purge_queue(queue_id);
+        let cmd = MqCommand::group_purge(queue_id);
         let resp = self.batcher.submit(cmd).await?;
         match resp {
             MqResponse::Ok => Ok(Json(())),
@@ -552,15 +515,17 @@ impl SqsState {
         let queue_name = self.parse_queue_name(&req.queue_url)?;
         let queue_id = name_hash(queue_name);
 
-        let cmd = MqCommand::get_queue_attributes(queue_id);
+        let cmd = MqCommand::group_get_attributes(queue_id);
         let resp = self.batcher.submit(cmd).await?;
 
         match resp {
-            MqResponse::Stats(bisque_mq::types::EntityStats::Queue {
-                queue_id: _,
+            MqResponse::Stats(EntityStats::ConsumerGroup {
+                group_id: _,
+                variant: _,
                 pending_count,
                 in_flight_count,
                 dlq_count,
+                active_actor_count: _,
             }) => {
                 let mut attrs = serde_json::Map::with_capacity(4);
                 attrs.insert(
@@ -590,14 +555,6 @@ impl SqsState {
 // =============================================================================
 // Helpers
 // =============================================================================
-
-#[derive(Deserialize)]
-struct RedrivePolicy {
-    #[serde(rename = "maxReceiveCount")]
-    max_receive_count: u32,
-    #[serde(rename = "deadLetterTargetArn", default)]
-    _dead_letter_target_arn: Option<String>,
-}
 
 fn to_sqs_message(
     queue_id: u64,

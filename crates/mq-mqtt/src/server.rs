@@ -454,7 +454,6 @@ async fn ensure_queue(
     batcher: &MqWriteBatcher,
     queue_name: impl AsRef<str> + Into<String>,
     cached_id: Option<u64>,
-    config: bisque_mq::config::QueueConfig,
 ) -> Result<u64, ConnectionError> {
     if let Some(id) = cached_id {
         return Ok(id);
@@ -464,7 +463,7 @@ async fn ensure_queue(
     }
 
     let resp = batcher
-        .submit(MqCommand::create_queue(queue_name.as_ref(), &config))
+        .submit(MqCommand::create_consumer_group(queue_name.as_ref(), 0))
         .await?;
 
     if let Some(id) = extract_entity_id(&resp) {
@@ -703,7 +702,6 @@ async fn orchestrate_subscribe(
             routing_key,
             cached_binding_id,
             qos: _,
-            queue_config,
             shared_group,
             no_local,
             subscription_id,
@@ -712,8 +710,7 @@ async fn orchestrate_subscribe(
         } = filter_plan;
 
         // Ensure queue — moves queue_name into cache.
-        let queue_id =
-            ensure_queue(session, batcher, queue_name, cached_queue_id, queue_config).await?;
+        let queue_id = ensure_queue(session, batcher, queue_name, cached_queue_id).await?;
 
         // Ensure binding (with MQTT 5.0 opts: no_local, shared_group, subscription_id).
         let binding_id = if no_local || shared_group.is_some() || subscription_id.is_some() {
@@ -837,7 +834,11 @@ async fn deliver_outbound(
 
         // Issue Deliver command to pull messages from the subscription queue.
         let resp = batcher
-            .submit(MqCommand::deliver(queue_id, session.session_id, remaining))
+            .submit(MqCommand::group_deliver(
+                queue_id,
+                session.session_id,
+                remaining,
+            ))
             .await?;
 
         if let MqResponse::Messages { messages } = resp {
@@ -849,7 +850,7 @@ async fn deliver_outbound(
                 if flat_messages_buf.is_empty() {
                     // Message has been purged — NACK it so the queue can move on.
                     let _ = batcher
-                        .submit(MqCommand::nack(queue_id, &[delivered.message_id]))
+                        .submit(MqCommand::group_nack(queue_id, &[delivered.message_id]))
                         .await;
                     continue;
                 }
@@ -863,7 +864,7 @@ async fn deliver_outbound(
                             if let Some(topic) = flat.routing_key() {
                                 if topic.first() == Some(&b'$') {
                                     let _ = batcher
-                                        .submit(MqCommand::ack(
+                                        .submit(MqCommand::group_ack(
                                             queue_id,
                                             &[delivered.message_id],
                                             None,
@@ -880,7 +881,7 @@ async fn deliver_outbound(
                                 if pub_session_id == my_session_id {
                                     // ACK the message so it's removed from the queue.
                                     let _ = batcher
-                                        .submit(MqCommand::ack(
+                                        .submit(MqCommand::group_ack(
                                             queue_id,
                                             &[delivered.message_id],
                                             None,
@@ -901,7 +902,7 @@ async fn deliver_outbound(
                                 if elapsed_ms >= ttl_ms {
                                     // Message has expired — ACK and skip.
                                     let _ = batcher
-                                        .submit(MqCommand::ack(
+                                        .submit(MqCommand::group_ack(
                                             queue_id,
                                             &[delivered.message_id],
                                             None,
@@ -981,7 +982,11 @@ async fn deliver_outbound(
                             );
                             // ACK the message so the queue doesn't retry.
                             let _ = batcher
-                                .submit(MqCommand::ack(queue_id, &[delivered.message_id], None))
+                                .submit(MqCommand::group_ack(
+                                    queue_id,
+                                    &[delivered.message_id],
+                                    None,
+                                ))
                                 .await;
                             continue;
                         }

@@ -1042,6 +1042,297 @@ pub fn encode_record_batch(batch: &RecordBatch, buf: &mut BytesMut) {
 }
 
 // =============================================================================
+// Direct FlatMessage → RecordBatch Encoding (zero intermediate structs)
+// =============================================================================
+
+/// Compute the encoded body size of a single Kafka record from a FlatMessage,
+/// without constructing any intermediate Record struct.
+#[inline]
+fn flat_record_body_size(
+    timestamp_delta: i64,
+    offset_delta: i32,
+    flat: &bisque_mq::flat::FlatMessage,
+) -> usize {
+    let value_len = flat.value_len() as usize;
+    let key_size = match flat.key() {
+        Some(k) => varint_size(k.len() as i32) + k.len(),
+        None => varint_size(-1),
+    };
+    let header_count = flat.header_count();
+    let mut headers_size = varint_size(header_count as i32);
+    for i in 0..header_count {
+        let (hk, hv) = flat.header(i);
+        headers_size += varint_size(hk.len() as i32) + hk.len();
+        headers_size += varint_size(hv.len() as i32) + hv.len();
+    }
+    1 // attributes (i8)
+    + varlong_size(timestamp_delta)
+    + varint_size(offset_delta)
+    + varint_size(value_len as i32) + value_len
+    + key_size
+    + headers_size
+}
+
+/// Encode a single Kafka record directly from a FlatMessage into `buf`.
+/// No intermediate Record/RecordHeader structs are constructed.
+#[inline]
+fn encode_record_from_flat(
+    buf: &mut BytesMut,
+    timestamp_delta: i64,
+    offset_delta: i32,
+    flat: &bisque_mq::flat::FlatMessage,
+) {
+    let body_size = flat_record_body_size(timestamp_delta, offset_delta, flat);
+    write_varint(buf, body_size as i32);
+
+    write_i8(buf, 0); // attributes
+    write_varlong(buf, timestamp_delta);
+    write_varint(buf, offset_delta);
+
+    // key
+    match flat.key() {
+        Some(k) => {
+            write_varint(buf, k.len() as i32);
+            buf.put_slice(&k);
+        }
+        None => write_varint(buf, -1),
+    }
+
+    // value (always present)
+    let value = flat.value();
+    write_varint(buf, value.len() as i32);
+    buf.put_slice(&value);
+
+    // headers
+    let header_count = flat.header_count();
+    write_varint(buf, header_count as i32);
+    for i in 0..header_count {
+        let (hk, hv) = flat.header(i);
+        write_varint_slice(buf, &hk);
+        write_varint_slice(buf, &hv);
+    }
+}
+
+/// Encode a Kafka v2 RecordBatch directly from FlatMessage bytes.
+///
+/// `messages` is a slice of `(offset, flat_message_bytes)` pairs — typically
+/// zero-copy `Bytes` slices from mmap'd raft log segments. This avoids all
+/// intermediate FetchedMessage, Record, and RecordBatch struct allocations.
+///
+/// The output is a complete Kafka v2 RecordBatch with CRC32.
+pub fn encode_record_batch_from_flat(
+    messages: &[(u64, Bytes)],
+    base_offset: i64,
+    buf: &mut BytesMut,
+) {
+    if messages.is_empty() {
+        return;
+    }
+
+    // Parse first and last message metadata for batch header fields
+    let first_flat =
+        bisque_mq::flat::FlatMessage::new(messages[0].1.clone()).expect("invalid FlatMessage");
+    let last_flat = if messages.len() > 1 {
+        bisque_mq::flat::FlatMessage::new(messages[messages.len() - 1].1.clone())
+    } else {
+        None
+    };
+
+    let first_ts = first_flat.timestamp() as i64;
+    let max_ts = last_flat
+        .as_ref()
+        .map(|m| m.timestamp() as i64)
+        .unwrap_or(first_ts);
+    let last_offset_delta = if messages.len() > 1 {
+        (messages.len() - 1) as i32
+    } else {
+        0
+    };
+
+    // -- Batch header --
+    write_i64(buf, base_offset);
+
+    let batch_len_pos = buf.len();
+    write_i32(buf, 0); // placeholder for batch_length
+
+    let batch_start = buf.len();
+
+    write_i32(buf, 0); // partition_leader_epoch
+    buf.put_u8(2); // magic
+
+    let crc_pos = buf.len();
+    buf.put_u32(0); // placeholder for CRC
+
+    let crc_start = buf.len();
+
+    write_i16(buf, 0); // attributes (no compression)
+    write_i32(buf, last_offset_delta);
+    write_i64(buf, first_ts);
+    write_i64(buf, max_ts);
+    write_i64(buf, -1); // producer_id
+    write_i16(buf, -1); // producer_epoch
+    write_i32(buf, -1); // base_sequence
+    write_i32(buf, messages.len() as i32); // record_count
+
+    // -- Encode records directly from FlatMessage bytes --
+    for (i, (_offset, flat_bytes)) in messages.iter().enumerate() {
+        let flat =
+            bisque_mq::flat::FlatMessage::new(flat_bytes.clone()).expect("invalid FlatMessage");
+        let timestamp_delta = flat.timestamp() as i64 - first_ts;
+        encode_record_from_flat(buf, timestamp_delta, i as i32, &flat);
+    }
+
+    // -- Backfill batch_length and CRC --
+    let batch_length = (buf.len() - batch_start) as i32;
+    buf[batch_len_pos..batch_len_pos + 4].copy_from_slice(&batch_length.to_be_bytes());
+
+    let crc = crc32fast::hash(&buf[crc_start..]);
+    buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
+}
+
+/// Encode a Kafka v2 RecordBatch directly from FetchedMessage slice.
+///
+/// This is an optimized version of `build_record_batch` that encodes directly
+/// into the buffer without constructing intermediate RecordBatch/Record structs.
+pub fn encode_record_batch_from_fetched(
+    messages: &[super::handler::FetchedMessage],
+    base_offset: i64,
+    buf: &mut BytesMut,
+) {
+    if messages.is_empty() {
+        return;
+    }
+
+    let first_ts = messages[0].timestamp as i64;
+    let max_ts = messages
+        .last()
+        .map(|m| m.timestamp as i64)
+        .unwrap_or(first_ts);
+    let last_offset_delta = if messages.len() > 1 {
+        (messages.len() - 1) as i32
+    } else {
+        0
+    };
+
+    // -- Batch header --
+    write_i64(buf, base_offset);
+
+    let batch_len_pos = buf.len();
+    write_i32(buf, 0);
+
+    let batch_start = buf.len();
+
+    write_i32(buf, 0); // partition_leader_epoch
+    buf.put_u8(2); // magic
+
+    let crc_pos = buf.len();
+    buf.put_u32(0);
+
+    let crc_start = buf.len();
+
+    write_i16(buf, 0); // attributes
+    write_i32(buf, last_offset_delta);
+    write_i64(buf, first_ts);
+    write_i64(buf, max_ts);
+    write_i64(buf, -1); // producer_id
+    write_i16(buf, -1); // producer_epoch
+    write_i32(buf, -1); // base_sequence
+    write_i32(buf, messages.len() as i32);
+
+    // -- Encode records inline, no Record struct --
+    for (i, msg) in messages.iter().enumerate() {
+        let timestamp_delta = msg.timestamp as i64 - first_ts;
+        let offset_delta = i as i32;
+
+        // Pre-compute body size
+        let key_size = match &msg.key {
+            Some(k) => varint_size(k.len() as i32) + k.len(),
+            None => varint_size(-1),
+        };
+        let value_size = varint_size(msg.value.len() as i32) + msg.value.len();
+        let mut headers_size = varint_size(msg.headers.len() as i32);
+        for (hk, hv) in &msg.headers {
+            headers_size += varint_size(hk.len() as i32) + hk.len();
+            headers_size += varint_size(hv.len() as i32) + hv.len();
+        }
+        let body_size = 1
+            + varlong_size(timestamp_delta)
+            + varint_size(offset_delta)
+            + key_size
+            + value_size
+            + headers_size;
+
+        write_varint(buf, body_size as i32);
+        write_i8(buf, 0); // attributes
+        write_varlong(buf, timestamp_delta);
+        write_varint(buf, offset_delta);
+
+        // key
+        match &msg.key {
+            Some(k) => {
+                write_varint(buf, k.len() as i32);
+                buf.put_slice(k);
+            }
+            None => write_varint(buf, -1),
+        }
+
+        // value
+        write_varint(buf, msg.value.len() as i32);
+        buf.put_slice(&msg.value);
+
+        // headers
+        write_varint(buf, msg.headers.len() as i32);
+        for (hk, hv) in &msg.headers {
+            write_varint_slice(buf, hk);
+            write_varint_slice(buf, hv);
+        }
+    }
+
+    // -- Backfill --
+    let batch_length = (buf.len() - batch_start) as i32;
+    buf[batch_len_pos..batch_len_pos + 4].copy_from_slice(&batch_length.to_be_bytes());
+
+    let crc = crc32fast::hash(&buf[crc_start..]);
+    buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
+}
+
+// =============================================================================
+// Batch Produce: Kafka Records → FlatMessages (single-allocation)
+// =============================================================================
+
+/// Convert a decoded Kafka RecordBatch directly into a Vec of FlatMessage `Bytes`,
+/// pre-computing total size for efficient allocation.
+///
+/// This replaces the per-record `FlatMessageBuilder::new().build()` pattern with
+/// a batch-level conversion that minimizes allocations.
+pub fn batch_records_to_flat_messages(batch: &RecordBatch) -> Vec<Bytes> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let mut messages = Vec::with_capacity(batch.records.len());
+    for r in &batch.records {
+        let timestamp = if batch.first_timestamp > 0 {
+            (batch.first_timestamp + r.timestamp_delta) as u64
+        } else {
+            now_ms
+        };
+        let mut builder =
+            bisque_mq::flat::FlatMessageBuilder::new(r.value.clone().unwrap_or_default())
+                .timestamp(timestamp);
+        if let Some(ref key) = r.key {
+            builder = builder.key(key.clone());
+        }
+        for h in &r.headers {
+            builder = builder.header(h.key.clone(), h.value.clone());
+        }
+        messages.push(builder.build());
+    }
+    messages
+}
+
+// =============================================================================
 // Request Decode — zero-copy via BytesCursor
 // =============================================================================
 
@@ -4725,5 +5016,473 @@ mod tests {
         assert_eq!(varlong_size(64), 2);
         assert_eq!(varlong_size(i64::MAX), 10);
         assert_eq!(varlong_size(i64::MIN), 10);
+    }
+
+    // =========================================================================
+    // Phase 1 Tests: Direct FlatMessage → RecordBatch encoding
+    // =========================================================================
+
+    #[test]
+    fn test_encode_record_batch_from_flat_single_message() {
+        use bisque_mq::flat::{FlatMessage, FlatMessageBuilder};
+
+        let flat_msg = FlatMessageBuilder::new(Bytes::from_static(b"hello world"))
+            .timestamp(1000)
+            .key(Bytes::from_static(b"key1"))
+            .build();
+
+        let messages = vec![(0u64, flat_msg)];
+        let mut buf = BytesMut::new();
+        encode_record_batch_from_flat(&messages, 42, &mut buf);
+
+        // Verify by decoding with the standard decoder
+        let decoded = decode_record_batch(&buf).unwrap();
+        assert_eq!(decoded.base_offset, 42);
+        assert_eq!(decoded.records.len(), 1);
+        assert_eq!(decoded.records[0].key.as_deref(), Some(b"key1".as_ref()));
+        assert_eq!(
+            decoded.records[0].value.as_deref(),
+            Some(b"hello world".as_ref())
+        );
+        assert_eq!(decoded.records[0].offset_delta, 0);
+        assert_eq!(decoded.records[0].timestamp_delta, 0);
+        assert_eq!(decoded.first_timestamp, 1000);
+    }
+
+    #[test]
+    fn test_encode_record_batch_from_flat_multiple_messages() {
+        use bisque_mq::flat::FlatMessageBuilder;
+
+        let msg1 = FlatMessageBuilder::new(Bytes::from_static(b"value1"))
+            .timestamp(1000)
+            .key(Bytes::from_static(b"k1"))
+            .build();
+        let msg2 = FlatMessageBuilder::new(Bytes::from_static(b"value2"))
+            .timestamp(1005)
+            .build();
+        let msg3 = FlatMessageBuilder::new(Bytes::from_static(b"value3"))
+            .timestamp(1010)
+            .key(Bytes::from_static(b"k3"))
+            .header("content-type", &b"text/plain"[..])
+            .build();
+
+        let messages = vec![(10u64, msg1), (11, msg2), (12, msg3)];
+        let mut buf = BytesMut::new();
+        encode_record_batch_from_flat(&messages, 10, &mut buf);
+
+        let decoded = decode_record_batch(&buf).unwrap();
+        assert_eq!(decoded.base_offset, 10);
+        assert_eq!(decoded.records.len(), 3);
+        assert_eq!(decoded.first_timestamp, 1000);
+        assert_eq!(decoded.max_timestamp, 1010);
+        assert_eq!(decoded.last_offset_delta, 2);
+
+        // Record 0
+        assert_eq!(decoded.records[0].key.as_deref(), Some(b"k1".as_ref()));
+        assert_eq!(
+            decoded.records[0].value.as_deref(),
+            Some(b"value1".as_ref())
+        );
+        assert_eq!(decoded.records[0].offset_delta, 0);
+        assert_eq!(decoded.records[0].timestamp_delta, 0);
+
+        // Record 1 (no key)
+        assert_eq!(decoded.records[1].key, None);
+        assert_eq!(
+            decoded.records[1].value.as_deref(),
+            Some(b"value2".as_ref())
+        );
+        assert_eq!(decoded.records[1].offset_delta, 1);
+        assert_eq!(decoded.records[1].timestamp_delta, 5);
+
+        // Record 2 (with header)
+        assert_eq!(decoded.records[2].key.as_deref(), Some(b"k3".as_ref()));
+        assert_eq!(decoded.records[2].headers.len(), 1);
+        assert_eq!(&decoded.records[2].headers[0].key[..], b"content-type");
+        assert_eq!(&decoded.records[2].headers[0].value[..], b"text/plain");
+    }
+
+    #[test]
+    fn test_encode_record_batch_from_flat_empty() {
+        let messages: Vec<(u64, Bytes)> = vec![];
+        let mut buf = BytesMut::new();
+        encode_record_batch_from_flat(&messages, 0, &mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_record_batch_from_flat_with_multiple_headers() {
+        use bisque_mq::flat::FlatMessageBuilder;
+
+        let msg = FlatMessageBuilder::new(Bytes::from_static(b"payload"))
+            .timestamp(5000)
+            .header("h1", &b"v1"[..])
+            .header("h2", &b"v2"[..])
+            .header("h3", &b"v3"[..])
+            .build();
+
+        let messages = vec![(0u64, msg)];
+        let mut buf = BytesMut::new();
+        encode_record_batch_from_flat(&messages, 0, &mut buf);
+
+        let decoded = decode_record_batch(&buf).unwrap();
+        assert_eq!(decoded.records[0].headers.len(), 3);
+        assert_eq!(&decoded.records[0].headers[0].key[..], b"h1");
+        assert_eq!(&decoded.records[0].headers[0].value[..], b"v1");
+        assert_eq!(&decoded.records[0].headers[1].key[..], b"h2");
+        assert_eq!(&decoded.records[0].headers[1].value[..], b"v2");
+        assert_eq!(&decoded.records[0].headers[2].key[..], b"h3");
+        assert_eq!(&decoded.records[0].headers[2].value[..], b"v3");
+    }
+
+    // =========================================================================
+    // Phase 1 Tests: Direct FetchedMessage → RecordBatch encoding
+    // =========================================================================
+
+    #[test]
+    fn test_encode_record_batch_from_fetched_single() {
+        let msg = super::super::handler::FetchedMessage {
+            offset: 0,
+            timestamp: 2000,
+            key: Some(Bytes::from_static(b"fkey")),
+            value: Bytes::from_static(b"fvalue"),
+            headers: vec![(Bytes::from_static(b"hk"), Bytes::from_static(b"hv"))],
+        };
+
+        let mut buf = BytesMut::new();
+        encode_record_batch_from_fetched(&[msg], 5, &mut buf);
+
+        let decoded = decode_record_batch(&buf).unwrap();
+        assert_eq!(decoded.base_offset, 5);
+        assert_eq!(decoded.records.len(), 1);
+        assert_eq!(decoded.records[0].key.as_deref(), Some(b"fkey".as_ref()));
+        assert_eq!(
+            decoded.records[0].value.as_deref(),
+            Some(b"fvalue".as_ref())
+        );
+        assert_eq!(decoded.records[0].headers.len(), 1);
+        assert_eq!(&decoded.records[0].headers[0].key[..], b"hk");
+    }
+
+    #[test]
+    fn test_encode_record_batch_from_fetched_empty() {
+        let mut buf = BytesMut::new();
+        encode_record_batch_from_fetched(&[], 0, &mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_record_batch_from_fetched_no_key() {
+        let msg = super::super::handler::FetchedMessage {
+            offset: 0,
+            timestamp: 3000,
+            key: None,
+            value: Bytes::from_static(b"nokey"),
+            headers: vec![],
+        };
+
+        let mut buf = BytesMut::new();
+        encode_record_batch_from_fetched(&[msg], 0, &mut buf);
+
+        let decoded = decode_record_batch(&buf).unwrap();
+        assert_eq!(decoded.records[0].key, None);
+        assert_eq!(decoded.records[0].value.as_deref(), Some(b"nokey".as_ref()));
+    }
+
+    // =========================================================================
+    // Phase 2 Tests: Batch produce conversion
+    // =========================================================================
+
+    #[test]
+    fn test_batch_records_to_flat_messages_basic() {
+        use bisque_mq::flat::FlatMessage;
+
+        let batch = RecordBatch {
+            base_offset: 0,
+            partition_leader_epoch: 0,
+            attributes: 0,
+            last_offset_delta: 1,
+            first_timestamp: 1000,
+            max_timestamp: 1001,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            records: vec![
+                Record {
+                    offset_delta: 0,
+                    timestamp_delta: 0,
+                    key: Some(Bytes::from_static(b"key1")),
+                    value: Some(Bytes::from_static(b"val1")),
+                    headers: vec![],
+                },
+                Record {
+                    offset_delta: 1,
+                    timestamp_delta: 1,
+                    key: None,
+                    value: Some(Bytes::from_static(b"val2")),
+                    headers: vec![RecordHeader {
+                        key: Bytes::from_static(b"hk"),
+                        value: Bytes::from_static(b"hv"),
+                    }],
+                },
+            ],
+        };
+
+        let flat_msgs = batch_records_to_flat_messages(&batch);
+        assert_eq!(flat_msgs.len(), 2);
+
+        let m1 = FlatMessage::new(flat_msgs[0].clone()).unwrap();
+        assert_eq!(m1.value(), Bytes::from_static(b"val1"));
+        assert_eq!(m1.key().as_deref(), Some(b"key1".as_ref()));
+        assert_eq!(m1.timestamp(), 1000);
+        assert_eq!(m1.header_count(), 0);
+
+        let m2 = FlatMessage::new(flat_msgs[1].clone()).unwrap();
+        assert_eq!(m2.value(), Bytes::from_static(b"val2"));
+        assert_eq!(m2.key(), None);
+        assert_eq!(m2.timestamp(), 1001);
+        assert_eq!(m2.header_count(), 1);
+        let (hk, hv) = m2.header(0);
+        assert_eq!(&hk[..], b"hk");
+        assert_eq!(&hv[..], b"hv");
+    }
+
+    #[test]
+    fn test_batch_records_to_flat_messages_empty_value() {
+        use bisque_mq::flat::FlatMessage;
+
+        let batch = RecordBatch {
+            base_offset: 0,
+            partition_leader_epoch: 0,
+            attributes: 0,
+            last_offset_delta: 0,
+            first_timestamp: 500,
+            max_timestamp: 500,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            records: vec![Record {
+                offset_delta: 0,
+                timestamp_delta: 0,
+                key: None,
+                value: None, // null value → empty bytes
+                headers: vec![],
+            }],
+        };
+
+        let flat_msgs = batch_records_to_flat_messages(&batch);
+        let m = FlatMessage::new(flat_msgs[0].clone()).unwrap();
+        assert!(m.value().is_empty());
+    }
+
+    // =========================================================================
+    // Round-trip test: Kafka produce → FlatMessage → RecordBatch encode
+    // =========================================================================
+
+    #[test]
+    fn test_produce_fetch_roundtrip() {
+        use bisque_mq::flat::FlatMessage;
+
+        // Simulate a Kafka produce: create a RecordBatch, encode it, decode it
+        let original_batch = RecordBatch {
+            base_offset: 100,
+            partition_leader_epoch: 0,
+            attributes: 0,
+            last_offset_delta: 2,
+            first_timestamp: 10000,
+            max_timestamp: 10020,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            records: vec![
+                Record {
+                    offset_delta: 0,
+                    timestamp_delta: 0,
+                    key: Some(Bytes::from_static(b"k1")),
+                    value: Some(Bytes::from_static(b"hello")),
+                    headers: vec![RecordHeader {
+                        key: Bytes::from_static(b"ct"),
+                        value: Bytes::from_static(b"json"),
+                    }],
+                },
+                Record {
+                    offset_delta: 1,
+                    timestamp_delta: 10,
+                    key: None,
+                    value: Some(Bytes::from_static(b"world")),
+                    headers: vec![],
+                },
+                Record {
+                    offset_delta: 2,
+                    timestamp_delta: 20,
+                    key: Some(Bytes::from_static(b"k3")),
+                    value: Some(Bytes::from_static(b"")),
+                    headers: vec![
+                        RecordHeader {
+                            key: Bytes::from_static(b"h1"),
+                            value: Bytes::from_static(b"v1"),
+                        },
+                        RecordHeader {
+                            key: Bytes::from_static(b"h2"),
+                            value: Bytes::from_static(b"v2"),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        // Step 1: Encode as Kafka wire format
+        let mut wire = BytesMut::new();
+        encode_record_batch(&original_batch, &mut wire);
+
+        // Step 2: Decode (zero-copy) — simulates produce path
+        let decoded = decode_record_batch_bytes(wire.freeze()).unwrap();
+
+        // Step 3: Convert to FlatMessages — simulates produce_records()
+        let flat_msgs = batch_records_to_flat_messages(&decoded);
+        assert_eq!(flat_msgs.len(), 3);
+
+        // Step 4: Encode directly from FlatMessages — simulates fetch path
+        let flat_with_offsets: Vec<(u64, Bytes)> = flat_msgs
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| (100 + i as u64, b))
+            .collect();
+        let mut fetch_buf = BytesMut::new();
+        encode_record_batch_from_flat(&flat_with_offsets, 100, &mut fetch_buf);
+
+        // Step 5: Decode the fetch response
+        let fetched = decode_record_batch(&fetch_buf).unwrap();
+        assert_eq!(fetched.base_offset, 100);
+        assert_eq!(fetched.records.len(), 3);
+        assert_eq!(fetched.first_timestamp, 10000);
+        assert_eq!(fetched.max_timestamp, 10020);
+
+        // Verify message 0
+        assert_eq!(fetched.records[0].key.as_deref(), Some(b"k1".as_ref()));
+        assert_eq!(fetched.records[0].value.as_deref(), Some(b"hello".as_ref()));
+        assert_eq!(fetched.records[0].headers.len(), 1);
+        assert_eq!(&fetched.records[0].headers[0].key[..], b"ct");
+        assert_eq!(&fetched.records[0].headers[0].value[..], b"json");
+
+        // Verify message 1
+        assert_eq!(fetched.records[1].key, None);
+        assert_eq!(fetched.records[1].value.as_deref(), Some(b"world".as_ref()));
+        assert_eq!(fetched.records[1].timestamp_delta, 10);
+
+        // Verify message 2
+        assert_eq!(fetched.records[2].key.as_deref(), Some(b"k3".as_ref()));
+        assert_eq!(fetched.records[2].value.as_deref(), Some(b"".as_ref()));
+        assert_eq!(fetched.records[2].headers.len(), 2);
+    }
+
+    // =========================================================================
+    // Phase 1: Equivalence test — old vs new encoding produces same output
+    // =========================================================================
+
+    #[test]
+    fn test_flat_encoding_matches_standard_encoding() {
+        use bisque_mq::flat::FlatMessageBuilder;
+
+        // Create messages with various field combinations
+        let msgs = vec![
+            FlatMessageBuilder::new(Bytes::from_static(b"v1"))
+                .timestamp(1000)
+                .key(Bytes::from_static(b"k1"))
+                .build(),
+            FlatMessageBuilder::new(Bytes::from_static(b"v2"))
+                .timestamp(1005)
+                .header("h1", &b"hv1"[..])
+                .build(),
+        ];
+
+        // Build FetchedMessage equivalents
+        let fetched: Vec<super::super::handler::FetchedMessage> = msgs
+            .iter()
+            .enumerate()
+            .map(|(i, flat_bytes)| {
+                let flat = bisque_mq::flat::FlatMessage::new(flat_bytes.clone()).unwrap();
+                super::super::handler::FetchedMessage {
+                    offset: i as u64,
+                    timestamp: flat.timestamp(),
+                    key: flat.key(),
+                    value: flat.value(),
+                    headers: flat.headers().collect(),
+                }
+            })
+            .collect();
+
+        // Encode via old path (RecordBatch struct)
+        let old_batch = RecordBatch {
+            base_offset: 0,
+            partition_leader_epoch: 0,
+            attributes: 0,
+            last_offset_delta: 1,
+            first_timestamp: 1000,
+            max_timestamp: 1005,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            records: fetched
+                .iter()
+                .enumerate()
+                .map(|(i, m)| Record {
+                    offset_delta: i as i32,
+                    timestamp_delta: m.timestamp as i64 - 1000,
+                    key: m.key.clone(),
+                    value: Some(m.value.clone()),
+                    headers: m
+                        .headers
+                        .iter()
+                        .map(|(k, v)| RecordHeader {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        let mut old_buf = BytesMut::new();
+        encode_record_batch(&old_batch, &mut old_buf);
+
+        // Encode via new flat path
+        let flat_with_offsets: Vec<(u64, Bytes)> = msgs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i as u64, b.clone()))
+            .collect();
+        let mut new_buf = BytesMut::new();
+        encode_record_batch_from_flat(&flat_with_offsets, 0, &mut new_buf);
+
+        // Encode via new fetched path
+        let mut fetched_buf = BytesMut::new();
+        encode_record_batch_from_fetched(&fetched, 0, &mut fetched_buf);
+
+        // All three encodings should decode to equivalent results
+        let old_decoded = decode_record_batch(&old_buf).unwrap();
+        let new_decoded = decode_record_batch(&new_buf).unwrap();
+        let fetched_decoded = decode_record_batch(&fetched_buf).unwrap();
+
+        assert_eq!(old_decoded.records.len(), new_decoded.records.len());
+        assert_eq!(old_decoded.records.len(), fetched_decoded.records.len());
+
+        for i in 0..old_decoded.records.len() {
+            assert_eq!(old_decoded.records[i].key, new_decoded.records[i].key);
+            assert_eq!(old_decoded.records[i].value, new_decoded.records[i].value);
+            assert_eq!(
+                old_decoded.records[i].timestamp_delta,
+                new_decoded.records[i].timestamp_delta
+            );
+            assert_eq!(
+                old_decoded.records[i].headers.len(),
+                new_decoded.records[i].headers.len()
+            );
+
+            assert_eq!(old_decoded.records[i].key, fetched_decoded.records[i].key);
+            assert_eq!(
+                old_decoded.records[i].value,
+                fetched_decoded.records[i].value
+            );
+        }
     }
 }
