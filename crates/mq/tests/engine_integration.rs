@@ -2113,7 +2113,7 @@ fn test_cg_batch_mixed_types() {
         MqResponse::BatchResponse(responses) => {
             assert_eq!(responses.len(), 2);
             // Both should be EntityCreated
-            for resp in &responses {
+            for resp in responses.iter() {
                 match resp {
                     MqResponse::EntityCreated { .. } => {}
                     other => panic!("expected EntityCreated, got {other}"),

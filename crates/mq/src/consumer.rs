@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
-use crate::types::Subscription;
+use crate::types::{Subscription, WillMessage};
 
 /// Persisted consumer metadata (snapshot / MDBX).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +18,8 @@ pub struct ConsumerMeta {
     pub subscriptions: HashSet<Subscription>,
     #[serde(default)]
     pub assigned_jobs: HashSet<u64>,
+    #[serde(default)]
+    pub will: Option<WillMessage>,
 }
 
 impl ConsumerMeta {
@@ -33,6 +36,7 @@ impl ConsumerMeta {
             last_heartbeat_at: connected_at,
             subscriptions,
             assigned_jobs: HashSet::new(),
+            will: None,
         }
     }
 }
@@ -48,19 +52,22 @@ pub struct ConsumerState {
     // -- Mutable state --
     last_heartbeat_at: AtomicU64,
     assigned_jobs: RwLock<HashSet<u64>>,
+    will: RwLock<Option<WillMessage>>,
 
     /// entity_id → list of in-flight message_ids
-    pub in_flight: DashMap<u64, Vec<u64>>,
+    pub in_flight: DashMap<u64, SmallVec<[u64; 8]>>,
 }
 
 impl ConsumerState {
     pub fn new(meta: ConsumerMeta) -> Self {
         let last_heartbeat_at = AtomicU64::new(meta.last_heartbeat_at);
         let assigned_jobs = RwLock::new(meta.assigned_jobs.clone());
+        let will = RwLock::new(meta.will.clone());
         Self {
             meta,
             last_heartbeat_at,
             assigned_jobs,
+            will,
             in_flight: DashMap::new(),
         }
     }
@@ -90,11 +97,24 @@ impl ConsumerState {
         self.assigned_jobs.write().remove(&job_id);
     }
 
+    pub fn set_will(&self, will: WillMessage) {
+        *self.will.write() = Some(will);
+    }
+
+    pub fn clear_will(&self) {
+        *self.will.write() = None;
+    }
+
+    pub fn take_will(&self) -> Option<WillMessage> {
+        self.will.write().take()
+    }
+
     /// Flush mutable state back to a cloned `ConsumerMeta` for snapshot/persistence.
     pub fn snapshot_meta(&self) -> ConsumerMeta {
         let mut m = self.meta.clone();
         m.last_heartbeat_at = self.last_heartbeat_at();
         m.assigned_jobs = self.assigned_jobs.read().clone();
+        m.will = self.will.read().clone();
         m
     }
 }

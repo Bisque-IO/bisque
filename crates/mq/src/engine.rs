@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use smallvec::SmallVec;
 use tracing::{debug, info, warn};
 
 use crate::actor::ActorNamespaceState;
@@ -193,6 +194,7 @@ impl MqEngine {
                     let count =
                         queue.apply_enqueue(log_index, &messages, &dedup_keys, current_time);
                     self.on_message_added(log_index);
+                    self.meta.queue_notifier.notify(queue_id);
                     MqResponse::Published {
                         base_offset: log_index,
                         count: count as u64,
@@ -224,6 +226,7 @@ impl MqEngine {
                                 message_id: id,
                                 attempt: meta.attempts,
                                 original_timestamp: current_time,
+                                queue_id,
                             })
                         })
                         .collect();
@@ -283,6 +286,7 @@ impl MqEngine {
                 let message_ids = v.message_ids();
                 if let Some(queue) = self.meta.queues.get(&queue_id) {
                     queue.apply_nack(&message_ids);
+                    self.meta.queue_notifier.notify(queue_id);
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
@@ -432,6 +436,10 @@ impl MqEngine {
                 let exchange_id = cmd.field_u64(1);
                 if let Some((_, state)) = self.meta.exchanges.remove(&exchange_id) {
                     self.meta.exchange_names.remove(&state.meta.name_hash);
+                    // Clean up binding_id → exchange_id reverse index
+                    for binding_id in state.bindings.keys() {
+                        self.meta.binding_index.remove(binding_id);
+                    }
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
@@ -446,6 +454,15 @@ impl MqEngine {
                 let exchange_id = v.exchange_id();
                 let queue_id = v.queue_id();
                 let routing_key = v.routing_key();
+                let no_local = v.no_local();
+                let shared_group = v.shared_group();
+                let subscription_id = v.subscription_id();
+                // MQTT 5.0 §3.8.3.1: no_local on shared subscriptions is a protocol error
+                if no_local && shared_group.is_some() {
+                    return MqResponse::Error(MqError::Custom(
+                        "no_local not allowed on shared subscriptions".to_string(),
+                    ));
+                }
                 // Verify both exchange and queue exist
                 if !self.meta.exchanges.contains_key(&exchange_id) {
                     return MqResponse::Error(MqError::NotFound {
@@ -465,25 +482,25 @@ impl MqEngine {
                     exchange_id,
                     queue_id,
                     routing_key,
+                    no_local,
+                    shared_group,
+                    subscription_id,
                 };
                 if let Some(mut exchange) = self.meta.exchanges.get_mut(&exchange_id) {
                     exchange.add_binding(binding);
                 }
+                // Maintain O(1) binding → exchange reverse index
+                self.meta.binding_index.insert(binding_id, exchange_id);
                 MqResponse::EntityCreated { id: binding_id }
             }
 
             MqCommand::TAG_DELETE_BINDING => {
                 let binding_id = cmd.field_u64(1);
-                // Find which exchange owns this binding
-                let mut found = false;
-                for mut exchange in self.meta.exchanges.iter_mut() {
-                    if exchange.bindings.contains_key(&binding_id) {
+                // O(1) lookup via binding_id → exchange_id reverse index
+                if let Some((_, exchange_id)) = self.meta.binding_index.remove(&binding_id) {
+                    if let Some(mut exchange) = self.meta.exchanges.get_mut(&exchange_id) {
                         exchange.remove_binding(binding_id);
-                        found = true;
-                        break;
                     }
-                }
-                if found {
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
@@ -517,14 +534,17 @@ impl MqEngine {
 
                 // Enqueue to each target queue (empty dedup_keys slice — no allocation)
                 let mut total_enqueued = 0u64;
-                for qid in target_queue_ids {
-                    if let Some(queue) = self.meta.queues.get(&qid) {
+                for qid in &target_queue_ids {
+                    if let Some(queue) = self.meta.queues.get(qid) {
                         queue.apply_enqueue(log_index, &messages, &[], current_time);
                         total_enqueued += messages.len() as u64;
                     }
                 }
                 if total_enqueued > 0 {
                     self.on_message_added(log_index);
+                    for qid in &target_queue_ids {
+                        self.meta.queue_notifier.notify(*qid);
+                    }
                 }
                 MqResponse::Ok
             }
@@ -610,6 +630,7 @@ impl MqEngine {
                                 message_id: msg_index,
                                 attempt: 1,
                                 original_timestamp: current_time,
+                                queue_id: 0,
                             }],
                         },
                         None => MqResponse::Messages {
@@ -882,19 +903,31 @@ impl MqEngine {
                 let subscriptions = v.subscriptions().into_iter().collect();
                 let meta = crate::consumer::ConsumerMeta::new(
                     consumer_id,
-                    group_name,
+                    group_name.clone(),
                     log_index,
                     subscriptions,
                 );
                 self.meta
                     .consumers
                     .insert(consumer_id, ConsumerState::new(meta));
+                // Cancel any pending will for this client (MQTT 5.0 Will Delay)
+                let client_hash = name_hash(&group_name);
+                if self.meta.pending_wills.remove(&client_hash).is_some() {
+                    debug!(consumer_id, "cancelled pending will on reconnect");
+                }
                 debug!(consumer_id, "consumer registered");
                 MqResponse::Ok
             }
 
             MqCommand::TAG_DISCONNECT_CONSUMER => {
                 let consumer_id = cmd.field_u64(1);
+                // Take the will message and client_id before removing the consumer
+                let (will, client_id) = self
+                    .meta
+                    .consumers
+                    .get(&consumer_id)
+                    .map(|c| (c.take_will(), c.meta.group_name.clone()))
+                    .unwrap_or((None, String::new()));
                 if self.meta.consumers.remove(&consumer_id).is_some() {
                     // O(1) disconnect using reverse indexes
                     let (queue_ids, actor_ns_ids, job_ids) =
@@ -936,6 +969,58 @@ impl MqEngine {
                     if had_in_flight {
                         self.mark_purge_floor_dirty();
                     }
+
+                    // Publish will message if present
+                    if let Some(will) = will {
+                        if will.delay_secs > 0 {
+                            // Store as pending will with scheduled fire time
+                            let fire_at_ms = current_time + (will.delay_secs as u64 * 1000);
+                            let delay_secs = will.delay_secs;
+                            let client_hash = name_hash(&client_id);
+                            self.meta.pending_wills.insert(
+                                client_hash,
+                                PendingWill {
+                                    consumer_id,
+                                    client_id: client_id.clone(),
+                                    will,
+                                    fire_at_ms,
+                                },
+                            );
+                            debug!(consumer_id, delay_secs, "will stored as pending");
+                            return MqResponse::WillPending {
+                                consumer_id,
+                                delay_secs,
+                            };
+                        }
+                        // Immediate will: publish to exchange
+                        if let Some(exchange) = self.meta.exchanges.get(&will.exchange_id) {
+                            let routing_key_bytes = will.routing_key.as_bytes();
+                            let routing_key_str = Some(will.routing_key.as_str());
+                            let target_queue_ids = exchange.route(routing_key_str);
+                            drop(exchange);
+
+                            // If retain flag, store in exchange
+                            if will.retain {
+                                if let Some(mut ex) = self.meta.exchanges.get_mut(&will.exchange_id)
+                                {
+                                    ex.retained
+                                        .insert(will.routing_key.clone(), will.message.clone());
+                                }
+                            }
+
+                            let messages = [will.message];
+                            for qid in &target_queue_ids {
+                                if let Some(queue) = self.meta.queues.get(qid) {
+                                    queue.apply_enqueue(log_index, &messages, &[], current_time);
+                                }
+                            }
+                            for qid in &target_queue_ids {
+                                self.meta.queue_notifier.notify(*qid);
+                            }
+                            let _ = routing_key_bytes; // suppress unused warning
+                        }
+                    }
+
                     debug!(consumer_id, "consumer disconnected");
                     MqResponse::Ok
                 } else {
@@ -973,11 +1058,11 @@ impl MqEngine {
 
             MqCommand::TAG_BATCH => {
                 let batch = cmd.as_batch();
-                let responses: Vec<MqResponse> = batch
+                let responses: SmallVec<[MqResponse; 8]> = batch
                     .commands()
                     .map(|sub| self.apply_command(&sub, log_index, current_time))
                     .collect();
-                MqResponse::BatchResponse(responses)
+                MqResponse::BatchResponse(Box::new(responses))
             }
 
             // =================================================================
@@ -1290,7 +1375,8 @@ impl MqEngine {
             MqCommand::TAG_EXPIRE_GROUP_OFFSETS => {
                 let before_timestamp = cmd.field_u64(1);
 
-                let to_remove: Vec<u64> = self
+                // Use SmallVec to avoid heap allocation for typical small sets
+                let to_remove: smallvec::SmallVec<[u64; 8]> = self
                     .meta
                     .consumer_groups
                     .iter()
@@ -1308,6 +1394,351 @@ impl MqEngine {
                     }
                 }
 
+                MqResponse::Ok
+            }
+
+            // =================================================================
+            // MQTT Optimizations
+            // =================================================================
+            MqCommand::TAG_SET_RETAINED => {
+                let v = cmd.as_set_retained();
+                let exchange_id = v.exchange_id();
+                let routing_key = v.routing_key().to_owned();
+                let message = v.message();
+                if let Some(mut exchange) = self.meta.exchanges.get_mut(&exchange_id) {
+                    exchange.retained.insert(routing_key, message);
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Exchange,
+                        id: exchange_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_DELETE_RETAINED => {
+                let v = cmd.as_delete_retained();
+                let exchange_id = v.exchange_id();
+                let routing_key = v.routing_key();
+                if let Some(mut exchange) = self.meta.exchanges.get_mut(&exchange_id) {
+                    exchange.retained.remove(routing_key);
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Exchange,
+                        id: exchange_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_GET_RETAINED => {
+                let v = cmd.as_get_retained();
+                let exchange_id = v.exchange_id();
+                let topic_filter = v.topic_filter();
+                if let Some(exchange) = self.meta.exchanges.get(&exchange_id) {
+                    let messages: Vec<RetainedEntry> = exchange
+                        .retained
+                        .iter()
+                        .filter(|(rk, _)| crate::exchange::topic_pattern_matches(topic_filter, rk))
+                        .map(|(rk, msg)| RetainedEntry {
+                            routing_key: Bytes::from(rk.clone()),
+                            message: msg.clone(),
+                        })
+                        .collect();
+                    MqResponse::RetainedMessages { messages }
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Exchange,
+                        id: exchange_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_SET_WILL => {
+                let v = cmd.as_set_will();
+                let consumer_id = v.consumer_id();
+                if let Some(consumer) = self.meta.consumers.get(&consumer_id) {
+                    let will = WillMessage {
+                        exchange_id: v.exchange_id(),
+                        delay_secs: v.delay_secs(),
+                        qos: v.qos(),
+                        retain: v.retain(),
+                        routing_key: v.routing_key(),
+                        message: v.message(),
+                    };
+                    consumer.set_will(will);
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Consumer,
+                        id: consumer_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_CLEAR_WILL => {
+                let consumer_id = cmd.field_u64(1);
+                if let Some(consumer) = self.meta.consumers.get(&consumer_id) {
+                    consumer.clear_will();
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Consumer,
+                        id: consumer_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_MARK_RECEIVED => {
+                let v = cmd.as_mark_received();
+                let queue_id = v.queue_id();
+                let message_ids = v.message_ids();
+                if let Some(queue) = self.meta.queues.get(&queue_id) {
+                    queue.apply_mark_received(&message_ids);
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Queue,
+                        id: queue_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_MARK_RELEASED => {
+                let v = cmd.as_mark_released();
+                let queue_id = v.queue_id();
+                let message_ids = v.message_ids();
+                if let Some(queue) = self.meta.queues.get(&queue_id) {
+                    queue.apply_mark_released(&message_ids);
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Queue,
+                        id: queue_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_PERSIST_SESSION => {
+                let v = cmd.as_persist_session();
+                let consumer_id = v.consumer_id();
+                let session = PersistedSession {
+                    consumer_id,
+                    client_id: v.client_id().to_owned(),
+                    session_expiry_secs: v.session_expiry_secs(),
+                    subscription_data: v.subscription_data(),
+                    persisted_at: current_time,
+                    inbound_qos_inflight: v.inbound_qos_inflight(),
+                    outbound_qos1_count: v.outbound_qos1_count(),
+                    remaining_quota: v.remaining_quota(),
+                };
+                // Maintain O(1) client_id → consumer_id reverse index
+                let client_hash = name_hash(v.client_id());
+                self.meta
+                    .session_client_index
+                    .insert(client_hash, consumer_id);
+                self.meta.persisted_sessions.insert(consumer_id, session);
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_RESTORE_SESSION => {
+                let v = cmd.as_restore_session();
+                let client_id = v.client_id();
+                let client_hash = name_hash(client_id);
+                // O(1) lookup via client_id hash → consumer_id reverse index
+                let found =
+                    self.meta
+                        .session_client_index
+                        .get(&client_hash)
+                        .and_then(|consumer_id| {
+                            self.meta
+                                .persisted_sessions
+                                .get(&consumer_id)
+                                .map(|entry| entry.value().clone())
+                        });
+                match found {
+                    Some(session) => {
+                        let expiry_ms = session.session_expiry_secs as u64 * 1000;
+                        if expiry_ms > 0 && current_time > session.persisted_at + expiry_ms {
+                            // Session expired — remove it
+                            self.meta.persisted_sessions.remove(&session.consumer_id);
+                            self.meta.session_client_index.remove(&client_hash);
+                            MqResponse::SessionNotFound
+                        } else {
+                            MqResponse::SessionRestored {
+                                consumer_id: session.consumer_id,
+                                session_expiry_secs: session.session_expiry_secs,
+                                subscription_data: session.subscription_data,
+                            }
+                        }
+                    }
+                    None => MqResponse::SessionNotFound,
+                }
+            }
+
+            MqCommand::TAG_EXPIRE_SESSIONS => {
+                let now_ms = current_time;
+                // Use retain to avoid intermediate Vec allocation
+                self.meta.persisted_sessions.retain(|_key, s| {
+                    let expiry_ms = s.session_expiry_secs as u64 * 1000;
+                    !(expiry_ms > 0 && now_ms > s.persisted_at + expiry_ms)
+                });
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_MULTI_DELIVER => {
+                let v = cmd.as_multi_deliver();
+                let consumer_id = v.consumer_id();
+                let queue_specs = v.queues();
+                let mut queues = Vec::with_capacity(queue_specs.len());
+                for (queue_id, max_count) in queue_specs {
+                    if let Some(queue) = self.meta.queues.get(&queue_id) {
+                        let msg_ids =
+                            queue.apply_deliver(consumer_id, max_count, current_time, log_index);
+                        if !msg_ids.is_empty() {
+                            self.meta.track_consumer_queue(consumer_id, queue_id);
+                        }
+                        let messages: smallvec::SmallVec<[DeliveredMessage; 8]> = msg_ids
+                            .iter()
+                            .filter_map(|&id| {
+                                queue.messages.get(&id).map(|meta| DeliveredMessage {
+                                    message_id: id,
+                                    attempt: meta.attempts,
+                                    original_timestamp: current_time,
+                                    queue_id,
+                                })
+                            })
+                            .collect();
+                        queues.push((queue_id, messages));
+                    }
+                }
+                MqResponse::MultiMessages { queues }
+            }
+
+            MqCommand::TAG_MULTI_ACK => {
+                let v = cmd.as_multi_ack();
+                let queue_specs = v.queues();
+                for (queue_id, message_ids) in queue_specs {
+                    if let Some(min_id) = message_ids.iter().copied().min() {
+                        self.on_message_removed(min_id);
+                    }
+                    if let Some(queue) = self.meta.queues.get(&queue_id) {
+                        queue.apply_ack(&message_ids);
+                    }
+                }
+                MqResponse::Ok
+            }
+
+            // =================================================================
+            // MQTT Optimizations Phase 2
+            // =================================================================
+            MqCommand::TAG_SET_TOPIC_ALIAS => {
+                let v = cmd.as_set_topic_alias();
+                let consumer_id = v.consumer_id();
+                let alias = v.alias();
+                let topic_name = v.topic_name().to_owned();
+                let mut aliases = self.meta.topic_aliases.entry(consumer_id).or_default();
+                // Update existing alias or add new
+                if let Some(entry) = aliases.iter_mut().find(|e| e.alias == alias) {
+                    entry.topic_name = topic_name;
+                } else {
+                    aliases.push(TopicAliasEntry { alias, topic_name });
+                }
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_CLEAR_TOPIC_ALIASES => {
+                let consumer_id = cmd.field_u64(1);
+                self.meta.topic_aliases.remove(&consumer_id);
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_CANCEL_PENDING_WILL => {
+                let v = cmd.as_cancel_pending_will();
+                let client_id = v.client_id();
+                let client_hash = name_hash(client_id);
+                self.meta.pending_wills.remove(&client_hash);
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_FIRE_PENDING_WILLS => {
+                let now_ms = cmd.field_u64(1);
+                let to_fire: smallvec::SmallVec<[(u64, PendingWill); 4]> = self
+                    .meta
+                    .pending_wills
+                    .iter()
+                    .filter(|entry| now_ms >= entry.value().fire_at_ms)
+                    .map(|entry| (*entry.key(), entry.value().clone()))
+                    .collect();
+                let mut count = 0u32;
+                for (key, pw) in &to_fire {
+                    self.meta.pending_wills.remove(key);
+                    // Publish the will message to exchange
+                    if let Some(exchange) = self.meta.exchanges.get(&pw.will.exchange_id) {
+                        let routing_key_str = Some(pw.will.routing_key.as_str());
+                        let target_queue_ids = exchange.route(routing_key_str);
+                        drop(exchange);
+                        // Store as retained if flagged
+                        if pw.will.retain {
+                            if let Some(mut ex) = self.meta.exchanges.get_mut(&pw.will.exchange_id)
+                            {
+                                ex.retained
+                                    .insert(pw.will.routing_key.clone(), pw.will.message.clone());
+                            }
+                        }
+                        let messages = [pw.will.message.clone()];
+                        for qid in &target_queue_ids {
+                            if let Some(queue) = self.meta.queues.get(qid) {
+                                queue.apply_enqueue(log_index, &messages, &[], current_time);
+                            }
+                        }
+                        for qid in &target_queue_ids {
+                            self.meta.queue_notifier.notify(*qid);
+                        }
+                        count += 1;
+                    }
+                }
+                MqResponse::WillsFired { count }
+            }
+
+            MqCommand::TAG_REGISTER_PUBLISHER_SESSION => {
+                let v = cmd.as_register_publisher_session();
+                let consumer_id = v.consumer_id();
+                let session_id = v.session_id();
+                let session_hash = name_hash(session_id);
+                self.meta.publisher_dedup.entry(session_hash).or_default();
+                // Track consumer → session for cleanup on disconnect
+                debug!(consumer_id, session_id, "publisher session registered");
+                MqResponse::Ok
+            }
+
+            MqCommand::TAG_QOS2_REGISTER_INBOUND => {
+                let v = cmd.as_qos2_inbound();
+                let consumer_id = v.consumer_id();
+                let packet_id = v.packet_id();
+                let mut entry = self.meta.qos2_inbound.entry(consumer_id).or_default();
+                if entry.contains_key(&packet_id) {
+                    // Duplicate — already received, this is a re-delivery.
+                    MqResponse::Error(MqError::Custom(
+                        "QoS 2 packet_id already registered".to_string(),
+                    ))
+                } else {
+                    entry.insert(packet_id, 0); // 0 = RECEIVED state
+                    MqResponse::Ok
+                }
+            }
+
+            MqCommand::TAG_QOS2_COMPLETE_INBOUND => {
+                let v = cmd.as_qos2_inbound();
+                let consumer_id = v.consumer_id();
+                let packet_id = v.packet_id();
+                if let Some(mut entry) = self.meta.qos2_inbound.get_mut(&consumer_id) {
+                    entry.remove(&packet_id);
+                    if entry.is_empty() {
+                        drop(entry);
+                        self.meta.qos2_inbound.remove(&consumer_id);
+                    }
+                }
                 MqResponse::Ok
             }
 
@@ -1414,6 +1845,14 @@ impl MqEngine {
                 ExchangeSnapshot {
                     meta: e.meta.clone(),
                     bindings: e.bindings.values().cloned().collect(),
+                    retained: e
+                        .retained
+                        .iter()
+                        .map(|(rk, msg)| RetainedEntry {
+                            routing_key: Bytes::from(rk.clone()),
+                            message: msg.clone(),
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -1436,6 +1875,28 @@ impl MqEngine {
                         meta: g.snapshot_meta(),
                         offsets: g.offsets.iter().map(|e| e.value().clone()).collect(),
                     }
+                })
+                .collect(),
+            sessions: self
+                .meta
+                .persisted_sessions
+                .iter()
+                .map(|entry| entry.value().clone())
+                .collect(),
+            pending_wills: self
+                .meta
+                .pending_wills
+                .iter()
+                .map(|entry| entry.value().clone())
+                .collect(),
+            qos2_inbound: self
+                .meta
+                .qos2_inbound
+                .iter()
+                .map(|entry| {
+                    let packets: Vec<(u16, u8)> =
+                        entry.value().iter().map(|(&k, &v)| (k, v)).collect();
+                    (*entry.key(), packets)
                 })
                 .collect(),
             next_id: self.meta.next_id.load(Ordering::Relaxed),
@@ -1525,6 +1986,13 @@ impl MqEngine {
         self.meta.exchange_names.clear();
         self.meta.consumer_groups.clear();
         self.meta.consumer_group_names.clear();
+        self.meta.persisted_sessions.clear();
+        self.meta.topic_aliases.clear();
+        self.meta.pending_wills.clear();
+        self.meta.publisher_dedup.clear();
+        self.meta.qos2_inbound.clear();
+        self.meta.binding_index.clear();
+        self.meta.session_client_index.clear();
         self.meta.clear_consumer_indexes();
 
         // Restore topics
@@ -1607,7 +2075,13 @@ impl MqEngine {
             let hash = meta.name_hash;
             let mut state = ExchangeState::new(meta);
             for binding in es.bindings {
+                // Rebuild binding_id → exchange_id reverse index
+                self.meta.binding_index.insert(binding.binding_id, id);
                 state.add_binding(binding);
+            }
+            for entry in es.retained {
+                let rk = String::from_utf8(entry.routing_key.to_vec()).unwrap_or_default();
+                state.retained.insert(rk, entry.message);
             }
             self.meta.exchange_names.insert(hash, id);
             self.meta.exchanges.insert(id, state);
@@ -1626,6 +2100,29 @@ impl MqEngine {
             self.meta.consumer_groups.insert(id, state);
         }
 
+        // Restore persisted sessions
+        for session in data.sessions {
+            let client_hash = crate::types::name_hash(&session.client_id);
+            let consumer_id = session.consumer_id;
+            // Rebuild client_id → consumer_id reverse index
+            self.meta
+                .session_client_index
+                .insert(client_hash, consumer_id);
+            self.meta.persisted_sessions.insert(consumer_id, session);
+        }
+
+        // Restore pending wills
+        for pw in data.pending_wills {
+            let client_hash = crate::types::name_hash(&pw.client_id);
+            self.meta.pending_wills.insert(client_hash, pw);
+        }
+
+        // Restore QoS 2 inbound dedup state
+        for (consumer_id, packets) in data.qos2_inbound {
+            let map: std::collections::HashMap<u16, u8> = packets.into_iter().collect();
+            self.meta.qos2_inbound.insert(consumer_id, map);
+        }
+
         info!(
             topics = self.meta.topics.len(),
             queues = self.meta.queues.len(),
@@ -1634,6 +2131,8 @@ impl MqEngine {
             exchanges = self.meta.exchanges.len(),
             consumers = self.meta.consumers.len(),
             consumer_groups = self.meta.consumer_groups.len(),
+            sessions = self.meta.persisted_sessions.len(),
+            pending_wills = self.meta.pending_wills.len(),
             "MQ engine restored from snapshot"
         );
     }
@@ -1659,6 +2158,8 @@ impl MqEngine {
         self.meta.queue_names.clear();
         self.meta.namespace_names.clear();
         self.meta.job_names.clear();
+        self.meta.binding_index.clear();
+        self.meta.session_client_index.clear();
 
         for mut meta in state.topics {
             meta.ensure_name_hash();

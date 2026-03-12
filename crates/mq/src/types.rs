@@ -30,6 +30,9 @@ pub struct DeliveredMessage {
     pub message_id: u64,
     pub attempt: u32,
     pub original_timestamp: u64,
+    /// Queue ID this message was delivered from (for O(1) subscription lookup).
+    #[serde(default)]
+    pub queue_id: u64,
 }
 
 // =============================================================================
@@ -73,7 +76,7 @@ impl Default for ExchangeType {
 pub struct ExchangePublishNotification {
     pub exchange_id: u64,
     /// The flat message bytes published.
-    pub messages: Vec<Bytes>,
+    pub messages: SmallVec<[Bytes; 8]>,
 }
 
 /// A binding from an exchange to a queue with an optional routing key pattern.
@@ -86,6 +89,15 @@ pub struct Binding {
     /// For topic exchanges this supports `*` and `#` wildcards.
     #[serde(default)]
     pub routing_key: Option<String>,
+    /// MQTT no-local flag — prevents messages from being delivered to the publisher.
+    #[serde(default)]
+    pub no_local: bool,
+    /// MQTT shared subscription group name (if shared).
+    #[serde(default)]
+    pub shared_group: Option<String>,
+    /// MQTT 5.0 subscription identifier (§3.8.2.1.2).
+    #[serde(default)]
+    pub subscription_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -164,6 +176,10 @@ pub enum MessageState {
     InFlight,
     Acked,
     DeadLetter,
+    /// QoS 2: PUBREC sent, message confirmed received.
+    Received,
+    /// QoS 2: PUBREL received, message released for completion.
+    Released,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,6 +392,27 @@ impl MqCommand {
     pub const TAG_HEARTBEAT_CONSUMER_GROUP: u8 = 54;
     pub const TAG_EXPIRE_GROUP_OFFSETS: u8 = 55;
     pub const TAG_EXPIRE_GROUP_SESSIONS: u8 = 56;
+    // -- MQTT Optimizations --
+    pub const TAG_SET_RETAINED: u8 = 57;
+    pub const TAG_DELETE_RETAINED: u8 = 58;
+    pub const TAG_GET_RETAINED: u8 = 59;
+    pub const TAG_SET_WILL: u8 = 60;
+    pub const TAG_CLEAR_WILL: u8 = 61;
+    pub const TAG_MARK_RECEIVED: u8 = 62;
+    pub const TAG_MARK_RELEASED: u8 = 63;
+    pub const TAG_PERSIST_SESSION: u8 = 64;
+    pub const TAG_RESTORE_SESSION: u8 = 65;
+    pub const TAG_EXPIRE_SESSIONS: u8 = 66;
+    pub const TAG_MULTI_DELIVER: u8 = 67;
+    pub const TAG_MULTI_ACK: u8 = 68;
+    // -- MQTT Optimizations Phase 2 --
+    pub const TAG_SET_TOPIC_ALIAS: u8 = 69;
+    pub const TAG_CLEAR_TOPIC_ALIASES: u8 = 70;
+    pub const TAG_CANCEL_PENDING_WILL: u8 = 71;
+    pub const TAG_FIRE_PENDING_WILLS: u8 = 72;
+    pub const TAG_REGISTER_PUBLISHER_SESSION: u8 = 73;
+    pub const TAG_QOS2_REGISTER_INBOUND: u8 = 74;
+    pub const TAG_QOS2_COMPLETE_INBOUND: u8 = 75;
 }
 
 impl MqCommand {
@@ -512,6 +549,63 @@ impl fmt::Display for MqError {
 // MqResponse
 // =============================================================================
 
+/// A retained message entry stored per exchange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetainedEntry {
+    /// MQTT topic/routing key.
+    pub routing_key: Bytes,
+    /// The flat-encoded message bytes.
+    pub message: Bytes,
+}
+
+/// Will/testament message attached to a consumer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WillMessage {
+    pub exchange_id: u64,
+    pub delay_secs: u32,
+    pub qos: u8,
+    pub retain: bool,
+    pub routing_key: String,
+    pub message: Bytes,
+}
+
+/// Per-consumer topic alias entry (MQTT 5.0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicAliasEntry {
+    pub alias: u16,
+    pub topic_name: String,
+}
+
+/// A will message waiting to be fired after a delay (MQTT 5.0 Will Delay Interval).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingWill {
+    pub consumer_id: u64,
+    pub client_id: String,
+    pub will: WillMessage,
+    /// Absolute timestamp (ms) when the will should fire.
+    pub fire_at_ms: u64,
+}
+
+/// Persisted MQTT session state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSession {
+    pub consumer_id: u64,
+    pub client_id: String,
+    pub session_expiry_secs: u32,
+    pub subscription_data: Bytes,
+    /// Timestamp (ms) when the session was persisted.
+    pub persisted_at: u64,
+    /// MQTT 5.0: Inbound QoS 1/2 inflight count at time of persist.
+    #[serde(default)]
+    pub inbound_qos_inflight: u32,
+    /// MQTT 5.0: Outbound QoS 1 inflight count at time of persist.
+    #[serde(default)]
+    pub outbound_qos1_count: u32,
+    /// Rate limiting: remaining message quota at time of persist.
+    #[serde(default)]
+    pub remaining_quota: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MqResponse {
     Ok,
@@ -529,7 +623,7 @@ pub enum MqResponse {
         count: u64,
     },
     Stats(EntityStats),
-    BatchResponse(Vec<MqResponse>),
+    BatchResponse(Box<SmallVec<[MqResponse; 8]>>),
     /// Consumer group join completed (or partially — check `phase_complete`).
     GroupJoined {
         generation: i32,
@@ -552,9 +646,38 @@ pub enum MqResponse {
     /// the original message bytes from the raft log and issue `PublishToDlq`.
     DeadLettered {
         /// Raft log indexes of the dead-lettered messages.
-        dead_letter_ids: Vec<u64>,
+        dead_letter_ids: SmallVec<[u64; 8]>,
         /// The configured DLQ topic to publish them to.
         dlq_topic_id: u64,
+    },
+    /// Retained messages matching a topic filter.
+    RetainedMessages {
+        messages: Vec<RetainedEntry>,
+    },
+    /// Will message is pending (has a delay).
+    WillPending {
+        consumer_id: u64,
+        delay_secs: u32,
+    },
+    /// Session restored successfully.
+    SessionRestored {
+        consumer_id: u64,
+        session_expiry_secs: u32,
+        subscription_data: Bytes,
+    },
+    /// Session not found or expired.
+    SessionNotFound,
+    /// Multi-queue deliver result.
+    MultiMessages {
+        queues: Vec<(u64, SmallVec<[DeliveredMessage; 8]>)>,
+    },
+    /// Topic aliases for a consumer.
+    TopicAliases {
+        aliases: Vec<TopicAliasEntry>,
+    },
+    /// Pending wills that were fired.
+    WillsFired {
+        count: u32,
     },
 }
 
@@ -596,6 +719,28 @@ impl fmt::Display for MqResponse {
                     dlq_topic_id
                 )
             }
+            Self::RetainedMessages { messages } => {
+                write!(f, "RetainedMessages(count={})", messages.len())
+            }
+            Self::WillPending {
+                consumer_id,
+                delay_secs,
+            } => write!(
+                f,
+                "WillPending(consumer={consumer_id}, delay={delay_secs}s)"
+            ),
+            Self::SessionRestored { consumer_id, .. } => {
+                write!(f, "SessionRestored(consumer={consumer_id})")
+            }
+            Self::SessionNotFound => write!(f, "SessionNotFound"),
+            Self::MultiMessages { queues } => {
+                let total: usize = queues.iter().map(|(_, msgs)| msgs.len()).sum();
+                write!(f, "MultiMessages(queues={}, msgs={})", queues.len(), total)
+            }
+            Self::TopicAliases { aliases } => {
+                write!(f, "TopicAliases(count={})", aliases.len())
+            }
+            Self::WillsFired { count } => write!(f, "WillsFired(count={count})"),
         }
     }
 }
@@ -616,6 +761,12 @@ pub struct MqSnapshotData {
     pub exchanges: Vec<ExchangeSnapshot>,
     #[serde(default)]
     pub consumer_groups: Vec<crate::consumer_group::ConsumerGroupSnapshot>,
+    #[serde(default)]
+    pub sessions: Vec<PersistedSession>,
+    #[serde(default)]
+    pub pending_wills: Vec<PendingWill>,
+    #[serde(default)]
+    pub qos2_inbound: Vec<(u64, Vec<(u16, u8)>)>,
     pub next_id: u64,
     /// Manifest of raft log segment files the follower needs to sync.
     #[serde(default)]
@@ -663,6 +814,8 @@ pub struct ProducerSnapshot {
 pub struct ExchangeSnapshot {
     pub meta: crate::exchange::ExchangeMeta,
     pub bindings: Vec<Binding>,
+    #[serde(default)]
+    pub retained: Vec<RetainedEntry>,
 }
 
 #[cfg(test)]
@@ -723,6 +876,7 @@ mod tests {
                         message_id: 1,
                         attempt: 1,
                         original_timestamp: 0,
+                        queue_id: 0,
                     }]
                 }
             ),
@@ -850,6 +1004,7 @@ mod tests {
                 message_id: 42,
                 attempt: 2,
                 original_timestamp: 500,
+                queue_id: 0,
             }],
         };
         let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
@@ -888,6 +1043,9 @@ mod tests {
             sync_addr: None,
             exchanges: Vec::new(),
             consumer_groups: Vec::new(),
+            sessions: Vec::new(),
+            pending_wills: Vec::new(),
+            qos2_inbound: Vec::new(),
         };
         let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
         let (decoded, _): (MqSnapshotData, _) =
@@ -917,6 +1075,8 @@ mod tests {
             MessageState::InFlight,
             MessageState::Acked,
             MessageState::DeadLetter,
+            MessageState::Received,
+            MessageState::Released,
         ];
         for state in &states {
             let bytes = bincode::serde::encode_to_vec(state, bincode::config::standard()).unwrap();
@@ -950,8 +1110,10 @@ mod tests {
         assert_eq!(cmds[0].tag(), MqCommand::TAG_CREATE_TOPIC);
         assert_eq!(cmds[1].tag(), MqCommand::TAG_PUBLISH);
 
-        let resp =
-            MqResponse::BatchResponse(vec![MqResponse::Ok, MqResponse::EntityCreated { id: 5 }]);
+        let resp = MqResponse::BatchResponse(Box::new(smallvec::smallvec![
+            MqResponse::Ok,
+            MqResponse::EntityCreated { id: 5 }
+        ]));
         let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
         let (decoded, _): (MqResponse, _) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
@@ -975,7 +1137,10 @@ mod tests {
         let cmd = MqCommand::batch(&sub_cmds);
         assert_eq!(format!("{}", cmd), "Batch(count=3)");
 
-        let resp = MqResponse::BatchResponse(vec![MqResponse::Ok, MqResponse::Ok]);
+        let resp = MqResponse::BatchResponse(Box::new(smallvec::smallvec![
+            MqResponse::Ok,
+            MqResponse::Ok
+        ]));
         assert_eq!(format!("{}", resp), "BatchResponse(count=2)");
     }
 }

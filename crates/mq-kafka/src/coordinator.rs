@@ -146,7 +146,9 @@ impl GroupState {
                     .unwrap_or_default();
                 JoinGroupMember {
                     member_id: m.member_id.clone(),
+                    group_instance_id: None,
                     metadata,
+                    ..Default::default()
                 }
             })
             .collect();
@@ -410,6 +412,7 @@ impl GroupCoordinator {
             None => {
                 return LeaveGroupResponse {
                     error_code: ErrorCode::InvalidGroupId.as_i16(),
+                    members: Vec::new(),
                 };
             }
         };
@@ -423,6 +426,7 @@ impl GroupCoordinator {
 
         LeaveGroupResponse {
             error_code: ErrorCode::None.as_i16(),
+            members: Vec::new(),
         }
     }
 
@@ -491,10 +495,12 @@ impl GroupCoordinator {
                             .unwrap_or_default();
                         DescribedGroupMember {
                             member_id: m.member_id.clone(),
+                            group_instance_id: None,
                             client_id: m.client_id.clone(),
                             client_host: WireString::empty(),
                             metadata,
                             assignment: m.assignment.clone(),
+                            ..Default::default()
                         }
                     })
                     .collect(),
@@ -509,6 +515,8 @@ impl GroupCoordinator {
             .map(|g| ListedGroup {
                 group_id: g.group_id.clone(),
                 protocol_type: g.protocol_type.clone(),
+                group_state: WireString::empty(),
+                ..Default::default()
             })
             .collect()
     }
@@ -545,6 +553,7 @@ mod tests {
                 name: WireString::from(protocol),
                 metadata: Bytes::from_static(b"meta"),
             }],
+            ..Default::default()
         }
     }
 
@@ -570,6 +579,7 @@ mod tests {
                 member_id: member_id.clone(),
                 assignment: Bytes::from_static(b"assign1"),
             }],
+            ..Default::default()
         };
         let rx = coord.sync_group(&sync_req).unwrap();
         let resp = rx.await.unwrap();
@@ -599,6 +609,7 @@ mod tests {
                     member_id: m1.clone(),
                     assignment: Bytes::from_static(b"a1"),
                 }],
+                ..Default::default()
             })
             .unwrap();
         let _ = sync_rx.await.unwrap();
@@ -632,6 +643,7 @@ mod tests {
             group_id: WireString::from("nonexistent"),
             generation_id: 1,
             member_id: WireString::from("m1"),
+            ..Default::default()
         });
         assert_eq!(resp.error_code, ErrorCode::InvalidGroupId.as_i16());
     }
@@ -647,6 +659,7 @@ mod tests {
         let leave_resp = coord.leave_group(&LeaveGroupRequest {
             group_id: WireString::from("g1"),
             member_id: member_id.clone(),
+            ..Default::default()
         });
         assert_eq!(leave_resp.error_code, ErrorCode::None.as_i16());
 
@@ -753,6 +766,7 @@ mod tests {
             group_id: WireString::from("hb-gen"),
             generation_id: 999, // wrong generation
             member_id: resp.member_id,
+            ..Default::default()
         });
         assert_eq!(hb_resp.error_code, ErrorCode::IllegalGeneration.as_i16());
     }
@@ -768,6 +782,7 @@ mod tests {
             group_id: WireString::from("hb-unk"),
             generation_id: 1,
             member_id: WireString::from("unknown-member"),
+            ..Default::default()
         });
         assert_eq!(hb_resp.error_code, ErrorCode::UnknownMemberId.as_i16());
     }
@@ -790,6 +805,7 @@ mod tests {
                     member_id: resp.member_id.clone(),
                     assignment: Bytes::from_static(b"a"),
                 }],
+                ..Default::default()
             })
             .unwrap();
         let _ = sync_rx.await.unwrap();
@@ -798,6 +814,7 @@ mod tests {
             group_id: WireString::from("hb-ok"),
             generation_id: resp.generation_id,
             member_id: resp.member_id,
+            ..Default::default()
         });
         assert_eq!(hb_resp.error_code, ErrorCode::None.as_i16());
     }
@@ -820,6 +837,7 @@ mod tests {
                     member_id: resp.member_id.clone(),
                     assignment: Bytes::from_static(b"a"),
                 }],
+                ..Default::default()
             })
             .unwrap();
         let _ = sync_rx.await.unwrap();
@@ -834,6 +852,7 @@ mod tests {
             group_id: WireString::from("hb-reb"),
             generation_id: resp.generation_id,
             member_id: resp.member_id,
+            ..Default::default()
         });
         assert_eq!(hb_resp.error_code, ErrorCode::RebalanceInProgress.as_i16());
     }
@@ -851,6 +870,7 @@ mod tests {
             generation_id: 999,
             member_id: resp.member_id,
             assignments: vec![],
+            ..Default::default()
         });
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -870,6 +890,7 @@ mod tests {
             generation_id: resp.generation_id,
             member_id: WireString::from("not-a-member"),
             assignments: vec![],
+            ..Default::default()
         });
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -882,6 +903,7 @@ mod tests {
         let resp = coord.leave_group(&LeaveGroupRequest {
             group_id: WireString::from("nonexistent"),
             member_id: WireString::from("m1"),
+            ..Default::default()
         });
         assert_eq!(resp.error_code, ErrorCode::InvalidGroupId.as_i16());
     }
@@ -911,6 +933,7 @@ mod tests {
                     member_id: resp.member_id.clone(),
                     assignment: Bytes::new(),
                 }],
+                ..Default::default()
             })
             .unwrap();
         let _ = sync_rx.await.unwrap();
@@ -961,6 +984,7 @@ mod tests {
                     member_id: mid.clone(),
                     assignment: Bytes::new(),
                 }],
+                ..Default::default()
             })
             .unwrap();
         let _ = sync_rx.await.unwrap();

@@ -90,6 +90,8 @@ pub struct AmqpSession {
     pub remote_incoming_window: u32,
     /// Handle max for this session.
     pub handle_max: u32,
+    /// TR2: Peer's handle-max from their Begin frame.
+    pub peer_handle_max: u32,
     /// Links by handle.
     pub links: HashMap<u32, AmqpLink>,
     /// Reverse index: link name → handle for O(1) link stealing lookup.
@@ -128,6 +130,7 @@ impl AmqpSession {
             outgoing_window: 2048,
             remote_incoming_window: 0,
             handle_max: u32::MAX,
+            peer_handle_max: u32::MAX,
             links: HashMap::new(),
             link_names: HashMap::new(),
             next_handle: 0,
@@ -232,6 +235,8 @@ pub struct AmqpConnection {
     next_consumer_id: u64,
     /// SEC3: Peer certificate subject from TLS client cert (for SASL EXTERNAL).
     peer_cert_subject: Option<String>,
+    /// TR1: Peer's channel-max from their Open frame.
+    peer_channel_max: u16,
 
     // Pre-initialized metrics handles (N15)
     m_frames_received: metrics::Counter,
@@ -273,6 +278,7 @@ impl AmqpConnection {
             pending_actions: Vec::new(),
             next_consumer_id: 1,
             peer_cert_subject: None,
+            peer_channel_max: u16::MAX,
             m_frames_received: metrics::counter!("amqp.frames_received", &labels),
             m_frames_sent: metrics::counter!("amqp.frames_sent", &labels),
             m_bytes_received: metrics::counter!("amqp.bytes_received", &labels),
@@ -895,6 +901,8 @@ impl AmqpConnection {
         if open.max_frame_size > 0 && open.max_frame_size < self.max_frame_size {
             self.max_frame_size = open.max_frame_size;
         }
+        // TR1: Store peer's channel-max for enforcement
+        self.peer_channel_max = open.channel_max;
         if open.channel_max < self.channel_max {
             self.channel_max = open.channel_max;
         }
@@ -968,6 +976,13 @@ impl AmqpConnection {
             return Err(ConnectionError::NotOpen);
         }
 
+        // TR1: Enforce peer's channel-max
+        if remote_channel > self.peer_channel_max {
+            self.send_connection_error(condition::NOT_ALLOWED, "channel exceeds peer channel-max");
+            self.phase = ConnectionPhase::Closed;
+            return Ok(false);
+        }
+
         let local_channel = self.alloc_channel();
         if local_channel > self.channel_max {
             return Err(ConnectionError::SessionLimitExceeded {
@@ -982,6 +997,8 @@ impl AmqpConnection {
         session.incoming_window = begin.outgoing_window;
         // Gap S2/S3: Initialize remote_incoming_window from peer's BEGIN
         session.remote_incoming_window = begin.incoming_window;
+        // TR2: Store peer's handle-max for enforcement
+        session.peer_handle_max = begin.handle_max;
         if begin.handle_max < session.handle_max {
             session.handle_max = begin.handle_max;
         }
@@ -1179,6 +1196,14 @@ impl AmqpSession {
             return Err(LinkError::HandleExceedsMax {
                 handle,
                 max: self.handle_max,
+            });
+        }
+
+        // TR2: Enforce peer's handle-max
+        if handle > self.peer_handle_max {
+            return Err(LinkError::HandleExceedsMax {
+                handle,
+                max: self.peer_handle_max,
             });
         }
 
@@ -1392,6 +1417,27 @@ impl AmqpSession {
                 if let Some(ref filter) = source.filter {
                     link.source_filter = Some(filter.clone());
                 }
+                // M6: Store default outcome for link destruction
+                if let Some(ref default_outcome) = source.default_outcome {
+                    // Convert AmqpValue (described outcome) to DeliveryState
+                    if let AmqpValue::Described(desc, _) = default_outcome {
+                        if let Some(d) = desc.as_u64() {
+                            link.default_outcome = match d {
+                                descriptor::ACCEPTED => Some(DeliveryState::Accepted),
+                                descriptor::RELEASED => Some(DeliveryState::Released),
+                                descriptor::REJECTED => {
+                                    Some(DeliveryState::Rejected { error: None })
+                                }
+                                descriptor::MODIFIED => Some(DeliveryState::Modified {
+                                    delivery_failed: false,
+                                    undeliverable_here: false,
+                                    message_annotations: None,
+                                }),
+                                _ => None,
+                            };
+                        }
+                    }
+                }
             }
         }
 
@@ -1592,6 +1638,34 @@ impl AmqpSession {
                 }
             }
 
+            // M6: Apply default-outcome to unsettled deliveries when link destroyed
+            if !link.unsettled.is_empty() {
+                if let Some(eid) = link.entity_id {
+                    let message_ids: SmallVec<[u64; 16]> = link
+                        .unsettled
+                        .iter()
+                        .map(|ud| ud.delivery_id as u64)
+                        .collect();
+                    let action = if let Some(ref default_outcome) = link.default_outcome {
+                        let settle_action =
+                            crate::broker::SettleAction::from_delivery_state(default_outcome);
+                        BrokerAction::Settle {
+                            entity_id: eid,
+                            message_ids,
+                            action: settle_action,
+                        }
+                    } else {
+                        // Default: release
+                        BrokerAction::Settle {
+                            entity_id: eid,
+                            message_ids,
+                            action: crate::broker::SettleAction::Release,
+                        }
+                    };
+                    actions.push(action);
+                }
+            }
+
             // Send Detach response.
             let resp = Detach {
                 handle,
@@ -1638,6 +1712,24 @@ impl AmqpSession {
 
         // If this is a link-level flow, update the link.
         if let Some(handle) = flow.handle {
+            // TR9: Validate that handle is attached (spec §2.7.4)
+            if !self.links.contains_key(&handle) {
+                let end = End {
+                    error: Some(AmqpError::from_static(
+                        condition::SESSION_UNATTACHED_HANDLE,
+                        "flow references unattached handle",
+                    )),
+                };
+                codec::encode_framed_performative(
+                    write_buf,
+                    self.local_channel,
+                    FRAME_TYPE_AMQP,
+                    &Performative::End(end),
+                );
+                self.discarding = true;
+                return Err(LinkError::UnknownHandle(handle));
+            }
+
             let ch = self.local_channel;
             if let Some(link) = self.links.get_mut(&handle) {
                 if let Some(credit) = flow.link_credit {
@@ -1893,6 +1985,7 @@ impl AmqpSession {
             return self.handle_coordinator_transfer(
                 handle,
                 delivery_id,
+                settled,
                 complete_payload,
                 write_buf,
                 actions,
@@ -2100,6 +2193,7 @@ impl AmqpSession {
         &mut self,
         handle: u32,
         delivery_id: u32,
+        settled: bool,
         payload: Bytes,
         write_buf: &mut BytesMut,
         actions: &mut Vec<BrokerAction>,
@@ -2117,6 +2211,27 @@ impl AmqpSession {
         })?;
 
         let ch = self.local_channel;
+
+        // X2: Declare MUST NOT be sent settled (§4.2)
+        if settled {
+            if codec::decode_txn_declare(&value).is_some() {
+                let detach = Detach {
+                    handle,
+                    closed: true,
+                    error: Some(AmqpError::from_static(
+                        condition::ILLEGAL_STATE,
+                        "declare transfer must not be sent settled",
+                    )),
+                };
+                codec::encode_framed_performative(
+                    write_buf,
+                    ch,
+                    FRAME_TYPE_AMQP,
+                    &Performative::Detach(detach),
+                );
+                return Ok(());
+            }
+        }
 
         if let Some(_declare) = codec::decode_txn_declare(&value) {
             // Declare: allocate a new transaction
@@ -2167,6 +2282,41 @@ impl AmqpSession {
 
             // Look up and remove the transaction
             if let Some(txn) = self.transactions.remove(&txn_id) {
+                // X4: Check for partial deliveries in the transaction
+                let has_partial = self.links.values().any(|l| l.partial_delivery.is_some());
+                if has_partial && !fail {
+                    warn!(
+                        channel = ch,
+                        ?txn_id,
+                        "discharge with partial delivery in progress"
+                    );
+                    actions.push(BrokerAction::RollbackTransaction {
+                        txn_id: txn_id.clone(),
+                        session_channel: ch,
+                        coordinator_handle: handle,
+                    });
+                    let disposition = Disposition {
+                        role: Role::Receiver,
+                        first: delivery_id,
+                        last: None,
+                        settled: true,
+                        state: Some(DeliveryState::Rejected {
+                            error: Some(AmqpError::from_static(
+                                condition::TXN_ROLLBACK,
+                                "cannot discharge with partial delivery in progress",
+                            )),
+                        }),
+                        batchable: false,
+                    };
+                    codec::encode_framed_performative(
+                        write_buf,
+                        ch,
+                        FRAME_TYPE_AMQP,
+                        &Performative::Disposition(disposition),
+                    );
+                    return Ok(());
+                }
+
                 if fail {
                     // Rollback: discard buffered actions, queue rollback action
                     debug!(
@@ -5277,5 +5427,357 @@ mod tests {
             conn.peer_cert_subject.as_deref(),
             Some("CN=my-client,O=Acme")
         );
+    }
+
+    // =================================================================
+    // TR1: channel-max enforcement
+    // =================================================================
+
+    #[test]
+    fn test_channel_max_enforcement() {
+        let mut conn = AmqpConnection::new("");
+        // Send AMQP header
+        conn.feed_data(&AMQP_HEADER);
+        conn.process().unwrap();
+        conn.take_write_bytes();
+
+        // Send Open with channel_max=2 (peer can only handle channels 0-2)
+        let open = Open {
+            container_id: WireString::from("test-client"),
+            channel_max: 2,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(&mut buf, 0, FRAME_TYPE_AMQP, &Performative::Open(open));
+        conn.feed_data(&buf);
+        conn.process().unwrap();
+        conn.take_write_bytes();
+        assert_eq!(conn.phase, ConnectionPhase::Open);
+        assert_eq!(conn.peer_channel_max, 2);
+
+        // Begin on channel 0 — should succeed
+        let begin = Begin {
+            remote_channel: None,
+            next_outgoing_id: 0,
+            incoming_window: 2048,
+            outgoing_window: 2048,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(
+            &mut buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Begin(begin),
+        );
+        conn.feed_data(&buf);
+        conn.process().unwrap();
+        conn.take_write_bytes();
+        assert_eq!(conn.sessions.len(), 1);
+
+        // Begin on channel 5 — exceeds peer_channel_max of 2, should close connection
+        let begin2 = Begin {
+            remote_channel: None,
+            next_outgoing_id: 0,
+            incoming_window: 2048,
+            outgoing_window: 2048,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(
+            &mut buf,
+            5,
+            FRAME_TYPE_AMQP,
+            &Performative::Begin(begin2),
+        );
+        conn.feed_data(&buf);
+        let _result = conn.process();
+        // Connection should be closing or closed
+        assert!(conn.phase == ConnectionPhase::Closing || conn.phase == ConnectionPhase::Closed);
+    }
+
+    // =================================================================
+    // TR2: handle-max enforcement (peer's handle-max)
+    // =================================================================
+
+    #[test]
+    fn test_handle_max_enforcement() {
+        let mut conn = AmqpConnection::new("");
+        conn.feed_data(&AMQP_HEADER);
+        conn.process().unwrap();
+        conn.take_write_bytes();
+
+        let open = Open {
+            container_id: WireString::from("test-client"),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(&mut buf, 0, FRAME_TYPE_AMQP, &Performative::Open(open));
+        conn.feed_data(&buf);
+        conn.process().unwrap();
+        conn.take_write_bytes();
+
+        // Begin with handle_max=3
+        let begin = Begin {
+            remote_channel: None,
+            next_outgoing_id: 0,
+            incoming_window: 2048,
+            outgoing_window: 2048,
+            handle_max: 3,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(
+            &mut buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Begin(begin),
+        );
+        conn.feed_data(&buf);
+        conn.process().unwrap();
+        conn.take_write_bytes();
+
+        // Verify peer_handle_max was stored
+        assert_eq!(conn.sessions.get(&0).unwrap().peer_handle_max, 3);
+
+        // Attach with handle=2 — should succeed
+        let attach = Attach {
+            name: WireString::from("ok-link"),
+            handle: 2,
+            role: Role::Sender,
+            initial_delivery_count: Some(0),
+            source: Some(Source {
+                address: Some(WireString::from("queue/test")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(
+            &mut buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Attach(attach),
+        );
+        conn.feed_data(&buf);
+        conn.process().unwrap();
+        conn.take_write_bytes();
+        assert!(conn.sessions.get(&0).unwrap().links.contains_key(&2));
+
+        // Attach with handle=10 — exceeds peer_handle_max
+        let attach2 = Attach {
+            name: WireString::from("bad-link"),
+            handle: 10,
+            role: Role::Sender,
+            initial_delivery_count: Some(0),
+            source: Some(Source {
+                address: Some(WireString::from("queue/test2")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(
+            &mut buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Attach(attach2),
+        );
+        conn.feed_data(&buf);
+        let result = conn.process();
+        // Should error with handle exceeds max
+        assert!(result.is_err());
+    }
+
+    // =================================================================
+    // TR9: Unattached-handle validation for Flow
+    // =================================================================
+
+    #[test]
+    fn test_flow_unattached_handle() {
+        let mut conn = setup_open_connection_with_session();
+
+        // Send Flow referencing handle 99 which doesn't exist
+        let flow = Flow {
+            next_incoming_id: Some(0),
+            incoming_window: 2048,
+            next_outgoing_id: 0,
+            outgoing_window: 2048,
+            handle: Some(99),
+            delivery_count: Some(0),
+            link_credit: Some(10),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(&mut buf, 0, FRAME_TYPE_AMQP, &Performative::Flow(flow));
+        conn.feed_data(&buf);
+        let result = conn.process();
+        // Should error — session ended with unattached-handle
+        assert!(result.is_err());
+    }
+
+    // =================================================================
+    // TR10: Delivery-tag size limit (validated in link.rs)
+    // =================================================================
+
+    #[test]
+    fn test_delivery_tag_size_limit() {
+        let mut conn = setup_open_connection_with_session();
+        {
+            let session = conn.sessions.get_mut(&0).unwrap();
+            let link = session.links.get_mut(&0).unwrap();
+            link.link_credit = 100;
+        }
+
+        // Transfer with 33-byte delivery tag — should fail
+        let transfer = Transfer {
+            handle: 0,
+            delivery_id: Some(0),
+            delivery_tag: Some(Bytes::from(vec![0xAB; 33])),
+            settled: Some(false),
+            payload: Bytes::from_static(b"msg"),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(
+            &mut buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Transfer(transfer),
+        );
+        conn.feed_data(&buf);
+        let result = conn.process();
+        assert!(result.is_err());
+    }
+
+    // =================================================================
+    // M6: Default-outcome on link detach
+    // =================================================================
+
+    #[test]
+    fn test_default_outcome_on_detach() {
+        let mut conn = setup_open_connection_with_session();
+        conn.take_pending_actions();
+
+        // Set up entity info and add unsettled deliveries to the link
+        {
+            let session = conn.sessions.get_mut(&0).unwrap();
+            let link = session.links.get_mut(&0).unwrap();
+            link.link_credit = 100;
+            link.entity_id = Some(42);
+            link.entity_type = Some("queue");
+            link.default_outcome = Some(DeliveryState::Released);
+            // Add unsettled deliveries
+            link.unsettled.push(UnsettledDelivery {
+                delivery_id: 0,
+                delivery_tag: Bytes::from_static(b"tag-0"),
+                settled: false,
+                state: None,
+            });
+            link.unsettled.push(UnsettledDelivery {
+                delivery_id: 1,
+                delivery_tag: Bytes::from_static(b"tag-1"),
+                settled: false,
+                state: None,
+            });
+        }
+
+        // Detach the link
+        let detach = Detach {
+            handle: 0,
+            closed: true,
+            error: None,
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(
+            &mut buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Detach(detach),
+        );
+        conn.feed_data(&buf);
+        conn.process().unwrap();
+
+        // Check that a Settle action was queued with Release
+        let actions = conn.take_pending_actions();
+        let has_settle = actions.iter().any(|a| matches!(a, BrokerAction::Settle { action, .. } if *action == crate::broker::SettleAction::Release));
+        assert!(
+            has_settle,
+            "expected Settle action with Release for unsettled deliveries"
+        );
+    }
+
+    // =================================================================
+    // Session window violation test
+    // =================================================================
+
+    #[test]
+    fn test_session_window_violation() {
+        let mut conn = setup_open_connection_with_session();
+        {
+            let session = conn.sessions.get_mut(&0).unwrap();
+            let link = session.links.get_mut(&0).unwrap();
+            link.link_credit = 100;
+            // Set incoming_window to 0 to trigger violation
+            session.incoming_window = 0;
+        }
+
+        let transfer = Transfer {
+            handle: 0,
+            delivery_id: Some(0),
+            delivery_tag: Some(Bytes::from_static(b"tag")),
+            settled: Some(true),
+            payload: Bytes::from_static(b"msg"),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(
+            &mut buf,
+            0,
+            FRAME_TYPE_AMQP,
+            &Performative::Transfer(transfer),
+        );
+        conn.feed_data(&buf);
+        let result = conn.process();
+        assert!(result.is_err());
+    }
+
+    // =================================================================
+    // Oversized frame rejection test
+    // =================================================================
+
+    #[test]
+    fn test_oversized_frame_rejection() {
+        let mut conn = AmqpConnection::new("");
+        conn.feed_data(&AMQP_HEADER);
+        conn.process().unwrap();
+        conn.take_write_bytes();
+
+        // Open with small max_frame_size
+        let open = Open {
+            container_id: WireString::from("test"),
+            max_frame_size: 256, // very small
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        codec::encode_framed_performative(&mut buf, 0, FRAME_TYPE_AMQP, &Performative::Open(open));
+        conn.feed_data(&buf);
+        conn.process().unwrap();
+        conn.take_write_bytes();
+        assert_eq!(conn.max_frame_size, 256);
+
+        // Now send a frame larger than 256 bytes
+        let big_payload = vec![0xAB; 300];
+        let mut frame_buf = BytesMut::new();
+        let size = 8 + big_payload.len();
+        frame_buf.put_u32(size as u32);
+        frame_buf.put_u8(2);
+        frame_buf.put_u8(FRAME_TYPE_AMQP);
+        frame_buf.put_u16(0);
+        frame_buf.extend_from_slice(&big_payload);
+        conn.feed_data(&frame_buf);
+        conn.process().unwrap(); // process returns Ok but closes connection
+        // Connection should be closing/closed due to framing-error
+        assert!(conn.phase == ConnectionPhase::Closing || conn.phase == ConnectionPhase::Closed);
     }
 }

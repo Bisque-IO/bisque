@@ -200,6 +200,209 @@ impl KafkaHandler {
             KafkaRequest::CreatePartitions(req) => self.handle_create_partitions(req).await,
             KafkaRequest::DeleteGroups(req) => self.handle_delete_groups(req).await,
             KafkaRequest::OffsetDelete(req) => self.handle_offset_delete(req).await,
+            KafkaRequest::OffsetForLeaderEpoch(req) => self.handle_offset_for_leader_epoch(req),
+            KafkaRequest::IncrementalAlterConfigs(req) => {
+                self.handle_incremental_alter_configs(req)
+            }
+            KafkaRequest::DescribeAcls(req) => self.handle_describe_acls(req),
+            KafkaRequest::CreateAcls(req) => self.handle_create_acls(req),
+            KafkaRequest::DeleteAcls(req) => self.handle_delete_acls(req),
+            KafkaRequest::DescribeLogDirs(req) => self.handle_describe_log_dirs(req),
+            KafkaRequest::DescribeUserScramCredentials(req) => {
+                self.handle_describe_user_scram_credentials(req)
+            }
+            KafkaRequest::AlterUserScramCredentials(req) => {
+                self.handle_alter_user_scram_credentials(req)
+            }
+            KafkaRequest::DescribeCluster(req) => self.handle_describe_cluster(req),
+            // Stub handlers: return UNSUPPORTED_VERSION error
+            KafkaRequest::WriteTxnMarkers(_) => {
+                KafkaResponse::WriteTxnMarkers(WriteTxnMarkersResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::AlterReplicaLogDirs(_) => {
+                KafkaResponse::AlterReplicaLogDirs(AlterReplicaLogDirsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::CreateDelegationToken(_) => {
+                KafkaResponse::CreateDelegationToken(CreateDelegationTokenResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::RenewDelegationToken(_) => {
+                KafkaResponse::RenewDelegationToken(RenewDelegationTokenResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ExpireDelegationToken(_) => {
+                KafkaResponse::ExpireDelegationToken(ExpireDelegationTokenResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::DescribeDelegationToken(_) => {
+                KafkaResponse::DescribeDelegationToken(DescribeDelegationTokenResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ElectLeaders(_) => KafkaResponse::ElectLeaders(ElectLeadersResponse {
+                error_code: ErrorCode::UnsupportedVersion.as_i16(),
+            }),
+            KafkaRequest::AlterPartitionReassignments(_) => {
+                KafkaResponse::AlterPartitionReassignments(AlterPartitionReassignmentsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ListPartitionReassignments(_) => {
+                KafkaResponse::ListPartitionReassignments(ListPartitionReassignmentsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::DescribeClientQuotas(_) => {
+                KafkaResponse::DescribeClientQuotas(DescribeClientQuotasResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::AlterClientQuotas(_) => {
+                KafkaResponse::AlterClientQuotas(AlterClientQuotasResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::DescribeQuorum(_) => {
+                KafkaResponse::DescribeQuorum(DescribeQuorumResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::UpdateFeatures(_) => {
+                KafkaResponse::UpdateFeatures(UpdateFeaturesResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::DescribeProducers(_) => {
+                KafkaResponse::DescribeProducers(DescribeProducersResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::UnregisterBroker(_) => {
+                KafkaResponse::UnregisterBroker(UnregisterBrokerResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::DescribeTransactions(_) => {
+                KafkaResponse::DescribeTransactions(DescribeTransactionsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ListTransactions(_) => {
+                KafkaResponse::ListTransactions(ListTransactionsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ConsumerGroupHeartbeat(_) => {
+                KafkaResponse::ConsumerGroupHeartbeat(ConsumerGroupHeartbeatResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ConsumerGroupDescribe(_) => {
+                KafkaResponse::ConsumerGroupDescribe(ConsumerGroupDescribeResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::GetTelemetrySubscriptions(_) => {
+                KafkaResponse::GetTelemetrySubscriptions(GetTelemetrySubscriptionsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::PushTelemetry(_) => KafkaResponse::PushTelemetry(PushTelemetryResponse {
+                error_code: ErrorCode::UnsupportedVersion.as_i16(),
+            }),
+            KafkaRequest::ListConfigResources(_) => {
+                KafkaResponse::ListConfigResources(ListConfigResourcesResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::DescribeTopicPartitions(_) => {
+                KafkaResponse::DescribeTopicPartitions(DescribeTopicPartitionsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ShareGroupHeartbeat(_) => {
+                KafkaResponse::ShareGroupHeartbeat(ShareGroupHeartbeatResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ShareGroupDescribe(_) => {
+                KafkaResponse::ShareGroupDescribe(ShareGroupDescribeResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ShareFetch(_) => KafkaResponse::ShareFetch(ShareFetchResponse {
+                error_code: ErrorCode::UnsupportedVersion.as_i16(),
+            }),
+            KafkaRequest::ShareAcknowledge(_) => {
+                KafkaResponse::ShareAcknowledge(ShareAcknowledgeResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::AddRaftVoter(_) => KafkaResponse::AddRaftVoter(AddRaftVoterResponse {
+                error_code: ErrorCode::UnsupportedVersion.as_i16(),
+            }),
+            KafkaRequest::RemoveRaftVoter(_) => {
+                KafkaResponse::RemoveRaftVoter(RemoveRaftVoterResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::InitializeShareGroupState(_) => {
+                KafkaResponse::InitializeShareGroupState(InitializeShareGroupStateResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ReadShareGroupState(_) => {
+                KafkaResponse::ReadShareGroupState(ReadShareGroupStateResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::WriteShareGroupState(_) => {
+                KafkaResponse::WriteShareGroupState(WriteShareGroupStateResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::DeleteShareGroupState(_) => {
+                KafkaResponse::DeleteShareGroupState(DeleteShareGroupStateResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::ReadShareGroupStateSummary(_) => {
+                KafkaResponse::ReadShareGroupStateSummary(ReadShareGroupStateSummaryResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::StreamsGroupHeartbeat(_) => {
+                KafkaResponse::StreamsGroupHeartbeat(StreamsGroupHeartbeatResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::StreamsGroupDescribe(_) => {
+                KafkaResponse::StreamsGroupDescribe(StreamsGroupDescribeResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::DescribeShareGroupOffsets(_) => {
+                KafkaResponse::DescribeShareGroupOffsets(DescribeShareGroupOffsetsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::AlterShareGroupOffsets(_) => {
+                KafkaResponse::AlterShareGroupOffsets(AlterShareGroupOffsetsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
+            KafkaRequest::DeleteShareGroupOffsets(_) => {
+                KafkaResponse::DeleteShareGroupOffsets(DeleteShareGroupOffsetsResponse {
+                    error_code: ErrorCode::UnsupportedVersion.as_i16(),
+                })
+            }
         }
     }
 
@@ -259,8 +462,56 @@ impl KafkaHandler {
             ApiKey::AlterConfigs,
             ApiKey::SaslAuthenticate,
             ApiKey::CreatePartitions,
+            ApiKey::OffsetForLeaderEpoch,
             ApiKey::DeleteGroups,
             ApiKey::OffsetDelete,
+            ApiKey::DescribeAcls,
+            ApiKey::CreateAcls,
+            ApiKey::DeleteAcls,
+            ApiKey::DescribeLogDirs,
+            ApiKey::IncrementalAlterConfigs,
+            ApiKey::WriteTxnMarkers,
+            ApiKey::AlterReplicaLogDirs,
+            ApiKey::CreateDelegationToken,
+            ApiKey::RenewDelegationToken,
+            ApiKey::ExpireDelegationToken,
+            ApiKey::DescribeDelegationToken,
+            ApiKey::ElectLeaders,
+            ApiKey::AlterPartitionReassignments,
+            ApiKey::ListPartitionReassignments,
+            ApiKey::DescribeClientQuotas,
+            ApiKey::AlterClientQuotas,
+            ApiKey::DescribeUserScramCredentials,
+            ApiKey::AlterUserScramCredentials,
+            ApiKey::DescribeQuorum,
+            ApiKey::UpdateFeatures,
+            ApiKey::DescribeCluster,
+            ApiKey::DescribeProducers,
+            ApiKey::UnregisterBroker,
+            ApiKey::DescribeTransactions,
+            ApiKey::ListTransactions,
+            ApiKey::ConsumerGroupHeartbeat,
+            ApiKey::ConsumerGroupDescribe,
+            ApiKey::GetTelemetrySubscriptions,
+            ApiKey::PushTelemetry,
+            ApiKey::ListConfigResources,
+            ApiKey::DescribeTopicPartitions,
+            ApiKey::ShareGroupHeartbeat,
+            ApiKey::ShareGroupDescribe,
+            ApiKey::ShareFetch,
+            ApiKey::ShareAcknowledge,
+            ApiKey::AddRaftVoter,
+            ApiKey::RemoveRaftVoter,
+            ApiKey::InitializeShareGroupState,
+            ApiKey::ReadShareGroupState,
+            ApiKey::WriteShareGroupState,
+            ApiKey::DeleteShareGroupState,
+            ApiKey::ReadShareGroupStateSummary,
+            ApiKey::StreamsGroupHeartbeat,
+            ApiKey::StreamsGroupDescribe,
+            ApiKey::DescribeShareGroupOffsets,
+            ApiKey::AlterShareGroupOffsets,
+            ApiKey::DeleteShareGroupOffsets,
         ];
 
         let api_keys = supported
@@ -327,7 +578,12 @@ impl KafkaHandler {
             Some(names) => names.into_iter().map(build_topic_meta).collect(),
         };
 
-        KafkaResponse::Metadata(MetadataResponse { brokers, topics })
+        KafkaResponse::Metadata(MetadataResponse {
+            brokers,
+            cluster_id: WireString::from_static("bisque-mq"),
+            controller_id: self.broker_id,
+            topics,
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -379,6 +635,9 @@ impl KafkaHandler {
                     partition_index,
                     error_code,
                     base_offset,
+                    log_append_time_ms: -1,
+                    log_start_offset: 0,
+                    ..Default::default()
                 });
             }
             topic_responses.push(ProduceTopicResponse {
@@ -490,7 +749,11 @@ impl KafkaHandler {
                             partition_index: part_data.partition_index,
                             error_code: ErrorCode::UnknownTopicOrPartition.as_i16(),
                             high_watermark: -1,
+                            last_stable_offset: -1,
+                            log_start_offset: -1,
+                            preferred_read_replica: -1,
                             record_set: Bytes::new(),
+                            ..Default::default()
                         });
                     }
                     Some(topic_id) => {
@@ -513,7 +776,11 @@ impl KafkaHandler {
                             partition_index: part_data.partition_index,
                             error_code: ErrorCode::None.as_i16(),
                             high_watermark: high_watermark as i64,
+                            last_stable_offset: high_watermark as i64,
+                            log_start_offset: 0,
+                            preferred_read_replica: -1,
                             record_set,
+                            ..Default::default()
                         });
                     }
                 }
@@ -732,7 +999,9 @@ impl KafkaHandler {
                                 .into_iter()
                                 .map(|(id, meta)| JoinGroupMember {
                                     member_id: WireString::from(id),
+                                    group_instance_id: None,
                                     metadata: Bytes::from(meta),
+                                    ..Default::default()
                                 })
                                 .collect()
                         } else {
@@ -804,7 +1073,9 @@ impl KafkaHandler {
                 .into_iter()
                 .map(|(id, meta)| JoinGroupMember {
                     member_id: WireString::from(id),
+                    group_instance_id: None,
                     metadata: meta,
+                    ..Default::default()
                 })
                 .collect()
         } else {
@@ -960,6 +1231,8 @@ impl KafkaHandler {
             None => {
                 return KafkaResponse::LeaveGroup(LeaveGroupResponse {
                     error_code: ErrorCode::None.as_i16(),
+                    members: Vec::new(),
+                    ..Default::default()
                 });
             }
         };
@@ -976,6 +1249,8 @@ impl KafkaHandler {
 
         KafkaResponse::LeaveGroup(LeaveGroupResponse {
             error_code: ErrorCode::None.as_i16(),
+            members: Vec::new(),
+            ..Default::default()
         })
     }
 
@@ -1151,7 +1426,9 @@ impl KafkaHandler {
                             partition_index: partition,
                             offset: -1,
                             metadata: None,
+                            committed_leader_epoch: -1,
                             error_code: ErrorCode::UnknownTopicOrPartition.as_i16(),
+                            ..Default::default()
                         });
                     }
                     Some(topic_id) => {
@@ -1174,7 +1451,9 @@ impl KafkaHandler {
                             partition_index: partition,
                             offset,
                             metadata: None,
+                            committed_leader_epoch: -1,
                             error_code: ErrorCode::None.as_i16(),
+                            ..Default::default()
                         });
                     }
                 }
@@ -1346,9 +1625,11 @@ impl KafkaHandler {
                 DescribedGroupMember {
                     client_id: wire_mid.clone(),
                     member_id: wire_mid,
+                    group_instance_id: None,
                     client_host: WireString::empty(),
                     metadata,
                     assignment,
+                    ..Default::default()
                 }
             })
             .collect();
@@ -1370,6 +1651,8 @@ impl KafkaHandler {
             .map(|entry| ListedGroup {
                 group_id: WireString::from(entry.value().meta.name.clone()),
                 protocol_type: WireString::from(entry.value().meta.protocol_type.clone()),
+                group_state: WireString::empty(),
+                ..Default::default()
             })
             .collect();
 
@@ -1404,17 +1687,23 @@ impl KafkaHandler {
                     error_code: ErrorCode::None.as_i16(),
                     error_message: None,
                     auth_bytes: Bytes::new(),
+                    session_lifetime_ms: 0,
+                    ..Default::default()
                 }),
                 Err(msg) => KafkaResponse::SaslAuthenticate(SaslAuthenticateResponse {
                     error_code: ErrorCode::SaslAuthenticationFailed.as_i16(),
                     error_message: Some(WireString::from_static(msg)),
                     auth_bytes: Bytes::new(),
+                    session_lifetime_ms: 0,
+                    ..Default::default()
                 }),
             },
             None => KafkaResponse::SaslAuthenticate(SaslAuthenticateResponse {
                 error_code: ErrorCode::SaslAuthenticationFailed.as_i16(),
                 error_message: Some(WireString::from_static("invalid SASL/PLAIN payload")),
                 auth_bytes: Bytes::new(),
+                session_lifetime_ms: 0,
+                ..Default::default()
             }),
         }
     }
@@ -1931,6 +2220,188 @@ impl KafkaHandler {
     }
 
     // -------------------------------------------------------------------------
+    // OffsetForLeaderEpoch
+    // -------------------------------------------------------------------------
+
+    fn handle_offset_for_leader_epoch(&self, req: OffsetForLeaderEpochRequest) -> KafkaResponse {
+        let pmap = self.partition_map.load();
+        let mut topic_responses = Vec::with_capacity(req.topics.len());
+
+        for topic_data in req.topics {
+            let mut part_responses = Vec::with_capacity(topic_data.partitions.len());
+
+            for part_data in &topic_data.partitions {
+                let topic_id = pmap.resolve(&topic_data.topic_name, part_data.partition_index);
+
+                match topic_id {
+                    None => {
+                        part_responses.push(OffsetForLeaderEpochPartitionResponse {
+                            error_code: ErrorCode::UnknownTopicOrPartition.as_i16(),
+                            partition_index: part_data.partition_index,
+                            leader_epoch: -1,
+                            end_offset: -1,
+                        });
+                    }
+                    Some(topic_id) => {
+                        let end_offset =
+                            self.log_reader.get_topic_head(topic_id).unwrap_or(0) as i64;
+                        part_responses.push(OffsetForLeaderEpochPartitionResponse {
+                            error_code: ErrorCode::None.as_i16(),
+                            partition_index: part_data.partition_index,
+                            leader_epoch: 0, // single-node: always epoch 0
+                            end_offset,
+                        });
+                    }
+                }
+            }
+
+            topic_responses.push(OffsetForLeaderEpochTopicResponse {
+                topic_name: topic_data.topic_name,
+                partitions: part_responses,
+            });
+        }
+
+        KafkaResponse::OffsetForLeaderEpoch(OffsetForLeaderEpochResponse {
+            topics: topic_responses,
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // DescribeCluster
+    // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // IncrementalAlterConfigs (API 44) — stub
+    // -------------------------------------------------------------------------
+
+    fn handle_incremental_alter_configs(
+        &self,
+        req: IncrementalAlterConfigsRequest,
+    ) -> KafkaResponse {
+        // Accept but no-op (single-node, configs are not persisted)
+        let resources = req
+            .resources
+            .into_iter()
+            .map(|res| IncrementalAlterConfigsResourceResult {
+                error_code: ErrorCode::None.as_i16(),
+                error_message: None,
+                resource_type: res.resource_type,
+                resource_name: res.resource_name,
+            })
+            .collect();
+        KafkaResponse::IncrementalAlterConfigs(IncrementalAlterConfigsResponse { resources })
+    }
+
+    // -------------------------------------------------------------------------
+    // DescribeAcls (API 29) — stub
+    // -------------------------------------------------------------------------
+
+    fn handle_describe_acls(&self, _req: DescribeAclsRequest) -> KafkaResponse {
+        // Return empty results — no ACLs configured
+        KafkaResponse::DescribeAcls(DescribeAclsResponse {
+            error_code: ErrorCode::None.as_i16(),
+            error_message: None,
+            resources: vec![],
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // CreateAcls (API 30) — stub
+    // -------------------------------------------------------------------------
+
+    fn handle_create_acls(&self, req: CreateAclsRequest) -> KafkaResponse {
+        // Pretend ACLs were created — return success for each
+        let results = req
+            .creations
+            .iter()
+            .map(|_| CreateAclsResult {
+                error_code: ErrorCode::None.as_i16(),
+                error_message: None,
+            })
+            .collect();
+        KafkaResponse::CreateAcls(CreateAclsResponse { results })
+    }
+
+    // -------------------------------------------------------------------------
+    // DeleteAcls (API 31) — stub
+    // -------------------------------------------------------------------------
+
+    fn handle_delete_acls(&self, req: DeleteAclsRequest) -> KafkaResponse {
+        // Return empty matching_acls for each filter
+        let filter_results = req
+            .filters
+            .iter()
+            .map(|_| DeleteAclsFilterResult {
+                error_code: ErrorCode::None.as_i16(),
+                error_message: None,
+                matching_acls: vec![],
+            })
+            .collect();
+        KafkaResponse::DeleteAcls(DeleteAclsResponse { filter_results })
+    }
+
+    // -------------------------------------------------------------------------
+    // DescribeLogDirs (API 35) — stub
+    // -------------------------------------------------------------------------
+
+    fn handle_describe_log_dirs(&self, _req: DescribeLogDirsRequest) -> KafkaResponse {
+        // Return empty results
+        KafkaResponse::DescribeLogDirs(DescribeLogDirsResponse { results: vec![] })
+    }
+
+    // -------------------------------------------------------------------------
+    // DescribeUserScramCredentials (API 50) — stub
+    // -------------------------------------------------------------------------
+
+    fn handle_describe_user_scram_credentials(
+        &self,
+        _req: DescribeUserScramCredentialsRequest,
+    ) -> KafkaResponse {
+        // Return empty results
+        KafkaResponse::DescribeUserScramCredentials(DescribeUserScramCredentialsResponse {
+            error_code: ErrorCode::None.as_i16(),
+            error_message: None,
+            results: vec![],
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // AlterUserScramCredentials (API 51) — stub
+    // -------------------------------------------------------------------------
+
+    fn handle_alter_user_scram_credentials(
+        &self,
+        _req: AlterUserScramCredentialsRequest,
+    ) -> KafkaResponse {
+        // Return empty results (success)
+        KafkaResponse::AlterUserScramCredentials(AlterUserScramCredentialsResponse {
+            results: vec![],
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // DescribeCluster
+    // -------------------------------------------------------------------------
+
+    fn handle_describe_cluster(&self, req: DescribeClusterRequest) -> KafkaResponse {
+        KafkaResponse::DescribeCluster(DescribeClusterResponse {
+            error_code: ErrorCode::None.as_i16(),
+            cluster_id: WireString::from_static("bisque-mq"),
+            controller_id: self.broker_id,
+            brokers: vec![BrokerMeta {
+                node_id: self.broker_id,
+                host: self.advertised_host.clone(),
+                port: self.advertised_port,
+            }],
+            cluster_authorized_operations: if req.include_cluster_authorized_operations {
+                i32::MIN // not available
+            } else {
+                i32::MIN
+            },
+        })
+    }
+
+    // -------------------------------------------------------------------------
     // Connection disconnect — submit leave via Raft
     // -------------------------------------------------------------------------
 
@@ -2074,6 +2545,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2102,6 +2574,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2134,6 +2607,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::from_static(b"\x01"),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2161,6 +2635,7 @@ mod tests {
                     generation_id: 1,
                     member_id: WireString::from("m1"),
                     assignments: vec![],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2190,6 +2665,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2210,6 +2686,7 @@ mod tests {
                         member_id: member_id.clone(),
                         assignment: Bytes::from_static(b"partition-data"),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2233,6 +2710,7 @@ mod tests {
                     group_id: WireString::from("nonexistent"),
                     generation_id: 1,
                     member_id: WireString::from("m1"),
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2262,6 +2740,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2280,6 +2759,7 @@ mod tests {
                         member_id: mid.clone(),
                         assignment: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2291,6 +2771,7 @@ mod tests {
                     group_id: WireString::from("hb-ok"),
                     generation_id: generation,
                     member_id: mid,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2320,6 +2801,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2338,6 +2820,7 @@ mod tests {
                         member_id: mid.clone(),
                         assignment: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2349,6 +2832,7 @@ mod tests {
                     group_id: WireString::from("hb-generation"),
                     generation_id: 999,
                     member_id: mid,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2378,6 +2862,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2396,6 +2881,7 @@ mod tests {
                         member_id: mid.clone(),
                         assignment: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2407,6 +2893,7 @@ mod tests {
                     group_id: WireString::from("hb-unk"),
                     generation_id: generation,
                     member_id: WireString::from("unknown-member-xyz"),
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2429,7 +2916,7 @@ mod tests {
         match resp {
             KafkaResponse::ApiVersions(r) => {
                 assert_eq!(r.error_code, ErrorCode::None.as_i16());
-                assert_eq!(r.api_keys.len(), 29);
+                assert_eq!(r.api_keys.len(), 77);
                 for key in &r.api_keys {
                     assert!(
                         ApiKey::from_i16(key.api_key).is_some(),
@@ -2909,6 +3396,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2928,6 +3416,7 @@ mod tests {
                 KafkaRequest::LeaveGroup(LeaveGroupRequest {
                     group_id: WireString::from("leave-test"),
                     member_id,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2956,8 +3445,10 @@ mod tests {
                             partition_index: 0,
                             offset: 42,
                             metadata: None,
+                            ..Default::default()
                         }],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -2988,6 +3479,7 @@ mod tests {
                         topic_name: WireString::from("some-topic"),
                         partitions: vec![0],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -3021,8 +3513,10 @@ mod tests {
                             partition_index: 0,
                             fetch_offset: 0,
                             max_bytes: 1048576,
+                            ..Default::default()
                         }],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -3061,8 +3555,10 @@ mod tests {
                             partition_index: 0,
                             fetch_offset: 0,
                             max_bytes: 1048576,
+                            ..Default::default()
                         }],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -3433,6 +3929,7 @@ mod tests {
                             metadata: None,
                         }],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -3671,6 +4168,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -3711,6 +4209,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4014,8 +4513,10 @@ mod tests {
                             partition_index: 0,
                             fetch_offset: 0,
                             max_bytes: 1048576,
+                            ..Default::default()
                         }],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4054,6 +4555,7 @@ mod tests {
                             record_set: None,
                         }],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4089,6 +4591,7 @@ mod tests {
                             record_set: None,
                         }],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4129,6 +4632,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4147,6 +4651,7 @@ mod tests {
                         member_id: mid,
                         assignment: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4164,8 +4669,10 @@ mod tests {
                             partition_index: 0,
                             offset: 42,
                             metadata: None,
+                            ..Default::default()
                         }],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4202,6 +4709,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4215,6 +4723,7 @@ mod tests {
                         topic_name: WireString::from("of-topic"),
                         partitions: vec![0],
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4254,6 +4763,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4267,6 +4777,7 @@ mod tests {
                 KafkaRequest::LeaveGroup(LeaveGroupRequest {
                     group_id: WireString::from("dg-empty"),
                     member_id: mid,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -4309,6 +4820,7 @@ mod tests {
                         name: WireString::from("range"),
                         metadata: Bytes::new(),
                     }],
+                    ..Default::default()
                 }),
             )
             .await;

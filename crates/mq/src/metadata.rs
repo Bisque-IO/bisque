@@ -12,7 +12,7 @@
 //!
 //! **Periodic leader tasks** iterate `DashMap` without blocking the writer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -25,9 +25,11 @@ use crate::consumer::ConsumerState;
 use crate::consumer_group::ConsumerGroupState;
 use crate::exchange::ExchangeState;
 use crate::job::JobInstance;
+use crate::notifier::QueueNotifier;
 use crate::producer::ProducerMeta;
 use crate::queue::QueueState;
 use crate::topic::TopicState;
+use crate::types::{PendingWill, PersistedSession, TopicAliasEntry};
 
 // ---------------------------------------------------------------------------
 // Atomic metadata entities
@@ -268,6 +270,36 @@ pub struct MqMetadata {
     /// consumer_id → set of job_ids assigned to the consumer.
     pub(crate) consumer_job_index: DashMap<u64, HashSet<u64>>,
 
+    // -- MQTT session persistence --
+    /// client_id name_hash → persisted session state.
+    pub(crate) persisted_sessions: DashMap<u64, PersistedSession>,
+
+    // -- Push-based queue delivery --
+    /// Notifies watchers when messages are enqueued to a queue.
+    pub queue_notifier: QueueNotifier,
+
+    // -- Topic aliases (MQTT 5.0) --
+    /// consumer_id → list of topic alias entries.
+    pub(crate) topic_aliases: DashMap<u64, Vec<TopicAliasEntry>>,
+
+    // -- Pending will messages (MQTT 5.0 Will Delay Interval) --
+    /// client_id name_hash → pending will with scheduled fire time.
+    pub(crate) pending_wills: DashMap<u64, PendingWill>,
+
+    // -- Publisher session dedup (MQTT 5.0 exactly-once) --
+    /// session_id name_hash → set of received publisher_ids for dedup.
+    pub(crate) publisher_dedup: DashMap<u64, HashSet<u64>>,
+
+    // -- QoS 2 inbound dedup (MQTT 5.0 exactly-once inbound) --
+    /// consumer_id → (packet_id → qos2 state: 0=RECEIVED, 1=COMPLETE).
+    pub(crate) qos2_inbound: DashMap<u64, HashMap<u16, u8>>,
+
+    // -- O(1) reverse indexes --
+    /// binding_id → exchange_id for O(1) delete-binding lookup.
+    pub(crate) binding_index: DashMap<u64, u64>,
+    /// client_id name_hash → consumer_id for O(1) session restore.
+    pub(crate) session_client_index: DashMap<u64, u64>,
+
     // -- Atomic scalars --
     pub(crate) next_id: AtomicU64,
     pub(crate) cached_purge_floor: AtomicU64,
@@ -299,6 +331,14 @@ impl MqMetadata {
             consumer_queue_index: DashMap::new(),
             consumer_actor_ns_index: DashMap::new(),
             consumer_job_index: DashMap::new(),
+            persisted_sessions: DashMap::new(),
+            queue_notifier: QueueNotifier::new(),
+            topic_aliases: DashMap::new(),
+            pending_wills: DashMap::new(),
+            publisher_dedup: DashMap::new(),
+            qos2_inbound: DashMap::new(),
+            binding_index: DashMap::new(),
+            session_client_index: DashMap::new(),
             next_id: AtomicU64::new(1),
             cached_purge_floor: AtomicU64::new(0),
             purge_floor_dirty: AtomicBool::new(true),
@@ -409,7 +449,8 @@ impl MqMetadata {
         out.reserve(self.topics_by_id.len());
         for entry in self.topics_by_id.iter() {
             let t = entry.value();
-            out.push((Bytes::from(t.name.clone()), t.topic_id));
+            // Use Bytes::copy_from_slice to avoid String clone + into Vec + into Bytes
+            out.push((Bytes::copy_from_slice(t.name.as_bytes()), t.topic_id));
         }
     }
 
@@ -419,7 +460,7 @@ impl MqMetadata {
         for entry in self.topics_by_id.iter() {
             let t = entry.value();
             if t.name.starts_with(prefix) {
-                out.push((Bytes::from(t.name.clone()), t.topic_id));
+                out.push((Bytes::copy_from_slice(t.name.as_bytes()), t.topic_id));
             }
         }
     }

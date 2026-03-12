@@ -43,6 +43,13 @@ const TAG_RESP_BATCH: u8 = 6;
 const TAG_RESP_DEAD_LETTERED: u8 = 7;
 const TAG_RESP_GROUP_JOINED: u8 = 8;
 const TAG_RESP_GROUP_SYNCED: u8 = 9;
+const TAG_RESP_RETAINED_MESSAGES: u8 = 10;
+const TAG_RESP_WILL_PENDING: u8 = 11;
+const TAG_RESP_SESSION_RESTORED: u8 = 12;
+const TAG_RESP_SESSION_NOT_FOUND: u8 = 13;
+const TAG_RESP_MULTI_MESSAGES: u8 = 14;
+const TAG_RESP_TOPIC_ALIASES: u8 = 15;
+const TAG_RESP_WILLS_FIRED: u8 = 16;
 
 // =============================================================================
 // Bytes encoding helpers
@@ -131,9 +138,9 @@ fn encode_vec_u64<W: Write>(w: &mut W, v: &[u64]) -> Result<(), CodecError> {
 }
 
 #[inline]
-fn decode_vec_u64<R: Read>(r: &mut R) -> Result<Vec<u64>, CodecError> {
+fn decode_vec_u64<R: Read>(r: &mut R) -> Result<SmallVec<[u64; 8]>, CodecError> {
     let count = u32::decode(r)? as usize;
-    let mut v = Vec::with_capacity(count.min(4096));
+    let mut v = SmallVec::with_capacity(count.min(4096));
     for _ in 0..count {
         v.push(u64::decode(r)?);
     }
@@ -187,6 +194,26 @@ fn decode_opt_string<R: Read>(r: &mut R) -> Result<Option<String>, CodecError> {
         Ok(None)
     } else {
         Ok(Some(String::decode(r)?))
+    }
+}
+
+#[inline]
+fn encode_opt_u32<W: Write>(w: &mut W, v: Option<u32>) -> Result<(), CodecError> {
+    match v {
+        None => 0u8.encode(w),
+        Some(val) => {
+            1u8.encode(w)?;
+            val.encode(w)
+        }
+    }
+}
+
+#[inline]
+fn decode_opt_u32<R: Read>(r: &mut R) -> Result<Option<u32>, CodecError> {
+    if u8::decode(r)? == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(u32::decode(r)?))
     }
 }
 
@@ -566,10 +593,11 @@ impl Encode for DeliveredMessage {
     fn encode<W: Write>(&self, w: &mut W) -> Result<(), CodecError> {
         self.message_id.encode(w)?;
         self.attempt.encode(w)?;
-        self.original_timestamp.encode(w)
+        self.original_timestamp.encode(w)?;
+        self.queue_id.encode(w)
     }
     fn encoded_size(&self) -> usize {
-        8 + 4 + 8
+        8 + 4 + 8 + 8
     }
 }
 
@@ -579,6 +607,7 @@ impl Decode for DeliveredMessage {
             message_id: u64::decode(r)?,
             attempt: u32::decode(r)?,
             original_timestamp: u64::decode(r)?,
+            queue_id: u64::decode(r)?,
         })
     }
 }
@@ -924,7 +953,29 @@ impl MqCommand {
             Self::TAG_CREATE_BINDING,
             |w: &mut Vec<u8>| exchange_id.encode(w),
             |w: &mut Vec<u8>| queue_id.encode(w),
-            |w: &mut Vec<u8>| encode_opt_str(w, routing_key)
+            |w: &mut Vec<u8>| encode_opt_str(w, routing_key),
+            |w: &mut Vec<u8>| false.encode(w),
+            |w: &mut Vec<u8>| encode_opt_str(w, None),
+            |w: &mut Vec<u8>| encode_opt_u32(w, None)
+        )
+    }
+
+    pub fn create_binding_with_opts(
+        exchange_id: u64,
+        queue_id: u64,
+        routing_key: Option<&str>,
+        no_local: bool,
+        shared_group: Option<&str>,
+        subscription_id: Option<u32>,
+    ) -> Self {
+        build_cmd!(
+            Self::TAG_CREATE_BINDING,
+            |w: &mut Vec<u8>| exchange_id.encode(w),
+            |w: &mut Vec<u8>| queue_id.encode(w),
+            |w: &mut Vec<u8>| encode_opt_str(w, routing_key),
+            |w: &mut Vec<u8>| no_local.encode(w),
+            |w: &mut Vec<u8>| encode_opt_str(w, shared_group),
+            |w: &mut Vec<u8>| encode_opt_u32(w, subscription_id)
         )
     }
 
@@ -1261,6 +1312,193 @@ impl MqCommand {
             now_ms.encode(w)
         })
     }
+
+    // -- MQTT Optimizations --
+
+    pub fn set_retained(exchange_id: u64, routing_key: &str, message: &Bytes) -> Self {
+        build_cmd!(
+            Self::TAG_SET_RETAINED,
+            |w: &mut Vec<u8>| exchange_id.encode(w),
+            |w: &mut Vec<u8>| routing_key.to_string().encode(w),
+            |w: &mut Vec<u8>| encode_bytes(w, message)
+        )
+    }
+
+    pub fn delete_retained(exchange_id: u64, routing_key: &str) -> Self {
+        build_cmd!(
+            Self::TAG_DELETE_RETAINED,
+            |w: &mut Vec<u8>| exchange_id.encode(w),
+            |w: &mut Vec<u8>| routing_key.to_string().encode(w)
+        )
+    }
+
+    pub fn get_retained(exchange_id: u64, topic_filter: &str) -> Self {
+        build_cmd!(
+            Self::TAG_GET_RETAINED,
+            |w: &mut Vec<u8>| exchange_id.encode(w),
+            |w: &mut Vec<u8>| topic_filter.to_string().encode(w)
+        )
+    }
+
+    pub fn set_will(
+        consumer_id: u64,
+        exchange_id: u64,
+        delay_secs: u32,
+        qos: u8,
+        retain: bool,
+        routing_key: &str,
+        message: &Bytes,
+    ) -> Self {
+        build_cmd!(
+            Self::TAG_SET_WILL,
+            |w: &mut Vec<u8>| consumer_id.encode(w),
+            |w: &mut Vec<u8>| exchange_id.encode(w),
+            |w: &mut Vec<u8>| delay_secs.encode(w),
+            |w: &mut Vec<u8>| qos.encode(w),
+            |w: &mut Vec<u8>| (retain as u8).encode(w),
+            |w: &mut Vec<u8>| routing_key.to_string().encode(w),
+            |w: &mut Vec<u8>| encode_bytes(w, message)
+        )
+    }
+
+    pub fn clear_will(consumer_id: u64) -> Self {
+        build_cmd!(Self::TAG_CLEAR_WILL, |w: &mut Vec<u8>| consumer_id
+            .encode(w))
+    }
+
+    pub fn mark_received(queue_id: u64, message_ids: &[u64]) -> Self {
+        build_cmd!(
+            Self::TAG_MARK_RECEIVED,
+            |w: &mut Vec<u8>| queue_id.encode(w),
+            |w: &mut Vec<u8>| encode_vec_u64(w, message_ids)
+        )
+    }
+
+    pub fn mark_released(queue_id: u64, message_ids: &[u64]) -> Self {
+        build_cmd!(
+            Self::TAG_MARK_RELEASED,
+            |w: &mut Vec<u8>| queue_id.encode(w),
+            |w: &mut Vec<u8>| encode_vec_u64(w, message_ids)
+        )
+    }
+
+    pub fn persist_session(
+        consumer_id: u64,
+        client_id: &str,
+        session_expiry_secs: u32,
+        subscription_data: &Bytes,
+        inbound_qos_inflight: u32,
+        outbound_qos1_count: u32,
+        remaining_quota: u64,
+    ) -> Self {
+        build_cmd!(
+            Self::TAG_PERSIST_SESSION,
+            |w: &mut Vec<u8>| consumer_id.encode(w),
+            |w: &mut Vec<u8>| client_id.to_string().encode(w),
+            |w: &mut Vec<u8>| session_expiry_secs.encode(w),
+            |w: &mut Vec<u8>| encode_bytes(w, subscription_data),
+            |w: &mut Vec<u8>| inbound_qos_inflight.encode(w),
+            |w: &mut Vec<u8>| outbound_qos1_count.encode(w),
+            |w: &mut Vec<u8>| remaining_quota.encode(w)
+        )
+    }
+
+    pub fn restore_session(client_id: &str) -> Self {
+        build_cmd!(Self::TAG_RESTORE_SESSION, |w: &mut Vec<u8>| client_id
+            .to_string()
+            .encode(w))
+    }
+
+    pub fn expire_sessions(now_ms: u64) -> Self {
+        build_cmd!(Self::TAG_EXPIRE_SESSIONS, |w: &mut Vec<u8>| now_ms
+            .encode(w))
+    }
+
+    pub fn multi_deliver(consumer_id: u64, queues: &[(u64, u32)]) -> Self {
+        let mut buf = Vec::new();
+        Self::TAG_MULTI_DELIVER.encode(&mut buf).unwrap();
+        consumer_id.encode(&mut buf).unwrap();
+        (queues.len() as u32).encode(&mut buf).unwrap();
+        for &(queue_id, max_count) in queues {
+            queue_id.encode(&mut buf).unwrap();
+            max_count.encode(&mut buf).unwrap();
+        }
+        MqCommand {
+            buf: Bytes::from(buf),
+        }
+    }
+
+    pub fn multi_ack(queues: &[(u64, &[u64])]) -> Self {
+        let mut buf = Vec::new();
+        Self::TAG_MULTI_ACK.encode(&mut buf).unwrap();
+        (queues.len() as u32).encode(&mut buf).unwrap();
+        for &(queue_id, ref message_ids) in queues {
+            queue_id.encode(&mut buf).unwrap();
+            encode_vec_u64(&mut buf, message_ids).unwrap();
+        }
+        MqCommand {
+            buf: Bytes::from(buf),
+        }
+    }
+
+    // -- Phase 2: Topic Aliases --
+
+    pub fn set_topic_alias(consumer_id: u64, alias: u16, topic_name: &str) -> Self {
+        build_cmd!(
+            Self::TAG_SET_TOPIC_ALIAS,
+            |w: &mut Vec<u8>| consumer_id.encode(w),
+            |w: &mut Vec<u8>| alias.encode(w),
+            |w: &mut Vec<u8>| topic_name.to_string().encode(w)
+        )
+    }
+
+    pub fn clear_topic_aliases(consumer_id: u64) -> Self {
+        build_cmd!(Self::TAG_CLEAR_TOPIC_ALIASES, |w: &mut Vec<u8>| consumer_id
+            .encode(w))
+    }
+
+    // -- Phase 2: Will Delay Cancellation --
+
+    pub fn cancel_pending_will(client_id: &str) -> Self {
+        build_cmd!(Self::TAG_CANCEL_PENDING_WILL, |w: &mut Vec<u8>| client_id
+            .to_string()
+            .encode(w))
+    }
+
+    pub fn fire_pending_wills(now_ms: u64) -> Self {
+        build_cmd!(Self::TAG_FIRE_PENDING_WILLS, |w: &mut Vec<u8>| now_ms
+            .encode(w))
+    }
+
+    // -- Phase 2: Publisher Session Dedup --
+
+    pub fn register_publisher_session(consumer_id: u64, session_id: &str) -> Self {
+        build_cmd!(
+            Self::TAG_REGISTER_PUBLISHER_SESSION,
+            |w: &mut Vec<u8>| consumer_id.encode(w),
+            |w: &mut Vec<u8>| session_id.to_string().encode(w)
+        )
+    }
+
+    /// Register a QoS 2 inbound packet (PUBLISH QoS 2 received).
+    /// State 0 = RECEIVED (waiting for PUBREL).
+    pub fn qos2_register_inbound(consumer_id: u64, packet_id: u16) -> Self {
+        build_cmd!(
+            Self::TAG_QOS2_REGISTER_INBOUND,
+            |w: &mut Vec<u8>| consumer_id.encode(w),
+            |w: &mut Vec<u8>| packet_id.encode(w)
+        )
+    }
+
+    /// Complete a QoS 2 inbound flow (PUBREL received → PUBCOMP sent).
+    /// Removes the packet_id from the dedup map.
+    pub fn qos2_complete_inbound(consumer_id: u64, packet_id: u16) -> Self {
+        build_cmd!(
+            Self::TAG_QOS2_COMPLETE_INBOUND,
+            |w: &mut Vec<u8>| consumer_id.encode(w),
+            |w: &mut Vec<u8>| packet_id.encode(w)
+        )
+    }
 }
 
 // =============================================================================
@@ -1454,6 +1692,92 @@ impl MqCommand {
         }
     }
 
+    // -- MQTT Optimization accessors --
+
+    pub fn as_set_retained(&self) -> CmdSetRetained {
+        CmdSetRetained {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_delete_retained(&self) -> CmdDeleteRetained {
+        CmdDeleteRetained {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_get_retained(&self) -> CmdGetRetained {
+        CmdGetRetained {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_set_will(&self) -> CmdSetWill {
+        CmdSetWill {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_mark_received(&self) -> CmdMarkReceived {
+        CmdMarkReceived {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_mark_released(&self) -> CmdMarkReleased {
+        CmdMarkReleased {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_persist_session(&self) -> CmdPersistSession {
+        CmdPersistSession {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_restore_session(&self) -> CmdRestoreSession {
+        CmdRestoreSession {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_multi_deliver(&self) -> CmdMultiDeliver {
+        CmdMultiDeliver {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_multi_ack(&self) -> CmdMultiAck {
+        CmdMultiAck {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_set_topic_alias(&self) -> CmdSetTopicAlias {
+        CmdSetTopicAlias {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_cancel_pending_will(&self) -> CmdCancelPendingWill {
+        CmdCancelPendingWill {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_register_publisher_session(&self) -> CmdRegisterPublisherSession {
+        CmdRegisterPublisherSession {
+            buf: self.buf.clone(),
+        }
+    }
+
+    pub fn as_qos2_inbound(&self) -> CmdQos2Inbound {
+        CmdQos2Inbound {
+            buf: self.buf.clone(),
+        }
+    }
+
     // -- Message extraction helpers --
 
     /// For `Publish` or `PublishToExchange`: iterate messages zero-copy.
@@ -1623,7 +1947,7 @@ impl CmdAck {
         u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
     }
 
-    pub fn message_ids(&self) -> Vec<u64> {
+    pub fn message_ids(&self) -> SmallVec<[u64; 8]> {
         let mut cursor = std::io::Cursor::new(&self.buf[9..]);
         decode_vec_u64(&mut cursor).unwrap_or_default()
     }
@@ -1658,7 +1982,7 @@ impl CmdNack {
         u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
     }
 
-    pub fn message_ids(&self) -> Vec<u64> {
+    pub fn message_ids(&self) -> SmallVec<[u64; 8]> {
         let mut cursor = std::io::Cursor::new(&self.buf[9..]);
         decode_vec_u64(&mut cursor).unwrap_or_default()
     }
@@ -1674,7 +1998,7 @@ impl CmdExtendVisibility {
         u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
     }
 
-    pub fn message_ids(&self) -> Vec<u64> {
+    pub fn message_ids(&self) -> SmallVec<[u64; 8]> {
         let mut cursor = std::io::Cursor::new(&self.buf[9..]);
         decode_vec_u64(&mut cursor).unwrap_or_default()
     }
@@ -1698,7 +2022,7 @@ impl CmdTimeoutExpired {
         u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
     }
 
-    pub fn message_ids(&self) -> Vec<u64> {
+    pub fn message_ids(&self) -> SmallVec<[u64; 8]> {
         let mut cursor = std::io::Cursor::new(&self.buf[9..]);
         decode_vec_u64(&mut cursor).unwrap_or_default()
     }
@@ -1718,7 +2042,7 @@ impl CmdPublishToDlq {
         u64::from_le_bytes(self.buf[9..17].try_into().unwrap())
     }
 
-    pub fn dead_letter_ids(&self) -> Vec<u64> {
+    pub fn dead_letter_ids(&self) -> SmallVec<[u64; 8]> {
         let mut cursor = std::io::Cursor::new(&self.buf[17..]);
         decode_vec_u64(&mut cursor).unwrap_or_default()
     }
@@ -1747,7 +2071,7 @@ impl CmdExpirePendingMessages {
         u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
     }
 
-    pub fn message_ids(&self) -> Vec<u64> {
+    pub fn message_ids(&self) -> SmallVec<[u64; 8]> {
         let mut cursor = std::io::Cursor::new(&self.buf[9..]);
         decode_vec_u64(&mut cursor).unwrap_or_default()
     }
@@ -1789,6 +2113,32 @@ impl CmdCreateBinding {
     pub fn routing_key(&self) -> Option<String> {
         let mut cursor = std::io::Cursor::new(&self.buf[17..]);
         decode_opt_string(&mut cursor).unwrap_or(None)
+    }
+
+    pub fn no_local(&self) -> bool {
+        let mut cursor = std::io::Cursor::new(&self.buf[17..]);
+        let _ = decode_opt_string(&mut cursor); // skip routing_key
+        let pos = cursor.position() as usize + 17;
+        if pos < self.buf.len() {
+            self.buf[pos] != 0
+        } else {
+            false
+        }
+    }
+
+    pub fn shared_group(&self) -> Option<String> {
+        let mut cursor = std::io::Cursor::new(&self.buf[17..]);
+        let _ = decode_opt_string(&mut cursor); // skip routing_key
+        let _ = u8::decode(&mut cursor); // skip no_local
+        decode_opt_string(&mut cursor).unwrap_or(None)
+    }
+
+    pub fn subscription_id(&self) -> Option<u32> {
+        let mut cursor = std::io::Cursor::new(&self.buf[17..]);
+        let _ = decode_opt_string(&mut cursor); // skip routing_key
+        let _ = u8::decode(&mut cursor); // skip no_local
+        let _ = decode_opt_string(&mut cursor); // skip shared_group
+        decode_opt_u32(&mut cursor).unwrap_or(None)
     }
 }
 
@@ -2700,6 +3050,127 @@ pub fn fmt_mq_command(cmd: &MqCommand, f: &mut std::fmt::Formatter<'_>) -> std::
         MqCommand::TAG_EXPIRE_GROUP_SESSIONS => {
             write!(f, "ExpireGroupSessions(now={})", cmd.field_u64(1))
         }
+        MqCommand::TAG_SET_RETAINED => {
+            let v = cmd.as_set_retained();
+            write!(
+                f,
+                "SetRetained(exchange={}, rk={})",
+                v.exchange_id(),
+                v.routing_key()
+            )
+        }
+        MqCommand::TAG_DELETE_RETAINED => {
+            let v = cmd.as_delete_retained();
+            write!(
+                f,
+                "DeleteRetained(exchange={}, rk={})",
+                v.exchange_id(),
+                v.routing_key()
+            )
+        }
+        MqCommand::TAG_GET_RETAINED => {
+            let v = cmd.as_get_retained();
+            write!(
+                f,
+                "GetRetained(exchange={}, filter={})",
+                v.exchange_id(),
+                v.topic_filter()
+            )
+        }
+        MqCommand::TAG_SET_WILL => {
+            let v = cmd.as_set_will();
+            write!(
+                f,
+                "SetWill(consumer={}, exchange={})",
+                v.consumer_id(),
+                v.exchange_id()
+            )
+        }
+        MqCommand::TAG_CLEAR_WILL => {
+            write!(f, "ClearWill(consumer={})", cmd.field_u64(1))
+        }
+        MqCommand::TAG_MARK_RECEIVED => {
+            write!(f, "MarkReceived(queue={})", cmd.field_u64(1))
+        }
+        MqCommand::TAG_MARK_RELEASED => {
+            write!(f, "MarkReleased(queue={})", cmd.field_u64(1))
+        }
+        MqCommand::TAG_PERSIST_SESSION => {
+            let v = cmd.as_persist_session();
+            write!(
+                f,
+                "PersistSession(consumer={}, client={})",
+                v.consumer_id(),
+                v.client_id()
+            )
+        }
+        MqCommand::TAG_RESTORE_SESSION => {
+            let v = cmd.as_restore_session();
+            write!(f, "RestoreSession(client={})", v.client_id())
+        }
+        MqCommand::TAG_EXPIRE_SESSIONS => {
+            write!(f, "ExpireSessions(now={})", cmd.field_u64(1))
+        }
+        MqCommand::TAG_MULTI_DELIVER => {
+            let v = cmd.as_multi_deliver();
+            write!(
+                f,
+                "MultiDeliver(consumer={}, queues={})",
+                v.consumer_id(),
+                v.queues().len()
+            )
+        }
+        MqCommand::TAG_MULTI_ACK => {
+            let v = cmd.as_multi_ack();
+            write!(f, "MultiAck(queues={})", v.queues().len())
+        }
+        MqCommand::TAG_SET_TOPIC_ALIAS => {
+            let v = cmd.as_set_topic_alias();
+            write!(
+                f,
+                "SetTopicAlias(consumer={}, alias={}, topic={})",
+                v.consumer_id(),
+                v.alias(),
+                v.topic_name()
+            )
+        }
+        MqCommand::TAG_CLEAR_TOPIC_ALIASES => {
+            write!(f, "ClearTopicAliases(consumer={})", cmd.field_u64(1))
+        }
+        MqCommand::TAG_CANCEL_PENDING_WILL => {
+            let v = cmd.as_cancel_pending_will();
+            write!(f, "CancelPendingWill(client={})", v.client_id())
+        }
+        MqCommand::TAG_FIRE_PENDING_WILLS => {
+            write!(f, "FirePendingWills(now={})", cmd.field_u64(1))
+        }
+        MqCommand::TAG_REGISTER_PUBLISHER_SESSION => {
+            let v = cmd.as_register_publisher_session();
+            write!(
+                f,
+                "RegisterPublisherSession(consumer={}, session={})",
+                v.consumer_id(),
+                v.session_id()
+            )
+        }
+        MqCommand::TAG_QOS2_REGISTER_INBOUND => {
+            let v = cmd.as_qos2_inbound();
+            write!(
+                f,
+                "QoS2RegisterInbound(consumer={}, packet={})",
+                v.consumer_id(),
+                v.packet_id()
+            )
+        }
+        MqCommand::TAG_QOS2_COMPLETE_INBOUND => {
+            let v = cmd.as_qos2_inbound();
+            write!(
+                f,
+                "QoS2CompleteInbound(consumer={}, packet={})",
+                v.consumer_id(),
+                v.packet_id()
+            )
+        }
         _ => write!(f, "MqCommand(tag={})", cmd.tag()),
     }
 }
@@ -2740,7 +3211,7 @@ impl Encode for MqResponse {
             MqResponse::BatchResponse(resps) => {
                 TAG_RESP_BATCH.encode(w)?;
                 (resps.len() as u32).encode(w)?;
-                for resp in resps {
+                for resp in (*resps).iter() {
                     resp.encode(w)?;
                 }
                 Ok(())
@@ -2783,6 +3254,59 @@ impl Encode for MqResponse {
                 encode_vec_u64(w, dead_letter_ids)?;
                 dlq_topic_id.encode(w)
             }
+            MqResponse::RetainedMessages { messages } => {
+                TAG_RESP_RETAINED_MESSAGES.encode(w)?;
+                (messages.len() as u32).encode(w)?;
+                for entry in messages {
+                    encode_bytes(w, &entry.routing_key)?;
+                    encode_bytes(w, &entry.message)?;
+                }
+                Ok(())
+            }
+            MqResponse::WillPending {
+                consumer_id,
+                delay_secs,
+            } => {
+                TAG_RESP_WILL_PENDING.encode(w)?;
+                consumer_id.encode(w)?;
+                delay_secs.encode(w)
+            }
+            MqResponse::SessionRestored {
+                consumer_id,
+                session_expiry_secs,
+                subscription_data,
+            } => {
+                TAG_RESP_SESSION_RESTORED.encode(w)?;
+                consumer_id.encode(w)?;
+                session_expiry_secs.encode(w)?;
+                encode_bytes(w, subscription_data)
+            }
+            MqResponse::SessionNotFound => TAG_RESP_SESSION_NOT_FOUND.encode(w),
+            MqResponse::MultiMessages { queues } => {
+                TAG_RESP_MULTI_MESSAGES.encode(w)?;
+                (queues.len() as u32).encode(w)?;
+                for (queue_id, messages) in queues {
+                    queue_id.encode(w)?;
+                    (messages.len() as u32).encode(w)?;
+                    for msg in messages.iter() {
+                        msg.encode(w)?;
+                    }
+                }
+                Ok(())
+            }
+            MqResponse::TopicAliases { aliases } => {
+                TAG_RESP_TOPIC_ALIASES.encode(w)?;
+                (aliases.len() as u32).encode(w)?;
+                for a in aliases {
+                    a.alias.encode(w)?;
+                    a.topic_name.encode(w)?;
+                }
+                Ok(())
+            }
+            MqResponse::WillsFired { count } => {
+                TAG_RESP_WILLS_FIRED.encode(w)?;
+                count.encode(w)
+            }
         }
     }
 
@@ -2819,6 +3343,30 @@ impl Encode for MqResponse {
             MqResponse::DeadLettered {
                 dead_letter_ids, ..
             } => 4 + dead_letter_ids.len() * 8 + 8,
+            MqResponse::RetainedMessages { messages } => {
+                4 + messages
+                    .iter()
+                    .map(|e| 4 + e.routing_key.len() + 4 + e.message.len())
+                    .sum::<usize>()
+            }
+            MqResponse::WillPending { .. } => 8 + 4,
+            MqResponse::SessionRestored {
+                subscription_data, ..
+            } => 8 + 4 + 4 + subscription_data.len(),
+            MqResponse::SessionNotFound => 0,
+            MqResponse::MultiMessages { queues } => {
+                4 + queues
+                    .iter()
+                    .map(|(_, msgs)| 8 + 4 + msgs.iter().map(|m| m.encoded_size()).sum::<usize>())
+                    .sum::<usize>()
+            }
+            MqResponse::TopicAliases { aliases } => {
+                4 + aliases
+                    .iter()
+                    .map(|a| 2 + a.topic_name.encoded_size())
+                    .sum::<usize>()
+            }
+            MqResponse::WillsFired { .. } => 4,
         }
     }
 }
@@ -2846,11 +3394,11 @@ impl Decode for MqResponse {
             TAG_RESP_STATS => Ok(MqResponse::Stats(EntityStats::decode(r)?)),
             TAG_RESP_BATCH => {
                 let count = u32::decode(r)? as usize;
-                let mut resps = Vec::with_capacity(count.min(256));
+                let mut resps = SmallVec::with_capacity(count.min(256));
                 for _ in 0..count {
                     resps.push(MqResponse::decode(r)?);
                 }
-                Ok(MqResponse::BatchResponse(resps))
+                Ok(MqResponse::BatchResponse(Box::new(resps)))
             }
             TAG_RESP_GROUP_JOINED => {
                 let generation = i32::decode(r)?;
@@ -2888,6 +3436,57 @@ impl Decode for MqResponse {
                 dead_letter_ids: decode_vec_u64(r)?,
                 dlq_topic_id: u64::decode(r)?,
             }),
+            TAG_RESP_RETAINED_MESSAGES => {
+                let count = u32::decode(r)? as usize;
+                let mut messages = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    let routing_key = decode_bytes_owned(r)?;
+                    let message = decode_bytes_owned(r)?;
+                    messages.push(RetainedEntry {
+                        routing_key,
+                        message,
+                    });
+                }
+                Ok(MqResponse::RetainedMessages { messages })
+            }
+            TAG_RESP_WILL_PENDING => Ok(MqResponse::WillPending {
+                consumer_id: u64::decode(r)?,
+                delay_secs: u32::decode(r)?,
+            }),
+            TAG_RESP_SESSION_RESTORED => Ok(MqResponse::SessionRestored {
+                consumer_id: u64::decode(r)?,
+                session_expiry_secs: u32::decode(r)?,
+                subscription_data: decode_bytes_owned(r)?,
+            }),
+            TAG_RESP_SESSION_NOT_FOUND => Ok(MqResponse::SessionNotFound),
+            TAG_RESP_MULTI_MESSAGES => {
+                let count = u32::decode(r)? as usize;
+                let mut queues = Vec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    let queue_id = u64::decode(r)?;
+                    let msg_count = u32::decode(r)? as usize;
+                    let mut messages = SmallVec::with_capacity(msg_count.min(256));
+                    for _ in 0..msg_count {
+                        messages.push(DeliveredMessage::decode(r)?);
+                    }
+                    queues.push((queue_id, messages));
+                }
+                Ok(MqResponse::MultiMessages { queues })
+            }
+            TAG_RESP_TOPIC_ALIASES => {
+                let count = u32::decode(r)? as usize;
+                let mut aliases = Vec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    aliases.push(TopicAliasEntry {
+                        alias: u16::decode(r)?,
+                        topic_name: String::decode(r)?,
+                    });
+                }
+                Ok(MqResponse::TopicAliases { aliases })
+            }
+            TAG_RESP_WILLS_FIRED => Ok(MqResponse::WillsFired {
+                count: u32::decode(r)?,
+            }),
             t => Err(CodecError::InvalidDiscriminant(t)),
         }
     }
@@ -2896,6 +3495,325 @@ impl Decode for MqResponse {
 impl BorrowPayload for MqResponse {
     fn payload_bytes(&self) -> &[u8] {
         &[]
+    }
+}
+
+// =============================================================================
+// MQTT Optimization View Structs
+// =============================================================================
+
+pub struct CmdSetRetained {
+    buf: Bytes,
+}
+
+impl CmdSetRetained {
+    pub fn exchange_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn routing_key(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[13..13 + len]).unwrap_or("")
+    }
+
+    pub fn message(&self) -> Bytes {
+        let rk_len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        let offset = 13 + rk_len;
+        let msg_len = u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+        self.buf.slice(offset + 4..offset + 4 + msg_len)
+    }
+}
+
+pub struct CmdDeleteRetained {
+    buf: Bytes,
+}
+
+impl CmdDeleteRetained {
+    pub fn exchange_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn routing_key(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[13..13 + len]).unwrap_or("")
+    }
+}
+
+pub struct CmdGetRetained {
+    buf: Bytes,
+}
+
+impl CmdGetRetained {
+    pub fn exchange_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn topic_filter(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[13..13 + len]).unwrap_or("")
+    }
+}
+
+pub struct CmdSetWill {
+    buf: Bytes,
+}
+
+impl CmdSetWill {
+    pub fn consumer_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn exchange_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[9..17].try_into().unwrap())
+    }
+
+    pub fn delay_secs(&self) -> u32 {
+        u32::from_le_bytes(self.buf[17..21].try_into().unwrap())
+    }
+
+    pub fn qos(&self) -> u8 {
+        self.buf[21]
+    }
+
+    pub fn retain(&self) -> bool {
+        self.buf[22] != 0
+    }
+
+    pub fn routing_key(&self) -> String {
+        let len = u32::from_le_bytes(self.buf[23..27].try_into().unwrap()) as usize;
+        String::from_utf8(self.buf[27..27 + len].to_vec()).unwrap_or_default()
+    }
+
+    pub fn message(&self) -> Bytes {
+        let rk_len = u32::from_le_bytes(self.buf[23..27].try_into().unwrap()) as usize;
+        let offset = 27 + rk_len;
+        let msg_len = u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+        self.buf.slice(offset + 4..offset + 4 + msg_len)
+    }
+}
+
+pub struct CmdMarkReceived {
+    buf: Bytes,
+}
+
+impl CmdMarkReceived {
+    pub fn queue_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn message_ids(&self) -> SmallVec<[u64; 8]> {
+        let mut cursor = std::io::Cursor::new(&self.buf[9..]);
+        decode_vec_u64(&mut cursor).unwrap_or_default()
+    }
+}
+
+pub struct CmdMarkReleased {
+    buf: Bytes,
+}
+
+impl CmdMarkReleased {
+    pub fn queue_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn message_ids(&self) -> SmallVec<[u64; 8]> {
+        let mut cursor = std::io::Cursor::new(&self.buf[9..]);
+        decode_vec_u64(&mut cursor).unwrap_or_default()
+    }
+}
+
+pub struct CmdPersistSession {
+    buf: Bytes,
+}
+
+impl CmdPersistSession {
+    pub fn consumer_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn client_id(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[13..13 + len]).unwrap_or("")
+    }
+
+    pub fn session_expiry_secs(&self) -> u32 {
+        let cid_len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        let offset = 13 + cid_len;
+        u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    pub fn subscription_data(&self) -> Bytes {
+        let cid_len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        let offset = 13 + cid_len + 4; // skip client_id + session_expiry_secs
+        let data_len =
+            u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+        self.buf.slice(offset + 4..offset + 4 + data_len)
+    }
+
+    /// Offset past subscription_data (after tag + consumer_id + client_id + session_expiry + sub_data).
+    fn flow_control_offset(&self) -> usize {
+        let cid_len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        let sub_offset = 13 + cid_len + 4;
+        let data_len =
+            u32::from_le_bytes(self.buf[sub_offset..sub_offset + 4].try_into().unwrap()) as usize;
+        sub_offset + 4 + data_len
+    }
+
+    pub fn inbound_qos_inflight(&self) -> u32 {
+        let off = self.flow_control_offset();
+        if off + 4 <= self.buf.len() {
+            u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    pub fn outbound_qos1_count(&self) -> u32 {
+        let off = self.flow_control_offset() + 4;
+        if off + 4 <= self.buf.len() {
+            u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    pub fn remaining_quota(&self) -> u64 {
+        let off = self.flow_control_offset() + 8;
+        if off + 8 <= self.buf.len() {
+            u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+}
+
+pub struct CmdRestoreSession {
+    buf: Bytes,
+}
+
+impl CmdRestoreSession {
+    pub fn client_id(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[1..5].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[5..5 + len]).unwrap_or("")
+    }
+}
+
+pub struct CmdMultiDeliver {
+    buf: Bytes,
+}
+
+impl CmdMultiDeliver {
+    pub fn consumer_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn queues(&self) -> SmallVec<[(u64, u32); 4]> {
+        let mut offset = 9;
+        let count = u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let mut result = SmallVec::with_capacity(count);
+        for _ in 0..count {
+            let queue_id = u64::from_le_bytes(self.buf[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            let max_count = u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            result.push((queue_id, max_count));
+        }
+        result
+    }
+}
+
+pub struct CmdMultiAck {
+    buf: Bytes,
+}
+
+impl CmdMultiAck {
+    pub fn queues(&self) -> SmallVec<[(u64, SmallVec<[u64; 8]>); 4]> {
+        let mut offset = 1;
+        let count = u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let mut result = SmallVec::with_capacity(count);
+        for _ in 0..count {
+            let queue_id = u64::from_le_bytes(self.buf[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            let id_count =
+                u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let mut ids = SmallVec::with_capacity(id_count);
+            for _ in 0..id_count {
+                ids.push(u64::from_le_bytes(
+                    self.buf[offset..offset + 8].try_into().unwrap(),
+                ));
+                offset += 8;
+            }
+            result.push((queue_id, ids));
+        }
+        result
+    }
+}
+
+// =============================================================================
+// Phase 2 MQTT view structs
+// =============================================================================
+
+pub struct CmdSetTopicAlias {
+    buf: Bytes,
+}
+
+impl CmdSetTopicAlias {
+    pub fn consumer_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn alias(&self) -> u16 {
+        u16::from_le_bytes(self.buf[9..11].try_into().unwrap())
+    }
+
+    pub fn topic_name(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[11..15].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[15..15 + len]).unwrap()
+    }
+}
+
+pub struct CmdCancelPendingWill {
+    buf: Bytes,
+}
+
+impl CmdCancelPendingWill {
+    pub fn client_id(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[1..5].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[5..5 + len]).unwrap()
+    }
+}
+
+pub struct CmdRegisterPublisherSession {
+    buf: Bytes,
+}
+
+impl CmdRegisterPublisherSession {
+    pub fn consumer_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn session_id(&self) -> &str {
+        let len = u32::from_le_bytes(self.buf[9..13].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[13..13 + len]).unwrap()
+    }
+}
+
+/// Zero-copy view over a QoS2RegisterInbound or QoS2CompleteInbound command.
+/// Wire format: [tag:1][consumer_id:8][packet_id:2]
+pub struct CmdQos2Inbound {
+    buf: Bytes,
+}
+
+impl CmdQos2Inbound {
+    pub fn consumer_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[1..9].try_into().unwrap())
+    }
+
+    pub fn packet_id(&self) -> u16 {
+        u16::from_le_bytes(self.buf[9..11].try_into().unwrap())
     }
 }
 
@@ -3047,7 +3965,7 @@ mod tests {
                 count: 3,
             },
             MqResponse::DeadLettered {
-                dead_letter_ids: vec![10, 20],
+                dead_letter_ids: smallvec::smallvec![10, 20],
                 dlq_topic_id: 99,
             },
         ];
@@ -3160,7 +4078,7 @@ mod tests {
         let cmd = MqCommand::ack(5, &[1, 2, 3], Some(&Bytes::from_static(b"resp")));
         let v = cmd.as_ack();
         assert_eq!(v.queue_id(), 5);
-        assert_eq!(v.message_ids(), vec![1, 2, 3]);
+        assert_eq!(v.message_ids().as_slice(), &[1, 2, 3]);
         assert_eq!(v.response(), Some(Bytes::from_static(b"resp")));
 
         let cmd2 = MqCommand::ack(5, &[1], None);
@@ -3173,7 +4091,7 @@ mod tests {
         let cmd = MqCommand::nack(7, &[10, 20]);
         let v = cmd.as_nack();
         assert_eq!(v.queue_id(), 7);
-        assert_eq!(v.message_ids(), vec![10, 20]);
+        assert_eq!(v.message_ids().as_slice(), &[10, 20]);
     }
 
     #[test]

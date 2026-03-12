@@ -78,6 +78,9 @@ pub struct DedupWindow {
     pub window_secs: u64,
     /// timestamp_bucket → set of dedup keys
     pub buckets: BTreeMap<u64, HashSet<Bytes>>,
+    /// Flat O(1) lookup mirror of all keys across all buckets.
+    #[serde(skip)]
+    lookup: HashSet<Bytes>,
 }
 
 impl DedupWindow {
@@ -85,10 +88,16 @@ impl DedupWindow {
         Self {
             window_secs,
             buckets: BTreeMap::new(),
+            lookup: HashSet::new(),
         }
     }
 
     pub fn contains(&self, key: &Bytes, current_time: u64) -> bool {
+        // Fast-path: O(1) negative lookup avoids scanning buckets entirely
+        if !self.lookup.contains(key) {
+            return false;
+        }
+        // Key exists somewhere; verify it's within the active time window
         let cutoff = current_time.saturating_sub(self.window_secs);
         for (_bucket_time, keys) in self.buckets.range(cutoff..) {
             if keys.contains(key) {
@@ -101,11 +110,21 @@ impl DedupWindow {
     pub fn insert(&mut self, key: Bytes, current_time: u64) {
         // Bucket by seconds
         let bucket = current_time;
+        self.lookup.insert(key.clone());
         self.buckets.entry(bucket).or_default().insert(key);
     }
 
     pub fn prune(&mut self, before_timestamp: u64) {
-        self.buckets = self.buckets.split_off(&before_timestamp);
+        let removed = self.buckets.split_off(&before_timestamp);
+        // Everything left in self.buckets is the old (pruned) portion.
+        // Remove pruned keys from the lookup set.
+        for (_ts, keys) in &self.buckets {
+            for k in keys {
+                self.lookup.remove(k);
+            }
+        }
+        // Keep only the entries >= before_timestamp
+        self.buckets = removed;
     }
 
     pub fn snapshot_entries(&self) -> Vec<(u64, Vec<Bytes>)> {
@@ -119,6 +138,7 @@ impl DedupWindow {
         for (ts, keys) in entries {
             let set = self.buckets.entry(ts).or_default();
             for k in keys {
+                self.lookup.insert(k.clone());
                 set.insert(k);
             }
         }
@@ -154,13 +174,13 @@ pub struct QueueState {
     dedup: Mutex<DedupWindow>,
     /// In-flight deadline index: deadline_ms → set of message_ids.
     /// Enables O(log n) expired message lookups instead of O(n) full scan.
-    in_flight_deadlines: Mutex<BTreeMap<u64, Vec<u64>>>,
+    in_flight_deadlines: Mutex<BTreeMap<u64, SmallVec<[u64; 4]>>>,
     /// Consumer in-flight index: consumer_id → set of message_ids.
     /// Enables O(1) lookup on consumer disconnect instead of O(n) full scan.
-    consumer_in_flight: DashMap<u64, Vec<u64>>,
+    consumer_in_flight: DashMap<u64, SmallVec<[u64; 8]>>,
     /// Expiry deadline index: expires_at_ms → set of message_ids.
     /// Enables O(log n + k) scanning for messages that have exceeded their TTL.
-    expires_at_deadlines: Mutex<BTreeMap<u64, Vec<u64>>>,
+    expires_at_deadlines: Mutex<BTreeMap<u64, SmallVec<[u64; 4]>>>,
 
     /// Cached min message_id for purge floor.
     /// `MIN_DIRTY` = needs recompute, `MIN_NONE` = no messages, else = cached value.
@@ -310,7 +330,10 @@ impl QueueState {
 
         if state == MessageState::Pending {
             self.pending.lock().insert((priority, msg_id), ());
-        } else if state == MessageState::InFlight {
+        } else if matches!(
+            state,
+            MessageState::InFlight | MessageState::Received | MessageState::Released
+        ) {
             if let Some(deadline) = visibility_deadline {
                 self.in_flight_deadlines
                     .lock()
@@ -514,7 +537,7 @@ impl QueueState {
                 self.pending_count.fetch_sub(1, Ordering::Relaxed);
                 self.pending_bytes
                     .fetch_sub(meta.value_len as u64, Ordering::Relaxed);
-                self.remove_from_expires_index_locked(meta.expires_at, msg_id);
+                self.remove_from_expires_index(meta.expires_at, msg_id);
                 // Invalidate cached min if this could have been it
                 let cached = self.cached_min_message_id.load(Ordering::Relaxed);
                 if cached != MIN_DIRTY && cached != MIN_NONE && msg_id <= cached {
@@ -563,32 +586,59 @@ impl QueueState {
 
     pub fn apply_ack(&self, message_ids: &[u64]) {
         let mut count = 0u64;
+        let mut deadlines_guard = self.in_flight_deadlines.lock();
+        let mut expires_guard = self.expires_at_deadlines.lock();
         for &msg_id in message_ids {
             if let Some((_, meta)) = self.messages.remove(&msg_id) {
-                if meta.state == MessageState::InFlight {
-                    self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
-                    self.in_flight_bytes
-                        .fetch_sub(meta.value_len as u64, Ordering::Relaxed);
-                    self.remove_from_deadline_index(meta.visibility_deadline, msg_id);
-                    self.remove_from_consumer_index(meta.consumer_id, msg_id);
-                    self.remove_from_expires_index(meta.expires_at, msg_id);
-                    count += 1;
-
-                    // Invalidate cached min if this could have been it
-                    let cached = self.cached_min_message_id.load(Ordering::Relaxed);
-                    if cached != MIN_DIRTY && cached != MIN_NONE && msg_id <= cached {
-                        self.cached_min_message_id
-                            .store(MIN_DIRTY, Ordering::Relaxed);
+                match meta.state {
+                    MessageState::InFlight => {
+                        // Still counted as in-flight
+                        self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+                        self.in_flight_bytes
+                            .fetch_sub(meta.value_len as u64, Ordering::Relaxed);
+                        Self::remove_from_deadline_index_locked(
+                            &mut deadlines_guard,
+                            meta.visibility_deadline,
+                            msg_id,
+                        );
+                        self.remove_from_consumer_index(meta.consumer_id, msg_id);
+                        Self::remove_from_expires_index_locked(
+                            &mut expires_guard,
+                            meta.expires_at,
+                            msg_id,
+                        );
+                        count += 1;
                     }
+                    MessageState::Received | MessageState::Released => {
+                        // In-flight count was already decremented in apply_mark_received
+                        self.remove_from_consumer_index(meta.consumer_id, msg_id);
+                        Self::remove_from_expires_index_locked(
+                            &mut expires_guard,
+                            meta.expires_at,
+                            msg_id,
+                        );
+                        count += 1;
+                    }
+                    _ => continue,
+                }
+
+                // Invalidate cached min if this could have been it
+                let cached = self.cached_min_message_id.load(Ordering::Relaxed);
+                if cached != MIN_DIRTY && cached != MIN_NONE && msg_id <= cached {
+                    self.cached_min_message_id
+                        .store(MIN_DIRTY, Ordering::Relaxed);
                 }
             }
         }
+        drop(deadlines_guard);
+        drop(expires_guard);
         self.m_ack_count.increment(count);
     }
 
     pub fn apply_nack(&self, message_ids: &[u64]) {
         let mut count = 0u64;
         let mut pending_guard = self.pending.lock();
+        let mut deadlines_guard = self.in_flight_deadlines.lock();
         for &msg_id in message_ids {
             if let Some(mut meta) = self.messages.get_mut(&msg_id) {
                 if meta.state == MessageState::InFlight {
@@ -605,14 +655,52 @@ impl QueueState {
                     self.in_flight_bytes.fetch_sub(msg_bytes, Ordering::Relaxed);
                     self.pending_bytes.fetch_add(msg_bytes, Ordering::Relaxed);
                     drop(meta);
-                    self.remove_from_deadline_index(old_deadline, msg_id);
+                    Self::remove_from_deadline_index_locked(
+                        &mut deadlines_guard,
+                        old_deadline,
+                        msg_id,
+                    );
                     self.remove_from_consumer_index(old_consumer, msg_id);
                     count += 1;
                 }
             }
         }
         drop(pending_guard);
+        drop(deadlines_guard);
         self.m_nack_count.increment(count);
+    }
+
+    /// QoS 2: Transition InFlight → Received (PUBREC sent).
+    /// The message is no longer considered in-flight for accounting purposes
+    /// (it won't be timed out or re-delivered), but remains in the message
+    /// index until fully acked (PUBCOMP).
+    pub fn apply_mark_received(&self, message_ids: &[u64]) {
+        for &msg_id in message_ids {
+            if let Some(mut meta) = self.messages.get_mut(&msg_id) {
+                if meta.state == MessageState::InFlight {
+                    let msg_bytes = meta.value_len as u64;
+                    let old_deadline = meta.visibility_deadline;
+                    meta.state = MessageState::Received;
+                    meta.visibility_deadline = None;
+                    self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+                    self.in_flight_bytes.fetch_sub(msg_bytes, Ordering::Relaxed);
+                    drop(meta);
+                    self.remove_from_deadline_index(old_deadline, msg_id);
+                }
+            }
+        }
+    }
+
+    /// QoS 2: Transition Received → Released (PUBREL received).
+    /// After this the message can be acked (PUBCOMP).
+    pub fn apply_mark_released(&self, message_ids: &[u64]) {
+        for &msg_id in message_ids {
+            if let Some(mut meta) = self.messages.get_mut(&msg_id) {
+                if meta.state == MessageState::Received {
+                    meta.state = MessageState::Released;
+                }
+            }
+        }
     }
 
     pub fn apply_extend_visibility(&self, message_ids: &[u64], extension_ms: u64) {
@@ -652,6 +740,9 @@ impl QueueState {
 
         for &msg_id in message_ids {
             if let Some(mut meta) = self.messages.get_mut(&msg_id) {
+                // Only timeout InFlight messages; Received/Released (QoS 2) are
+                // exempt from visibility timeout since they've been acknowledged
+                // at the protocol level.
                 if meta.state != MessageState::InFlight {
                     continue;
                 }
@@ -835,21 +926,17 @@ impl QueueState {
     fn remove_from_expires_index(&self, expires_at: Option<u64>, msg_id: u64) {
         if let Some(exp) = expires_at {
             let mut guard = self.expires_at_deadlines.lock();
-            if let Some(ids) = guard.get_mut(&exp) {
-                if let Some(pos) = ids.iter().position(|&id| id == msg_id) {
-                    ids.swap_remove(pos);
-                }
-                if ids.is_empty() {
-                    guard.remove(&exp);
-                }
-            }
+            Self::remove_from_expires_index_locked(&mut guard, Some(exp), msg_id);
         }
     }
 
-    /// Remove from expires index when the lock is already held (during apply_deliver).
-    fn remove_from_expires_index_locked(&self, expires_at: Option<u64>, msg_id: u64) {
+    /// Remove from expires index with an existing lock guard.
+    fn remove_from_expires_index_locked(
+        guard: &mut BTreeMap<u64, SmallVec<[u64; 4]>>,
+        expires_at: Option<u64>,
+        msg_id: u64,
+    ) {
         if let Some(exp) = expires_at {
-            let mut guard = self.expires_at_deadlines.lock();
             if let Some(ids) = guard.get_mut(&exp) {
                 if let Some(pos) = ids.iter().position(|&id| id == msg_id) {
                     ids.swap_remove(pos);
@@ -871,7 +958,7 @@ impl QueueState {
 
     /// Remove from deadline index with an existing lock guard.
     fn remove_from_deadline_index_locked(
-        guard: &mut BTreeMap<u64, Vec<u64>>,
+        guard: &mut BTreeMap<u64, SmallVec<[u64; 4]>>,
         deadline: Option<u64>,
         msg_id: u64,
     ) {

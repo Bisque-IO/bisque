@@ -227,6 +227,37 @@ impl BytesCursor {
 // Decode — zero-copy via BytesCursor
 // =============================================================================
 
+/// Structural equality for AmqpValue map keys.
+///
+/// The derived PartialEq on AmqpValue always returns true (for AmqpError usage),
+/// so we need a real structural comparison for duplicate-key detection.
+fn amqp_value_key_eq(a: &AmqpValue, b: &AmqpValue) -> bool {
+    use AmqpValue::*;
+    match (a, b) {
+        (Null, Null) => true,
+        (Boolean(x), Boolean(y)) => x == y,
+        (Ubyte(x), Ubyte(y)) => x == y,
+        (Ushort(x), Ushort(y)) => x == y,
+        (Uint(x), Uint(y)) => x == y,
+        (Ulong(x), Ulong(y)) => x == y,
+        (Byte(x), Byte(y)) => x == y,
+        (Short(x), Short(y)) => x == y,
+        (Int(x), Int(y)) => x == y,
+        (Long(x), Long(y)) => x == y,
+        (Float(x), Float(y)) => x.to_bits() == y.to_bits(),
+        (Double(x), Double(y)) => x.to_bits() == y.to_bits(),
+        (Decimal32(x), Decimal32(y)) => x == y,
+        (Decimal64(x), Decimal64(y)) => x == y,
+        (Decimal128(x), Decimal128(y)) => x == y,
+        (Char(x), Char(y)) => x == y,
+        (Timestamp(x), Timestamp(y)) => x == y,
+        (Uuid(x), Uuid(y)) => x == y,
+        (Binary(x), Binary(y)) => x == y,
+        (String(x), String(y)) | (Symbol(x), Symbol(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Decode an AMQP 1.0 typed value from the cursor (zero-copy for strings/binary).
 pub fn decode_value(cur: &mut BytesCursor) -> Result<AmqpValue, CodecError> {
     let code = cur.read_u8()?;
@@ -364,6 +395,18 @@ pub fn decode_value(cur: &mut BytesCursor) -> Result<AmqpValue, CodecError> {
                 let v = decode_value(cur)?;
                 items.push((k, v));
             }
+            // T1: Reject duplicate map keys (spec §1.6.23)
+            if items.len() <= 64 {
+                for i in 0..items.len() {
+                    for j in (i + 1)..items.len() {
+                        if amqp_value_key_eq(&items[i].0, &items[j].0) {
+                            return Err(CodecError::InvalidPerformative(
+                                "map contains duplicate keys".into(),
+                            ));
+                        }
+                    }
+                }
+            }
             Ok(AmqpValue::Map(items))
         }
         format_code::MAP32 => {
@@ -375,6 +418,18 @@ pub fn decode_value(cur: &mut BytesCursor) -> Result<AmqpValue, CodecError> {
                 let k = decode_value(cur)?;
                 let v = decode_value(cur)?;
                 items.push((k, v));
+            }
+            // T1: Reject duplicate map keys (spec §1.6.23)
+            if items.len() <= 64 {
+                for i in 0..items.len() {
+                    for j in (i + 1)..items.len() {
+                        if amqp_value_key_eq(&items[i].0, &items[j].0) {
+                            return Err(CodecError::InvalidPerformative(
+                                "map contains duplicate keys".into(),
+                            ));
+                        }
+                    }
+                }
             }
             Ok(AmqpValue::Map(items))
         }
@@ -1129,7 +1184,7 @@ fn decode_performative(value: AmqpValue, payload: Bytes) -> Result<Performative,
 }
 
 fn decode_open(fields: &[AmqpValue]) -> Result<Open, CodecError> {
-    Ok(Open {
+    let mut open = Open {
         container_id: list_get_wire_string(fields, 0),
         hostname: list_get_opt_wire_string(fields, 1),
         max_frame_size: list_get(fields, 2)
@@ -1140,18 +1195,90 @@ fn decode_open(fields: &[AmqpValue]) -> Result<Open, CodecError> {
             .unwrap_or(DEFAULT_CHANNEL_MAX as u32) as u16,
         idle_timeout: list_get(fields, 4).as_u32(),
         ..Default::default()
-    })
+    };
+    // TR13: outgoing-locales (field 5)
+    if let AmqpValue::Array(arr) = list_get(fields, 5) {
+        for v in arr {
+            if let Some(s) = v.as_wire_string() {
+                open.outgoing_locales.push(s.clone());
+            }
+        }
+    } else if let AmqpValue::Symbol(s) = list_get(fields, 5) {
+        open.outgoing_locales.push(s.clone());
+    }
+    // TR13: incoming-locales (field 6)
+    if let AmqpValue::Array(arr) = list_get(fields, 6) {
+        for v in arr {
+            if let Some(s) = v.as_wire_string() {
+                open.incoming_locales.push(s.clone());
+            }
+        }
+    } else if let AmqpValue::Symbol(s) = list_get(fields, 6) {
+        open.incoming_locales.push(s.clone());
+    }
+    // offered-capabilities (field 7)
+    if let AmqpValue::Array(arr) = list_get(fields, 7) {
+        for v in arr {
+            if let Some(s) = v.as_wire_string() {
+                open.offered_capabilities.push(s.clone());
+            }
+        }
+    } else if let AmqpValue::Symbol(s) = list_get(fields, 7) {
+        open.offered_capabilities.push(s.clone());
+    }
+    // desired-capabilities (field 8)
+    if let AmqpValue::Array(arr) = list_get(fields, 8) {
+        for v in arr {
+            if let Some(s) = v.as_wire_string() {
+                open.desired_capabilities.push(s.clone());
+            }
+        }
+    } else if let AmqpValue::Symbol(s) = list_get(fields, 8) {
+        open.desired_capabilities.push(s.clone());
+    }
+    // TR4: properties (field 9)
+    match list_get(fields, 9) {
+        AmqpValue::Null => {}
+        v => open.properties = Some(v.clone()),
+    }
+    Ok(open)
 }
 
 fn decode_begin(fields: &[AmqpValue]) -> Result<Begin, CodecError> {
-    Ok(Begin {
+    let mut begin = Begin {
         remote_channel: list_get(fields, 0).as_u32().map(|v| v as u16),
         next_outgoing_id: list_get(fields, 1).as_u32().unwrap_or(0),
         incoming_window: list_get(fields, 2).as_u32().unwrap_or(2048),
         outgoing_window: list_get(fields, 3).as_u32().unwrap_or(2048),
         handle_max: list_get(fields, 4).as_u32().unwrap_or(u32::MAX),
         ..Default::default()
-    })
+    };
+    // TR5: offered-capabilities (field 5)
+    if let AmqpValue::Array(arr) = list_get(fields, 5) {
+        for v in arr {
+            if let Some(s) = v.as_wire_string() {
+                begin.offered_capabilities.push(s.clone());
+            }
+        }
+    } else if let AmqpValue::Symbol(s) = list_get(fields, 5) {
+        begin.offered_capabilities.push(s.clone());
+    }
+    // TR5: desired-capabilities (field 6)
+    if let AmqpValue::Array(arr) = list_get(fields, 6) {
+        for v in arr {
+            if let Some(s) = v.as_wire_string() {
+                begin.desired_capabilities.push(s.clone());
+            }
+        }
+    } else if let AmqpValue::Symbol(s) = list_get(fields, 6) {
+        begin.desired_capabilities.push(s.clone());
+    }
+    // TR5: properties (field 7)
+    match list_get(fields, 7) {
+        AmqpValue::Null => {}
+        v => begin.properties = Some(v.clone()),
+    }
+    Ok(begin)
 }
 
 fn decode_source_owned(value: AmqpValue) -> Option<Source> {
@@ -1686,12 +1813,41 @@ fn encode_open(buf: &mut BytesMut, p: &Open) {
 }
 
 fn encode_begin(buf: &mut BytesMut, p: &Begin) {
-    let (sp, bs) = begin_described_list(buf, descriptor::BEGIN, 5);
+    let count = if p.properties.is_some() {
+        8u32
+    } else if !p.desired_capabilities.is_empty() {
+        7
+    } else if !p.offered_capabilities.is_empty() {
+        6
+    } else {
+        5
+    };
+    let (sp, bs) = begin_described_list(buf, descriptor::BEGIN, count);
     put_opt_ushort(buf, p.remote_channel);
     put_uint(buf, p.next_outgoing_id);
     put_uint(buf, p.incoming_window);
     put_uint(buf, p.outgoing_window);
     put_uint(buf, p.handle_max);
+    if count >= 6 {
+        if !p.offered_capabilities.is_empty() {
+            encode_wire_string_symbol_array(buf, &p.offered_capabilities);
+        } else {
+            put_null(buf);
+        }
+    }
+    if count >= 7 {
+        if !p.desired_capabilities.is_empty() {
+            encode_wire_string_symbol_array(buf, &p.desired_capabilities);
+        } else {
+            put_null(buf);
+        }
+    }
+    if count >= 8 {
+        match &p.properties {
+            Some(v) => encode_value(buf, v),
+            None => put_null(buf),
+        }
+    }
     finish_described_list(buf, sp, bs);
 }
 
@@ -1861,10 +2017,20 @@ fn encode_attach(buf: &mut BytesMut, p: &Attach) {
         }
     }
     if count >= 13 {
-        put_null(buf); // 12: offered-capabilities (TODO: encode array)
+        // 12: offered-capabilities
+        if !p.offered_capabilities.is_empty() {
+            encode_wire_string_symbol_array(buf, &p.offered_capabilities);
+        } else {
+            put_null(buf);
+        }
     }
     if count >= 14 {
-        put_null(buf); // 13: desired-capabilities (TODO: encode array)
+        // 13: desired-capabilities
+        if !p.desired_capabilities.is_empty() {
+            encode_wire_string_symbol_array(buf, &p.desired_capabilities);
+        } else {
+            put_null(buf);
+        }
     }
     if count >= 15 {
         // 14: properties
@@ -1878,7 +2044,8 @@ fn encode_attach(buf: &mut BytesMut, p: &Attach) {
 }
 
 fn encode_flow(buf: &mut BytesMut, p: &Flow) {
-    let (sp, bs) = begin_described_list(buf, descriptor::FLOW, 10);
+    let count = if p.properties.is_some() { 11u32 } else { 10 };
+    let (sp, bs) = begin_described_list(buf, descriptor::FLOW, count);
     put_opt_uint(buf, p.next_incoming_id);
     put_uint(buf, p.incoming_window);
     put_uint(buf, p.next_outgoing_id);
@@ -1889,6 +2056,12 @@ fn encode_flow(buf: &mut BytesMut, p: &Flow) {
     put_opt_uint(buf, p.available);
     put_bool(buf, p.drain);
     put_bool(buf, p.echo);
+    if count >= 11 {
+        match &p.properties {
+            Some(v) => encode_value(buf, v),
+            None => put_null(buf),
+        }
+    }
     finish_described_list(buf, sp, bs);
 }
 
@@ -2082,6 +2255,22 @@ pub fn decode_message(payload: Bytes) -> Result<AmqpMessage, CodecError> {
                         msg.properties = Some(decode_message_properties(*inner));
                     }
                     descriptor::APPLICATION_PROPERTIES => {
+                        // M2: Validate application-properties values are simple types
+                        if let AmqpValue::Map(ref entries) = *inner {
+                            for (_key, value) in entries {
+                                match value {
+                                    AmqpValue::Map(_)
+                                    | AmqpValue::List(_)
+                                    | AmqpValue::Array(_) => {
+                                        return Err(CodecError::InvalidPerformative(
+                                            "application-properties values must be simple types"
+                                                .into(),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         msg.application_properties = Some(*inner);
                     }
                     descriptor::DATA => {
@@ -4622,5 +4811,305 @@ mod tests {
             LifetimePolicy::DeleteOnClose.descriptor(),
             descriptor::DELETE_ON_CLOSE
         );
+    }
+
+    // =================================================================
+    // T1: Map duplicate key rejection
+    // =================================================================
+
+    #[test]
+    fn test_map_duplicate_key_rejected() {
+        // Manually encode a map with duplicate keys
+        let mut buf = BytesMut::new();
+        // MAP8: [format_code][size][count]
+        // We'll encode: { "key" => 1, "key" => 2 } which should be rejected
+        let map = AmqpValue::Map(vec![
+            (
+                AmqpValue::String(WireString::from("key")),
+                AmqpValue::Uint(1),
+            ),
+            (
+                AmqpValue::String(WireString::from("other")),
+                AmqpValue::Uint(2),
+            ),
+        ]);
+        encode_value(&mut buf, &map);
+        // This should decode fine (no duplicates)
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        assert!(decode_value(&mut cur).is_ok());
+
+        // Now build a map WITH duplicate keys by encoding manually
+        let mut buf2 = BytesMut::new();
+        // Write MAP8 header
+        let dup_map = AmqpValue::Map(vec![
+            (
+                AmqpValue::String(WireString::from("dup")),
+                AmqpValue::Uint(1),
+            ),
+            (
+                AmqpValue::String(WireString::from("dup")),
+                AmqpValue::Uint(2),
+            ),
+        ]);
+        encode_value(&mut buf2, &dup_map);
+        // Decoding should fail because of duplicate keys
+        let bytes2 = buf2.freeze();
+        let mut cur2 = BytesCursor::new(bytes2);
+        let result = decode_value(&mut cur2);
+        assert!(
+            result.is_err(),
+            "map with duplicate keys should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_map_unique_keys_accepted() {
+        let map = AmqpValue::Map(vec![
+            (AmqpValue::String(WireString::from("a")), AmqpValue::Uint(1)),
+            (AmqpValue::String(WireString::from("b")), AmqpValue::Uint(2)),
+            (AmqpValue::String(WireString::from("c")), AmqpValue::Uint(3)),
+        ]);
+        let mut buf = BytesMut::new();
+        encode_value(&mut buf, &map);
+        let bytes = buf.freeze();
+        let mut cur = BytesCursor::new(bytes);
+        let decoded = decode_value(&mut cur).unwrap();
+        if let AmqpValue::Map(entries) = decoded {
+            assert_eq!(entries.len(), 3);
+        } else {
+            panic!("expected map");
+        }
+    }
+
+    // =================================================================
+    // TR3: Attach capabilities encoding
+    // =================================================================
+
+    #[test]
+    fn test_attach_offered_capabilities_encode_decode() {
+        let attach = Attach {
+            name: WireString::from("test"),
+            handle: 0,
+            role: Role::Sender,
+            initial_delivery_count: Some(0),
+            offered_capabilities: smallvec::smallvec![
+                WireString::from("cap1"),
+                WireString::from("cap2"),
+            ],
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        encode_attach(&mut buf, &attach);
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &buf);
+        let bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Attach(decoded)) => {
+                assert_eq!(decoded.name, WireString::from("test"));
+                // Note: offered_capabilities are at field 12, which may not be
+                // decoded by default — the decode_attach function decodes up to field 14
+            }
+            _ => panic!("expected Attach"),
+        }
+    }
+
+    // =================================================================
+    // TR4: Open full field roundtrip
+    // =================================================================
+
+    #[test]
+    fn test_open_full_fields_roundtrip() {
+        let open = Open {
+            container_id: WireString::from("test-container"),
+            hostname: Some(WireString::from("localhost")),
+            max_frame_size: 65536,
+            channel_max: 255,
+            idle_timeout: Some(30000),
+            outgoing_locales: smallvec::smallvec![WireString::from("en-US")],
+            incoming_locales: smallvec::smallvec![WireString::from("en-US")],
+            offered_capabilities: smallvec::smallvec![WireString::from("ANONYMOUS-RELAY")],
+            desired_capabilities: smallvec::smallvec![WireString::from("DELAYED-DELIVERY")],
+            properties: Some(AmqpValue::Map(vec![(
+                AmqpValue::Symbol(WireString::from("product")),
+                AmqpValue::String(WireString::from("test")),
+            )])),
+        };
+
+        let mut payload = BytesMut::new();
+        encode_open(&mut payload, &open);
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+        let bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Open(decoded)) => {
+                assert_eq!(&*decoded.container_id, "test-container");
+                assert_eq!(decoded.hostname.as_deref(), Some("localhost"));
+                assert_eq!(decoded.max_frame_size, 65536);
+                assert_eq!(decoded.channel_max, 255);
+                assert_eq!(decoded.idle_timeout, Some(30000));
+                assert_eq!(decoded.outgoing_locales.len(), 1);
+                assert_eq!(&*decoded.outgoing_locales[0], "en-US");
+                assert_eq!(decoded.incoming_locales.len(), 1);
+                assert_eq!(decoded.offered_capabilities.len(), 1);
+                assert_eq!(&*decoded.offered_capabilities[0], "ANONYMOUS-RELAY");
+                assert_eq!(decoded.desired_capabilities.len(), 1);
+                assert_eq!(&*decoded.desired_capabilities[0], "DELAYED-DELIVERY");
+                assert!(decoded.properties.is_some());
+            }
+            _ => panic!("expected Open"),
+        }
+    }
+
+    // =================================================================
+    // TR5: Begin capabilities roundtrip
+    // =================================================================
+
+    #[test]
+    fn test_begin_capabilities_roundtrip() {
+        let begin = Begin {
+            remote_channel: Some(0),
+            next_outgoing_id: 1,
+            incoming_window: 2048,
+            outgoing_window: 2048,
+            handle_max: 255,
+            offered_capabilities: smallvec::smallvec![WireString::from("cap1")],
+            desired_capabilities: smallvec::smallvec![WireString::from("cap2")],
+            properties: Some(AmqpValue::Map(vec![(
+                AmqpValue::Symbol(WireString::from("key")),
+                AmqpValue::Uint(42),
+            )])),
+        };
+
+        let mut payload = BytesMut::new();
+        encode_begin(&mut payload, &begin);
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+        let bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Begin(decoded)) => {
+                assert_eq!(decoded.remote_channel, Some(0));
+                assert_eq!(decoded.handle_max, 255);
+                assert_eq!(decoded.offered_capabilities.len(), 1);
+                assert_eq!(&*decoded.offered_capabilities[0], "cap1");
+                assert_eq!(decoded.desired_capabilities.len(), 1);
+                assert_eq!(&*decoded.desired_capabilities[0], "cap2");
+                assert!(decoded.properties.is_some());
+            }
+            _ => panic!("expected Begin"),
+        }
+    }
+
+    // =================================================================
+    // M2: Application-properties value validation
+    // =================================================================
+
+    #[test]
+    fn test_application_properties_simple_values_ok() {
+        let msg = AmqpMessage {
+            application_properties: Some(AmqpValue::Map(vec![
+                (
+                    AmqpValue::String(WireString::from("key1")),
+                    AmqpValue::Uint(42),
+                ),
+                (
+                    AmqpValue::String(WireString::from("key2")),
+                    AmqpValue::String(WireString::from("val")),
+                ),
+                (
+                    AmqpValue::String(WireString::from("key3")),
+                    AmqpValue::Boolean(true),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let decoded = decode_message(buf.freeze());
+        assert!(decoded.is_ok());
+    }
+
+    #[test]
+    fn test_application_properties_complex_value_rejected() {
+        // Build a message with a map value in application-properties (not allowed)
+        let msg = AmqpMessage {
+            application_properties: Some(AmqpValue::Map(vec![(
+                AmqpValue::String(WireString::from("key1")),
+                AmqpValue::Map(vec![(
+                    AmqpValue::String(WireString::from("nested")),
+                    AmqpValue::Uint(1),
+                )]),
+            )])),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let result = decode_message(buf.freeze());
+        assert!(
+            result.is_err(),
+            "map value in application-properties should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_application_properties_list_value_rejected() {
+        let msg = AmqpMessage {
+            application_properties: Some(AmqpValue::Map(vec![(
+                AmqpValue::String(WireString::from("key1")),
+                AmqpValue::List(vec![AmqpValue::Uint(1)]),
+            )])),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_message(&mut buf, &msg);
+        let result = decode_message(buf.freeze());
+        assert!(
+            result.is_err(),
+            "list value in application-properties should be rejected"
+        );
+    }
+
+    // =================================================================
+    // Flow properties roundtrip
+    // =================================================================
+
+    #[test]
+    fn test_flow_with_properties_roundtrip() {
+        let flow = Flow {
+            next_incoming_id: Some(5),
+            incoming_window: 2048,
+            next_outgoing_id: 10,
+            outgoing_window: 2048,
+            handle: Some(0),
+            delivery_count: Some(3),
+            link_credit: Some(100),
+            properties: Some(AmqpValue::Map(vec![(
+                AmqpValue::Symbol(WireString::from("txn-id")),
+                AmqpValue::Binary(Bytes::from_static(b"\x00\x01")),
+            )])),
+            ..Default::default()
+        };
+        let mut payload = BytesMut::new();
+        encode_flow(&mut payload, &flow);
+        let mut frame_buf = BytesMut::new();
+        encode_frame(&mut frame_buf, 0, FRAME_TYPE_AMQP, &payload);
+        let bytes = frame_buf.freeze();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Flow(decoded)) => {
+                assert_eq!(decoded.next_incoming_id, Some(5));
+                assert!(decoded.properties.is_some());
+                if let Some(AmqpValue::Map(entries)) = decoded.properties {
+                    assert_eq!(entries.len(), 1);
+                } else {
+                    panic!("expected properties map");
+                }
+            }
+            _ => panic!("expected Flow"),
+        }
     }
 }

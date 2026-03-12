@@ -1,6 +1,6 @@
 use std::fmt;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
 use smallvec::SmallVec;
 
 // =============================================================================
@@ -300,8 +300,56 @@ pub enum ApiKey {
     AlterConfigs = 33,
     SaslAuthenticate = 36,
     CreatePartitions = 37,
+    OffsetForLeaderEpoch = 23,
     DeleteGroups = 42,
     OffsetDelete = 47,
+    DescribeAcls = 29,
+    CreateAcls = 30,
+    DeleteAcls = 31,
+    DescribeLogDirs = 35,
+    IncrementalAlterConfigs = 44,
+    WriteTxnMarkers = 27,
+    DescribeUserScramCredentials = 50,
+    AlterUserScramCredentials = 51,
+    DescribeQuorum = 55,
+    UpdateFeatures = 57,
+    DescribeCluster = 60,
+    DescribeProducers = 61,
+    UnregisterBroker = 64,
+    DescribeTransactions = 65,
+    ListTransactions = 66,
+    ConsumerGroupHeartbeat = 68,
+    ConsumerGroupDescribe = 69,
+    GetTelemetrySubscriptions = 71,
+    PushTelemetry = 72,
+    ListConfigResources = 74,
+    DescribeTopicPartitions = 75,
+    ShareGroupHeartbeat = 76,
+    ShareGroupDescribe = 77,
+    ShareFetch = 78,
+    ShareAcknowledge = 79,
+    AddRaftVoter = 80,
+    RemoveRaftVoter = 81,
+    InitializeShareGroupState = 83,
+    ReadShareGroupState = 84,
+    WriteShareGroupState = 85,
+    DeleteShareGroupState = 86,
+    ReadShareGroupStateSummary = 87,
+    StreamsGroupHeartbeat = 88,
+    StreamsGroupDescribe = 89,
+    DescribeShareGroupOffsets = 90,
+    AlterShareGroupOffsets = 91,
+    DeleteShareGroupOffsets = 92,
+    AlterReplicaLogDirs = 34,
+    CreateDelegationToken = 38,
+    RenewDelegationToken = 39,
+    ExpireDelegationToken = 40,
+    DescribeDelegationToken = 41,
+    ElectLeaders = 43,
+    AlterPartitionReassignments = 45,
+    ListPartitionReassignments = 46,
+    DescribeClientQuotas = 48,
+    AlterClientQuotas = 49,
 }
 
 impl ApiKey {
@@ -326,6 +374,7 @@ impl ApiKey {
             20 => Some(Self::DeleteTopics),
             21 => Some(Self::DeleteRecords),
             22 => Some(Self::InitProducerId),
+            23 => Some(Self::OffsetForLeaderEpoch),
             24 => Some(Self::AddPartitionsToTxn),
             25 => Some(Self::AddOffsetsToTxn),
             26 => Some(Self::EndTxn),
@@ -335,7 +384,54 @@ impl ApiKey {
             36 => Some(Self::SaslAuthenticate),
             37 => Some(Self::CreatePartitions),
             42 => Some(Self::DeleteGroups),
+            29 => Some(Self::DescribeAcls),
+            30 => Some(Self::CreateAcls),
+            31 => Some(Self::DeleteAcls),
+            35 => Some(Self::DescribeLogDirs),
+            44 => Some(Self::IncrementalAlterConfigs),
+            27 => Some(Self::WriteTxnMarkers),
+            34 => Some(Self::AlterReplicaLogDirs),
+            38 => Some(Self::CreateDelegationToken),
+            39 => Some(Self::RenewDelegationToken),
+            40 => Some(Self::ExpireDelegationToken),
+            41 => Some(Self::DescribeDelegationToken),
+            43 => Some(Self::ElectLeaders),
+            45 => Some(Self::AlterPartitionReassignments),
+            46 => Some(Self::ListPartitionReassignments),
             47 => Some(Self::OffsetDelete),
+            48 => Some(Self::DescribeClientQuotas),
+            49 => Some(Self::AlterClientQuotas),
+            50 => Some(Self::DescribeUserScramCredentials),
+            51 => Some(Self::AlterUserScramCredentials),
+            55 => Some(Self::DescribeQuorum),
+            57 => Some(Self::UpdateFeatures),
+            60 => Some(Self::DescribeCluster),
+            61 => Some(Self::DescribeProducers),
+            64 => Some(Self::UnregisterBroker),
+            65 => Some(Self::DescribeTransactions),
+            66 => Some(Self::ListTransactions),
+            68 => Some(Self::ConsumerGroupHeartbeat),
+            69 => Some(Self::ConsumerGroupDescribe),
+            71 => Some(Self::GetTelemetrySubscriptions),
+            72 => Some(Self::PushTelemetry),
+            74 => Some(Self::ListConfigResources),
+            75 => Some(Self::DescribeTopicPartitions),
+            76 => Some(Self::ShareGroupHeartbeat),
+            77 => Some(Self::ShareGroupDescribe),
+            78 => Some(Self::ShareFetch),
+            79 => Some(Self::ShareAcknowledge),
+            80 => Some(Self::AddRaftVoter),
+            81 => Some(Self::RemoveRaftVoter),
+            83 => Some(Self::InitializeShareGroupState),
+            84 => Some(Self::ReadShareGroupState),
+            85 => Some(Self::WriteShareGroupState),
+            86 => Some(Self::DeleteShareGroupState),
+            87 => Some(Self::ReadShareGroupStateSummary),
+            88 => Some(Self::StreamsGroupHeartbeat),
+            89 => Some(Self::StreamsGroupDescribe),
+            90 => Some(Self::DescribeShareGroupOffsets),
+            91 => Some(Self::AlterShareGroupOffsets),
+            92 => Some(Self::DeleteShareGroupOffsets),
             _ => None,
         }
     }
@@ -343,36 +439,175 @@ impl ApiKey {
     /// Returns the supported API version range `(min, max)`.
     pub fn version_range(self) -> (i16, i16) {
         match self {
-            Self::Produce => (0, 3),
-            Self::Fetch => (0, 4),
-            Self::ListOffsets => (0, 1),
-            Self::Metadata => (0, 1),
-            Self::OffsetCommit => (0, 2),
-            Self::OffsetFetch => (0, 1),
-            Self::FindCoordinator => (0, 1),
-            Self::JoinGroup => (0, 1),
-            Self::Heartbeat => (0, 0),
-            Self::LeaveGroup => (0, 0),
-            Self::SyncGroup => (0, 0),
-            Self::DescribeGroups => (0, 0),
-            Self::ListGroups => (0, 0),
+            Self::Produce => (0, 10),
+            Self::Fetch => (0, 12),
+            Self::ListOffsets => (0, 6),
+            Self::Metadata => (0, 9),
+            Self::OffsetCommit => (0, 8),
+            Self::OffsetFetch => (0, 6),
+            Self::FindCoordinator => (0, 3),
+            Self::JoinGroup => (0, 6),
+            Self::Heartbeat => (0, 4),
+            Self::LeaveGroup => (0, 4),
+            Self::SyncGroup => (0, 4),
+            Self::DescribeGroups => (0, 5),
+            Self::ListGroups => (0, 4),
             Self::SaslHandshake => (0, 1),
-            Self::ApiVersions => (0, 0),
-            Self::CreateTopics => (0, 0),
-            Self::DeleteTopics => (0, 0),
-            Self::DeleteRecords => (0, 0),
-            Self::InitProducerId => (0, 0),
-            Self::AddPartitionsToTxn => (0, 0),
-            Self::AddOffsetsToTxn => (0, 0),
-            Self::EndTxn => (0, 0),
-            Self::TxnOffsetCommit => (0, 0),
-            Self::DescribeConfigs => (0, 0),
-            Self::AlterConfigs => (0, 0),
-            Self::SaslAuthenticate => (0, 1),
-            Self::CreatePartitions => (0, 0),
-            Self::DeleteGroups => (0, 0),
+            Self::ApiVersions => (0, 3),
+            Self::CreateTopics => (0, 5),
+            Self::DeleteTopics => (0, 4),
+            Self::DeleteRecords => (0, 2),
+            Self::InitProducerId => (0, 2),
+            Self::OffsetForLeaderEpoch => (0, 4),
+            Self::AddPartitionsToTxn => (0, 3),
+            Self::AddOffsetsToTxn => (0, 3),
+            Self::EndTxn => (0, 3),
+            Self::TxnOffsetCommit => (0, 3),
+            Self::DescribeConfigs => (0, 4),
+            Self::AlterConfigs => (0, 2),
+            Self::SaslAuthenticate => (0, 2),
+            Self::CreatePartitions => (0, 2),
+            Self::DeleteGroups => (0, 2),
+            Self::DescribeAcls => (0, 2),
+            Self::CreateAcls => (0, 2),
+            Self::DeleteAcls => (0, 2),
+            Self::DescribeLogDirs => (0, 2),
+            Self::IncrementalAlterConfigs => (0, 1),
+            Self::WriteTxnMarkers => (0, 2),
+            Self::AlterReplicaLogDirs => (0, 2),
+            Self::CreateDelegationToken => (0, 3),
+            Self::RenewDelegationToken => (0, 2),
+            Self::ExpireDelegationToken => (0, 2),
+            Self::DescribeDelegationToken => (0, 3),
+            Self::ElectLeaders => (0, 2),
+            Self::AlterPartitionReassignments => (0, 1),
+            Self::ListPartitionReassignments => (0, 0),
+            Self::DescribeClientQuotas => (0, 1),
+            Self::AlterClientQuotas => (0, 1),
+            Self::DescribeUserScramCredentials => (0, 0),
+            Self::AlterUserScramCredentials => (0, 0),
+            Self::DescribeQuorum => (0, 2),
+            Self::UpdateFeatures => (0, 2),
             Self::OffsetDelete => (0, 0),
+            Self::DescribeCluster => (0, 0),
+            Self::DescribeProducers => (0, 0),
+            Self::UnregisterBroker => (0, 0),
+            Self::DescribeTransactions => (0, 0),
+            Self::ListTransactions => (0, 2),
+            Self::ConsumerGroupHeartbeat => (0, 1),
+            Self::ConsumerGroupDescribe => (0, 1),
+            Self::GetTelemetrySubscriptions => (0, 0),
+            Self::PushTelemetry => (0, 0),
+            Self::ListConfigResources => (0, 1),
+            Self::DescribeTopicPartitions => (0, 0),
+            Self::ShareGroupHeartbeat => (0, 1),
+            Self::ShareGroupDescribe => (0, 1),
+            Self::ShareFetch => (0, 2),
+            Self::ShareAcknowledge => (0, 2),
+            Self::AddRaftVoter => (0, 1),
+            Self::RemoveRaftVoter => (0, 0),
+            Self::InitializeShareGroupState => (0, 0),
+            Self::ReadShareGroupState => (0, 0),
+            Self::WriteShareGroupState => (0, 1),
+            Self::DeleteShareGroupState => (0, 0),
+            Self::ReadShareGroupStateSummary => (0, 1),
+            Self::StreamsGroupHeartbeat => (0, 0),
+            Self::StreamsGroupDescribe => (0, 0),
+            Self::DescribeShareGroupOffsets => (0, 1),
+            Self::AlterShareGroupOffsets => (0, 0),
+            Self::DeleteShareGroupOffsets => (0, 0),
         }
+    }
+
+    /// Returns the first API version that uses flexible encoding (request header v2,
+    /// response header v1, compact encoding). Returns `None` if the API never uses
+    /// flexible encoding.
+    pub fn flexible_version(self) -> Option<i16> {
+        match self {
+            Self::Produce => Some(9),
+            Self::Fetch => Some(12),
+            Self::ListOffsets => Some(6),
+            Self::Metadata => Some(9),
+            Self::OffsetCommit => Some(8),
+            Self::OffsetFetch => Some(6),
+            Self::FindCoordinator => Some(3),
+            Self::JoinGroup => Some(6),
+            Self::Heartbeat => Some(4),
+            Self::LeaveGroup => Some(4),
+            Self::SyncGroup => Some(4),
+            Self::DescribeGroups => Some(5),
+            Self::ListGroups => Some(3),
+            Self::SaslHandshake => None,
+            Self::ApiVersions => Some(3),
+            Self::CreateTopics => Some(5),
+            Self::DeleteTopics => Some(4),
+            Self::DeleteRecords => Some(2),
+            Self::InitProducerId => Some(2),
+            Self::OffsetForLeaderEpoch => None,
+            Self::AddPartitionsToTxn => Some(3),
+            Self::AddOffsetsToTxn => Some(3),
+            Self::EndTxn => Some(3),
+            Self::TxnOffsetCommit => Some(3),
+            Self::DescribeConfigs => Some(4),
+            Self::AlterConfigs => Some(2),
+            Self::SaslAuthenticate => Some(2),
+            Self::CreatePartitions => Some(2),
+            Self::DeleteGroups => Some(2),
+            Self::DescribeAcls => Some(2),
+            Self::CreateAcls => Some(2),
+            Self::DeleteAcls => Some(2),
+            Self::DescribeLogDirs => Some(2),
+            Self::IncrementalAlterConfigs => Some(1),
+            Self::WriteTxnMarkers => Some(1),
+            Self::AlterReplicaLogDirs => Some(2),
+            Self::CreateDelegationToken => Some(2),
+            Self::RenewDelegationToken => Some(2),
+            Self::ExpireDelegationToken => Some(2),
+            Self::DescribeDelegationToken => Some(2),
+            Self::ElectLeaders => Some(2),
+            Self::AlterPartitionReassignments => Some(0),
+            Self::ListPartitionReassignments => Some(0),
+            Self::DescribeClientQuotas => Some(1),
+            Self::AlterClientQuotas => Some(1),
+            Self::DescribeUserScramCredentials => Some(0),
+            Self::AlterUserScramCredentials => Some(0),
+            Self::DescribeQuorum => Some(0),
+            Self::UpdateFeatures => Some(0),
+            Self::OffsetDelete => None,
+            Self::DescribeCluster => None,
+            Self::DescribeProducers => Some(0),
+            Self::UnregisterBroker => Some(0),
+            Self::DescribeTransactions => Some(0),
+            Self::ListTransactions => Some(0),
+            Self::ConsumerGroupHeartbeat => Some(0),
+            Self::ConsumerGroupDescribe => Some(0),
+            Self::GetTelemetrySubscriptions => Some(0),
+            Self::PushTelemetry => Some(0),
+            Self::ListConfigResources => Some(0),
+            Self::DescribeTopicPartitions => Some(0),
+            Self::ShareGroupHeartbeat => Some(0),
+            Self::ShareGroupDescribe => Some(0),
+            Self::ShareFetch => Some(0),
+            Self::ShareAcknowledge => Some(0),
+            Self::AddRaftVoter => Some(0),
+            Self::RemoveRaftVoter => Some(0),
+            Self::InitializeShareGroupState => Some(0),
+            Self::ReadShareGroupState => Some(0),
+            Self::WriteShareGroupState => Some(0),
+            Self::DeleteShareGroupState => Some(0),
+            Self::ReadShareGroupStateSummary => Some(0),
+            Self::StreamsGroupHeartbeat => Some(0),
+            Self::StreamsGroupDescribe => Some(0),
+            Self::DescribeShareGroupOffsets => Some(0),
+            Self::AlterShareGroupOffsets => Some(0),
+            Self::DeleteShareGroupOffsets => Some(0),
+        }
+    }
+
+    /// Returns `true` if the given API version uses flexible encoding.
+    pub fn is_flexible(self, api_version: i16) -> bool {
+        self.flexible_version()
+            .map_or(false, |fv| api_version >= fv)
     }
 }
 
@@ -480,6 +715,54 @@ pub enum KafkaRequest {
     CreatePartitions(CreatePartitionsRequest),
     DeleteGroups(DeleteGroupsRequest),
     OffsetDelete(OffsetDeleteRequest),
+    OffsetForLeaderEpoch(OffsetForLeaderEpochRequest),
+    IncrementalAlterConfigs(IncrementalAlterConfigsRequest),
+    DescribeAcls(DescribeAclsRequest),
+    CreateAcls(CreateAclsRequest),
+    DeleteAcls(DeleteAclsRequest),
+    DescribeLogDirs(DescribeLogDirsRequest),
+    DescribeUserScramCredentials(DescribeUserScramCredentialsRequest),
+    AlterUserScramCredentials(AlterUserScramCredentialsRequest),
+    DescribeCluster(DescribeClusterRequest),
+    WriteTxnMarkers(WriteTxnMarkersRequest),
+    AlterReplicaLogDirs(AlterReplicaLogDirsRequest),
+    CreateDelegationToken(CreateDelegationTokenRequest),
+    RenewDelegationToken(RenewDelegationTokenRequest),
+    ExpireDelegationToken(ExpireDelegationTokenRequest),
+    DescribeDelegationToken(DescribeDelegationTokenRequest),
+    ElectLeaders(ElectLeadersRequest),
+    AlterPartitionReassignments(AlterPartitionReassignmentsRequest),
+    ListPartitionReassignments(ListPartitionReassignmentsRequest),
+    DescribeClientQuotas(DescribeClientQuotasRequest),
+    AlterClientQuotas(AlterClientQuotasRequest),
+    DescribeQuorum(DescribeQuorumRequest),
+    UpdateFeatures(UpdateFeaturesRequest),
+    DescribeProducers(DescribeProducersRequest),
+    UnregisterBroker(UnregisterBrokerRequest),
+    DescribeTransactions(DescribeTransactionsRequest),
+    ListTransactions(ListTransactionsRequest),
+    ConsumerGroupHeartbeat(ConsumerGroupHeartbeatRequest),
+    ConsumerGroupDescribe(ConsumerGroupDescribeRequest),
+    GetTelemetrySubscriptions(GetTelemetrySubscriptionsRequest),
+    PushTelemetry(PushTelemetryRequest),
+    ListConfigResources(ListConfigResourcesRequest),
+    DescribeTopicPartitions(DescribeTopicPartitionsRequest),
+    ShareGroupHeartbeat(ShareGroupHeartbeatRequest),
+    ShareGroupDescribe(ShareGroupDescribeRequest),
+    ShareFetch(ShareFetchRequest),
+    ShareAcknowledge(ShareAcknowledgeRequest),
+    AddRaftVoter(AddRaftVoterRequest),
+    RemoveRaftVoter(RemoveRaftVoterRequest),
+    InitializeShareGroupState(InitializeShareGroupStateRequest),
+    ReadShareGroupState(ReadShareGroupStateRequest),
+    WriteShareGroupState(WriteShareGroupStateRequest),
+    DeleteShareGroupState(DeleteShareGroupStateRequest),
+    ReadShareGroupStateSummary(ReadShareGroupStateSummaryRequest),
+    StreamsGroupHeartbeat(StreamsGroupHeartbeatRequest),
+    StreamsGroupDescribe(StreamsGroupDescribeRequest),
+    DescribeShareGroupOffsets(DescribeShareGroupOffsetsRequest),
+    AlterShareGroupOffsets(AlterShareGroupOffsetsRequest),
+    DeleteShareGroupOffsets(DeleteShareGroupOffsetsRequest),
 }
 
 // -- Metadata --
@@ -492,8 +775,9 @@ pub struct MetadataRequest {
 
 // -- Produce --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProduceRequest {
+    pub transactional_id: Option<WireString>, // v3+
     pub acks: i16,
     pub timeout_ms: i32,
     pub topics: Vec<ProduceTopicData>,
@@ -514,11 +798,24 @@ pub struct ProducePartitionData {
 
 // -- Fetch --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FetchRequest {
+    pub replica_id: i32,
     pub max_wait_ms: i32,
     pub min_bytes: i32,
+    pub max_bytes: i32,      // v3+
+    pub isolation_level: i8, // v4+
+    pub session_id: i32,     // v7+
+    pub session_epoch: i32,  // v7+
     pub topics: Vec<FetchTopicData>,
+    pub forgotten_topics: Vec<FetchForgottenTopic>, // v7+
+    pub rack_id: Option<WireString>,                // v11+
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FetchForgottenTopic {
+    pub topic_name: WireString,
+    pub partitions: Vec<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -527,10 +824,12 @@ pub struct FetchTopicData {
     pub partitions: Vec<FetchPartitionData>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FetchPartitionData {
     pub partition_index: i32,
+    pub current_leader_epoch: i32, // v9+
     pub fetch_offset: i64,
+    pub log_start_offset: i64, // v5+
     pub max_bytes: i32,
 }
 
@@ -566,17 +865,18 @@ pub struct FindCoordinatorRequest {
 
 // -- JoinGroup --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct JoinGroupRequest {
     pub group_id: WireString,
     pub session_timeout_ms: i32,
     pub rebalance_timeout_ms: i32,
     pub member_id: WireString,
+    pub group_instance_id: Option<WireString>, // v5+
     pub protocol_type: WireString,
     pub protocols: Vec<JoinGroupProtocol>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct JoinGroupProtocol {
     pub name: WireString,
     pub metadata: Bytes,
@@ -584,15 +884,16 @@ pub struct JoinGroupProtocol {
 
 // -- SyncGroup --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SyncGroupRequest {
     pub group_id: WireString,
     pub generation_id: i32,
     pub member_id: WireString,
+    pub group_instance_id: Option<WireString>, // v3+
     pub assignments: Vec<SyncGroupAssignment>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SyncGroupAssignment {
     pub member_id: WireString,
     pub assignment: Bytes,
@@ -600,28 +901,37 @@ pub struct SyncGroupAssignment {
 
 // -- Heartbeat --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HeartbeatRequest {
     pub group_id: WireString,
     pub generation_id: i32,
     pub member_id: WireString,
+    pub group_instance_id: Option<WireString>, // v3+
 }
 
 // -- LeaveGroup --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LeaveGroupRequest {
     pub group_id: WireString,
     pub member_id: WireString,
+    pub members: Vec<LeaveGroupMember>, // v3+ replaces single member_id
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LeaveGroupMember {
+    pub member_id: WireString,
+    pub group_instance_id: Option<WireString>,
 }
 
 // -- OffsetCommit --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OffsetCommitRequest {
     pub group_id: WireString,
     pub generation_id: i32,
     pub member_id: WireString,
+    pub group_instance_id: Option<WireString>, // v7+
     pub topics: Vec<OffsetCommitTopicData>,
 }
 
@@ -631,16 +941,17 @@ pub struct OffsetCommitTopicData {
     pub partitions: Vec<OffsetCommitPartitionData>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OffsetCommitPartitionData {
     pub partition_index: i32,
     pub offset: i64,
+    pub committed_leader_epoch: i32, // v6+
     pub metadata: Option<WireString>,
 }
 
 // -- OffsetFetch --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OffsetFetchRequest {
     pub group_id: WireString,
     pub topics: Vec<OffsetFetchTopicData>,
@@ -762,7 +1073,7 @@ pub struct EndTxnRequest {
 
 // -- TxnOffsetCommit --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TxnOffsetCommitRequest {
     pub transactional_id: WireString,
     pub group_id: WireString,
@@ -820,6 +1131,120 @@ pub struct AlterConfigEntry {
     pub value: Option<WireString>,
 }
 
+// -- IncrementalAlterConfigs --
+
+#[derive(Debug, Clone, Default)]
+pub struct IncrementalAlterConfigsRequest {
+    pub resources: Vec<IncrementalAlterConfigsResource>,
+    pub validate_only: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IncrementalAlterConfigsResource {
+    pub resource_type: i8,
+    pub resource_name: WireString,
+    pub configs: Vec<IncrementalAlterConfigEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IncrementalAlterConfigEntry {
+    pub name: WireString,
+    pub config_operation: i8,
+    pub value: Option<WireString>,
+}
+
+// -- DescribeAcls --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeAclsRequest {
+    pub resource_type_filter: i8,
+    pub resource_name_filter: Option<WireString>,
+    pub pattern_type_filter: i8,
+    pub principal_filter: Option<WireString>,
+    pub host_filter: Option<WireString>,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+// -- CreateAcls --
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateAclsRequest {
+    pub creations: Vec<AclCreation>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AclCreation {
+    pub resource_type: i8,
+    pub resource_name: WireString,
+    pub resource_pattern_type: i8,
+    pub principal: WireString,
+    pub host: WireString,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+// -- DeleteAcls --
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteAclsRequest {
+    pub filters: Vec<AclFilter>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AclFilter {
+    pub resource_type_filter: i8,
+    pub resource_name_filter: Option<WireString>,
+    pub pattern_type_filter: i8,
+    pub principal_filter: Option<WireString>,
+    pub host_filter: Option<WireString>,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+// -- DescribeLogDirs --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeLogDirsRequest {
+    pub topics: Option<Vec<DescribeLogDirsTopic>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeLogDirsTopic {
+    pub topic: WireString,
+    pub partitions: Vec<i32>,
+}
+
+// -- DescribeUserScramCredentials --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeUserScramCredentialsRequest {
+    pub users: Option<Vec<WireString>>,
+}
+
+// -- AlterUserScramCredentials --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterUserScramCredentialsRequest {
+    pub upsertions: Vec<ScramCredentialUpsertion>,
+    pub deletions: Vec<ScramCredentialDeletion>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScramCredentialUpsertion {
+    pub name: WireString,
+    pub mechanism: i8,
+    pub iterations: i32,
+    pub salt: Bytes,
+    pub salted_password: Bytes,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScramCredentialDeletion {
+    pub name: WireString,
+    pub mechanism: i8,
+}
+
 // -- CreatePartitions --
 
 #[derive(Debug, Clone)]
@@ -861,6 +1286,306 @@ pub struct OffsetDeletePartitionData {
     pub partition_index: i32,
 }
 
+// -- OffsetForLeaderEpoch --
+
+#[derive(Debug, Clone)]
+pub struct OffsetForLeaderEpochRequest {
+    pub topics: Vec<OffsetForLeaderEpochTopicData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetForLeaderEpochTopicData {
+    pub topic_name: WireString,
+    pub partitions: Vec<OffsetForLeaderEpochPartitionData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetForLeaderEpochPartitionData {
+    pub partition_index: i32,
+    pub current_leader_epoch: i32,
+    pub leader_epoch: i32,
+}
+
+// -- DescribeCluster --
+
+#[derive(Debug, Clone)]
+pub struct DescribeClusterRequest {
+    pub include_cluster_authorized_operations: bool,
+}
+
+// -- WriteTxnMarkers --
+
+#[derive(Debug, Clone, Default)]
+pub struct WriteTxnMarkersRequest {
+    pub data: Bytes,
+}
+
+// -- AlterReplicaLogDirs --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterReplicaLogDirsRequest {
+    pub data: Bytes,
+}
+
+// -- CreateDelegationToken --
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateDelegationTokenRequest {
+    pub data: Bytes,
+}
+
+// -- RenewDelegationToken --
+
+#[derive(Debug, Clone, Default)]
+pub struct RenewDelegationTokenRequest {
+    pub data: Bytes,
+}
+
+// -- ExpireDelegationToken --
+
+#[derive(Debug, Clone, Default)]
+pub struct ExpireDelegationTokenRequest {
+    pub data: Bytes,
+}
+
+// -- DescribeDelegationToken --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeDelegationTokenRequest {
+    pub data: Bytes,
+}
+
+// -- ElectLeaders --
+
+#[derive(Debug, Clone, Default)]
+pub struct ElectLeadersRequest {
+    pub data: Bytes,
+}
+
+// -- AlterPartitionReassignments --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterPartitionReassignmentsRequest {
+    pub data: Bytes,
+}
+
+// -- ListPartitionReassignments --
+
+#[derive(Debug, Clone, Default)]
+pub struct ListPartitionReassignmentsRequest {
+    pub data: Bytes,
+}
+
+// -- DescribeClientQuotas --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeClientQuotasRequest {
+    pub data: Bytes,
+}
+
+// -- AlterClientQuotas --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterClientQuotasRequest {
+    pub data: Bytes,
+}
+
+// -- DescribeQuorum --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeQuorumRequest {
+    pub data: Bytes,
+}
+
+// -- UpdateFeatures --
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateFeaturesRequest {
+    pub data: Bytes,
+}
+
+// -- DescribeProducers --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeProducersRequest {
+    pub data: Bytes,
+}
+
+// -- UnregisterBroker --
+
+#[derive(Debug, Clone, Default)]
+pub struct UnregisterBrokerRequest {
+    pub data: Bytes,
+}
+
+// -- DescribeTransactions --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeTransactionsRequest {
+    pub data: Bytes,
+}
+
+// -- ListTransactions --
+
+#[derive(Debug, Clone, Default)]
+pub struct ListTransactionsRequest {
+    pub data: Bytes,
+}
+
+// -- ConsumerGroupHeartbeat --
+
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerGroupHeartbeatRequest {
+    pub data: Bytes,
+}
+
+// -- ConsumerGroupDescribe --
+
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerGroupDescribeRequest {
+    pub data: Bytes,
+}
+
+// -- GetTelemetrySubscriptions --
+
+#[derive(Debug, Clone, Default)]
+pub struct GetTelemetrySubscriptionsRequest {
+    pub data: Bytes,
+}
+
+// -- PushTelemetry --
+
+#[derive(Debug, Clone, Default)]
+pub struct PushTelemetryRequest {
+    pub data: Bytes,
+}
+
+// -- ListConfigResources --
+
+#[derive(Debug, Clone, Default)]
+pub struct ListConfigResourcesRequest {
+    pub data: Bytes,
+}
+
+// -- DescribeTopicPartitions --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeTopicPartitionsRequest {
+    pub data: Bytes,
+}
+
+// -- ShareGroupHeartbeat --
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareGroupHeartbeatRequest {
+    pub data: Bytes,
+}
+
+// -- ShareGroupDescribe --
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareGroupDescribeRequest {
+    pub data: Bytes,
+}
+
+// -- ShareFetch --
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareFetchRequest {
+    pub data: Bytes,
+}
+
+// -- ShareAcknowledge --
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareAcknowledgeRequest {
+    pub data: Bytes,
+}
+
+// -- AddRaftVoter --
+
+#[derive(Debug, Clone, Default)]
+pub struct AddRaftVoterRequest {
+    pub data: Bytes,
+}
+
+// -- RemoveRaftVoter --
+
+#[derive(Debug, Clone, Default)]
+pub struct RemoveRaftVoterRequest {
+    pub data: Bytes,
+}
+
+// -- InitializeShareGroupState --
+
+#[derive(Debug, Clone, Default)]
+pub struct InitializeShareGroupStateRequest {
+    pub data: Bytes,
+}
+
+// -- ReadShareGroupState --
+
+#[derive(Debug, Clone, Default)]
+pub struct ReadShareGroupStateRequest {
+    pub data: Bytes,
+}
+
+// -- WriteShareGroupState --
+
+#[derive(Debug, Clone, Default)]
+pub struct WriteShareGroupStateRequest {
+    pub data: Bytes,
+}
+
+// -- DeleteShareGroupState --
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteShareGroupStateRequest {
+    pub data: Bytes,
+}
+
+// -- ReadShareGroupStateSummary --
+
+#[derive(Debug, Clone, Default)]
+pub struct ReadShareGroupStateSummaryRequest {
+    pub data: Bytes,
+}
+
+// -- StreamsGroupHeartbeat --
+
+#[derive(Debug, Clone, Default)]
+pub struct StreamsGroupHeartbeatRequest {
+    pub data: Bytes,
+}
+
+// -- StreamsGroupDescribe --
+
+#[derive(Debug, Clone, Default)]
+pub struct StreamsGroupDescribeRequest {
+    pub data: Bytes,
+}
+
+// -- DescribeShareGroupOffsets --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeShareGroupOffsetsRequest {
+    pub data: Bytes,
+}
+
+// -- AlterShareGroupOffsets --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterShareGroupOffsetsRequest {
+    pub data: Bytes,
+}
+
+// -- DeleteShareGroupOffsets --
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteShareGroupOffsetsRequest {
+    pub data: Bytes,
+}
+
 // =============================================================================
 // Responses — WireString for string fields (zero-copy echo from requests)
 // =============================================================================
@@ -896,6 +1621,54 @@ pub enum KafkaResponse {
     CreatePartitions(CreatePartitionsResponse),
     DeleteGroups(DeleteGroupsResponse),
     OffsetDelete(OffsetDeleteResponse),
+    OffsetForLeaderEpoch(OffsetForLeaderEpochResponse),
+    IncrementalAlterConfigs(IncrementalAlterConfigsResponse),
+    DescribeAcls(DescribeAclsResponse),
+    CreateAcls(CreateAclsResponse),
+    DeleteAcls(DeleteAclsResponse),
+    DescribeLogDirs(DescribeLogDirsResponse),
+    DescribeUserScramCredentials(DescribeUserScramCredentialsResponse),
+    AlterUserScramCredentials(AlterUserScramCredentialsResponse),
+    DescribeCluster(DescribeClusterResponse),
+    WriteTxnMarkers(WriteTxnMarkersResponse),
+    AlterReplicaLogDirs(AlterReplicaLogDirsResponse),
+    CreateDelegationToken(CreateDelegationTokenResponse),
+    RenewDelegationToken(RenewDelegationTokenResponse),
+    ExpireDelegationToken(ExpireDelegationTokenResponse),
+    DescribeDelegationToken(DescribeDelegationTokenResponse),
+    ElectLeaders(ElectLeadersResponse),
+    AlterPartitionReassignments(AlterPartitionReassignmentsResponse),
+    ListPartitionReassignments(ListPartitionReassignmentsResponse),
+    DescribeClientQuotas(DescribeClientQuotasResponse),
+    AlterClientQuotas(AlterClientQuotasResponse),
+    DescribeQuorum(DescribeQuorumResponse),
+    UpdateFeatures(UpdateFeaturesResponse),
+    DescribeProducers(DescribeProducersResponse),
+    UnregisterBroker(UnregisterBrokerResponse),
+    DescribeTransactions(DescribeTransactionsResponse),
+    ListTransactions(ListTransactionsResponse),
+    ConsumerGroupHeartbeat(ConsumerGroupHeartbeatResponse),
+    ConsumerGroupDescribe(ConsumerGroupDescribeResponse),
+    GetTelemetrySubscriptions(GetTelemetrySubscriptionsResponse),
+    PushTelemetry(PushTelemetryResponse),
+    ListConfigResources(ListConfigResourcesResponse),
+    DescribeTopicPartitions(DescribeTopicPartitionsResponse),
+    ShareGroupHeartbeat(ShareGroupHeartbeatResponse),
+    ShareGroupDescribe(ShareGroupDescribeResponse),
+    ShareFetch(ShareFetchResponse),
+    ShareAcknowledge(ShareAcknowledgeResponse),
+    AddRaftVoter(AddRaftVoterResponse),
+    RemoveRaftVoter(RemoveRaftVoterResponse),
+    InitializeShareGroupState(InitializeShareGroupStateResponse),
+    ReadShareGroupState(ReadShareGroupStateResponse),
+    WriteShareGroupState(WriteShareGroupStateResponse),
+    DeleteShareGroupState(DeleteShareGroupStateResponse),
+    ReadShareGroupStateSummary(ReadShareGroupStateSummaryResponse),
+    StreamsGroupHeartbeat(StreamsGroupHeartbeatResponse),
+    StreamsGroupDescribe(StreamsGroupDescribeResponse),
+    DescribeShareGroupOffsets(DescribeShareGroupOffsetsResponse),
+    AlterShareGroupOffsets(AlterShareGroupOffsetsResponse),
+    DeleteShareGroupOffsets(DeleteShareGroupOffsetsResponse),
 }
 
 // -- ApiVersions --
@@ -918,6 +1691,8 @@ pub struct ApiVersionRange {
 #[derive(Debug, Clone)]
 pub struct MetadataResponse {
     pub brokers: Vec<BrokerMeta>,
+    pub cluster_id: WireString,
+    pub controller_id: i32,
     pub topics: Vec<TopicMetadata>,
 }
 
@@ -957,11 +1732,13 @@ pub struct ProduceTopicResponse {
     pub partitions: Vec<ProducePartitionResponse>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProducePartitionResponse {
     pub partition_index: i32,
     pub error_code: i16,
     pub base_offset: i64,
+    pub log_append_time_ms: i64, // v2+
+    pub log_start_offset: i64,   // v5+
 }
 
 // -- Fetch --
@@ -977,11 +1754,14 @@ pub struct FetchTopicResponse {
     pub partitions: Vec<FetchPartitionResponse>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FetchPartitionResponse {
     pub partition_index: i32,
     pub error_code: i16,
     pub high_watermark: i64,
+    pub last_stable_offset: i64,     // v4+
+    pub log_start_offset: i64,       // v5+
+    pub preferred_read_replica: i32, // v11+
     /// Encoded record batch bytes.
     pub record_set: Bytes,
 }
@@ -1029,9 +1809,10 @@ pub struct JoinGroupResponse {
     pub members: Vec<JoinGroupMember>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct JoinGroupMember {
     pub member_id: WireString,
+    pub group_instance_id: Option<WireString>, // v5+
     pub metadata: Bytes,
 }
 
@@ -1052,8 +1833,16 @@ pub struct HeartbeatResponse {
 
 // -- LeaveGroup --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LeaveGroupResponse {
+    pub error_code: i16,
+    pub members: Vec<LeaveGroupResponseMember>, // v3+
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LeaveGroupResponseMember {
+    pub member_id: WireString,
+    pub group_instance_id: Option<WireString>,
     pub error_code: i16,
 }
 
@@ -1089,10 +1878,11 @@ pub struct OffsetFetchTopicResponse {
     pub partitions: Vec<OffsetFetchPartitionResponse>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OffsetFetchPartitionResponse {
     pub partition_index: i32,
     pub offset: i64,
+    pub committed_leader_epoch: i32, // v5+
     pub metadata: Option<WireString>,
     pub error_code: i16,
 }
@@ -1140,9 +1930,10 @@ pub struct DescribedGroup {
     pub members: Vec<DescribedGroupMember>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DescribedGroupMember {
     pub member_id: WireString,
+    pub group_instance_id: Option<WireString>, // v4+
     pub client_id: WireString,
     pub client_host: WireString,
     pub metadata: Bytes,
@@ -1157,10 +1948,11 @@ pub struct ListGroupsResponse {
     pub groups: Vec<ListedGroup>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ListedGroup {
     pub group_id: WireString,
     pub protocol_type: WireString,
+    pub group_state: WireString, // v4+
 }
 
 // -- SaslHandshake --
@@ -1173,11 +1965,12 @@ pub struct SaslHandshakeResponse {
 
 // -- SaslAuthenticate --
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SaslAuthenticateResponse {
     pub error_code: i16,
     pub error_message: Option<WireString>,
     pub auth_bytes: Bytes,
+    pub session_lifetime_ms: i64, // v1+
 }
 
 // -- DeleteRecords --
@@ -1301,6 +2094,151 @@ pub struct AlterConfigsResourceResult {
     pub resource_name: WireString,
 }
 
+// -- IncrementalAlterConfigs --
+
+#[derive(Debug, Clone, Default)]
+pub struct IncrementalAlterConfigsResponse {
+    pub resources: Vec<IncrementalAlterConfigsResourceResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IncrementalAlterConfigsResourceResult {
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+    pub resource_type: i8,
+    pub resource_name: WireString,
+}
+
+// -- DescribeAcls --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeAclsResponse {
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+    pub resources: Vec<DescribeAclsResource>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeAclsResource {
+    pub resource_type: i8,
+    pub resource_name: WireString,
+    pub pattern_type: i8,
+    pub acls: Vec<DescribeAclsAcl>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeAclsAcl {
+    pub principal: WireString,
+    pub host: WireString,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+// -- CreateAcls --
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateAclsResponse {
+    pub results: Vec<CreateAclsResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateAclsResult {
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+}
+
+// -- DeleteAcls --
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteAclsResponse {
+    pub filter_results: Vec<DeleteAclsFilterResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteAclsFilterResult {
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+    pub matching_acls: Vec<DeleteAclsMatchingAcl>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteAclsMatchingAcl {
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+    pub resource_type: i8,
+    pub resource_name: WireString,
+    pub resource_pattern_type: i8,
+    pub principal: WireString,
+    pub host: WireString,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+// -- DescribeLogDirs --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeLogDirsResponse {
+    pub results: Vec<DescribeLogDirsResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeLogDirsResult {
+    pub error_code: i16,
+    pub log_dir: WireString,
+    pub topics: Vec<DescribeLogDirsTopicResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeLogDirsTopicResult {
+    pub name: WireString,
+    pub partitions: Vec<DescribeLogDirsPartitionResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeLogDirsPartitionResult {
+    pub partition_index: i32,
+    pub partition_size: i64,
+    pub offset_lag: i64,
+    pub is_future_key: bool,
+}
+
+// -- DescribeUserScramCredentials --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeUserScramCredentialsResponse {
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+    pub results: Vec<DescribeUserScramCredentialsResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeUserScramCredentialsResult {
+    pub user: WireString,
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+    pub credential_infos: Vec<ScramCredentialInfo>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScramCredentialInfo {
+    pub mechanism: i8,
+    pub iterations: i32,
+}
+
+// -- AlterUserScramCredentials --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterUserScramCredentialsResponse {
+    pub results: Vec<AlterUserScramCredentialsResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterUserScramCredentialsResult {
+    pub user: WireString,
+    pub error_code: i16,
+    pub error_message: Option<WireString>,
+}
+
 // -- CreatePartitions --
 
 #[derive(Debug, Clone)]
@@ -1345,6 +2283,311 @@ pub struct OffsetDeleteTopicResponse {
 #[derive(Debug, Clone)]
 pub struct OffsetDeletePartitionResponse {
     pub partition_index: i32,
+    pub error_code: i16,
+}
+
+// -- OffsetForLeaderEpoch --
+
+#[derive(Debug, Clone)]
+pub struct OffsetForLeaderEpochResponse {
+    pub topics: Vec<OffsetForLeaderEpochTopicResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetForLeaderEpochTopicResponse {
+    pub topic_name: WireString,
+    pub partitions: Vec<OffsetForLeaderEpochPartitionResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetForLeaderEpochPartitionResponse {
+    pub error_code: i16,
+    pub partition_index: i32,
+    pub leader_epoch: i32,
+    pub end_offset: i64,
+}
+
+// -- DescribeCluster --
+
+#[derive(Debug, Clone)]
+pub struct DescribeClusterResponse {
+    pub error_code: i16,
+    pub cluster_id: WireString,
+    pub controller_id: i32,
+    pub brokers: Vec<BrokerMeta>,
+    pub cluster_authorized_operations: i32,
+}
+
+// -- WriteTxnMarkers --
+
+#[derive(Debug, Clone, Default)]
+pub struct WriteTxnMarkersResponse {
+    pub error_code: i16,
+}
+
+// -- AlterReplicaLogDirs --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterReplicaLogDirsResponse {
+    pub error_code: i16,
+}
+
+// -- CreateDelegationToken --
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateDelegationTokenResponse {
+    pub error_code: i16,
+}
+
+// -- RenewDelegationToken --
+
+#[derive(Debug, Clone, Default)]
+pub struct RenewDelegationTokenResponse {
+    pub error_code: i16,
+}
+
+// -- ExpireDelegationToken --
+
+#[derive(Debug, Clone, Default)]
+pub struct ExpireDelegationTokenResponse {
+    pub error_code: i16,
+}
+
+// -- DescribeDelegationToken --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeDelegationTokenResponse {
+    pub error_code: i16,
+}
+
+// -- ElectLeaders --
+
+#[derive(Debug, Clone, Default)]
+pub struct ElectLeadersResponse {
+    pub error_code: i16,
+}
+
+// -- AlterPartitionReassignments --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterPartitionReassignmentsResponse {
+    pub error_code: i16,
+}
+
+// -- ListPartitionReassignments --
+
+#[derive(Debug, Clone, Default)]
+pub struct ListPartitionReassignmentsResponse {
+    pub error_code: i16,
+}
+
+// -- DescribeClientQuotas --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeClientQuotasResponse {
+    pub error_code: i16,
+}
+
+// -- AlterClientQuotas --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterClientQuotasResponse {
+    pub error_code: i16,
+}
+
+// -- DescribeQuorum --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeQuorumResponse {
+    pub error_code: i16,
+}
+
+// -- UpdateFeatures --
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateFeaturesResponse {
+    pub error_code: i16,
+}
+
+// -- DescribeProducers --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeProducersResponse {
+    pub error_code: i16,
+}
+
+// -- UnregisterBroker --
+
+#[derive(Debug, Clone, Default)]
+pub struct UnregisterBrokerResponse {
+    pub error_code: i16,
+}
+
+// -- DescribeTransactions --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeTransactionsResponse {
+    pub error_code: i16,
+}
+
+// -- ListTransactions --
+
+#[derive(Debug, Clone, Default)]
+pub struct ListTransactionsResponse {
+    pub error_code: i16,
+}
+
+// -- ConsumerGroupHeartbeat --
+
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerGroupHeartbeatResponse {
+    pub error_code: i16,
+}
+
+// -- ConsumerGroupDescribe --
+
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerGroupDescribeResponse {
+    pub error_code: i16,
+}
+
+// -- GetTelemetrySubscriptions --
+
+#[derive(Debug, Clone, Default)]
+pub struct GetTelemetrySubscriptionsResponse {
+    pub error_code: i16,
+}
+
+// -- PushTelemetry --
+
+#[derive(Debug, Clone, Default)]
+pub struct PushTelemetryResponse {
+    pub error_code: i16,
+}
+
+// -- ListConfigResources --
+
+#[derive(Debug, Clone, Default)]
+pub struct ListConfigResourcesResponse {
+    pub error_code: i16,
+}
+
+// -- DescribeTopicPartitions --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeTopicPartitionsResponse {
+    pub error_code: i16,
+}
+
+// -- ShareGroupHeartbeat --
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareGroupHeartbeatResponse {
+    pub error_code: i16,
+}
+
+// -- ShareGroupDescribe --
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareGroupDescribeResponse {
+    pub error_code: i16,
+}
+
+// -- ShareFetch --
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareFetchResponse {
+    pub error_code: i16,
+}
+
+// -- ShareAcknowledge --
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareAcknowledgeResponse {
+    pub error_code: i16,
+}
+
+// -- AddRaftVoter --
+
+#[derive(Debug, Clone, Default)]
+pub struct AddRaftVoterResponse {
+    pub error_code: i16,
+}
+
+// -- RemoveRaftVoter --
+
+#[derive(Debug, Clone, Default)]
+pub struct RemoveRaftVoterResponse {
+    pub error_code: i16,
+}
+
+// -- InitializeShareGroupState --
+
+#[derive(Debug, Clone, Default)]
+pub struct InitializeShareGroupStateResponse {
+    pub error_code: i16,
+}
+
+// -- ReadShareGroupState --
+
+#[derive(Debug, Clone, Default)]
+pub struct ReadShareGroupStateResponse {
+    pub error_code: i16,
+}
+
+// -- WriteShareGroupState --
+
+#[derive(Debug, Clone, Default)]
+pub struct WriteShareGroupStateResponse {
+    pub error_code: i16,
+}
+
+// -- DeleteShareGroupState --
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteShareGroupStateResponse {
+    pub error_code: i16,
+}
+
+// -- ReadShareGroupStateSummary --
+
+#[derive(Debug, Clone, Default)]
+pub struct ReadShareGroupStateSummaryResponse {
+    pub error_code: i16,
+}
+
+// -- StreamsGroupHeartbeat --
+
+#[derive(Debug, Clone, Default)]
+pub struct StreamsGroupHeartbeatResponse {
+    pub error_code: i16,
+}
+
+// -- StreamsGroupDescribe --
+
+#[derive(Debug, Clone, Default)]
+pub struct StreamsGroupDescribeResponse {
+    pub error_code: i16,
+}
+
+// -- DescribeShareGroupOffsets --
+
+#[derive(Debug, Clone, Default)]
+pub struct DescribeShareGroupOffsetsResponse {
+    pub error_code: i16,
+}
+
+// -- AlterShareGroupOffsets --
+
+#[derive(Debug, Clone, Default)]
+pub struct AlterShareGroupOffsetsResponse {
+    pub error_code: i16,
+}
+
+// -- DeleteShareGroupOffsets --
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteShareGroupOffsetsResponse {
     pub error_code: i16,
 }
 
@@ -1428,6 +2671,7 @@ mod tests {
             ApiKey::SaslAuthenticate,
             ApiKey::DeleteRecords,
             ApiKey::InitProducerId,
+            ApiKey::OffsetForLeaderEpoch,
             ApiKey::AddPartitionsToTxn,
             ApiKey::AddOffsetsToTxn,
             ApiKey::EndTxn,
@@ -1437,6 +2681,7 @@ mod tests {
             ApiKey::CreatePartitions,
             ApiKey::DeleteGroups,
             ApiKey::OffsetDelete,
+            ApiKey::DescribeCluster,
         ];
         for key in keys {
             let i = key as i16;
@@ -1477,7 +2722,7 @@ mod tests {
 
         let (min, max) = ApiKey::ApiVersions.version_range();
         assert_eq!(min, 0);
-        assert_eq!(max, 0);
+        assert_eq!(max, 3);
     }
 
     #[test]
@@ -1757,17 +3002,66 @@ mod tests {
             (20, ApiKey::DeleteTopics),
             (21, ApiKey::DeleteRecords),
             (22, ApiKey::InitProducerId),
+            (23, ApiKey::OffsetForLeaderEpoch),
             (24, ApiKey::AddPartitionsToTxn),
             (25, ApiKey::AddOffsetsToTxn),
             (26, ApiKey::EndTxn),
+            (27, ApiKey::WriteTxnMarkers),
             (28, ApiKey::TxnOffsetCommit),
+            (29, ApiKey::DescribeAcls),
+            (30, ApiKey::CreateAcls),
+            (31, ApiKey::DeleteAcls),
             (32, ApiKey::DescribeConfigs),
             (33, ApiKey::AlterConfigs),
+            (34, ApiKey::AlterReplicaLogDirs),
+            (35, ApiKey::DescribeLogDirs),
             (36, ApiKey::SaslAuthenticate),
             (37, ApiKey::CreatePartitions),
+            (38, ApiKey::CreateDelegationToken),
+            (39, ApiKey::RenewDelegationToken),
+            (40, ApiKey::ExpireDelegationToken),
+            (41, ApiKey::DescribeDelegationToken),
             (42, ApiKey::DeleteGroups),
+            (43, ApiKey::ElectLeaders),
+            (44, ApiKey::IncrementalAlterConfigs),
+            (45, ApiKey::AlterPartitionReassignments),
+            (46, ApiKey::ListPartitionReassignments),
             (47, ApiKey::OffsetDelete),
+            (48, ApiKey::DescribeClientQuotas),
+            (49, ApiKey::AlterClientQuotas),
+            (50, ApiKey::DescribeUserScramCredentials),
+            (51, ApiKey::AlterUserScramCredentials),
+            (55, ApiKey::DescribeQuorum),
+            (57, ApiKey::UpdateFeatures),
+            (60, ApiKey::DescribeCluster),
+            (61, ApiKey::DescribeProducers),
+            (64, ApiKey::UnregisterBroker),
+            (65, ApiKey::DescribeTransactions),
+            (66, ApiKey::ListTransactions),
+            (68, ApiKey::ConsumerGroupHeartbeat),
+            (69, ApiKey::ConsumerGroupDescribe),
+            (71, ApiKey::GetTelemetrySubscriptions),
+            (72, ApiKey::PushTelemetry),
+            (74, ApiKey::ListConfigResources),
+            (75, ApiKey::DescribeTopicPartitions),
+            (76, ApiKey::ShareGroupHeartbeat),
+            (77, ApiKey::ShareGroupDescribe),
+            (78, ApiKey::ShareFetch),
+            (79, ApiKey::ShareAcknowledge),
+            (80, ApiKey::AddRaftVoter),
+            (81, ApiKey::RemoveRaftVoter),
+            (83, ApiKey::InitializeShareGroupState),
+            (84, ApiKey::ReadShareGroupState),
+            (85, ApiKey::WriteShareGroupState),
+            (86, ApiKey::DeleteShareGroupState),
+            (87, ApiKey::ReadShareGroupStateSummary),
+            (88, ApiKey::StreamsGroupHeartbeat),
+            (89, ApiKey::StreamsGroupDescribe),
+            (90, ApiKey::DescribeShareGroupOffsets),
+            (91, ApiKey::AlterShareGroupOffsets),
+            (92, ApiKey::DeleteShareGroupOffsets),
         ];
+        assert_eq!(valid_keys.len(), 77, "expected 77 total API keys");
         for (i, expected) in &valid_keys {
             assert_eq!(ApiKey::from_i16(*i), Some(*expected), "ApiKey {i}");
         }
@@ -1777,7 +3071,6 @@ mod tests {
     fn test_api_key_from_i16_invalid() {
         assert!(ApiKey::from_i16(-1).is_none());
         assert!(ApiKey::from_i16(4).is_none()); // gap
-        assert!(ApiKey::from_i16(23).is_none()); // gap
         assert!(ApiKey::from_i16(100).is_none());
         assert!(ApiKey::from_i16(i16::MAX).is_none());
         assert!(ApiKey::from_i16(i16::MIN).is_none());
@@ -1806,17 +3099,66 @@ mod tests {
             ApiKey::DeleteTopics,
             ApiKey::DeleteRecords,
             ApiKey::InitProducerId,
+            ApiKey::OffsetForLeaderEpoch,
             ApiKey::AddPartitionsToTxn,
             ApiKey::AddOffsetsToTxn,
             ApiKey::EndTxn,
+            ApiKey::WriteTxnMarkers,
             ApiKey::TxnOffsetCommit,
             ApiKey::DescribeConfigs,
             ApiKey::AlterConfigs,
+            ApiKey::AlterReplicaLogDirs,
             ApiKey::SaslAuthenticate,
             ApiKey::CreatePartitions,
+            ApiKey::CreateDelegationToken,
+            ApiKey::RenewDelegationToken,
+            ApiKey::ExpireDelegationToken,
+            ApiKey::DescribeDelegationToken,
             ApiKey::DeleteGroups,
+            ApiKey::ElectLeaders,
+            ApiKey::DescribeAcls,
+            ApiKey::CreateAcls,
+            ApiKey::DeleteAcls,
+            ApiKey::DescribeLogDirs,
+            ApiKey::IncrementalAlterConfigs,
+            ApiKey::AlterPartitionReassignments,
+            ApiKey::ListPartitionReassignments,
             ApiKey::OffsetDelete,
+            ApiKey::DescribeClientQuotas,
+            ApiKey::AlterClientQuotas,
+            ApiKey::DescribeUserScramCredentials,
+            ApiKey::AlterUserScramCredentials,
+            ApiKey::DescribeQuorum,
+            ApiKey::UpdateFeatures,
+            ApiKey::DescribeCluster,
+            ApiKey::DescribeProducers,
+            ApiKey::UnregisterBroker,
+            ApiKey::DescribeTransactions,
+            ApiKey::ListTransactions,
+            ApiKey::ConsumerGroupHeartbeat,
+            ApiKey::ConsumerGroupDescribe,
+            ApiKey::GetTelemetrySubscriptions,
+            ApiKey::PushTelemetry,
+            ApiKey::ListConfigResources,
+            ApiKey::DescribeTopicPartitions,
+            ApiKey::ShareGroupHeartbeat,
+            ApiKey::ShareGroupDescribe,
+            ApiKey::ShareFetch,
+            ApiKey::ShareAcknowledge,
+            ApiKey::AddRaftVoter,
+            ApiKey::RemoveRaftVoter,
+            ApiKey::InitializeShareGroupState,
+            ApiKey::ReadShareGroupState,
+            ApiKey::WriteShareGroupState,
+            ApiKey::DeleteShareGroupState,
+            ApiKey::ReadShareGroupStateSummary,
+            ApiKey::StreamsGroupHeartbeat,
+            ApiKey::StreamsGroupDescribe,
+            ApiKey::DescribeShareGroupOffsets,
+            ApiKey::AlterShareGroupOffsets,
+            ApiKey::DeleteShareGroupOffsets,
         ];
+        assert_eq!(keys.len(), 77, "expected 77 total API keys");
         for key in &keys {
             let (min, max) = key.version_range();
             assert!(min <= max, "ApiKey {:?}: min={min} > max={max}", key);

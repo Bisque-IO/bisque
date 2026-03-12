@@ -259,9 +259,10 @@ impl ReasonCode {
     pub const PAYLOAD_FORMAT_INVALID: Self = Self(0x99);
     pub const RETAIN_NOT_SUPPORTED: Self = Self(0x9A);
     pub const QOS_NOT_SUPPORTED: Self = Self(0x9B);
-    pub const USE_ANOTHER_SERVER: Self = Self(0x9D);
+    pub const USE_ANOTHER_SERVER: Self = Self(0x9C);
+    pub const SERVER_MOVED: Self = Self(0x9D);
     pub const SHARED_SUBSCRIPTIONS_NOT_SUPPORTED: Self = Self(0x9E);
-    pub const SERVER_MOVED: Self = Self(0x9E); // Same as SHARED_SUBSCRIPTIONS_NOT_SUPPORTED (context-dependent)
+    pub const DISCONNECT_WITH_WILL: Self = Self(0x04);
     pub const CONNECTION_RATE_EXCEEDED: Self = Self(0x9F);
     pub const MAXIMUM_CONNECT_TIME: Self = Self(0xA0);
     pub const SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED: Self = Self(0xA1);
@@ -833,7 +834,9 @@ mod tests {
         assert_eq!(ReasonCode::RECEIVE_MAXIMUM_EXCEEDED.0, 0x93);
         assert_eq!(ReasonCode::MESSAGE_RATE_TOO_HIGH.0, 0x96);
         assert_eq!(ReasonCode::ADMINISTRATIVE_ACTION.0, 0x98);
-        assert_eq!(ReasonCode::USE_ANOTHER_SERVER.0, 0x9D);
+        assert_eq!(ReasonCode::USE_ANOTHER_SERVER.0, 0x9C);
+        assert_eq!(ReasonCode::SERVER_MOVED.0, 0x9D);
+        assert_eq!(ReasonCode::DISCONNECT_WITH_WILL.0, 0x04);
         assert_eq!(ReasonCode::CONNECTION_RATE_EXCEEDED.0, 0x9F);
         assert_eq!(ReasonCode::MAXIMUM_CONNECT_TIME.0, 0xA0);
     }

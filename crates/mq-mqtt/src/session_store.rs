@@ -35,6 +35,12 @@ pub struct PersistedSession {
     pub session_expiry_interval: u32,
     /// When the session was disconnected (for expiry calculation).
     pub disconnected_at: Option<Instant>,
+    /// MQTT 5.0: Inbound QoS 1/2 inflight count at time of persist.
+    pub inbound_qos_inflight: u32,
+    /// MQTT 5.0: Outbound QoS 1 inflight count at time of persist.
+    pub outbound_qos1_count: u32,
+    /// Rate limiting: remaining message quota at time of persist.
+    pub remaining_quota: u64,
 }
 
 /// Persisted subscription information.
@@ -165,7 +171,9 @@ impl SessionStore for InMemorySessionStore {
 
 /// Extract persisted state from an `MqttSession`.
 ///
-/// Called when a session disconnects with session_expiry_interval > 0.
+/// Called when a session disconnects and `should_persist()` returns true.
+/// For MQTT 3.1.1 with `clean_session=false`, uses `0xFFFFFFFF` (never expire)
+/// since V3.1.1 has no session expiry concept — sessions persist indefinitely.
 pub fn extract_session_state(session: &crate::session::MqttSession) -> PersistedSession {
     let subscriptions = session
         .subscriptions_iter()
@@ -180,19 +188,38 @@ pub fn extract_session_state(session: &crate::session::MqttSession) -> Persisted
         })
         .collect();
 
+    // MQTT 3.1.1: clean_session=false implies indefinite persistence (no expiry concept).
+    // MQTT 5.0: use the negotiated session_expiry_interval.
+    let session_expiry_interval = match session.protocol_version {
+        crate::types::ProtocolVersion::V311 => 0xFFFFFFFF,
+        crate::types::ProtocolVersion::V5 => session.session_expiry_interval,
+    };
+
     PersistedSession {
         client_id: session.client_id.clone(),
         subscriptions,
         pending_qos1: session.pending_qos1_packet_ids(),
         pending_qos2: session.pending_qos2_packet_ids(),
-        session_expiry_interval: session.session_expiry_interval,
+        session_expiry_interval,
         disconnected_at: Some(Instant::now()),
+        inbound_qos_inflight: session.inbound_qos_inflight(),
+        outbound_qos1_count: session.outbound_qos1_count(),
+        remaining_quota: session.remaining_quota(),
     }
 }
 
 /// Check if a session's state should be persisted on disconnect.
+///
+/// For MQTT 3.1.1: `clean_session=false` always persists (no expiry concept).
+/// For MQTT 5.0: persists when `session_expiry_interval > 0`.
 pub fn should_persist(session: &crate::session::MqttSession) -> bool {
-    !session.clean_session && session.session_expiry_interval > 0
+    if session.clean_session {
+        return false;
+    }
+    match session.protocol_version {
+        crate::types::ProtocolVersion::V311 => true,
+        crate::types::ProtocolVersion::V5 => session.session_expiry_interval > 0,
+    }
 }
 
 // =============================================================================
@@ -219,6 +246,9 @@ mod tests {
             pending_qos2: vec![3],
             session_expiry_interval: expiry,
             disconnected_at: None,
+            inbound_qos_inflight: 0,
+            outbound_qos1_count: 0,
+            remaining_quota: 0,
         }
     }
 
@@ -384,6 +414,129 @@ mod tests {
         assert!(sub.retain_as_published);
         assert_eq!(sub.retain_handling, 2);
         assert_eq!(sub.shared_group.as_deref(), Some("mygroup"));
+    }
+
+    // ---- MQTT 3.1.1 Compliance: V3.1.1 Session Persistence ----
+
+    #[test]
+    fn test_v311_session_expiry_uses_never_expire() {
+        // MQTT 3.1.1 has no session expiry concept — clean_session=false sessions
+        // persist indefinitely. extract_session_state must use 0xFFFFFFFF for V3.1.1.
+        // This verifies the fix for GAP-7 where V3.1.1 sessions expired immediately.
+        let store = InMemorySessionStore::new();
+        let mut session = make_session("v311-persist", 0xFFFFFFFF);
+        session.disconnected_at = Some(Instant::now() - Duration::from_secs(86400 * 30)); // 30 days ago
+        store.save(session);
+
+        // Should still be loadable (never expires).
+        let loaded = store.load("v311-persist");
+        assert!(loaded.is_some(), "V3.1.1 session should never expire");
+        assert_eq!(loaded.unwrap().session_expiry_interval, 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn test_v5_session_expiry_zero_expires_immediately() {
+        // MQTT 5.0 with session_expiry_interval=0 should expire on disconnect.
+        let store = InMemorySessionStore::new();
+        let mut session = make_session("v5-zero", 0);
+        session.disconnected_at = Some(Instant::now() - Duration::from_millis(1));
+        store.save(session);
+
+        assert!(
+            store.load("v5-zero").is_none(),
+            "session_expiry_interval=0 should expire immediately"
+        );
+    }
+
+    #[test]
+    fn test_v5_session_expiry_honors_interval() {
+        // MQTT 5.0 with a specific interval should expire after that many seconds.
+        let store = InMemorySessionStore::new();
+        let mut session = make_session("v5-60", 60);
+        session.disconnected_at = Some(Instant::now()); // just now
+        store.save(session);
+
+        // Should still be loadable (not yet expired).
+        assert!(
+            store.load("v5-60").is_some(),
+            "session within expiry window should be loadable"
+        );
+    }
+
+    #[test]
+    fn test_expire_preserves_never_expire_sessions() {
+        let store = InMemorySessionStore::new();
+
+        // V3.1.1 session (never expires).
+        let mut v311 = make_session("v311", 0xFFFFFFFF);
+        v311.disconnected_at = Some(Instant::now() - Duration::from_secs(86400 * 365));
+        store.save(v311);
+
+        // V5 session with short expiry.
+        let mut v5 = make_session("v5-short", 1);
+        v5.disconnected_at = Some(Instant::now() - Duration::from_secs(10));
+        store.save(v5);
+
+        let removed = store.expire();
+        assert_eq!(removed, 1);
+        assert!(
+            store.load("v311").is_some(),
+            "V3.1.1 session should survive expire()"
+        );
+        assert!(
+            store.load("v5-short").is_none(),
+            "expired V5 session should be removed"
+        );
+    }
+
+    #[test]
+    fn test_session_preserves_subscriptions_and_pending() {
+        let store = InMemorySessionStore::new();
+        let session = PersistedSession {
+            client_id: "sub-test".to_string(),
+            subscriptions: vec![
+                PersistedSubscription {
+                    filter: "sensor/+/data".to_string(),
+                    max_qos: QoS::AtLeastOnce,
+                    subscription_id: Some(10),
+                    no_local: true,
+                    retain_as_published: false,
+                    retain_handling: 1,
+                    shared_group: None,
+                },
+                PersistedSubscription {
+                    filter: "$SYS/#".to_string(),
+                    max_qos: QoS::ExactlyOnce,
+                    subscription_id: None,
+                    no_local: false,
+                    retain_as_published: true,
+                    retain_handling: 0,
+                    shared_group: Some("monitors".to_string()),
+                },
+            ],
+            pending_qos1: vec![1, 5, 10],
+            pending_qos2: vec![2, 7],
+            session_expiry_interval: 0xFFFFFFFF,
+            disconnected_at: Some(Instant::now()),
+            inbound_qos_inflight: 3,
+            outbound_qos1_count: 5,
+            remaining_quota: 100,
+        };
+        store.save(session);
+
+        let loaded = store.load("sub-test").unwrap();
+        assert_eq!(loaded.subscriptions.len(), 2);
+        assert_eq!(loaded.subscriptions[0].filter, "sensor/+/data");
+        assert_eq!(loaded.subscriptions[0].subscription_id, Some(10));
+        assert!(loaded.subscriptions[0].no_local);
+        assert_eq!(loaded.subscriptions[1].filter, "$SYS/#");
+        assert_eq!(
+            loaded.subscriptions[1].shared_group.as_deref(),
+            Some("monitors")
+        );
+        assert!(loaded.subscriptions[1].retain_as_published);
+        assert_eq!(loaded.pending_qos1, vec![1, 5, 10]);
+        assert_eq!(loaded.pending_qos2, vec![2, 7]);
     }
 
     #[test]

@@ -3,14 +3,15 @@
 //! # Wire layout
 //!
 //! ```text
-//! [fixed header: 32 bytes]
+//! [fixed header: 40 bytes]
 //!   flags:            u16   (bitfield — see FLAGS_*)
 //!   header_count:     u16   (number of key/value header pairs)
 //!   span_count:       u16   (total variable-length spans in the index)
-//!   value_len:        u16   (reserved — currently unused, kept for alignment)
+//!   reserved:         u16   (alignment padding)
 //!   timestamp:        u64
 //!   ttl_ms:           u64   (0 = not set)
 //!   delay_ms:         u64   (0 = not set)
+//!   publisher_id:     u64   (0 = not set; MQTT client/producer ID)
 //!
 //! [span index: span_count × 8 bytes]
 //!   Fixed order: value, [key], [routing_key], [reply_to], [correlation_id],
@@ -27,7 +28,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 // Constants
 // ---------------------------------------------------------------------------
 
-pub(crate) const HEADER_SIZE: usize = 32;
+pub(crate) const HEADER_SIZE: usize = 40;
 const SPAN_SIZE: usize = 8; // u32 offset + u32 length
 
 // Flag bits
@@ -37,6 +38,11 @@ const FLAG_HAS_DELAY: u16 = 1 << 2;
 const FLAG_HAS_ROUTING_KEY: u16 = 1 << 3;
 const FLAG_HAS_REPLY_TO: u16 = 1 << 4;
 const FLAG_HAS_CORRELATION_ID: u16 = 1 << 5;
+// MQTT-native flag bits
+const FLAG_RETAIN: u16 = 1 << 6;
+const FLAG_NO_LOCAL: u16 = 1 << 7;
+const FLAG_UTF8_PAYLOAD: u16 = 1 << 8;
+const FLAG_HAS_PUBLISHER_ID: u16 = 1 << 9;
 
 // Span index positions (value is always span 0)
 const SPAN_VALUE: usize = 0;
@@ -45,7 +51,7 @@ const SPAN_VALUE: usize = 0;
 // FlatMessageMeta — extracted from the fixed 32-byte header only
 // ---------------------------------------------------------------------------
 
-/// Lightweight metadata extracted from the first 32 bytes of a `FlatMessage`.
+/// Lightweight metadata extracted from the first 40 bytes of a `FlatMessage`.
 /// No variable-length deserialization required — suitable for the state machine
 /// replay path where only timestamps and TTL/delay matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,10 +62,11 @@ pub struct FlatMessageMeta {
     pub timestamp: u64,
     pub ttl_ms: u64,
     pub delay_ms: u64,
+    pub publisher_id: u64,
 }
 
 impl FlatMessageMeta {
-    /// Parse metadata from the first 32 bytes of `buf`.
+    /// Parse metadata from the first 40 bytes of `buf`.
     /// Returns `None` if the buffer is too short.
     #[inline]
     pub fn parse(buf: &[u8]) -> Option<Self> {
@@ -74,6 +81,7 @@ impl FlatMessageMeta {
             timestamp: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             ttl_ms: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
             delay_ms: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            publisher_id: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
         })
     }
 
@@ -108,6 +116,21 @@ impl FlatMessageMeta {
     #[inline]
     pub fn has_correlation_id(&self) -> bool {
         self.flags & FLAG_HAS_CORRELATION_ID != 0
+    }
+
+    #[inline]
+    pub fn is_retain(&self) -> bool {
+        self.flags & FLAG_RETAIN != 0
+    }
+
+    #[inline]
+    pub fn is_no_local(&self) -> bool {
+        self.flags & FLAG_NO_LOCAL != 0
+    }
+
+    #[inline]
+    pub fn is_utf8_payload(&self) -> bool {
+        self.flags & FLAG_UTF8_PAYLOAD != 0
     }
 
     /// Total byte length of the value field, read from the first span.
@@ -192,6 +215,26 @@ impl FlatMessage {
     #[inline]
     pub fn delay_ms(&self) -> Option<u64> {
         self.meta.delay_ms_opt()
+    }
+
+    #[inline]
+    pub fn is_retain(&self) -> bool {
+        self.meta.is_retain()
+    }
+
+    #[inline]
+    pub fn is_no_local(&self) -> bool {
+        self.meta.is_no_local()
+    }
+
+    #[inline]
+    pub fn is_utf8_payload(&self) -> bool {
+        self.meta.is_utf8_payload()
+    }
+
+    #[inline]
+    pub fn publisher_id(&self) -> u64 {
+        self.meta.publisher_id
     }
 
     // -- span accessor helpers ------------------------------------------------
@@ -353,6 +396,7 @@ pub struct FlatMessageBuilder {
     timestamp: u64,
     ttl_ms: u64,
     delay_ms: u64,
+    publisher_id: u64,
     flags: u16,
 }
 
@@ -368,6 +412,7 @@ impl FlatMessageBuilder {
             timestamp: 0,
             ttl_ms: 0,
             delay_ms: 0,
+            publisher_id: 0,
             flags: 0,
         }
     }
@@ -413,6 +458,53 @@ impl FlatMessageBuilder {
         self
     }
 
+    /// Alias for `ttl_ms`.
+    pub fn ttl(self, ttl: u64) -> Self {
+        self.ttl_ms(ttl)
+    }
+
+    /// Alias for `delay_ms`.
+    pub fn delay(self, delay: u64) -> Self {
+        self.delay_ms(delay)
+    }
+
+    pub fn retain(mut self, retain: bool) -> Self {
+        if retain {
+            self.flags |= FLAG_RETAIN;
+        } else {
+            self.flags &= !FLAG_RETAIN;
+        }
+        self
+    }
+
+    pub fn no_local(mut self, no_local: bool) -> Self {
+        if no_local {
+            self.flags |= FLAG_NO_LOCAL;
+        } else {
+            self.flags &= !FLAG_NO_LOCAL;
+        }
+        self
+    }
+
+    pub fn utf8_payload(mut self, utf8: bool) -> Self {
+        if utf8 {
+            self.flags |= FLAG_UTF8_PAYLOAD;
+        } else {
+            self.flags &= !FLAG_UTF8_PAYLOAD;
+        }
+        self
+    }
+
+    pub fn publisher_id(mut self, id: u64) -> Self {
+        self.publisher_id = id;
+        if id != 0 {
+            self.flags |= FLAG_HAS_PUBLISHER_ID;
+        } else {
+            self.flags &= !FLAG_HAS_PUBLISHER_ID;
+        }
+        self
+    }
+
     pub fn header(mut self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
         self.headers.push((key.into(), value.into()));
         self
@@ -450,7 +542,7 @@ impl FlatMessageBuilder {
         let total_size = HEADER_SIZE + (span_count as usize) * SPAN_SIZE + data_size;
         let mut buf = BytesMut::with_capacity(total_size);
 
-        // -- Write fixed header (32 bytes) --
+        // -- Write fixed header (40 bytes) --
         buf.put_u16_le(self.flags);
         buf.put_u16_le(header_count);
         buf.put_u16_le(span_count);
@@ -458,6 +550,7 @@ impl FlatMessageBuilder {
         buf.put_u64_le(self.timestamp);
         buf.put_u64_le(self.ttl_ms);
         buf.put_u64_le(self.delay_ms);
+        buf.put_u64_le(self.publisher_id);
 
         // -- Write span index --
         struct Span {
@@ -581,7 +674,7 @@ mod tests {
             .delay_ms(1500)
             .build();
 
-        let meta = FlatMessageMeta::parse(&buf[..32]).unwrap();
+        let meta = FlatMessageMeta::parse(&buf[..HEADER_SIZE]).unwrap();
         assert_eq!(meta.timestamp, 999);
         assert_eq!(meta.ttl_ms_opt(), Some(3000));
         assert_eq!(meta.delay_ms_opt(), Some(1500));

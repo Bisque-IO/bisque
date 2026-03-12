@@ -805,6 +805,8 @@ pub mod condition {
     pub const LINK_SOURCE_RANK_TOO_HIGH: &str = "amqp:link:source-rank-too-high";
     pub const LINK_AMBIGUOUS_COMMIT: &str = "amqp:link:ambiguous-commit";
 
+    pub const ILLEGAL_STATE: &str = "amqp:illegal-state";
+
     // Transaction error conditions (Gap X2)
     pub const TXN_UNKNOWN_ID: &str = "amqp:transaction:unknown-id";
     pub const TXN_ROLLBACK: &str = "amqp:transaction:rollback";

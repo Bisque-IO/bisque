@@ -1621,6 +1621,35 @@ pub fn encode_publish_from_flat(
     topic_alias_info: Option<(u16, bool)>,
     buf: &mut BytesMut,
 ) {
+    encode_publish_from_flat_with_expiry(
+        flat_msg,
+        qos,
+        retain,
+        dup,
+        packet_id,
+        is_v5,
+        subscription_id,
+        topic_alias_info,
+        None,
+        buf,
+    )
+}
+
+/// Like `encode_publish_from_flat` but with an optional adjusted message expiry
+/// interval (in seconds). When provided, this overrides the FlatMessage's ttl_ms
+/// so the subscriber receives the **remaining** lifetime per MQTT 5.0 §3.3.2.3.3.
+pub fn encode_publish_from_flat_with_expiry(
+    flat_msg: &FlatMessage,
+    qos: QoS,
+    retain: bool,
+    dup: bool,
+    packet_id: Option<u16>,
+    is_v5: bool,
+    subscription_id: Option<u32>,
+    topic_alias_info: Option<(u16, bool)>,
+    adjusted_expiry_secs: Option<u32>,
+    buf: &mut BytesMut,
+) {
     let topic = flat_msg.routing_key().unwrap_or_default();
     let payload = flat_msg.value();
 
@@ -1630,7 +1659,7 @@ pub fn encode_publish_from_flat(
 
     // Compute MQTT 5.0 properties size.
     let props_content_size = if is_v5 {
-        compute_flat_properties_size(flat_msg, subscription_id, topic_alias)
+        compute_flat_properties_size(flat_msg, subscription_id, topic_alias, adjusted_expiry_secs)
     } else {
         0
     };
@@ -1681,7 +1710,13 @@ pub fn encode_publish_from_flat(
     // MQTT 5.0 properties.
     if is_v5 {
         write_variable_int(props_content_size as u32, buf);
-        write_flat_properties(flat_msg, subscription_id, topic_alias, buf);
+        write_flat_properties(
+            flat_msg,
+            subscription_id,
+            topic_alias,
+            adjusted_expiry_secs,
+            buf,
+        );
     }
 
     // Payload (from FlatMessage value span — zero-copy from mmap).
@@ -1693,13 +1728,23 @@ fn compute_flat_properties_size(
     flat_msg: &FlatMessage,
     subscription_id: Option<u32>,
     topic_alias: Option<u16>,
+    adjusted_expiry_secs: Option<u32>,
 ) -> usize {
     let mut size = 0;
 
     // message_expiry_interval (0x02): 1 + 4
-    if let Some(ttl_ms) = flat_msg.ttl_ms() {
-        if ttl_ms / 1000 > 0 {
+    // Use adjusted value if provided (remaining lifetime), else fall back to stored TTL.
+    match adjusted_expiry_secs {
+        Some(secs) if secs > 0 => {
             size += 1 + 4;
+        }
+        Some(_) => {} // zero or expired — don't include
+        None => {
+            if let Some(ttl_ms) = flat_msg.ttl_ms() {
+                if ttl_ms / 1000 > 0 {
+                    size += 1 + 4;
+                }
+            }
         }
     }
 
@@ -1747,17 +1792,28 @@ fn write_flat_properties(
     flat_msg: &FlatMessage,
     subscription_id: Option<u32>,
     topic_alias: Option<u16>,
+    adjusted_expiry_secs: Option<u32>,
     buf: &mut BytesMut,
 ) {
     // payload_format_indicator (0x01) — write early per MQTT convention
     // (handled below in header loop to avoid double iteration)
 
     // message_expiry_interval (0x02)
-    if let Some(ttl_ms) = flat_msg.ttl_ms() {
-        let secs = (ttl_ms / 1000) as u32;
-        if secs > 0 {
+    // Use adjusted value (remaining lifetime) if provided, else fall back to stored TTL.
+    match adjusted_expiry_secs {
+        Some(secs) if secs > 0 => {
             buf.put_u8(0x02);
             buf.put_u32(secs);
+        }
+        Some(_) => {} // zero or expired — omit
+        None => {
+            if let Some(ttl_ms) = flat_msg.ttl_ms() {
+                let secs = (ttl_ms / 1000) as u32;
+                if secs > 0 {
+                    buf.put_u8(0x02);
+                    buf.put_u32(secs);
+                }
+            }
         }
     }
 
@@ -4517,6 +4573,490 @@ mod tests {
             matches!(result, Err(CodecError::ProtocolError)),
             "zero packet ID in QoS 2 PUBLISH should be rejected, got {:?}",
             result
+        );
+    }
+
+    // =========================================================================
+    // MQTT 3.1.1 Compliance Tests
+    // =========================================================================
+
+    // ---- BOM preservation [MQTT-1.5.3-3] ----
+
+    #[test]
+    fn test_utf8_bom_preserved_in_string() {
+        // MQTT spec says BOM (U+FEFF = 0xEF 0xBB 0xBF) SHOULD NOT be stripped.
+        // Verify that a string containing BOM survives encode/decode roundtrip.
+        let mut buf = BytesMut::new();
+        // Write a string that starts with BOM: "\u{FEFF}hello"
+        let bom_str = "\u{FEFF}hello";
+        write_mqtt_string(bom_str, &mut buf);
+
+        let mut cursor: &[u8] = &buf;
+        let decoded = read_mqtt_string(&mut cursor).unwrap();
+        assert_eq!(decoded, bom_str, "BOM must be preserved, not stripped");
+        assert!(decoded.starts_with('\u{FEFF}'));
+    }
+
+    // ---- V5 password without username is allowed ----
+
+    #[test]
+    fn test_v5_password_without_username_allowed() {
+        // MQTT 5.0 relaxes this constraint — password without username is valid.
+        let connect = Connect {
+            protocol_name: "MQTT".to_string(),
+            protocol_version: ProtocolVersion::V5,
+            flags: ConnectFlags {
+                username: false,
+                password: true,
+                will_retain: false,
+                will_qos: QoS::AtMostOnce,
+                will: false,
+                clean_session: true,
+            },
+            keep_alive: 60,
+            client_id: "v5-test".to_string(),
+            will: None,
+            username: None,
+            password: Some(Bytes::from_static(b"token")),
+            properties: Properties::default(),
+        };
+        let mut buf = BytesMut::new();
+        encode_packet_versioned(&MqttPacket::Connect(connect), ProtocolVersion::V5, &mut buf);
+
+        let result = decode_packet_versioned(&buf, ProtocolVersion::V5);
+        assert!(result.is_ok(), "V5 should allow password without username");
+    }
+
+    // ---- QoS 3 rejected [MQTT-3.3.1-4] ----
+
+    #[test]
+    fn test_publish_qos3_rejected() {
+        // QoS bits both set to 1 (QoS=3) is a protocol violation.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x04]); // topic length
+        payload.extend_from_slice(b"test");
+        payload.extend_from_slice(&[0x00, 0x01]); // packet_id (required for QoS>0)
+        payload.extend_from_slice(b"data");
+
+        // flags: 0x06 = QoS 3 (both bits set)
+        let raw = build_raw_packet(3, 0x06, &payload);
+        let result = decode_packet(&raw);
+        assert!(result.is_err(), "QoS 3 (0x06) must be rejected");
+    }
+
+    // ---- Fixed header flag validation [MQTT-2.2.2-1] ----
+
+    #[test]
+    fn test_subscribe_wrong_flags_rejected() {
+        // SUBSCRIBE fixed header flags must be 0x02.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x01]); // packet_id
+        payload.extend_from_slice(&[0x00, 0x01, b'a']); // filter
+        payload.push(0x00); // QoS 0
+
+        // flags=0x00 instead of required 0x02
+        let raw = build_raw_packet(8, 0x00, &payload);
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::InvalidFixedHeaderFlags(8))),
+            "SUBSCRIBE with flags!=0x02 must be rejected, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_unsubscribe_wrong_flags_rejected() {
+        // UNSUBSCRIBE fixed header flags must be 0x02.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x01]); // packet_id
+        payload.extend_from_slice(&[0x00, 0x01, b'a']); // filter
+
+        // flags=0x00 instead of required 0x02
+        let raw = build_raw_packet(10, 0x00, &payload);
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::InvalidFixedHeaderFlags(10))),
+            "UNSUBSCRIBE with flags!=0x02 must be rejected, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pingreq_wrong_flags_rejected() {
+        // PINGREQ flags must be 0x00.
+        let raw = build_raw_packet(12, 0x01, &[]);
+        let result = decode_packet(&raw);
+        assert!(
+            matches!(result, Err(CodecError::InvalidFixedHeaderFlags(12))),
+            "PINGREQ with flags!=0x00 must be rejected, got {:?}",
+            result
+        );
+    }
+
+    // ---- Topic name validation [MQTT-3.3.2-2] ----
+
+    #[test]
+    fn test_topic_name_with_hash_wildcard_rejected() {
+        assert!(validate_topic_name(b"sensor/#").is_err());
+    }
+
+    #[test]
+    fn test_topic_name_with_plus_wildcard_rejected() {
+        assert!(validate_topic_name(b"sensor/+/data").is_err());
+    }
+
+    #[test]
+    fn test_topic_name_empty_is_invalid() {
+        assert!(validate_topic_name(b"").is_err());
+    }
+
+    // ---- Topic filter validation edge cases [MQTT-4.7.1-2, MQTT-4.7.1-3] ----
+
+    #[test]
+    fn test_topic_filter_hash_not_last_rejected() {
+        assert!(validate_topic_filter("a/#/b").is_err());
+    }
+
+    #[test]
+    fn test_topic_filter_hash_mixed_in_level_rejected() {
+        assert!(validate_topic_filter("a/b#").is_err());
+    }
+
+    #[test]
+    fn test_topic_filter_plus_mixed_in_level_rejected() {
+        assert!(validate_topic_filter("a/b+c").is_err());
+    }
+
+    #[test]
+    fn test_topic_filter_valid_multilevel() {
+        assert!(validate_topic_filter("#").is_ok());
+        assert!(validate_topic_filter("a/b/#").is_ok());
+    }
+
+    #[test]
+    fn test_topic_filter_valid_single_level() {
+        assert!(validate_topic_filter("+").is_ok());
+        assert!(validate_topic_filter("+/a/+").is_ok());
+        assert!(validate_topic_filter("a/+/b").is_ok());
+    }
+
+    // ---- Remaining length encoding edge cases ----
+
+    #[test]
+    fn test_remaining_length_max_value() {
+        // Maximum remaining length: 268,435,455
+        let max_val = 268_435_455;
+        let mut buf = BytesMut::new();
+        encode_remaining_length(max_val, &mut buf);
+        let (decoded, consumed) = decode_remaining_length(&buf).unwrap();
+        assert_eq!(decoded, max_val);
+        assert_eq!(consumed, 4);
+    }
+
+    // ---- Connect with all fields roundtrip ----
+
+    #[test]
+    fn test_connect_v311_with_credentials_and_will_roundtrip() {
+        let connect = MqttPacket::Connect(Connect {
+            protocol_name: "MQTT".to_string(),
+            protocol_version: ProtocolVersion::V311,
+            flags: ConnectFlags {
+                username: true,
+                password: true,
+                will_retain: true,
+                will_qos: QoS::ExactlyOnce,
+                will: true,
+                clean_session: false,
+            },
+            keep_alive: 300,
+            client_id: "full-featured-client".to_string(),
+            will: Some(WillMessage {
+                topic: "clients/status".to_string(),
+                payload: Bytes::from_static(b"offline"),
+                qos: QoS::ExactlyOnce,
+                retain: true,
+                properties: Properties::default(),
+            }),
+            username: Some("admin".to_string()),
+            password: Some(Bytes::from_static(b"secret123")),
+            properties: Properties::default(),
+        });
+
+        let mut buf = BytesMut::new();
+        encode_packet(&connect, &mut buf);
+
+        let (decoded, consumed) = decode_packet(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+
+        match decoded {
+            MqttPacket::Connect(c) => {
+                assert_eq!(c.protocol_version, ProtocolVersion::V311);
+                assert!(!c.flags.clean_session);
+                assert!(c.flags.will);
+                assert!(c.flags.will_retain);
+                assert_eq!(c.flags.will_qos, QoS::ExactlyOnce);
+                assert_eq!(c.keep_alive, 300);
+                assert_eq!(c.client_id, "full-featured-client");
+                let will = c.will.unwrap();
+                assert_eq!(will.topic, "clients/status");
+                assert_eq!(will.payload.as_ref(), b"offline");
+                assert_eq!(c.username.unwrap(), "admin");
+                assert_eq!(c.password.unwrap().as_ref(), b"secret123");
+            }
+            _ => panic!("expected Connect"),
+        }
+    }
+
+    // ---- PUBREL/PUBCOMP roundtrip ----
+
+    #[test]
+    fn test_encode_decode_pubrel() {
+        let pubrel = MqttPacket::PubRel(PubRel {
+            packet_id: 42,
+            reason_code: None,
+            properties: Properties::default(),
+        });
+        let mut buf = BytesMut::new();
+        encode_packet(&pubrel, &mut buf);
+
+        // PUBREL fixed header must have flags=0x02
+        assert_eq!(buf[0] & 0x0F, 0x02);
+
+        let (decoded, _) = decode_packet(&buf).unwrap();
+        match decoded {
+            MqttPacket::PubRel(pr) => assert_eq!(pr.packet_id, 42),
+            _ => panic!("expected PubRel"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_pubrec() {
+        let pubrec = MqttPacket::PubRec(PubRec {
+            packet_id: 77,
+            reason_code: None,
+            properties: Properties::default(),
+        });
+        let mut buf = BytesMut::new();
+        encode_packet(&pubrec, &mut buf);
+
+        let (decoded, _) = decode_packet(&buf).unwrap();
+        match decoded {
+            MqttPacket::PubRec(pr) => assert_eq!(pr.packet_id, 77),
+            _ => panic!("expected PubRec"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_pubcomp() {
+        let pubcomp = MqttPacket::PubComp(PubComp {
+            packet_id: 99,
+            reason_code: None,
+            properties: Properties::default(),
+        });
+        let mut buf = BytesMut::new();
+        encode_packet(&pubcomp, &mut buf);
+
+        let (decoded, _) = decode_packet(&buf).unwrap();
+        match decoded {
+            MqttPacket::PubComp(pc) => assert_eq!(pc.packet_id, 99),
+            _ => panic!("expected PubComp"),
+        }
+    }
+
+    // ---- Publish QoS 2 with retain roundtrip ----
+
+    #[test]
+    fn test_publish_qos2_retain_roundtrip() {
+        let publish = MqttPacket::Publish(Publish {
+            dup: true,
+            qos: QoS::ExactlyOnce,
+            retain: true,
+            topic: Bytes::from_static(b"status/device/1"),
+            packet_id: Some(65535),
+            payload: Bytes::from_static(b"retained qos2 data"),
+            properties: Properties::default(),
+        });
+
+        let mut buf = BytesMut::new();
+        encode_packet(&publish, &mut buf);
+
+        let (decoded, _) = decode_packet(&buf).unwrap();
+        match decoded {
+            MqttPacket::Publish(p) => {
+                assert!(p.dup);
+                assert_eq!(p.qos, QoS::ExactlyOnce);
+                assert!(p.retain);
+                assert_eq!(&p.topic[..], b"status/device/1");
+                assert_eq!(p.packet_id, Some(65535));
+                assert_eq!(&p.payload[..], b"retained qos2 data");
+            }
+            _ => panic!("expected Publish"),
+        }
+    }
+
+    // ---- ConnectFlags reserved bit validation ----
+
+    #[test]
+    fn test_connect_flags_reserved_bit_set_rejected() {
+        // Reserved bit 0 must be 0.
+        assert!(
+            ConnectFlags::from_byte(0x01).is_none(),
+            "reserved bit 0 must be 0"
+        );
+        assert!(
+            ConnectFlags::from_byte(0x03).is_none(),
+            "reserved bit must cause rejection"
+        );
+    }
+
+    // ---- Will flag constraints [MQTT-3.1.2-11 through 3.1.2-15] ----
+
+    #[test]
+    fn test_connect_flags_will_false_constraints() {
+        // will=false: will_qos must be 0 and will_retain must be false.
+        // will=false, will_qos=1: byte = 0b0000_1000 = 0x08
+        assert!(
+            ConnectFlags::from_byte(0x08).is_none(),
+            "will=false with will_qos>0 must fail"
+        );
+        // will=false, will_retain=true: byte = 0b0010_0000 = 0x20
+        assert!(
+            ConnectFlags::from_byte(0x20).is_none(),
+            "will=false with will_retain must fail"
+        );
+    }
+
+    // ---- Message Expiry Adjustment tests (GAP-5) ----
+
+    #[test]
+    fn test_encode_publish_from_flat_with_adjusted_expiry() {
+        use crate::types::ProtocolVersion;
+        use bisque_mq::flat::FlatMessageBuilder;
+
+        // Build a FlatMessage with original TTL of 300s.
+        let flat_bytes = FlatMessageBuilder::new(Bytes::from_static(b"payload"))
+            .routing_key(Bytes::from_static(b"test/expiry"))
+            .ttl_ms(300_000)
+            .timestamp(1000)
+            .build();
+
+        let flat = FlatMessage::new(flat_bytes).unwrap();
+        let mut buf = BytesMut::new();
+
+        // Encode with adjusted expiry of 120 seconds (remaining lifetime).
+        encode_publish_from_flat_with_expiry(
+            &flat,
+            QoS::AtLeastOnce,
+            false,
+            false,
+            Some(1),
+            true, // V5
+            None,
+            None,
+            Some(120), // adjusted expiry
+            &mut buf,
+        );
+
+        // Decode with V5 to get properties.
+        let (decoded, _) = decode_packet_versioned(&buf, ProtocolVersion::V5).unwrap();
+        match decoded {
+            MqttPacket::Publish(p) => {
+                assert_eq!(p.properties.message_expiry_interval, Some(120));
+                assert_eq!(&p.topic[..], b"test/expiry");
+                assert_eq!(&p.payload[..], b"payload");
+            }
+            _ => panic!("expected Publish"),
+        }
+    }
+
+    #[test]
+    fn test_encode_publish_from_flat_with_zero_adjusted_expiry_omits_property() {
+        use crate::types::ProtocolVersion;
+        use bisque_mq::flat::FlatMessageBuilder;
+
+        let flat_bytes = FlatMessageBuilder::new(Bytes::from_static(b"data"))
+            .routing_key(Bytes::from_static(b"t"))
+            .ttl_ms(60_000)
+            .timestamp(1000)
+            .build();
+
+        let flat = FlatMessage::new(flat_bytes).unwrap();
+        let mut buf = BytesMut::new();
+
+        // Zero adjusted expiry should omit the property entirely.
+        encode_publish_from_flat_with_expiry(
+            &flat,
+            QoS::AtMostOnce,
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            Some(0),
+            &mut buf,
+        );
+
+        let (decoded, _) = decode_packet_versioned(&buf, ProtocolVersion::V5).unwrap();
+        match decoded {
+            MqttPacket::Publish(p) => {
+                assert!(p.properties.message_expiry_interval.is_none());
+            }
+            _ => panic!("expected Publish"),
+        }
+    }
+
+    #[test]
+    fn test_encode_publish_from_flat_no_adjusted_expiry_uses_original() {
+        use crate::types::ProtocolVersion;
+        use bisque_mq::flat::FlatMessageBuilder;
+
+        let flat_bytes = FlatMessageBuilder::new(Bytes::from_static(b"data"))
+            .routing_key(Bytes::from_static(b"t"))
+            .ttl_ms(60_000)
+            .timestamp(1000)
+            .build();
+
+        let flat = FlatMessage::new(flat_bytes).unwrap();
+        let mut buf = BytesMut::new();
+
+        // No adjusted expiry → should use the FlatMessage's ttl_ms (60s).
+        encode_publish_from_flat_with_expiry(
+            &flat,
+            QoS::AtMostOnce,
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None, // no override
+            &mut buf,
+        );
+
+        let (decoded, _) = decode_packet_versioned(&buf, ProtocolVersion::V5).unwrap();
+        match decoded {
+            MqttPacket::Publish(p) => {
+                assert_eq!(p.properties.message_expiry_interval, Some(60));
+            }
+            _ => panic!("expected Publish"),
+        }
+    }
+
+    // ---- Empty subscribe/unsubscribe payload rejection ----
+
+    #[test]
+    fn test_subscribe_empty_filters_rejected() {
+        // SUBSCRIBE with no topic filter/QoS pairs is a protocol violation.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x01]); // packet_id only, no filters
+
+        let raw = build_raw_packet(8, 0x02, &payload);
+        let result = decode_packet(&raw);
+        // Should fail due to no filters (payload exhausted after packet_id).
+        assert!(
+            result.is_err(),
+            "SUBSCRIBE with no filters must be rejected"
         );
     }
 }

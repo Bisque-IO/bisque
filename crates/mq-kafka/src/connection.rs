@@ -99,9 +99,21 @@ impl KafkaConnection {
     }
 
     /// Encode a response into the write buffer.
-    pub fn encode_response(&mut self, correlation_id: i32, response: &KafkaResponse) {
+    pub fn encode_response(
+        &mut self,
+        correlation_id: i32,
+        api_key: i16,
+        api_version: i16,
+        response: &KafkaResponse,
+    ) {
         let before = self.write_buf.len();
-        codec::encode_response(correlation_id, response, &mut self.write_buf);
+        codec::encode_response(
+            correlation_id,
+            api_key,
+            api_version,
+            response,
+            &mut self.write_buf,
+        );
         self.metrics
             .bytes_out
             .increment((self.write_buf.len() - before) as u64);
@@ -173,7 +185,7 @@ mod tests {
         assert!(!conn.has_pending_writes());
 
         let resp = KafkaResponse::Heartbeat(HeartbeatResponse { error_code: 0 });
-        conn.encode_response(7, &resp);
+        conn.encode_response(7, 12, 0, &resp);
 
         assert!(conn.has_pending_writes());
         let buf = conn.take_write_buf();
@@ -255,7 +267,7 @@ mod tests {
     fn test_take_write_buf_clears() {
         let mut conn = KafkaConnection::new();
         let resp = KafkaResponse::Heartbeat(HeartbeatResponse { error_code: 0 });
-        conn.encode_response(1, &resp);
+        conn.encode_response(1, 12, 0, &resp);
         assert!(conn.has_pending_writes());
 
         let buf = conn.take_write_buf();

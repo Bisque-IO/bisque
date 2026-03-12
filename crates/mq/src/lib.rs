@@ -10,6 +10,7 @@ pub mod flat;
 pub mod job;
 pub mod manifest;
 pub mod metadata;
+pub mod notifier;
 pub mod producer;
 pub mod purge;
 pub mod queue;

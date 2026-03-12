@@ -120,6 +120,14 @@ pub struct AmqpLink {
     pub dynamic_node_address: Option<String>,
     /// Lifetime policy for dynamic nodes (for cleanup on detach).
     pub lifetime_policy: Option<crate::types::LifetimePolicy>,
+
+    // === X1: Transactional acquisition ===
+    /// Active transaction ID for transactional acquisition (set via Flow properties).
+    pub txn_id: Option<Bytes>,
+
+    // === M6: Default outcome ===
+    /// Default outcome from source, applied when link is destroyed with unsettled deliveries.
+    pub default_outcome: Option<DeliveryState>,
 }
 
 /// An unsettled delivery tracked by the link.
@@ -187,6 +195,8 @@ impl AmqpLink {
             section_offset: 0,
             dynamic_node_address: None,
             lifetime_policy: None,
+            txn_id: None,
+            default_outcome: None,
         }
     }
 
@@ -229,6 +239,16 @@ impl AmqpLink {
     /// last frame is received (`more=false`), or `None` if still accumulating.
     /// Returns `Err` on abort or size violation.
     pub fn accumulate_transfer(&mut self, transfer: &Transfer) -> Result<Option<Bytes>, LinkError> {
+        // TR10: Delivery tag must not exceed 32 bytes
+        if let Some(ref tag) = transfer.delivery_tag {
+            if tag.len() > 32 {
+                return Err(LinkError::ProtocolError(format!(
+                    "delivery-tag exceeds 32-byte limit: {} bytes",
+                    tag.len()
+                )));
+            }
+        }
+
         // Handle aborted transfer
         if transfer.aborted {
             if self.partial_delivery.take().is_some() {
@@ -1623,5 +1643,97 @@ mod tests {
         };
         let result = link.accumulate_transfer(&t3).unwrap().unwrap();
         assert_eq!(&result[..], b"part1part2part3");
+    }
+
+    // =================================================================
+    // TR10: Delivery-tag 32-byte limit
+    // =================================================================
+
+    #[test]
+    fn test_delivery_tag_32_byte_limit() {
+        let mut link = AmqpLink::new(0, WireString::from("l"), Role::Receiver, None);
+        link.link_credit = 5;
+
+        // 32-byte tag should succeed
+        let t1 = Transfer {
+            handle: 0,
+            delivery_id: Some(0),
+            delivery_tag: Some(Bytes::from(vec![0xAB; 32])),
+            payload: Bytes::from_static(b"msg"),
+            ..Default::default()
+        };
+        let result = link.accumulate_transfer(&t1);
+        assert!(result.is_ok());
+
+        // 33-byte tag should fail
+        let t2 = Transfer {
+            handle: 0,
+            delivery_id: Some(1),
+            delivery_tag: Some(Bytes::from(vec![0xAB; 33])),
+            payload: Bytes::from_static(b"msg"),
+            ..Default::default()
+        };
+        let result = link.accumulate_transfer(&t2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delivery_tag_empty_ok() {
+        let mut link = AmqpLink::new(0, WireString::from("l"), Role::Receiver, None);
+        link.link_credit = 5;
+
+        let t = Transfer {
+            handle: 0,
+            delivery_id: Some(0),
+            delivery_tag: Some(Bytes::new()),
+            payload: Bytes::from_static(b"msg"),
+            ..Default::default()
+        };
+        assert!(link.accumulate_transfer(&t).is_ok());
+    }
+
+    #[test]
+    fn test_delivery_tag_none_ok() {
+        let mut link = AmqpLink::new(0, WireString::from("l"), Role::Receiver, None);
+        link.link_credit = 5;
+
+        let t = Transfer {
+            handle: 0,
+            delivery_id: Some(0),
+            delivery_tag: None,
+            payload: Bytes::from_static(b"msg"),
+            ..Default::default()
+        };
+        assert!(link.accumulate_transfer(&t).is_ok());
+    }
+
+    // =================================================================
+    // X1: txn_id field
+    // =================================================================
+
+    #[test]
+    fn test_txn_id_field_default() {
+        let link = AmqpLink::new(0, WireString::from("l"), Role::Sender, None);
+        assert!(link.txn_id.is_none());
+    }
+
+    // =================================================================
+    // M6: default_outcome field
+    // =================================================================
+
+    #[test]
+    fn test_default_outcome_field_default() {
+        let link = AmqpLink::new(0, WireString::from("l"), Role::Sender, None);
+        assert!(link.default_outcome.is_none());
+    }
+
+    #[test]
+    fn test_default_outcome_set() {
+        let mut link = AmqpLink::new(0, WireString::from("l"), Role::Sender, None);
+        link.default_outcome = Some(DeliveryState::Released);
+        assert!(matches!(
+            link.default_outcome,
+            Some(DeliveryState::Released)
+        ));
     }
 }

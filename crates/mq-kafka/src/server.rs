@@ -165,8 +165,10 @@ async fn handle_connection(
                         Ok(Some((header, request))) => {
                             stats.total_requests.fetch_add(1, Ordering::Relaxed);
                             let correlation_id = header.correlation_id;
+                            let api_key = header.api_key;
+                            let api_version = header.api_version;
                             let response = handler.handle(&header, request).await;
-                            conn.encode_response(correlation_id, &response);
+                            conn.encode_response(correlation_id, api_key, api_version, &response);
                         }
                         Ok(None) => break, // need more data
                         Err(e) => {

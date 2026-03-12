@@ -12,6 +12,7 @@ tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
 websocket = ["dep:fastwebsockets"]
 
 [dependencies]
+arc-swap = { workspace = true }
 bisque-mq = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }

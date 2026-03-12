@@ -1299,6 +1299,7 @@ dependencies = [
 name = "bisque-mq-mqtt"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bisque-mq",
  "bytes",
  "dashmap",

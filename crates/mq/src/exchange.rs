@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::types::{Binding, ExchangeType, name_hash};
 
@@ -51,7 +53,9 @@ pub struct ExchangeState {
     /// binding_id → Binding
     pub bindings: HashMap<u64, Binding>,
     /// Routing key hash → binding IDs (for direct exchange fast path).
-    pub direct_index: HashMap<u64, Vec<u64>>,
+    pub direct_index: HashMap<u64, SmallVec<[u64; 4]>>,
+    /// Retained messages: routing_key → message bytes.
+    pub retained: HashMap<String, Bytes>,
 }
 
 impl ExchangeState {
@@ -60,6 +64,7 @@ impl ExchangeState {
             meta,
             bindings: HashMap::new(),
             direct_index: HashMap::new(),
+            retained: HashMap::new(),
         }
     }
 
@@ -81,7 +86,7 @@ impl ExchangeState {
                 if let Some(ref key) = binding.routing_key {
                     let hash = name_hash(key);
                     if let Some(ids) = self.direct_index.get_mut(&hash) {
-                        ids.retain(|&id| id != binding_id);
+                        ids.retain(|id| *id != binding_id);
                         if ids.is_empty() {
                             self.direct_index.remove(&hash);
                         }
@@ -92,7 +97,7 @@ impl ExchangeState {
     }
 
     /// Route a message to target queue IDs based on exchange type and routing key.
-    pub fn route(&self, routing_key: Option<&str>) -> Vec<u64> {
+    pub fn route(&self, routing_key: Option<&str>) -> SmallVec<[u64; 8]> {
         match self.meta.exchange_type {
             ExchangeType::Fanout => {
                 // Deliver to all bound queues
@@ -146,55 +151,78 @@ impl ExchangeState {
 /// - `#` matches zero or more words/levels
 /// - Words are delimited by `.` (AMQP) or `/` (MQTT)
 pub fn topic_pattern_matches(pattern: &str, key: &str) -> bool {
-    // Determine delimiter: use `/` if either contains `/`, else `.`
-    let delim = if pattern.contains('/') || key.contains('/') {
-        '/'
+    let delim = if pattern.as_bytes().contains(&b'/') || key.as_bytes().contains(&b'/') {
+        b'/'
     } else {
-        '.'
+        b'.'
     };
-
-    let pattern_parts: Vec<&str> = pattern.split(delim).collect();
-    let key_parts: Vec<&str> = key.split(delim).collect();
-
-    match_parts(&pattern_parts, &key_parts)
+    match_bytes(pattern.as_bytes(), key.as_bytes(), delim)
 }
 
-fn match_parts(pattern: &[&str], key: &[&str]) -> bool {
-    let mut pi = 0;
-    let mut ki = 0;
+/// Zero-allocation recursive pattern matching on byte slices.
+fn match_bytes(pattern: &[u8], key: &[u8], delim: u8) -> bool {
+    let (p_seg, p_rest) = split_first_segment(pattern, delim);
+    let (k_seg, k_rest) = split_first_segment(key, delim);
 
-    while pi < pattern.len() {
-        let p = pattern[pi];
-        if p == "#" {
-            // # at end matches everything remaining
-            if pi == pattern.len() - 1 {
+    match (p_seg, k_seg) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(b"#"), _) => {
+            // # at end matches everything
+            if p_rest.is_empty() {
                 return true;
             }
-            // Try matching rest of pattern against every suffix of key
-            for skip in ki..=key.len() {
-                if match_parts(&pattern[pi + 1..], &key[skip..]) {
+            // Try matching rest of pattern starting from every possible position in key
+            // First try with current key (skip 0 segments)
+            if match_bytes(p_rest, key, delim) {
+                return true;
+            }
+            // Then try skipping segments
+            let mut remaining = key;
+            loop {
+                let (seg, rest) = split_first_segment(remaining, delim);
+                if seg.is_none() {
+                    break;
+                }
+                if match_bytes(p_rest, rest, delim) {
                     return true;
                 }
+                if rest.is_empty() {
+                    break;
+                }
+                remaining = rest;
             }
-            return false;
-        } else if p == "*" || p == "+" {
-            // Match exactly one word
-            if ki >= key.len() {
-                return false;
+            false
+        }
+        (Some(_), None) => {
+            // Pattern has segment but key exhausted
+            // Check if pattern segment is # and there's nothing else
+            p_seg == Some(b"#") && p_rest.is_empty()
+        }
+        (Some(p), Some(k)) => {
+            if p == b"*" || p == b"+" {
+                match_bytes(p_rest, k_rest, delim)
+            } else if p == k {
+                match_bytes(p_rest, k_rest, delim)
+            } else {
+                false
             }
-            pi += 1;
-            ki += 1;
-        } else {
-            // Literal match
-            if ki >= key.len() || p != key[ki] {
-                return false;
-            }
-            pi += 1;
-            ki += 1;
         }
     }
+}
 
-    pi == pattern.len() && ki == key.len()
+/// Split on the first delimiter. Returns (first_segment, rest_after_delimiter).
+/// If no delimiter, returns (Some(input), &[]).
+/// If input is empty, returns (None, &[]).
+#[inline]
+fn split_first_segment<'a>(input: &'a [u8], delim: u8) -> (Option<&'a [u8]>, &'a [u8]) {
+    if input.is_empty() {
+        return (None, &[]);
+    }
+    match input.iter().position(|&b| b == delim) {
+        Some(pos) => (Some(&input[..pos]), &input[pos + 1..]),
+        None => (Some(input), &[]),
+    }
 }
 
 #[cfg(test)]
@@ -255,12 +283,18 @@ mod tests {
             exchange_id: 1,
             queue_id: 10,
             routing_key: None,
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
         });
         ex.add_binding(Binding {
             binding_id: 2,
             exchange_id: 1,
             queue_id: 20,
             routing_key: None,
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
         });
 
         let targets = ex.route(None);
@@ -278,16 +312,22 @@ mod tests {
             exchange_id: 1,
             queue_id: 10,
             routing_key: Some("error".to_string()),
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
         });
         ex.add_binding(Binding {
             binding_id: 2,
             exchange_id: 1,
             queue_id: 20,
             routing_key: Some("info".to_string()),
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
         });
 
-        assert_eq!(ex.route(Some("error")), vec![10]);
-        assert_eq!(ex.route(Some("info")), vec![20]);
+        assert_eq!(ex.route(Some("error")).as_slice(), &[10]);
+        assert_eq!(ex.route(Some("info")).as_slice(), &[20]);
         assert!(ex.route(Some("debug")).is_empty());
     }
 
@@ -300,12 +340,18 @@ mod tests {
             exchange_id: 1,
             queue_id: 10,
             routing_key: Some("logs.*".to_string()),
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
         });
         ex.add_binding(Binding {
             binding_id: 2,
             exchange_id: 1,
             queue_id: 20,
             routing_key: Some("logs.#".to_string()),
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
         });
 
         let targets = ex.route(Some("logs.error"));
@@ -326,9 +372,12 @@ mod tests {
             exchange_id: 1,
             queue_id: 10,
             routing_key: Some("key".to_string()),
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
         });
 
-        assert_eq!(ex.route(Some("key")), vec![10]);
+        assert_eq!(ex.route(Some("key")).as_slice(), &[10]);
         ex.remove_binding(1);
         assert!(ex.route(Some("key")).is_empty());
     }
