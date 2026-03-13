@@ -9,6 +9,7 @@ use openraft::OptionalSend;
 use openraft::OptionalSync;
 use openraft::RaftTypeConfig;
 use openraft::storage::RaftLogStorage;
+use parking_lot::Mutex;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -58,6 +59,13 @@ where
     /// controlling which sealed segments stay pinned in memory.
     /// Returns `None` if the group has not been initialized yet.
     fn get_pin_ceiling(&self, group_id: u64) -> Option<Arc<AtomicU64>>;
+
+    /// Get the purged segments notification handle for a specific group.
+    ///
+    /// The state machine drains this `Vec<u64>` after each apply batch to
+    /// detach any mmap-backed retained messages referencing purged segments.
+    /// Returns `None` if the group has not been initialized yet.
+    fn get_purged_segments(&self, group_id: u64) -> Option<Arc<Mutex<Vec<u64>>>>;
 
     /// Stop background threads and release resources.
     ///

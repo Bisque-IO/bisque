@@ -45,6 +45,53 @@ impl ExchangeMeta {
 }
 
 // =============================================================================
+// Retained Message Value — tracks segment provenance for mmap lifecycle
+// =============================================================================
+
+/// A retained message value that tracks its backing segment.
+///
+/// When `segment_id` is `Some`, the `message` `Bytes` is zero-copy and backed
+/// by an mmap'd raft log segment. The segment `Arc` stays alive as long as
+/// this `Bytes` exists. When the segment is purged, the sweep copies the
+/// message to heap and sets `segment_id` to `None`.
+pub struct RetainedValue {
+    /// The mmap segment ID backing this message, or `None` if heap-allocated
+    /// (e.g. from snapshot restore or after detach sweep).
+    pub segment_id: Option<u64>,
+    /// The retained message bytes.
+    pub message: Bytes,
+}
+
+impl RetainedValue {
+    /// Create a retained value backed by an mmap segment.
+    pub fn mmap_backed(segment_id: u64, message: Bytes) -> Self {
+        Self {
+            segment_id: Some(segment_id),
+            message,
+        }
+    }
+
+    /// Create a heap-allocated retained value (no segment provenance).
+    pub fn heap(message: Bytes) -> Self {
+        Self {
+            segment_id: None,
+            message,
+        }
+    }
+
+    /// Detach from the mmap segment by copying to a heap-allocated `Bytes`.
+    /// Returns the old segment_id if it was mmap-backed.
+    pub fn detach(&mut self) -> Option<u64> {
+        if let Some(seg_id) = self.segment_id.take() {
+            self.message = Bytes::copy_from_slice(&self.message);
+            Some(seg_id)
+        } else {
+            None
+        }
+    }
+}
+
+// =============================================================================
 // In-memory Exchange State
 // =============================================================================
 
@@ -54,8 +101,8 @@ pub struct ExchangeState {
     pub bindings: HashMap<u64, Binding>,
     /// Routing key hash → binding IDs (for direct exchange fast path).
     pub direct_index: HashMap<u64, SmallVec<[u64; 4]>>,
-    /// Retained messages: routing_key → message bytes.
-    pub retained: HashMap<String, Bytes>,
+    /// Retained messages: routing_key → retained value with segment provenance.
+    pub retained: HashMap<String, RetainedValue>,
 }
 
 impl ExchangeState {

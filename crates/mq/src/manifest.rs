@@ -116,6 +116,17 @@ pub(crate) enum StructuralWrite {
     CreateConsumerGroup(crate::consumer_group::ConsumerGroupMeta),
     DeleteConsumerGroup(u64),
     CreateSession(crate::session::SessionMeta),
+    /// Persist a retained message set on an exchange.
+    SetRetained {
+        exchange_id: u64,
+        routing_key: String,
+        message: Vec<u8>,
+    },
+    /// Persist removal of a retained message from an exchange.
+    DeleteRetained {
+        exchange_id: u64,
+        routing_key: String,
+    },
 }
 
 /// Command sent to the manifest worker thread.
@@ -143,6 +154,15 @@ pub(crate) enum ManifestCommand {
     },
     /// Fire-and-forget segment range deletion when a segment is purged.
     PurgeSegment { group_id: u64, segment_id: u64 },
+    /// Batch-persist detached retained messages for an exchange.
+    /// Written when segments are purged and retained messages are detached
+    /// from mmap, so recovery doesn't need to replay ancient log entries.
+    PersistRetained {
+        group_id: u64,
+        exchange_id: u64,
+        /// (routing_key, message_bytes) pairs
+        entries: Vec<(String, Vec<u8>)>,
+    },
 }
 
 /// Entity key prefixes for MDBX entities table.
@@ -156,6 +176,7 @@ fn entity_key(prefix: &[u8], id: u64) -> [u8; 9] {
 const TOPIC_PREFIX: &[u8] = b"T";
 const EXCHANGE_PREFIX: &[u8] = b"E";
 const CONSUMER_GROUP_PREFIX: &[u8] = b"G";
+const RETAINED_PREFIX: &[u8] = b"R";
 const SESSION_PREFIX: &[u8] = b"S";
 
 /// Structural state loaded from MDBX on recovery.
@@ -164,6 +185,8 @@ pub(crate) struct StructuralState {
     pub exchanges: Vec<crate::exchange::ExchangeMeta>,
     pub consumer_groups: Vec<crate::consumer_group::ConsumerGroupMeta>,
     pub sessions: Vec<crate::session::SessionMeta>,
+    /// Retained messages per exchange: (exchange_id, Vec<(routing_key, message_bytes)>)
+    pub retained: Vec<(u64, Vec<(String, Vec<u8>)>)>,
     pub next_id: u64,
     pub structural_purge_floor: u64,
 }
@@ -519,6 +542,7 @@ impl GroupMdbxEnv {
         let mut exchanges = Vec::new();
         let mut consumer_groups = Vec::new();
         let mut sessions = Vec::new();
+        let mut retained = Vec::new();
 
         // Scan all entity keys
         let mut cursor = txn
@@ -568,6 +592,15 @@ impl GroupMdbxEnv {
                             })?;
                     sessions.push(meta);
                 }
+                b'R' => {
+                    let exchange_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                    let (entries, _): (Vec<(String, Vec<u8>)>, _) =
+                        bincode::serde::decode_from_slice(&value, bincode::config::standard())
+                            .map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                            })?;
+                    retained.push((exchange_id, entries));
+                }
                 _ => {} // unknown prefix, skip
             }
         }
@@ -577,6 +610,7 @@ impl GroupMdbxEnv {
             exchanges,
             consumer_groups,
             sessions,
+            retained,
             next_id,
             structural_purge_floor: floor,
         }))
@@ -640,6 +674,56 @@ impl GroupMdbxEnv {
                 txn.put(&entities_tbl, &key[..], &bytes, WriteFlags::empty())
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
+            StructuralWrite::SetRetained {
+                exchange_id,
+                routing_key,
+                message,
+            } => {
+                // Read existing retained entries for this exchange, update, and write back.
+                let key = entity_key(RETAINED_PREFIX, *exchange_id);
+                let mut entries: Vec<(String, Vec<u8>)> = match txn
+                    .get::<Vec<u8>>(&entities_tbl, &key[..])
+                {
+                    Ok(Some(existing)) => {
+                        bincode::serde::decode_from_slice(&existing, bincode::config::standard())
+                            .map(|(v, _)| v)
+                            .unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                // Upsert: replace existing or append.
+                if let Some(pos) = entries.iter().position(|(k, _)| k == routing_key) {
+                    entries[pos].1 = message.clone();
+                } else {
+                    entries.push((routing_key.clone(), message.clone()));
+                }
+                let bytes = bincode::serde::encode_to_vec(&entries, bincode::config::standard())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                txn.put(&entities_tbl, &key[..], &bytes, WriteFlags::empty())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+            StructuralWrite::DeleteRetained {
+                exchange_id,
+                routing_key,
+            } => {
+                let key = entity_key(RETAINED_PREFIX, *exchange_id);
+                if let Ok(Some(existing)) = txn.get::<Vec<u8>>(&entities_tbl, &key[..]) {
+                    let mut entries: Vec<(String, Vec<u8>)> =
+                        bincode::serde::decode_from_slice(&existing, bincode::config::standard())
+                            .map(|(v, _)| v)
+                            .unwrap_or_default();
+                    entries.retain(|(k, _)| k != routing_key);
+                    if entries.is_empty() {
+                        let _ = txn.del(&entities_tbl, &key[..], None);
+                    } else {
+                        let bytes =
+                            bincode::serde::encode_to_vec(&entries, bincode::config::standard())
+                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        txn.put(&entities_tbl, &key[..], &bytes, WriteFlags::empty())
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    }
+                }
+            }
         }
 
         // Update structural purge floor
@@ -659,6 +743,32 @@ impl GroupMdbxEnv {
             WriteFlags::empty(),
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        txn.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist detached retained messages for an exchange.
+    /// Overwrites any previously stored retained data for this exchange.
+    fn persist_retained(&self, exchange_id: u64, entries: &[(String, Vec<u8>)]) -> io::Result<()> {
+        let txn = self
+            .db
+            .begin_rw_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let entities_tbl = unsafe { self.entities_table_rw(&txn) };
+        let key = entity_key(RETAINED_PREFIX, exchange_id);
+
+        if entries.is_empty() {
+            // Clear retained data for this exchange
+            let _ = txn.del(&entities_tbl, &key[..], None);
+        } else {
+            let bytes = bincode::serde::encode_to_vec(entries, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            txn.put(&entities_tbl, &key[..], &bytes, WriteFlags::empty())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
 
         txn.commit()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1027,6 +1137,21 @@ impl MqManifestManager {
         });
     }
 
+    /// Fire-and-forget persist of detached retained messages for an exchange.
+    /// Called after sweep detaches retained messages from purged mmap segments.
+    pub(crate) fn persist_retained_fire_and_forget(
+        &self,
+        group_id: u64,
+        exchange_id: u64,
+        entries: Vec<(String, Vec<u8>)>,
+    ) {
+        let _ = self.tx.try_send(ManifestCommand::PersistRetained {
+            group_id,
+            exchange_id,
+            entries,
+        });
+    }
+
     /// Read all segment ranges for a given entity (concurrent reader-safe).
     ///
     /// Returns `Vec<(segment_id, record_count, total_bytes)>` sorted by segment_id.
@@ -1187,6 +1312,23 @@ impl MqManifestManager {
                             }
                         }
                     }
+                    ManifestCommand::PersistRetained {
+                        group_id,
+                        exchange_id,
+                        entries,
+                    } => {
+                        let envs_read = envs.read();
+                        if let Some(env) = envs_read.get(&group_id) {
+                            if let Err(e) = env.persist_retained(exchange_id, &entries) {
+                                error!(
+                                    group_id,
+                                    exchange_id,
+                                    error = %e,
+                                    "MQ manifest persist retained failed"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1243,6 +1385,7 @@ mod tests {
             &MqCommand::create_topic(&"t1".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         let snap = engine.snapshot();
         env.install_snapshot(&meta, &snap).unwrap();
@@ -1255,7 +1398,7 @@ mod tests {
         assert_eq!(read_snap.topics[0].meta.name, "t1");
         assert_eq!(
             read_snap.next_id,
-            engine.meta.next_id.load(Ordering::Relaxed)
+            engine.metadata().next_id.load(Ordering::Relaxed)
         );
     }
 
@@ -1276,6 +1419,7 @@ mod tests {
             &MqCommand::create_topic(&"old_topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         env.install_snapshot(&meta1, &engine1.snapshot()).unwrap();
 
@@ -1291,11 +1435,13 @@ mod tests {
             &MqCommand::create_topic(&"new_topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         engine2.apply_command(
             &MqCommand::create_topic(&"t2".to_string(), RetentionPolicy::default(), 0),
             2,
             1001,
+            None,
         );
         env.install_snapshot(&meta2, &engine2.snapshot()).unwrap();
 
@@ -1367,8 +1513,14 @@ mod tests {
             &MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
-        engine.apply_command(&MqCommand::publish(1, &vec![make_msg(b"hello")]), 2, 1001);
+        engine.apply_command(
+            &MqCommand::publish(1, &vec![make_msg(b"hello")]),
+            2,
+            1001,
+            None,
+        );
 
         let snap = engine.snapshot();
 
@@ -1442,11 +1594,13 @@ mod tests {
             &MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         engine.apply_command(
             &MqCommand::publish(1, &vec![make_msg(b"m1"), make_msg(b"m2")]),
             2,
             1001,
+            None,
         );
 
         let snap = engine.snapshot();
@@ -1459,7 +1613,10 @@ mod tests {
         assert_eq!(read.topics[0].meta.name, "events");
         assert_eq!(read.topics[0].meta.message_count, 2);
 
-        assert_eq!(read.next_id, engine.meta.next_id.load(Ordering::Relaxed));
+        assert_eq!(
+            read.next_id,
+            engine.metadata().next_id.load(Ordering::Relaxed)
+        );
     }
 
     /// Multiple topics survive the MDBX roundtrip.
@@ -1473,11 +1630,13 @@ mod tests {
             &MqCommand::create_topic(&"t1".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         engine.apply_command(
             &MqCommand::create_topic(&"t2".to_string(), RetentionPolicy::default(), 0),
             2,
             1001,
+            None,
         );
 
         let snap = engine.snapshot();
@@ -1505,8 +1664,14 @@ mod tests {
             ),
             1,
             1000,
+            None,
         );
-        let topic_meta = tmp_engine.meta.topics.get(&1).unwrap().snapshot_meta();
+        let topic_meta = tmp_engine
+            .metadata()
+            .topics
+            .get(&1)
+            .unwrap()
+            .snapshot_meta();
         env.apply_structural_write(1, 2, &StructuralWrite::CreateTopic(topic_meta))
             .unwrap();
 
@@ -1520,6 +1685,7 @@ mod tests {
             &MqCommand::create_topic(&"snap-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         env.install_snapshot(&make_meta(5), &engine.snapshot())
             .unwrap();
@@ -1548,6 +1714,7 @@ mod tests {
             &MqCommand::create_topic(&"snap-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         env.install_snapshot(&make_meta(1), &engine.snapshot())
             .unwrap();
@@ -1558,8 +1725,14 @@ mod tests {
             &MqCommand::create_topic(&"new-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
-        let topic_meta = tmp_engine2.meta.topics.get(&1).unwrap().snapshot_meta();
+        let topic_meta = tmp_engine2
+            .metadata()
+            .topics
+            .get(&1)
+            .unwrap()
+            .snapshot_meta();
         env.apply_structural_write(2, 100, &StructuralWrite::CreateTopic(topic_meta))
             .unwrap();
 
@@ -1599,6 +1772,7 @@ mod tests {
                 &MqCommand::create_topic(&format!("t{}", i), RetentionPolicy::default(), 0),
                 i + 1,
                 1000,
+                None,
             );
         }
         let snap = engine.snapshot();
@@ -1627,6 +1801,7 @@ mod tests {
             &MqCommand::create_topic(&"group1-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         mgr.install_snapshot(1, make_meta(1), engine1.snapshot())
             .await
@@ -1637,6 +1812,7 @@ mod tests {
             &MqCommand::create_topic(&"group2-topic".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         mgr.install_snapshot(2, make_meta(1), engine2.snapshot())
             .await
@@ -1666,6 +1842,7 @@ mod tests {
                 &MqCommand::create_topic(&format!("topic-{}", i), RetentionPolicy::default(), 0),
                 i + 1,
                 1000,
+                None,
             );
         }
         let snap = engine.snapshot();
@@ -1688,6 +1865,7 @@ mod tests {
                 &MqCommand::create_topic(&format!("old-{}", i), RetentionPolicy::default(), 0),
                 i + 1,
                 1000,
+                None,
             );
         }
         env.install_snapshot(&make_meta(3), &engine1.snapshot())
@@ -1701,6 +1879,7 @@ mod tests {
             &MqCommand::create_topic(&"replacement-t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         env.install_snapshot(&make_meta(10), &engine2.snapshot())
             .unwrap();
@@ -1721,14 +1900,16 @@ mod tests {
             &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         engine.apply_command(
             &MqCommand::publish(1, &vec![make_msg(b"a"), make_msg(b"b"), make_msg(b"c")]),
             2,
             1001,
+            None,
         );
         // Commit an offset for consumer 42
-        engine.apply_command(&MqCommand::commit_offset(1, 42, 2), 3, 1002);
+        engine.apply_command(&MqCommand::commit_offset(1, 42, 2), 3, 1002, None);
 
         let snap = engine.snapshot();
         assert!(!snap.topics[0].consumer_offsets.is_empty());
@@ -1752,8 +1933,9 @@ mod tests {
             &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
-        engine.apply_command(&MqCommand::publish(1, &vec![make_msg(b"a")]), 2, 1001);
+        engine.apply_command(&MqCommand::publish(1, &vec![make_msg(b"a")]), 2, 1001, None);
 
         let original_snap = engine.snapshot();
         env.install_snapshot(&make_meta(2), &original_snap).unwrap();
@@ -1789,6 +1971,7 @@ mod tests {
             &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
         let mut snap = engine.snapshot();
         snap.file_manifest = vec![bisque_raft::SnapshotFileEntry {
@@ -1832,6 +2015,7 @@ mod tests {
                 ),
                 1,
                 1000,
+                None,
             );
             // Must install synchronously since manifest requires &self
             mgr.install_snapshot(gid, make_meta(1), engine.snapshot())
@@ -1862,6 +2046,7 @@ mod tests {
             &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
             1,
             1000,
+            None,
         );
 
         let mut meta = make_meta(100);

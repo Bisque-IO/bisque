@@ -344,6 +344,10 @@ mod tests {
         fn get_pin_ceiling(&self, _group_id: u64) -> Option<Arc<AtomicU64>> {
             None
         }
+
+        fn get_purged_segments(&self, _group_id: u64) -> Option<Arc<parking_lot::Mutex<Vec<u64>>>> {
+            None
+        }
     }
 
     // Simple state machine for testing

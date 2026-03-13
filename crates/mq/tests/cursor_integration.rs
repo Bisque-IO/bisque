@@ -113,7 +113,7 @@ fn scanner_single_segment() {
         let entries = vec![
             make_entry(1, 1, MqCommand::publish(10, &[make_flat_msg(b"hello")])),
             make_entry(2, 1, MqCommand::publish(20, &[make_flat_msg(b"world")])),
-            make_entry(3, 1, MqCommand::enqueue(30, &[make_flat_msg(b"msg")], &[])),
+            make_entry(3, 1, MqCommand::publish(30, &[make_flat_msg(b"msg")])),
         ];
         append_entries(&mut log, entries).await;
 
@@ -130,7 +130,7 @@ fn scanner_single_segment() {
 
         let rec = scanner.next_record().unwrap();
         assert_eq!(rec.log_index, 3);
-        assert_eq!(rec.command.tag(), MqCommand::TAG_ENQUEUE);
+        assert_eq!(rec.command.tag(), MqCommand::TAG_PUBLISH);
 
         assert!(scanner.next_record().is_none());
         storage.stop();
@@ -217,7 +217,7 @@ fn scanner_batch_explosion_across_segments() {
         ]);
         let batch2 = MqCommand::batch(&[
             MqCommand::publish(10, &[make_flat_msg(b"b2-a")]),
-            MqCommand::enqueue(30, &[make_flat_msg(b"b2-b")], &[]),
+            MqCommand::publish(30, &[make_flat_msg(b"b2-b")]),
         ]);
 
         let entries = vec![
@@ -250,7 +250,7 @@ fn scanner_batch_explosion_across_segments() {
         assert_eq!(tags[2], MqCommand::TAG_PUBLISH);
         assert_eq!(tags[3], MqCommand::TAG_PUBLISH);
         assert_eq!(tags[4], MqCommand::TAG_PUBLISH);
-        assert_eq!(tags[5], MqCommand::TAG_ENQUEUE);
+        assert_eq!(tags[5], MqCommand::TAG_PUBLISH);
         assert_eq!(tags[6], MqCommand::TAG_PUBLISH);
 
         storage.stop();
@@ -383,8 +383,8 @@ fn read_message_at_returns_none_for_non_publish() {
         let (storage, mut log) = setup_storage(&tmp, 1024 * 1024).await;
         let prefetcher = log.prefetcher();
 
-        // Enqueue is not a publish — read_message_at should return None.
-        let cmd = MqCommand::enqueue(1, &[make_flat_msg(b"data")], &[]);
+        // A non-publish command — read_message_at should return None.
+        let cmd = MqCommand::commit_offset(1, 1, 0);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         assert!(read_message_at(&prefetcher, 1).is_none());
@@ -675,7 +675,7 @@ fn cursor_from_real_segment_bytes() {
         let entries = vec![
             make_entry(1, 1, MqCommand::publish(10, &[make_flat_msg(b"hello")])),
             make_entry(2, 1, MqCommand::publish(20, &[make_flat_msg(b"world")])),
-            make_entry(3, 1, MqCommand::enqueue(30, &[make_flat_msg(b"q")], &[])),
+            make_entry(3, 1, MqCommand::publish(30, &[make_flat_msg(b"q")])),
         ];
         append_entries(&mut log, entries).await;
 
@@ -688,7 +688,7 @@ fn cursor_from_real_segment_bytes() {
         assert_eq!(all[0].command.tag(), MqCommand::TAG_PUBLISH);
         assert_eq!(all[0].command.as_publish().topic_id(), 10);
         assert_eq!(all[1].command.as_publish().topic_id(), 20);
-        assert_eq!(all[2].command.tag(), MqCommand::TAG_ENQUEUE);
+        assert_eq!(all[2].command.tag(), MqCommand::TAG_PUBLISH);
 
         storage.stop();
     });
@@ -737,7 +737,7 @@ fn cursor_batch_with_real_storage() {
         let batch = MqCommand::batch(&[
             MqCommand::publish(1, &[make_flat_msg(b"a")]),
             MqCommand::publish(2, &[make_flat_msg(b"b")]),
-            MqCommand::enqueue(3, &[make_flat_msg(b"c")], &[]),
+            MqCommand::publish(3, &[make_flat_msg(b"c")]),
         ]);
         let entries = vec![
             make_entry(1, 1, MqCommand::publish(0, &[make_flat_msg(b"solo")])),
@@ -758,7 +758,7 @@ fn cursor_batch_with_real_storage() {
         assert_eq!(all[3].log_index, 2);
         assert_eq!(all[1].command.as_publish().topic_id(), 1);
         assert_eq!(all[2].command.as_publish().topic_id(), 2);
-        assert_eq!(all[3].command.tag(), MqCommand::TAG_ENQUEUE);
+        assert_eq!(all[3].command.tag(), MqCommand::TAG_PUBLISH);
 
         storage.stop();
     });

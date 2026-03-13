@@ -115,8 +115,30 @@ pub struct GroupTopicPartitionOffset {
     pub topic_id: u64,
     pub partition_index: u32,
     pub committed_offset: u64,
-    pub metadata: Option<String>,
+    #[serde(with = "opt_bytes_as_string")]
+    pub metadata: Option<Bytes>,
     pub committed_at: u64,
+}
+
+/// Serde helper: serialize `Option<Bytes>` as `Option<String>` for snapshot compatibility.
+mod opt_bytes_as_string {
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(val: &Option<Bytes>, ser: S) -> Result<S::Ok, S::Error> {
+        match val {
+            Some(b) => {
+                let s = std::str::from_utf8(b).unwrap_or("");
+                Some(s).serialize(ser)
+            }
+            None => Option::<&str>::None.serialize(ser),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Bytes>, D::Error> {
+        let opt: Option<String> = Option::deserialize(de)?;
+        Ok(opt.map(Bytes::from))
+    }
 }
 
 /// Snapshot data for a consumer group.
@@ -189,7 +211,7 @@ pub struct AckVariantState {
     pub messages: DashMap<u64, AckMessageMeta>,
     pub(crate) pending: Mutex<BTreeMap<(u8, u64), ()>>,
     pub(crate) in_flight_deadlines: Mutex<BTreeMap<u64, SmallVec<[u64; 4]>>>,
-    pub(crate) consumer_in_flight: DashMap<u64, SmallVec<[u64; 8]>>,
+    pub(crate) consumer_in_flight: DashMap<u64, HashSet<u64>>,
     pub(crate) expires_at_deadlines: Mutex<BTreeMap<u64, SmallVec<[u64; 4]>>>,
     /// Tiered delay index: compact storage for delayed messages.
     /// Key = ms offset from server start epoch (u32), Value = message IDs.
@@ -297,65 +319,66 @@ impl AckVariantState {
         dedup_keys: &[Option<Bytes>],
         current_time: u64,
     ) -> u64 {
-        let mut count = 0u64;
+        let count = messages.len() as u64;
+        if count == 0 {
+            return 0;
+        }
+
+        let has_delay = config.delay_default_ms > 0;
+        let deliver_after = if has_delay {
+            current_time + config.delay_default_ms
+        } else {
+            0
+        };
+
+        // Batch accumulators — collect work, then take locks once
         let mut delayed_batch: SmallVec<[(u32, u64); 4]> = SmallVec::new();
+        let mut pending_batch: SmallVec<[(u8, u64); 16]> = SmallVec::new();
+        let mut expires_batch: SmallVec<[(u64, u64); 4]> = SmallVec::new();
+        let mut total_bytes_acc: u64 = 0;
+        let mut pending_bytes_acc: u64 = 0;
+        let mut delayed_bytes_acc: u64 = 0;
+        let mut delayed_count: u64 = 0;
 
         for (i, msg) in messages.iter().enumerate() {
-            let value_len = crate::flat::FlatMessageMeta::value_len(msg).unwrap_or(0);
             let message_id = log_index + i as u64;
 
-            let deliver_after = if config.delay_default_ms > 0 {
-                current_time + config.delay_default_ms
-            } else {
-                0
-            };
+            // Parse header once — extract all fields from single read
+            let meta_parsed = crate::flat::FlatMessageMeta::parse(msg);
+            let value_len = crate::flat::FlatMessageMeta::value_len(msg).unwrap_or(0);
+            total_bytes_acc += value_len as u64;
 
-            // Always count towards totals (even delayed)
-            self.total_messages.fetch_add(1, Ordering::Relaxed);
-            self.total_bytes
-                .fetch_add(value_len as u64, Ordering::Relaxed);
-
-            // Update cached min
-            let cached = self.cached_min_required.load(Ordering::Relaxed);
-            if cached == MIN_NONE {
-                self.cached_min_required
-                    .store(message_id, Ordering::Relaxed);
-            } else if cached != MIN_DIRTY && message_id < cached {
-                self.cached_min_required
-                    .store(message_id, Ordering::Relaxed);
-            }
-
-            // Delayed messages go to the compact delay index
-            if deliver_after > current_time {
+            // Delayed messages go to compact delay index
+            if has_delay && deliver_after > current_time {
                 let offset = self.delay_offset(deliver_after);
                 delayed_batch.push((offset, message_id));
-                self.delayed_count.fetch_add(1, Ordering::Relaxed);
-                self.delayed_bytes
-                    .fetch_add(value_len as u64, Ordering::Relaxed);
-                count += 1;
+                delayed_count += 1;
+                delayed_bytes_acc += value_len as u64;
                 continue;
             }
 
-            // Immediate messages get full AckMessageMeta
-            let priority = crate::flat::FlatMessageMeta::priority(msg).unwrap_or(0);
-            let (reply_to, correlation_id) = {
-                let meta = crate::flat::FlatMessageMeta::parse(msg);
-                let has_reply_to = meta.as_ref().map_or(false, |m| m.has_reply_to());
-                let has_corr = meta.as_ref().map_or(false, |m| m.has_correlation_id());
-                let rt = if has_reply_to {
-                    crate::flat::FlatMessage::new(msg.clone()).and_then(|f| f.reply_to())
-                } else {
-                    None
-                };
-                let ci = if has_corr {
-                    crate::flat::FlatMessage::new(msg.clone()).and_then(|f| f.correlation_id())
-                } else {
-                    None
-                };
-                (rt, ci)
+            // Extract fields from the single parsed header
+            let (priority, ttl_ms, has_reply_to, has_corr) = match meta_parsed {
+                Some(ref m) => (
+                    m.priority,
+                    m.ttl_ms_opt().unwrap_or(0),
+                    m.has_reply_to(),
+                    m.has_correlation_id(),
+                ),
+                None => (0, 0, false, false),
             };
 
-            let ttl_ms = crate::flat::FlatMessageMeta::ttl_ms(msg).unwrap_or(0);
+            let reply_to = if has_reply_to {
+                crate::flat::FlatMessage::new(msg.clone()).and_then(|f| f.reply_to())
+            } else {
+                None
+            };
+            let correlation_id = if has_corr {
+                crate::flat::FlatMessage::new(msg.clone()).and_then(|f| f.correlation_id())
+            } else {
+                None
+            };
+
             let expires_at = if ttl_ms > 0 {
                 Some(current_time + ttl_ms)
             } else {
@@ -364,7 +387,7 @@ impl AckVariantState {
 
             let dedup_key = dedup_keys.get(i).and_then(|k| k.clone());
 
-            let meta = AckMessageMeta {
+            let ack_meta = AckMessageMeta {
                 message_id,
                 group_id,
                 state: MessageState::Pending,
@@ -381,29 +404,63 @@ impl AckVariantState {
                 value_len,
             };
 
-            self.messages.insert(message_id, meta);
-            self.pending.lock().insert((priority, message_id), ());
-            self.pending_count.fetch_add(1, Ordering::Relaxed);
-            self.pending_bytes
-                .fetch_add(value_len as u64, Ordering::Relaxed);
+            self.messages.insert(message_id, ack_meta);
+            pending_batch.push((priority, message_id));
+            pending_bytes_acc += value_len as u64;
 
-            if let Some(ref ea) = expires_at {
-                self.expires_at_deadlines
-                    .lock()
-                    .entry(*ea)
-                    .or_default()
-                    .push(message_id);
+            if let Some(ea) = expires_at {
+                expires_batch.push((ea, message_id));
             }
-
-            count += 1;
         }
 
-        // Batch-insert delayed entries
+        // Batch: single pending lock acquisition for all messages
+        if !pending_batch.is_empty() {
+            let mut pending = self.pending.lock();
+            for (prio, msg_id) in &pending_batch {
+                pending.insert((*prio, *msg_id), ());
+            }
+        }
+
+        // Batch: single expires_at lock acquisition
+        if !expires_batch.is_empty() {
+            let mut deadlines = self.expires_at_deadlines.lock();
+            for (ea, msg_id) in expires_batch {
+                deadlines.entry(ea).or_default().push(msg_id);
+            }
+        }
+
+        // Batch: single delayed_index lock acquisition
         if !delayed_batch.is_empty() {
             let mut delayed = self.delayed_index.lock();
             for (offset, msg_id) in delayed_batch {
                 delayed.entry(offset).or_default().push(msg_id);
             }
+        }
+
+        // Batch atomic updates — single fetch_add per counter instead of per-message
+        self.total_messages.fetch_add(count, Ordering::Relaxed);
+        self.total_bytes
+            .fetch_add(total_bytes_acc, Ordering::Relaxed);
+        if !pending_batch.is_empty() {
+            self.pending_count
+                .fetch_add(pending_batch.len() as u64, Ordering::Relaxed);
+            self.pending_bytes
+                .fetch_add(pending_bytes_acc, Ordering::Relaxed);
+        }
+        if delayed_count > 0 {
+            self.delayed_count
+                .fetch_add(delayed_count, Ordering::Relaxed);
+            self.delayed_bytes
+                .fetch_add(delayed_bytes_acc, Ordering::Relaxed);
+        }
+
+        // Update cached min — only need first message_id (lowest)
+        let first_id = log_index;
+        let cached = self.cached_min_required.load(Ordering::Relaxed);
+        if cached == MIN_NONE {
+            self.cached_min_required.store(first_id, Ordering::Relaxed);
+        } else if cached != MIN_DIRTY && first_id < cached {
+            self.cached_min_required.store(first_id, Ordering::Relaxed);
         }
 
         self.m_enqueue_count.increment(count);
@@ -420,48 +477,50 @@ impl AckVariantState {
         _log_index: u64,
     ) -> SmallVec<[u64; 8]> {
         let mut delivered = SmallVec::new();
-        let mut pending = self.pending.lock();
-
         let mut keys_to_remove: SmallVec<[(u8, u64); 8]> = SmallVec::new();
-        for (&(prio, msg_id), _) in pending.iter().rev() {
-            if delivered.len() >= max_count as usize {
-                break;
+        let deadline = current_time + config.visibility_timeout_ms;
+
+        // Hold pending lock only for iteration + removal, no nested locks
+        {
+            let mut pending = self.pending.lock();
+            for (&(prio, msg_id), _) in pending.iter().rev() {
+                if delivered.len() >= max_count as usize {
+                    break;
+                }
+                if let Some(mut msg) = self.messages.get_mut(&msg_id) {
+                    if msg.state != MessageState::Pending {
+                        continue;
+                    }
+                    if msg.deliver_after > current_time {
+                        continue;
+                    }
+                    msg.state = MessageState::InFlight;
+                    msg.consumer_id = Some(consumer_id);
+                    msg.attempts += 1;
+                    msg.last_delivered_at = Some(current_time);
+                    msg.visibility_deadline = Some(deadline);
+
+                    delivered.push(msg_id);
+                    keys_to_remove.push((prio, msg_id));
+                }
             }
-            if let Some(mut msg) = self.messages.get_mut(&msg_id) {
-                if msg.state != MessageState::Pending {
-                    continue;
-                }
-                if msg.deliver_after > current_time {
-                    continue;
-                }
-                msg.state = MessageState::InFlight;
-                msg.consumer_id = Some(consumer_id);
-                msg.attempts += 1;
-                msg.last_delivered_at = Some(current_time);
-                let deadline = current_time + config.visibility_timeout_ms;
-                msg.visibility_deadline = Some(deadline);
-
-                delivered.push(msg_id);
-                keys_to_remove.push((prio, msg_id));
-
-                // Track in-flight deadline
-                self.in_flight_deadlines
-                    .lock()
-                    .entry(deadline)
-                    .or_default()
-                    .push(msg_id);
+            for key in &keys_to_remove {
+                pending.remove(key);
             }
         }
-
-        for key in &keys_to_remove {
-            pending.remove(key);
-        }
-        drop(pending);
+        // pending lock dropped before taking in_flight_deadlines lock
 
         let count = delivered.len() as u64;
         if count > 0 {
             self.pending_count.fetch_sub(count, Ordering::Relaxed);
             self.in_flight_count.fetch_add(count, Ordering::Relaxed);
+
+            // Batch: single in_flight_deadlines lock for all delivered messages
+            {
+                let mut deadlines = self.in_flight_deadlines.lock();
+                let entry = deadlines.entry(deadline).or_default();
+                entry.extend(delivered.iter().copied());
+            }
 
             // Track per-consumer in-flight
             self.consumer_in_flight
@@ -476,53 +535,75 @@ impl AckVariantState {
 
     /// ACK messages.
     pub fn apply_ack(&self, message_ids: &[u64]) {
+        let mut ack_count = 0u64;
+        let mut ack_bytes = 0u64;
+        let mut invalidate_min = false;
         for &msg_id in message_ids {
             if let Some((_, meta)) = self.messages.remove(&msg_id) {
                 if meta.state == MessageState::InFlight {
-                    self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
-                    self.in_flight_bytes
-                        .fetch_sub(meta.value_len as u64, Ordering::Relaxed);
+                    ack_count += 1;
+                    ack_bytes += meta.value_len as u64;
                     // Remove from consumer in-flight tracking
                     if let Some(cid) = meta.consumer_id {
                         if let Some(mut ids) = self.consumer_in_flight.get_mut(&cid) {
-                            ids.retain(|id| *id != msg_id);
+                            ids.remove(&msg_id);
                         }
                     }
                 }
-                // Invalidate cached min if needed
-                let cached = self.cached_min_required.load(Ordering::Relaxed);
-                if cached != MIN_DIRTY && cached != MIN_NONE && msg_id <= cached {
-                    self.cached_min_required.store(MIN_DIRTY, Ordering::Relaxed);
+                // Check cached min invalidation
+                if !invalidate_min {
+                    let cached = self.cached_min_required.load(Ordering::Relaxed);
+                    if cached != MIN_DIRTY && cached != MIN_NONE && msg_id <= cached {
+                        invalidate_min = true;
+                    }
                 }
             }
+        }
+        // Batch atomic updates
+        if ack_count > 0 {
+            self.in_flight_count.fetch_sub(ack_count, Ordering::Relaxed);
+            self.in_flight_bytes.fetch_sub(ack_bytes, Ordering::Relaxed);
+        }
+        if invalidate_min {
+            self.cached_min_required.store(MIN_DIRTY, Ordering::Relaxed);
         }
         self.m_ack_count.increment(message_ids.len() as u64);
     }
 
     /// NACK messages — return to pending with attempt increment.
     pub fn apply_nack(&self, message_ids: &[u64]) {
+        let mut pending_batch: SmallVec<[(u8, u64); 8]> = SmallVec::new();
         for &msg_id in message_ids {
             if let Some(mut msg) = self.messages.get_mut(&msg_id) {
                 if msg.state == MessageState::InFlight {
                     msg.state = MessageState::Pending;
+                    let cid = msg.consumer_id;
                     msg.consumer_id = None;
                     msg.visibility_deadline = None;
-                    self.pending.lock().insert((msg.priority, msg_id), ());
-                    self.pending_count.fetch_add(1, Ordering::Relaxed);
-                    self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+                    pending_batch.push((msg.priority, msg_id));
                     // Remove from consumer in-flight
-                    if let Some(cid) = msg.consumer_id {
+                    if let Some(cid) = cid {
                         if let Some(mut ids) = self.consumer_in_flight.get_mut(&cid) {
-                            ids.retain(|id| *id != msg_id);
+                            ids.remove(&msg_id);
                         }
                     }
                 }
             }
         }
+        if !pending_batch.is_empty() {
+            let count = pending_batch.len() as u64;
+            let mut pending = self.pending.lock();
+            for (prio, msg_id) in pending_batch {
+                pending.insert((prio, msg_id), ());
+            }
+            self.pending_count.fetch_add(count, Ordering::Relaxed);
+            self.in_flight_count.fetch_sub(count, Ordering::Relaxed);
+        }
     }
 
     /// RELEASE messages — return to pending WITHOUT attempt increment.
     pub fn apply_release(&self, message_ids: &[u64]) {
+        let mut pending_batch: SmallVec<[(u8, u64); 8]> = SmallVec::new();
         for &msg_id in message_ids {
             if let Some(mut msg) = self.messages.get_mut(&msg_id) {
                 if msg.state == MessageState::InFlight {
@@ -532,16 +613,23 @@ impl AckVariantState {
                     msg.visibility_deadline = None;
                     // Decrement attempt count (release = no attempt charge)
                     msg.attempts = msg.attempts.saturating_sub(1);
-                    self.pending.lock().insert((msg.priority, msg_id), ());
-                    self.pending_count.fetch_add(1, Ordering::Relaxed);
-                    self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+                    pending_batch.push((msg.priority, msg_id));
                     if let Some(cid) = cid {
                         if let Some(mut ids) = self.consumer_in_flight.get_mut(&cid) {
-                            ids.retain(|id| *id != msg_id);
+                            ids.remove(&msg_id);
                         }
                     }
                 }
             }
+        }
+        if !pending_batch.is_empty() {
+            let count = pending_batch.len() as u64;
+            let mut pending = self.pending.lock();
+            for (prio, msg_id) in pending_batch {
+                pending.insert((prio, msg_id), ());
+            }
+            self.pending_count.fetch_add(count, Ordering::Relaxed);
+            self.in_flight_count.fetch_sub(count, Ordering::Relaxed);
         }
     }
 
@@ -566,6 +654,8 @@ impl AckVariantState {
         _current_time: u64,
     ) -> SmallVec<[u64; 8]> {
         let mut dead_lettered = SmallVec::new();
+        let mut pending_batch: SmallVec<[(u8, u64); 8]> = SmallVec::new();
+        let mut dlq_count = 0u64;
         for &msg_id in message_ids {
             if let Some(mut msg) = self.messages.get_mut(&msg_id) {
                 if msg.state != MessageState::InFlight {
@@ -573,26 +663,37 @@ impl AckVariantState {
                 }
                 if msg.attempts >= config.max_retries {
                     msg.state = MessageState::DeadLetter;
-                    self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
-                    self.dlq_count.fetch_add(1, Ordering::Relaxed);
+                    dlq_count += 1;
                     dead_lettered.push(msg_id);
-                    self.m_dlq_count.increment(1);
                 } else {
                     // Return to pending
                     msg.state = MessageState::Pending;
                     let cid = msg.consumer_id;
                     msg.consumer_id = None;
                     msg.visibility_deadline = None;
-                    self.pending.lock().insert((msg.priority, msg_id), ());
-                    self.pending_count.fetch_add(1, Ordering::Relaxed);
-                    self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+                    pending_batch.push((msg.priority, msg_id));
                     if let Some(cid) = cid {
                         if let Some(mut ids) = self.consumer_in_flight.get_mut(&cid) {
-                            ids.retain(|id| *id != msg_id);
+                            ids.remove(&msg_id);
                         }
                     }
                 }
             }
+        }
+        // Batch pending lock
+        if !pending_batch.is_empty() {
+            let count = pending_batch.len() as u64;
+            let mut pending = self.pending.lock();
+            for (prio, msg_id) in pending_batch {
+                pending.insert((prio, msg_id), ());
+            }
+            self.pending_count.fetch_add(count, Ordering::Relaxed);
+            self.in_flight_count.fetch_sub(count, Ordering::Relaxed);
+        }
+        if dlq_count > 0 {
+            self.in_flight_count.fetch_sub(dlq_count, Ordering::Relaxed);
+            self.dlq_count.fetch_add(dlq_count, Ordering::Relaxed);
+            self.m_dlq_count.increment(dlq_count);
         }
         dead_lettered
     }
@@ -601,7 +702,7 @@ impl AckVariantState {
     pub fn consumer_in_flight_ids(&self, consumer_id: u64) -> SmallVec<[u64; 8]> {
         self.consumer_in_flight
             .get(&consumer_id)
-            .map(|ids| ids.clone())
+            .map(|ids| ids.iter().copied().collect())
             .unwrap_or_default()
     }
 
@@ -850,7 +951,10 @@ impl AckVariantState {
                     self.in_flight_count.fetch_add(1, Ordering::Relaxed);
                     self.in_flight_bytes.fetch_add(value_len, Ordering::Relaxed);
                     if let Some(cid) = consumer_id {
-                        self.consumer_in_flight.entry(cid).or_default().push(msg_id);
+                        self.consumer_in_flight
+                            .entry(cid)
+                            .or_default()
+                            .insert(msg_id);
                     }
                 }
                 MessageState::DeadLetter => {
@@ -1935,5 +2039,1360 @@ mod tests {
         assert_eq!(decoded.meta.group_id, 42);
         assert_eq!(decoded.meta.variant, GroupVariant::Ack);
         assert_eq!(decoded.meta.source_topic_id, 99);
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    fn make_actor_group(id: u64, name: &str) -> ConsumerGroupState {
+        let meta = ConsumerGroupMeta {
+            group_id: id,
+            name: name.to_string(),
+            name_hash: 0,
+            created_at: 1000,
+            generation: 0,
+            phase: GroupPhase::Empty,
+            protocol_type: "consumer".to_string(),
+            protocol_name: String::new(),
+            leader: None,
+            auto_offset_reset: AutoOffsetReset::Latest,
+            last_activity_at: 1000,
+            next_member_id: 1,
+            members: Vec::new(),
+            variant: GroupVariant::Actor,
+            source_topic_id: 2,
+            variant_config: VariantConfig::Actor(ActorVariantConfig::default()),
+        };
+        ConsumerGroupState::new(meta, "test", 0)
+    }
+
+    fn build_msg(payload: &[u8]) -> Bytes {
+        crate::flat::FlatMessageBuilder::new(Bytes::from(payload.to_vec()))
+            .timestamp(1000)
+            .build()
+    }
+
+    fn build_msg_with_priority(payload: &[u8], prio: u8) -> Bytes {
+        crate::flat::FlatMessageBuilder::new(Bytes::from(payload.to_vec()))
+            .timestamp(1000)
+            .priority(prio)
+            .build()
+    }
+
+    fn build_msg_with_ttl(payload: &[u8], ttl: u64) -> Bytes {
+        crate::flat::FlatMessageBuilder::new(Bytes::from(payload.to_vec()))
+            .timestamp(1000)
+            .ttl_ms(ttl)
+            .build()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ACK VARIANT STATE TESTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_ack_enqueue_multiple() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        let msgs: Vec<Bytes> = (0..5)
+            .map(|i| build_msg(format!("msg-{i}").as_bytes()))
+            .collect();
+        let dedup: Vec<Option<Bytes>> = vec![None; 5];
+        let count = ack.apply_enqueue(&config, 1, 100, &msgs, &dedup, 1000);
+        assert_eq!(count, 5);
+        assert_eq!(ack.pending_count(), 5);
+        assert_eq!(ack.total_messages.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn test_ack_delayed_enqueue() {
+        let mut config = AckVariantConfig::default();
+        config.delay_default_ms = 5000;
+        let group = make_ack_group(1, "g");
+        let ack = group.ack_state().unwrap();
+
+        let msgs = vec![build_msg(b"delayed")];
+        let count = ack.apply_enqueue(&config, 1, 100, &msgs, &[None], 1000);
+        assert_eq!(count, 1);
+        // Delayed messages don't go to pending
+        assert_eq!(ack.pending_count(), 0);
+        assert_eq!(ack.delayed_count(), 1);
+        assert!(ack.delayed_bytes() > 0);
+        assert_eq!(ack.total_messages.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_ack_collect_due_delayed() {
+        let mut config = AckVariantConfig::default();
+        config.delay_default_ms = 5000;
+        let group = make_ack_group(1, "g");
+        let ack = group.ack_state().unwrap();
+
+        let msgs = vec![build_msg(b"delayed")];
+        ack.apply_enqueue(&config, 1, 100, &msgs, &[None], 1000);
+        assert_eq!(ack.delayed_count(), 1);
+
+        // Not yet due
+        let due = ack.collect_due_delayed(5000);
+        assert!(due.is_empty());
+
+        // Now due (current_time >= deliver_after)
+        let due = ack.collect_due_delayed(6001);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0], 100);
+    }
+
+    #[test]
+    fn test_ack_materialize_delayed() {
+        let mut config = AckVariantConfig::default();
+        config.delay_default_ms = 5000;
+        let group = make_ack_group(1, "g");
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg(b"delayed-msg");
+        ack.apply_enqueue(&config, 1, 100, &[msg.clone()], &[None], 1000);
+        assert_eq!(ack.delayed_count(), 1);
+        assert_eq!(ack.pending_count(), 0);
+
+        let due = ack.collect_due_delayed(6001);
+        assert_eq!(due.len(), 1);
+
+        ack.materialize_delayed(1, due[0], &msg, 6001);
+        assert_eq!(ack.pending_count(), 1);
+        assert_eq!(ack.delayed_count(), 0);
+    }
+
+    #[test]
+    fn test_ack_extend_visibility() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg(b"data");
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+        let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
+        assert_eq!(delivered.len(), 1);
+
+        let meta = ack.messages.get(&delivered[0]).unwrap();
+        let original_deadline = meta.visibility_deadline.unwrap();
+        drop(meta);
+
+        ack.apply_extend_visibility(&delivered, 10_000);
+
+        let meta = ack.messages.get(&delivered[0]).unwrap();
+        assert_eq!(
+            meta.visibility_deadline.unwrap(),
+            original_deadline + 10_000
+        );
+    }
+
+    #[test]
+    fn test_ack_timeout_under_max_retries() {
+        let group = make_ack_group(1, "g");
+        let mut config = AckVariantConfig::default();
+        config.max_retries = 3;
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg(b"data");
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+        let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
+        assert_eq!(ack.in_flight_count(), 1);
+
+        // Timeout with attempts(1) < max_retries(3) → returns to pending
+        let dlq = ack.apply_timeout_expired(&delivered, &config, 35_000);
+        assert!(dlq.is_empty());
+        assert_eq!(ack.pending_count(), 1);
+        assert_eq!(ack.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn test_ack_timeout_at_max_retries_dead_letters() {
+        let group = make_ack_group(1, "g");
+        let mut config = AckVariantConfig::default();
+        config.max_retries = 1;
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg(b"data");
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+        let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
+        // After deliver, attempts = 1 which equals max_retries = 1
+        let dlq = ack.apply_timeout_expired(&delivered, &config, 35_000);
+        assert_eq!(dlq.len(), 1);
+        assert_eq!(ack.dlq_count(), 1);
+        assert_eq!(ack.in_flight_count(), 0);
+        assert_eq!(ack.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_ack_remove_dead_lettered() {
+        let group = make_ack_group(1, "g");
+        let mut config = AckVariantConfig::default();
+        config.max_retries = 1;
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg(b"data");
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+        let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
+        let dlq = ack.apply_timeout_expired(&delivered, &config, 35_000);
+        assert_eq!(ack.dlq_count(), 1);
+
+        ack.apply_remove_dead_lettered(&dlq);
+        assert_eq!(ack.dlq_count(), 0);
+        assert!(ack.messages.is_empty());
+    }
+
+    #[test]
+    fn test_ack_expire_pending() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg_with_ttl(b"data", 5000);
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+        assert_eq!(ack.pending_count(), 1);
+
+        ack.apply_expire_pending(&[100]);
+        assert_eq!(ack.pending_count(), 0);
+        assert!(ack.messages.is_empty());
+    }
+
+    #[test]
+    fn test_ack_purge() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        let msgs: Vec<Bytes> = (0..3)
+            .map(|i| build_msg(format!("msg-{i}").as_bytes()))
+            .collect();
+        ack.apply_enqueue(&config, 1, 100, &msgs, &[None, None, None], 1000);
+        let delivered = ack.apply_deliver(&config, 42, 1, 2000, 200);
+        assert_eq!(ack.pending_count(), 2);
+        assert_eq!(ack.in_flight_count(), 1);
+
+        let had = ack.purge();
+        assert!(had);
+        assert_eq!(ack.pending_count(), 0);
+        assert_eq!(ack.in_flight_count(), 0);
+        assert_eq!(ack.dlq_count(), 0);
+        assert_eq!(ack.delayed_count(), 0);
+        assert!(ack.messages.is_empty());
+
+        // Purge empty returns false
+        let had = ack.purge();
+        assert!(!had);
+    }
+
+    #[test]
+    fn test_ack_min_required_index() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        // Empty → None
+        assert!(ack.min_required_index().is_none());
+
+        let msgs = vec![build_msg(b"a"), build_msg(b"b"), build_msg(b"c")];
+        ack.apply_enqueue(&config, 1, 100, &msgs, &[None, None, None], 1000);
+        // Min should be 100 (first message)
+        assert_eq!(ack.min_required_index(), Some(100));
+
+        // Ack the min message → cache dirty → recompute
+        ack.apply_ack(&[100]);
+        assert_eq!(ack.min_required_index(), Some(101));
+    }
+
+    #[test]
+    fn test_ack_consumer_in_flight_tracking() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        let msgs = vec![build_msg(b"a"), build_msg(b"b")];
+        ack.apply_enqueue(&config, 1, 100, &msgs, &[None, None], 1000);
+
+        let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
+        assert_eq!(delivered.len(), 2);
+
+        let ids = ack.consumer_in_flight_ids(42);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&100));
+        assert!(ids.contains(&101));
+
+        // Unknown consumer
+        let ids = ack.consumer_in_flight_ids(999);
+        assert!(ids.is_empty());
+
+        // Ack removes from tracking
+        ack.apply_ack(&[100]);
+        let ids = ack.consumer_in_flight_ids(42);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&101));
+    }
+
+    #[test]
+    fn test_ack_would_exceed_limit_messages() {
+        let group = make_ack_group(1, "g");
+        let mut config = AckVariantConfig::default();
+        config.max_pending_messages = Some(5);
+        let ack = group.ack_state().unwrap();
+
+        let msgs: Vec<Bytes> = (0..3).map(|_| build_msg(b"x")).collect();
+        ack.apply_enqueue(&config, 1, 100, &msgs, &[None, None, None], 1000);
+
+        // 3 pending + 3 additional = 6 > 5
+        assert!(ack.would_exceed_limit(&config, 0, 0, 3, 0));
+        // 3 pending + 2 additional = 5 ≤ 5
+        assert!(!ack.would_exceed_limit(&config, 0, 0, 2, 0));
+    }
+
+    #[test]
+    fn test_ack_would_exceed_limit_bytes() {
+        let group = make_ack_group(1, "g");
+        let mut config = AckVariantConfig::default();
+        config.max_pending_bytes = Some(100);
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg(b"12345678901234567890"); // 20 byte value
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+
+        // pending_bytes ~ 20 + 80 additional = 100 ≤ 100
+        let pb = ack.pending_bytes.load(Ordering::Relaxed);
+        assert!(!ack.would_exceed_limit(&config, 0, 0, 0, 100 - pb));
+        assert!(ack.would_exceed_limit(&config, 0, 0, 0, 101 - pb));
+    }
+
+    #[test]
+    fn test_ack_would_exceed_delayed_limit() {
+        let group = make_ack_group(1, "g");
+        let mut config = AckVariantConfig::default();
+        config.delay_default_ms = 5000;
+        config.max_delayed_messages = Some(2);
+        let ack = group.ack_state().unwrap();
+
+        let msgs = vec![build_msg(b"a"), build_msg(b"b")];
+        ack.apply_enqueue(&config, 1, 100, &msgs, &[None, None], 1000);
+        assert_eq!(ack.delayed_count(), 2);
+
+        assert!(ack.would_exceed_limit(&config, 0, 0, 1, 0));
+        assert!(!ack.would_exceed_limit(&config, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_ack_byte_accounting() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg(b"hello"); // 5 byte value
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+
+        let pending_bytes = ack.pending_bytes.load(Ordering::Relaxed);
+        assert!(pending_bytes > 0);
+        assert_eq!(ack.in_flight_bytes.load(Ordering::Relaxed), 0);
+
+        // Deliver moves bytes from pending accounting to in-flight
+        let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
+        assert_eq!(delivered.len(), 1);
+        // pending_bytes stays (not decremented in deliver — only pending_count changes)
+        // in_flight_bytes not explicitly tracked in deliver currently
+
+        // Ack removes from in_flight_bytes
+        ack.apply_ack(&delivered);
+        assert_eq!(ack.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn test_ack_snapshot_restore() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        // Enqueue several messages in various states
+        let msgs = vec![build_msg(b"a"), build_msg(b"b"), build_msg(b"c")];
+        ack.apply_enqueue(&config, 1, 100, &msgs, &[None, None, None], 1000);
+        let delivered = ack.apply_deliver(&config, 42, 1, 2000, 200);
+        assert_eq!(delivered.len(), 1);
+
+        let snap = ack.snapshot();
+        assert_eq!(snap.messages.len(), 3);
+
+        // Restore into a fresh group
+        let group2 = make_ack_group(2, "g2");
+        let ack2 = group2.ack_state().unwrap();
+        ack2.restore(snap, &config);
+
+        assert_eq!(ack2.pending_count(), 2);
+        assert_eq!(ack2.in_flight_count(), 1);
+        assert_eq!(ack2.messages.len(), 3);
+        assert_eq!(ack2.total_messages.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn test_ack_snapshot_restore_with_delayed() {
+        let mut config = AckVariantConfig::default();
+        config.delay_default_ms = 5000;
+        let group = make_ack_group(1, "g");
+        let ack = group.ack_state().unwrap();
+
+        let msgs = vec![build_msg(b"delayed")];
+        ack.apply_enqueue(&config, 1, 100, &msgs, &[None], 1000);
+
+        let snap = ack.snapshot();
+        assert_eq!(snap.delayed_entries.len(), 1);
+
+        let group2 = make_ack_group(2, "g2");
+        let ack2 = group2.ack_state().unwrap();
+        ack2.restore(snap, &config);
+        assert_eq!(ack2.delayed_count(), 1);
+    }
+
+    #[test]
+    fn test_ack_noop_on_nonexistent() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        // All of these should be no-ops on nonexistent message IDs
+        ack.apply_ack(&[999]);
+        ack.apply_nack(&[999]);
+        ack.apply_release(&[999]);
+        ack.apply_extend_visibility(&[999], 1000);
+        let dlq = ack.apply_timeout_expired(&[999], &config, 1000);
+        assert!(dlq.is_empty());
+        assert_eq!(ack.pending_count(), 0);
+        assert_eq!(ack.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn test_ack_nack_clears_consumer_id() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg(b"data");
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+        let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
+        assert_eq!(ack.messages.get(&100).unwrap().consumer_id, Some(42));
+
+        ack.apply_nack(&delivered);
+        let meta = ack.messages.get(&100).unwrap();
+        assert_eq!(meta.consumer_id, None);
+        assert_eq!(meta.state, MessageState::Pending);
+    }
+
+    #[test]
+    fn test_ack_deliver_skips_non_pending() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        let msg = build_msg(b"data");
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+        // First deliver takes the message
+        let d1 = ack.apply_deliver(&config, 42, 10, 2000, 200);
+        assert_eq!(d1.len(), 1);
+        // Second deliver gets nothing
+        let d2 = ack.apply_deliver(&config, 43, 10, 3000, 300);
+        assert!(d2.is_empty());
+    }
+
+    #[test]
+    fn test_ack_priority_ordering() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        // Higher priority = higher u8 = delivered first (BTreeMap iterated in reverse)
+        let msg_low = build_msg_with_priority(b"low", 1);
+        let msg_high = build_msg_with_priority(b"high", 9);
+        ack.apply_enqueue(&config, 1, 100, &[msg_low], &[None], 1000);
+        ack.apply_enqueue(&config, 1, 101, &[msg_high], &[None], 1000);
+
+        // Deliver one at a time — should get high priority first (iter().rev())
+        let d1 = ack.apply_deliver(&config, 42, 1, 2000, 200);
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0], 101); // high priority message
+
+        let d2 = ack.apply_deliver(&config, 42, 1, 2000, 200);
+        assert_eq!(d2.len(), 1);
+        assert_eq!(d2[0], 100); // low priority message
+    }
+
+    #[test]
+    fn test_ack_has_messages() {
+        let group = make_ack_group(1, "g");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+        assert!(!ack.has_messages());
+
+        let msg = build_msg(b"x");
+        ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
+        assert!(ack.has_messages());
+
+        ack.purge();
+        assert!(!ack.has_messages());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ACTOR VARIANT STATE TESTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_actor_send_basic() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        let result = actor_state.apply_send(&config, 1, &actor_id, 100, 1000, None, 50);
+        assert!(result.is_ok());
+        assert_eq!(actor_state.active_count(), 1);
+
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.pending_count(), 1);
+        assert_eq!(actor.pending_bytes(), 50);
+        assert_eq!(actor.head_index.load(Ordering::Relaxed), 100);
+        assert_eq!(actor.tail_index.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn test_actor_send_multiple() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        for i in 0..5u64 {
+            actor_state
+                .apply_send(&config, 1, &actor_id, 100 + i, 1000, None, 10)
+                .unwrap();
+        }
+
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.pending_count(), 5);
+        assert_eq!(actor.pending_bytes(), 50);
+        assert_eq!(actor.tail_index.load(Ordering::Relaxed), 100);
+        assert_eq!(actor.head_index.load(Ordering::Relaxed), 104);
+        assert_eq!(actor_state.active_count(), 1);
+    }
+
+    #[test]
+    fn test_actor_send_mailbox_full() {
+        let group = make_actor_group(1, "g");
+        let mut config = ActorVariantConfig::default();
+        config.max_mailbox_depth = 2;
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 10)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &actor_id, 101, 1000, None, 10)
+            .unwrap();
+        let result = actor_state.apply_send(&config, 1, &actor_id, 102, 1000, None, 10);
+        assert!(matches!(result, Err(MqError::MailboxFull { pending: 2 })));
+    }
+
+    #[test]
+    fn test_actor_send_backpressure_messages() {
+        let group = make_actor_group(1, "g");
+        let mut config = ActorVariantConfig::default();
+        config.max_pending_messages = Some(2);
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 10)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &actor_id, 101, 1000, None, 10)
+            .unwrap();
+        let result = actor_state.apply_send(&config, 1, &actor_id, 102, 1000, None, 10);
+        assert!(matches!(result, Err(MqError::BackPressure { .. })));
+    }
+
+    #[test]
+    fn test_actor_send_backpressure_bytes() {
+        let group = make_actor_group(1, "g");
+        let mut config = ActorVariantConfig::default();
+        config.max_pending_bytes = Some(50);
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 30)
+            .unwrap();
+        let result = actor_state.apply_send(&config, 1, &actor_id, 101, 1000, None, 30);
+        assert!(matches!(result, Err(MqError::BackPressure { .. })));
+    }
+
+    #[test]
+    fn test_actor_deliver_basic() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+
+        let msg = actor_state.apply_deliver(&actor_id, 42, 50);
+        assert_eq!(msg, Some(100));
+
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.pending_count(), 0);
+        assert_eq!(actor.in_flight_index(), Some(100));
+        assert_eq!(actor.pending_bytes(), 0);
+        assert_eq!(actor.in_flight_bytes(), 50);
+        assert_eq!(actor.attempts(), 1);
+    }
+
+    #[test]
+    fn test_actor_deliver_wrong_consumer() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+
+        // Wrong consumer_id
+        let msg = actor_state.apply_deliver(&actor_id, 99, 50);
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    fn test_actor_deliver_already_in_flight() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 50)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &actor_id, 101, 1000, None, 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+
+        let msg = actor_state.apply_deliver(&actor_id, 42, 50);
+        assert_eq!(msg, Some(100));
+
+        // Second deliver fails — already has in-flight
+        let msg2 = actor_state.apply_deliver(&actor_id, 42, 50);
+        assert_eq!(msg2, None);
+    }
+
+    #[test]
+    fn test_actor_deliver_unassigned() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 50)
+            .unwrap();
+        // Not assigned to any consumer
+        let msg = actor_state.apply_deliver(&actor_id, 42, 50);
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    fn test_actor_deliver_empty_mailbox() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+
+        // Deliver the only message
+        actor_state.apply_deliver(&actor_id, 42, 50);
+        actor_state.apply_ack(&actor_id, 100, 50);
+
+        // Mailbox is empty now
+        let msg = actor_state.apply_deliver(&actor_id, 42, 50);
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    fn test_actor_ack_basic() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+        actor_state.apply_deliver(&actor_id, 42, 50);
+
+        let reply = actor_state.apply_ack(&actor_id, 100, 50);
+        assert_eq!(reply, None); // No reply_to was set
+
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.in_flight_index(), None);
+        assert_eq!(actor.attempts(), 0);
+        assert_eq!(actor.in_flight_bytes(), 0);
+    }
+
+    #[test]
+    fn test_actor_ack_with_reply_to() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        let reply_to = Bytes::from_static(b"response-topic");
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, Some(reply_to.clone()), 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+        actor_state.apply_deliver(&actor_id, 42, 50);
+
+        let reply = actor_state.apply_ack(&actor_id, 100, 50);
+        assert_eq!(reply, Some(reply_to));
+    }
+
+    #[test]
+    fn test_actor_ack_wrong_message() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+        actor_state.apply_deliver(&actor_id, 42, 50);
+
+        // Wrong message_id
+        let reply = actor_state.apply_ack(&actor_id, 999, 50);
+        assert_eq!(reply, None);
+        // In-flight should still be set
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.in_flight_index(), Some(100));
+    }
+
+    #[test]
+    fn test_actor_nack() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+        actor_state.apply_deliver(&actor_id, 42, 50);
+
+        actor_state.apply_nack(&actor_id, 100, 50);
+
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.in_flight_index(), None);
+        assert_eq!(actor.pending_count(), 1); // returned to mailbox
+        assert_eq!(actor.in_flight_bytes(), 0);
+        assert_eq!(actor.pending_bytes(), 50);
+        // Message should be back at front of mailbox
+        assert_eq!(*actor.mailbox.lock().front().unwrap(), 100);
+    }
+
+    #[test]
+    fn test_actor_assign() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let a1 = Bytes::from_static(b"actor-1");
+        let a2 = Bytes::from_static(b"actor-2");
+
+        actor_state
+            .apply_send(&config, 1, &a1, 100, 1000, None, 10)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &a2, 101, 1000, None, 10)
+            .unwrap();
+
+        actor_state.apply_assign(42, &[a1.clone(), a2.clone()]);
+
+        let actor1 = actor_state.actors.get(&a1).unwrap();
+        assert_eq!(actor1.assigned_consumer_id(), Some(42));
+        let actor2 = actor_state.actors.get(&a2).unwrap();
+        assert_eq!(actor2.assigned_consumer_id(), Some(42));
+
+        let assignments = actor_state.consumer_assignments.get(&42).unwrap();
+        assert!(assignments.contains(&a1));
+        assert!(assignments.contains(&a2));
+    }
+
+    #[test]
+    fn test_actor_release() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+        actor_state.apply_deliver(&actor_id, 42, 50);
+
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.in_flight_index(), Some(100));
+        assert_eq!(actor.in_flight_bytes(), 50);
+        drop(actor);
+
+        // Release consumer 42 → in-flight returns to pending
+        actor_state.apply_release(42);
+
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.assigned_consumer_id(), None);
+        assert_eq!(actor.in_flight_index(), None);
+        assert_eq!(actor.pending_count(), 1); // returned to mailbox
+        assert_eq!(actor.in_flight_bytes(), 0);
+        assert!(actor.pending_bytes() > 0);
+
+        assert!(actor_state.consumer_assignments.get(&42).is_none());
+    }
+
+    #[test]
+    fn test_actor_evict_idle() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+
+        let idle = Bytes::from_static(b"idle-actor");
+        let active = Bytes::from_static(b"active-actor");
+
+        actor_state
+            .apply_send(&config, 1, &idle, 100, 500, None, 10)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &active, 101, 2000, None, 10)
+            .unwrap();
+
+        // Ack the idle actor's only message so it has pending=0
+        actor_state.apply_assign(42, &[idle.clone()]);
+        actor_state.apply_deliver(&idle, 42, 10);
+        actor_state.apply_ack(&idle, 100, 10);
+
+        // Evict actors idle before timestamp 1000
+        let count = actor_state.apply_evict_idle(1000);
+        assert_eq!(count, 1);
+        assert!(actor_state.actors.get(&idle).is_none());
+        assert!(actor_state.actors.get(&active).is_some());
+        assert_eq!(actor_state.active_count(), 1);
+    }
+
+    #[test]
+    fn test_actor_evict_keeps_actors_with_pending() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 500, None, 10)
+            .unwrap();
+
+        // Actor has pending messages, so evict should keep it even if idle
+        let count = actor_state.apply_evict_idle(1000);
+        assert_eq!(count, 0);
+        assert!(actor_state.actors.get(&actor_id).is_some());
+    }
+
+    #[test]
+    fn test_actor_unassigned_with_messages() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+
+        let a1 = Bytes::from_static(b"actor-1");
+        let a2 = Bytes::from_static(b"actor-2");
+        let a3 = Bytes::from_static(b"actor-3");
+
+        actor_state
+            .apply_send(&config, 1, &a1, 100, 1000, None, 10)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &a2, 101, 1000, None, 10)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &a3, 102, 1000, None, 10)
+            .unwrap();
+
+        // Assign only a1
+        actor_state.apply_assign(42, &[a1.clone()]);
+
+        let unassigned = actor_state.unassigned_actors_with_messages();
+        assert_eq!(unassigned.len(), 2);
+        assert!(unassigned.contains(&a2));
+        assert!(unassigned.contains(&a3));
+    }
+
+    #[test]
+    fn test_actor_min_required_index() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+
+        assert!(actor_state.min_required_index().is_none());
+
+        let a1 = Bytes::from_static(b"actor-1");
+        let a2 = Bytes::from_static(b"actor-2");
+
+        actor_state
+            .apply_send(&config, 1, &a1, 100, 1000, None, 10)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &a2, 200, 1000, None, 10)
+            .unwrap();
+
+        assert_eq!(actor_state.min_required_index(), Some(100));
+
+        // Ack a1's message
+        actor_state.apply_assign(42, &[a1.clone()]);
+        actor_state.apply_deliver(&a1, 42, 10);
+        actor_state.apply_ack(&a1, 100, 10);
+
+        // Now min should be actor-2's tail
+        assert_eq!(actor_state.min_required_index(), Some(200));
+    }
+
+    #[test]
+    fn test_actor_snapshot_restore() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+
+        let a1 = Bytes::from_static(b"actor-1");
+        let a2 = Bytes::from_static(b"actor-2");
+
+        actor_state
+            .apply_send(&config, 1, &a1, 100, 1000, None, 50)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &a1, 101, 1000, None, 50)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &a2, 200, 2000, None, 30)
+            .unwrap();
+        actor_state.apply_assign(42, &[a1.clone()]);
+
+        let snap = actor_state.snapshot();
+        assert_eq!(snap.actors.len(), 2);
+
+        let group2 = make_actor_group(2, "g2");
+        let actor_state2 = group2.actor_state().unwrap();
+        actor_state2.restore(snap, 2);
+
+        assert_eq!(actor_state2.active_count(), 2);
+        let a1_restored = actor_state2.actors.get(&a1).unwrap();
+        assert_eq!(a1_restored.pending_count(), 2);
+        assert_eq!(a1_restored.assigned_consumer_id(), Some(42));
+        assert_eq!(a1_restored.pending_bytes(), 100);
+    }
+
+    #[test]
+    fn test_actor_byte_accounting() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+        let actor_id = Bytes::from_static(b"actor-1");
+
+        actor_state
+            .apply_send(&config, 1, &actor_id, 100, 1000, None, 100)
+            .unwrap();
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.pending_bytes(), 100);
+        assert_eq!(actor.in_flight_bytes(), 0);
+        drop(actor);
+
+        actor_state.apply_assign(42, &[actor_id.clone()]);
+        actor_state.apply_deliver(&actor_id, 42, 100);
+
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.pending_bytes(), 0);
+        assert_eq!(actor.in_flight_bytes(), 100);
+        drop(actor);
+
+        actor_state.apply_ack(&actor_id, 100, 100);
+        let actor = actor_state.actors.get(&actor_id).unwrap();
+        assert_eq!(actor.pending_bytes(), 0);
+        assert_eq!(actor.in_flight_bytes(), 0);
+    }
+
+    #[test]
+    fn test_actor_multiple_actors_independent() {
+        let group = make_actor_group(1, "g");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+
+        let a1 = Bytes::from_static(b"actor-1");
+        let a2 = Bytes::from_static(b"actor-2");
+
+        actor_state
+            .apply_send(&config, 1, &a1, 100, 1000, None, 10)
+            .unwrap();
+        actor_state
+            .apply_send(&config, 1, &a2, 101, 1000, None, 20)
+            .unwrap();
+
+        actor_state.apply_assign(42, &[a1.clone()]);
+        actor_state.apply_assign(43, &[a2.clone()]);
+
+        // Each delivers independently
+        let m1 = actor_state.apply_deliver(&a1, 42, 10);
+        let m2 = actor_state.apply_deliver(&a2, 43, 20);
+        assert_eq!(m1, Some(100));
+        assert_eq!(m2, Some(101));
+
+        // Ack independently
+        actor_state.apply_ack(&a1, 100, 10);
+        let a1_ref = actor_state.actors.get(&a1).unwrap();
+        assert_eq!(a1_ref.in_flight_index(), None);
+        let a2_ref = actor_state.actors.get(&a2).unwrap();
+        assert_eq!(a2_ref.in_flight_index(), Some(101));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CONSUMER GROUP STATE TESTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cg_phase_lifecycle() {
+        let group = make_group(1, "g");
+        assert_eq!(group.phase(), GroupPhase::Empty);
+
+        group.set_phase(GroupPhase::PreparingRebalance);
+        assert_eq!(group.phase(), GroupPhase::PreparingRebalance);
+
+        group.set_phase(GroupPhase::CompletingRebalance);
+        assert_eq!(group.phase(), GroupPhase::CompletingRebalance);
+
+        group.set_phase(GroupPhase::Stable);
+        assert_eq!(group.phase(), GroupPhase::Stable);
+
+        group.set_phase(GroupPhase::Dead);
+        assert_eq!(group.phase(), GroupPhase::Dead);
+    }
+
+    #[test]
+    fn test_cg_members_joined_synced() {
+        let group = make_group(1, "g");
+
+        // Empty group: all_members_joined and all_members_synced return false
+        assert!(!group.all_members_joined());
+        assert!(!group.all_members_synced());
+
+        group.upsert_member(make_member("m-1", &[("range", b"")]));
+        group.upsert_member(make_member("m-2", &[("range", b"")]));
+
+        assert!(!group.all_members_joined());
+
+        group.mark_joined("m-1");
+        assert!(!group.all_members_joined());
+
+        group.mark_joined("m-2");
+        assert!(group.all_members_joined());
+        assert!(!group.all_members_synced());
+
+        group.mark_synced("m-1");
+        group.mark_synced("m-2");
+        assert!(group.all_members_synced());
+
+        // Clear marks
+        group.clear_join_marks();
+        assert!(!group.all_members_joined());
+        group.clear_sync_marks();
+        assert!(!group.all_members_synced());
+    }
+
+    #[test]
+    fn test_cg_offsets() {
+        let group = make_group(1, "g");
+
+        assert!(group.get_offset(10, 0).is_none());
+
+        group.offsets.insert(
+            (10, 0),
+            GroupTopicPartitionOffset {
+                topic_id: 10,
+                partition_index: 0,
+                committed_offset: 42,
+                metadata: None,
+                committed_at: 1000,
+            },
+        );
+        assert_eq!(group.get_offset(10, 0), Some(42));
+
+        // Different partition
+        assert!(group.get_offset(10, 1).is_none());
+    }
+
+    #[test]
+    fn test_cg_select_protocol() {
+        let group = make_group(1, "g");
+
+        group.upsert_member(make_member("m-1", &[("range", b""), ("roundrobin", b"")]));
+        group.upsert_member(make_member("m-2", &[("range", b"")]));
+
+        group.select_and_set_protocol();
+        // "range" is supported by both members, "roundrobin" only by one
+        assert_eq!(*group.protocol_name(), "range");
+    }
+
+    #[test]
+    fn test_cg_elect_leader() {
+        let group = make_group(1, "g");
+
+        group.upsert_member(make_member("m-1", &[("range", b"")]));
+        group.upsert_member(make_member("m-2", &[("range", b"")]));
+
+        group.elect_leader();
+        assert!(group.leader().is_some());
+        // Leader should be one of the members
+        let leader = group.leader().unwrap();
+        assert!(leader.as_str() == "m-1" || leader.as_str() == "m-2");
+    }
+
+    #[test]
+    fn test_cg_find_expired_members() {
+        let group = make_group(1, "g");
+        group.upsert_member(make_member("m-1", &[("range", b"")]));
+        group.upsert_member(make_member("m-2", &[("range", b"")]));
+
+        // Both members have last_heartbeat_at=1000, session_timeout=30_000
+        // At time 29_000 neither is expired
+        let expired = group.find_expired_members(29_000);
+        assert!(expired.is_empty());
+
+        // At time 31_001 both are expired (1000 + 30_000 = 31_000 < 31_001)
+        let expired = group.find_expired_members(31_001);
+        assert_eq!(expired.len(), 2);
+
+        // Update heartbeat for m-1
+        group.update_member_heartbeat("m-1", 30_000);
+        let expired = group.find_expired_members(31_001);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0], "m-2");
+    }
+
+    #[test]
+    fn test_cg_member_assignment() {
+        let group = make_group(1, "g");
+        group.upsert_member(make_member("m-1", &[("range", b"")]));
+
+        assert!(group.get_member_assignment("m-1").is_some());
+        assert!(group.get_member_assignment("m-1").unwrap().is_empty());
+
+        group.set_member_assignment("m-1", Bytes::from_static(b"\x01\x02\x03"));
+        assert_eq!(
+            &*group.get_member_assignment("m-1").unwrap(),
+            b"\x01\x02\x03"
+        );
+    }
+
+    #[test]
+    fn test_cg_increment_next_member_id() {
+        let group = make_group(1, "g");
+        assert_eq!(group.next_member_id(), 1);
+        let old = group.increment_next_member_id();
+        assert_eq!(old, 1);
+        assert_eq!(group.next_member_id(), 2);
+    }
+
+    #[test]
+    fn test_cg_touch_activity() {
+        let group = make_group(1, "g");
+        assert_eq!(group.last_activity_at(), 1000);
+        group.touch_activity(5000);
+        assert_eq!(group.last_activity_at(), 5000);
+    }
+
+    #[test]
+    fn test_cg_member_protocols() {
+        let group = make_group(1, "g");
+        group.upsert_member(make_member("m-1", &[("range", b"\x01")]));
+        group.upsert_member(make_member("m-2", &[("range", b"\x02")]));
+        group.set_protocol_name("range".to_string());
+
+        let protocols = group.member_protocols();
+        assert_eq!(protocols.len(), 2);
+    }
+
+    #[test]
+    fn test_cg_snapshot_restore_offset() {
+        let group = make_group(1, "test-group");
+        group.upsert_member(make_member("m-1", &[("range", b"\x01\x02")]));
+        group.bump_generation();
+        group.set_phase(GroupPhase::Stable);
+        group.set_leader(Some("m-1".to_string()));
+        group.offsets.insert(
+            (10, 0),
+            GroupTopicPartitionOffset {
+                topic_id: 10,
+                partition_index: 0,
+                committed_offset: 42,
+                metadata: Some(Bytes::from("meta")),
+                committed_at: 2000,
+            },
+        );
+
+        let meta = group.snapshot_meta();
+        let offsets: Vec<GroupTopicPartitionOffset> =
+            group.offsets.iter().map(|e| e.value().clone()).collect();
+
+        let restored = ConsumerGroupState::from_snapshot(meta, offsets, "test", 0);
+        assert_eq!(restored.generation(), 1);
+        assert_eq!(restored.phase(), GroupPhase::Stable);
+        assert!(restored.leader().is_some());
+        assert_eq!(*restored.leader().unwrap(), "m-1");
+        assert_eq!(restored.member_count(), 1);
+        assert!(restored.has_member("m-1"));
+        assert_eq!(restored.get_offset(10, 0), Some(42));
+    }
+
+    #[test]
+    fn test_cg_snapshot_restore_ack_variant() {
+        let group = make_ack_group(1, "ack-cg");
+        let config = AckVariantConfig::default();
+        let ack = group.ack_state().unwrap();
+
+        let msgs = vec![build_msg(b"a"), build_msg(b"b")];
+        ack.apply_enqueue(&config, 1, 100, &msgs, &[None, None], 1000);
+        ack.apply_deliver(&config, 42, 1, 2000, 200);
+
+        let snap = ack.snapshot();
+        let meta = group.snapshot_meta();
+
+        let restored = ConsumerGroupState::from_snapshot(meta, vec![], "test", 0);
+        let ack2 = restored.ack_state().unwrap();
+        ack2.restore(snap, &config);
+
+        assert_eq!(ack2.pending_count(), 1);
+        assert_eq!(ack2.in_flight_count(), 1);
+    }
+
+    #[test]
+    fn test_cg_snapshot_restore_actor_variant() {
+        let group = make_actor_group(1, "actor-cg");
+        let config = ActorVariantConfig::default();
+        let actor_state = group.actor_state().unwrap();
+
+        let a1 = Bytes::from_static(b"actor-1");
+        actor_state
+            .apply_send(&config, 1, &a1, 100, 1000, None, 50)
+            .unwrap();
+        actor_state.apply_assign(42, &[a1.clone()]);
+
+        let snap = actor_state.snapshot();
+        let meta = group.snapshot_meta();
+
+        let restored = ConsumerGroupState::from_snapshot(meta, vec![], "test", 0);
+        let actor_state2 = restored.actor_state().unwrap();
+        actor_state2.restore(snap, 1);
+
+        assert_eq!(actor_state2.active_count(), 1);
+        let a1_ref = actor_state2.actors.get(&a1).unwrap();
+        assert_eq!(a1_ref.pending_count(), 1);
+        assert_eq!(a1_ref.assigned_consumer_id(), Some(42));
+    }
+
+    #[test]
+    fn test_cg_variant_accessors() {
+        let offset_group = make_group(1, "offset");
+        assert!(offset_group.ack_state().is_none());
+        assert!(offset_group.actor_state().is_none());
+
+        let ack_group = make_ack_group(2, "ack");
+        assert!(ack_group.ack_state().is_some());
+        assert!(ack_group.actor_state().is_none());
+        assert!(ack_group.ack_config().is_some());
+
+        let actor_group = make_actor_group(3, "actor");
+        assert!(actor_group.ack_state().is_none());
+        assert!(actor_group.actor_state().is_some());
+        assert!(actor_group.actor_config().is_some());
+    }
+
+    #[test]
+    fn test_cg_clear_leader() {
+        let group = make_group(1, "g");
+        group.set_leader(Some("m-1".to_string()));
+        assert!(group.leader().is_some());
+        group.clear_leader();
+        assert!(group.leader().is_none());
+    }
+
+    #[test]
+    fn test_cg_from_snapshot_members() {
+        let meta = ConsumerGroupMeta {
+            group_id: 1,
+            name: "g".to_string(),
+            name_hash: 0,
+            created_at: 1000,
+            generation: 2,
+            phase: GroupPhase::Stable,
+            protocol_type: "consumer".to_string(),
+            protocol_name: "range".to_string(),
+            leader: Some("m-1".to_string()),
+            auto_offset_reset: AutoOffsetReset::Latest,
+            last_activity_at: 5000,
+            next_member_id: 3,
+            members: vec![
+                GroupMemberMeta {
+                    member_id: "m-1".to_string(),
+                    client_id: "c-1".to_string(),
+                    session_timeout_ms: 30_000,
+                    rebalance_timeout_ms: 60_000,
+                    protocol_type: "consumer".to_string(),
+                    protocols: vec![("range".to_string(), vec![1, 2])],
+                    assignment: vec![10, 20],
+                },
+                GroupMemberMeta {
+                    member_id: "m-2".to_string(),
+                    client_id: "c-2".to_string(),
+                    session_timeout_ms: 30_000,
+                    rebalance_timeout_ms: 60_000,
+                    protocol_type: "consumer".to_string(),
+                    protocols: vec![("range".to_string(), vec![3, 4])],
+                    assignment: vec![30, 40],
+                },
+            ],
+            variant: GroupVariant::Offset,
+            source_topic_id: 0,
+            variant_config: VariantConfig::Offset,
+        };
+
+        let restored = ConsumerGroupState::from_snapshot(meta, vec![], "test", 0);
+        assert_eq!(restored.member_count(), 2);
+        assert!(restored.has_member("m-1"));
+        assert!(restored.has_member("m-2"));
+        assert_eq!(restored.generation(), 2);
+        assert_eq!(restored.phase(), GroupPhase::Stable);
+        assert_eq!(restored.next_member_id(), 3);
+
+        // Check member assignment restored
+        let a1 = restored.get_member_assignment("m-1").unwrap();
+        assert_eq!(&*a1, &[10, 20]);
+        let a2 = restored.get_member_assignment("m-2").unwrap();
+        assert_eq!(&*a2, &[30, 40]);
     }
 }

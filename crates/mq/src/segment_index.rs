@@ -819,11 +819,11 @@ impl SegmentIndexMap {
 
         match cmd.tag() {
             MqCommand::TAG_PUBLISH => {
-                let topic_id = cmd.field_u64(1);
+                let topic_id = cmd.field_u64(8);
                 self.add_entry(seg_id, ENTITY_TOPIC, topic_id, rec_offset, cmd_len);
             }
             MqCommand::TAG_PUBLISH_TO_EXCHANGE => {
-                let exchange_id = cmd.field_u64(1);
+                let exchange_id = cmd.field_u64(8);
                 self.add_entry(seg_id, ENTITY_TOPIC, exchange_id, rec_offset, cmd_len);
             }
             MqCommand::TAG_BATCH => {
@@ -831,7 +831,7 @@ impl SegmentIndexMap {
                 for sub_cmd in batch.commands() {
                     match sub_cmd.tag() {
                         MqCommand::TAG_PUBLISH => {
-                            let topic_id = sub_cmd.field_u64(1);
+                            let topic_id = sub_cmd.field_u64(8);
                             self.add_entry(seg_id, ENTITY_TOPIC, topic_id, rec_offset, cmd_len);
                         }
                         _ => {}

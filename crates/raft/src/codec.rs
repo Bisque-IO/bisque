@@ -643,6 +643,28 @@ where
             )),
         }
     }
+
+    fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, CodecError> {
+        if data.is_empty() {
+            return Err(CodecError::BufferTooSmall { needed: 1, have: 0 });
+        }
+        let tag = EntryPayloadType::try_from(data[0])?;
+        match tag {
+            EntryPayloadType::Blank => Ok(openraft::EntryPayload::Blank),
+            EntryPayloadType::Normal => {
+                let payload_bytes = data.slice(1..);
+                Ok(openraft::EntryPayload::Normal(C::D::decode_from_bytes(
+                    payload_bytes,
+                )?))
+            }
+            EntryPayloadType::Membership => {
+                let payload_bytes = data.slice(1..);
+                Ok(openraft::EntryPayload::Membership(
+                    openraft::Membership::<C>::decode_from_slice(&payload_bytes)?,
+                ))
+            }
+        }
+    }
 }
 
 // --- Entry ---
@@ -683,6 +705,29 @@ where
             log_id: openraft::LogId::<C>::decode(reader)?,
             payload: openraft::EntryPayload::<C>::decode(reader)?,
         })
+    }
+
+    fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, CodecError> {
+        // Entry layout: [term:8][node_id:8][index:8][payload_tag:1][payload...]
+        if data.len() < 25 {
+            return Err(CodecError::BufferTooSmall {
+                needed: 25,
+                have: data.len(),
+            });
+        }
+        let term = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let node_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let index = u64::from_le_bytes(data[16..24].try_into().unwrap());
+
+        let log_id = openraft::LogId::<C> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
+            index,
+        };
+
+        let payload_bytes = data.slice(24..);
+        let payload = openraft::EntryPayload::<C>::decode_from_bytes(payload_bytes)?;
+
+        Ok(Self { log_id, payload })
     }
 }
 

@@ -117,16 +117,28 @@ async fn test_snapshot_install_with_segment_sync() {
         &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
         1,
         1000,
+        None,
     );
     leader_engine.apply_command(
         &MqCommand::publish(1, &[make_msg(b"msg1"), make_msg(b"msg2")]),
         2,
         1001,
+        None,
     );
     leader_engine.apply_command(
-        &MqCommand::create_queue("tasks", &bisque_mq::config::QueueConfig::default()),
+        &MqCommand::create_queue(
+            "tasks",
+            AckVariantConfig::default(),
+            RetentionPolicy::default(),
+            None,
+            false,
+            None,
+            false,
+            None,
+        ),
         3,
         1002,
+        None,
     );
 
     // Create leader state machine with group_dir and sync_addr
@@ -145,8 +157,8 @@ async fn test_snapshot_install_with_segment_sync() {
 
     assert_eq!(snap_data.file_manifest.len(), 2);
     assert_eq!(snap_data.sync_addr, Some(sync_addr.clone()));
-    assert_eq!(snap_data.topics.len(), 1);
-    assert_eq!(snap_data.queues.len(), 1);
+    assert_eq!(snap_data.topics.len(), 2); // "events" + auto-created source topic for "tasks" queue
+    assert_eq!(snap_data.consumer_groups.len(), 1);
 
     // --- Follower side: install snapshot with segment sync ---
     let follower_group_dir = follower_dir.path().to_path_buf();
@@ -175,11 +187,15 @@ async fn test_snapshot_install_with_segment_sync() {
 
     // Verify engine state was restored
     let snap = follower_sm.snapshot();
-    assert_eq!(snap.topics.len(), 1);
-    assert_eq!(snap.topics[0].meta.name, "events");
-    assert_eq!(snap.topics[0].meta.message_count, 2);
-    assert_eq!(snap.queues.len(), 1);
-    assert_eq!(snap.queues[0].meta.name, "tasks");
+    assert_eq!(snap.topics.len(), 2); // "events" + auto-created source topic for "tasks" queue
+    let events_topic = snap
+        .topics
+        .iter()
+        .find(|t| t.meta.name == "events")
+        .unwrap();
+    assert_eq!(events_topic.meta.message_count, 2);
+    assert_eq!(snap.consumer_groups.len(), 1);
+    assert_eq!(snap.consumer_groups[0].meta.name, "tasks");
 
     // Cleanup
     shutdown_tx.send(true).unwrap();
@@ -221,6 +237,7 @@ async fn test_snapshot_install_empty_manifest() {
         &MqCommand::create_topic("t", RetentionPolicy::default(), 0),
         1,
         1000,
+        None,
     );
 
     let snap_data = engine.snapshot();

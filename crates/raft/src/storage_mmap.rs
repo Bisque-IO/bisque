@@ -707,15 +707,18 @@ impl MmapSegmentMap {
 
     /// Update pins: remove segments fully below `purge_up_to` (delete files)
     /// and unpin segments fully above pin_ceiling (close but keep files).
-    fn update_pins(&self, purge_up_to: u64) -> Vec<PathBuf> {
+    /// Returns `(paths_to_delete, purged_segment_ids)`.
+    fn update_pins(&self, purge_up_to: u64) -> (Vec<PathBuf>, Vec<u64>) {
         let ceiling = self.pin_ceiling.load(Ordering::Acquire);
         let mut pinned = self.pinned.lock();
         let mut removed_paths = Vec::new();
+        let mut purged_ids = Vec::new();
 
-        pinned.retain(|_seg_id, entry| {
+        pinned.retain(|&seg_id, entry| {
             if entry.max_index <= purge_up_to {
                 // Fully purged — unpin and delete
                 removed_paths.push(entry.segment.path.clone());
+                purged_ids.push(seg_id);
                 false
             } else if ceiling > 0 && entry.min_index > ceiling {
                 // Fully above pin ceiling — unpin but keep file
@@ -725,7 +728,7 @@ impl MmapSegmentMap {
             }
         });
 
-        removed_paths
+        (removed_paths, purged_ids)
     }
 
     /// Remove pinned segments with min_index > after_index for truncation.
@@ -1590,6 +1593,10 @@ struct MmapGroupState<C: RaftTypeConfig> {
     /// Last applied index from the state machine.
     /// Segments fully above this are not needed yet. 0 = unconstrained.
     pin_ceiling: Arc<AtomicU64>,
+    /// Segment IDs that have been purged (files deleted). The state machine
+    /// drains this after each apply batch to detach any retained messages
+    /// backed by mmap'd segments that no longer exist.
+    purged_segments: Arc<Mutex<Vec<u64>>>,
     /// Optional archive manager for uploading sealed segments to remote storage.
     archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
 }
@@ -1900,6 +1907,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             fsync_state,
             purge_floor,
             pin_ceiling,
+            purged_segments: Arc::new(Mutex::new(Vec::new())),
             archive,
         })
     }
@@ -2254,6 +2262,14 @@ impl<C: RaftTypeConfig> MmapPerGroupLogStorage<C> {
             .map(|state| state.pin_ceiling.clone())
     }
 
+    /// Get the purged segments notification handle for a specific group.
+    /// Returns `None` if the group has not been initialized yet.
+    pub fn get_purged_segments(&self, group_id: u64) -> Option<Arc<Mutex<Vec<u64>>>> {
+        self.groups
+            .get(group_id)
+            .map(|state| state.purged_segments.clone())
+    }
+
     /// Get a segment prefetcher handle for a specific group.
     /// Returns `None` if the group has not been initialized yet.
     pub fn get_prefetcher(&self, group_id: u64) -> Option<SegmentPrefetcher> {
@@ -2459,6 +2475,13 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
         self.state.pin_ceiling.clone()
     }
 
+    /// Get the purged segments notification handle.
+    /// The state machine drains this after each apply batch to detach any
+    /// mmap-backed retained messages referencing purged segments.
+    pub fn purged_segments(&self) -> Arc<Mutex<Vec<u64>>> {
+        self.state.purged_segments.clone()
+    }
+
     /// Get a prefetcher handle for the state machine.
     /// The state machine calls `prefetch_next(applied_index)` after each apply
     /// batch to speculatively open the next segment before it's needed.
@@ -2472,7 +2495,7 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
     /// Decode an entry from a segment at the given location.
     fn decode_entry_from_segment(
         &self,
-        segment: &Segment,
+        segment: &Arc<Segment>,
         loc: &LogLocation,
     ) -> io::Result<Option<C::Entry>>
     where
@@ -2530,35 +2553,40 @@ impl<C: RaftTypeConfig> MmapGroupLogStorage<C> {
                 "entry payload too short",
             ));
         }
-        let term = u64::from_le_bytes(p[0..8].try_into().unwrap());
-        let node_id = u64::from_le_bytes(p[8..16].try_into().unwrap());
-        let log_index = u64::from_le_bytes(p[16..24].try_into().unwrap());
         let tag = p[24];
 
-        let log_id = openraft::LogId::<C> {
-            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
-            index: log_index,
-        };
-
-        let payload = match tag {
-            0 => openraft::EntryPayload::Blank,
+        match tag {
+            0 => {
+                // Blank: parse log_id directly, no payload data to propagate.
+                let term = u64::from_le_bytes(p[0..8].try_into().unwrap());
+                let node_id = u64::from_le_bytes(p[8..16].try_into().unwrap());
+                let log_index = u64::from_le_bytes(p[16..24].try_into().unwrap());
+                let log_id = openraft::LogId::<C> {
+                    leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
+                    index: log_index,
+                };
+                use openraft::entry::RaftEntry;
+                Ok(Some(openraft::impls::Entry::<C>::new(
+                    log_id,
+                    openraft::EntryPayload::Blank,
+                )))
+            }
             1 | 2 => {
-                // Normal or Membership: full entry decode via the codec.
-                let entry = openraft::impls::Entry::<C>::decode_from_slice(p)
+                // Normal or Membership: zero-copy decode via mmap-backed Bytes.
+                // Payload starts after the record header (HEADER_SIZE includes length prefix).
+                let payload_offset = start + HEADER_SIZE;
+                let payload_len = p.len();
+                let entry_bytes =
+                    bytes_from_segment(&Arc::clone(segment), payload_offset, payload_len);
+                let entry = openraft::impls::Entry::<C>::decode_from_bytes(entry_bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                return Ok(Some(entry));
+                Ok(Some(entry))
             }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown entry tag: {}", tag),
-                ));
-            }
-        };
-
-        use openraft::entry::RaftEntry;
-        let entry = openraft::impls::Entry::<C>::new(log_id, payload);
-        Ok(Some(entry))
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown entry tag: {}", tag),
+            )),
+        }
     }
 }
 
@@ -2948,9 +2976,18 @@ where
 
         // Purge from LogIndex and update pins (removes segments below purge index)
         self.state.log_index.purge_to(index);
-        let removed = self.state.segment_map.update_pins(index);
-        for path in &removed {
+        let (removed_paths, purged_ids) = self.state.segment_map.update_pins(index);
+        for path in &removed_paths {
             let _ = std::fs::remove_file(path);
+        }
+
+        // Notify the state machine about purged segment IDs so it can detach
+        // any mmap-backed retained messages referencing these segments.
+        if !purged_ids.is_empty() {
+            self.state
+                .purged_segments
+                .lock()
+                .extend_from_slice(&purged_ids);
         }
 
         Ok(())
@@ -2996,6 +3033,10 @@ where
 
     fn get_pin_ceiling(&self, group_id: u64) -> Option<Arc<AtomicU64>> {
         MmapPerGroupLogStorage::get_pin_ceiling(self, group_id)
+    }
+
+    fn get_purged_segments(&self, group_id: u64) -> Option<Arc<Mutex<Vec<u64>>>> {
+        MmapPerGroupLogStorage::get_purged_segments(self, group_id)
     }
 
     fn stop(&self) {

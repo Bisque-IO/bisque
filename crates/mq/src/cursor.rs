@@ -114,13 +114,14 @@ impl MqSegmentCursor {
     /// Returns `None` when the segment is exhausted.
     pub fn next_record(&mut self) -> Option<SegmentRecord> {
         // If we're in the middle of exploding a batch, yield the next sub-command.
-        // Batch format: [TAG_BATCH:1][count:4][len1:4][cmd1][len2:4][cmd2]...
+        // Batch v2: sub-commands are self-sized via their own header, padded to 8 bytes.
         if let Some(data) = &self.batch_data {
             if self.batch_remaining > 0 {
                 let off = self.batch_offset;
-                let len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
-                let cmd = MqCommand::from_bytes(data.slice(off + 4..off + 4 + len));
-                self.batch_offset = off + 4 + len;
+                let size = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+                let cmd = MqCommand::from_bytes(data.slice(off..off + size));
+                let padded = (size + 7) & !7;
+                self.batch_offset = off + padded;
                 self.batch_remaining -= 1;
                 return Some(SegmentRecord {
                     log_index: self.batch_log_index,
@@ -190,11 +191,11 @@ impl MqSegmentCursor {
 
             // Explode TAG_BATCH: store the bytes and re-enter to yield first sub-command.
             // Layout: [TAG_BATCH:1][count:4][len1:4][cmd1][len2:4][cmd2]...
-            if cmd_bytes[0] == MqCommand::TAG_BATCH && cmd_bytes.len() >= 5 {
-                let count = u32::from_le_bytes(cmd_bytes[1..5].try_into().unwrap());
+            if cmd_bytes[6] == MqCommand::TAG_BATCH && cmd_bytes.len() >= 16 {
+                let count = u32::from_le_bytes(cmd_bytes[8..12].try_into().unwrap());
                 if count > 0 {
                     self.batch_data = Some(cmd_bytes);
-                    self.batch_offset = 5; // skip tag(1) + count(4)
+                    self.batch_offset = 16; // skip header(8) + count(4) + pad(4)
                     self.batch_remaining = count;
                     self.batch_log_index = log_index;
                     // Re-enter to yield first sub-command from the batch path above.
@@ -226,8 +227,8 @@ impl MqSegmentCursor {
         loop {
             let rec = self.next_record()?;
             let cmd = &rec.command;
-            if cmd.tag() == match_tag && cmd.buf.len() >= 9 {
-                let id = u64::from_le_bytes(cmd.buf[1..9].try_into().unwrap());
+            if cmd.tag() == match_tag && cmd.buf.len() >= 16 {
+                let id = u64::from_le_bytes(cmd.buf[8..16].try_into().unwrap());
                 if id == entity_id {
                     return Some(rec);
                 }

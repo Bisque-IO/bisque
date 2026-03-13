@@ -4,6 +4,8 @@ use std::io::{self, Cursor};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use parking_lot::Mutex as ParkingMutex;
+
 use futures::StreamExt;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{EntryPayload, LogId, OptionalSend, Snapshot, SnapshotMeta, StoredMembership};
@@ -51,6 +53,9 @@ pub struct MqStateMachine {
     /// Per-segment index builders — lives outside the engine for
     /// lock-free concurrent reads during applies.
     segment_indexes: Arc<SegmentIndexMap>,
+    /// Shared with log storage — purged segment IDs are pushed here
+    /// when segments are deleted. Drained after each apply batch.
+    purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
 }
 
 impl MqStateMachine {
@@ -69,6 +74,7 @@ impl MqStateMachine {
             sync_addr: None,
             group_dir: None,
             segment_indexes: Arc::new(SegmentIndexMap::new()),
+            purged_segments: None,
         }
     }
 
@@ -79,6 +85,11 @@ impl MqStateMachine {
 
     pub fn with_pin_ceiling(mut self, ceiling: Arc<AtomicU64>) -> Self {
         self.pin_ceiling = Some(ceiling);
+        self
+    }
+
+    pub fn with_purged_segments(mut self, purged: Arc<ParkingMutex<Vec<u64>>>) -> Self {
+        self.purged_segments = Some(purged);
         self
     }
 
@@ -233,6 +244,23 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                     self.engine.restore_structural(snap);
                     self.segment_indexes.clear();
 
+                    // Populate retained messages from MDBX into exchange state.
+                    // These were persisted during segment purge sweeps.
+                    for (exchange_id, entries) in structural.retained {
+                        if let Some(mut exchange) =
+                            self.engine.metadata().exchanges.get_mut(&exchange_id)
+                        {
+                            for (key, msg_bytes) in entries {
+                                exchange.retained.insert(
+                                    key,
+                                    crate::exchange::RetainedValue::heap(bytes::Bytes::from(
+                                        msg_bytes,
+                                    )),
+                                );
+                            }
+                        }
+                    }
+
                     // Return a synthetic last_applied at structural_purge_floor
                     // so openraft replays from there.
                     let last_applied = LogId {
@@ -289,7 +317,10 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                     // Check if this is a structural command before applying
                     let structural_kind = classify_structural(&cmd);
 
-                    let response = self.engine.apply_command(&cmd, log_index, current_time);
+                    let segment_id = record_location.map(|(seg, _)| seg as u64);
+                    let response =
+                        self.engine
+                            .apply_command(&cmd, log_index, current_time, segment_id);
 
                     // Fire-and-forget structural writes to MDBX after apply
                     if let Some(ref manifest) = self.manifest {
@@ -331,6 +362,56 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
         // Update purge floor and pin ceiling
         self.update_purge_floor();
         self.update_pin_ceiling();
+
+        // Sweep retained messages referencing purged mmap segments.
+        // Detach (copy to heap) so the segment can be freed, then batch-persist
+        // the detached retained data to MDBX for fast recovery.
+        if let Some(ref purged_segments) = self.purged_segments {
+            let purged_ids: Vec<u64> = {
+                let mut guard = purged_segments.lock();
+                if guard.is_empty() {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut *guard)
+                }
+            };
+
+            if !purged_ids.is_empty() {
+                let meta = self.engine.metadata();
+                // Collect exchange IDs first to avoid holding DashMap refs across mutation
+                let exchange_ids: Vec<u64> = meta.exchanges.iter().map(|e| *e.key()).collect();
+
+                for exchange_id in exchange_ids {
+                    if let Some(mut exchange) = meta.exchanges.get_mut(&exchange_id) {
+                        let mut detached = false;
+                        for rv in exchange.retained.values_mut() {
+                            if let Some(seg_id) = rv.segment_id {
+                                if purged_ids.contains(&seg_id) {
+                                    rv.detach();
+                                    detached = true;
+                                }
+                            }
+                        }
+
+                        // Batch-persist all retained messages for this exchange
+                        if detached {
+                            if let Some(ref manifest) = self.manifest {
+                                let entries: Vec<(String, Vec<u8>)> = exchange
+                                    .retained
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.message.to_vec()))
+                                    .collect();
+                                manifest.persist_retained_fire_and_forget(
+                                    self.group_id,
+                                    exchange_id,
+                                    entries,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Drain sealed segment indexes and write .sidx files on blocking pool.
         // The current segment_id is derived from the last applied entry's record location.
@@ -567,20 +648,44 @@ enum StructuralKind {
     CreateConsumerGroup,
     DeleteConsumerGroup(u64),
     CreateSession,
+    SetRetained {
+        exchange_id: u64,
+        routing_key: String,
+        message: Vec<u8>,
+    },
+    DeleteRetained {
+        exchange_id: u64,
+        routing_key: String,
+    },
     Batch(Vec<StructuralKind>),
 }
 
 fn classify_structural(cmd: &MqCommand) -> StructuralKind {
     match cmd.tag() {
         MqCommand::TAG_CREATE_TOPIC => StructuralKind::CreateTopic,
-        MqCommand::TAG_DELETE_TOPIC => StructuralKind::DeleteTopic(cmd.field_u64(1)),
+        MqCommand::TAG_DELETE_TOPIC => StructuralKind::DeleteTopic(cmd.field_u64(8)),
         MqCommand::TAG_CREATE_EXCHANGE => StructuralKind::CreateExchange,
-        MqCommand::TAG_DELETE_EXCHANGE => StructuralKind::DeleteExchange(cmd.field_u64(1)),
+        MqCommand::TAG_DELETE_EXCHANGE => StructuralKind::DeleteExchange(cmd.field_u64(8)),
         MqCommand::TAG_CREATE_CONSUMER_GROUP => StructuralKind::CreateConsumerGroup,
         MqCommand::TAG_DELETE_CONSUMER_GROUP => {
-            StructuralKind::DeleteConsumerGroup(cmd.field_u64(1))
+            StructuralKind::DeleteConsumerGroup(cmd.field_u64(8))
         }
         MqCommand::TAG_CREATE_SESSION => StructuralKind::CreateSession,
+        MqCommand::TAG_SET_RETAINED => {
+            let v = cmd.as_set_retained();
+            StructuralKind::SetRetained {
+                exchange_id: v.exchange_id(),
+                routing_key: v.routing_key().to_owned(),
+                message: v.message().to_vec(),
+            }
+        }
+        MqCommand::TAG_DELETE_RETAINED => {
+            let v = cmd.as_delete_retained();
+            StructuralKind::DeleteRetained {
+                exchange_id: v.exchange_id(),
+                routing_key: v.routing_key().to_owned(),
+            }
+        }
         MqCommand::TAG_BATCH => {
             let batch = cmd.as_batch();
             let kinds: Vec<StructuralKind> =
@@ -642,6 +747,34 @@ fn collect_structural_writes(
                 meta.sessions
                     .get(id)
                     .map(|s| vec![StructuralWrite::CreateSession(s.snapshot_meta())])
+            } else {
+                None
+            }
+        }
+        StructuralKind::SetRetained {
+            exchange_id,
+            routing_key,
+            message,
+        } => {
+            if matches!(response, MqResponse::Ok) {
+                Some(vec![StructuralWrite::SetRetained {
+                    exchange_id,
+                    routing_key,
+                    message,
+                }])
+            } else {
+                None
+            }
+        }
+        StructuralKind::DeleteRetained {
+            exchange_id,
+            routing_key,
+        } => {
+            if matches!(response, MqResponse::Ok) {
+                Some(vec![StructuralWrite::DeleteRetained {
+                    exchange_id,
+                    routing_key,
+                }])
             } else {
                 None
             }

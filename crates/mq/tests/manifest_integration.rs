@@ -65,16 +65,28 @@ async fn test_snapshot_recovery_via_applied_state() {
         &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
         1,
         1000,
+        None,
     );
     engine.apply_command(
         &MqCommand::publish(1, &[make_msg(b"m1"), make_msg(b"m2")]),
         2,
         1001,
+        None,
     );
     engine.apply_command(
-        &MqCommand::create_queue("tasks", &bisque_mq::config::QueueConfig::default()),
+        &MqCommand::create_queue(
+            "tasks",
+            AckVariantConfig::default(),
+            RetentionPolicy::default(),
+            None,
+            false,
+            None,
+            false,
+            None,
+        ),
         3,
         1002,
+        None,
     );
 
     let snap = engine.snapshot();
@@ -99,11 +111,11 @@ async fn test_snapshot_recovery_via_applied_state() {
 
     // Verify the engine was restored with the snapshot data
     let s = sm2.snapshot();
-    assert_eq!(s.topics.len(), 1);
-    assert_eq!(s.topics[0].meta.name, "events");
-    assert_eq!(s.topics[0].meta.message_count, 2);
-    assert_eq!(s.queues.len(), 1);
-    assert_eq!(s.queues[0].meta.name, "tasks");
+    assert_eq!(s.topics.len(), 2); // "events" + auto-created source topic for "tasks" queue
+    let events_topic = s.topics.iter().find(|t| t.meta.name == "events").unwrap();
+    assert_eq!(events_topic.meta.message_count, 2);
+    assert_eq!(s.consumer_groups.len(), 1);
+    assert_eq!(s.consumer_groups[0].meta.name, "tasks");
 
     manifest.shutdown();
 }
@@ -123,11 +135,22 @@ async fn test_snapshot_install_then_recovery_via_applied_state() {
         &MqCommand::create_topic("my-topic", RetentionPolicy::default(), 0),
         1,
         1000,
+        None,
     );
     engine.apply_command(
-        &MqCommand::create_queue("my-queue", &bisque_mq::config::QueueConfig::default()),
+        &MqCommand::create_queue(
+            "my-queue",
+            AckVariantConfig::default(),
+            RetentionPolicy::default(),
+            None,
+            false,
+            None,
+            false,
+            None,
+        ),
         2,
         1001,
+        None,
     );
 
     // Install snapshot via state machine (this writes to manifest)
@@ -156,10 +179,10 @@ async fn test_snapshot_install_then_recovery_via_applied_state() {
 
     // Verify the engine has the restored entities
     let s = sm2.snapshot();
-    assert_eq!(s.topics.len(), 1);
-    assert_eq!(s.topics[0].meta.name, "my-topic");
-    assert_eq!(s.queues.len(), 1);
-    assert_eq!(s.queues[0].meta.name, "my-queue");
+    assert_eq!(s.topics.len(), 2); // "my-topic" + auto-created source topic for "my-queue"
+    assert!(s.topics.iter().any(|t| t.meta.name == "my-topic"));
+    assert_eq!(s.consumer_groups.len(), 1);
+    assert_eq!(s.consumer_groups[0].meta.name, "my-queue");
 
     manifest.shutdown();
 }
@@ -194,6 +217,7 @@ async fn test_snapshot_overwrites_structural_on_restart() {
         &MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
         1,
         1000,
+        None,
     );
     let snap1_bytes =
         bincode::serde::encode_to_vec(&engine1.snapshot(), bincode::config::standard()).unwrap();
@@ -207,9 +231,19 @@ async fn test_snapshot_overwrites_structural_on_restart() {
     // Second: install snapshot with queue "q1" (no topics)
     let mut engine2 = make_engine();
     engine2.apply_command(
-        &MqCommand::create_queue("q1", &bisque_mq::config::QueueConfig::default()),
+        &MqCommand::create_queue(
+            "q1",
+            AckVariantConfig::default(),
+            RetentionPolicy::default(),
+            None,
+            false,
+            None,
+            false,
+            None,
+        ),
         1,
         1000,
+        None,
     );
     let snap2_bytes =
         bincode::serde::encode_to_vec(&engine2.snapshot(), bincode::config::standard()).unwrap();
@@ -226,9 +260,13 @@ async fn test_snapshot_overwrites_structural_on_restart() {
     assert_eq!(la.unwrap().index, 5);
 
     let s = sm3.snapshot();
-    assert_eq!(s.topics.len(), 0, "snap-2 has no topics");
-    assert_eq!(s.queues.len(), 1);
-    assert_eq!(s.queues[0].meta.name, "q1");
+    assert_eq!(
+        s.topics.len(),
+        1,
+        "snap-2 has auto-created source topic for q1"
+    );
+    assert_eq!(s.consumer_groups.len(), 1);
+    assert_eq!(s.consumer_groups[0].meta.name, "q1");
 
     manifest.shutdown();
 }
@@ -250,11 +288,22 @@ async fn test_get_current_snapshot_after_install() {
         &MqCommand::create_topic("live-topic", RetentionPolicy::default(), 0),
         1,
         1000,
+        None,
     );
     engine.apply_command(
-        &MqCommand::create_queue("live-queue", &bisque_mq::config::QueueConfig::default()),
+        &MqCommand::create_queue(
+            "live-queue",
+            AckVariantConfig::default(),
+            RetentionPolicy::default(),
+            None,
+            false,
+            None,
+            false,
+            None,
+        ),
         2,
         1001,
+        None,
     );
 
     let snap_bytes =
@@ -275,10 +324,10 @@ async fn test_get_current_snapshot_after_install() {
     let data = current.snapshot.into_inner();
     let (snap, _): (MqSnapshotData, _) =
         bincode::serde::decode_from_slice(&data, bincode::config::standard()).unwrap();
-    assert_eq!(snap.topics.len(), 1);
-    assert_eq!(snap.topics[0].meta.name, "live-topic");
-    assert_eq!(snap.queues.len(), 1);
-    assert_eq!(snap.queues[0].meta.name, "live-queue");
+    assert_eq!(snap.topics.len(), 2); // "live-topic" + auto-created source topic for "live-queue"
+    assert!(snap.topics.iter().any(|t| t.meta.name == "live-topic"));
+    assert_eq!(snap.consumer_groups.len(), 1);
+    assert_eq!(snap.consumer_groups[0].meta.name, "live-queue");
 }
 
 /// Passing invalid bytes to `install_snapshot()` returns InvalidData error.
@@ -323,8 +372,9 @@ async fn test_install_snapshot_persists_to_manifest() {
         &MqCommand::create_topic("persisted", RetentionPolicy::default(), 0),
         1,
         1000,
+        None,
     );
-    engine.apply_command(&MqCommand::publish(1, &[make_msg(b"x")]), 2, 1001);
+    engine.apply_command(&MqCommand::publish(1, &[make_msg(b"x")]), 2, 1001, None);
 
     let snap_bytes =
         bincode::serde::encode_to_vec(&engine.snapshot(), bincode::config::standard()).unwrap();
@@ -363,8 +413,14 @@ async fn test_snapshot_builder_to_install_to_recovery_roundtrip() {
         &MqCommand::create_topic("rt-topic", RetentionPolicy::default(), 0),
         1,
         1000,
+        None,
     );
-    leader_engine.apply_command(&MqCommand::publish(1, &[make_msg(b"payload")]), 2, 1001);
+    leader_engine.apply_command(
+        &MqCommand::publish(1, &[make_msg(b"payload")]),
+        2,
+        1001,
+        None,
+    );
 
     let mut leader_sm = MqStateMachine::new(leader_engine);
     // Manually set last_applied so get_snapshot_builder works

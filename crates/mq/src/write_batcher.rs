@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use bytes::Bytes;
 use openraft::Raft;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -167,7 +166,7 @@ impl MqWriteBatcher {
             while let Ok(req) = rx.recv().await {
                 let resp = {
                     let mut eng = engine.lock();
-                    eng.apply_command(&req.command, log_index, log_index * 1000)
+                    eng.apply_command(&req.command, log_index, log_index * 1000, None)
                 };
                 log_index += 1;
                 let _ = req.response_tx.send(resp);
@@ -227,31 +226,27 @@ fn merge_pending(
     pending: &mut Vec<BatchedRequest>,
     publish_idx: &mut HashMap<u64, usize>,
 ) -> (Vec<MqCommand>, Vec<ResponseSlot>) {
-    let mut commands = Vec::with_capacity(pending.len());
+    let mut commands: Vec<MqCommand> = Vec::with_capacity(pending.len());
     let mut slots = Vec::with_capacity(pending.len());
 
     publish_idx.clear();
 
-    for req in pending.drain(..) {
+    for mut req in pending.drain(..) {
         match req.command.tag() {
             MqCommand::TAG_PUBLISH => {
-                let v = req.command.as_publish();
-                let topic_id = v.topic_id();
+                let topic_id = req.command.as_publish().topic_id();
+                let msg_count = req.command.as_publish().message_count() as usize;
                 if let Some(&idx) = publish_idx.get(&topic_id) {
-                    // Merge: collect all messages from the existing command and
-                    // the new one, then re-encode a single publish.
-                    let msg_count = v.message_count() as usize;
-                    let existing: &MqCommand = &commands[idx];
-                    let ex_v = existing.as_publish();
-                    let mut all_msgs: Vec<Bytes> = ex_v.messages().collect();
-                    all_msgs.extend(v.messages());
-                    commands[idx] = MqCommand::publish(topic_id, &all_msgs);
+                    // Merge: combine payload segments from both commands
+                    // into a single scatter publish (zero-copy).
+                    let mut all_msgs = commands[idx].take_publish_segments();
+                    all_msgs.extend(req.command.take_publish_segments());
+                    commands[idx] = MqCommand::publish_scatter(topic_id, all_msgs);
                     if let ResponseSlot::MergedPublish(ref mut callers) = slots[idx] {
                         callers.push((req.response_tx, msg_count));
                     }
                 } else {
                     let idx = commands.len();
-                    let msg_count = v.message_count() as usize;
                     publish_idx.insert(topic_id, idx);
                     commands.push(req.command);
                     slots.push(ResponseSlot::MergedPublish(vec![(

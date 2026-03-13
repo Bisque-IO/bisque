@@ -72,6 +72,7 @@ impl MqEngine {
         cmd: &MqCommand,
         log_index: u64,
         current_time: u64,
+        segment_id: Option<u64>,
     ) -> MqResponse {
         self.m_apply_count.increment(1);
         let md = &self.metadata;
@@ -82,8 +83,8 @@ impl MqEngine {
             // =================================================================
             MqCommand::TAG_CREATE_TOPIC => {
                 let v = cmd.as_create_topic();
-                let name = v.name().to_owned();
-                let name_h = name_hash(&name);
+                let name_str = v.name();
+                let name_h = name_hash(name_str);
                 if let Some(r) = md.topic_names.get(&name_h) {
                     return MqResponse::Error(MqError::AlreadyExists {
                         entity: EntityKind::Topic,
@@ -91,6 +92,7 @@ impl MqEngine {
                     });
                 }
                 let topic_id = md.alloc_id();
+                let name = name_str.to_owned();
                 let mut meta = TopicMeta::new(topic_id, name, current_time, v.retention());
                 meta.partition_count = v.partition_count();
                 // Extended fields: lifetime, retained, dedup, cron are parsed
@@ -107,7 +109,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DELETE_TOPIC => {
-                let topic_id = cmd.field_u64(1);
+                let topic_id = cmd.field_u64(8);
                 if let Some((_, state)) = md.topics.remove(&topic_id) {
                     md.topic_names.remove(&state.meta.name_hash);
                     if state.message_count() > 0 {
@@ -127,9 +129,28 @@ impl MqEngine {
                 let topic_id = v.topic_id();
                 let count = v.message_count() as u64;
                 if let Some(topic) = md.topics.get(&topic_id) {
-                    let base_offset = topic.apply_publish(log_index, v.messages());
-                    self.on_message_added(log_index);
-                    MqResponse::Published { base_offset, count }
+                    if topic.consumer_group_ids.is_empty() {
+                        // Fast path: no attached groups, skip collect + enqueue
+                        let base_offset = topic.apply_publish(log_index, v.messages());
+                        drop(topic);
+                        self.on_message_added(log_index);
+                        MqResponse::Published { base_offset, count }
+                    } else {
+                        let messages: SmallVec<[Bytes; 16]> = v.messages().collect();
+                        let base_offset = topic.apply_publish(log_index, messages.iter().cloned());
+                        let group_ids: SmallVec<[u64; 4]> =
+                            topic.consumer_group_ids.iter().map(|e| *e.key()).collect();
+                        drop(topic);
+                        Self::auto_enqueue_attached_groups(
+                            md,
+                            &group_ids,
+                            &messages,
+                            log_index,
+                            current_time,
+                        );
+                        self.on_message_added(log_index);
+                        MqResponse::Published { base_offset, count }
+                    }
                 } else {
                     MqResponse::Error(MqError::NotFound {
                         entity: EntityKind::Topic,
@@ -140,9 +161,9 @@ impl MqEngine {
 
             MqCommand::TAG_COMMIT_OFFSET => {
                 // Wire: [tag:1][topic_id:8][consumer_id:8][offset:8]
-                let topic_id = cmd.field_u64(1);
-                let consumer_id = cmd.field_u64(9);
-                let offset = cmd.field_u64(17);
+                let topic_id = cmd.field_u64(8);
+                let consumer_id = cmd.field_u64(16);
+                let offset = cmd.field_u64(24);
                 if let Some(topic) = md.topics.get(&topic_id) {
                     topic.apply_commit_offset(consumer_id, offset);
                     md.purge_floor_dirty.store(true, Ordering::Relaxed);
@@ -157,8 +178,8 @@ impl MqEngine {
 
             MqCommand::TAG_PURGE_TOPIC => {
                 // Wire: [tag:1][topic_id:8][before_index:8]
-                let topic_id = cmd.field_u64(1);
-                let before_index = cmd.field_u64(9);
+                let topic_id = cmd.field_u64(8);
+                let before_index = cmd.field_u64(16);
                 if let Some(topic) = md.topics.get(&topic_id) {
                     topic.apply_purge(before_index);
                     self.mark_purge_floor_dirty();
@@ -174,10 +195,55 @@ impl MqEngine {
             MqCommand::TAG_SET_RETAINED => {
                 let v = cmd.as_set_retained();
                 let exchange_id = v.exchange_id();
-                let routing_key = v.routing_key().to_owned();
-                let message = v.message();
                 if let Some(mut exchange) = md.exchanges.get_mut(&exchange_id) {
-                    exchange.retained.insert(routing_key, message);
+                    let routing_key = v.routing_key().to_owned();
+                    let message = v.message();
+                    let retained = match segment_id {
+                        Some(seg_id) => RetainedValue::mmap_backed(seg_id, message),
+                        None => RetainedValue::heap(message),
+                    };
+                    exchange.retained.insert(routing_key, retained);
+                    MqResponse::Ok
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Exchange,
+                        id: exchange_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_GET_RETAINED => {
+                let v = cmd.as_get_retained();
+                let exchange_id = v.exchange_id();
+                let filter = v.routing_key_filter();
+                if let Some(exchange) = md.exchanges.get(&exchange_id) {
+                    let messages: Vec<RetainedEntry> = exchange
+                        .retained
+                        .iter()
+                        .filter(|(key, _)| match &filter {
+                            Some(pattern) => crate::exchange::topic_pattern_matches(pattern, key),
+                            None => true,
+                        })
+                        .map(|(key, rv)| RetainedEntry {
+                            routing_key: Bytes::from(key.clone()),
+                            message: rv.message.clone(),
+                        })
+                        .collect();
+                    MqResponse::RetainedMessages { messages }
+                } else {
+                    MqResponse::Error(MqError::NotFound {
+                        entity: EntityKind::Exchange,
+                        id: exchange_id,
+                    })
+                }
+            }
+
+            MqCommand::TAG_DELETE_RETAINED => {
+                let v = cmd.as_delete_retained();
+                let exchange_id = v.exchange_id();
+                if let Some(mut exchange) = md.exchanges.get_mut(&exchange_id) {
+                    let routing_key = v.routing_key();
+                    exchange.retained.remove(routing_key);
                     MqResponse::Ok
                 } else {
                     MqResponse::Error(MqError::NotFound {
@@ -192,9 +258,9 @@ impl MqEngine {
             // =================================================================
             MqCommand::TAG_CREATE_EXCHANGE => {
                 let v = cmd.as_create_exchange();
-                let name = v.name().to_owned();
+                let name_str = v.name();
                 let exchange_type = v.exchange_type();
-                let name_h = name_hash(&name);
+                let name_h = name_hash(name_str);
                 if let Some(r) = md.exchange_names.get(&name_h) {
                     return MqResponse::Error(MqError::AlreadyExists {
                         entity: EntityKind::Exchange,
@@ -202,6 +268,7 @@ impl MqEngine {
                     });
                 }
                 let id = md.alloc_id();
+                let name = name_str.to_owned();
                 let meta = ExchangeMeta::new(id, name, current_time, exchange_type);
                 md.exchanges.insert(id, ExchangeState::new(meta));
                 md.exchange_names.insert(name_h, id);
@@ -210,7 +277,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DELETE_EXCHANGE => {
-                let exchange_id = cmd.field_u64(1);
+                let exchange_id = cmd.field_u64(8);
                 if let Some((_, state)) = md.exchanges.remove(&exchange_id) {
                     md.exchange_names.remove(&state.meta.name_hash);
                     // Clean up binding reverse index
@@ -267,7 +334,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DELETE_BINDING => {
-                let binding_id = cmd.field_u64(1);
+                let binding_id = cmd.field_u64(8);
                 if let Some((_, exchange_id)) = md.binding_index.remove(&binding_id) {
                     if let Some(mut exchange) = md.exchanges.get_mut(&exchange_id) {
                         exchange.remove_binding(binding_id);
@@ -284,29 +351,66 @@ impl MqEngine {
             MqCommand::TAG_PUBLISH_TO_EXCHANGE => {
                 let v = cmd.as_publish_to_exchange();
                 let exchange_id = v.exchange_id();
-                let messages: SmallVec<[Bytes; 16]> = v.messages().collect();
 
-                let targets = if let Some(exchange) = md.exchanges.get(&exchange_id) {
-                    // Extract routing key from first flat message
-                    let routing_key_bytes = messages.first().and_then(|m| {
-                        crate::flat::FlatMessage::new(m.clone()).and_then(|f| f.routing_key())
-                    });
-                    let routing_key_str = routing_key_bytes
-                        .as_ref()
-                        .and_then(|b| std::str::from_utf8(b).ok());
-                    exchange.route(routing_key_str)
-                } else {
-                    return MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Exchange,
-                        id: exchange_id,
-                    });
+                let exchange = match md.exchanges.get(&exchange_id) {
+                    Some(e) => e,
+                    None => {
+                        return MqResponse::Error(MqError::NotFound {
+                            entity: EntityKind::Exchange,
+                            id: exchange_id,
+                        });
+                    }
                 };
+
+                let messages: SmallVec<[Bytes; 16]> = v.messages().collect();
+                let routing_key_bytes = messages.first().and_then(|m| {
+                    crate::flat::FlatMessage::new(m.clone()).and_then(|f| f.routing_key())
+                });
+                let routing_key_str = routing_key_bytes
+                    .as_ref()
+                    .and_then(|b| std::str::from_utf8(b).ok());
+                let targets = exchange.route(routing_key_str);
+                drop(exchange);
 
                 let mut total_count = 0u64;
                 for &target_id in &targets {
                     if let Some(topic) = md.topics.get(&target_id) {
                         topic.apply_publish(log_index, messages.iter().cloned());
                         total_count += messages.len() as u64;
+                        if !topic.consumer_group_ids.is_empty() {
+                            let group_ids: SmallVec<[u64; 4]> =
+                                topic.consumer_group_ids.iter().map(|e| *e.key()).collect();
+                            drop(topic);
+                            Self::auto_enqueue_attached_groups(
+                                md,
+                                &group_ids,
+                                &messages,
+                                log_index,
+                                current_time,
+                            );
+                        }
+                    } else if let Some(group) = md.consumer_groups.get(&target_id) {
+                        // Target is a consumer group — publish to its source topic
+                        // and enqueue into its ack state
+                        let src = group.meta.source_topic_id;
+                        let group_id = target_id;
+                        if src != 0 {
+                            if let Some(topic) = md.topics.get(&src) {
+                                topic.apply_publish(log_index, messages.iter().cloned());
+                                total_count += messages.len() as u64;
+                            }
+                        }
+                        if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
+                            ack.apply_enqueue(
+                                config,
+                                group_id,
+                                log_index,
+                                &messages,
+                                &[],
+                                current_time,
+                            );
+                            md.group_notifier.notify(group_id);
+                        }
                     }
                 }
                 if total_count > 0 {
@@ -323,8 +427,8 @@ impl MqEngine {
             // =================================================================
             MqCommand::TAG_CREATE_CONSUMER_GROUP => {
                 let v = cmd.as_create_consumer_group();
-                let name = v.name().to_owned();
-                let name_h = name_hash(&name);
+                let name_str = v.name();
+                let name_h = name_hash(name_str);
 
                 // Check for name collision with existing groups
                 if md.consumer_group_names.contains_key(&name_h) {
@@ -333,6 +437,7 @@ impl MqEngine {
                         id: 0,
                     });
                 }
+                let name = name_str.to_owned();
 
                 let group_id = md.alloc_id();
                 let auto_offset_reset = match v.auto_offset_reset() {
@@ -438,7 +543,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DELETE_CONSUMER_GROUP => {
-                let group_id = cmd.field_u64(1);
+                let group_id = cmd.field_u64(8);
                 if let Some((_, group)) = md.consumer_groups.remove(&group_id) {
                     md.consumer_group_names.remove(&group.meta.name_hash);
                     let source = group.meta.source_topic_id;
@@ -685,7 +790,7 @@ impl MqEngine {
                         topic_id: v.topic_id(),
                         partition_index: v.partition_index(),
                         committed_offset: v.offset(),
-                        metadata: v.metadata().map(|s| s.to_string()),
+                        metadata: v.metadata_bytes(),
                         committed_at: v.timestamp(),
                     },
                 );
@@ -697,7 +802,7 @@ impl MqEngine {
 
             MqCommand::TAG_EXPIRE_GROUP_SESSIONS => {
                 // Wire: [tag:1][now_ms:8]
-                let now_ms = cmd.field_u64(1);
+                let now_ms = cmd.field_u64(8);
 
                 for entry in md.consumer_groups.iter() {
                     let group = entry.value();
@@ -729,9 +834,9 @@ impl MqEngine {
             // =================================================================
             MqCommand::TAG_GROUP_DELIVER => {
                 // Wire: [tag:1][group_id:8][consumer_id:8][max_count:4]
-                let group_id = cmd.field_u64(1);
-                let consumer_id = cmd.field_u64(9);
-                let max_count = cmd.field_u32(17);
+                let group_id = cmd.field_u64(8);
+                let consumer_id = cmd.field_u64(16);
+                let max_count = cmd.field_u32(24);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
@@ -768,12 +873,9 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_ACK => {
-                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
-                let group_id = cmd.field_u64(1);
-                let message_ids = {
-                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
-                    crate::codec::decode_cmd_vec_u64(&mut cursor)
-                };
+                // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64, @24 response:opt_flex8
+                let group_id = cmd.field_u64(8);
+                let message_ids = cmd.field_vec_u64(16);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -814,12 +916,9 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_NACK => {
-                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
-                let group_id = cmd.field_u64(1);
-                let message_ids = {
-                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
-                    crate::codec::decode_cmd_vec_u64(&mut cursor)
-                };
+                // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
+                let group_id = cmd.field_u64(8);
+                let message_ids = cmd.field_vec_u64(16);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -831,12 +930,9 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_RELEASE => {
-                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
-                let group_id = cmd.field_u64(1);
-                let message_ids = {
-                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
-                    crate::codec::decode_cmd_vec_u64(&mut cursor)
-                };
+                // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
+                let group_id = cmd.field_u64(8);
+                let message_ids = cmd.field_vec_u64(16);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -848,13 +944,9 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_MODIFY => {
-                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
-                // Modify = release with re-delivery semantics (return to pending, keep attempts)
-                let group_id = cmd.field_u64(1);
-                let message_ids = {
-                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
-                    crate::codec::decode_cmd_vec_u64(&mut cursor)
-                };
+                // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
+                let group_id = cmd.field_u64(8);
+                let message_ids = cmd.field_vec_u64(16);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -867,14 +959,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_EXTEND_VISIBILITY => {
-                // Wire: [tag:1][group_id:8][vec_u64(message_ids)][extension_ms:8]
-                let group_id = cmd.field_u64(1);
-                // Parse message_ids and extension_ms from the buffer
-                let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
-                let message_ids = crate::codec::decode_cmd_vec_u64(&mut cursor);
-                let pos = cursor.position() as usize;
-                let ext_offset = 9 + pos;
-                let extension_ms = cmd.field_u64(ext_offset);
+                // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64, @24 extension_ms:u64
+                let group_id = cmd.field_u64(8);
+                let message_ids = cmd.field_vec_u64(16);
+                let extension_ms = cmd.field_u64(24);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -885,12 +973,9 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_TIMEOUT_EXPIRED => {
-                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
-                let group_id = cmd.field_u64(1);
-                let message_ids = {
-                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
-                    crate::codec::decode_cmd_vec_u64(&mut cursor)
-                };
+                // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
+                let group_id = cmd.field_u64(8);
+                let message_ids = cmd.field_vec_u64(16);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
@@ -933,12 +1018,9 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_EXPIRE_PENDING => {
-                // Wire: [tag:1][group_id:8][vec_u64(message_ids)]
-                let group_id = cmd.field_u64(1);
-                let message_ids = {
-                    let mut cursor = std::io::Cursor::new(&cmd.as_bytes()[9..]);
-                    crate::codec::decode_cmd_vec_u64(&mut cursor)
-                };
+                // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
+                let group_id = cmd.field_u64(8);
+                let message_ids = cmd.field_vec_u64(16);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -951,7 +1033,7 @@ impl MqEngine {
 
             MqCommand::TAG_GROUP_PURGE => {
                 // Wire: [tag:1][group_id:8]
-                let group_id = cmd.field_u64(1);
+                let group_id = cmd.field_u64(8);
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(ack) = group.ack_state() {
                         if ack.purge() {
@@ -964,7 +1046,7 @@ impl MqEngine {
 
             MqCommand::TAG_GROUP_GET_ATTRIBUTES => {
                 // Wire: [tag:1][group_id:8]
-                let group_id = cmd.field_u64(1);
+                let group_id = cmd.field_u64(8);
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     let variant = group.meta.variant;
                     let (pending, in_flight, dlq, actors) = match &group.variant_state {
@@ -997,18 +1079,13 @@ impl MqEngine {
             // Actor Variant (30-35)
             // =================================================================
             MqCommand::TAG_GROUP_DELIVER_ACTOR => {
-                // Wire: [tag:1][group_id:8][consumer_id:8][count:4][actor_id_1:len_prefixed]...
-                let group_id = cmd.field_u64(1);
-                let consumer_id = cmd.field_u64(9);
-                let actor_count = cmd.field_u32(17) as usize;
-                let mut offset = 21;
+                // Wire v2: @8 group_id:u64, @16 consumer_id:u64, @24 actor_ids:vec_bytes
+                let group_id = cmd.field_u64(8);
+                let consumer_id = cmd.field_u64(16);
+                let actor_count = cmd.field_vec_bytes_count(24) as usize;
                 let mut actor_ids: SmallVec<[Bytes; 8]> = SmallVec::with_capacity(actor_count);
-                for _ in 0..actor_count {
-                    let len = cmd.field_u32(offset) as usize;
-                    offset += 4;
-                    let id = cmd.buf.slice(offset..offset + len);
-                    offset += len;
-                    actor_ids.push(id);
+                for i in 0..actor_count {
+                    actor_ids.push(cmd.field_vec_bytes_get_bytes(24, i));
                 }
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
@@ -1039,11 +1116,11 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_ACK_ACTOR => {
-                // Wire: [tag:1][group_id:8][actor_id:len_prefixed][message_id:8]
-                let group_id = cmd.field_u64(1);
-                let actor_id_len = cmd.field_u32(9) as usize;
-                let actor_id = cmd.buf.slice(13..13 + actor_id_len);
-                let message_id = cmd.field_u64(13 + actor_id_len);
+                // Wire v2: @8 group_id:u64, @16 message_id:u64, @24 actor_id:flex8
+                let group_id = cmd.field_u64(8);
+                let message_id = cmd.field_u64(16);
+                let actor_id_data = cmd.field_flex8(24);
+                let actor_id = Bytes::copy_from_slice(actor_id_data);
 
                 self.on_message_removed(message_id);
 
@@ -1068,11 +1145,11 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_NACK_ACTOR => {
-                // Wire: [tag:1][group_id:8][actor_id:len_prefixed][message_id:8]
-                let group_id = cmd.field_u64(1);
-                let actor_id_len = cmd.field_u32(9) as usize;
-                let actor_id = cmd.buf.slice(13..13 + actor_id_len);
-                let message_id = cmd.field_u64(13 + actor_id_len);
+                // Wire v2: @8 group_id:u64, @16 message_id:u64, @24 actor_id:flex8
+                let group_id = cmd.field_u64(8);
+                let message_id = cmd.field_u64(16);
+                let actor_id_data = cmd.field_flex8(24);
+                let actor_id = Bytes::copy_from_slice(actor_id_data);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(actor_state) = group.actor_state() {
@@ -1083,18 +1160,13 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_ASSIGN_ACTORS => {
-                // Wire: [tag:1][group_id:8][consumer_id:8][count:4][actor_ids...]
-                let group_id = cmd.field_u64(1);
-                let consumer_id = cmd.field_u64(9);
-                let count = cmd.field_u32(17) as usize;
-                let mut offset = 21;
+                // Wire v2: @8 group_id:u64, @16 consumer_id:u64, @24 actor_ids:vec_bytes
+                let group_id = cmd.field_u64(8);
+                let consumer_id = cmd.field_u64(16);
+                let count = cmd.field_vec_bytes_count(24) as usize;
                 let mut actor_ids: Vec<Bytes> = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let len = cmd.field_u32(offset) as usize;
-                    offset += 4;
-                    let id = cmd.buf.slice(offset..offset + len);
-                    offset += len;
-                    actor_ids.push(id);
+                for i in 0..count {
+                    actor_ids.push(cmd.field_vec_bytes_get_bytes(24, i));
                 }
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
@@ -1108,8 +1180,8 @@ impl MqEngine {
 
             MqCommand::TAG_GROUP_RELEASE_ACTORS => {
                 // Wire: [tag:1][group_id:8][consumer_id:8]
-                let group_id = cmd.field_u64(1);
-                let consumer_id = cmd.field_u64(9);
+                let group_id = cmd.field_u64(8);
+                let consumer_id = cmd.field_u64(16);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(actor_state) = group.actor_state() {
@@ -1121,8 +1193,8 @@ impl MqEngine {
 
             MqCommand::TAG_GROUP_EVICT_IDLE => {
                 // Wire: [tag:1][group_id:8][before_timestamp:8]
-                let group_id = cmd.field_u64(1);
-                let before_timestamp = cmd.field_u64(9);
+                let group_id = cmd.field_u64(8);
+                let before_timestamp = cmd.field_u64(16);
 
                 if let Some(group) = md.consumer_groups.get(&group_id) {
                     if let Some(actor_state) = group.actor_state() {
@@ -1138,7 +1210,7 @@ impl MqEngine {
             // =================================================================
             MqCommand::TAG_CRON_ENABLE => {
                 // Wire: [tag:1][topic_id:8]
-                let topic_id = cmd.field_u64(1);
+                let topic_id = cmd.field_u64(8);
                 if let Some(topic) = md.topics.get(&topic_id) {
                     topic.cron_enabled.store(true, Ordering::Relaxed);
                     MqResponse::Ok
@@ -1152,7 +1224,7 @@ impl MqEngine {
 
             MqCommand::TAG_CRON_DISABLE => {
                 // Wire: [tag:1][topic_id:8]
-                let topic_id = cmd.field_u64(1);
+                let topic_id = cmd.field_u64(8);
                 if let Some(topic) = md.topics.get(&topic_id) {
                     topic.cron_enabled.store(false, Ordering::Relaxed);
                     MqResponse::Ok
@@ -1166,8 +1238,8 @@ impl MqEngine {
 
             MqCommand::TAG_CRON_TRIGGER => {
                 // Wire: [tag:1][topic_id:8][triggered_at:8]
-                let topic_id = cmd.field_u64(1);
-                let triggered_at = cmd.field_u64(9);
+                let topic_id = cmd.field_u64(8);
+                let triggered_at = cmd.field_u64(16);
                 if let Some(topic) = md.topics.get(&topic_id) {
                     // Publish a trigger message
                     let payload = topic
@@ -1191,7 +1263,7 @@ impl MqEngine {
             MqCommand::TAG_CRON_UPDATE => {
                 // Wire: [tag:1][topic_id:8] + trailing cron config fields
                 // For now, just acknowledge — full cron config update requires codec extension
-                let topic_id = cmd.field_u64(1);
+                let topic_id = cmd.field_u64(8);
                 if md.topics.contains_key(&topic_id) {
                     MqResponse::Ok
                 } else {
@@ -1206,15 +1278,11 @@ impl MqEngine {
             // Sessions (40-48)
             // =================================================================
             MqCommand::TAG_CREATE_SESSION => {
-                // Wire: [tag:1][session_id:8][client_id:len_prefixed][keep_alive_ms:8][session_expiry_ms:8]
-                let session_id = cmd.field_u64(1);
-                let client_id_len = cmd.field_u32(9) as usize;
-                let client_id = std::str::from_utf8(&cmd.as_bytes()[13..13 + client_id_len])
-                    .unwrap_or("")
-                    .to_string();
-                let keep_alive_offset = 13 + client_id_len;
-                let keep_alive_ms = cmd.field_u64(keep_alive_offset);
-                let session_expiry_ms = cmd.field_u64(keep_alive_offset + 8);
+                // Wire v2: @8 session_id:u64, @16 keep_alive_ms:u64, @24 session_expiry_ms:u64, @32 client_id:flex8
+                let session_id = cmd.field_u64(8);
+                let client_id = cmd.field_flex8_str(32).to_string();
+                let keep_alive_ms = cmd.field_u64(16);
+                let session_expiry_ms = cmd.field_u64(24);
 
                 let client_id_hash = name_hash(&client_id);
 
@@ -1247,15 +1315,15 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DISCONNECT_SESSION => {
-                // Wire: [tag:1][session_id:8][publish_will:1]
-                let session_id = cmd.field_u64(1);
-                let publish_will = cmd.as_bytes().get(9).copied().unwrap_or(0) != 0;
+                // Wire v2: flags=publish_will, @8 session_id:u64
+                let session_id = cmd.field_u64(8);
+                let publish_will = cmd.flags() != 0;
                 self.disconnect_session_internal(session_id, publish_will, log_index, current_time)
             }
 
             MqCommand::TAG_HEARTBEAT_SESSION => {
                 // Wire: [tag:1][session_id:8]
-                let session_id = cmd.field_u64(1);
+                let session_id = cmd.field_u64(8);
                 if let Some(session) = md.sessions.get(&session_id) {
                     session.heartbeat(current_time);
                     MqResponse::Ok
@@ -1290,7 +1358,7 @@ impl MqEngine {
 
             MqCommand::TAG_CLEAR_WILL => {
                 // Wire: [tag:1][session_id:8]
-                let session_id = cmd.field_u64(1);
+                let session_id = cmd.field_u64(8);
                 if let Some(session) = md.sessions.get(&session_id) {
                     session.clear_will();
                     MqResponse::Ok
@@ -1304,7 +1372,7 @@ impl MqEngine {
 
             MqCommand::TAG_FIRE_PENDING_WILLS => {
                 // Wire: [tag:1][now_ms:8]
-                let now_ms = cmd.field_u64(1);
+                let now_ms = cmd.field_u64(8);
                 let mut count = 0u32;
                 let mut to_fire: SmallVec<[(u64, PendingWill); 4]> = SmallVec::new();
 
@@ -1316,9 +1384,7 @@ impl MqEngine {
 
                 for (key, pw) in to_fire {
                     md.pending_wills.remove(&key);
-                    if let Some(topic) = md.topics.get(&pw.will.topic_id) {
-                        topic.apply_publish(log_index, std::iter::once(pw.will.payload));
-                        self.on_message_added(log_index);
+                    if self.publish_will_payload(pw.will.topic_id, pw.will.payload, log_index) {
                         count += 1;
                     }
                 }
@@ -1334,24 +1400,30 @@ impl MqEngine {
                 let session_expiry_ms = v.session_expiry_secs() as u64 * 1000;
                 let subscription_data = v.subscription_data();
 
-                // Store or update session with subscription data
-                if let Some(session) = md.sessions.get(&session_id) {
-                    // Session already exists, just update expiry
-                    drop(session);
-                } else {
-                    // Create a new session shell for persistence
-                    let meta = SessionMeta::new(
-                        session_id,
-                        client_id.clone(),
-                        current_time,
-                        0,
-                        session_expiry_ms,
-                    );
-                    md.sessions.insert(session_id, SessionState::new(meta));
+                // Remove old session for this client_id if it maps to a different session_id
+                if let Some(old_id) = md.session_client_index.get(&client_id_hash) {
+                    let old_id = *old_id;
+                    if old_id != session_id {
+                        md.sessions.remove(&old_id);
+                    }
                 }
 
+                // Preserve will from existing session if present
+                let existing_will = md.sessions.get(&session_id).and_then(|s| s.take_will());
+
+                // Create or replace session with updated persistence state
+                let mut meta = SessionMeta::new(
+                    session_id,
+                    client_id.clone(),
+                    current_time,
+                    0,
+                    session_expiry_ms,
+                );
+                meta.subscription_data = subscription_data;
+                meta.will = existing_will;
+                md.sessions.insert(session_id, SessionState::new(meta));
+
                 md.session_client_index.insert(client_id_hash, session_id);
-                let _ = subscription_data; // subscription data is embedded in the session state
                 MqResponse::Ok
             }
 
@@ -1383,7 +1455,7 @@ impl MqEngine {
                             MqResponse::SessionRestored {
                                 session_id,
                                 session_expiry_ms: expiry_ms,
-                                subscription_data: Bytes::new(), // TODO: serialize subscription state
+                                subscription_data: snap.subscription_data.clone(),
                             }
                         }
                     }
@@ -1413,22 +1485,15 @@ impl MqEngine {
             // =================================================================
             // Batch (49)
             // =================================================================
-            MqCommand::TAG_BATCH => {
-                let batch = cmd.as_batch();
-                let responses: SmallVec<[MqResponse; 8]> = batch
-                    .commands()
-                    .map(|sub| self.apply_command(&sub, log_index, current_time))
-                    .collect();
-                MqResponse::BatchResponse(Box::new(responses))
-            }
+            MqCommand::TAG_BATCH => self.apply_batch(cmd, log_index, current_time, segment_id),
 
             // =================================================================
             // Dedup (50)
             // =================================================================
             MqCommand::TAG_PRUNE_DEDUP_WINDOW => {
                 // Wire: [tag:1][topic_id:8][before_ts:8]
-                let topic_id = cmd.field_u64(1);
-                let before_ts = cmd.field_u64(9);
+                let topic_id = cmd.field_u64(8);
+                let before_ts = cmd.field_u64(16);
                 if let Some(topic) = md.topics.get(&topic_id) {
                     topic.prune_dedup(before_ts);
                 }
@@ -1449,6 +1514,275 @@ impl MqEngine {
     // =========================================================================
     // Internal helpers
     // =========================================================================
+
+    /// Process a TAG_BATCH command, detecting runs of consecutive sub-commands
+    /// that target the same entity to amortize DashMap lookups.
+    fn apply_batch(
+        &mut self,
+        cmd: &MqCommand,
+        log_index: u64,
+        current_time: u64,
+        segment_id: Option<u64>,
+    ) -> MqResponse {
+        let batch = cmd.as_batch();
+        let count = batch.count() as usize;
+        let cmds: SmallVec<[MqCommand; 16]> = batch.commands().collect();
+        let mut responses: SmallVec<[MqResponse; 8]> = SmallVec::with_capacity(count);
+
+        let mut i = 0;
+        while i < cmds.len() {
+            let tag = cmds[i].tag();
+
+            // Detect consecutive runs of same (tag, entity_id) for batch optimization.
+            // Entity ID is at @8 (offset 8..16) in v2 format.
+            let has_entity_id = cmds[i].buf.len() >= 16;
+
+            if has_entity_id && tag == MqCommand::TAG_PUBLISH {
+                let topic_id = cmds[i].field_u64(8);
+                let run_end = self.find_run_end(&cmds, i, tag, topic_id);
+
+                if run_end - i > 1 {
+                    self.apply_publish_run(
+                        &cmds[i..run_end],
+                        topic_id,
+                        log_index,
+                        current_time,
+                        &mut responses,
+                    );
+                    i = run_end;
+                    continue;
+                }
+            }
+
+            if has_entity_id
+                && matches!(
+                    tag,
+                    MqCommand::TAG_GROUP_ACK
+                        | MqCommand::TAG_GROUP_NACK
+                        | MqCommand::TAG_GROUP_RELEASE
+                )
+            {
+                let group_id = cmds[i].field_u64(8);
+                let run_end = self.find_run_end(&cmds, i, tag, group_id);
+
+                if run_end - i > 1 {
+                    self.apply_ack_variant_run(tag, &cmds[i..run_end], group_id, &mut responses);
+                    i = run_end;
+                    continue;
+                }
+            }
+
+            // Default: process single command
+            responses.push(self.apply_command(&cmds[i], log_index, current_time, segment_id));
+            i += 1;
+        }
+
+        MqResponse::BatchResponse(Box::new(responses))
+    }
+
+    /// Find the end of a consecutive run of commands with the same tag and entity_id.
+    #[inline]
+    fn find_run_end(&self, cmds: &[MqCommand], start: usize, tag: u8, entity_id: u64) -> usize {
+        let mut end = start + 1;
+        while end < cmds.len()
+            && cmds[end].tag() == tag
+            && cmds[end].buf.len() >= 16
+            && cmds[end].field_u64(8) == entity_id
+        {
+            end += 1;
+        }
+        end
+    }
+
+    /// Process a run of consecutive TAG_PUBLISH commands targeting the same topic.
+    /// Single DashMap lookup for the entire run.
+    fn apply_publish_run(
+        &mut self,
+        cmds: &[MqCommand],
+        topic_id: u64,
+        log_index: u64,
+        current_time: u64,
+        responses: &mut SmallVec<[MqResponse; 8]>,
+    ) {
+        let md = &self.metadata;
+        if let Some(topic) = md.topics.get(&topic_id) {
+            let has_groups = !topic.consumer_group_ids.is_empty();
+            if has_groups {
+                let mut all_messages: SmallVec<[SmallVec<[Bytes; 16]>; 4]> =
+                    SmallVec::with_capacity(cmds.len());
+                for sub in cmds {
+                    let v = sub.as_publish();
+                    let msgs: SmallVec<[Bytes; 16]> = v.messages().collect();
+                    let msg_count = msgs.len() as u64;
+                    let base_offset = topic.apply_publish(log_index, msgs.iter().cloned());
+                    responses.push(MqResponse::Published {
+                        base_offset,
+                        count: msg_count,
+                    });
+                    all_messages.push(msgs);
+                }
+                let group_ids: SmallVec<[u64; 4]> =
+                    topic.consumer_group_ids.iter().map(|e| *e.key()).collect();
+                drop(topic);
+                for msgs in &all_messages {
+                    Self::auto_enqueue_attached_groups(
+                        md,
+                        &group_ids,
+                        msgs,
+                        log_index,
+                        current_time,
+                    );
+                }
+            } else {
+                for sub in cmds {
+                    let v = sub.as_publish();
+                    let msg_count = v.message_count() as u64;
+                    let base_offset = topic.apply_publish(log_index, v.messages());
+                    responses.push(MqResponse::Published {
+                        base_offset,
+                        count: msg_count,
+                    });
+                }
+                drop(topic);
+            }
+            self.on_message_added(log_index);
+        } else {
+            for _ in cmds {
+                responses.push(MqResponse::Error(MqError::NotFound {
+                    entity: EntityKind::Topic,
+                    id: topic_id,
+                }));
+            }
+        }
+    }
+
+    /// Process a run of consecutive ack-variant commands (ACK/NACK/RELEASE)
+    /// targeting the same consumer group. Single DashMap lookup for the run.
+    fn apply_ack_variant_run(
+        &mut self,
+        tag: u8,
+        cmds: &[MqCommand],
+        group_id: u64,
+        responses: &mut SmallVec<[MqResponse; 8]>,
+    ) {
+        let md = &self.metadata;
+        if let Some(group) = md.consumer_groups.get(&group_id) {
+            if let Some(ack) = group.ack_state() {
+                for sub in cmds {
+                    let ids = sub.field_vec_u64(16);
+                    match tag {
+                        MqCommand::TAG_GROUP_ACK => {
+                            ack.apply_ack(&ids);
+                            if let Some(min_id) = ids.iter().copied().min() {
+                                self.on_message_removed(min_id);
+                            }
+                        }
+                        MqCommand::TAG_GROUP_NACK => {
+                            ack.apply_nack(&ids);
+                        }
+                        MqCommand::TAG_GROUP_RELEASE => {
+                            ack.apply_release(&ids);
+                        }
+                        _ => unreachable!(),
+                    }
+                    responses.push(MqResponse::Ok);
+                }
+                if tag == MqCommand::TAG_GROUP_NACK || tag == MqCommand::TAG_GROUP_RELEASE {
+                    md.group_notifier.notify(group_id);
+                }
+            } else {
+                for _ in cmds {
+                    responses.push(MqResponse::Ok);
+                }
+            }
+        } else {
+            for _ in cmds {
+                responses.push(MqResponse::Ok);
+            }
+        }
+    }
+
+    /// Enqueue messages into ack-variant consumer groups attached to a topic.
+    ///
+    /// `group_ids` should be pre-collected from `topic.consumer_group_ids` so
+    /// the topic `DashMap` ref is already released before we borrow
+    /// `md.consumer_groups`.
+    #[inline]
+    fn auto_enqueue_attached_groups(
+        md: &MqMetadata,
+        group_ids: &[u64],
+        messages: &[Bytes],
+        log_index: u64,
+        current_time: u64,
+    ) {
+        for gid in group_ids {
+            if let Some(group) = md.consumer_groups.get(gid) {
+                if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
+                    ack.apply_enqueue(config, *gid, log_index, messages, &[], current_time);
+                    md.group_notifier.notify(*gid);
+                }
+            }
+        }
+    }
+
+    /// Publish a will payload to a topic or exchange. Returns true if published.
+    fn publish_will_payload(&self, topic_id: u64, payload: Bytes, log_index: u64) -> bool {
+        let md = &self.metadata;
+        let current_time = 0; // Will messages use log_index for message_id
+        // Try direct topic first
+        if let Some(topic) = md.topics.get(&topic_id) {
+            topic.apply_publish(log_index, std::iter::once(payload));
+            self.on_message_added(log_index);
+            return true;
+        }
+        // Fall back to exchange routing
+        if let Some(exchange) = md.exchanges.get(&topic_id) {
+            let routing_key_bytes =
+                crate::flat::FlatMessage::new(payload.clone()).and_then(|f| f.routing_key());
+            let routing_key_str = routing_key_bytes
+                .as_ref()
+                .and_then(|b| std::str::from_utf8(b).ok());
+            let targets = exchange.route(routing_key_str);
+            drop(exchange);
+            let mut published = false;
+            for &target_id in &targets {
+                // Try direct topic publish
+                if md.topics.contains_key(&target_id) {
+                    if let Some(topic) = md.topics.get(&target_id) {
+                        topic.apply_publish(log_index, std::iter::once(payload.clone()));
+                        published = true;
+                    }
+                } else if let Some(group) = md.consumer_groups.get(&target_id) {
+                    // Target is a consumer group — publish to its source topic
+                    // and enqueue into its ack state if applicable
+                    let src = group.meta.source_topic_id;
+                    let group_id = target_id;
+                    if src != 0 {
+                        if let Some(topic) = md.topics.get(&src) {
+                            topic.apply_publish(log_index, std::iter::once(payload.clone()));
+                            published = true;
+                        }
+                    }
+                    // Also enqueue into ack state for ack-variant groups
+                    if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
+                        ack.apply_enqueue(
+                            config,
+                            group_id,
+                            log_index,
+                            &[payload.clone()],
+                            &[],
+                            current_time,
+                        );
+                    }
+                }
+            }
+            if published {
+                self.on_message_added(log_index);
+            }
+            return published;
+        }
+        false
+    }
 
     /// Disconnect a session, optionally publishing its will message.
     fn disconnect_session_internal(
@@ -1520,10 +1854,7 @@ impl MqEngine {
                     };
                 } else {
                     // Publish will immediately
-                    if let Some(topic) = md.topics.get(&will.topic_id) {
-                        topic.apply_publish(log_index, std::iter::once(will.payload));
-                        self.on_message_added(log_index);
-                    }
+                    self.publish_will_payload(will.topic_id, will.payload, log_index);
                 }
             }
         }
@@ -1600,9 +1931,9 @@ impl MqEngine {
                     retained: e
                         .retained
                         .iter()
-                        .map(|(rk, msg)| RetainedEntry {
+                        .map(|(rk, rv)| RetainedEntry {
                             routing_key: Bytes::from(rk.clone()),
-                            message: msg.clone(),
+                            message: rv.message.clone(),
                         })
                         .collect(),
                 }
@@ -1718,7 +2049,9 @@ impl MqEngine {
             }
             for entry in es.retained {
                 let rk = String::from_utf8(entry.routing_key.to_vec()).unwrap_or_default();
-                state.retained.insert(rk, entry.message);
+                state
+                    .retained
+                    .insert(rk, RetainedValue::heap(entry.message));
             }
             md.exchange_names.insert(hash, id);
             md.exchanges.insert(id, state);
@@ -1879,7 +2212,6 @@ impl MqEngine {
 mod tests {
     use super::*;
     use crate::flat::FlatMessageBuilder;
-    use crate::types::*;
 
     fn make_config() -> MqConfig {
         MqConfig::new("/tmp/mq-engine-test")
@@ -1904,7 +2236,7 @@ mod tests {
         let mut engine = make_engine();
 
         let cmd = MqCommand::create_topic("events", RetentionPolicy::default(), 0);
-        let resp = engine.apply_command(&cmd, 1, 1000);
+        let resp = engine.apply_command(&cmd, 1, 1000, None);
         let topic_id = match resp {
             MqResponse::EntityCreated { id } => id,
             other => panic!("expected EntityCreated, got {:?}", other),
@@ -1913,7 +2245,7 @@ mod tests {
 
         // Duplicate name should fail
         let cmd2 = MqCommand::create_topic("events", RetentionPolicy::default(), 0);
-        match engine.apply_command(&cmd2, 2, 1001) {
+        match engine.apply_command(&cmd2, 2, 1001, None) {
             MqResponse::Error(MqError::AlreadyExists { .. }) => {}
             other => panic!("expected AlreadyExists, got {:?}", other),
         }
@@ -1921,12 +2253,12 @@ mod tests {
         // Delete
         let del_cmd = MqCommand::delete_topic(topic_id);
         assert!(matches!(
-            engine.apply_command(&del_cmd, 3, 1002),
+            engine.apply_command(&del_cmd, 3, 1002, None),
             MqResponse::Ok
         ));
 
         // Delete non-existent
-        match engine.apply_command(&del_cmd, 4, 1003) {
+        match engine.apply_command(&del_cmd, 4, 1003, None) {
             MqResponse::Error(MqError::NotFound { .. }) => {}
             other => panic!("expected NotFound, got {:?}", other),
         }
@@ -1941,14 +2273,14 @@ mod tests {
         let mut engine = make_engine();
 
         let cmd = MqCommand::create_topic("logs", RetentionPolicy::default(), 0);
-        let topic_id = match engine.apply_command(&cmd, 1, 1000) {
+        let topic_id = match engine.apply_command(&cmd, 1, 1000, None) {
             MqResponse::EntityCreated { id } => id,
             other => panic!("expected EntityCreated, got {:?}", other),
         };
 
         let msg = make_msg(b"hello");
         let pub_cmd = MqCommand::publish(topic_id, &[msg]);
-        match engine.apply_command(&pub_cmd, 2, 1001) {
+        match engine.apply_command(&pub_cmd, 2, 1001, None) {
             MqResponse::Published { base_offset, count } => {
                 assert_eq!(base_offset, 0);
                 assert_eq!(count, 1);
@@ -1960,7 +2292,7 @@ mod tests {
         let msg2 = make_msg(b"world");
         let msg3 = make_msg(b"!");
         let pub_cmd2 = MqCommand::publish(topic_id, &[msg2, msg3]);
-        match engine.apply_command(&pub_cmd2, 3, 1002) {
+        match engine.apply_command(&pub_cmd2, 3, 1002, None) {
             MqResponse::Published { base_offset, count } => {
                 assert_eq!(base_offset, 1);
                 assert_eq!(count, 2);
@@ -1984,7 +2316,7 @@ mod tests {
 
         // Create a basic consumer group (Offset variant via old codec)
         let cmd = MqCommand::create_consumer_group("my-group", 1); // 1 = Latest
-        let group_id = match engine.apply_command(&cmd, 1, 1000) {
+        let group_id = match engine.apply_command(&cmd, 1, 1000, None) {
             MqResponse::EntityCreated { id } => id,
             other => panic!("expected EntityCreated, got {:?}", other),
         };
@@ -2003,7 +2335,7 @@ mod tests {
         let mut engine = make_engine();
 
         // Manually create a consumer group with Ack variant
-        let md = &engine.metadata;
+        let md = engine.shared_metadata();
         let group_id = md.alloc_id();
         let topic_id = md.alloc_id();
 
@@ -2076,7 +2408,7 @@ mod tests {
     #[test]
     fn test_actor_variant_lifecycle() {
         let mut engine = make_engine();
-        let md = &engine.metadata;
+        let md = engine.shared_metadata();
         let group_id = md.alloc_id();
 
         let group_meta = ConsumerGroupMeta {
@@ -2133,7 +2465,7 @@ mod tests {
     #[test]
     fn test_session_lifecycle() {
         let mut engine = make_engine();
-        let md = &engine.metadata;
+        let md = engine.shared_metadata();
 
         // Create session directly
         let session_id = md.alloc_id();
@@ -2158,11 +2490,11 @@ mod tests {
     #[test]
     fn test_will_on_disconnect() {
         let mut engine = make_engine();
-        let md = &engine.metadata;
+        let md = engine.shared_metadata();
 
         // Create a topic for will publication
         let cmd = MqCommand::create_topic("will-topic", RetentionPolicy::default(), 0);
-        let will_topic_id = match engine.apply_command(&cmd, 1, 1000) {
+        let will_topic_id = match engine.apply_command(&cmd, 1, 1000, None) {
             MqResponse::EntityCreated { id } => id,
             other => panic!("expected EntityCreated, got {:?}", other),
         };
@@ -2200,41 +2532,41 @@ mod tests {
 
         // Create exchange
         let ex_cmd = MqCommand::create_exchange("fanout-ex", ExchangeType::Fanout);
-        let exchange_id = match engine.apply_command(&ex_cmd, 1, 1000) {
+        let exchange_id = match engine.apply_command(&ex_cmd, 1, 1000, None) {
             MqResponse::EntityCreated { id } => id,
             other => panic!("expected EntityCreated, got {:?}", other),
         };
 
         // Create target topics
         let t1_cmd = MqCommand::create_topic("target-1", RetentionPolicy::default(), 0);
-        let t1_id = match engine.apply_command(&t1_cmd, 2, 1001) {
+        let t1_id = match engine.apply_command(&t1_cmd, 2, 1001, None) {
             MqResponse::EntityCreated { id } => id,
             other => panic!("expected EntityCreated, got {:?}", other),
         };
 
         let t2_cmd = MqCommand::create_topic("target-2", RetentionPolicy::default(), 0);
-        let t2_id = match engine.apply_command(&t2_cmd, 3, 1002) {
+        let t2_id = match engine.apply_command(&t2_cmd, 3, 1002, None) {
             MqResponse::EntityCreated { id } => id,
             other => panic!("expected EntityCreated, got {:?}", other),
         };
 
         // Create bindings
-        let b1_cmd = MqCommand::create_binding(exchange_id, t1_id, None, false, None, None);
+        let b1_cmd = MqCommand::create_binding(exchange_id, t1_id, None);
         assert!(matches!(
-            engine.apply_command(&b1_cmd, 4, 1003),
+            engine.apply_command(&b1_cmd, 4, 1003, None),
             MqResponse::EntityCreated { .. }
         ));
 
-        let b2_cmd = MqCommand::create_binding(exchange_id, t2_id, None, false, None, None);
+        let b2_cmd = MqCommand::create_binding(exchange_id, t2_id, None);
         assert!(matches!(
-            engine.apply_command(&b2_cmd, 5, 1004),
+            engine.apply_command(&b2_cmd, 5, 1004, None),
             MqResponse::EntityCreated { .. }
         ));
 
         // Publish to exchange
         let msg = make_msg(b"fanout-msg");
         let pub_cmd = MqCommand::publish_to_exchange(exchange_id, &[msg]);
-        match engine.apply_command(&pub_cmd, 6, 1005) {
+        match engine.apply_command(&pub_cmd, 6, 1005, None) {
             MqResponse::Published { count, .. } => {
                 assert!(count > 0);
             }
@@ -2258,14 +2590,14 @@ mod tests {
 
         // Create some state
         let cmd = MqCommand::create_topic("snap-topic", RetentionPolicy::default(), 0);
-        let topic_id = match engine.apply_command(&cmd, 1, 1000) {
+        let topic_id = match engine.apply_command(&cmd, 1, 1000, None) {
             MqResponse::EntityCreated { id } => id,
             _ => panic!("expected EntityCreated"),
         };
 
         let msg = make_msg(b"snap-msg");
         let pub_cmd = MqCommand::publish(topic_id, &[msg]);
-        engine.apply_command(&pub_cmd, 2, 1001);
+        engine.apply_command(&pub_cmd, 2, 1001, None);
 
         // Snapshot
         let snap = engine.snapshot();
@@ -2291,7 +2623,7 @@ mod tests {
         let mut engine = make_engine();
 
         let cmd = MqCommand::create_consumer_group("join-test", 1);
-        let group_id = match engine.apply_command(&cmd, 1, 1000) {
+        let group_id = match engine.apply_command(&cmd, 1, 1000, None) {
             MqResponse::EntityCreated { id } => id,
             other => panic!("expected EntityCreated, got {:?}", other),
         };
@@ -2304,9 +2636,9 @@ mod tests {
             30_000,
             60_000,
             "consumer",
-            &[("range".to_string(), Bytes::from_static(b"meta"))],
+            &[("range", b"meta" as &[u8])],
         );
-        let resp = engine.apply_command(&join_cmd, 2, 1001);
+        let resp = engine.apply_command(&join_cmd, 2, 1001, None);
         let member_id = match resp {
             MqResponse::GroupJoined {
                 member_id,
@@ -2324,9 +2656,9 @@ mod tests {
             group_id,
             1, // generation
             &member_id,
-            &[(member_id.clone(), vec![1, 2, 3])],
+            &[(&member_id as &str, &[1u8, 2, 3] as &[u8])],
         );
-        let resp = engine.apply_command(&sync_cmd, 3, 1002);
+        let resp = engine.apply_command(&sync_cmd, 3, 1002, None);
         match resp {
             MqResponse::GroupSynced {
                 assignment,
@@ -2346,11 +2678,11 @@ mod tests {
     #[test]
     fn test_dlq_routing() {
         let mut engine = make_engine();
-        let md = &engine.metadata;
+        let md = engine.shared_metadata();
 
         // Create DLQ topic
         let cmd = MqCommand::create_topic("dlq-topic", RetentionPolicy::default(), 0);
-        let dlq_id = match engine.apply_command(&cmd, 1, 1000) {
+        let dlq_id = match engine.apply_command(&cmd, 1, 1000, None) {
             MqResponse::EntityCreated { id } => id,
             _ => panic!("expected EntityCreated"),
         };
@@ -2409,7 +2741,7 @@ mod tests {
     #[test]
     fn test_auto_delete_on_last_detach() {
         let mut engine = make_engine();
-        let md = &engine.metadata;
+        let md = engine.shared_metadata();
 
         // Create a topic with DeleteOnLastDetach
         let topic_id = md.alloc_id();
@@ -2460,7 +2792,7 @@ mod tests {
 
         // Delete the consumer group — should auto-delete the topic
         let del_cmd = MqCommand::delete_consumer_group(group_id);
-        engine.apply_command(&del_cmd, 10, 2000);
+        engine.apply_command(&del_cmd, 10, 2000, None);
 
         // Topic should be gone
         assert!(!md.topics.contains_key(&topic_id));
@@ -2478,7 +2810,7 @@ mod tests {
         let cmd2 = MqCommand::create_topic("batch-t2", RetentionPolicy::default(), 0);
         let batch = MqCommand::batch(&[cmd1, cmd2]);
 
-        match engine.apply_command(&batch, 1, 1000) {
+        match engine.apply_command(&batch, 1, 1000, None) {
             MqResponse::BatchResponse(responses) => {
                 assert_eq!(responses.len(), 2);
                 assert!(matches!(responses[0], MqResponse::EntityCreated { .. }));

@@ -43,6 +43,9 @@ pub struct SessionMeta {
     /// Optional producer name (for dedup / named producers).
     #[serde(default)]
     pub producer_name: Option<String>,
+    /// Opaque subscription data persisted by the MQTT adapter.
+    #[serde(default)]
+    pub subscription_data: Bytes,
 }
 
 impl SessionMeta {
@@ -66,6 +69,7 @@ impl SessionMeta {
             will: None,
             subscriptions: HashSet::new(),
             producer_name: None,
+            subscription_data: Bytes::new(),
         }
     }
 
@@ -92,6 +96,7 @@ pub struct SessionState {
     last_activity_at: AtomicU64,
     will: RwLock<Option<WillConfig>>,
     subscriptions: RwLock<HashSet<SessionSubscription>>,
+    subscription_data: RwLock<Bytes>,
 }
 
 impl SessionState {
@@ -99,11 +104,13 @@ impl SessionState {
         let last_activity_at = AtomicU64::new(meta.last_activity_at);
         let will = RwLock::new(meta.will.clone());
         let subscriptions = RwLock::new(meta.subscriptions.clone());
+        let subscription_data = RwLock::new(meta.subscription_data.clone());
         Self {
             meta,
             last_activity_at,
             will,
             subscriptions,
+            subscription_data,
         }
     }
 
@@ -155,12 +162,21 @@ impl SessionState {
         self.subscriptions.write().remove(sub);
     }
 
+    pub fn set_subscription_data(&self, data: Bytes) {
+        *self.subscription_data.write() = data;
+    }
+
+    pub fn subscription_data(&self) -> Bytes {
+        self.subscription_data.read().clone()
+    }
+
     /// Flush mutable state back to a cloned `SessionMeta` for snapshot/persistence.
     pub fn snapshot_meta(&self) -> SessionMeta {
         let mut m = self.meta.clone();
         m.last_activity_at = self.last_activity_at();
         m.will = self.will.read().clone();
         m.subscriptions = self.subscriptions.read().clone();
+        m.subscription_data = self.subscription_data.read().clone();
         m
     }
 }
