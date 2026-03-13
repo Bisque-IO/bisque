@@ -1,16 +1,17 @@
 //! Lock-free concurrent metadata for MQ engine state.
 //!
 //! All entity stores, name→ID indexes, and scalar counters live here behind
-//! `DashMap` and atomics — eliminating the global `RwLock<MqEngine>` that
-//! previously serialised readers and the writer.
+//! `papaya::HashMap` (epoch-based concurrent maps) and atomics — eliminating
+//! the global `RwLock<MqEngine>` that previously serialised readers and the
+//! writer.
 //!
 //! **Protocol adapters** cache `Arc<TopicMeta>` after the first lookup and
 //! read atomics directly — zero-cost after the initial lookup.
 //!
-//! **Raft apply path** (single writer) uses `DashMap::get_mut` for per-entry
-//! mutations. Readers on other shards proceed without contention.
+//! **Raft apply path** (single writer) uses `pin().get()` with interior
+//! mutability for per-entry mutations. Readers proceed without contention.
 //!
-//! **Periodic leader tasks** iterate `DashMap` without blocking the writer.
+//! **Periodic leader tasks** iterate maps without blocking the writer.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -18,7 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use dashmap::DashMap;
 
 use crate::consumer_group::ConsumerGroupState;
 use crate::exchange::ExchangeState;
@@ -194,46 +194,46 @@ impl fmt::Debug for TopicMeta {
 }
 
 // ---------------------------------------------------------------------------
-// MqMetadata — DashMap + atomics
+// MqMetadata — papaya + atomics
 // ---------------------------------------------------------------------------
 
 /// Lock-free concurrent metadata store.
 ///
-/// Holds **all** MQ entity state behind `DashMap` (sharded concurrent maps)
-/// and `AtomicU64`/`AtomicBool` for scalar counters. This replaces the
-/// previous `HashMap` fields inside `MqEngine` that were behind a global
-/// `RwLock`.
+/// Holds **all** MQ entity state behind `papaya::HashMap` (epoch-based
+/// concurrent maps) and `AtomicU64`/`AtomicBool` for scalar counters. This
+/// replaces the previous `HashMap` fields inside `MqEngine` that were behind
+/// a global `RwLock`.
 ///
 /// - **Readers** can iterate or lookup any entity without blocking the writer.
-/// - **Writer** (Raft apply, single-threaded) uses `DashMap::get_mut` for
-///   per-entry mutations — only the target shard is locked.
+/// - **Writer** (Raft apply, single-threaded) uses `pin().get()` with
+///   interior mutability for per-entry mutations.
 /// - **Protocol adapters** cache `Arc<TopicMeta>` for zero-cost atomic reads.
 pub struct MqMetadata {
     /// Catalog name for metrics labeling (set at construction, immutable).
     catalog_name: String,
 
     // -- Protocol adapter caches (lightweight, with atomics for hot fields) --
-    topics_by_id: DashMap<u64, Arc<TopicMeta>>,
-    topics_by_name: DashMap<String, u64>,
+    topics_by_id: papaya::HashMap<u64, Arc<TopicMeta>>,
+    topics_by_name: papaya::HashMap<String, u64>,
 
-    // -- Full entity stores (DashMap replaces HashMap behind RwLock) --
-    pub(crate) topics: DashMap<u64, TopicState>,
-    pub(crate) exchanges: DashMap<u64, ExchangeState>,
+    // -- Full entity stores (papaya + Arc for epoch-based read concurrency) --
+    pub(crate) topics: papaya::HashMap<u64, Arc<TopicState>>,
+    pub(crate) exchanges: papaya::HashMap<u64, Arc<ExchangeState>>,
 
     // -- Consumer groups (unified — Offset, Ack, Actor variants) --
-    pub(crate) consumer_groups: DashMap<u64, ConsumerGroupState>,
-    pub(crate) consumer_group_names: DashMap<u64, u64>, // name_hash → group_id
+    pub(crate) consumer_groups: papaya::HashMap<u64, Arc<ConsumerGroupState>>,
+    pub(crate) consumer_group_names: papaya::HashMap<u64, u64>, // name_hash → group_id
 
     // -- Sessions (unified, replaces consumers + producers) --
-    pub(crate) sessions: DashMap<u64, SessionState>,
+    pub(crate) sessions: papaya::HashMap<u64, Arc<SessionState>>,
 
     // -- Name hash (CRC64-NVME) → ID lookup indexes --
-    pub(crate) topic_names: DashMap<u64, u64>,
-    pub(crate) exchange_names: DashMap<u64, u64>,
+    pub(crate) topic_names: papaya::HashMap<u64, u64>,
+    pub(crate) exchange_names: papaya::HashMap<u64, u64>,
 
     // -- Consumer group reverse indexes for O(1) disconnect --
     /// session_id → set of group_ids where the session has in-flight messages or assignments.
-    pub(crate) session_group_index: DashMap<u64, HashSet<u64>>,
+    pub(crate) session_group_index: papaya::HashMap<u64, HashSet<u64>>,
 
     // -- Push-based group delivery --
     /// Notifies watchers when messages are available in a consumer group.
@@ -241,25 +241,25 @@ pub struct MqMetadata {
 
     // -- Topic aliases (MQTT 5.0) --
     /// session_id → list of topic alias entries.
-    pub(crate) topic_aliases: DashMap<u64, Vec<TopicAliasEntry>>,
+    pub(crate) topic_aliases: papaya::HashMap<u64, Vec<TopicAliasEntry>>,
 
     // -- Pending will messages (MQTT 5.0 Will Delay Interval) --
     /// client_id name_hash → pending will with scheduled fire time.
-    pub(crate) pending_wills: DashMap<u64, PendingWill>,
+    pub(crate) pending_wills: papaya::HashMap<u64, PendingWill>,
 
     // -- Publisher session dedup (MQTT 5.0 exactly-once) --
     /// session_id name_hash → set of received publisher_ids for dedup.
-    pub(crate) publisher_dedup: DashMap<u64, HashSet<u64>>,
+    pub(crate) publisher_dedup: papaya::HashMap<u64, HashSet<u64>>,
 
     // -- QoS 2 inbound dedup (MQTT 5.0 exactly-once inbound) --
     /// session_id → (packet_id → qos2 state: 0=RECEIVED, 1=COMPLETE).
-    pub(crate) qos2_inbound: DashMap<u64, HashMap<u16, u8>>,
+    pub(crate) qos2_inbound: papaya::HashMap<u64, HashMap<u16, u8>>,
 
     // -- O(1) reverse indexes --
     /// binding_id → exchange_id for O(1) delete-binding lookup.
-    pub(crate) binding_index: DashMap<u64, u64>,
+    pub(crate) binding_index: papaya::HashMap<u64, u64>,
     /// client_id name_hash → session_id for O(1) session restore.
-    pub(crate) session_client_index: DashMap<u64, u64>,
+    pub(crate) session_client_index: papaya::HashMap<u64, u64>,
 
     // -- Atomic scalars --
     pub(crate) next_id: AtomicU64,
@@ -274,23 +274,23 @@ impl MqMetadata {
     pub fn new(catalog_name: String) -> Self {
         Self {
             catalog_name,
-            topics_by_id: DashMap::new(),
-            topics_by_name: DashMap::new(),
-            topics: DashMap::new(),
-            exchanges: DashMap::new(),
-            consumer_groups: DashMap::new(),
-            consumer_group_names: DashMap::new(),
-            sessions: DashMap::new(),
-            topic_names: DashMap::new(),
-            exchange_names: DashMap::new(),
-            session_group_index: DashMap::new(),
+            topics_by_id: papaya::HashMap::new(),
+            topics_by_name: papaya::HashMap::new(),
+            topics: papaya::HashMap::new(),
+            exchanges: papaya::HashMap::new(),
+            consumer_groups: papaya::HashMap::new(),
+            consumer_group_names: papaya::HashMap::new(),
+            sessions: papaya::HashMap::new(),
+            topic_names: papaya::HashMap::new(),
+            exchange_names: papaya::HashMap::new(),
+            session_group_index: papaya::HashMap::new(),
             group_notifier: GroupNotifier::new(),
-            topic_aliases: DashMap::new(),
-            pending_wills: DashMap::new(),
-            publisher_dedup: DashMap::new(),
-            qos2_inbound: DashMap::new(),
-            binding_index: DashMap::new(),
-            session_client_index: DashMap::new(),
+            topic_aliases: papaya::HashMap::new(),
+            pending_wills: papaya::HashMap::new(),
+            publisher_dedup: papaya::HashMap::new(),
+            qos2_inbound: papaya::HashMap::new(),
+            binding_index: papaya::HashMap::new(),
+            session_client_index: papaya::HashMap::new(),
             next_id: AtomicU64::new(1),
             cached_purge_floor: AtomicU64::new(0),
             purge_floor_dirty: AtomicBool::new(true),
@@ -323,9 +323,9 @@ impl MqMetadata {
     /// Resolve an entity by type and name hash. Returns the entity ID if found.
     pub fn resolve_entity(&self, entity_type: u8, name_hash: u64) -> Option<u64> {
         match entity_type {
-            0 => self.topic_names.get(&name_hash).map(|r| *r),
-            1 => self.exchange_names.get(&name_hash).map(|r| *r),
-            2 => self.consumer_group_names.get(&name_hash).map(|r| *r),
+            0 => self.topic_names.pin().get(&name_hash).copied(),
+            1 => self.exchange_names.pin().get(&name_hash).copied(),
+            2 => self.consumer_group_names.pin().get(&name_hash).copied(),
             _ => None,
         }
     }
@@ -333,6 +333,7 @@ impl MqMetadata {
     /// Get the current head index for a topic.
     pub fn get_topic_head_from_state(&self, topic_id: u64) -> u64 {
         self.topics
+            .pin()
             .get(&topic_id)
             .map(|t| t.head_index())
             .unwrap_or(0)
@@ -341,6 +342,7 @@ impl MqMetadata {
     /// Get the partition map for a topic.
     pub fn get_topic_partitions(&self, topic_id: u64) -> Option<Vec<crate::types::PartitionInfo>> {
         self.topics
+            .pin()
             .get(&topic_id)
             .map(|t| t.meta.partitions.clone())
     }
@@ -349,14 +351,19 @@ impl MqMetadata {
 
     /// Insert or replace a topic. Returns the previous value if any.
     pub fn insert_topic(&self, meta: Arc<TopicMeta>) -> Option<Arc<TopicMeta>> {
-        self.topics_by_name.insert(meta.name.clone(), meta.topic_id);
-        self.topics_by_id.insert(meta.topic_id, meta)
+        let guard = self.topics_by_id.pin();
+        self.topics_by_name
+            .pin()
+            .insert(meta.name.clone(), meta.topic_id);
+        guard.insert(meta.topic_id, meta).cloned()
     }
 
     /// Remove a topic by ID. Returns the removed value if any.
     pub fn remove_topic(&self, topic_id: u64) -> Option<Arc<TopicMeta>> {
-        if let Some((_, meta)) = self.topics_by_id.remove(&topic_id) {
-            self.topics_by_name.remove(&meta.name);
+        let guard = self.topics_by_id.pin();
+        if let Some(meta) = guard.get(&topic_id).cloned() {
+            guard.remove(&topic_id);
+            self.topics_by_name.pin().remove(&meta.name);
             Some(meta)
         } else {
             None
@@ -367,20 +374,19 @@ impl MqMetadata {
     /// subsequent reads via atomics.
     #[inline]
     pub fn get_topic(&self, topic_id: u64) -> Option<Arc<TopicMeta>> {
-        self.topics_by_id
-            .get(&topic_id)
-            .map(|r| Arc::clone(r.value()))
+        self.topics_by_id.pin().get(&topic_id).cloned()
     }
 
     /// Find a topic by name. Returns `Arc<TopicMeta>` for caching.
     pub fn find_topic_by_name(&self, name: &str) -> Option<Arc<TopicMeta>> {
-        let topic_id = *self.topics_by_name.get(name)?;
+        let topic_id = *self.topics_by_name.pin().get(name)?;
         self.get_topic(topic_id)
     }
 
     /// Get the current head offset for a topic.
     pub fn get_topic_head(&self, topic_id: u64) -> Option<u64> {
-        let t = self.topics_by_id.get(&topic_id)?;
+        let guard = self.topics_by_id.pin();
+        let t = guard.get(&topic_id)?;
         let count = t.message_count();
         if count == 0 {
             return None;
@@ -390,7 +396,8 @@ impl MqMetadata {
 
     /// Get the current tail offset for a topic.
     pub fn get_topic_tail(&self, topic_id: u64) -> Option<u64> {
-        let t = self.topics_by_id.get(&topic_id)?;
+        let guard = self.topics_by_id.pin();
+        let t = guard.get(&topic_id)?;
         if t.message_count() == 0 {
             return None;
         }
@@ -399,16 +406,17 @@ impl MqMetadata {
 
     /// Get the raft log location of the latest message for a topic.
     pub fn get_topic_latest(&self, topic_id: u64) -> Option<(u64, usize)> {
-        let t = self.topics_by_id.get(&topic_id)?;
+        let guard = self.topics_by_id.pin();
+        let t = guard.get(&topic_id)?;
         t.latest()
     }
 
     /// List all topics as `(name_bytes, topic_id)` pairs.
     pub fn list_topics_into(&self, out: &mut Vec<(Bytes, u64)>) {
         out.clear();
-        out.reserve(self.topics_by_id.len());
-        for entry in self.topics_by_id.iter() {
-            let t = entry.value();
+        let guard = self.topics_by_id.pin();
+        out.reserve(guard.len());
+        for (_, t) in guard.iter() {
             out.push((Bytes::copy_from_slice(t.name.as_bytes()), t.topic_id));
         }
     }
@@ -416,8 +424,8 @@ impl MqMetadata {
     /// List topics matching a name prefix.
     pub fn list_topics_with_prefix_into(&self, prefix: &str, out: &mut Vec<(Bytes, u64)>) {
         out.clear();
-        for entry in self.topics_by_id.iter() {
-            let t = entry.value();
+        let guard = self.topics_by_id.pin();
+        for (_, t) in guard.iter() {
             if t.name.starts_with(prefix) {
                 out.push((Bytes::copy_from_slice(t.name.as_bytes()), t.topic_id));
             }
@@ -434,12 +442,12 @@ impl MqMetadata {
     /// Number of topics.
     #[inline]
     pub fn topic_count(&self) -> usize {
-        self.topics_by_id.len()
+        self.topics_by_id.pin().len()
     }
 
     /// Collect all topic IDs (for sync/removal checks).
     pub fn topic_ids(&self) -> Vec<u64> {
-        self.topics_by_id.iter().map(|e| *e.key()).collect()
+        self.topics_by_id.pin().iter().map(|(&k, _)| k).collect()
     }
 
     // -- Session / group reverse index operations --
@@ -447,49 +455,57 @@ impl MqMetadata {
     /// Track that a session has in-flight messages or assignments in a group.
     #[inline]
     pub(crate) fn track_session_group(&self, session_id: u64, group_id: u64) {
-        self.session_group_index
-            .entry(session_id)
-            .or_default()
-            .insert(group_id);
+        let guard = self.session_group_index.pin();
+        let mut set = guard.get(&session_id).cloned().unwrap_or_default();
+        set.insert(group_id);
+        guard.insert(session_id, set);
     }
 
     /// Remove a session from the reverse index. Returns the tracked group set.
     pub(crate) fn remove_session_group_index(&self, session_id: u64) -> Option<HashSet<u64>> {
-        self.session_group_index.remove(&session_id).map(|(_, v)| v)
+        let guard = self.session_group_index.pin();
+        let value = guard.get(&session_id).cloned();
+        if value.is_some() {
+            guard.remove(&session_id);
+        }
+        value
     }
 
     /// Clear all session reverse indexes (used during snapshot restore).
     pub(crate) fn clear_session_indexes(&self) {
-        self.session_group_index.clear();
+        self.session_group_index.pin().clear();
     }
 
     // -- Consumer group operations (public API for Kafka adapter) --
 
     /// Resolve a consumer group name hash to its group ID.
     pub fn resolve_consumer_group(&self, name_hash: u64) -> Option<u64> {
-        self.consumer_group_names.get(&name_hash).map(|r| *r)
+        self.consumer_group_names.pin().get(&name_hash).copied()
     }
 
     /// Get a consumer group state by ID.
-    /// Returns a `DashMap` ref guard for reading group state.
-    pub fn get_consumer_group(
-        &self,
-        group_id: u64,
-    ) -> Option<dashmap::mapref::one::Ref<'_, u64, ConsumerGroupState>> {
-        self.consumer_groups.get(&group_id)
+    pub fn get_consumer_group(&self, group_id: u64) -> Option<Arc<ConsumerGroupState>> {
+        self.consumer_groups.pin().get(&group_id).cloned()
     }
 
-    /// Iterate over all consumer groups.
-    pub fn iter_consumer_groups(&self) -> dashmap::iter::Iter<'_, u64, ConsumerGroupState> {
-        self.consumer_groups.iter()
+    /// Iterate over all consumer groups, collecting `(group_id, Arc<state>)` pairs.
+    pub fn iter_consumer_groups(&self) -> Vec<(u64, Arc<ConsumerGroupState>)> {
+        self.consumer_groups
+            .pin()
+            .iter()
+            .map(|(&k, v)| (k, Arc::clone(v)))
+            .collect()
     }
 
     /// Find the group ID that a member belongs to (scans all groups).
     pub fn find_member_group(&self, member_id: &str) -> Option<u64> {
-        self.consumer_groups
-            .iter()
-            .find(|entry| entry.value().has_member(member_id))
-            .map(|entry| *entry.key())
+        let guard = self.consumer_groups.pin();
+        for (&group_id, state) in guard.iter() {
+            if state.has_member(member_id) {
+                return Some(group_id);
+            }
+        }
+        None
     }
 }
 

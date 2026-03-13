@@ -1,3 +1,4 @@
+pub mod async_apply;
 pub mod codec;
 pub mod config;
 pub mod consumer_group;
@@ -17,6 +18,10 @@ pub mod topic;
 pub mod types;
 pub mod write_batcher;
 
+pub use async_apply::{
+    AsyncApplyManager, ClientRegistry, HighWaterMark, PendingRequest, PendingRequests,
+    ResponseEntry,
+};
 pub use config::MqConfig;
 pub use cursor::{
     MqReader, MqSegmentCursor, MqSegmentScanner, SegmentRecord, read_command,

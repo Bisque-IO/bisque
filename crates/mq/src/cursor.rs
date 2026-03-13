@@ -16,6 +16,7 @@
 //! For Normal entries (tag=1), `data` is the serialized `MqCommand` bytes.
 //! The cursor extracts just the `data` portion as a zero-copy `Bytes` slice.
 
+use bisque_raft::SegmentView;
 use bisque_raft::record_format::{CRC64_SIZE, HEADER_SIZE, LENGTH_SIZE};
 use bytes::Bytes;
 
@@ -28,12 +29,50 @@ const ENTRY_HEADER_SIZE: usize = 25;
 /// header(8) + entry_header(25) + crc(8) = 41 bytes.
 const MIN_ENTRY_RECORD_SIZE: usize = HEADER_SIZE + ENTRY_HEADER_SIZE + CRC64_SIZE;
 
+/// Segment data source — either a live mmap view or a fixed snapshot.
+///
+/// `View` reads `logical_size` atomically on every `len()` call, so it
+/// sees data appended after the cursor was created (for the active segment).
+/// `Snapshot` is a fixed `Bytes` slice (sealed segments, tests).
+enum SegmentData {
+    View(SegmentView),
+    Snapshot(Bytes),
+}
+
+impl SegmentData {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::View(v) => v.len(),
+            Self::Snapshot(b) => b.len(),
+        }
+    }
+
+    #[inline]
+    fn read_bytes(&self, offset: usize, len: usize) -> &[u8] {
+        match self {
+            Self::View(v) => v.read_slice(offset, len),
+            Self::Snapshot(b) => &b[offset..offset + len],
+        }
+    }
+
+    #[inline]
+    fn slice_bytes(&self, start: usize, end: usize) -> Bytes {
+        match self {
+            Self::View(v) => v.slice_bytes(start, end - start),
+            Self::Snapshot(b) => b.slice(start..end),
+        }
+    }
+}
+
 /// A record yielded by the cursor.
 pub struct SegmentRecord {
     /// The raft log index of this entry.
     pub log_index: u64,
     /// The MqCommand extracted from this entry (zero-copy slice of segment mmap).
     pub command: MqCommand,
+    /// Byte offset of the record start within the segment.
+    pub record_offset: usize,
 }
 
 /// Sequential cursor over MqCommand records in a single raft log segment.
@@ -45,8 +84,8 @@ pub struct SegmentRecord {
 /// individual sub-commands, yielding each one separately with the same
 /// `log_index` as the batch entry.
 pub struct MqSegmentCursor {
-    /// The full segment bytes (holds Arc<Segment> alive via Bytes ownership).
-    data: Bytes,
+    /// Segment data — live mmap view or fixed snapshot.
+    data: SegmentData,
     /// Current byte offset within the segment.
     offset: usize,
     /// Segment ID for diagnostics / prefetching.
@@ -59,22 +98,43 @@ pub struct MqSegmentCursor {
     batch_remaining: u32,
     /// The log_index of the batch currently being exploded.
     batch_log_index: u64,
+    /// The record_offset of the batch currently being exploded.
+    batch_record_offset: usize,
 }
 
 impl MqSegmentCursor {
-    /// Create a cursor pinning the given segment.
+    /// Create a cursor from a fixed `Bytes` snapshot.
     ///
-    /// `data` must be the full valid region of the segment (from
-    /// `SegmentPrefetcher::segment_bytes`). The cursor starts at offset 0.
+    /// Use for sealed segments or tests. For the active segment,
+    /// prefer `new_live()` which sees newly appended data.
     pub fn new(segment_id: u64, data: Bytes) -> Self {
         Self {
-            data,
+            data: SegmentData::Snapshot(data),
             offset: 0,
             segment_id,
             batch_data: None,
             batch_offset: 0,
             batch_remaining: 0,
             batch_log_index: 0,
+            batch_record_offset: 0,
+        }
+    }
+
+    /// Create a cursor from a live `SegmentView`.
+    ///
+    /// `len()` reads `logical_size` atomically, so the cursor sees
+    /// data appended after creation. Use for the active segment.
+    pub fn new_live(view: SegmentView) -> Self {
+        let segment_id = view.segment_id();
+        Self {
+            data: SegmentData::View(view),
+            offset: 0,
+            segment_id,
+            batch_data: None,
+            batch_offset: 0,
+            batch_remaining: 0,
+            batch_log_index: 0,
+            batch_record_offset: 0,
         }
     }
 
@@ -126,6 +186,7 @@ impl MqSegmentCursor {
                 return Some(SegmentRecord {
                     log_index: self.batch_log_index,
                     command: cmd,
+                    record_offset: self.batch_record_offset,
                 });
             }
             // Batch exhausted.
@@ -138,16 +199,23 @@ impl MqSegmentCursor {
             }
 
             let record_len = u32::from_le_bytes(
-                self.data[self.offset..self.offset + LENGTH_SIZE]
+                self.data
+                    .read_bytes(self.offset, LENGTH_SIZE)
                     .try_into()
                     .unwrap(),
             ) as usize;
 
-            // Zero length or overrun = end of valid data.
+            // Zero length = zeroed memory (end of written data).
+            // Overrun = partial record (more data may arrive for live views).
             let total = LENGTH_SIZE + record_len;
-            if record_len == 0 || self.offset + total > self.data.len() {
-                // Park at end so is_exhausted() returns true.
-                self.offset = self.data.len();
+            if record_len == 0 {
+                // Park past the zero marker so is_exhausted() returns true.
+                self.offset += LENGTH_SIZE;
+                return None;
+            }
+            if self.offset + total > self.data.len() {
+                // Don't advance offset — for live views the record may
+                // complete when more data is appended.
                 return None;
             }
 
@@ -160,25 +228,22 @@ impl MqSegmentCursor {
             }
 
             // Check record type: must be Entry (0x02).
-            let record_type = self.data[record_start + LENGTH_SIZE];
+            let record_type = self.data.read_bytes(record_start + LENGTH_SIZE, 1)[0];
             if record_type != 0x02 {
                 continue;
             }
 
             // Check entry tag: must be Normal (1).
             // Entry tag is at: record_start + HEADER_SIZE + 24 (after term+node_id+index).
-            let entry_tag = self.data[record_start + HEADER_SIZE + 24];
+            let entry_tag = self.data.read_bytes(record_start + HEADER_SIZE + 24, 1)[0];
             if entry_tag != 1 {
                 continue;
             }
 
             // Extract log_index from the entry header.
             let index_offset = record_start + HEADER_SIZE + 16; // after term(8) + node_id(8)
-            let log_index = u64::from_le_bytes(
-                self.data[index_offset..index_offset + 8]
-                    .try_into()
-                    .unwrap(),
-            );
+            let log_index =
+                u64::from_le_bytes(self.data.read_bytes(index_offset, 8).try_into().unwrap());
 
             // Extract MqCommand data: after entry header, before CRC.
             let data_start = record_start + HEADER_SIZE + ENTRY_HEADER_SIZE;
@@ -187,7 +252,7 @@ impl MqSegmentCursor {
                 continue;
             }
 
-            let cmd_bytes = self.data.slice(data_start..data_end);
+            let cmd_bytes = self.data.slice_bytes(data_start, data_end);
 
             // Explode TAG_BATCH: store the bytes and re-enter to yield first sub-command.
             // Layout: [TAG_BATCH:1][count:4][len1:4][cmd1][len2:4][cmd2]...
@@ -198,6 +263,7 @@ impl MqSegmentCursor {
                     self.batch_offset = 16; // skip header(8) + count(4) + pad(4)
                     self.batch_remaining = count;
                     self.batch_log_index = log_index;
+                    self.batch_record_offset = record_start;
                     // Re-enter to yield first sub-command from the batch path above.
                     return self.next_record();
                 }
@@ -208,6 +274,7 @@ impl MqSegmentCursor {
             return Some(SegmentRecord {
                 log_index,
                 command: MqCommand::from_bytes(cmd_bytes),
+                record_offset: record_start,
             });
         }
     }
@@ -253,6 +320,73 @@ impl MqSegmentCursor {
         }
         out
     }
+
+    /// Like `next_record()` but does NOT explode `TAG_BATCH` entries.
+    ///
+    /// Returns batch commands as-is. Used by async apply workers that skip
+    /// batch entries (they are processed synchronously in `apply()`).
+    pub fn next_record_raw(&mut self) -> Option<SegmentRecord> {
+        // Clear any in-progress batch state (safety guard).
+        self.batch_data = None;
+        self.batch_remaining = 0;
+
+        loop {
+            if self.offset + LENGTH_SIZE > self.data.len() {
+                return None;
+            }
+
+            let record_len = u32::from_le_bytes(
+                self.data
+                    .read_bytes(self.offset, LENGTH_SIZE)
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+
+            let total = LENGTH_SIZE + record_len;
+            if record_len == 0 {
+                self.offset += LENGTH_SIZE;
+                return None;
+            }
+            if self.offset + total > self.data.len() {
+                return None;
+            }
+
+            let record_start = self.offset;
+            self.offset += total;
+
+            if total < MIN_ENTRY_RECORD_SIZE {
+                continue;
+            }
+
+            let record_type = self.data.read_bytes(record_start + LENGTH_SIZE, 1)[0];
+            if record_type != 0x02 {
+                continue;
+            }
+
+            let entry_tag = self.data.read_bytes(record_start + HEADER_SIZE + 24, 1)[0];
+            if entry_tag != 1 {
+                continue;
+            }
+
+            let index_offset = record_start + HEADER_SIZE + 16;
+            let log_index =
+                u64::from_le_bytes(self.data.read_bytes(index_offset, 8).try_into().unwrap());
+
+            let data_start = record_start + HEADER_SIZE + ENTRY_HEADER_SIZE;
+            let data_end = record_start + total - CRC64_SIZE;
+            if data_start >= data_end {
+                continue;
+            }
+
+            let cmd_bytes = self.data.slice_bytes(data_start, data_end);
+
+            return Some(SegmentRecord {
+                log_index,
+                command: MqCommand::from_bytes(cmd_bytes),
+                record_offset: record_start,
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +407,9 @@ pub struct MqSegmentScanner {
     /// Segment ID of the last segment we know exists (active segment).
     /// We stop scanning past this.
     active_segment_id: u64,
+    /// A record that was consumed but needs to be returned on the next call.
+    /// Used by callers via `put_back()` to avoid losing records at range boundaries.
+    peeked: Option<SegmentRecord>,
 }
 
 impl MqSegmentScanner {
@@ -284,6 +421,7 @@ impl MqSegmentScanner {
             cursor: None,
             next_segment_id: start_segment_id,
             active_segment_id,
+            peeked: None,
         }
     }
 
@@ -298,22 +436,65 @@ impl MqSegmentScanner {
         self.cursor.as_ref().map(|c| c.segment_id())
     }
 
+    /// Put back a record that was already consumed.
+    ///
+    /// The record will be returned by the next `next_record*()` call.
+    /// Used to avoid losing records at range boundaries when a persistent
+    /// scanner reads past the end of the current range.
+    #[inline]
+    pub fn put_back(&mut self, record: SegmentRecord) {
+        self.peeked = Some(record);
+    }
+
     /// Advance to the next record across segments.
     ///
     /// When the current segment is exhausted, automatically opens the next
     /// segment and continues scanning. Returns `None` when all segments
     /// are exhausted.
     pub fn next_record(&mut self) -> Option<SegmentRecord> {
+        if let Some(rec) = self.peeked.take() {
+            return Some(rec);
+        }
         loop {
-            // Try the current cursor first.
             if let Some(cursor) = &mut self.cursor {
                 if let Some(rec) = cursor.next_record() {
                     return Some(rec);
                 }
-                // Current segment exhausted — fall through to advance.
+                // Active segment uses a live view — don't advance past it.
+                // More data may be appended; the cursor will see it next call.
+                // Refresh active_segment_id to detect segment rotation.
+                self.active_segment_id = self.prefetcher.active_segment_id();
+                if cursor.segment_id() == self.active_segment_id {
+                    return None;
+                }
+                // Segment was sealed — fall through to advance.
             }
 
-            // Try to open the next segment.
+            if !self.advance_segment() {
+                return None;
+            }
+        }
+    }
+
+    /// Like `next_record()` but does NOT explode `TAG_BATCH` entries.
+    ///
+    /// Returns batch commands as-is. Used by async apply workers that skip
+    /// batch entries (they are processed synchronously in `apply()`).
+    pub fn next_record_raw(&mut self) -> Option<SegmentRecord> {
+        if let Some(rec) = self.peeked.take() {
+            return Some(rec);
+        }
+        loop {
+            if let Some(cursor) = &mut self.cursor {
+                if let Some(rec) = cursor.next_record_raw() {
+                    return Some(rec);
+                }
+                self.active_segment_id = self.prefetcher.active_segment_id();
+                if cursor.segment_id() == self.active_segment_id {
+                    return None;
+                }
+            }
+
             if !self.advance_segment() {
                 return None;
             }
@@ -326,10 +507,23 @@ impl MqSegmentScanner {
         match_tag: u8,
         entity_id: u64,
     ) -> Option<SegmentRecord> {
+        if let Some(rec) = self.peeked.take() {
+            if rec.command.tag() == match_tag && rec.command.buf.len() >= 16 {
+                let id = u64::from_le_bytes(rec.command.buf[8..16].try_into().unwrap());
+                if id == entity_id {
+                    return Some(rec);
+                }
+            }
+            // Peeked record doesn't match — discard it.
+        }
         loop {
             if let Some(cursor) = &mut self.cursor {
                 if let Some(rec) = cursor.next_record_for_entity(match_tag, entity_id) {
                     return Some(rec);
+                }
+                self.active_segment_id = self.prefetcher.active_segment_id();
+                if cursor.segment_id() == self.active_segment_id {
+                    return None;
                 }
             }
 
@@ -349,13 +543,23 @@ impl MqSegmentScanner {
             let seg_id = self.next_segment_id;
             self.next_segment_id += 1;
 
-            if let Some(data) = self.prefetcher.segment_bytes(seg_id) {
-                // Prefetch the segment after this one.
-                if self.next_segment_id <= self.active_segment_id {
-                    self.prefetcher.prefetch_next(0); // trigger background load
+            let is_active = seg_id == self.active_segment_id;
+            if is_active {
+                // Active segment: use live SegmentView so we see appended data.
+                if let Some(view) = self.prefetcher.segment_view(seg_id) {
+                    self.cursor = Some(MqSegmentCursor::new_live(view));
+                    return true;
                 }
-                self.cursor = Some(MqSegmentCursor::new(seg_id, data));
-                return true;
+            } else {
+                // Sealed segment: snapshot is fine (data is immutable).
+                if let Some(data) = self.prefetcher.segment_bytes(seg_id) {
+                    // Prefetch the segment after this one.
+                    if self.next_segment_id <= self.active_segment_id {
+                        self.prefetcher.prefetch_next(0);
+                    }
+                    self.cursor = Some(MqSegmentCursor::new(seg_id, data));
+                    return true;
+                }
             }
             // Segment not pinned — skip it (may have been evicted or purged).
         }

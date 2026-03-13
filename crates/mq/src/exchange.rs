@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
@@ -98,44 +99,50 @@ impl RetainedValue {
 pub struct ExchangeState {
     pub meta: ExchangeMeta,
     /// binding_id → Binding
-    pub bindings: HashMap<u64, Binding>,
+    pub bindings: RwLock<HashMap<u64, Binding>>,
     /// Routing key hash → binding IDs (for direct exchange fast path).
-    pub direct_index: HashMap<u64, SmallVec<[u64; 4]>>,
+    direct_index: RwLock<HashMap<u64, SmallVec<[u64; 4]>>>,
     /// Retained messages: routing_key → retained value with segment provenance.
-    pub retained: HashMap<String, RetainedValue>,
+    pub retained: RwLock<HashMap<String, RetainedValue>>,
 }
 
 impl ExchangeState {
     pub fn new(meta: ExchangeMeta) -> Self {
         Self {
             meta,
-            bindings: HashMap::new(),
-            direct_index: HashMap::new(),
-            retained: HashMap::new(),
+            bindings: RwLock::new(HashMap::new()),
+            direct_index: RwLock::new(HashMap::new()),
+            retained: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn add_binding(&mut self, binding: Binding) {
+    pub fn add_binding(&self, binding: Binding) {
         let binding_id = binding.binding_id;
         // Build direct index for fast lookup
         if self.meta.exchange_type == ExchangeType::Direct {
             if let Some(ref key) = binding.routing_key {
                 let hash = name_hash(key);
-                self.direct_index.entry(hash).or_default().push(binding_id);
+                self.direct_index
+                    .write()
+                    .entry(hash)
+                    .or_default()
+                    .push(binding_id);
             }
         }
-        self.bindings.insert(binding_id, binding);
+        self.bindings.write().insert(binding_id, binding);
     }
 
-    pub fn remove_binding(&mut self, binding_id: u64) {
-        if let Some(binding) = self.bindings.remove(&binding_id) {
+    pub fn remove_binding(&self, binding_id: u64) {
+        let mut bindings = self.bindings.write();
+        if let Some(binding) = bindings.remove(&binding_id) {
             if self.meta.exchange_type == ExchangeType::Direct {
                 if let Some(ref key) = binding.routing_key {
                     let hash = name_hash(key);
-                    if let Some(ids) = self.direct_index.get_mut(&hash) {
+                    let mut di = self.direct_index.write();
+                    if let Some(ids) = di.get_mut(&hash) {
                         ids.retain(|id| *id != binding_id);
                         if ids.is_empty() {
-                            self.direct_index.remove(&hash);
+                            di.remove(&hash);
                         }
                     }
                 }
@@ -145,26 +152,27 @@ impl ExchangeState {
 
     /// Route a message to target topic IDs based on exchange type and routing key.
     pub fn route(&self, routing_key: Option<&str>) -> SmallVec<[u64; 8]> {
+        let bindings = self.bindings.read();
         match self.meta.exchange_type {
             ExchangeType::Fanout => {
                 // Deliver to all bound topics
-                self.bindings.values().map(|b| b.target_topic_id).collect()
+                bindings.values().map(|b| b.target_topic_id).collect()
             }
             ExchangeType::Direct => {
                 // Deliver to topics with exact routing key match
                 if let Some(key) = routing_key {
                     let hash = name_hash(key);
-                    self.direct_index
-                        .get(&hash)
+                    let di = self.direct_index.read();
+                    di.get(&hash)
                         .map(|ids| {
                             ids.iter()
-                                .filter_map(|id| self.bindings.get(id).map(|b| b.target_topic_id))
+                                .filter_map(|id| bindings.get(id).map(|b| b.target_topic_id))
                                 .collect()
                         })
                         .unwrap_or_default()
                 } else {
                     // Match bindings with no routing key
-                    self.bindings
+                    bindings
                         .values()
                         .filter(|b| b.routing_key.is_none())
                         .map(|b| b.target_topic_id)
@@ -174,7 +182,7 @@ impl ExchangeState {
             ExchangeType::Topic => {
                 // Deliver to topics whose binding pattern matches the routing key
                 let key = routing_key.unwrap_or("");
-                self.bindings
+                bindings
                     .values()
                     .filter(|b| {
                         let pattern = b.routing_key.as_deref().unwrap_or("");

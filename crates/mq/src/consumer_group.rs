@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
-use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -208,10 +207,10 @@ fn atomic_to_opt(v: u64) -> Option<u64> {
 
 /// In-memory Ack variant state (migrated from QueueState).
 pub struct AckVariantState {
-    pub messages: DashMap<u64, AckMessageMeta>,
+    pub messages: papaya::HashMap<u64, AckMessageMeta>,
     pub(crate) pending: Mutex<BTreeMap<(u8, u64), ()>>,
     pub(crate) in_flight_deadlines: Mutex<BTreeMap<u64, SmallVec<[u64; 4]>>>,
-    pub(crate) consumer_in_flight: DashMap<u64, HashSet<u64>>,
+    pub(crate) consumer_in_flight: papaya::HashMap<u64, HashSet<u64>>,
     pub(crate) expires_at_deadlines: Mutex<BTreeMap<u64, SmallVec<[u64; 4]>>>,
     /// Tiered delay index: compact storage for delayed messages.
     /// Key = ms offset from server start epoch (u32), Value = message IDs.
@@ -245,10 +244,10 @@ impl AckVariantState {
             ("group", group_name.to_owned()),
         ];
         Self {
-            messages: DashMap::new(),
+            messages: papaya::HashMap::new(),
             pending: Mutex::new(BTreeMap::new()),
             in_flight_deadlines: Mutex::new(BTreeMap::new()),
-            consumer_in_flight: DashMap::new(),
+            consumer_in_flight: papaya::HashMap::new(),
             expires_at_deadlines: Mutex::new(BTreeMap::new()),
             delayed_index: Mutex::new(BTreeMap::new()),
             server_start_ms,
@@ -295,7 +294,7 @@ impl AckVariantState {
     }
 
     pub fn has_messages(&self) -> bool {
-        !self.messages.is_empty() || self.delayed_count() > 0
+        !self.messages.pin().is_empty() || self.delayed_count() > 0
     }
 
     /// Convert absolute timestamp to u32 offset from server start.
@@ -404,7 +403,7 @@ impl AckVariantState {
                 value_len,
             };
 
-            self.messages.insert(message_id, ack_meta);
+            self.messages.pin().insert(message_id, ack_meta);
             pending_batch.push((priority, message_id));
             pending_bytes_acc += value_len as u64;
 
@@ -482,23 +481,26 @@ impl AckVariantState {
 
         // Hold pending lock only for iteration + removal, no nested locks
         {
+            let guard = self.messages.pin();
             let mut pending = self.pending.lock();
             for (&(prio, msg_id), _) in pending.iter().rev() {
                 if delivered.len() >= max_count as usize {
                     break;
                 }
-                if let Some(mut msg) = self.messages.get_mut(&msg_id) {
+                if let Some(msg) = guard.get(&msg_id) {
                     if msg.state != MessageState::Pending {
                         continue;
                     }
                     if msg.deliver_after > current_time {
                         continue;
                     }
-                    msg.state = MessageState::InFlight;
-                    msg.consumer_id = Some(consumer_id);
-                    msg.attempts += 1;
-                    msg.last_delivered_at = Some(current_time);
-                    msg.visibility_deadline = Some(deadline);
+                    let mut updated = msg.clone();
+                    updated.state = MessageState::InFlight;
+                    updated.consumer_id = Some(consumer_id);
+                    updated.attempts += 1;
+                    updated.last_delivered_at = Some(current_time);
+                    updated.visibility_deadline = Some(deadline);
+                    guard.insert(msg_id, updated);
 
                     delivered.push(msg_id);
                     keys_to_remove.push((prio, msg_id));
@@ -523,10 +525,12 @@ impl AckVariantState {
             }
 
             // Track per-consumer in-flight
-            self.consumer_in_flight
-                .entry(consumer_id)
-                .or_default()
-                .extend(delivered.iter().copied());
+            {
+                let cif = self.consumer_in_flight.pin();
+                let mut set = cif.get(&consumer_id).cloned().unwrap_or_default();
+                set.extend(delivered.iter().copied());
+                cif.insert(consumer_id, set);
+            }
         }
 
         self.m_deliver_count.increment(count);
@@ -538,15 +542,20 @@ impl AckVariantState {
         let mut ack_count = 0u64;
         let mut ack_bytes = 0u64;
         let mut invalidate_min = false;
+        let msg_guard = self.messages.pin();
+        let cif_guard = self.consumer_in_flight.pin();
         for &msg_id in message_ids {
-            if let Some((_, meta)) = self.messages.remove(&msg_id) {
+            if let Some(meta) = msg_guard.get(&msg_id).cloned() {
+                msg_guard.remove(&msg_id);
                 if meta.state == MessageState::InFlight {
                     ack_count += 1;
                     ack_bytes += meta.value_len as u64;
                     // Remove from consumer in-flight tracking
                     if let Some(cid) = meta.consumer_id {
-                        if let Some(mut ids) = self.consumer_in_flight.get_mut(&cid) {
-                            ids.remove(&msg_id);
+                        if let Some(ids) = cif_guard.get(&cid) {
+                            let mut updated = ids.clone();
+                            updated.remove(&msg_id);
+                            cif_guard.insert(cid, updated);
                         }
                     }
                 }
@@ -573,18 +582,25 @@ impl AckVariantState {
     /// NACK messages — return to pending with attempt increment.
     pub fn apply_nack(&self, message_ids: &[u64]) {
         let mut pending_batch: SmallVec<[(u8, u64); 8]> = SmallVec::new();
+        let msg_guard = self.messages.pin();
+        let cif_guard = self.consumer_in_flight.pin();
         for &msg_id in message_ids {
-            if let Some(mut msg) = self.messages.get_mut(&msg_id) {
+            if let Some(msg) = msg_guard.get(&msg_id) {
                 if msg.state == MessageState::InFlight {
-                    msg.state = MessageState::Pending;
                     let cid = msg.consumer_id;
-                    msg.consumer_id = None;
-                    msg.visibility_deadline = None;
-                    pending_batch.push((msg.priority, msg_id));
+                    let priority = msg.priority;
+                    let mut updated = msg.clone();
+                    updated.state = MessageState::Pending;
+                    updated.consumer_id = None;
+                    updated.visibility_deadline = None;
+                    msg_guard.insert(msg_id, updated);
+                    pending_batch.push((priority, msg_id));
                     // Remove from consumer in-flight
                     if let Some(cid) = cid {
-                        if let Some(mut ids) = self.consumer_in_flight.get_mut(&cid) {
-                            ids.remove(&msg_id);
+                        if let Some(ids) = cif_guard.get(&cid) {
+                            let mut s = ids.clone();
+                            s.remove(&msg_id);
+                            cif_guard.insert(cid, s);
                         }
                     }
                 }
@@ -604,19 +620,26 @@ impl AckVariantState {
     /// RELEASE messages — return to pending WITHOUT attempt increment.
     pub fn apply_release(&self, message_ids: &[u64]) {
         let mut pending_batch: SmallVec<[(u8, u64); 8]> = SmallVec::new();
+        let msg_guard = self.messages.pin();
+        let cif_guard = self.consumer_in_flight.pin();
         for &msg_id in message_ids {
-            if let Some(mut msg) = self.messages.get_mut(&msg_id) {
+            if let Some(msg) = msg_guard.get(&msg_id) {
                 if msg.state == MessageState::InFlight {
-                    msg.state = MessageState::Pending;
                     let cid = msg.consumer_id;
-                    msg.consumer_id = None;
-                    msg.visibility_deadline = None;
+                    let priority = msg.priority;
+                    let mut updated = msg.clone();
+                    updated.state = MessageState::Pending;
+                    updated.consumer_id = None;
+                    updated.visibility_deadline = None;
                     // Decrement attempt count (release = no attempt charge)
-                    msg.attempts = msg.attempts.saturating_sub(1);
-                    pending_batch.push((msg.priority, msg_id));
+                    updated.attempts = updated.attempts.saturating_sub(1);
+                    msg_guard.insert(msg_id, updated);
+                    pending_batch.push((priority, msg_id));
                     if let Some(cid) = cid {
-                        if let Some(mut ids) = self.consumer_in_flight.get_mut(&cid) {
-                            ids.remove(&msg_id);
+                        if let Some(ids) = cif_guard.get(&cid) {
+                            let mut s = ids.clone();
+                            s.remove(&msg_id);
+                            cif_guard.insert(cid, s);
                         }
                     }
                 }
@@ -635,12 +658,15 @@ impl AckVariantState {
 
     /// Extend visibility timeout for in-flight messages.
     pub fn apply_extend_visibility(&self, message_ids: &[u64], extension_ms: u64) {
+        let guard = self.messages.pin();
         for &msg_id in message_ids {
-            if let Some(mut msg) = self.messages.get_mut(&msg_id) {
-                if msg.state == MessageState::InFlight {
-                    if let Some(ref mut deadline) = msg.visibility_deadline {
+            if let Some(msg) = guard.get(&msg_id) {
+                if msg.state == MessageState::InFlight && msg.visibility_deadline.is_some() {
+                    let mut updated = msg.clone();
+                    if let Some(ref mut deadline) = updated.visibility_deadline {
                         *deadline += extension_ms;
                     }
+                    guard.insert(msg_id, updated);
                 }
             }
         }
@@ -656,25 +682,34 @@ impl AckVariantState {
         let mut dead_lettered = SmallVec::new();
         let mut pending_batch: SmallVec<[(u8, u64); 8]> = SmallVec::new();
         let mut dlq_count = 0u64;
+        let msg_guard = self.messages.pin();
+        let cif_guard = self.consumer_in_flight.pin();
         for &msg_id in message_ids {
-            if let Some(mut msg) = self.messages.get_mut(&msg_id) {
+            if let Some(msg) = msg_guard.get(&msg_id) {
                 if msg.state != MessageState::InFlight {
                     continue;
                 }
                 if msg.attempts >= config.max_retries {
-                    msg.state = MessageState::DeadLetter;
+                    let mut updated = msg.clone();
+                    updated.state = MessageState::DeadLetter;
+                    msg_guard.insert(msg_id, updated);
                     dlq_count += 1;
                     dead_lettered.push(msg_id);
                 } else {
                     // Return to pending
-                    msg.state = MessageState::Pending;
                     let cid = msg.consumer_id;
-                    msg.consumer_id = None;
-                    msg.visibility_deadline = None;
-                    pending_batch.push((msg.priority, msg_id));
+                    let priority = msg.priority;
+                    let mut updated = msg.clone();
+                    updated.state = MessageState::Pending;
+                    updated.consumer_id = None;
+                    updated.visibility_deadline = None;
+                    msg_guard.insert(msg_id, updated);
+                    pending_batch.push((priority, msg_id));
                     if let Some(cid) = cid {
-                        if let Some(mut ids) = self.consumer_in_flight.get_mut(&cid) {
-                            ids.remove(&msg_id);
+                        if let Some(ids) = cif_guard.get(&cid) {
+                            let mut s = ids.clone();
+                            s.remove(&msg_id);
+                            cif_guard.insert(cid, s);
                         }
                     }
                 }
@@ -701,6 +736,7 @@ impl AckVariantState {
     /// Get in-flight message IDs for a consumer (for disconnect handling).
     pub fn consumer_in_flight_ids(&self, consumer_id: u64) -> SmallVec<[u64; 8]> {
         self.consumer_in_flight
+            .pin()
             .get(&consumer_id)
             .map(|ids| ids.iter().copied().collect())
             .unwrap_or_default()
@@ -708,8 +744,10 @@ impl AckVariantState {
 
     /// Remove dead-lettered messages after DLQ publish.
     pub fn apply_remove_dead_lettered(&self, message_ids: &SmallVec<[u64; 8]>) {
+        let guard = self.messages.pin();
         for &msg_id in message_ids {
-            if let Some((_, _meta)) = self.messages.remove(&msg_id) {
+            if guard.get(&msg_id).is_some() {
+                guard.remove(&msg_id);
                 self.dlq_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -718,8 +756,10 @@ impl AckVariantState {
 
     /// Expire pending messages that have exceeded their TTL.
     pub fn apply_expire_pending(&self, message_ids: &[u64]) {
+        let guard = self.messages.pin();
         for &msg_id in message_ids {
-            if let Some((_, _meta)) = self.messages.remove(&msg_id) {
+            if guard.get(&msg_id).is_some() {
+                guard.remove(&msg_id);
                 self.pending.lock().remove(&(0, msg_id));
                 self.pending_count.fetch_sub(1, Ordering::Relaxed);
             }
@@ -730,10 +770,10 @@ impl AckVariantState {
     /// Purge all messages.
     pub fn purge(&self) -> bool {
         let had_messages = self.has_messages();
-        self.messages.clear();
+        self.messages.pin().clear();
         self.pending.lock().clear();
         self.in_flight_deadlines.lock().clear();
-        self.consumer_in_flight.clear();
+        self.consumer_in_flight.pin().clear();
         self.expires_at_deadlines.lock().clear();
         self.delayed_index.lock().clear();
         self.pending_count.store(0, Ordering::Relaxed);
@@ -757,7 +797,7 @@ impl AckVariantState {
             return Some(cached);
         }
         // Recompute
-        let min = self.messages.iter().map(|e| e.message_id).min();
+        let min = self.messages.pin().iter().map(|(_, e)| e.message_id).min();
         match min {
             Some(v) => {
                 self.cached_min_required.store(v, Ordering::Relaxed);
@@ -847,7 +887,7 @@ impl AckVariantState {
             value_len,
         };
 
-        self.messages.insert(message_id, meta);
+        self.messages.pin().insert(message_id, meta);
         self.pending.lock().insert((priority, message_id), ());
         self.pending_count.fetch_add(1, Ordering::Relaxed);
         self.pending_bytes
@@ -916,7 +956,7 @@ impl AckVariantState {
     /// Build snapshot of Ack state.
     pub fn snapshot(&self) -> AckStateSnapshot {
         let messages: Vec<AckMessageMeta> =
-            self.messages.iter().map(|e| e.value().clone()).collect();
+            self.messages.pin().iter().map(|(_, e)| e.clone()).collect();
         let delayed_entries: Vec<(u32, Vec<u64>)> = self
             .delayed_index
             .lock()
@@ -932,6 +972,8 @@ impl AckVariantState {
 
     /// Restore from snapshot.
     pub fn restore(&self, snap: AckStateSnapshot, config: &AckVariantConfig) {
+        let msg_guard = self.messages.pin();
+        let cif_guard = self.consumer_in_flight.pin();
         for msg in snap.messages {
             let msg_id = msg.message_id;
             let prio = msg.priority;
@@ -939,7 +981,7 @@ impl AckVariantState {
             let consumer_id = msg.consumer_id;
             let value_len = msg.value_len as u64;
 
-            self.messages.insert(msg_id, msg);
+            msg_guard.insert(msg_id, msg);
 
             match state {
                 MessageState::Pending => {
@@ -951,10 +993,9 @@ impl AckVariantState {
                     self.in_flight_count.fetch_add(1, Ordering::Relaxed);
                     self.in_flight_bytes.fetch_add(value_len, Ordering::Relaxed);
                     if let Some(cid) = consumer_id {
-                        self.consumer_in_flight
-                            .entry(cid)
-                            .or_default()
-                            .insert(msg_id);
+                        let mut set = cif_guard.get(&cid).cloned().unwrap_or_default();
+                        set.insert(msg_id);
+                        cif_guard.insert(cid, set);
                     }
                 }
                 MessageState::DeadLetter => {
@@ -997,7 +1038,7 @@ pub struct ActorInMemory {
     pub(crate) last_activity_at: AtomicU64,
     pub(crate) attempts: AtomicU32,
     pub(crate) mailbox: Mutex<VecDeque<u64>>,
-    pub reply_to_map: DashMap<u64, Bytes>,
+    pub reply_to_map: papaya::HashMap<u64, Bytes>,
 }
 
 impl ActorInMemory {
@@ -1015,7 +1056,7 @@ impl ActorInMemory {
             last_activity_at: AtomicU64::new(current_time),
             attempts: AtomicU32::new(0),
             mailbox: Mutex::new(VecDeque::new()),
-            reply_to_map: DashMap::new(),
+            reply_to_map: papaya::HashMap::new(),
         }
     }
 
@@ -1033,7 +1074,7 @@ impl ActorInMemory {
             last_activity_at: AtomicU64::new(snap.last_activity_at),
             attempts: AtomicU32::new(snap.attempts),
             mailbox: Mutex::new(VecDeque::new()),
-            reply_to_map: DashMap::new(),
+            reply_to_map: papaya::HashMap::new(),
         }
     }
 
@@ -1090,8 +1131,8 @@ impl ActorInMemory {
 
 /// In-memory Actor variant state (migrated from ActorNamespaceState).
 pub struct ActorVariantState {
-    pub actors: DashMap<Bytes, ActorInMemory>,
-    pub consumer_assignments: DashMap<u64, HashSet<Bytes>>,
+    pub actors: papaya::HashMap<Bytes, Arc<ActorInMemory>>,
+    pub consumer_assignments: papaya::HashMap<u64, HashSet<Bytes>>,
     active_count: AtomicU64,
     cached_min_required: AtomicU64,
     // Pre-initialized metrics
@@ -1108,8 +1149,8 @@ impl ActorVariantState {
             ("group", group_name.to_owned()),
         ];
         Self {
-            actors: DashMap::new(),
-            consumer_assignments: DashMap::new(),
+            actors: papaya::HashMap::new(),
+            consumer_assignments: papaya::HashMap::new(),
             active_count: AtomicU64::new(0),
             cached_min_required: AtomicU64::new(MIN_NONE),
             m_send_count: metrics::counter!("mq.actor.send.count", &labels),
@@ -1135,10 +1176,16 @@ impl ActorVariantState {
         value_len: u32,
     ) -> Result<(), MqError> {
         let max_depth = config.max_mailbox_depth;
-        let actor = self.actors.entry(actor_id.clone()).or_insert_with(|| {
-            self.active_count.fetch_add(1, Ordering::Relaxed);
-            ActorInMemory::new(group_id, actor_id.clone(), current_time)
-        });
+        let guard = self.actors.pin();
+        let actor = match guard.get(actor_id) {
+            Some(a) => a.clone(),
+            None => {
+                self.active_count.fetch_add(1, Ordering::Relaxed);
+                let a = Arc::new(ActorInMemory::new(group_id, actor_id.clone(), current_time));
+                guard.insert(actor_id.clone(), a.clone());
+                a
+            }
+        };
 
         let pending = actor.pending_count();
         if pending >= max_depth {
@@ -1167,7 +1214,7 @@ impl ActorVariantState {
 
         actor.mailbox.lock().push_back(log_index);
         if let Some(rt) = reply_to {
-            actor.reply_to_map.insert(log_index, rt);
+            actor.reply_to_map.pin().insert(log_index, rt);
         }
         actor.pending_count.fetch_add(1, Ordering::Relaxed);
         actor
@@ -1199,7 +1246,7 @@ impl ActorVariantState {
     }
 
     pub fn apply_deliver(&self, actor_id: &Bytes, consumer_id: u64, value_len: u32) -> Option<u64> {
-        let actor = self.actors.get(actor_id)?;
+        let actor = self.actors.pin().get(actor_id)?.clone();
         if actor.assigned_consumer_id() != Some(consumer_id) {
             return None;
         }
@@ -1224,7 +1271,7 @@ impl ActorVariantState {
     }
 
     pub fn apply_ack(&self, actor_id: &Bytes, message_id: u64, value_len: u32) -> Option<Bytes> {
-        if let Some(actor) = self.actors.get(actor_id) {
+        if let Some(actor) = self.actors.pin().get(actor_id) {
             if actor.in_flight_index() == Some(message_id) {
                 actor.in_flight_index.store(NONE_U64, Ordering::Relaxed);
                 actor.attempts.store(0, Ordering::Relaxed);
@@ -1232,7 +1279,9 @@ impl ActorVariantState {
                 actor
                     .in_flight_bytes
                     .fetch_sub(bytes.min(actor.in_flight_bytes()), Ordering::Relaxed);
-                let reply_to = actor.reply_to_map.remove(&message_id).map(|(_, v)| v);
+                let rt_guard = actor.reply_to_map.pin();
+                let reply_to = rt_guard.get(&message_id).cloned();
+                rt_guard.remove(&message_id);
                 if let Some(&next) = actor.mailbox.lock().front() {
                     actor.tail_index.store(next, Ordering::Relaxed);
                 }
@@ -1248,7 +1297,7 @@ impl ActorVariantState {
     }
 
     pub fn apply_nack(&self, actor_id: &Bytes, message_id: u64, value_len: u32) {
-        if let Some(actor) = self.actors.get(actor_id) {
+        if let Some(actor) = self.actors.pin().get(actor_id) {
             if actor.in_flight_index() == Some(message_id) {
                 actor.mailbox.lock().push_front(message_id);
                 actor.in_flight_index.store(NONE_U64, Ordering::Relaxed);
@@ -1263,21 +1312,27 @@ impl ActorVariantState {
     }
 
     pub fn apply_assign(&self, consumer_id: u64, actor_ids: &[Bytes]) {
-        let mut set = self.consumer_assignments.entry(consumer_id).or_default();
+        let ca_guard = self.consumer_assignments.pin();
+        let actors_guard = self.actors.pin();
+        let mut set = ca_guard.get(&consumer_id).cloned().unwrap_or_default();
         for actor_id in actor_ids {
-            if let Some(actor) = self.actors.get(actor_id) {
+            if let Some(actor) = actors_guard.get(actor_id) {
                 actor
                     .assigned_consumer_id
                     .store(consumer_id, Ordering::Relaxed);
                 set.insert(actor_id.clone());
             }
         }
+        ca_guard.insert(consumer_id, set);
     }
 
     pub fn apply_release(&self, consumer_id: u64) {
-        if let Some((_, actor_ids)) = self.consumer_assignments.remove(&consumer_id) {
+        let ca_guard = self.consumer_assignments.pin();
+        if let Some(actor_ids) = ca_guard.get(&consumer_id).cloned() {
+            ca_guard.remove(&consumer_id);
+            let actors_guard = self.actors.pin();
             for actor_id in &actor_ids {
-                if let Some(actor) = self.actors.get(actor_id) {
+                if let Some(actor) = actors_guard.get(actor_id) {
                     actor
                         .assigned_consumer_id
                         .store(NONE_U64, Ordering::Relaxed);
@@ -1296,17 +1351,21 @@ impl ActorVariantState {
     }
 
     pub fn apply_evict_idle(&self, before_timestamp: u64) -> usize {
-        let before = self.actors.len();
-        self.actors.retain(|_, actor| {
-            let keep = actor.pending_count() > 0
-                || actor.in_flight_index().is_some()
-                || actor.last_activity_at() >= before_timestamp;
-            if !keep {
-                self.active_count.fetch_sub(1, Ordering::Relaxed);
-            }
-            keep
-        });
-        let count = before - self.actors.len();
+        let guard = self.actors.pin();
+        let to_remove: Vec<Bytes> = guard
+            .iter()
+            .filter(|(_, actor)| {
+                actor.pending_count() == 0
+                    && actor.in_flight_index().is_none()
+                    && actor.last_activity_at() < before_timestamp
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = to_remove.len();
+        for key in &to_remove {
+            guard.remove(key);
+            self.active_count.fetch_sub(1, Ordering::Relaxed);
+        }
         if count > 0 {
             self.cached_min_required.store(MIN_DIRTY, Ordering::Relaxed);
         }
@@ -1316,13 +1375,13 @@ impl ActorVariantState {
 
     pub fn unassigned_actors_with_messages(&self) -> Vec<Bytes> {
         self.actors
+            .pin()
             .iter()
-            .filter(|entry| {
-                let a = entry.value();
+            .filter(|(_, a)| {
                 a.assigned_consumer_id().is_none()
                     && (a.pending_count() > 0 || a.in_flight_index().is_some())
             })
-            .map(|entry| entry.key().clone())
+            .map(|(k, _)| k.clone())
             .collect()
     }
 
@@ -1335,8 +1394,7 @@ impl ActorVariantState {
             return Some(cached);
         }
         let mut min: Option<u64> = None;
-        for entry in self.actors.iter() {
-            let actor = entry.value();
+        for (_, actor) in self.actors.pin().iter() {
             if actor.pending_count() > 0 || actor.in_flight_index().is_some() {
                 let actor_min = actor
                     .in_flight_index()
@@ -1359,17 +1417,19 @@ impl ActorVariantState {
     pub fn snapshot(&self) -> ActorStateSnapshot {
         let actors: Vec<ActorSnapshot> = self
             .actors
+            .pin()
             .iter()
-            .map(|entry| entry.value().snapshot_state())
+            .map(|(_, actor)| actor.snapshot_state())
             .collect();
         ActorStateSnapshot { actors }
     }
 
     pub fn restore(&self, snap: ActorStateSnapshot, group_id: u64) {
+        let guard = self.actors.pin();
         for actor_snap in snap.actors {
-            self.actors.insert(
+            guard.insert(
                 actor_snap.actor_id.clone(),
-                ActorInMemory::from_snapshot(group_id, actor_snap),
+                Arc::new(ActorInMemory::from_snapshot(group_id, actor_snap)),
             );
             self.active_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -1399,8 +1459,8 @@ pub struct ConsumerGroupState {
     // ── Lock-free complex state ──
     leader: ArcSwapOption<String>,
     protocol_name: ArcSwap<String>,
-    members: DashMap<String, GroupMemberState>,
-    pub(crate) offsets: DashMap<(u64, u32), GroupTopicPartitionOffset>,
+    members: papaya::HashMap<String, Arc<GroupMemberState>>,
+    pub(crate) offsets: papaya::HashMap<(u64, u32), GroupTopicPartitionOffset>,
 
     /// Variant-specific state.
     pub(crate) variant_state: VariantState,
@@ -1447,8 +1507,8 @@ impl ConsumerGroupState {
             phase: AtomicU8::new(meta.phase as u8),
             leader: ArcSwapOption::new(meta.leader.clone().map(Arc::new)),
             protocol_name: ArcSwap::new(Arc::new(meta.protocol_name.clone())),
-            members: DashMap::new(),
-            offsets: DashMap::new(),
+            members: papaya::HashMap::new(),
+            offsets: papaya::HashMap::new(),
             variant_state,
             phase_notify: Arc::new(tokio::sync::Notify::new()),
             m_offset_commits: metrics::counter!("mq.consumer_group.offset_commits", "catalog" => catalog.clone(), "group" => name.clone()),
@@ -1468,32 +1528,38 @@ impl ConsumerGroupState {
         let last_activity = meta.last_activity_at;
         let state = Self::new(meta, catalog_name, server_start_ms);
 
-        for m in snapshot_members {
-            let protocols: SmallVec<[(String, Bytes); 2]> = m
-                .protocols
-                .into_iter()
-                .map(|(n, d)| (n, Bytes::from(d)))
-                .collect();
-            let member_id = m.member_id;
-            state.members.insert(
-                member_id.clone(),
-                GroupMemberState {
-                    member_id,
-                    client_id: m.client_id,
-                    session_timeout_ms: m.session_timeout_ms,
-                    rebalance_timeout_ms: m.rebalance_timeout_ms,
-                    protocol_type: m.protocol_type,
-                    protocols,
-                    assignment: RwLock::new(Bytes::from(m.assignment)),
-                    last_heartbeat_at: AtomicU64::new(last_activity),
-                    joined_this_gen: AtomicBool::new(false),
-                    synced_this_gen: AtomicBool::new(false),
-                },
-            );
+        {
+            let members_guard = state.members.pin();
+            for m in snapshot_members {
+                let protocols: SmallVec<[(String, Bytes); 2]> = m
+                    .protocols
+                    .into_iter()
+                    .map(|(n, d)| (n, Bytes::from(d)))
+                    .collect();
+                let member_id = m.member_id;
+                members_guard.insert(
+                    member_id.clone(),
+                    Arc::new(GroupMemberState {
+                        member_id,
+                        client_id: m.client_id,
+                        session_timeout_ms: m.session_timeout_ms,
+                        rebalance_timeout_ms: m.rebalance_timeout_ms,
+                        protocol_type: m.protocol_type,
+                        protocols,
+                        assignment: RwLock::new(Bytes::from(m.assignment)),
+                        last_heartbeat_at: AtomicU64::new(last_activity),
+                        joined_this_gen: AtomicBool::new(false),
+                        synced_this_gen: AtomicBool::new(false),
+                    }),
+                );
+            }
         }
 
-        for o in offsets {
-            state.offsets.insert((o.topic_id, o.partition_index), o);
+        {
+            let offsets_guard = state.offsets.pin();
+            for o in offsets {
+                offsets_guard.insert((o.topic_id, o.partition_index), o);
+            }
         }
 
         state
@@ -1563,12 +1629,12 @@ impl ConsumerGroupState {
 
     #[inline]
     pub fn member_count(&self) -> usize {
-        self.members.len()
+        self.members.pin().len()
     }
 
     #[inline]
     pub fn has_member(&self, member_id: &str) -> bool {
-        self.members.contains_key(member_id)
+        self.members.pin().get(member_id).is_some()
     }
 
     #[inline]
@@ -1579,6 +1645,7 @@ impl ConsumerGroupState {
     #[inline]
     pub fn get_offset(&self, topic_id: u64, partition_index: u32) -> Option<u64> {
         self.offsets
+            .pin()
             .get(&(topic_id, partition_index))
             .map(|o| o.committed_offset)
     }
@@ -1586,6 +1653,7 @@ impl ConsumerGroupState {
     #[inline]
     pub fn get_member_assignment(&self, member_id: &str) -> Option<Bytes> {
         self.members
+            .pin()
             .get(member_id)
             .map(|m| m.assignment.read().clone())
     }
@@ -1593,9 +1661,9 @@ impl ConsumerGroupState {
     pub fn member_protocols(&self) -> Vec<(String, Bytes)> {
         let chosen = self.protocol_name.load();
         self.members
+            .pin()
             .iter()
-            .map(|entry| {
-                let m = entry.value();
+            .map(|(_, m)| {
                 let meta_bytes = m
                     .protocols
                     .iter()
@@ -1609,35 +1677,37 @@ impl ConsumerGroupState {
 
     pub fn find_expired_members(&self, now_ms: u64) -> SmallVec<[String; 4]> {
         self.members
+            .pin()
             .iter()
-            .filter(|entry| {
-                let m = entry.value();
+            .filter(|(_, m)| {
                 let timeout = m.session_timeout_ms as u64;
                 let last = m.last_heartbeat_at.load(Ordering::Relaxed);
                 now_ms > last + timeout
             })
-            .map(|entry| entry.key().clone())
+            .map(|(k, _)| k.clone())
             .collect()
     }
 
     #[inline]
     pub fn all_members_joined(&self) -> bool {
-        if self.members.is_empty() {
+        let guard = self.members.pin();
+        if guard.is_empty() {
             return false;
         }
-        self.members
+        guard
             .iter()
-            .all(|e| e.value().joined_this_gen.load(Ordering::Relaxed))
+            .all(|(_, e)| e.joined_this_gen.load(Ordering::Relaxed))
     }
 
     #[inline]
     pub fn all_members_synced(&self) -> bool {
-        if self.members.is_empty() {
+        let guard = self.members.pin();
+        if guard.is_empty() {
             return false;
         }
-        self.members
+        guard
             .iter()
-            .all(|e| e.value().synced_this_gen.load(Ordering::Relaxed))
+            .all(|(_, e)| e.synced_this_gen.load(Ordering::Relaxed))
     }
 
     // ── Writers ──
@@ -1678,64 +1748,61 @@ impl ConsumerGroupState {
 
     #[inline]
     pub fn upsert_member(&self, member: GroupMemberState) {
-        self.members.insert(member.member_id.clone(), member);
+        self.members
+            .pin()
+            .insert(member.member_id.clone(), Arc::new(member));
     }
 
     #[inline]
     pub fn remove_member(&self, member_id: &str) {
-        self.members.remove(member_id);
+        self.members.pin().remove(member_id);
     }
 
     #[inline]
     pub fn mark_joined(&self, member_id: &str) {
-        if let Some(m) = self.members.get(member_id) {
+        if let Some(m) = self.members.pin().get(member_id) {
             m.joined_this_gen.store(true, Ordering::Relaxed);
         }
     }
 
     #[inline]
     pub fn mark_synced(&self, member_id: &str) {
-        if let Some(m) = self.members.get(member_id) {
+        if let Some(m) = self.members.pin().get(member_id) {
             m.synced_this_gen.store(true, Ordering::Relaxed);
         }
     }
 
     pub fn clear_join_marks(&self) {
-        for entry in self.members.iter() {
-            entry
-                .value()
-                .joined_this_gen
-                .store(false, Ordering::Relaxed);
+        for (_, m) in self.members.pin().iter() {
+            m.joined_this_gen.store(false, Ordering::Relaxed);
         }
     }
 
     pub fn clear_sync_marks(&self) {
-        for entry in self.members.iter() {
-            entry
-                .value()
-                .synced_this_gen
-                .store(false, Ordering::Relaxed);
+        for (_, m) in self.members.pin().iter() {
+            m.synced_this_gen.store(false, Ordering::Relaxed);
         }
     }
 
     #[inline]
     pub fn set_member_assignment(&self, member_id: &str, assignment: Bytes) {
-        if let Some(m) = self.members.get(member_id) {
+        if let Some(m) = self.members.pin().get(member_id) {
             *m.assignment.write() = assignment;
         }
     }
 
     #[inline]
     pub fn update_member_heartbeat(&self, member_id: &str, at: u64) {
-        if let Some(m) = self.members.get(member_id) {
+        if let Some(m) = self.members.pin().get(member_id) {
             m.last_heartbeat_at.store(at, Ordering::Relaxed);
         }
     }
 
     pub fn select_and_set_protocol(&self) {
         let mut counts: SmallVec<[(String, usize); 8]> = SmallVec::new();
-        for entry in self.members.iter() {
-            for (name, _) in entry.value().protocols.iter() {
+        let guard = self.members.pin();
+        for (_, m) in guard.iter() {
+            for (name, _) in m.protocols.iter() {
                 if let Some(c) = counts.iter_mut().find(|(n, _)| n == name) {
                     c.1 += 1;
                 } else {
@@ -1743,7 +1810,7 @@ impl ConsumerGroupState {
                 }
             }
         }
-        let member_count = self.members.len();
+        let member_count = guard.len();
         if let Some((name, _)) = counts
             .iter()
             .filter(|(_, c)| *c == member_count)
@@ -1758,9 +1825,10 @@ impl ConsumerGroupState {
     pub fn elect_leader(&self) {
         let leader = self
             .members
+            .pin()
             .iter()
             .next()
-            .map(|e| Arc::new(e.key().clone()));
+            .map(|(k, _)| Arc::new(k.clone()));
         self.leader.store(leader);
     }
 
@@ -1779,22 +1847,20 @@ impl ConsumerGroupState {
     pub fn snapshot_meta(&self) -> ConsumerGroupMeta {
         let members: Vec<GroupMemberMeta> = self
             .members
+            .pin()
             .iter()
-            .map(|entry| {
-                let ms = entry.value();
-                GroupMemberMeta {
-                    member_id: ms.member_id.clone(),
-                    client_id: ms.client_id.clone(),
-                    session_timeout_ms: ms.session_timeout_ms,
-                    rebalance_timeout_ms: ms.rebalance_timeout_ms,
-                    protocol_type: ms.protocol_type.clone(),
-                    protocols: ms
-                        .protocols
-                        .iter()
-                        .map(|(n, d)| (n.clone(), d.to_vec()))
-                        .collect(),
-                    assignment: ms.assignment.read().to_vec(),
-                }
+            .map(|(_, ms)| GroupMemberMeta {
+                member_id: ms.member_id.clone(),
+                client_id: ms.client_id.clone(),
+                session_timeout_ms: ms.session_timeout_ms,
+                rebalance_timeout_ms: ms.rebalance_timeout_ms,
+                protocol_type: ms.protocol_type.clone(),
+                protocols: ms
+                    .protocols
+                    .iter()
+                    .map(|(n, d)| (n.clone(), d.to_vec()))
+                    .collect(),
+                assignment: ms.assignment.read().to_vec(),
             })
             .collect();
 
@@ -1948,17 +2014,14 @@ mod tests {
         let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
 
         // Check attempts before release
-        let meta = ack.messages.get(&delivered[0]).unwrap();
-        assert_eq!(meta.attempts, 1);
-        drop(meta);
+        assert_eq!(ack.messages.pin().get(&delivered[0]).unwrap().attempts, 1);
 
         ack.apply_release(&delivered);
         assert_eq!(ack.pending_count(), 1);
         assert_eq!(ack.in_flight_count(), 0);
 
         // Release should not increment attempts
-        let meta = ack.messages.get(&delivered[0]).unwrap();
-        assert_eq!(meta.attempts, 0); // decremented back
+        assert_eq!(ack.messages.pin().get(&delivered[0]).unwrap().attempts, 0); // decremented back
     }
 
     #[test]
@@ -2174,15 +2237,23 @@ mod tests {
         let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
         assert_eq!(delivered.len(), 1);
 
-        let meta = ack.messages.get(&delivered[0]).unwrap();
-        let original_deadline = meta.visibility_deadline.unwrap();
-        drop(meta);
+        let original_deadline = ack
+            .messages
+            .pin()
+            .get(&delivered[0])
+            .unwrap()
+            .visibility_deadline
+            .unwrap();
 
         ack.apply_extend_visibility(&delivered, 10_000);
 
-        let meta = ack.messages.get(&delivered[0]).unwrap();
         assert_eq!(
-            meta.visibility_deadline.unwrap(),
+            ack.messages
+                .pin()
+                .get(&delivered[0])
+                .unwrap()
+                .visibility_deadline
+                .unwrap(),
             original_deadline + 10_000
         );
     }
@@ -2239,7 +2310,7 @@ mod tests {
 
         ack.apply_remove_dead_lettered(&dlq);
         assert_eq!(ack.dlq_count(), 0);
-        assert!(ack.messages.is_empty());
+        assert!(ack.messages.pin().is_empty());
     }
 
     #[test]
@@ -2254,7 +2325,7 @@ mod tests {
 
         ack.apply_expire_pending(&[100]);
         assert_eq!(ack.pending_count(), 0);
-        assert!(ack.messages.is_empty());
+        assert!(ack.messages.pin().is_empty());
     }
 
     #[test]
@@ -2277,7 +2348,7 @@ mod tests {
         assert_eq!(ack.in_flight_count(), 0);
         assert_eq!(ack.dlq_count(), 0);
         assert_eq!(ack.delayed_count(), 0);
-        assert!(ack.messages.is_empty());
+        assert!(ack.messages.pin().is_empty());
 
         // Purge empty returns false
         let had = ack.purge();
@@ -2425,7 +2496,7 @@ mod tests {
 
         assert_eq!(ack2.pending_count(), 2);
         assert_eq!(ack2.in_flight_count(), 1);
-        assert_eq!(ack2.messages.len(), 3);
+        assert_eq!(ack2.messages.pin().len(), 3);
         assert_eq!(ack2.total_messages.load(Ordering::Relaxed), 3);
     }
 
@@ -2474,10 +2545,11 @@ mod tests {
         let msg = build_msg(b"data");
         ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
         let delivered = ack.apply_deliver(&config, 42, 10, 2000, 200);
-        assert_eq!(ack.messages.get(&100).unwrap().consumer_id, Some(42));
+        assert_eq!(ack.messages.pin().get(&100).unwrap().consumer_id, Some(42));
 
         ack.apply_nack(&delivered);
-        let meta = ack.messages.get(&100).unwrap();
+        let guard = ack.messages.pin();
+        let meta = guard.get(&100).unwrap();
         assert_eq!(meta.consumer_id, None);
         assert_eq!(meta.state, MessageState::Pending);
     }
@@ -2550,7 +2622,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(actor_state.active_count(), 1);
 
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.pending_count(), 1);
         assert_eq!(actor.pending_bytes(), 50);
         assert_eq!(actor.head_index.load(Ordering::Relaxed), 100);
@@ -2570,7 +2642,7 @@ mod tests {
                 .unwrap();
         }
 
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.pending_count(), 5);
         assert_eq!(actor.pending_bytes(), 50);
         assert_eq!(actor.tail_index.load(Ordering::Relaxed), 100);
@@ -2644,7 +2716,7 @@ mod tests {
         let msg = actor_state.apply_deliver(&actor_id, 42, 50);
         assert_eq!(msg, Some(100));
 
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.pending_count(), 0);
         assert_eq!(actor.in_flight_index(), Some(100));
         assert_eq!(actor.pending_bytes(), 0);
@@ -2744,7 +2816,7 @@ mod tests {
         let reply = actor_state.apply_ack(&actor_id, 100, 50);
         assert_eq!(reply, None); // No reply_to was set
 
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.in_flight_index(), None);
         assert_eq!(actor.attempts(), 0);
         assert_eq!(actor.in_flight_bytes(), 0);
@@ -2785,7 +2857,7 @@ mod tests {
         let reply = actor_state.apply_ack(&actor_id, 999, 50);
         assert_eq!(reply, None);
         // In-flight should still be set
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.in_flight_index(), Some(100));
     }
 
@@ -2804,7 +2876,7 @@ mod tests {
 
         actor_state.apply_nack(&actor_id, 100, 50);
 
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.in_flight_index(), None);
         assert_eq!(actor.pending_count(), 1); // returned to mailbox
         assert_eq!(actor.in_flight_bytes(), 0);
@@ -2830,12 +2902,17 @@ mod tests {
 
         actor_state.apply_assign(42, &[a1.clone(), a2.clone()]);
 
-        let actor1 = actor_state.actors.get(&a1).unwrap();
+        let actor1 = actor_state.actors.pin().get(&a1).unwrap().clone();
         assert_eq!(actor1.assigned_consumer_id(), Some(42));
-        let actor2 = actor_state.actors.get(&a2).unwrap();
+        let actor2 = actor_state.actors.pin().get(&a2).unwrap().clone();
         assert_eq!(actor2.assigned_consumer_id(), Some(42));
 
-        let assignments = actor_state.consumer_assignments.get(&42).unwrap();
+        let assignments = actor_state
+            .consumer_assignments
+            .pin()
+            .get(&42)
+            .unwrap()
+            .clone();
         assert!(assignments.contains(&a1));
         assert!(assignments.contains(&a2));
     }
@@ -2853,7 +2930,7 @@ mod tests {
         actor_state.apply_assign(42, &[actor_id.clone()]);
         actor_state.apply_deliver(&actor_id, 42, 50);
 
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.in_flight_index(), Some(100));
         assert_eq!(actor.in_flight_bytes(), 50);
         drop(actor);
@@ -2861,14 +2938,14 @@ mod tests {
         // Release consumer 42 → in-flight returns to pending
         actor_state.apply_release(42);
 
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.assigned_consumer_id(), None);
         assert_eq!(actor.in_flight_index(), None);
         assert_eq!(actor.pending_count(), 1); // returned to mailbox
         assert_eq!(actor.in_flight_bytes(), 0);
         assert!(actor.pending_bytes() > 0);
 
-        assert!(actor_state.consumer_assignments.get(&42).is_none());
+        assert!(actor_state.consumer_assignments.pin().get(&42).is_none());
     }
 
     #[test]
@@ -2895,8 +2972,8 @@ mod tests {
         // Evict actors idle before timestamp 1000
         let count = actor_state.apply_evict_idle(1000);
         assert_eq!(count, 1);
-        assert!(actor_state.actors.get(&idle).is_none());
-        assert!(actor_state.actors.get(&active).is_some());
+        assert!(actor_state.actors.pin().get(&idle).is_none());
+        assert!(actor_state.actors.pin().get(&active).is_some());
         assert_eq!(actor_state.active_count(), 1);
     }
 
@@ -2914,7 +2991,7 @@ mod tests {
         // Actor has pending messages, so evict should keep it even if idle
         let count = actor_state.apply_evict_idle(1000);
         assert_eq!(count, 0);
-        assert!(actor_state.actors.get(&actor_id).is_some());
+        assert!(actor_state.actors.pin().get(&actor_id).is_some());
     }
 
     #[test]
@@ -3003,7 +3080,7 @@ mod tests {
         actor_state2.restore(snap, 2);
 
         assert_eq!(actor_state2.active_count(), 2);
-        let a1_restored = actor_state2.actors.get(&a1).unwrap();
+        let a1_restored = actor_state2.actors.pin().get(&a1).unwrap().clone();
         assert_eq!(a1_restored.pending_count(), 2);
         assert_eq!(a1_restored.assigned_consumer_id(), Some(42));
         assert_eq!(a1_restored.pending_bytes(), 100);
@@ -3019,7 +3096,7 @@ mod tests {
         actor_state
             .apply_send(&config, 1, &actor_id, 100, 1000, None, 100)
             .unwrap();
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.pending_bytes(), 100);
         assert_eq!(actor.in_flight_bytes(), 0);
         drop(actor);
@@ -3027,13 +3104,13 @@ mod tests {
         actor_state.apply_assign(42, &[actor_id.clone()]);
         actor_state.apply_deliver(&actor_id, 42, 100);
 
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.pending_bytes(), 0);
         assert_eq!(actor.in_flight_bytes(), 100);
         drop(actor);
 
         actor_state.apply_ack(&actor_id, 100, 100);
-        let actor = actor_state.actors.get(&actor_id).unwrap();
+        let actor = actor_state.actors.pin().get(&actor_id).unwrap().clone();
         assert_eq!(actor.pending_bytes(), 0);
         assert_eq!(actor.in_flight_bytes(), 0);
     }
@@ -3065,9 +3142,9 @@ mod tests {
 
         // Ack independently
         actor_state.apply_ack(&a1, 100, 10);
-        let a1_ref = actor_state.actors.get(&a1).unwrap();
+        let a1_ref = actor_state.actors.pin().get(&a1).unwrap().clone();
         assert_eq!(a1_ref.in_flight_index(), None);
-        let a2_ref = actor_state.actors.get(&a2).unwrap();
+        let a2_ref = actor_state.actors.pin().get(&a2).unwrap().clone();
         assert_eq!(a2_ref.in_flight_index(), Some(101));
     }
 
@@ -3130,7 +3207,7 @@ mod tests {
 
         assert!(group.get_offset(10, 0).is_none());
 
-        group.offsets.insert(
+        group.offsets.pin().insert(
             (10, 0),
             GroupTopicPartitionOffset {
                 topic_id: 10,
@@ -3244,7 +3321,7 @@ mod tests {
         group.bump_generation();
         group.set_phase(GroupPhase::Stable);
         group.set_leader(Some("m-1".to_string()));
-        group.offsets.insert(
+        group.offsets.pin().insert(
             (10, 0),
             GroupTopicPartitionOffset {
                 topic_id: 10,
@@ -3257,7 +3334,7 @@ mod tests {
 
         let meta = group.snapshot_meta();
         let offsets: Vec<GroupTopicPartitionOffset> =
-            group.offsets.iter().map(|e| e.value().clone()).collect();
+            group.offsets.pin().iter().map(|(_, e)| e.clone()).collect();
 
         let restored = ConsumerGroupState::from_snapshot(meta, offsets, "test", 0);
         assert_eq!(restored.generation(), 1);
@@ -3310,7 +3387,7 @@ mod tests {
         actor_state2.restore(snap, 1);
 
         assert_eq!(actor_state2.active_count(), 1);
-        let a1_ref = actor_state2.actors.get(&a1).unwrap();
+        let a1_ref = actor_state2.actors.pin().get(&a1).unwrap().clone();
         assert_eq!(a1_ref.pending_count(), 1);
         assert_eq!(a1_ref.assigned_consumer_id(), Some(42));
     }

@@ -1669,6 +1669,7 @@ mod tests {
         let topic_meta = tmp_engine
             .metadata()
             .topics
+            .pin()
             .get(&1)
             .unwrap()
             .snapshot_meta();
@@ -1730,6 +1731,7 @@ mod tests {
         let topic_meta = tmp_engine2
             .metadata()
             .topics
+            .pin()
             .get(&1)
             .unwrap()
             .snapshot_meta();

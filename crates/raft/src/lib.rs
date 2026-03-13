@@ -42,6 +42,7 @@ pub use storage_mmap::MmapPerGroupLogStorage as MultiplexedLogStorage;
 pub use storage_mmap::MmapStorageConfig;
 pub use storage_mmap::MmapStorageConfig as MultiplexedStorageConfig;
 pub use storage_mmap::SegmentPrefetcher;
+pub use storage_mmap::SegmentView;
 pub use transport_tcp::{
     BisqueTcpTransport, BisqueTcpTransportConfig, BisqueTransportError, BoxedReader, BoxedWriter,
     DefaultNodeRegistry, NodeAddressResolver,

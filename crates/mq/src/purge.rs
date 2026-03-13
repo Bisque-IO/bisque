@@ -11,15 +11,17 @@ impl MqEngine {
         let mut min_index = u64::MAX;
         let meta = self.metadata();
 
-        for entry in meta.topics.iter() {
-            let t_min = entry.value().min_required_index();
+        let topics_guard = meta.topics.pin();
+        for (_, topic) in topics_guard.iter() {
+            let t_min = topic.min_required_index();
             if t_min > 0 {
                 min_index = min_index.min(t_min);
             }
         }
 
-        for entry in meta.consumer_groups.iter() {
-            let cg = entry.value();
+        let cg_guard = meta.consumer_groups.pin();
+        for (_, cg) in cg_guard.iter() {
+            let cg = cg;
             let cg_min = match &cg.variant_state {
                 VariantState::Offset => None,
                 VariantState::Ack(s) => s.min_required_index(),
@@ -34,7 +36,7 @@ impl MqEngine {
     }
 
     /// Return the cached purge floor. Recomputes only if dirty.
-    pub fn compute_purge_floor(&mut self) -> u64 {
+    pub fn compute_purge_floor(&self) -> u64 {
         let meta = self.metadata();
         if meta.purge_floor_dirty.load(Ordering::Relaxed) {
             let floor = self.recompute_purge_floor();

@@ -2415,7 +2415,8 @@ fn test_ack_release_returns_without_attempt_increment() {
     assert_eq!(ack.pending_count(), 1);
     assert_eq!(ack.in_flight_count(), 0);
     // Attempt count should be back to 0 (release decrements)
-    let meta = ack.messages.get(&msg_id).unwrap();
+    let msgs_guard = ack.messages.pin();
+    let meta = msgs_guard.get(&msg_id).unwrap();
     assert_eq!(meta.attempts, 0);
 }
 
@@ -2533,7 +2534,8 @@ fn test_ack_extend_visibility_via_engine() {
     // Verify deadline extended
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let ack = group.ack_state().unwrap();
-    let meta = ack.messages.get(&msg_id).unwrap();
+    let msgs_guard = ack.messages.pin();
+    let meta = msgs_guard.get(&msg_id).unwrap();
     // Original deadline was 1002 + 30000 = 31002, extended by 60000 = 91002
     assert!(meta.visibility_deadline.unwrap() > 31002);
 }
@@ -2704,7 +2706,8 @@ fn test_actor_group_assign_deliver_ack() {
     // Verify actor state
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let actor_state = group.actor_state().unwrap();
-    let actor = actor_state.actors.get(&actor_id).unwrap();
+    let actors_guard = actor_state.actors.pin();
+    let actor = actors_guard.get(&actor_id).unwrap();
     assert_eq!(actor.in_flight_index(), None);
     assert_eq!(actor.pending_count(), 0);
 }
@@ -2769,7 +2772,8 @@ fn test_actor_nack_returns_to_mailbox() {
     // Verify returned to mailbox
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let actor_state = group.actor_state().unwrap();
-    let actor = actor_state.actors.get(&actor_id).unwrap();
+    let actors_guard = actor_state.actors.pin();
+    let actor = actors_guard.get(&actor_id).unwrap();
     assert_eq!(actor.in_flight_index(), None);
     assert_eq!(actor.pending_count(), 1);
 }
@@ -2829,7 +2833,8 @@ fn test_actor_release_unassigns() {
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let actor_state = group.actor_state().unwrap();
-    let actor = actor_state.actors.get(&actor_id).unwrap();
+    let actors_guard = actor_state.actors.pin();
+    let actor = actors_guard.get(&actor_id).unwrap();
     assert_eq!(actor.assigned_consumer_id(), None);
     assert_eq!(actor.in_flight_index(), None);
     assert_eq!(actor.pending_count(), 1);

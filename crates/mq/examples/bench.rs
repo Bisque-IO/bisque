@@ -201,10 +201,12 @@ fn bench_topic_publish_single(config: &BenchConfig, msg_size: usize) -> BenchRes
 
     let count = config.messages.min(100_000); // cap single-message bench
 
+    let cmd = &MqCommand::publish(topic_id, &single);
     let start = Instant::now();
     for i in 0..count {
         engine.apply_command(
-            &MqCommand::publish(topic_id, &single),
+            cmd,
+            // &MqCommand::publish(topic_id, &single),
             (i + 2) as u64,
             1000 + i as u64,
             None,

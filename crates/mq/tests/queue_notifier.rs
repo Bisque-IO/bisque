@@ -16,30 +16,36 @@ mod tests {
 
     // Placeholder for QueueNotifier — replace with actual import when implemented
     struct QueueNotifier {
-        watchers: dashmap::DashMap<u64, Vec<mpsc::UnboundedSender<()>>>,
+        watchers: papaya::HashMap<u64, Vec<mpsc::UnboundedSender<()>>>,
     }
 
     impl QueueNotifier {
         fn new() -> Self {
             Self {
-                watchers: dashmap::DashMap::new(),
+                watchers: papaya::HashMap::new(),
             }
         }
 
         fn watch(&self, queue_id: u64) -> mpsc::UnboundedReceiver<()> {
             let (tx, rx) = mpsc::unbounded_channel();
-            self.watchers.entry(queue_id).or_default().push(tx);
+            let guard = self.watchers.pin();
+            let mut senders = guard.get(&queue_id).cloned().unwrap_or_default();
+            senders.push(tx);
+            guard.insert(queue_id, senders);
             rx
         }
 
         fn notify(&self, queue_id: u64) {
-            if let Some(mut entry) = self.watchers.get_mut(&queue_id) {
-                entry.retain(|tx| tx.send(()).is_ok());
+            let guard = self.watchers.pin();
+            if let Some(senders) = guard.get(&queue_id).cloned() {
+                let mut senders = senders;
+                senders.retain(|tx| tx.send(()).is_ok());
+                guard.insert(queue_id, senders);
             }
         }
 
         fn unwatch(&self, queue_id: u64) {
-            self.watchers.remove(&queue_id);
+            self.watchers.pin().remove(&queue_id);
         }
     }
 
@@ -107,7 +113,12 @@ mod tests {
 
         // After cleanup, only 1 sender should remain
         assert_eq!(
-            notifier.watchers.get(&1).map(|e| e.len()).unwrap_or(0),
+            notifier
+                .watchers
+                .pin()
+                .get(&1)
+                .map(|e| e.len())
+                .unwrap_or(0),
             1,
             "dead sender should be cleaned up"
         );

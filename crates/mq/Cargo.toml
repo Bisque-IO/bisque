@@ -15,8 +15,9 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 crc64fast-nvme = { workspace = true }
 cron = { workspace = true }
+crossbeam-utils = { workspace = true }
 crossfire = { workspace = true }
-dashmap = { workspace = true }
+papaya = { workspace = true }
 futures = { workspace = true }
 libmdbx = { workspace = true }
 metrics = { workspace = true }
@@ -36,4 +37,3 @@ test-util = []
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dashmap = { workspace = true }

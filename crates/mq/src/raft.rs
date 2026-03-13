@@ -357,9 +357,8 @@ fn unix_ms() -> u64 {
 /// expired in-flight messages (visibility timeout exceeded).
 pub(crate) fn collect_visibility_timeouts(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for entry in meta.consumer_groups.iter() {
-        let group_id = *entry.key();
-        let group = entry.value();
+    let guard = meta.consumer_groups.pin();
+    for (&group_id, group) in guard.iter() {
         if let Some(ack) = group.ack_state() {
             let deadlines = ack.in_flight_deadlines.lock();
             let expired: Vec<u64> = deadlines
@@ -379,9 +378,8 @@ pub(crate) fn collect_visibility_timeouts(meta: &MqMetadata, now_ms: u64) -> Vec
 /// pending messages past their TTL.
 pub(crate) fn collect_expired_pending_messages(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for entry in meta.consumer_groups.iter() {
-        let group_id = *entry.key();
-        let group = entry.value();
+    let guard = meta.consumer_groups.pin();
+    for (&group_id, group) in guard.iter() {
         if let Some(ack) = group.ack_state() {
             let deadlines = ack.expires_at_deadlines.lock();
             let expired: Vec<u64> = deadlines
@@ -404,9 +402,8 @@ pub(crate) fn collect_due_cron_triggers(
     _counter: &AtomicU64,
 ) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for entry in meta.topics.iter() {
-        let topic_id = *entry.key();
-        let topic = entry.value();
+    let guard = meta.topics.pin();
+    for (&topic_id, topic) in guard.iter() {
         if topic.should_cron_trigger(now_ms) {
             commands.push(MqCommand::cron_trigger(topic_id, now_ms));
         }
@@ -422,9 +419,8 @@ pub(crate) fn collect_dead_sessions(
     timeout_ms: u64,
 ) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for entry in meta.sessions.iter() {
-        let session_id = *entry.key();
-        let session = entry.value();
+    let sessions_guard = meta.sessions.pin();
+    for (&session_id, session) in sessions_guard.iter() {
         if !session.is_expired(now_ms) {
             continue;
         }
@@ -435,9 +431,8 @@ pub(crate) fn collect_dead_sessions(
         }
 
         // Timeout in-flight messages in consumer groups for this session
-        for cg_entry in meta.consumer_groups.iter() {
-            let group_id = *cg_entry.key();
-            let group = cg_entry.value();
+        let cg_guard = meta.consumer_groups.pin();
+        for (&group_id, group) in cg_guard.iter() {
             if let Some(ack) = group.ack_state() {
                 let in_flight = ack.consumer_in_flight_ids(session_id);
                 if !in_flight.is_empty() {
@@ -449,7 +444,7 @@ pub(crate) fn collect_dead_sessions(
             }
             // Release actors assigned to this session
             if let Some(actor) = group.actor_state() {
-                if actor.consumer_assignments.contains_key(&session_id) {
+                if actor.consumer_assignments.pin().contains_key(&session_id) {
                     commands.push(MqCommand::group_release_actors(group_id, session_id));
                 }
             }
@@ -464,11 +459,10 @@ pub(crate) fn collect_dead_sessions(
 /// Collect PruneDedupWindow commands for topics with active dedup windows.
 pub(crate) fn collect_dedup_prune_commands(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for entry in meta.topics.iter() {
-        let topic = entry.value();
+    let guard = meta.topics.pin();
+    for (&topic_id, topic) in guard.iter() {
         if let Some(ref dedup_config) = topic.meta.dedup_config {
             if topic.dedup.is_some() {
-                let topic_id = *entry.key();
                 let window_secs = dedup_config.window_secs;
                 let before_timestamp = now_ms.saturating_sub(window_secs * 1000);
                 commands.push(MqCommand::prune_dedup_window(topic_id, before_timestamp));
@@ -482,9 +476,8 @@ pub(crate) fn collect_dedup_prune_commands(meta: &MqMetadata, now_ms: u64) -> Ve
 pub(crate) fn collect_idle_actor_evictions(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     use crate::types::VariantConfig;
     let mut commands = Vec::new();
-    for entry in meta.consumer_groups.iter() {
-        let group_id = *entry.key();
-        let group = entry.value();
+    let guard = meta.consumer_groups.pin();
+    for (&group_id, group) in guard.iter() {
         if group.actor_state().is_some() {
             if let VariantConfig::Actor(ref actor_config) = group.meta.variant_config {
                 let eviction_secs = actor_config.idle_eviction_secs;
@@ -502,9 +495,8 @@ pub(crate) fn collect_idle_actor_evictions(meta: &MqMetadata, now_ms: u64) -> Ve
 /// sessions that are members of actor-variant consumer groups.
 pub(crate) fn collect_actor_rebalance(meta: &MqMetadata) -> Vec<MqCommand> {
     let mut commands = Vec::new();
-    for entry in meta.consumer_groups.iter() {
-        let group_id = *entry.key();
-        let group = entry.value();
+    let cg_guard = meta.consumer_groups.pin();
+    for (&group_id, group) in cg_guard.iter() {
         if let Some(actor) = group.actor_state() {
             let unassigned = actor.unassigned_actors_with_messages();
             if unassigned.is_empty() {
@@ -512,11 +504,11 @@ pub(crate) fn collect_actor_rebalance(meta: &MqMetadata) -> Vec<MqCommand> {
             }
 
             // Find sessions that are associated with this consumer group
-            let member_session_ids: Vec<u64> = meta
-                .session_group_index
+            let sgi_guard = meta.session_group_index.pin();
+            let member_session_ids: Vec<u64> = sgi_guard
                 .iter()
-                .filter(|entry| entry.value().contains(&group_id))
-                .map(|entry| *entry.key())
+                .filter(|(_, groups)| groups.contains(&group_id))
+                .map(|(&session_id, _)| session_id)
                 .collect();
             if member_session_ids.is_empty() {
                 continue;

@@ -621,6 +621,16 @@ impl MqCommand {
         )
     }
 
+    /// Primary entity ID — the first u64 field at offset 8.
+    ///
+    /// For topic commands this is `topic_id`, for consumer group commands
+    /// this is `group_id`, for session commands this is `session_id`, etc.
+    /// Used by async apply workers for partition routing.
+    #[inline]
+    pub fn primary_id(&self) -> u64 {
+        self.field_u64(8)
+    }
+
     /// Read a u64 LE field at the given byte offset.
     #[inline]
     pub(crate) fn field_u64(&self, offset: usize) -> u64 {

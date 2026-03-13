@@ -346,6 +346,60 @@ fn bytes_from_segment(segment: &Arc<Segment>, offset: usize, len: usize) -> byte
 }
 
 // ---------------------------------------------------------------------------
+// SegmentView — live view into a segment's mmap region
+// ---------------------------------------------------------------------------
+
+/// A live, zero-copy view into a raft log segment's mmap region.
+///
+/// Unlike `Bytes` (which snapshots `logical_size` at creation time),
+/// `SegmentView` reads `logical_size` atomically on every `len()` call,
+/// so it always sees newly appended data without re-acquiring the segment.
+///
+/// Holds an `Arc<Segment>` to keep the mmap pinned.
+#[derive(Clone)]
+pub struct SegmentView {
+    segment: Arc<Segment>,
+}
+
+impl SegmentView {
+    /// The segment ID.
+    #[inline]
+    pub fn segment_id(&self) -> u64 {
+        self.segment.segment_id
+    }
+
+    /// Current valid byte count — reads `logical_size` atomically.
+    /// Grows as new entries are appended to the active segment.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.segment.logical_size.load(Ordering::Acquire) as usize
+    }
+
+    /// Whether the segment has no data.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read a byte slice at `[offset..offset+len]`.
+    ///
+    /// # Safety
+    /// Caller must ensure `offset + len <= self.len()`.
+    #[inline]
+    pub fn read_slice(&self, offset: usize, len: usize) -> &[u8] {
+        self.segment.read_slice(offset, len)
+    }
+
+    /// Create a zero-copy `Bytes` handle for `[offset..offset+len]`.
+    ///
+    /// The returned `Bytes` holds the `Arc<Segment>` alive.
+    #[inline]
+    pub fn slice_bytes(&self, offset: usize, len: usize) -> bytes::Bytes {
+        bytes_from_segment(&self.segment, offset, len)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MmapSegmentMap — in-memory segment tracking shared between writer and readers
 // ---------------------------------------------------------------------------
 
@@ -882,6 +936,10 @@ struct FsyncState<C: RaftTypeConfig> {
     /// Test-only: count of actual sync_data() calls.
     #[cfg(test)]
     sync_count: AtomicU64,
+    /// Test-only: artificial delay (micros) injected into each seal request
+    /// to simulate slow I/O and reproduce seal-starvation hangs on fast tmpfs.
+    #[cfg(test)]
+    seal_delay_micros: AtomicU64,
 }
 
 impl<C: RaftTypeConfig> FsyncState<C> {
@@ -900,6 +958,8 @@ impl<C: RaftTypeConfig> FsyncState<C> {
             force_sync_error: AtomicBool::new(false),
             #[cfg(test)]
             sync_count: AtomicU64::new(0),
+            #[cfg(test)]
+            seal_delay_micros: AtomicU64::new(0),
         }
     }
 
@@ -1082,8 +1142,19 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
             }
         }
 
-        // Process seal requests: fsync + truncate + manifest update (no footer on file)
+        // Process seal requests: fsync + truncate + manifest update (no footer on file).
+        // IMPORTANT: Interleave callback processing between seal requests to avoid
+        // starving append callbacks when many seal requests accumulate (each seal
+        // does sync_data + truncate which can take milliseconds).
         for req in seal_requests {
+            #[cfg(test)]
+            {
+                let delay = state.seal_delay_micros.load(Ordering::Relaxed);
+                if delay > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(delay));
+                }
+            }
+
             if let Some(ref file) = req.segment.file {
                 if let Err(e) = file.sync_data() {
                     tracing::error!(
@@ -1168,6 +1239,94 @@ fn fsync_thread_loop<C: RaftTypeConfig>(state: Arc<FsyncState<C>>) {
                             }
                         }
                     });
+                }
+            }
+
+            // Drain pending callbacks and prealloc requests that arrived while
+            // sealing. This prevents starvation: rotate_segment_with_min()
+            // busy-loops waiting for prealloc completion, and append callers
+            // block on their callback. Both are serviced by this thread.
+            {
+                let mut inner = state.mu.lock().unwrap();
+                let has_callbacks = !inner.pending.is_empty();
+                let has_preallocs = !inner.prealloc_queue.is_empty();
+
+                if has_callbacks || has_preallocs {
+                    let now = nanos_now();
+                    let mut interleaved = Vec::new();
+                    if has_callbacks {
+                        let taken = std::mem::take(&mut inner.pending);
+                        for (key, entry) in taken {
+                            let t = entry.segment.first_enqueue_nanos.load(Ordering::Acquire);
+                            if t == 0 || t + delay_nanos <= now {
+                                interleaved.push(entry);
+                            } else {
+                                inner.pending.insert(key, entry);
+                            }
+                        }
+                    }
+                    let interleaved_preallocs = if has_preallocs {
+                        std::mem::take(&mut inner.prealloc_queue)
+                    } else {
+                        Vec::new()
+                    };
+                    drop(inner);
+
+                    for entry in interleaved {
+                        let _max_bytes = entry.segment.take_pending();
+                        let sync_result: Result<(), io::Error> =
+                            if let Some(ref file) = entry.segment.file {
+                                #[cfg(test)]
+                                {
+                                    state.sync_count.fetch_add(1, Ordering::Relaxed);
+                                    if state.force_sync_error.load(Ordering::Relaxed) {
+                                        Err(io::Error::new(
+                                            io::ErrorKind::Other,
+                                            "injected fsync error",
+                                        ))
+                                    } else {
+                                        file.sync_data()
+                                    }
+                                }
+                                #[cfg(not(test))]
+                                {
+                                    file.sync_data()
+                                }
+                            } else {
+                                Ok(())
+                            };
+
+                        match &sync_result {
+                            Ok(()) => {
+                                for cb in entry.callbacks {
+                                    cb.io_completed(Ok(()));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    segment_id = entry.segment.segment_id,
+                                    error = %e,
+                                    "fsync failed — notifying {} callbacks",
+                                    entry.callbacks.len()
+                                );
+                                for cb in entry.callbacks {
+                                    cb.io_completed(Err(io::Error::new(e.kind(), e.to_string())));
+                                }
+                            }
+                        }
+                    }
+
+                    for prealloc in interleaved_preallocs {
+                        let result = match ActiveMmapSegment::create(
+                            &prealloc.group_dir,
+                            prealloc.segment_id,
+                            prealloc.segment_size,
+                        ) {
+                            Ok(seg) => PreallocResult::Ready(seg),
+                            Err(_) => PreallocResult::Failed,
+                        };
+                        *prealloc.result.lock().unwrap() = result;
+                    }
                 }
             }
         }
@@ -1292,9 +1451,21 @@ impl WriterState {
         manifest_tx: &MAsyncTx<Array<SegmentMeta>>,
         fsync_state: &FsyncState<impl RaftTypeConfig>,
     ) -> io::Result<usize> {
+        let data_len = data.len() as u64;
+
         // Check if we need rotation before this write.
-        if self.active.current_size + data.len() as u64 > self.active.segment_capacity {
-            self.rotate_segment(config, segment_map, manifest_tx, fsync_state)?;
+        if self.active.current_size + data_len > self.active.segment_capacity {
+            // If the data itself exceeds the default segment size, create an
+            // oversized segment that can hold it. This handles large batches
+            // that are encoded into a single buffer.
+            let min_capacity = data_len;
+            self.rotate_segment_with_min(
+                config,
+                segment_map,
+                manifest_tx,
+                fsync_state,
+                min_capacity,
+            )?;
         }
 
         let offset = self.active.current_size as usize;
@@ -1347,6 +1518,21 @@ impl WriterState {
         manifest_tx: &MAsyncTx<Array<SegmentMeta>>,
         fsync_state: &FsyncState<impl RaftTypeConfig>,
     ) -> io::Result<()> {
+        self.rotate_segment_with_min(config, segment_map, manifest_tx, fsync_state, 0)
+    }
+
+    /// Rotate with a minimum capacity for the new segment. If `min_capacity`
+    /// exceeds `config.segment_size`, the new segment is created oversized to
+    /// accommodate large batches that don't fit in a standard segment.
+    fn rotate_segment_with_min(
+        &mut self,
+        config: &MmapStorageConfig,
+        segment_map: &MmapSegmentMap,
+        manifest_tx: &MAsyncTx<Array<SegmentMeta>>,
+        fsync_state: &FsyncState<impl RaftTypeConfig>,
+        min_capacity: u64,
+    ) -> io::Result<()> {
+        let segment_size = config.segment_size.max(min_capacity);
         let valid_bytes = self.active.current_size;
 
         // Capture record type flags and record count for manifest, reset for new segment
@@ -1358,35 +1544,40 @@ impl WriterState {
         // finish in microseconds (just open+ftruncate+mmap). Waiting avoids
         // creating the segment twice and orphaning a file.
         let new_id = self.active.segment_id + 1;
-        let new_seg = if let Some(slot) = self.pending_prealloc.take() {
-            loop {
-                let mut guard = slot.lock().unwrap();
-                match std::mem::replace(&mut *guard, PreallocResult::Pending) {
-                    PreallocResult::Ready(seg) if seg.segment_id == new_id => break seg,
-                    PreallocResult::Ready(_) => {
-                        // Wrong ID (shouldn't happen), fall back
-                        break ActiveMmapSegment::create(
-                            &self.group_dir,
-                            new_id,
-                            config.segment_size,
-                        )?;
-                    }
-                    PreallocResult::Failed => {
-                        break ActiveMmapSegment::create(
-                            &self.group_dir,
-                            new_id,
-                            config.segment_size,
-                        )?;
-                    }
-                    PreallocResult::Pending => {
-                        // Not ready yet — release lock, yield, retry
-                        drop(guard);
-                        std::thread::yield_now();
+        let needs_oversized = min_capacity > config.segment_size;
+        let new_seg = if !needs_oversized {
+            if let Some(slot) = self.pending_prealloc.take() {
+                loop {
+                    let mut guard = slot.lock().unwrap();
+                    match std::mem::replace(&mut *guard, PreallocResult::Pending) {
+                        PreallocResult::Ready(seg) if seg.segment_id == new_id => break seg,
+                        PreallocResult::Ready(_) => {
+                            break ActiveMmapSegment::create(
+                                &self.group_dir,
+                                new_id,
+                                segment_size,
+                            )?;
+                        }
+                        PreallocResult::Failed => {
+                            break ActiveMmapSegment::create(
+                                &self.group_dir,
+                                new_id,
+                                segment_size,
+                            )?;
+                        }
+                        PreallocResult::Pending => {
+                            drop(guard);
+                            std::thread::yield_now();
+                        }
                     }
                 }
+            } else {
+                ActiveMmapSegment::create(&self.group_dir, new_id, segment_size)?
             }
         } else {
-            ActiveMmapSegment::create(&self.group_dir, new_id, config.segment_size)?
+            // Oversized segment — skip prealloc (wrong size), discard any pending.
+            self.pending_prealloc.take();
+            ActiveMmapSegment::create(&self.group_dir, new_id, segment_size)?
         };
 
         // Atomically swap active → the old active becomes the sealed segment
@@ -2287,6 +2478,7 @@ impl<C: RaftTypeConfig> MmapPerGroupLogStorage<C> {
 /// Handle given to the state machine for speculatively prefetching the next segment.
 /// Call `prefetch_next(applied_index)` after each apply batch to open the next
 /// segment in the background before the state machine needs it.
+#[derive(Clone)]
 pub struct SegmentPrefetcher {
     log_index: Arc<LogIndex>,
     segment_map: Arc<MmapSegmentMap>,
@@ -2396,6 +2588,60 @@ impl SegmentPrefetcher {
             start + data_start,
             data_end - data_start,
         ))
+    }
+
+    /// Read the command data of a Normal entry at a pre-resolved `LogLocation`.
+    ///
+    /// Same as `read_normal_entry_data` but skips the index lookup, useful
+    /// when the caller already has the location (e.g. from a prior
+    /// `log_location()` call).
+    pub fn read_normal_entry_data_at(&self, loc: &LogLocation) -> Option<bytes::Bytes> {
+        let segment = self.segment_map.find_segment(loc.segment_id)?;
+
+        let valid_bytes = segment.logical_size.load(Ordering::Acquire) as usize;
+        let start = loc.offset as usize;
+        let end = start + loc.len as usize;
+        if end > valid_bytes || end > segment.capacity() {
+            return None;
+        }
+
+        if loc.len < 41 {
+            return None;
+        }
+
+        let buf = segment.read_slice(start, loc.len as usize);
+
+        let tag = buf[HEADER_SIZE + 24];
+        if tag != 1 {
+            return None;
+        }
+
+        let data_start = HEADER_SIZE + 25;
+        let data_end = loc.len as usize - CRC64_SIZE;
+        if data_start >= data_end {
+            return None;
+        }
+
+        Some(bytes_from_segment(
+            &Arc::clone(&segment),
+            start + data_start,
+            data_end - data_start,
+        ))
+    }
+
+    /// Return a live view into a segment's mmap region.
+    ///
+    /// Unlike `segment_bytes()` which snapshots `logical_size`, the returned
+    /// `SegmentView` reads `logical_size` atomically on every `len()` call,
+    /// always seeing newly appended data.
+    ///
+    /// Returns `None` if the segment is not currently pinned or active.
+    pub fn segment_view(&self, segment_id: u64) -> Option<SegmentView> {
+        let segment = self.segment_map.find_segment(segment_id)?;
+        if segment.logical_size.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        Some(SegmentView { segment })
     }
 
     /// Return the full valid region of a segment as a single `Bytes`.
@@ -8683,6 +8929,94 @@ mod tests {
             }
 
             drop(pinned);
+            storage.stop();
+        });
+    }
+
+    /// Reproduce benchmark hang: many large batches that trigger double rotation
+    /// (before-write + after-write) generating many seal requests. The fsync thread
+    /// must interleave callback + prealloc processing between seal requests or the
+    /// writer thread will stall spinning on prealloc completion.
+    ///
+    /// Uses a multi-threaded tokio runtime (like the real benchmark) so that
+    /// appends can overlap with seal processing, causing seal accumulation.
+    #[test]
+    fn test_large_batch_double_rotation_no_hang() {
+        // Multi-threaded runtime is critical: in single-threaded mode, the task
+        // can't overlap with fsync processing, so seals never accumulate.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = TempDir::new().unwrap();
+            // Small segments (64KB) so that large batches trigger rotation.
+            let config = MmapStorageConfig::new(tmp.path())
+                .with_segment_size(64 * 1024)
+                .with_fsync_delay(Duration::from_millis(1));
+            let storage = MmapPerGroupLogStorage::<C>::new(config).await.unwrap();
+            // Simulate real-world slow I/O: each seal takes ~500µs (sync_data + truncate).
+            // Without interleave fix, 20+ accumulated seals block callbacks for 10+ ms,
+            // and the writer thread spins on prealloc indefinitely.
+            // 50ms per seal simulates heavily loaded real filesystem sync_data.
+            // The benchmark uses /home/me/tmp (real FS) where sync_data can take
+            // 10-100ms under journal contention with many small segments.
+            storage
+                .fsync_state
+                .seal_delay_micros
+                .store(50_000, Ordering::Relaxed);
+            let mut log = storage.get_log_storage(0).await.unwrap();
+
+            // Each entry ~5KB payload → 100 entries ≈ 500KB batch,
+            // well over the 64KB segment size → double rotation every batch.
+            let big_payload = vec![0xABu8; 5000];
+
+            let num_batches = 64;
+            let entries_per_batch = 100;
+            let mut index = 1u64;
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+            for batch in 0..num_batches {
+                let entries: Vec<_> = (0..entries_per_batch)
+                    .map(|_| {
+                        let e = openraft::impls::Entry::<C> {
+                            log_id: LogId {
+                                leader_id: openraft::impls::leader_id_adv::LeaderId {
+                                    term: 1,
+                                    node_id: 1,
+                                },
+                                index,
+                            },
+                            payload: openraft::entry::EntryPayload::Normal(TestData(
+                                big_payload.clone(),
+                            )),
+                        };
+                        index += 1;
+                        e
+                    })
+                    .collect();
+
+                let (cb, rx) = make_callback();
+                log.append(entries, cb).await.unwrap();
+                match tokio::time::timeout_at(deadline, rx).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(e))) => panic!("fsync error on batch {batch}: {e}"),
+                    Ok(Err(_)) => panic!("callback channel closed on batch {batch}"),
+                    Err(_) => panic!(
+                        "HANG DETECTED: append_and_flush stuck on batch {batch}/{num_batches} \
+                         (30s timeout). Likely fsync thread starvation from seal requests \
+                         blocking callback/prealloc delivery."
+                    ),
+                }
+            }
+
+            // Verify all entries readable.
+            let total = num_batches * entries_per_batch;
+            let result = log.try_get_log_entries(1..total as u64 + 1).await.unwrap();
+            assert_eq!(result.len(), total);
+
             storage.stop();
         });
     }

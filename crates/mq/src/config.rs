@@ -1,6 +1,24 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Configuration for the parallel (partitioned) apply workers.
+#[derive(Debug, Clone)]
+pub struct ParallelApplyConfig {
+    /// Number of partition workers. Always pre-allocated at startup.
+    /// Fixed for the lifetime of the node — no rebalancing, fully deterministic.
+    pub num_partitions: usize,
+}
+
+impl Default for ParallelApplyConfig {
+    fn default() -> Self {
+        Self {
+            num_partitions: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        }
+    }
+}
+
 // =============================================================================
 // Top-level MQ config
 // =============================================================================
@@ -28,6 +46,8 @@ pub struct MqConfig {
     pub group_offset_retention_ms: u64,
     /// How often to check for dead sessions and fire wills (default: 5s).
     pub session_expiry_interval: Duration,
+    /// Parallel apply configuration.
+    pub parallel_apply: ParallelApplyConfig,
 }
 
 impl MqConfig {
@@ -47,6 +67,7 @@ impl MqConfig {
             group_offset_expiry_interval: Duration::from_secs(600),
             group_offset_retention_ms: 7 * 24 * 60 * 60 * 1000, // 7 days
             session_expiry_interval: Duration::from_secs(5),
+            parallel_apply: ParallelApplyConfig::default(),
         }
     }
 

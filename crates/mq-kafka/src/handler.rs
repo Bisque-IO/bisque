@@ -1721,9 +1721,10 @@ impl KafkaHandler {
         let groups: Vec<ListedGroup> = self
             .metadata
             .iter_consumer_groups()
-            .map(|entry| ListedGroup {
-                group_id: WireString::from(entry.value().meta.name.clone()),
-                protocol_type: WireString::from(entry.value().meta.protocol_type.clone()),
+            .into_iter()
+            .map(|(_, group)| ListedGroup {
+                group_id: WireString::from(group.meta.name.clone()),
+                protocol_type: WireString::from(group.meta.protocol_type.clone()),
                 group_state: WireString::empty(),
                 ..Default::default()
             })

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use dashmap::DashMap;
+use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -241,20 +241,20 @@ pub struct TopicState {
     // -- Immutable identity (set once at creation, never changed) --
     pub meta: TopicMeta,
 
-    // -- Mutable counters (atomics for concurrent readers + single writer) --
-    head_index: AtomicU64,
-    tail_index: AtomicU64,
-    message_count: AtomicU64,
-    total_bytes: AtomicU64,
-    latest_log_index: AtomicU64,
-    latest_msg_pos: AtomicUsize,
+    // -- Mutable counters (CachePadded to avoid false sharing between cores) --
+    head_index: CachePadded<AtomicU64>,
+    tail_index: CachePadded<AtomicU64>,
+    message_count: CachePadded<AtomicU64>,
+    total_bytes: CachePadded<AtomicU64>,
+    latest_log_index: CachePadded<AtomicU64>,
+    latest_msg_pos: CachePadded<AtomicUsize>,
 
-    pub(crate) consumer_offsets: DashMap<u64, TopicConsumerOffset>,
+    pub(crate) consumer_offsets: papaya::HashMap<u64, TopicConsumerOffset>,
     /// Cached minimum consumer offset.
-    cached_min_consumer_offset: AtomicU64,
+    cached_min_consumer_offset: CachePadded<AtomicU64>,
 
     /// IDs of consumer groups attached to this topic.
-    pub(crate) consumer_group_ids: DashMap<u64, ()>,
+    pub(crate) consumer_group_ids: papaya::HashMap<u64, ()>,
 
     /// Retained message (last published message bytes). Only used when meta.retained == true.
     pub(crate) retained_message: Mutex<Option<Bytes>>,
@@ -265,27 +265,19 @@ pub struct TopicState {
     /// Cron state atomics.
     pub(crate) cron_enabled: AtomicBool,
     pub(crate) next_trigger_at: AtomicU64,
-
-    // Pre-initialized metrics handles
-    m_publish_count: metrics::Counter,
-    m_publish_bytes: metrics::Counter,
+    // Pre-initialized metrics handles (commented out — hot-path contention)
+    // m_publish_count: metrics::Counter,
+    // m_publish_bytes: metrics::Counter,
 }
 
 impl TopicState {
-    pub fn new(meta: TopicMeta, catalog_name: &str) -> Self {
-        let labels = [
-            ("catalog", catalog_name.to_owned()),
-            ("topic", meta.name.clone()),
-        ];
-        let m_publish_count = metrics::counter!("mq.topic.publish.count", &labels);
-        let m_publish_bytes = metrics::counter!("mq.topic.publish.bytes", &labels);
-
-        let head_index = AtomicU64::new(meta.head_index);
-        let tail_index = AtomicU64::new(meta.tail_index);
-        let message_count = AtomicU64::new(meta.message_count);
-        let total_bytes = AtomicU64::new(meta.total_bytes);
-        let latest_log_index = AtomicU64::new(meta.latest_log_index);
-        let latest_msg_pos = AtomicUsize::new(meta.latest_msg_pos);
+    pub fn new(meta: TopicMeta, _catalog_name: &str) -> Self {
+        let head_index = CachePadded::new(AtomicU64::new(meta.head_index));
+        let tail_index = CachePadded::new(AtomicU64::new(meta.tail_index));
+        let message_count = CachePadded::new(AtomicU64::new(meta.message_count));
+        let total_bytes = CachePadded::new(AtomicU64::new(meta.total_bytes));
+        let latest_log_index = CachePadded::new(AtomicU64::new(meta.latest_log_index));
+        let latest_msg_pos = CachePadded::new(AtomicUsize::new(meta.latest_msg_pos));
         let cron_enabled = AtomicBool::new(meta.cron_enabled);
         let next_trigger_at = AtomicU64::new(meta.next_trigger_at);
         let dedup = meta.dedup_config.as_ref().map(|_| DedupWindow::new());
@@ -298,15 +290,13 @@ impl TopicState {
             total_bytes,
             latest_log_index,
             latest_msg_pos,
-            consumer_offsets: DashMap::new(),
-            cached_min_consumer_offset: AtomicU64::new(MIN_NONE),
-            consumer_group_ids: DashMap::new(),
+            consumer_offsets: papaya::HashMap::new(),
+            cached_min_consumer_offset: CachePadded::new(AtomicU64::new(MIN_NONE)),
+            consumer_group_ids: papaya::HashMap::new(),
             retained_message: Mutex::new(None),
             dedup,
             cron_enabled,
             next_trigger_at,
-            m_publish_count,
-            m_publish_bytes,
         }
     }
 
@@ -368,10 +358,8 @@ impl TopicState {
 
     /// Snapshot consumer offsets as a Vec (for serialization).
     pub fn consumer_offsets_snapshot(&self) -> Vec<TopicConsumerOffset> {
-        self.consumer_offsets
-            .iter()
-            .map(|e| e.value().clone())
-            .collect()
+        let guard = self.consumer_offsets.pin();
+        guard.iter().map(|(_, v)| v.clone()).collect()
     }
 
     /// Apply a batch of pre-encoded flat messages to this topic.
@@ -411,8 +399,8 @@ impl TopicState {
         self.latest_log_index.store(log_index, Ordering::Relaxed);
         self.latest_msg_pos.store(last_pos, Ordering::Relaxed);
 
-        self.m_publish_count.increment(count);
-        self.m_publish_bytes.increment(total_bytes);
+        // self.m_publish_count.increment(count);
+        // self.m_publish_bytes.increment(total_bytes);
 
         base_offset
     }
@@ -434,21 +422,28 @@ impl TopicState {
     }
 
     pub fn apply_commit_offset(&self, consumer_id: u64, offset: u64) {
-        let is_new_consumer = !self.consumer_offsets.contains_key(&consumer_id);
-        let mut entry =
-            self.consumer_offsets
-                .entry(consumer_id)
-                .or_insert_with(|| TopicConsumerOffset {
+        let guard = self.consumer_offsets.pin();
+        let mut dirty = false;
+        if let Some(existing) = guard.get(&consumer_id) {
+            if offset > existing.committed_offset {
+                let mut updated = existing.clone();
+                updated.committed_offset = offset;
+                guard.insert(consumer_id, updated);
+                dirty = true;
+            }
+        } else {
+            guard.insert(
+                consumer_id,
+                TopicConsumerOffset {
                     topic_id: self.meta.topic_id,
                     consumer_id,
-                    committed_offset: 0,
+                    committed_offset: offset,
                     pending_offset: 0,
-                });
-        if offset > entry.committed_offset {
-            entry.committed_offset = offset;
-            self.cached_min_consumer_offset
-                .store(MIN_DIRTY, Ordering::Relaxed);
-        } else if is_new_consumer {
+                },
+            );
+            dirty = true;
+        }
+        if dirty {
             self.cached_min_consumer_offset
                 .store(MIN_DIRTY, Ordering::Relaxed);
         }
@@ -469,18 +464,18 @@ impl TopicState {
 
     /// Attach a consumer group to this topic.
     pub fn attach_group(&self, group_id: u64) {
-        self.consumer_group_ids.insert(group_id, ());
+        self.consumer_group_ids.pin().insert(group_id, ());
     }
 
     /// Detach a consumer group from this topic.
     pub fn detach_group(&self, group_id: u64) {
-        self.consumer_group_ids.remove(&group_id);
+        self.consumer_group_ids.pin().remove(&group_id);
     }
 
     /// Returns true if this topic should be auto-deleted (DeleteOnLastDetach + no groups).
     pub fn should_auto_delete(&self) -> bool {
         self.meta.lifetime == TopicLifetimePolicy::DeleteOnLastDetach
-            && self.consumer_group_ids.is_empty()
+            && self.consumer_group_ids.pin().len() == 0
     }
 
     /// Check if cron should trigger now.
@@ -507,10 +502,10 @@ impl TopicState {
             cached
         } else {
             // Recompute
-            let min = self
-                .consumer_offsets
+            let guard = self.consumer_offsets.pin();
+            let min = guard
                 .iter()
-                .map(|e| e.committed_offset)
+                .map(|(_, e)| e.committed_offset)
                 .min()
                 .unwrap_or(u64::MAX);
             if min == u64::MAX {
@@ -640,10 +635,10 @@ mod tests {
         let topic = make_topic("test");
         topic.attach_group(1);
         topic.attach_group(2);
-        assert_eq!(topic.consumer_group_ids.len(), 2);
+        assert_eq!(topic.consumer_group_ids.pin().len(), 2);
 
         topic.detach_group(1);
-        assert_eq!(topic.consumer_group_ids.len(), 1);
+        assert_eq!(topic.consumer_group_ids.pin().len(), 1);
         assert!(!topic.should_auto_delete()); // Permanent policy
     }
 
@@ -667,20 +662,35 @@ mod tests {
 
         topic.apply_commit_offset(100, 0);
         assert_eq!(
-            topic.consumer_offsets.get(&100).unwrap().committed_offset,
+            topic
+                .consumer_offsets
+                .pin()
+                .get(&100)
+                .unwrap()
+                .committed_offset,
             0
         );
 
         topic.apply_commit_offset(100, 15);
         assert_eq!(
-            topic.consumer_offsets.get(&100).unwrap().committed_offset,
+            topic
+                .consumer_offsets
+                .pin()
+                .get(&100)
+                .unwrap()
+                .committed_offset,
             15
         );
 
         // Cannot go backwards
         topic.apply_commit_offset(100, 5);
         assert_eq!(
-            topic.consumer_offsets.get(&100).unwrap().committed_offset,
+            topic
+                .consumer_offsets
+                .pin()
+                .get(&100)
+                .unwrap()
+                .committed_offset,
             15
         );
     }

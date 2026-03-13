@@ -157,17 +157,14 @@ impl MqWriteBatcher {
     /// Create a test batcher that routes commands through the given engine.
     ///
     /// Each submitted command is applied directly (no batching, no Raft).
-    /// The engine is protected by a Mutex for single-writer access.
+    /// Engine uses interior mutability (papaya + atomics), no Mutex needed.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn new_test(engine: std::sync::Arc<parking_lot::Mutex<crate::engine::MqEngine>>) -> Self {
+    pub fn new_test(engine: std::sync::Arc<crate::engine::MqEngine>) -> Self {
         let (tx, rx) = crossfire::mpsc::bounded_async::<BatchedRequest>(1024);
         let task = tokio::spawn(async move {
             let mut log_index = 1u64;
             while let Ok(req) = rx.recv().await {
-                let resp = {
-                    let mut eng = engine.lock();
-                    eng.apply_command(&req.command, log_index, log_index * 1000, None)
-                };
+                let resp = engine.apply_command(&req.command, log_index, log_index * 1000, None);
                 log_index += 1;
                 let _ = req.response_tx.send(resp);
             }

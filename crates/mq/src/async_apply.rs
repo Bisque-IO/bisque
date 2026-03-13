@@ -1,0 +1,1316 @@
+//! Async apply — pull-based worker architecture for the MQ state machine.
+//!
+//! Workers read committed entries directly from the mmap raft log,
+//! filter by partition (`primary_id % N`), and apply matching commands.
+//! The state machine's `apply()` drains the stream, advances a
+//! high-water mark, and returns. Workers process asynchronously.
+//!
+//! Batch entries (`TAG_BATCH`) are processed synchronously in `apply()`
+//! with a barrier to preserve ordering. Workers skip them when scanning.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bytes::{BufMut, Bytes, BytesMut};
+use tokio::sync::mpsc;
+use tracing::debug;
+
+use bisque_raft::SegmentPrefetcher;
+
+use crate::config::ParallelApplyConfig;
+use crate::cursor::MqSegmentScanner;
+use crate::engine::MqEngine;
+use crate::manifest::MqManifestManager;
+use crate::state_machine::{classify_structural, collect_structural_writes};
+use crate::types::{MqCommand, MqResponse};
+
+// =============================================================================
+// High-Water Mark
+// =============================================================================
+
+/// Coalescing high-water mark with single-permit notification.
+///
+/// The writer (state machine) advances the HWM and notifies. Multiple
+/// advances before a worker wakes coalesce into a single wakeup. The
+/// worker reads the HWM, processes everything since its cursor, then
+/// waits again.
+pub struct HighWaterMark {
+    value: AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+impl HighWaterMark {
+    pub fn new(initial: u64) -> Self {
+        Self {
+            value: AtomicU64::new(initial),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Advance the HWM and notify all waiting workers.
+    #[inline]
+    pub fn advance(&self, new_hwm: u64) {
+        self.value.store(new_hwm, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Wait for the HWM to advance past `cursor`. Returns the new HWM.
+    ///
+    /// Fast path: if HWM > cursor, returns immediately.
+    /// Slow path: registers a single waker, sleeps until notified.
+    #[inline]
+    pub async fn wait_for(&self, cursor: u64) -> u64 {
+        loop {
+            // Register interest BEFORE checking the value to avoid missed wakeups.
+            // notify_waiters() does not store permits, so we must call enable()
+            // to ensure the notification is captured even if it fires between the
+            // check and the await.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let hwm = self.value.load(Ordering::Acquire);
+            if hwm > cursor {
+                return hwm;
+            }
+            notified.await;
+        }
+    }
+
+    #[inline]
+    pub fn current(&self) -> u64 {
+        self.value.load(Ordering::Acquire)
+    }
+}
+
+// =============================================================================
+// Responder Table
+// =============================================================================
+
+/// Maps log_index → stashed ApplyResponder for leader entries.
+///
+/// During `apply()`, the state machine stashes responders for non-batch
+/// Normal entries. Workers take responders after applying to send the
+/// response back through the Raft machinery (completing `client_write()`).
+///
+/// `ApplyResponder` is not `Clone`, so we wrap it in `Arc<parking_lot::Mutex<Option<...>>>`
+/// to satisfy papaya's `Clone` requirement while allowing single-consumer take semantics.
+pub(crate) struct ResponderTable {
+    entries: papaya::HashMap<
+        u64,
+        Arc<parking_lot::Mutex<Option<openraft::storage::ApplyResponder<crate::MqTypeConfig>>>>,
+    >,
+}
+
+impl ResponderTable {
+    pub fn new() -> Self {
+        Self {
+            entries: papaya::HashMap::new(),
+        }
+    }
+
+    pub fn insert(
+        &self,
+        log_index: u64,
+        responder: openraft::storage::ApplyResponder<crate::MqTypeConfig>,
+    ) {
+        self.entries.pin().insert(
+            log_index,
+            Arc::new(parking_lot::Mutex::new(Some(responder))),
+        );
+    }
+
+    pub fn take(
+        &self,
+        log_index: u64,
+    ) -> Option<openraft::storage::ApplyResponder<crate::MqTypeConfig>> {
+        let guard = self.entries.pin();
+        let slot = guard.get(&log_index)?.clone();
+        guard.remove(&log_index);
+        slot.lock().take()
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.entries.pin().len()
+    }
+}
+
+// =============================================================================
+// Response Entry (flat wire format)
+// =============================================================================
+
+/// Minimal response entry for per-client delivery channels.
+///
+/// Uses flat binary encoding with 8-byte aligned header:
+/// `[tag:1][status:1][pad:6][log_index:8][...fields]`.
+///
+/// All field offsets are multiples of their natural alignment,
+/// enabling zero-copy access via direct reads.
+pub struct ResponseEntry {
+    pub buf: Bytes,
+}
+
+impl ResponseEntry {
+    pub const STATUS_OK: u8 = 0;
+    pub const STATUS_ERROR: u8 = 1;
+
+    pub const TAG_PUBLISHED: u8 = 0x01;
+    pub const TAG_ENTITY_CREATED: u8 = 0x02;
+    pub const TAG_OK: u8 = 0x03;
+    pub const TAG_ERROR: u8 = 0x04;
+    pub const TAG_MESSAGES: u8 = 0x05;
+    pub const TAG_BATCH: u8 = 0x06;
+
+    /// Encode a Published response (32 bytes).
+    pub fn published(log_index: u64, base_offset: u64, count: u64) -> Self {
+        let mut buf = BytesMut::with_capacity(32);
+        buf.put_u8(Self::TAG_PUBLISHED);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 6); // pad to 8
+        buf.put_u64_le(log_index);
+        buf.put_u64_le(base_offset);
+        buf.put_u64_le(count);
+        Self { buf: buf.freeze() }
+    }
+
+    /// Encode an EntityCreated response (24 bytes).
+    pub fn entity_created(log_index: u64, entity_id: u64) -> Self {
+        let mut buf = BytesMut::with_capacity(24);
+        buf.put_u8(Self::TAG_ENTITY_CREATED);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 6);
+        buf.put_u64_le(log_index);
+        buf.put_u64_le(entity_id);
+        Self { buf: buf.freeze() }
+    }
+
+    /// Encode an Ok response (16 bytes).
+    pub fn ok(log_index: u64) -> Self {
+        let mut buf = BytesMut::with_capacity(16);
+        buf.put_u8(Self::TAG_OK);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 6);
+        buf.put_u64_le(log_index);
+        Self { buf: buf.freeze() }
+    }
+
+    /// Encode an Error response (24+ bytes).
+    pub fn error(log_index: u64, error_code: u32, msg: &str) -> Self {
+        let msg_bytes = msg.as_bytes();
+        let padded_msg_len = (msg_bytes.len() + 7) & !7;
+        let total = 24 + padded_msg_len;
+        let mut buf = BytesMut::with_capacity(total);
+        buf.put_u8(Self::TAG_ERROR);
+        buf.put_u8(Self::STATUS_ERROR);
+        buf.put_bytes(0, 6);
+        buf.put_u64_le(log_index);
+        buf.put_u32_le(error_code);
+        buf.put_u32_le(msg_bytes.len() as u32);
+        buf.put_slice(msg_bytes);
+        let pad = padded_msg_len - msg_bytes.len();
+        if pad > 0 {
+            buf.put_bytes(0, pad);
+        }
+        Self { buf: buf.freeze() }
+    }
+
+    /// Construct from an MqResponse.
+    pub fn from_response(log_index: u64, response: &MqResponse) -> Self {
+        match response {
+            MqResponse::Ok => Self::ok(log_index),
+            MqResponse::Published { base_offset, count } => {
+                Self::published(log_index, *base_offset, *count)
+            }
+            MqResponse::EntityCreated { id } => Self::entity_created(log_index, *id),
+            MqResponse::Error(e) => Self::error(log_index, 1, &e.to_string()),
+            _ => Self::ok(log_index), // fallback for complex responses
+        }
+    }
+
+    // Zero-copy accessors.
+    #[inline]
+    pub fn tag(&self) -> u8 {
+        self.buf[0]
+    }
+    #[inline]
+    pub fn status(&self) -> u8 {
+        self.buf[1]
+    }
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        self.buf[1] == Self::STATUS_OK
+    }
+    #[inline]
+    pub fn log_index(&self) -> u64 {
+        u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
+    }
+}
+
+// =============================================================================
+// Client Registry
+// =============================================================================
+
+/// Registry of active client response channels.
+///
+/// Workers look up channels by client_id after applying each command.
+/// Adapters register on connect, unregister on disconnect.
+pub struct ClientRegistry {
+    clients: papaya::HashMap<u64, mpsc::UnboundedSender<ResponseEntry>>,
+    next_id: AtomicU64,
+}
+
+impl ClientRegistry {
+    pub fn new() -> Self {
+        Self {
+            clients: papaya::HashMap::new(),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Register a new client. Returns (client_id, receiver).
+    pub fn register(&self) -> (u64, mpsc::UnboundedReceiver<ResponseEntry>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.clients.pin().insert(id, tx);
+        (id, rx)
+    }
+
+    /// Unregister a client. Pending responses are discarded.
+    pub fn unregister(&self, client_id: u64) {
+        self.clients.pin().remove(&client_id);
+    }
+
+    /// Send a response to a client. Returns false if disconnected.
+    #[inline]
+    pub fn send(&self, client_id: u64, entry: ResponseEntry) -> bool {
+        let guard = self.clients.pin();
+        if let Some(tx) = guard.get(&client_id) {
+            tx.send(entry).is_ok()
+        } else {
+            false
+        }
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.clients.pin().len()
+    }
+}
+
+// =============================================================================
+// Client ID Table
+// =============================================================================
+
+/// Maps log_index → client_id for response routing.
+///
+/// Populated by `apply()` when client_id is available. Workers read
+/// and remove after applying.
+pub(crate) struct ClientIdTable {
+    entries: papaya::HashMap<u64, u64>,
+}
+
+impl ClientIdTable {
+    pub fn new() -> Self {
+        Self {
+            entries: papaya::HashMap::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn insert(&self, log_index: u64, client_id: u64) {
+        self.entries.pin().insert(log_index, client_id);
+    }
+
+    pub fn take(&self, log_index: u64) -> Option<u64> {
+        let guard = self.entries.pin();
+        let value = guard.get(&log_index).copied();
+        if value.is_some() {
+            guard.remove(&log_index);
+        }
+        value
+    }
+}
+
+// =============================================================================
+// Partition Worker
+// =============================================================================
+
+/// Per-worker state for the pull-based log consumer.
+#[allow(dead_code)]
+struct PartitionWorker {
+    partition_id: usize,
+    num_partitions: usize,
+    cursor: Arc<AtomicU64>,
+    hwm: Arc<HighWaterMark>,
+    prefetcher: SegmentPrefetcher,
+    engine: Arc<MqEngine>,
+    responder_table: Arc<ResponderTable>,
+    client_registry: Arc<ClientRegistry>,
+    client_id_table: Arc<ClientIdTable>,
+    manifest: Option<Arc<MqManifestManager>>,
+    group_id: u64,
+    cursor_notify: Arc<tokio::sync::Notify>,
+    m_apply_count: metrics::Counter,
+    m_skip_count: metrics::Counter,
+}
+
+impl PartitionWorker {
+    async fn run(self) {
+        debug!(
+            partition = self.partition_id,
+            "async partition worker started"
+        );
+
+        // Persistent scanner — kept alive across ranges. The active segment
+        // uses a live SegmentView that reads logical_size atomically, so the
+        // cursor always sees newly appended data without re-acquiring.
+        let mut scanner: Option<MqSegmentScanner> = None;
+
+        loop {
+            let cursor_val = self.cursor.load(Ordering::Acquire);
+            let hwm = self.hwm.wait_for(cursor_val).await;
+
+            // Shutdown sentinel.
+            if hwm == u64::MAX {
+                debug!(
+                    partition = self.partition_id,
+                    "async partition worker shutting down"
+                );
+                return;
+            }
+
+            let from = cursor_val + 1;
+            self.process_range(from, hwm, &mut scanner);
+            self.cursor.store(hwm, Ordering::Release);
+            self.cursor_notify.notify_waiters();
+        }
+    }
+
+    fn process_range(&self, from: u64, to: u64, scanner: &mut Option<MqSegmentScanner>) {
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Reuse persistent scanner if available, otherwise create a new one.
+        // The scanner's active segment uses a live SegmentView, so it always
+        // sees newly appended data — no stale snapshot issues.
+        if scanner.is_none() {
+            let start_seg = match self.prefetcher.segment_id_for(from) {
+                Some(seg) => seg,
+                None => return, // entry purged or not yet written
+            };
+            *scanner = Some(MqSegmentScanner::new(self.prefetcher.clone(), start_seg));
+        }
+        let scan = scanner.as_mut().unwrap();
+
+        let mut apply_count = 0u64;
+        let mut skip_count = 0u64;
+
+        loop {
+            let Some(rec) = scan.next_record_raw() else {
+                break; // segment(s) exhausted
+            };
+
+            // Skip entries before our range (mid-segment start).
+            if rec.log_index < from {
+                continue;
+            }
+            // Stop when past our range — put back for the next call.
+            if rec.log_index > to {
+                scan.put_back(rec);
+                break;
+            }
+
+            let cmd = rec.command;
+
+            // Batch entries are handled by apply() synchronously. Skip.
+            if cmd.tag() == MqCommand::TAG_BATCH {
+                continue;
+            }
+
+            // Route check: does this entry belong to my partition?
+            if !self.should_process(&cmd, rec.log_index) {
+                skip_count += 1;
+                continue;
+            }
+
+            // Segment location from the cursor — no index lookup needed.
+            let segment_id = scan.current_segment_id().unwrap();
+
+            // Apply command.
+            let response =
+                self.engine
+                    .apply_command(&cmd, rec.log_index, current_time, Some(segment_id));
+
+            // Post-apply: structural writes to MDBX.
+            self.handle_structural_writes(&cmd, &response, rec.log_index);
+
+            // Deliver response through stashed raft responder (leader path).
+            if let Some(responder) = self.responder_table.take(rec.log_index) {
+                responder.send(response);
+            } else if let Some(client_id) = self.client_id_table.take(rec.log_index) {
+                // Client channel path (Phase 4).
+                let entry = ResponseEntry::from_response(rec.log_index, &response);
+                let _ = self.client_registry.send(client_id, entry);
+            }
+
+            apply_count += 1;
+        }
+
+        if apply_count > 0 {
+            self.m_apply_count.increment(apply_count);
+        }
+        if skip_count > 0 {
+            self.m_skip_count.increment(skip_count);
+        }
+    }
+
+    /// Determine if this worker should process the given command.
+    #[inline]
+    fn should_process(&self, cmd: &MqCommand, log_index: u64) -> bool {
+        match cmd.tag() {
+            // Structural: assigned by log_index for even distribution.
+            MqCommand::TAG_CREATE_TOPIC
+            | MqCommand::TAG_DELETE_TOPIC
+            | MqCommand::TAG_CREATE_EXCHANGE
+            | MqCommand::TAG_DELETE_EXCHANGE
+            | MqCommand::TAG_CREATE_CONSUMER_GROUP
+            | MqCommand::TAG_DELETE_CONSUMER_GROUP
+            | MqCommand::TAG_CREATE_BINDING
+            | MqCommand::TAG_DELETE_BINDING
+            | MqCommand::TAG_CREATE_SESSION
+            | MqCommand::TAG_DISCONNECT_SESSION => {
+                (log_index as usize) % self.num_partitions == self.partition_id
+            }
+
+            // Data-plane: assigned by primary_id for entity co-location.
+            _ => (cmd.primary_id() as usize) % self.num_partitions == self.partition_id,
+        }
+    }
+
+    fn handle_structural_writes(&self, cmd: &MqCommand, response: &MqResponse, log_index: u64) {
+        let manifest = match self.manifest {
+            Some(ref m) => m,
+            None => return,
+        };
+
+        let kind = classify_structural(cmd);
+        if let Some(writes) = collect_structural_writes(self.engine.metadata(), response, kind) {
+            let next_id = self.engine.metadata().next_id.load(Ordering::Relaxed);
+            for w in writes {
+                manifest.structural_update_fire_and_forget(self.group_id, log_index, next_id, w);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Async Apply Manager
+// =============================================================================
+
+/// Coordinates pull-based partition workers and the high-water mark.
+///
+/// Created during state machine initialization. The state machine's
+/// `apply()` advances the HWM; workers wake and pull from the log.
+#[allow(dead_code)]
+pub struct AsyncApplyManager {
+    pub(crate) hwm: Arc<HighWaterMark>,
+    pub(crate) responder_table: Arc<ResponderTable>,
+    pub(crate) client_registry: Arc<ClientRegistry>,
+    pub(crate) client_id_table: Arc<ClientIdTable>,
+    worker_cursors: Vec<Arc<AtomicU64>>,
+    worker_handles: Vec<tokio::task::JoinHandle<()>>,
+    cursor_notify: Arc<tokio::sync::Notify>,
+    num_partitions: usize,
+}
+
+impl AsyncApplyManager {
+    /// Create the manager and spawn partition workers.
+    pub fn new(
+        config: &ParallelApplyConfig,
+        engine: Arc<MqEngine>,
+        prefetcher: SegmentPrefetcher,
+        manifest: Option<Arc<MqManifestManager>>,
+        group_id: u64,
+        initial_cursor: u64,
+        catalog_name: &str,
+    ) -> Self {
+        let n = config.num_partitions;
+        let hwm = Arc::new(HighWaterMark::new(initial_cursor));
+        let responder_table = Arc::new(ResponderTable::new());
+        let client_registry = Arc::new(ClientRegistry::new());
+        let client_id_table = Arc::new(ClientIdTable::new());
+        let cursor_notify = Arc::new(tokio::sync::Notify::new());
+
+        let mut worker_cursors = Vec::with_capacity(n);
+        let mut worker_handles = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let cursor = Arc::new(AtomicU64::new(initial_cursor));
+            let partition_label = i.to_string();
+            let catalog = catalog_name.to_owned();
+            let m_apply_count = metrics::counter!(
+                "mq.async_worker.apply_count",
+                "catalog" => catalog.clone(),
+                "partition" => partition_label.clone()
+            );
+            let m_skip_count = metrics::counter!(
+                "mq.async_worker.skip_count",
+                "catalog" => catalog,
+                "partition" => partition_label
+            );
+
+            let worker = PartitionWorker {
+                partition_id: i,
+                num_partitions: n,
+                cursor: Arc::clone(&cursor),
+                hwm: Arc::clone(&hwm),
+                prefetcher: prefetcher.clone(),
+                engine: Arc::clone(&engine),
+                responder_table: Arc::clone(&responder_table),
+                client_registry: Arc::clone(&client_registry),
+                client_id_table: Arc::clone(&client_id_table),
+                manifest: manifest.clone(),
+                group_id,
+                cursor_notify: Arc::clone(&cursor_notify),
+                m_apply_count,
+                m_skip_count,
+            };
+
+            let handle = tokio::spawn(worker.run());
+            worker_cursors.push(cursor);
+            worker_handles.push(handle);
+        }
+
+        Self {
+            hwm,
+            responder_table,
+            client_registry,
+            client_id_table,
+            worker_cursors,
+            worker_handles,
+            cursor_notify,
+            num_partitions: n,
+        }
+    }
+
+    /// Advance the HWM to the given index.
+    #[inline]
+    pub fn advance_hwm(&self, new_hwm: u64) {
+        self.hwm.advance(new_hwm);
+    }
+
+    /// Advance the HWM and wait for all workers to reach it.
+    pub async fn advance_and_wait(&self, target: u64) {
+        self.hwm.advance(target);
+        self.wait_for_workers(target).await;
+    }
+
+    /// Wait for all workers to reach at least `target`.
+    pub async fn wait_for_workers(&self, target: u64) {
+        loop {
+            let notified = self.cursor_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.min_worker_cursor() >= target {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Barrier: ensure all workers have processed up to `target`.
+    pub async fn barrier(&self, target: u64) {
+        self.advance_and_wait(target).await;
+    }
+
+    /// Returns the minimum cursor across all workers.
+    pub fn min_worker_cursor(&self) -> u64 {
+        self.worker_cursors
+            .iter()
+            .map(|c| c.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Number of partition workers.
+    pub fn num_partitions(&self) -> usize {
+        self.num_partitions
+    }
+
+    /// Get a reference to the client registry.
+    pub fn client_registry(&self) -> &Arc<ClientRegistry> {
+        &self.client_registry
+    }
+
+    /// Shutdown all workers.
+    pub async fn shutdown(&mut self) {
+        self.hwm.advance(u64::MAX);
+        for handle in self.worker_handles.drain(..) {
+            let _ = handle.await;
+        }
+    }
+}
+
+// =============================================================================
+// Adapter Integration (Phase 4)
+// =============================================================================
+
+/// Tracks in-flight requests for a single client connection.
+///
+/// Each adapter connection maintains one of these. After proposing a command
+/// through Raft, the adapter stores the request context here keyed by the
+/// returned `log_index`. When a `ResponseEntry` arrives on the client channel
+/// matching that `log_index`, the adapter removes the pending request and
+/// constructs the protocol-specific response.
+pub struct PendingRequests {
+    requests: std::collections::HashMap<u64, PendingRequest>,
+}
+
+/// Protocol-specific request context stored while awaiting a response.
+pub enum PendingRequest {
+    /// MQTT publish awaiting PUBACK.
+    Publish { packet_id: u16, qos: u8 },
+    /// AMQP disposition awaiting settlement.
+    Disposition { delivery_id: u32 },
+    /// Kafka produce awaiting partition response.
+    ProducePartition { topic: String, partition: i32 },
+    /// Entity creation (topic, exchange, consumer group, etc.).
+    CreateEntity { name: String },
+    /// Generic request with no protocol-specific metadata.
+    Generic,
+}
+
+impl PendingRequests {
+    pub fn new() -> Self {
+        Self {
+            requests: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register a pending request. Called after `raft.client_write()` returns
+    /// the `log_index`.
+    pub fn insert(&mut self, log_index: u64, request: PendingRequest) {
+        self.requests.insert(log_index, request);
+    }
+
+    /// Remove and return a pending request. Called when a `ResponseEntry`
+    /// arrives matching the `log_index`.
+    pub fn remove(&mut self, log_index: u64) -> Option<PendingRequest> {
+        self.requests.remove(&log_index)
+    }
+
+    /// Number of in-flight requests.
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+
+    /// Whether there are no in-flight requests.
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+}
+
+impl Default for PendingRequests {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- HighWaterMark tests ----
+
+    #[tokio::test]
+    async fn hwm_immediate_return_when_ahead() {
+        let hwm = HighWaterMark::new(10);
+        // cursor=5, HWM=10 → should return immediately
+        let val = hwm.wait_for(5).await;
+        assert_eq!(val, 10);
+    }
+
+    #[tokio::test]
+    async fn hwm_waits_then_wakes() {
+        let hwm = Arc::new(HighWaterMark::new(0));
+        let hwm2 = Arc::clone(&hwm);
+
+        let handle = tokio::spawn(async move {
+            // cursor=0, HWM=0 → should block
+            hwm2.wait_for(0).await
+        });
+
+        // Give the task time to register the waiter.
+        tokio::task::yield_now().await;
+
+        // Advance HWM — should wake the waiter.
+        hwm.advance(5);
+
+        let val = handle.await.unwrap();
+        assert_eq!(val, 5);
+    }
+
+    #[tokio::test]
+    async fn hwm_coalescing() {
+        let hwm = Arc::new(HighWaterMark::new(0));
+        let hwm2 = Arc::clone(&hwm);
+
+        let handle = tokio::spawn(async move { hwm2.wait_for(0).await });
+
+        tokio::task::yield_now().await;
+
+        // Multiple advances before wake — should coalesce.
+        hwm.advance(1);
+        hwm.advance(2);
+        hwm.advance(5);
+        hwm.advance(10);
+
+        let val = handle.await.unwrap();
+        assert_eq!(val, 10);
+    }
+
+    #[test]
+    fn hwm_current() {
+        let hwm = HighWaterMark::new(42);
+        assert_eq!(hwm.current(), 42);
+        hwm.advance(100);
+        assert_eq!(hwm.current(), 100);
+    }
+
+    // ---- ResponderTable tests ----
+
+    #[test]
+    fn responder_table_insert_take() {
+        let table = ResponderTable::new();
+        assert_eq!(table.len(), 0);
+
+        // We can't easily create an ApplyResponder in tests, so just test
+        // the empty take path.
+        assert!(table.take(1).is_none());
+    }
+
+    // ---- ResponseEntry tests ----
+
+    #[test]
+    fn response_entry_ok() {
+        let entry = ResponseEntry::ok(42);
+        assert_eq!(entry.tag(), ResponseEntry::TAG_OK);
+        assert!(entry.is_ok());
+        assert_eq!(entry.log_index(), 42);
+        assert_eq!(entry.buf.len(), 16);
+    }
+
+    #[test]
+    fn response_entry_published() {
+        let entry = ResponseEntry::published(100, 50, 10);
+        assert_eq!(entry.tag(), ResponseEntry::TAG_PUBLISHED);
+        assert!(entry.is_ok());
+        assert_eq!(entry.log_index(), 100);
+        assert_eq!(entry.buf.len(), 32);
+
+        // Read base_offset and count.
+        let base_offset = u64::from_le_bytes(entry.buf[16..24].try_into().unwrap());
+        let count = u64::from_le_bytes(entry.buf[24..32].try_into().unwrap());
+        assert_eq!(base_offset, 50);
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn response_entry_entity_created() {
+        let entry = ResponseEntry::entity_created(200, 999);
+        assert_eq!(entry.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+        assert!(entry.is_ok());
+        assert_eq!(entry.log_index(), 200);
+
+        let entity_id = u64::from_le_bytes(entry.buf[16..24].try_into().unwrap());
+        assert_eq!(entity_id, 999);
+    }
+
+    #[test]
+    fn response_entry_error() {
+        let entry = ResponseEntry::error(300, 42, "not found");
+        assert_eq!(entry.tag(), ResponseEntry::TAG_ERROR);
+        assert_eq!(entry.status(), ResponseEntry::STATUS_ERROR);
+        assert!(!entry.is_ok());
+        assert_eq!(entry.log_index(), 300);
+
+        let error_code = u32::from_le_bytes(entry.buf[16..20].try_into().unwrap());
+        let msg_len = u32::from_le_bytes(entry.buf[20..24].try_into().unwrap()) as usize;
+        assert_eq!(error_code, 42);
+        assert_eq!(msg_len, 9);
+        assert_eq!(&entry.buf[24..24 + msg_len], b"not found");
+        // Verify 8-byte alignment.
+        assert_eq!(entry.buf.len() % 8, 0);
+    }
+
+    #[test]
+    fn response_entry_from_mq_response() {
+        let entry = ResponseEntry::from_response(1, &MqResponse::Ok);
+        assert_eq!(entry.tag(), ResponseEntry::TAG_OK);
+
+        let entry = ResponseEntry::from_response(
+            2,
+            &MqResponse::Published {
+                base_offset: 10,
+                count: 5,
+            },
+        );
+        assert_eq!(entry.tag(), ResponseEntry::TAG_PUBLISHED);
+        assert_eq!(entry.log_index(), 2);
+
+        let entry = ResponseEntry::from_response(3, &MqResponse::EntityCreated { id: 77 });
+        assert_eq!(entry.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    }
+
+    #[test]
+    fn response_entry_8byte_alignment() {
+        // All response sizes should be 8-byte aligned.
+        assert_eq!(ResponseEntry::ok(0).buf.len() % 8, 0);
+        assert_eq!(ResponseEntry::published(0, 0, 0).buf.len() % 8, 0);
+        assert_eq!(ResponseEntry::entity_created(0, 0).buf.len() % 8, 0);
+        assert_eq!(ResponseEntry::error(0, 0, "").buf.len() % 8, 0);
+        assert_eq!(ResponseEntry::error(0, 0, "x").buf.len() % 8, 0);
+        assert_eq!(ResponseEntry::error(0, 0, "exactly8!").buf.len() % 8, 0);
+    }
+
+    // ---- ClientRegistry tests ----
+
+    #[tokio::test]
+    async fn client_registry_register_send_unregister() {
+        let registry = ClientRegistry::new();
+        assert_eq!(registry.client_count(), 0);
+
+        let (id, mut rx) = registry.register();
+        assert_eq!(id, 1);
+        assert_eq!(registry.client_count(), 1);
+
+        // Send a response.
+        let sent = registry.send(id, ResponseEntry::ok(42));
+        assert!(sent);
+
+        let entry = rx.recv().await.unwrap();
+        assert_eq!(entry.log_index(), 42);
+
+        // Send to non-existent client.
+        assert!(!registry.send(999, ResponseEntry::ok(1)));
+
+        // Unregister.
+        registry.unregister(id);
+        assert_eq!(registry.client_count(), 0);
+        assert!(!registry.send(id, ResponseEntry::ok(2)));
+    }
+
+    #[tokio::test]
+    async fn client_registry_disconnect_detection() {
+        let registry = ClientRegistry::new();
+        let (id, rx) = registry.register();
+
+        // Drop receiver — simulates client disconnect.
+        drop(rx);
+
+        // send should return false (channel closed).
+        assert!(!registry.send(id, ResponseEntry::ok(1)));
+    }
+
+    #[tokio::test]
+    async fn client_registry_multiple_clients() {
+        let registry = ClientRegistry::new();
+        let (id1, mut rx1) = registry.register();
+        let (id2, mut rx2) = registry.register();
+        assert_ne!(id1, id2);
+        assert_eq!(registry.client_count(), 2);
+
+        registry.send(id1, ResponseEntry::ok(1));
+        registry.send(id2, ResponseEntry::ok(2));
+
+        assert_eq!(rx1.recv().await.unwrap().log_index(), 1);
+        assert_eq!(rx2.recv().await.unwrap().log_index(), 2);
+    }
+
+    // ---- ClientIdTable tests ----
+
+    #[test]
+    fn client_id_table_insert_take() {
+        let table = ClientIdTable::new();
+        table.insert(100, 42);
+        table.insert(200, 43);
+
+        assert_eq!(table.take(100), Some(42));
+        assert_eq!(table.take(100), None); // already taken
+        assert_eq!(table.take(200), Some(43));
+        assert_eq!(table.take(300), None);
+    }
+
+    #[test]
+    fn client_id_table_overwrite() {
+        let table = ClientIdTable::new();
+        table.insert(100, 1);
+        table.insert(100, 2); // overwrite
+        assert_eq!(table.take(100), Some(2));
+    }
+
+    // ---- PendingRequests tests ----
+
+    #[test]
+    fn pending_requests_lifecycle() {
+        let mut pending = PendingRequests::new();
+        assert!(pending.is_empty());
+        assert_eq!(pending.len(), 0);
+
+        pending.insert(
+            10,
+            PendingRequest::Publish {
+                packet_id: 1,
+                qos: 1,
+            },
+        );
+        pending.insert(11, PendingRequest::Disposition { delivery_id: 42 });
+        pending.insert(12, PendingRequest::Generic);
+        assert_eq!(pending.len(), 3);
+        assert!(!pending.is_empty());
+
+        match pending.remove(10) {
+            Some(PendingRequest::Publish { packet_id, qos }) => {
+                assert_eq!(packet_id, 1);
+                assert_eq!(qos, 1);
+            }
+            _ => panic!("expected Publish"),
+        }
+
+        match pending.remove(11) {
+            Some(PendingRequest::Disposition { delivery_id }) => {
+                assert_eq!(delivery_id, 42);
+            }
+            _ => panic!("expected Disposition"),
+        }
+
+        assert!(pending.remove(10).is_none()); // already removed
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_requests_all_variants() {
+        let mut pending = PendingRequests::new();
+        pending.insert(
+            1,
+            PendingRequest::Publish {
+                packet_id: 100,
+                qos: 2,
+            },
+        );
+        pending.insert(2, PendingRequest::Disposition { delivery_id: 200 });
+        pending.insert(
+            3,
+            PendingRequest::ProducePartition {
+                topic: "test-topic".to_string(),
+                partition: 3,
+            },
+        );
+        pending.insert(
+            4,
+            PendingRequest::CreateEntity {
+                name: "my-queue".to_string(),
+            },
+        );
+        pending.insert(5, PendingRequest::Generic);
+        assert_eq!(pending.len(), 5);
+
+        match pending.remove(3) {
+            Some(PendingRequest::ProducePartition { topic, partition }) => {
+                assert_eq!(topic, "test-topic");
+                assert_eq!(partition, 3);
+            }
+            _ => panic!("expected ProducePartition"),
+        }
+
+        match pending.remove(4) {
+            Some(PendingRequest::CreateEntity { name }) => {
+                assert_eq!(name, "my-queue");
+            }
+            _ => panic!("expected CreateEntity"),
+        }
+    }
+
+    #[test]
+    fn pending_requests_default() {
+        let pending = PendingRequests::default();
+        assert!(pending.is_empty());
+    }
+
+    // ---- ResponseEntry extended tests ----
+
+    #[test]
+    fn response_entry_from_error() {
+        use crate::types::{EntityKind, MqError};
+        let err = MqResponse::Error(MqError::NotFound {
+            entity: EntityKind::Topic,
+            id: 42,
+        });
+        let entry = ResponseEntry::from_response(99, &err);
+        assert_eq!(entry.tag(), ResponseEntry::TAG_ERROR);
+        assert!(!entry.is_ok());
+        assert_eq!(entry.log_index(), 99);
+        assert_eq!(entry.buf.len() % 8, 0);
+    }
+
+    #[test]
+    fn response_entry_from_messages() {
+        // Messages variant falls through to Ok (fallback).
+        let resp = MqResponse::Messages {
+            messages: Default::default(),
+        };
+        let entry = ResponseEntry::from_response(50, &resp);
+        // Complex responses fall back to TAG_OK.
+        assert_eq!(entry.tag(), ResponseEntry::TAG_OK);
+        assert_eq!(entry.log_index(), 50);
+    }
+
+    #[test]
+    fn response_entry_from_batch_response() {
+        let resp = MqResponse::BatchResponse(Box::new(smallvec::smallvec![
+            MqResponse::Ok,
+            MqResponse::Published {
+                base_offset: 0,
+                count: 1
+            },
+        ]));
+        let entry = ResponseEntry::from_response(60, &resp);
+        // BatchResponse falls back to TAG_OK.
+        assert_eq!(entry.tag(), ResponseEntry::TAG_OK);
+    }
+
+    #[test]
+    fn response_entry_error_empty_message() {
+        let entry = ResponseEntry::error(1, 0, "");
+        assert_eq!(entry.tag(), ResponseEntry::TAG_ERROR);
+        assert_eq!(entry.log_index(), 1);
+        let msg_len = u32::from_le_bytes(entry.buf[20..24].try_into().unwrap()) as usize;
+        assert_eq!(msg_len, 0);
+        assert_eq!(entry.buf.len() % 8, 0);
+    }
+
+    #[test]
+    fn response_entry_error_long_message() {
+        let long_msg = "a]".repeat(500);
+        let entry = ResponseEntry::error(2, 99, &long_msg);
+        assert_eq!(entry.tag(), ResponseEntry::TAG_ERROR);
+        assert_eq!(entry.log_index(), 2);
+        let error_code = u32::from_le_bytes(entry.buf[16..20].try_into().unwrap());
+        assert_eq!(error_code, 99);
+        let msg_len = u32::from_le_bytes(entry.buf[20..24].try_into().unwrap()) as usize;
+        assert_eq!(msg_len, long_msg.len());
+        assert_eq!(&entry.buf[24..24 + msg_len], long_msg.as_bytes());
+        assert_eq!(entry.buf.len() % 8, 0);
+    }
+
+    // ---- HighWaterMark extended tests ----
+
+    #[tokio::test]
+    async fn hwm_shutdown_sentinel() {
+        let hwm = Arc::new(HighWaterMark::new(0));
+        let hwm2 = Arc::clone(&hwm);
+
+        let handle = tokio::spawn(async move { hwm2.wait_for(0).await });
+
+        tokio::task::yield_now().await;
+
+        // Advance with shutdown sentinel.
+        hwm.advance(u64::MAX);
+
+        let val = handle.await.unwrap();
+        assert_eq!(val, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn hwm_multiple_waiters() {
+        let hwm = Arc::new(HighWaterMark::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let hwm2 = Arc::clone(&hwm);
+            handles.push(tokio::spawn(async move { hwm2.wait_for(0).await }));
+        }
+
+        tokio::task::yield_now().await;
+        hwm.advance(42);
+
+        for h in handles {
+            assert_eq!(h.await.unwrap(), 42);
+        }
+    }
+
+    #[tokio::test]
+    async fn hwm_sequential_advances() {
+        let hwm = Arc::new(HighWaterMark::new(0));
+        let hwm2 = Arc::clone(&hwm);
+
+        // First wait.
+        hwm.advance(5);
+        let val = hwm2.wait_for(0).await;
+        assert_eq!(val, 5);
+
+        // Second wait from new cursor.
+        let hwm3 = Arc::clone(&hwm);
+        let handle = tokio::spawn(async move { hwm3.wait_for(5).await });
+        tokio::task::yield_now().await;
+        hwm.advance(10);
+        assert_eq!(handle.await.unwrap(), 10);
+    }
+
+    // ---- ClientRegistry extended tests ----
+
+    #[tokio::test]
+    async fn client_registry_ids_are_unique() {
+        let registry = ClientRegistry::new();
+        let (id1, _rx1) = registry.register();
+        let (id2, _rx2) = registry.register();
+        let (id3, _rx3) = registry.register();
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+    }
+
+    #[tokio::test]
+    async fn client_registry_send_multiple_responses() {
+        let registry = ClientRegistry::new();
+        let (id, mut rx) = registry.register();
+
+        for i in 0..10u64 {
+            assert!(registry.send(id, ResponseEntry::ok(i)));
+        }
+
+        for i in 0..10u64 {
+            let entry = rx.recv().await.unwrap();
+            assert_eq!(entry.log_index(), i);
+        }
+    }
+
+    // ---- Worker routing tests ----
+
+    /// Helper to test routing logic without constructing a PartitionWorker.
+    fn route_partition(cmd: &MqCommand, log_index: u64, num_partitions: usize) -> usize {
+        match cmd.tag() {
+            MqCommand::TAG_CREATE_TOPIC
+            | MqCommand::TAG_DELETE_TOPIC
+            | MqCommand::TAG_CREATE_EXCHANGE
+            | MqCommand::TAG_DELETE_EXCHANGE
+            | MqCommand::TAG_CREATE_CONSUMER_GROUP
+            | MqCommand::TAG_DELETE_CONSUMER_GROUP
+            | MqCommand::TAG_CREATE_BINDING
+            | MqCommand::TAG_DELETE_BINDING
+            | MqCommand::TAG_CREATE_SESSION
+            | MqCommand::TAG_DISCONNECT_SESSION => (log_index as usize) % num_partitions,
+            _ => (cmd.primary_id() as usize) % num_partitions,
+        }
+    }
+
+    #[test]
+    fn worker_routing_structural_by_log_index() {
+        let num_partitions = 4;
+
+        // CREATE_TOPIC at log_index=9 → 9 % 4 = 1
+        let cmd = MqCommand::create_topic("test", crate::types::RetentionPolicy::default(), 1);
+        assert_eq!(route_partition(&cmd, 9, num_partitions), 1);
+    }
+
+    #[test]
+    fn worker_routing_data_plane_by_primary_id() {
+        let num_partitions = 4;
+
+        let cmd = MqCommand::publish(7, &[]);
+        assert_eq!(route_partition(&cmd, 0, num_partitions), 3); // 7 % 4 = 3
+
+        let cmd = MqCommand::publish(8, &[]);
+        assert_eq!(route_partition(&cmd, 0, num_partitions), 0); // 8 % 4 = 0
+    }
+
+    #[test]
+    fn worker_routing_all_structural_tags() {
+        let n = 4;
+        let structural_cmds = vec![
+            MqCommand::create_topic("t", crate::types::RetentionPolicy::default(), 0),
+            MqCommand::delete_topic(1),
+            MqCommand::create_exchange("e", crate::types::ExchangeType::Fanout),
+            MqCommand::delete_exchange(1),
+            MqCommand::create_consumer_group("g", 1),
+            MqCommand::delete_consumer_group(1),
+            MqCommand::create_session(1, "c", 30000, 0),
+            MqCommand::disconnect_session(1, false),
+        ];
+
+        for cmd in &structural_cmds {
+            // Structural commands at different log indices should spread across partitions.
+            let mut seen = vec![false; n];
+            for log_index in 0..n as u64 {
+                seen[route_partition(cmd, log_index, n)] = true;
+            }
+            assert!(
+                seen.iter().all(|&s| s),
+                "tag {} should reach all partitions via log_index routing",
+                cmd.tag()
+            );
+        }
+    }
+
+    #[test]
+    fn worker_routing_data_plane_deterministic() {
+        let n = 8;
+        for topic_id in 0..100u64 {
+            let cmd = MqCommand::publish(topic_id, &[]);
+            let p1 = route_partition(&cmd, 1, n);
+            let p2 = route_partition(&cmd, 999, n);
+            // Same primary_id always maps to same partition regardless of log_index.
+            assert_eq!(
+                p1, p2,
+                "data-plane routing should be independent of log_index"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_routing_batch_not_structural() {
+        // TAG_BATCH should NOT match any structural tag, so it falls through
+        // to data-plane routing (which workers skip entirely for batch).
+        let batch = MqCommand::batch(&[MqCommand::publish(1, &[])]);
+        assert_eq!(batch.tag(), MqCommand::TAG_BATCH);
+
+        // Verify TAG_BATCH is not in the structural set.
+        let p = route_partition(&batch, 100, 4);
+        // Should use primary_id routing, not log_index.
+        let expected = (batch.primary_id() as usize) % 4;
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn worker_routing_commit_offset_by_primary_id() {
+        let cmd = MqCommand::commit_offset(42, 1, 100);
+        assert_eq!(route_partition(&cmd, 0, 8), (42usize) % 8);
+    }
+
+    #[test]
+    fn worker_routing_single_partition() {
+        // With 1 partition, everything goes to partition 0.
+        let cmd = MqCommand::publish(999, &[]);
+        assert_eq!(route_partition(&cmd, 123, 1), 0);
+
+        let cmd = MqCommand::create_topic("t", crate::types::RetentionPolicy::default(), 0);
+        assert_eq!(route_partition(&cmd, 456, 1), 0);
+    }
+
+    // ---- ResponderTable extended tests ----
+
+    #[test]
+    fn responder_table_take_nonexistent() {
+        let table = ResponderTable::new();
+        // Take from empty table.
+        assert!(table.take(0).is_none());
+        assert!(table.take(u64::MAX).is_none());
+    }
+}
