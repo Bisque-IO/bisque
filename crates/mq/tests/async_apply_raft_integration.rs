@@ -46,7 +46,7 @@ fn make_blank_entry(index: u64, term: u64) -> openraft::impls::Entry<MqTypeConfi
 
 fn make_flat_msg(payload_size: usize) -> bytes::Bytes {
     let value = vec![0xABu8; payload_size];
-    bisque_mq::flat::FlatMessageBuilder::new(bytes::Bytes::from(value))
+    bisque_mq::flat::FlatMessageBuilder::new(&value)
         .timestamp(1000)
         .build()
 }
@@ -116,7 +116,7 @@ async fn async_apply_workers_process_entries_from_raft_log() {
     let topic_id = snap.topics[0].meta.topic_id;
 
     // Now publish a message to the topic (data-plane command at index 2).
-    let msg = bisque_mq::flat::FlatMessageBuilder::new(bytes::Bytes::from_static(b"hello"))
+    let msg = bisque_mq::flat::FlatMessageBuilder::new(b"hello")
         .timestamp(1000)
         .build();
     let publish_cmd = MqCommand::publish(topic_id, &[msg]);
@@ -187,11 +187,9 @@ async fn async_apply_multiple_topics_and_publishes() {
     // Publish to each topic.
     let mut entries = Vec::new();
     for (i, &tid) in topic_ids.iter().enumerate() {
-        let msg = bisque_mq::flat::FlatMessageBuilder::new(bytes::Bytes::from(
-            format!("msg-{}", i).into_bytes(),
-        ))
-        .timestamp(2000)
-        .build();
+        let msg = bisque_mq::flat::FlatMessageBuilder::new(format!("msg-{}", i).as_bytes())
+            .timestamp(2000)
+            .build();
         entries.push(make_entry(5 + i as u64, 1, MqCommand::publish(tid, &[msg])));
     }
     append_and_flush(&mut log, entries).await;
@@ -294,10 +292,10 @@ async fn async_apply_batch_entries_skipped_by_workers() {
     let topic_id = engine.snapshot().topics[0].meta.topic_id;
 
     // Write a batch command at index 2, then a normal publish at index 3.
-    let msg1 = bisque_mq::flat::FlatMessageBuilder::new(bytes::Bytes::from_static(b"batch-msg"))
+    let msg1 = bisque_mq::flat::FlatMessageBuilder::new(b"batch-msg")
         .timestamp(1000)
         .build();
-    let msg2 = bisque_mq::flat::FlatMessageBuilder::new(bytes::Bytes::from_static(b"normal-msg"))
+    let msg2 = bisque_mq::flat::FlatMessageBuilder::new(b"normal-msg")
         .timestamp(1000)
         .build();
 
@@ -423,11 +421,9 @@ async fn async_apply_high_throughput() {
         let mut entries = Vec::with_capacity(50);
         for i in 0..50u64 {
             let idx = 2 + batch_start + i;
-            let msg = bisque_mq::flat::FlatMessageBuilder::new(bytes::Bytes::from(
-                format!("msg-{}", idx).into_bytes(),
-            ))
-            .timestamp(3000)
-            .build();
+            let msg = bisque_mq::flat::FlatMessageBuilder::new(format!("msg-{}", idx).as_bytes())
+                .timestamp(3000)
+                .build();
             entries.push(make_entry(idx, 1, MqCommand::publish(topic_id, &[msg])));
         }
         append_and_flush(&mut log, entries).await;
@@ -485,11 +481,9 @@ async fn async_apply_segment_index_tracking() {
     // Publish messages.
     let mut entries = Vec::new();
     for i in 0..5u64 {
-        let msg = bisque_mq::flat::FlatMessageBuilder::new(bytes::Bytes::from(
-            format!("idx-{}", i).into_bytes(),
-        ))
-        .timestamp(4000)
-        .build();
+        let msg = bisque_mq::flat::FlatMessageBuilder::new(format!("idx-{}", i).as_bytes())
+            .timestamp(4000)
+            .build();
         entries.push(make_entry(2 + i, 1, MqCommand::publish(topic_id, &[msg])));
     }
     append_and_flush(&mut log, entries).await;

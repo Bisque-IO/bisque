@@ -79,9 +79,7 @@ fn make_payload(size: usize) -> Bytes {
 }
 
 fn make_flat_msg(payload: &Bytes) -> Bytes {
-    FlatMessageBuilder::new(payload.clone())
-        .timestamp(1000)
-        .build()
+    FlatMessageBuilder::new(payload).timestamp(1000).build()
 }
 
 fn format_throughput(count: usize, elapsed: std::time::Duration) -> String {
@@ -766,9 +764,7 @@ fn bench_flat_message_build(config: &BenchConfig, msg_size: usize) -> BenchResul
 
     let start = Instant::now();
     for _ in 0..count {
-        let msg = FlatMessageBuilder::new(payload.clone())
-            .timestamp(1000)
-            .build();
+        let msg = FlatMessageBuilder::new(&payload).timestamp(1000).build();
         std::hint::black_box(&msg);
     }
     let elapsed = start.elapsed();

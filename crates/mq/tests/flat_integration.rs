@@ -20,40 +20,28 @@ fn make_engine() -> MqEngine {
 
 #[test]
 fn test_flat_message_full_roundtrip() {
-    let flat_bytes = FlatMessageBuilder::new(Bytes::from("important payload data"))
-        .key(Bytes::from_static(b"order-key-123"))
+    let flat_bytes = FlatMessageBuilder::new(b"important payload data")
+        .key(b"order-key-123")
         .timestamp(1700000000)
         .ttl_ms(30_000)
         .delay_ms(5_000)
-        .routing_key(Bytes::from_static(b"orders.us.west"))
-        .reply_to(Bytes::from_static(b"reply-topic-1"))
-        .correlation_id(Bytes::from_static(b"corr-uuid-456"))
-        .header(
-            Bytes::from_static(b"content-type"),
-            Bytes::from_static(b"application/json"),
-        )
-        .header(
-            Bytes::from_static(b"x-trace-id"),
-            Bytes::from_static(b"trace-abc-def"),
-        )
-        .header(
-            Bytes::from_static(b"x-priority"),
-            Bytes::from_static(b"high"),
-        )
+        .routing_key(b"orders.us.west")
+        .reply_to(b"reply-topic-1")
+        .correlation_id(b"corr-uuid-456")
+        .header(b"content-type", b"application/json")
+        .header(b"x-trace-id", b"trace-abc-def")
+        .header(b"x-priority", b"high")
         .build();
 
-    let flat = FlatMessage::new(flat_bytes).expect("valid flat message");
+    let flat = FlatMessage::new(&flat_bytes).expect("valid flat message");
     assert_eq!(flat.value(), Bytes::from("important payload data"));
-    assert_eq!(flat.key(), Some(Bytes::from_static(b"order-key-123")));
+    assert_eq!(flat.key(), Some(b"order-key-123" as &[u8]));
     assert_eq!(flat.timestamp(), 1700000000);
     assert_eq!(flat.ttl_ms(), Some(30_000));
     assert_eq!(flat.delay_ms(), Some(5_000));
     assert_eq!(flat.routing_key_str(), Some("orders.us.west".into()));
-    assert_eq!(flat.reply_to(), Some(Bytes::from_static(b"reply-topic-1")));
-    assert_eq!(
-        flat.correlation_id(),
-        Some(Bytes::from_static(b"corr-uuid-456"))
-    );
+    assert_eq!(flat.reply_to(), Some(b"reply-topic-1" as &[u8]));
+    assert_eq!(flat.correlation_id(), Some(b"corr-uuid-456" as &[u8]));
     assert_eq!(flat.header_count(), 3);
 
     let (k0, v0) = flat.header(0);
@@ -63,8 +51,8 @@ fn test_flat_message_full_roundtrip() {
 
 #[test]
 fn test_flat_message_minimal_roundtrip() {
-    let flat_bytes = FlatMessageBuilder::new(Bytes::from_static(b"bare")).build();
-    let flat = FlatMessage::new(flat_bytes).unwrap();
+    let flat_bytes = FlatMessageBuilder::new(b"bare").build();
+    let flat = FlatMessage::new(&flat_bytes).unwrap();
 
     assert_eq!(flat.value(), Bytes::from_static(b"bare"));
     assert!(flat.key().is_none());
@@ -82,7 +70,7 @@ fn test_flat_message_minimal_roundtrip() {
 
 #[test]
 fn test_meta_ttl_and_delay_extraction() {
-    let buf = FlatMessageBuilder::new(Bytes::from_static(b"data"))
+    let buf = FlatMessageBuilder::new(b"data")
         .timestamp(5000)
         .ttl_ms(60_000)
         .delay_ms(10_000)
@@ -97,21 +85,21 @@ fn test_meta_ttl_and_delay_extraction() {
 
 #[test]
 fn test_meta_value_len_large_payload() {
-    let large_value = Bytes::from(vec![0xABu8; 65_536]);
-    let buf = FlatMessageBuilder::new(large_value.clone()).build();
+    let large_value = vec![0xABu8; 65_536];
+    let buf = FlatMessageBuilder::new(&large_value).build();
 
     assert_eq!(FlatMessageMeta::value_len(&buf), Some(65_536));
 
-    let flat = FlatMessage::new(buf).unwrap();
+    let flat = FlatMessage::new(&buf).unwrap();
     assert_eq!(flat.value_len(), 65_536);
     assert_eq!(flat.value().len(), 65_536);
-    assert_eq!(flat.value(), large_value);
+    assert_eq!(flat.value(), &large_value[..]);
 }
 
 #[test]
 fn test_meta_flags_routing_key_present() {
-    let buf = FlatMessageBuilder::new(Bytes::new())
-        .routing_key(Bytes::from_static(b"events.user.created"))
+    let buf = FlatMessageBuilder::new(b"")
+        .routing_key(b"events.user.created")
         .build();
 
     let meta = FlatMessageMeta::parse(&buf).unwrap();
@@ -160,7 +148,7 @@ fn test_queue_publish_ttl_from_flat_header() {
     let source_topic_id = group_id + 1;
 
     // Publish message with 30s TTL to the source topic
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"expiring"))
+    let msg = FlatMessageBuilder::new(b"expiring")
         .timestamp(1000)
         .ttl_ms(30_000)
         .build();
@@ -210,7 +198,7 @@ fn test_queue_publish_delay_from_flat_header() {
     };
     let source_topic_id = group_id + 1;
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"delayed"))
+    let msg = FlatMessageBuilder::new(b"delayed")
         .timestamp(1000)
         .delay_ms(10_000)
         .build();
@@ -250,9 +238,7 @@ fn test_queue_publish_no_ttl_no_delay() {
     };
     let source_topic_id = group_id + 1;
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"plain"))
-        .timestamp(1000)
-        .build();
+    let msg = FlatMessageBuilder::new(b"plain").timestamp(1000).build();
 
     engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 5000, None);
 
@@ -289,7 +275,7 @@ fn test_queue_publish_delay_clamped_by_ttl() {
     };
     let source_topic_id = group_id + 1;
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"clamped"))
+    let msg = FlatMessageBuilder::new(b"clamped")
         .timestamp(1000)
         .ttl_ms(10_000)
         .delay_ms(60_000)
@@ -325,19 +311,19 @@ fn test_topic_publish_flat_messages() {
     };
 
     let messages: Vec<Bytes> = vec![
-        FlatMessageBuilder::new(Bytes::from_static(b"event-1"))
-            .key(Bytes::from_static(b"user-1"))
+        FlatMessageBuilder::new(b"event-1")
+            .key(b"user-1")
             .timestamp(1000)
             .build(),
-        FlatMessageBuilder::new(Bytes::from_static(b"event-2"))
+        FlatMessageBuilder::new(b"event-2")
             .timestamp(1001)
-            .routing_key(Bytes::from_static(b"events.user.created"))
+            .routing_key(b"events.user.created")
             .build(),
-        FlatMessageBuilder::new(Bytes::from_static(b"event-3"))
-            .key(Bytes::from_static(b"user-3"))
+        FlatMessageBuilder::new(b"event-3")
+            .key(b"user-3")
             .timestamp(1002)
-            .header("source", &b"api"[..])
-            .header("version", &b"2"[..])
+            .header(b"source", b"api")
+            .header(b"version", b"2")
             .build(),
     ];
 
@@ -424,9 +410,9 @@ fn test_exchange_fanout_with_flat_messages() {
         None,
     );
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"fanout-data"))
+    let msg = FlatMessageBuilder::new(b"fanout-data")
         .timestamp(2000)
-        .key(Bytes::from_static(b"some-key"))
+        .key(b"some-key")
         .build();
 
     let resp = engine.apply_command(
@@ -512,9 +498,9 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
         None,
     );
 
-    let msg_us = FlatMessageBuilder::new(Bytes::from_static(b"order-data-us"))
+    let msg_us = FlatMessageBuilder::new(b"order-data-us")
         .timestamp(2000)
-        .routing_key(Bytes::from_static(b"us"))
+        .routing_key(b"us")
         .build();
 
     engine.apply_command(
@@ -538,9 +524,9 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
     assert_eq!(us_topic.meta.message_count, 1);
     assert_eq!(eu_topic.meta.message_count, 0);
 
-    let msg_eu = FlatMessageBuilder::new(Bytes::from_static(b"order-data-eu"))
+    let msg_eu = FlatMessageBuilder::new(b"order-data-eu")
         .timestamp(2001)
-        .routing_key(Bytes::from_static(b"eu"))
+        .routing_key(b"eu")
         .build();
 
     engine.apply_command(
@@ -606,9 +592,7 @@ fn test_exchange_no_routing_key_in_flat_message() {
         None,
     );
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"no-route"))
-        .timestamp(2000)
-        .build();
+    let msg = FlatMessageBuilder::new(b"no-route").timestamp(2000).build();
 
     engine.apply_command(
         &MqCommand::publish_to_exchange(ex_id, &[msg]),
@@ -655,12 +639,12 @@ fn test_actor_send_flat_message() {
     };
     let source_topic_id = group_id + 1;
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"task-payload"))
-        .key(Bytes::from_static(b"task-key"))
+    let msg = FlatMessageBuilder::new(b"task-payload")
+        .key(b"task-key")
         .timestamp(5000)
-        .correlation_id(Bytes::from_static(b"corr-xyz"))
-        .reply_to(Bytes::from_static(b"response-topic"))
-        .header("priority", &b"high"[..])
+        .correlation_id(b"corr-xyz")
+        .reply_to(b"response-topic")
+        .header(b"priority", b"high")
         .build();
 
     // Publish to the actor group's source topic
@@ -704,31 +688,27 @@ fn test_batch_publish_mixed_flat_messages() {
     let source_topic_id = group_id + 1;
 
     let messages: Vec<Bytes> = vec![
-        FlatMessageBuilder::new(Bytes::from_static(b"msg-1"))
-            .timestamp(1000)
-            .build(),
-        FlatMessageBuilder::new(Bytes::from_static(b"msg-2"))
-            .key(Bytes::from_static(b"k2"))
+        FlatMessageBuilder::new(b"msg-1").timestamp(1000).build(),
+        FlatMessageBuilder::new(b"msg-2")
+            .key(b"k2")
             .timestamp(1001)
             .ttl_ms(5000)
             .build(),
-        FlatMessageBuilder::new(Bytes::from_static(b"msg-3"))
+        FlatMessageBuilder::new(b"msg-3")
             .timestamp(1002)
             .delay_ms(2000)
             .build(),
-        FlatMessageBuilder::new(Bytes::from_static(b"msg-4"))
-            .key(Bytes::from_static(b"k4"))
+        FlatMessageBuilder::new(b"msg-4")
+            .key(b"k4")
             .timestamp(1003)
             .ttl_ms(60000)
             .delay_ms(1000)
-            .routing_key(Bytes::from_static(b"rk"))
-            .reply_to(Bytes::from_static(b"rt"))
-            .correlation_id(Bytes::from_static(b"cid"))
-            .header("h1", &b"v1"[..])
+            .routing_key(b"rk")
+            .reply_to(b"rt")
+            .correlation_id(b"cid")
+            .header(b"h1", b"v1")
             .build(),
-        FlatMessageBuilder::new(Bytes::new())
-            .timestamp(1004)
-            .build(),
+        FlatMessageBuilder::new(b"").timestamp(1004).build(),
     ];
 
     engine.apply_command(
@@ -753,40 +733,43 @@ fn test_batch_publish_mixed_flat_messages() {
 
 #[test]
 fn test_flat_message_invalid_buffer() {
-    assert!(FlatMessage::new(Bytes::new()).is_none());
-    assert!(FlatMessage::new(Bytes::from_static(b"too short")).is_none());
+    assert!(FlatMessage::new(&[]).is_none());
+    assert!(FlatMessage::new(b"too short").is_none());
 
     let mut buf = vec![0u8; 32];
     buf[4] = 100;
     buf[5] = 0;
-    assert!(FlatMessage::new(Bytes::from(buf)).is_none());
+    assert!(FlatMessage::new(&buf).is_none());
 }
 
 #[test]
 fn test_flat_message_empty_optional_fields() {
-    let buf = FlatMessageBuilder::new(Bytes::from_static(b"val"))
-        .key(Bytes::new())
-        .routing_key(Bytes::new())
+    let buf = FlatMessageBuilder::new(b"val")
+        .key(b"")
+        .routing_key(b"")
         .build();
 
-    let flat = FlatMessage::new(buf).unwrap();
+    let flat = FlatMessage::new(&buf).unwrap();
     assert_eq!(flat.value(), Bytes::from_static(b"val"));
-    assert_eq!(flat.key(), Some(Bytes::new()));
-    assert_eq!(flat.routing_key(), Some(Bytes::new()));
+    assert_eq!(flat.key(), Some(b"" as &[u8]));
+    assert_eq!(flat.routing_key(), Some(b"" as &[u8]));
 }
 
 #[test]
 fn test_flat_message_many_headers() {
-    let mut builder = FlatMessageBuilder::new(Bytes::from_static(b"payload"));
+    let mut builder = FlatMessageBuilder::new(b"payload");
+    let mut hdr_keys: Vec<String> = Vec::new();
+    let mut hdr_vals: Vec<String> = Vec::new();
     for i in 0..50 {
-        builder = builder.header(
-            Bytes::from(format!("header-key-{}", i)),
-            Bytes::from(format!("header-value-{}", i)),
-        );
+        hdr_keys.push(format!("header-key-{}", i));
+        hdr_vals.push(format!("header-value-{}", i));
+    }
+    for i in 0..50 {
+        builder = builder.header(hdr_keys[i].as_bytes(), hdr_vals[i].as_bytes());
     }
     let buf = builder.build();
 
-    let flat = FlatMessage::new(buf).unwrap();
+    let flat = FlatMessage::new(&buf).unwrap();
     assert_eq!(flat.header_count(), 50);
 
     let (k0, v0) = flat.header(0);
@@ -803,32 +786,32 @@ fn test_flat_message_many_headers() {
 
 #[test]
 fn test_flat_message_large_value() {
-    let large = Bytes::from(vec![0xFFu8; 1_000_000]);
-    let buf = FlatMessageBuilder::new(large.clone())
+    let large = vec![0xFFu8; 1_000_000];
+    let buf = FlatMessageBuilder::new(&large)
         .timestamp(42)
-        .key(Bytes::from_static(b"big-key"))
+        .key(b"big-key")
         .build();
 
-    let flat = FlatMessage::new(buf).unwrap();
+    let flat = FlatMessage::new(&buf).unwrap();
     assert_eq!(flat.value().len(), 1_000_000);
-    assert_eq!(flat.value(), large);
+    assert_eq!(flat.value(), &large[..]);
     assert_eq!(flat.value_len(), 1_000_000);
-    assert_eq!(flat.key(), Some(Bytes::from_static(b"big-key")));
+    assert_eq!(flat.key(), Some(b"big-key" as &[u8]));
 }
 
 #[test]
 fn test_flat_message_binary_value() {
-    let binary_value = Bytes::from(vec![0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD]);
-    let binary_key = Bytes::from(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    let binary_value: &[u8] = &[0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD];
+    let binary_key: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
 
-    let buf = FlatMessageBuilder::new(binary_value.clone())
-        .key(binary_key.clone())
+    let buf = FlatMessageBuilder::new(binary_value)
+        .key(binary_key)
         .timestamp(100)
         .build();
 
-    let flat = FlatMessage::new(buf).unwrap();
+    let flat = FlatMessage::new(&buf).unwrap();
     assert_eq!(flat.value(), binary_value);
-    assert_eq!(flat.key(), Some(binary_key));
+    assert_eq!(flat.key().as_deref(), Some(binary_key));
 }
 
 // =============================================================================
@@ -846,11 +829,11 @@ fn test_snapshot_restore_with_flat_messages() {
         None,
     );
     let messages: Vec<Bytes> = vec![
-        FlatMessageBuilder::new(Bytes::from_static(b"evt-1"))
-            .key(Bytes::from_static(b"k1"))
+        FlatMessageBuilder::new(b"evt-1")
+            .key(b"k1")
             .timestamp(1000)
             .build(),
-        FlatMessageBuilder::new(Bytes::from_static(b"evt-2"))
+        FlatMessageBuilder::new(b"evt-2")
             .timestamp(1001)
             .ttl_ms(5000)
             .build(),
@@ -877,7 +860,7 @@ fn test_snapshot_restore_with_flat_messages() {
     };
     let source_topic_id = group_id + 1;
 
-    let enqueue_msg = FlatMessageBuilder::new(Bytes::from_static(b"task-1"))
+    let enqueue_msg = FlatMessageBuilder::new(b"task-1")
         .timestamp(2000)
         .delay_ms(1000)
         .build();
@@ -903,7 +886,7 @@ fn test_snapshot_restore_with_flat_messages() {
     let q1_topic = snap2.topics.iter().find(|t| t.meta.name == "q1").unwrap();
     assert_eq!(q1_topic.meta.message_count, 1);
 
-    let post_restore_msg = FlatMessageBuilder::new(Bytes::from_static(b"post-restore"))
+    let post_restore_msg = FlatMessageBuilder::new(b"post-restore")
         .timestamp(3000)
         .build();
     let resp = engine2.apply_command(&MqCommand::publish(1, &[post_restore_msg]), 5, 3000, None);
@@ -916,56 +899,53 @@ fn test_snapshot_restore_with_flat_messages() {
 
 #[test]
 fn test_flat_message_only_reply_to_and_correlation_id() {
-    let buf = FlatMessageBuilder::new(Bytes::from_static(b"rpc-request"))
+    let buf = FlatMessageBuilder::new(b"rpc-request")
         .timestamp(100)
-        .reply_to(Bytes::from_static(b"response-queue"))
-        .correlation_id(Bytes::from_static(b"req-id-001"))
+        .reply_to(b"response-queue")
+        .correlation_id(b"req-id-001")
         .build();
 
-    let flat = FlatMessage::new(buf).unwrap();
+    let flat = FlatMessage::new(&buf).unwrap();
     assert_eq!(flat.value(), Bytes::from_static(b"rpc-request"));
     assert!(flat.key().is_none());
     assert!(flat.routing_key().is_none());
-    assert_eq!(flat.reply_to(), Some(Bytes::from_static(b"response-queue")));
-    assert_eq!(
-        flat.correlation_id(),
-        Some(Bytes::from_static(b"req-id-001"))
-    );
+    assert_eq!(flat.reply_to(), Some(b"response-queue" as &[u8]));
+    assert_eq!(flat.correlation_id(), Some(b"req-id-001" as &[u8]));
 }
 
 #[test]
 fn test_flat_message_only_routing_key_no_key() {
-    let buf = FlatMessageBuilder::new(Bytes::from_static(b"routed"))
-        .routing_key(Bytes::from_static(b"events.user.signup"))
+    let buf = FlatMessageBuilder::new(b"routed")
+        .routing_key(b"events.user.signup")
         .timestamp(200)
         .build();
 
-    let flat = FlatMessage::new(buf).unwrap();
+    let flat = FlatMessage::new(&buf).unwrap();
     assert!(flat.key().is_none());
     assert_eq!(flat.routing_key_str(), Some("events.user.signup".into()));
 }
 
 #[test]
 fn test_flat_message_all_optional_fields_plus_headers() {
-    let buf = FlatMessageBuilder::new(Bytes::from_static(b"full"))
-        .key(Bytes::from_static(b"k"))
-        .routing_key(Bytes::from_static(b"rk"))
-        .reply_to(Bytes::from_static(b"rt"))
-        .correlation_id(Bytes::from_static(b"cid"))
+    let buf = FlatMessageBuilder::new(b"full")
+        .key(b"k")
+        .routing_key(b"rk")
+        .reply_to(b"rt")
+        .correlation_id(b"cid")
         .timestamp(999)
         .ttl_ms(1000)
         .delay_ms(500)
-        .header("h1", &b"v1"[..])
-        .header("h2", &b"v2"[..])
+        .header(b"h1", b"v1")
+        .header(b"h2", b"v2")
         .build();
 
-    let flat = FlatMessage::new(buf.clone()).unwrap();
+    let flat = FlatMessage::new(&buf).unwrap();
 
     assert_eq!(flat.value(), Bytes::from_static(b"full"));
-    assert_eq!(flat.key(), Some(Bytes::from_static(b"k")));
-    assert_eq!(flat.routing_key(), Some(Bytes::from_static(b"rk")));
-    assert_eq!(flat.reply_to(), Some(Bytes::from_static(b"rt")));
-    assert_eq!(flat.correlation_id(), Some(Bytes::from_static(b"cid")));
+    assert_eq!(flat.key(), Some(b"k" as &[u8]));
+    assert_eq!(flat.routing_key(), Some(b"rk" as &[u8]));
+    assert_eq!(flat.reply_to(), Some(b"rt" as &[u8]));
+    assert_eq!(flat.correlation_id(), Some(b"cid" as &[u8]));
     assert_eq!(flat.timestamp(), 999);
     assert_eq!(flat.ttl_ms(), Some(1000));
     assert_eq!(flat.delay_ms(), Some(500));
@@ -979,37 +959,37 @@ fn test_flat_message_all_optional_fields_plus_headers() {
 
 #[test]
 fn test_flat_message_clone_independence() {
-    let buf = FlatMessageBuilder::new(Bytes::from_static(b"original"))
-        .key(Bytes::from_static(b"key"))
+    let buf = FlatMessageBuilder::new(b"original")
+        .key(b"key")
         .timestamp(42)
         .build();
 
-    let flat1 = FlatMessage::new(buf).unwrap();
+    let flat1 = FlatMessage::new(&buf).unwrap();
     let flat2 = flat1.clone();
 
     assert_eq!(flat1.value(), flat2.value());
     assert_eq!(flat1.key(), flat2.key());
     assert_eq!(flat1.timestamp(), flat2.timestamp());
 
-    let raw = flat1.into_bytes();
+    let raw = flat1.as_bytes();
     assert!(!raw.is_empty());
-    assert_eq!(flat2.value(), Bytes::from_static(b"original"));
+    assert_eq!(flat2.value(), b"original");
 }
 
 #[test]
 fn test_flat_message_as_bytes_roundtrip() {
-    let original = FlatMessageBuilder::new(Bytes::from_static(b"data"))
-        .key(Bytes::from_static(b"k"))
+    let original = FlatMessageBuilder::new(b"data")
+        .key(b"k")
         .ttl_ms(1000)
         .timestamp(5)
         .build();
 
-    let flat = FlatMessage::new(original.clone()).unwrap();
+    let flat = FlatMessage::new(&original).unwrap();
     let raw = flat.as_bytes().clone();
 
-    let flat2 = FlatMessage::new(raw).unwrap();
-    assert_eq!(flat2.value(), Bytes::from_static(b"data"));
-    assert_eq!(flat2.key(), Some(Bytes::from_static(b"k")));
+    let flat2 = FlatMessage::new(&raw).unwrap();
+    assert_eq!(flat2.value(), b"data");
+    assert_eq!(flat2.key(), Some(b"k" as &[u8]));
     assert_eq!(flat2.ttl_ms(), Some(1000));
 }
 
@@ -1051,10 +1031,10 @@ fn test_queue_ack_with_response_publishes_to_reply_topic() {
     };
     let source_topic_id = group_id + 1;
 
-    let request_msg = FlatMessageBuilder::new(Bytes::from_static(b"compute-something"))
+    let request_msg = FlatMessageBuilder::new(b"compute-something")
         .timestamp(2000)
-        .reply_to(Bytes::from_static(b"responses"))
-        .correlation_id(Bytes::from_static(b"req-001"))
+        .reply_to(b"responses")
+        .correlation_id(b"req-001")
         .build();
 
     engine.apply_command(
@@ -1070,9 +1050,9 @@ fn test_queue_ack_with_response_publishes_to_reply_topic() {
             if !messages.is_empty() {
                 let msg_id = messages[0].message_id;
 
-                let response_msg = FlatMessageBuilder::new(Bytes::from_static(b"result: 42"))
+                let response_msg = FlatMessageBuilder::new(b"result: 42")
                     .timestamp(4000)
-                    .correlation_id(Bytes::from_static(b"req-001"))
+                    .correlation_id(b"req-001")
                     .build();
 
                 let resp = engine.apply_command(
@@ -1123,9 +1103,9 @@ fn test_queue_ack_without_response_is_normal_ack() {
     };
     let source_topic_id = group_id + 1;
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"data"))
+    let msg = FlatMessageBuilder::new(b"data")
         .timestamp(1000)
-        .reply_to(Bytes::from_static(b"some-topic"))
+        .reply_to(b"some-topic")
         .build();
 
     engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 1000, None);
@@ -1172,9 +1152,7 @@ fn test_queue_ack_response_without_reply_to_drops_silently() {
     };
     let source_topic_id = group_id + 1;
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"no-reply"))
-        .timestamp(1000)
-        .build();
+    let msg = FlatMessageBuilder::new(b"no-reply").timestamp(1000).build();
 
     engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 1000, None);
 
@@ -1183,7 +1161,7 @@ fn test_queue_ack_response_without_reply_to_drops_silently() {
         MqResponse::Messages { messages } => {
             if !messages.is_empty() {
                 let msg_id = messages[0].message_id;
-                let response = FlatMessageBuilder::new(Bytes::from_static(b"orphan-response"))
+                let response = FlatMessageBuilder::new(b"orphan-response")
                     .timestamp(3000)
                     .build();
 
@@ -1224,9 +1202,9 @@ fn test_queue_ack_response_reply_topic_missing_drops_silently() {
     };
     let source_topic_id = group_id + 1;
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"request"))
+    let msg = FlatMessageBuilder::new(b"request")
         .timestamp(1000)
-        .reply_to(Bytes::from_static(b"nonexistent-topic"))
+        .reply_to(b"nonexistent-topic")
         .build();
 
     engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 1000, None);
@@ -1236,9 +1214,7 @@ fn test_queue_ack_response_reply_topic_missing_drops_silently() {
         MqResponse::Messages { messages } => {
             if !messages.is_empty() {
                 let msg_id = messages[0].message_id;
-                let response = FlatMessageBuilder::new(Bytes::from_static(b"response"))
-                    .timestamp(3000)
-                    .build();
+                let response = FlatMessageBuilder::new(b"response").timestamp(3000).build();
 
                 let resp = engine.apply_command(
                     &MqCommand::group_ack(group_id, &[msg_id], Some(&response)),
@@ -1284,16 +1260,14 @@ fn test_queue_ack_multiple_messages_first_has_reply_to() {
     };
     let source_topic_id = group_id + 1;
 
-    let msg1 = FlatMessageBuilder::new(Bytes::from_static(b"req-1"))
+    let msg1 = FlatMessageBuilder::new(b"req-1")
         .timestamp(1000)
-        .reply_to(Bytes::from_static(b"multi-replies"))
-        .correlation_id(Bytes::from_static(b"corr-1"))
+        .reply_to(b"multi-replies")
+        .correlation_id(b"corr-1")
         .build();
     engine.apply_command(&MqCommand::publish(source_topic_id, &[msg1]), 3, 1000, None);
 
-    let msg2 = FlatMessageBuilder::new(Bytes::from_static(b"req-2"))
-        .timestamp(1001)
-        .build();
+    let msg2 = FlatMessageBuilder::new(b"req-2").timestamp(1001).build();
     engine.apply_command(&MqCommand::publish(source_topic_id, &[msg2]), 4, 1001, None);
 
     let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 2), 5, 2000, None);
@@ -1302,7 +1276,7 @@ fn test_queue_ack_multiple_messages_first_has_reply_to() {
             if !messages.is_empty() {
                 let msg_ids: Vec<u64> = messages.iter().map(|m| m.message_id).collect();
 
-                let response = FlatMessageBuilder::new(Bytes::from_static(b"batch-result"))
+                let response = FlatMessageBuilder::new(b"batch-result")
                     .timestamp(3000)
                     .build();
 
@@ -1354,10 +1328,10 @@ fn test_actor_ack_with_response_publishes_to_reply_topic() {
 
     let actor_id = Bytes::from_static(b"calculator");
 
-    let request = FlatMessageBuilder::new(Bytes::from_static(b"2+2"))
+    let request = FlatMessageBuilder::new(b"2+2")
         .timestamp(2000)
-        .reply_to(Bytes::from_static(b"actor-responses"))
-        .correlation_id(Bytes::from_static(b"calc-001"))
+        .reply_to(b"actor-responses")
+        .correlation_id(b"calc-001")
         .build();
 
     let source_topic_id = group_id + 1;
@@ -1386,9 +1360,9 @@ fn test_actor_ack_with_response_publishes_to_reply_topic() {
             if !messages.is_empty() {
                 let msg_id = messages[0].message_id;
 
-                let response = FlatMessageBuilder::new(Bytes::from_static(b"4"))
+                let response = FlatMessageBuilder::new(b"4")
                     .timestamp(3000)
-                    .correlation_id(Bytes::from_static(b"calc-001"))
+                    .correlation_id(b"calc-001")
                     .build();
 
                 let resp = engine.apply_command(
@@ -1438,7 +1412,7 @@ fn test_actor_ack_without_response_normal() {
 
     let actor_id = Bytes::from_static(b"worker-1");
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"fire-and-forget"))
+    let msg = FlatMessageBuilder::new(b"fire-and-forget")
         .timestamp(2000)
         .build();
 
@@ -1497,9 +1471,7 @@ fn test_actor_ack_response_no_reply_to_drops_silently() {
 
     let actor_id = Bytes::from_static(b"actor-1");
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"task"))
-        .timestamp(2000)
-        .build();
+    let msg = FlatMessageBuilder::new(b"task").timestamp(2000).build();
 
     engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 2000, None);
 
@@ -1520,9 +1492,7 @@ fn test_actor_ack_response_no_reply_to_drops_silently() {
         MqResponse::Messages { messages } => {
             if !messages.is_empty() {
                 let msg_id = messages[0].message_id;
-                let response = FlatMessageBuilder::new(Bytes::from_static(b"result"))
-                    .timestamp(3000)
-                    .build();
+                let response = FlatMessageBuilder::new(b"result").timestamp(3000).build();
 
                 let resp = engine.apply_command(
                     &MqCommand::group_ack_actor(group_id, &actor_id, msg_id, Some(&response)),
@@ -1546,7 +1516,7 @@ fn test_ack_display_with_response() {
     let ack_no_resp = MqCommand::group_ack(1, &[10, 11], None);
     assert_eq!(format!("{}", ack_no_resp), "GroupAck(group=1)");
 
-    let resp_bytes = FlatMessageBuilder::new(Bytes::from_static(b"resp")).build();
+    let resp_bytes = FlatMessageBuilder::new(b"resp").build();
     let ack_with_resp = MqCommand::group_ack(1, &[10], Some(&resp_bytes));
     assert_eq!(format!("{}", ack_with_resp), "GroupAck(group=1)");
 }
@@ -1557,7 +1527,7 @@ fn test_ack_actor_display_with_response() {
     let ack_no_resp = MqCommand::group_ack_actor(1, &actor_id, 10, None);
     assert_eq!(format!("{}", ack_no_resp), "GroupAckActor(group=1)");
 
-    let resp_bytes = FlatMessageBuilder::new(Bytes::from_static(b"resp")).build();
+    let resp_bytes = FlatMessageBuilder::new(b"resp").build();
     let ack_with_resp = MqCommand::group_ack_actor(1, &actor_id, 10, Some(&resp_bytes));
     assert_eq!(format!("{}", ack_with_resp), "GroupAckActor(group=1)");
 }
@@ -1596,10 +1566,10 @@ fn test_snapshot_restore_preserves_reply_to() {
     };
     let source_topic_id = group_id + 1;
 
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"request"))
+    let msg = FlatMessageBuilder::new(b"request")
         .timestamp(2000)
-        .reply_to(Bytes::from_static(b"replies"))
-        .correlation_id(Bytes::from_static(b"corr-snap"))
+        .reply_to(b"replies")
+        .correlation_id(b"corr-snap")
         .build();
 
     engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 3, 2000, None);
@@ -1618,7 +1588,7 @@ fn test_snapshot_restore_preserves_reply_to() {
             if !messages.is_empty() {
                 let msg_id = messages[0].message_id;
 
-                let response = FlatMessageBuilder::new(Bytes::from_static(b"reply-data"))
+                let response = FlatMessageBuilder::new(b"reply-data")
                     .timestamp(4000)
                     .build();
 

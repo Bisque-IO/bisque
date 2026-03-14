@@ -11,7 +11,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bisque_mq::flat::FlatMessage;
+use bisque_mq::flat::{FlatMessage, MqttEnvelope, is_mqtt_envelope};
+use bisque_mq::notifier::GroupNotifier;
 use bisque_mq::types::{ExchangeType, MqError, RetentionPolicy};
 use bisque_mq::{MqCommand, MqReader, MqResponse, MqWriteBatcher};
 use bytes::{Bytes, BytesMut};
@@ -30,7 +31,7 @@ use crate::session::{
     SubscribeFilterPlan, SubscribePlan,
 };
 use crate::session_store::{self, SessionStore};
-use crate::types::{MqttPacket, ProtocolVersion, QoS};
+use crate::types::{ProtocolVersion, QoS};
 
 /// Registry of active MQTT sessions keyed by client_id.
 /// Used for session takeover: when a new connection arrives with the same
@@ -209,6 +210,9 @@ pub struct MqttServer {
     /// Dynamic server redirect, checked at connection time (lock-free).
     /// Overrides config.server_redirect when Some.
     dynamic_redirect: Arc<ArcSwapOption<ServerRedirect>>,
+    /// Push-based delivery notifier from the engine. When set, the connection
+    /// loop wakes on group notifications instead of polling at fixed intervals.
+    group_notifier: Option<Arc<GroupNotifier>>,
 }
 
 impl MqttServer {
@@ -230,7 +234,16 @@ impl MqttServer {
             active_sessions: Arc::new(DashMap::new()),
             pending_wills: Arc::new(DashMap::new()),
             dynamic_redirect: Arc::new(ArcSwapOption::empty()),
+            group_notifier: None,
         }
+    }
+
+    /// Set the push-based delivery notifier. When set, the connection loop
+    /// wakes on group notifications (sub-millisecond delivery) instead of
+    /// polling at fixed intervals (50ms default).
+    pub fn with_group_notifier(mut self, notifier: Arc<GroupNotifier>) -> Self {
+        self.group_notifier = Some(notifier);
+        self
     }
 
     /// Get a reference to the server statistics.
@@ -273,6 +286,7 @@ impl MqttServer {
         let active_sessions = Arc::clone(&self.active_sessions);
         let pending_wills = Arc::clone(&self.pending_wills);
         let dynamic_redirect = Arc::clone(&self.dynamic_redirect);
+        let group_notifier = self.group_notifier.clone();
 
         let handle = tokio::spawn(accept_loop(
             listener,
@@ -284,6 +298,7 @@ impl MqttServer {
             active_sessions,
             pending_wills,
             dynamic_redirect,
+            group_notifier,
         ));
 
         Ok(handle)
@@ -311,6 +326,7 @@ async fn accept_loop(
     active_sessions: ActiveSessions,
     pending_wills: PendingWills,
     dynamic_redirect: Arc<ArcSwapOption<ServerRedirect>>,
+    group_notifier: Option<Arc<GroupNotifier>>,
 ) {
     // Periodic session expiry sweep (every 60 seconds).
     let mut expiry_interval = tokio::time::interval(Duration::from_secs(60));
@@ -337,6 +353,7 @@ async fn accept_loop(
                         let active_sessions = Arc::clone(&active_sessions);
                         let pending_wills = Arc::clone(&pending_wills);
                         let dynamic_redirect = Arc::clone(&dynamic_redirect);
+                        let group_notifier = group_notifier.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(
@@ -349,6 +366,7 @@ async fn accept_loop(
                                 &active_sessions,
                                 &pending_wills,
                                 &dynamic_redirect,
+                                group_notifier.as_deref(),
                             ).await {
                                 debug!(peer = %peer_addr, error = %e, "connection closed with error");
                             }
@@ -447,36 +465,6 @@ async fn ensure_exchange(
     }
 }
 
-/// Ensure a queue exists and return its ID, using the session cache.
-/// Accepts owned `String` (zero-alloc cache insert) or `&str`.
-async fn ensure_queue(
-    session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
-    queue_name: impl AsRef<str> + Into<String>,
-    cached_id: Option<u64>,
-) -> Result<u64, ConnectionError> {
-    if let Some(id) = cached_id {
-        return Ok(id);
-    }
-    if let Some(id) = session.cached_queue_id(queue_name.as_ref()) {
-        return Ok(id);
-    }
-
-    let resp = batcher
-        .submit(MqCommand::create_consumer_group(queue_name.as_ref(), 0))
-        .await?;
-
-    if let Some(id) = extract_entity_id(&resp) {
-        session.cache_queue_id(queue_name, id);
-        Ok(id)
-    } else {
-        warn!(?resp, "failed to create/resolve queue");
-        Err(ConnectionError::Batcher(
-            bisque_mq::MqBatcherError::ChannelClosed,
-        ))
-    }
-}
-
 /// Ensure a topic exists and return its ID, using the session cache.
 /// Accepts owned `String` (zero-alloc cache insert) or `&str`.
 async fn ensure_topic(
@@ -508,97 +496,28 @@ async fn ensure_topic(
     }
 }
 
-/// Ensure a binding exists and return its ID, using the session cache.
-/// Accepts owned `String` (zero-alloc cache insert) or `&str` for routing_key.
-async fn ensure_binding(
-    session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
-    exchange_id: u64,
-    queue_id: u64,
-    routing_key: impl AsRef<str> + Into<String>,
-    cached_id: Option<u64>,
-) -> Result<u64, ConnectionError> {
-    if let Some(id) = cached_id {
-        return Ok(id);
-    }
-    if let Some(id) = session.cached_binding_id(exchange_id, routing_key.as_ref()) {
-        return Ok(id);
-    }
-
-    let resp = batcher
-        .submit(MqCommand::create_binding(
-            exchange_id,
-            queue_id,
-            Some(routing_key.as_ref()),
-        ))
-        .await?;
-
-    if let Some(id) = extract_entity_id(&resp) {
-        session.cache_binding_id(exchange_id, routing_key, id);
-        Ok(id)
-    } else {
-        warn!(?resp, "failed to create/resolve binding");
-        Err(ConnectionError::Batcher(
-            bisque_mq::MqBatcherError::ChannelClosed,
-        ))
-    }
-}
-
-/// Ensure a binding exists with MQTT 5.0 options (no_local, shared_group, subscription_id).
-/// Accepts owned `String` (zero-alloc cache insert) or `&str` for routing_key.
-async fn ensure_binding_with_opts(
-    session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
-    exchange_id: u64,
-    queue_id: u64,
-    routing_key: impl AsRef<str> + Into<String>,
-    cached_id: Option<u64>,
-    no_local: bool,
-    shared_group: Option<&str>,
-    subscription_id: Option<u32>,
-) -> Result<u64, ConnectionError> {
-    if let Some(id) = cached_id {
-        return Ok(id);
-    }
-    if let Some(id) = session.cached_binding_id(exchange_id, routing_key.as_ref()) {
-        return Ok(id);
-    }
-
-    let resp = batcher
-        .submit(MqCommand::create_binding_with_opts(
-            exchange_id,
-            queue_id,
-            Some(routing_key.as_ref()),
-            no_local,
-            shared_group,
-            subscription_id,
-        ))
-        .await?;
-
-    if let Some(id) = extract_entity_id(&resp) {
-        session.cache_binding_id(exchange_id, routing_key, id);
-        Ok(id)
-    } else {
-        warn!(?resp, "failed to create/resolve binding with opts");
-        Err(ConnectionError::Batcher(
-            bisque_mq::MqBatcherError::ChannelClosed,
-        ))
-    }
-}
-
 // =============================================================================
 // Publish Orchestration
 // =============================================================================
 
 /// Execute a PublishPlan: ensure exchange, publish message, handle retained.
+///
+/// Used for will messages (which carry owned `flat_message: Some(Bytes)`).
+/// Normal PUBLISH batching uses `flush_publish_batch` instead.
 async fn orchestrate_publish(
     session: &mut MqttSession,
     batcher: &MqWriteBatcher,
     plan: PublishPlan,
 ) -> Result<(), ConnectionError> {
-    if plan.flat_message.is_empty() {
+    if !plan.has_message() {
         return Ok(()); // Invalid publish (e.g., unknown topic alias)
     }
+
+    // Will plans carry owned Bytes in flat_message.
+    let msg = match plan.flat_message {
+        Some(ref b) => b.clone(),
+        None => return Ok(()), // No owned message — should use flush_publish_batch instead
+    };
 
     // 1. Ensure the MQTT exchange exists.
     let exchange_id = ensure_exchange(
@@ -611,10 +530,7 @@ async fn orchestrate_publish(
 
     // 2. Publish through the exchange (routes to all matching subscription queues).
     let resp = batcher
-        .submit(MqCommand::publish_to_exchange(
-            exchange_id,
-            &[plan.flat_message],
-        ))
+        .submit(MqCommand::publish_to_exchange(exchange_id, &[msg]))
         .await?;
 
     match &resp {
@@ -627,6 +543,53 @@ async fn orchestrate_publish(
 
     // 3. Handle retained message.
     if let Some(retained) = plan.retained {
+        orchestrate_retained(session, batcher, retained).await?;
+    }
+
+    Ok(())
+}
+
+/// Flush a batch of accumulated PUBLISH messages as a single
+/// `publish_to_exchange_slices` command. Message data lives in `msg_buf`;
+/// `publish_ranges` stores (start, len) pairs indexing into `msg_buf`.
+/// After flush, `msg_buf` is cleared for the next batch.
+async fn flush_publish_batch(
+    session: &mut MqttSession,
+    batcher: &MqWriteBatcher,
+    publish_ranges: &mut SmallVec<[(usize, usize); 32]>,
+    msg_buf: &mut BytesMut,
+    retained_batch: &mut SmallVec<[RetainedPlan; 4]>,
+) -> Result<(), ConnectionError> {
+    // Ensure the MQTT exchange exists (cached after first call).
+    let exchange_name = crate::session::MQTT_EXCHANGE_NAME;
+    let cached_id = session.cached_exchange_id(exchange_name);
+    let exchange_id = ensure_exchange(session, batcher, exchange_name, cached_id).await?;
+
+    // Build the MqCommand from slices, then clear buffers.
+    let cmd = {
+        let slices: SmallVec<[&[u8]; 32]> = publish_ranges
+            .iter()
+            .map(|&(start, len)| &msg_buf[start..start + len])
+            .collect();
+        MqCommand::publish_to_exchange_slices(exchange_id, &slices)
+    };
+
+    publish_ranges.clear();
+    msg_buf.clear();
+
+    // Submit all messages in a single publish_to_exchange_slices command.
+    let resp = batcher.submit(cmd).await?;
+
+    match &resp {
+        MqResponse::Ok | MqResponse::Published { .. } => {}
+        MqResponse::Error(e) => {
+            warn!(%e, "batch exchange publish failed");
+        }
+        _ => {}
+    }
+
+    // Handle retained messages individually (different topics).
+    for retained in retained_batch.drain(..) {
         orchestrate_retained(session, batcher, retained).await?;
     }
 
@@ -692,58 +655,107 @@ async fn orchestrate_subscribe(
     // 1. Ensure the global MQTT exchange.
     let exchange_id = ensure_exchange(session, batcher, exchange_name, cached_exchange_id).await?;
 
-    // 2. For each filter, create queue and binding — moves owned strings into cache.
-    for (filter_plan, name_info) in filters.into_iter().zip(filter_names.iter()) {
-        // Destructure to move owned strings instead of cloning.
-        let SubscribeFilterPlan {
-            filter: _, // already moved to RetainedFilterInfo
-            queue_name,
-            cached_queue_id,
-            routing_key,
-            cached_binding_id,
-            qos: _,
-            shared_group,
-            no_local,
-            subscription_id,
-            retain_handling: _,
-            is_new_subscription: _,
-        } = filter_plan;
+    // 2. Batch queue creation: collect uncached queue creates into a single Raft proposal.
+    let mut queue_cmds: SmallVec<[MqCommand; 4]> = SmallVec::new();
+    // Track which filter index needs a queue create (index into queue_cmds).
+    let mut uncached_queue_indices: SmallVec<[usize; 4]> = SmallVec::new();
+    let mut resolved_queue_ids: SmallVec<[u64; 4]> = SmallVec::with_capacity(filters.len());
 
-        // Ensure queue — moves queue_name into cache.
-        let queue_id = ensure_queue(session, batcher, queue_name, cached_queue_id).await?;
-
-        // Ensure binding (with MQTT 5.0 opts: no_local, shared_group, subscription_id).
-        let binding_id = if no_local || shared_group.is_some() || subscription_id.is_some() {
-            ensure_binding_with_opts(
-                session,
-                batcher,
-                exchange_id,
-                queue_id,
-                routing_key,
-                cached_binding_id,
-                no_local,
-                shared_group.as_deref(),
-                subscription_id,
-            )
-            .await?
+    for fp in &filters {
+        if let Some(id) = fp.cached_queue_id {
+            resolved_queue_ids.push(id);
+        } else if let Some(id) = session.cached_queue_id(&fp.queue_name) {
+            resolved_queue_ids.push(id);
         } else {
-            ensure_binding(
-                session,
-                batcher,
-                exchange_id,
-                queue_id,
-                routing_key,
-                cached_binding_id,
-            )
-            .await?
+            uncached_queue_indices.push(resolved_queue_ids.len());
+            resolved_queue_ids.push(0); // placeholder
+            queue_cmds.push(MqCommand::create_consumer_group(&fp.queue_name, 0));
+        }
+    }
+
+    // Submit batched queue creates if needed.
+    if !queue_cmds.is_empty() {
+        let resp = if queue_cmds.len() == 1 {
+            batcher.submit(queue_cmds.pop().unwrap()).await?
+        } else {
+            batcher.submit(MqCommand::batch(&queue_cmds)).await?
         };
 
-        // Update the subscription mapping with resolved IDs.
+        // Parse responses and fill in resolved IDs.
+        let responses: SmallVec<[&MqResponse; 4]> = match &resp {
+            MqResponse::BatchResponse(batch) => batch.iter().collect(),
+            other => SmallVec::from_elem(other, 1),
+        };
+        for (resp_idx, &filter_idx) in uncached_queue_indices.iter().enumerate() {
+            if let Some(id) = responses.get(resp_idx).and_then(|r| extract_entity_id(r)) {
+                resolved_queue_ids[filter_idx] = id;
+                session.cache_queue_id(&filters[filter_idx].queue_name, id);
+            } else {
+                warn!(?resp, "failed to create/resolve queue in batch");
+                return Err(ConnectionError::Batcher(
+                    bisque_mq::MqBatcherError::ChannelClosed,
+                ));
+            }
+        }
+    }
+
+    // 3. Batch binding creation: collect uncached binding creates into a single Raft proposal.
+    let mut binding_cmds: SmallVec<[MqCommand; 4]> = SmallVec::new();
+    let mut uncached_binding_indices: SmallVec<[usize; 4]> = SmallVec::new();
+    let mut resolved_binding_ids: SmallVec<[u64; 4]> = SmallVec::with_capacity(filters.len());
+
+    for (i, fp) in filters.iter().enumerate() {
+        if let Some(id) = fp.cached_binding_id {
+            resolved_binding_ids.push(id);
+        } else if let Some(id) = session.cached_binding_id(exchange_id, &fp.routing_key) {
+            resolved_binding_ids.push(id);
+        } else {
+            uncached_binding_indices.push(resolved_binding_ids.len());
+            resolved_binding_ids.push(0); // placeholder
+            let queue_id = resolved_queue_ids[i];
+            binding_cmds.push(MqCommand::create_binding_with_opts(
+                exchange_id,
+                queue_id,
+                Some(fp.routing_key.as_str()),
+                fp.no_local,
+                fp.shared_group.as_deref(),
+                fp.subscription_id,
+            ));
+        }
+    }
+
+    // Submit batched binding creates if needed.
+    if !binding_cmds.is_empty() {
+        let resp = if binding_cmds.len() == 1 {
+            batcher.submit(binding_cmds.pop().unwrap()).await?
+        } else {
+            batcher.submit(MqCommand::batch(&binding_cmds)).await?
+        };
+
+        let responses: SmallVec<[&MqResponse; 4]> = match &resp {
+            MqResponse::BatchResponse(batch) => batch.iter().collect(),
+            other => SmallVec::from_elem(other, 1),
+        };
+        for (resp_idx, &filter_idx) in uncached_binding_indices.iter().enumerate() {
+            if let Some(id) = responses.get(resp_idx).and_then(|r| extract_entity_id(r)) {
+                resolved_binding_ids[filter_idx] = id;
+                session.cache_binding_id(exchange_id, &filters[filter_idx].routing_key, id);
+            } else {
+                warn!(?resp, "failed to create/resolve binding in batch");
+                return Err(ConnectionError::Batcher(
+                    bisque_mq::MqBatcherError::ChannelClosed,
+                ));
+            }
+        }
+    }
+
+    // 4. Update subscription mappings with all resolved IDs.
+    for (i, (_, name_info)) in filters.iter().zip(filter_names.iter()).enumerate() {
         session.update_subscription_ids(
             &name_info.filter,
             Some(exchange_id),
-            Some(binding_id),
-            Some(queue_id),
+            Some(resolved_binding_ids[i]),
+            Some(resolved_queue_ids[i]),
             None,
         );
     }
@@ -760,30 +772,6 @@ async fn orchestrate_subscribe(
 /// The `sub_buf` and `flat_messages_buf` are caller-owned reusable buffers
 /// to avoid per-cycle allocations.
 // SubDeliveryInfo is now defined in session.rs and cached per-session.
-
-/// Extract the publisher session ID from a FlatMessage header.
-fn extract_publisher_session_id(flat: &FlatMessage) -> Option<u64> {
-    for i in 0..flat.header_count() {
-        let (k, v) = flat.header(i);
-        if &k[..] == b"mqtt.publisher_session_id" && v.len() == 8 {
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(&v);
-            return Some(u64::from_be_bytes(buf));
-        }
-    }
-    None
-}
-
-/// Check if the original retain flag was set in a FlatMessage header.
-fn extract_original_retain(flat: &FlatMessage) -> bool {
-    for i in 0..flat.header_count() {
-        let (k, v) = flat.header(i);
-        if &k[..] == b"mqtt.original_retain" && !v.is_empty() {
-            return v[0] != 0;
-        }
-    }
-    false
-}
 
 async fn deliver_outbound(
     session: &mut MqttSession,
@@ -819,7 +807,7 @@ async fn deliver_outbound(
         max_qos,
         no_local,
         retain_as_published,
-        filter_starts_with_wildcard,
+        filter_starts_with_wildcard: _,
         is_shared,
     } in sub_buf.iter()
     {
@@ -833,11 +821,16 @@ async fn deliver_outbound(
         }
 
         // Issue Deliver command to pull messages from the subscription queue.
+        // Engine-level filtering: pass exclude_publisher_id for no-local,
+        // and current time for message expiry — both handled at Raft apply.
+        let exclude_pub = if no_local { my_session_id } else { 0 };
         let resp = batcher
-            .submit(MqCommand::group_deliver(
+            .submit(MqCommand::group_deliver_filtered(
                 queue_id,
                 session.session_id,
                 remaining,
+                exclude_pub,
+                now_ms,
             ))
             .await?;
 
@@ -856,110 +849,92 @@ async fn deliver_outbound(
                 }
 
                 for flat_bytes in flat_messages_buf.iter() {
-                    if let Some(flat) = FlatMessage::new(flat_bytes.clone()) {
-                        // GAP-8: $-topic filtering (MQTT 3.1.1 SS 4.7.2).
-                        // Topics starting with $ must not be delivered to subscriptions
-                        // whose filter starts with a wildcard (+ or #).
-                        if filter_starts_with_wildcard {
-                            if let Some(topic) = flat.routing_key() {
-                                if topic.first() == Some(&b'$') {
-                                    let _ = batcher
-                                        .submit(MqCommand::group_ack(
-                                            queue_id,
-                                            &[delivered.message_id],
-                                            None,
-                                        ))
-                                        .await;
-                                    continue;
-                                }
-                            }
+                    // Format-aware dispatch: MqttEnvelope or FlatMessage
+                    let is_envelope = is_mqtt_envelope(flat_bytes);
+                    let envelope = if is_envelope {
+                        MqttEnvelope::new(flat_bytes)
+                    } else {
+                        None
+                    };
+                    let flat = if !is_envelope {
+                        FlatMessage::new(flat_bytes)
+                    } else {
+                        None
+                    };
+
+                    if envelope.is_none() && flat.is_none() {
+                        continue;
+                    }
+
+                    // Extract common fields from either format.
+                    let (msg_ttl_ms, msg_timestamp, msg_is_retain) = if let Some(ref env) = envelope
+                    {
+                        (env.ttl_ms(), env.timestamp(), env.is_retain())
+                    } else if let Some(ref f) = flat {
+                        (f.ttl_ms(), f.timestamp(), f.is_retain())
+                    } else {
+                        unreachable!()
+                    };
+
+                    // Compute adjusted expiry interval for non-expired messages
+                    // (MQTT 5.0 §3.3.2.3.3: subscribers see remaining lifetime).
+                    let adjusted_expiry_secs = if is_v5 {
+                        if let Some(ttl_ms) = msg_ttl_ms {
+                            let elapsed_ms = now_ms.saturating_sub(msg_timestamp);
+                            let remaining_ms = ttl_ms.saturating_sub(elapsed_ms);
+                            let remaining_secs = (remaining_ms / 1000) as u32;
+                            Some(remaining_secs.max(1))
+                        } else {
+                            None
                         }
+                    } else {
+                        None
+                    };
 
-                        // No Local enforcement (M6): skip messages published by this session.
-                        if no_local {
-                            if let Some(pub_session_id) = extract_publisher_session_id(&flat) {
-                                if pub_session_id == my_session_id {
-                                    // ACK the message so it's removed from the queue.
-                                    let _ = batcher
-                                        .submit(MqCommand::group_ack(
-                                            queue_id,
-                                            &[delivered.message_id],
-                                            None,
-                                        ))
-                                        .await;
-                                    continue;
-                                }
-                            }
-                        }
+                    // Retain As Published enforcement (M7).
+                    let retain_flag = if is_shared {
+                        false
+                    } else if retain_as_published {
+                        msg_is_retain
+                    } else {
+                        false
+                    };
 
-                        // Message Expiry enforcement (MQTT 5.0 §3.3.2.3.3):
-                        // 1. Drop messages that have fully expired.
-                        // 2. Compute remaining lifetime so subscribers see the adjusted interval.
-                        let adjusted_expiry_secs = if is_v5 {
-                            if let Some(ttl_ms) = flat.ttl_ms() {
-                                let ts = flat.timestamp();
-                                let elapsed_ms = now_ms.saturating_sub(ts);
-                                if elapsed_ms >= ttl_ms {
-                                    // Message has expired — ACK and skip.
-                                    let _ = batcher
-                                        .submit(MqCommand::group_ack(
-                                            queue_id,
-                                            &[delivered.message_id],
-                                            None,
-                                        ))
-                                        .await;
-                                    continue;
-                                }
-                                let remaining_ms = ttl_ms - elapsed_ms;
-                                let remaining_secs = (remaining_ms / 1000) as u32;
-                                Some(remaining_secs.max(1)) // at least 1s if not yet expired
-                            } else {
-                                None // no expiry set
-                            }
+                    // Track inflight + encode directly.
+                    let tracking =
+                        session.track_outbound_delivery(max_qos, queue_id, delivered.message_id);
+                    let packet_id = match tracking {
+                        None => continue,
+                        Some(pid) => pid,
+                    };
+
+                    let topic_alias = if is_v5 {
+                        let topic = if let Some(ref env) = envelope {
+                            env.topic()
+                        } else if let Some(ref f) = flat {
+                            f.routing_key().unwrap_or_default()
                         } else {
-                            None
+                            unreachable!()
                         };
+                        session.resolve_outbound_topic_alias(&topic)
+                    } else {
+                        None
+                    };
+                    let subscription_id = if is_v5 {
+                        session.find_subscription_id_for_queue(queue_id)
+                    } else {
+                        None
+                    };
 
-                        // Retain As Published enforcement (M7): determine retain flag.
-                        // MQTT 5.0 §4.8.2: retain flag must be 0 for shared subscriptions.
-                        let retain_flag = if is_shared {
-                            false
-                        } else if retain_as_published {
-                            extract_original_retain(&flat)
-                        } else {
-                            false
-                        };
+                    // GAP-4: Set DUP=1 on first delivery after session resume.
+                    let dup = session.session_resumed && max_qos != QoS::AtMostOnce;
 
-                        // Zero-alloc outbound: track inflight + encode directly from FlatMessage.
-                        let tracking = session.track_outbound_delivery(
-                            max_qos,
-                            queue_id,
-                            delivered.message_id,
-                        );
-                        let packet_id = match tracking {
-                            None => continue, // inflight full
-                            Some(pid) => pid,
-                        };
+                    // Maximum Packet Size enforcement — outbound (M10).
+                    let buf_before = write_buf.len();
 
-                        let topic_alias = if is_v5 {
-                            let topic = flat.routing_key().unwrap_or_default();
-                            session.resolve_outbound_topic_alias(&topic)
-                        } else {
-                            None
-                        };
-                        let subscription_id = if is_v5 {
-                            session.find_subscription_id_for_queue(queue_id)
-                        } else {
-                            None
-                        };
-
-                        // GAP-4: Set DUP=1 on first delivery after session resume.
-                        let dup = session.session_resumed && max_qos != QoS::AtMostOnce;
-
-                        // Maximum Packet Size enforcement — outbound (M10).
-                        let buf_before = write_buf.len();
-                        codec::encode_publish_from_flat_with_expiry(
-                            &flat,
+                    if let Some(ref env) = envelope {
+                        codec::encode_publish_from_envelope(
+                            env,
                             max_qos,
                             retain_flag,
                             dup,
@@ -970,31 +945,43 @@ async fn deliver_outbound(
                             adjusted_expiry_secs,
                             write_buf,
                         );
-                        let client_max = session.client_maximum_packet_size;
-                        let encoded_size = write_buf.len() - buf_before;
-                        if client_max > 0 && encoded_size > client_max as usize {
-                            // Roll back the encoded packet — skip delivery.
-                            write_buf.truncate(buf_before);
-                            debug!(
-                                encoded_size,
-                                client_max,
-                                "outbound PUBLISH exceeds client maximum_packet_size, skipping"
-                            );
-                            // ACK the message so the queue doesn't retry.
-                            let _ = batcher
-                                .submit(MqCommand::group_ack(
-                                    queue_id,
-                                    &[delivered.message_id],
-                                    None,
-                                ))
-                                .await;
-                            continue;
-                        }
-                        stats
-                            .total_packets_sent
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        m.publishes_out.increment(1);
+                    } else if let Some(ref f) = flat {
+                        codec::encode_publish_from_flat_with_expiry(
+                            f,
+                            max_qos,
+                            retain_flag,
+                            dup,
+                            packet_id,
+                            is_v5,
+                            subscription_id,
+                            topic_alias,
+                            adjusted_expiry_secs,
+                            write_buf,
+                        );
                     }
+
+                    let client_max = session.client_maximum_packet_size;
+                    let encoded_size = write_buf.len() - buf_before;
+                    if client_max > 0 && encoded_size > client_max as usize {
+                        write_buf.truncate(buf_before);
+                        debug!(
+                            encoded_size,
+                            client_max,
+                            "outbound PUBLISH exceeds client maximum_packet_size, skipping"
+                        );
+                        let _ = batcher
+                            .submit(MqCommand::group_ack(
+                                queue_id,
+                                &[delivered.message_id],
+                                None,
+                            ))
+                            .await;
+                        continue;
+                    }
+                    stats
+                        .total_packets_sent
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    m.publishes_out.increment(1);
                 }
             }
         }
@@ -1032,6 +1019,7 @@ async fn handle_connection(
     active_sessions: &ActiveSessions,
     pending_wills: &PendingWills,
     dynamic_redirect: &Arc<ArcSwapOption<ServerRedirect>>,
+    group_notifier: Option<&GroupNotifier>,
 ) -> Result<(), ConnectionError> {
     let mut read_buf = BytesMut::with_capacity(config.read_buffer_size);
     // Reusable write buffer — cleared between uses, never re-allocated.
@@ -1039,33 +1027,37 @@ async fn handle_connection(
     let mut session = MqttSession::new(config.session_config.clone());
 
     // Wait for CONNECT packet with timeout.
-    let first_packet = tokio::time::timeout(config.connect_timeout, async {
+    let connect = tokio::time::timeout(config.connect_timeout, async {
         loop {
             let n = stream.read_buf(&mut read_buf).await?;
             if n == 0 {
                 return Err(ConnectionError::Closed);
             }
 
-            match codec::decode_packet(&read_buf) {
-                Ok((packet, consumed)) => {
+            match codec::decode_connect_packet(&read_buf) {
+                Ok((connect, consumed)) => {
                     let _ = read_buf.split_to(consumed);
-                    return Ok(packet);
+                    return Ok(connect);
                 }
                 Err(CodecError::Incomplete) => continue,
                 // GAP-2: Unsupported protocol version → send CONNACK 0x01 before disconnect.
                 Err(CodecError::UnsupportedProtocolVersion(_)) => {
-                    let connack = MqttPacket::ConnAck(crate::types::ConnAck {
+                    let connack = crate::types::ConnAck {
                         session_present: false,
                         return_code: crate::types::ConnectReturnCode::UnacceptableProtocolVersion
                             as u8,
-                        properties: crate::types::Properties::default(),
-                    });
+                        ..crate::types::ConnAck::default()
+                    };
                     write_buf.clear();
-                    codec::encode_packet(&connack, &mut write_buf);
+                    codec::encode_connack_v(&connack, &mut write_buf, false);
                     let _ = stream.write_all(&write_buf).await;
                     return Err(ConnectionError::Codec(
                         CodecError::UnsupportedProtocolVersion(0),
                     ));
+                }
+                // Not a CONNECT packet.
+                Err(CodecError::ProtocolError) => {
+                    return Err(ConnectionError::NotConnect);
                 }
                 Err(e) => return Err(ConnectionError::Codec(e)),
             }
@@ -1073,10 +1065,6 @@ async fn handle_connection(
     })
     .await
     .map_err(|_| ConnectionError::ConnectTimeout)??;
-
-    if !matches!(first_packet, MqttPacket::Connect(_)) {
-        return Err(ConnectionError::NotConnect);
-    }
 
     // Server Redirection (MQTT 5.0 §4.13): lock-free read; dynamic takes priority over config.
     let effective_redirect = {
@@ -1089,21 +1077,20 @@ async fn handle_connection(
     };
     if let Some(ref redirect) = effective_redirect {
         let reason_code = if redirect.permanent { 0x9D } else { 0x9C };
-        let mut props = crate::types::Properties::default();
-        props.server_reference = Some(redirect.server_reference.clone());
-        let connack = MqttPacket::ConnAck(crate::types::ConnAck {
+        let connack = crate::types::ConnAck {
             session_present: false,
             return_code: reason_code,
-            properties: props,
-        });
+            server_reference: Some(Bytes::from(redirect.server_reference.clone())),
+            ..crate::types::ConnAck::default()
+        };
         write_buf.clear();
-        codec::encode_packet(&connack, &mut write_buf);
+        codec::encode_connack_v(&connack, &mut write_buf, false);
         let _ = stream.write_all(&write_buf).await;
         return Err(ConnectionError::Closed);
     }
 
     // Process CONNECT via session.
-    let (commands, responses) = session.process_packet(&first_packet);
+    session.handle_connect(&connect);
 
     // Check session store for persisted session (MQTT 5.0 session resumption).
     let mut session_resumed = false;
@@ -1135,8 +1122,8 @@ async fn handle_connection(
     }
 
     // Submit registration commands.
-    for cmd in commands {
-        let _ = batcher.submit(cmd).await;
+    for i in 0..session.cmd_buf.len() {
+        let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
     }
 
     // Re-create queues and bindings for restored subscriptions.
@@ -1167,27 +1154,12 @@ async fn handle_connection(
         }
     }
 
-    // Collect pending retransmits before sending CONNACK (MQTT 5.0 SS 4.4).
-    let retransmits = if session_resumed {
-        session.pending_retransmits()
-    } else {
-        smallvec::SmallVec::new()
-    };
-
-    // Send CONNACK using reusable write buffer (version-aware encoding).
     // GAP-3: Patch session_present based on whether a stored session was actually found.
-    // - session_resumed=true  → session_present=true  (stored session exists)
-    // - session_resumed=false → session_present=false  (no stored session, even if CleanSession=0)
-    for response in responses {
-        let response = if let MqttPacket::ConnAck(mut connack) = response {
-            connack.session_present = session_resumed;
-            MqttPacket::ConnAck(connack)
-        } else {
-            response
-        };
-        write_buf.clear();
-        codec::encode_packet_versioned(&response, session.protocol_version, &mut write_buf);
-        stream.write_all(&write_buf).await?;
+    session.patch_connack_session_present(session_resumed);
+
+    // Send CONNACK (already encoded in session.out_buf by handle_connect).
+    if !session.out_buf.is_empty() {
+        stream.write_all(&session.out_buf).await?;
         stats
             .total_packets_sent
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1197,20 +1169,20 @@ async fn handle_connection(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Send pending retransmits after CONNACK (MQTT 5.0 SS 4.4).
-    if !retransmits.is_empty() {
-        debug!(
-            client_id = %session.client_id,
-            count = retransmits.len(),
-            "retransmitting pending QoS messages on session resume"
-        );
-        send_packets(
-            &mut stream,
-            &retransmits,
-            stats,
-            &mut write_buf,
-            session.protocol_version,
-        )
-        .await?;
+    if session_resumed {
+        let retransmit_count = session.pending_retransmits();
+        if retransmit_count > 0 {
+            debug!(
+                client_id = %session.client_id,
+                count = retransmit_count,
+                "retransmitting pending QoS messages on session resume"
+            );
+            stream.write_all(&session.out_buf).await?;
+            stats.total_packets_sent.fetch_add(
+                retransmit_count as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     info!(
@@ -1254,6 +1226,7 @@ async fn handle_connection(
         config.delivery_poll_ms,
         config.delivery_batch_size,
         takeover_rx,
+        group_notifier,
     )
     .await;
 
@@ -1270,7 +1243,7 @@ async fn handle_connection(
         Err(_) => {
             // Unclean disconnect.
             let will_delay = session.will_delay_interval();
-            let (will_plan, commands) = session.handle_unclean_disconnect();
+            let will_plan = session.handle_unclean_disconnect();
 
             // Publish will message if present.
             if let Some(plan) = will_plan {
@@ -1287,9 +1260,9 @@ async fn handle_connection(
                         // Delay expired — publish the will.
                         // We can't use orchestrate_publish here (needs session),
                         // so we submit the flat_message directly if exchange is known.
-                        if !plan.flat_message.is_empty() {
+                        if let Some(ref msg) = plan.flat_message {
                             if let Some(eid) = plan.cached_exchange_id {
-                                let cmd = MqCommand::publish_to_exchange(eid, &[plan.flat_message]);
+                                let cmd = MqCommand::publish_to_exchange(eid, &[msg.clone()]);
                                 let _ = batcher.submit(cmd).await;
                             }
                         }
@@ -1303,9 +1276,9 @@ async fn handle_connection(
                 }
             }
 
-            // Submit cleanup commands.
-            for cmd in commands {
-                let _ = batcher.submit(cmd).await;
+            // Submit cleanup commands from cmd_buf.
+            for i in 0..session.cmd_buf.len() {
+                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
             }
         }
     }
@@ -1345,6 +1318,7 @@ async fn connection_loop(
     delivery_poll_ms: u64,
     delivery_batch_size: u32,
     mut takeover_rx: tokio::sync::oneshot::Receiver<()>,
+    group_notifier: Option<&GroupNotifier>,
 ) -> Result<(), ConnectionError> {
     let keep_alive_timeout = if session.keep_alive > 0 {
         Duration::from_secs(session.keep_alive as u64 * 3 / 2)
@@ -1352,16 +1326,47 @@ async fn connection_loop(
         Duration::from_secs(3600)
     };
 
-    let mut delivery_interval = tokio::time::interval(Duration::from_millis(delivery_poll_ms));
+    // Push-based delivery: single per-connection Notify registered with GroupNotifier
+    // for each subscription queue. Engine notify() wakes this connection's Notify
+    // directly — zero intermediate allocations, coalescing semantics.
+    let has_push_delivery = group_notifier.is_some();
+    let delivery_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    let fallback_poll_ms = if has_push_delivery {
+        500
+    } else {
+        delivery_poll_ms
+    };
+    let mut delivery_interval = tokio::time::interval(Duration::from_millis(fallback_poll_ms));
     delivery_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Reusable buffers for deliver_outbound — hoisted to avoid per-cycle allocation.
     let mut sub_buf: Vec<SubDeliveryInfo> = Vec::new();
     let mut flat_messages_buf: Vec<Bytes> = Vec::new();
 
+    // Reusable buffers for inbound publish batching — accumulate message ranges
+    // into msg_buf and flush as a single publish_to_exchange_slices.
+    let mut msg_buf: BytesMut = BytesMut::with_capacity(8192);
+    let mut publish_ranges: SmallVec<[(usize, usize); 32]> = SmallVec::new();
+    let mut retained_batch: SmallVec<[RetainedPlan; 4]> = SmallVec::new();
+    // Reusable buffer for batched ACK responses — encoded bytes accumulated from session.out_buf.
+    let mut ack_buf: BytesMut = BytesMut::with_capacity(256);
+
+    // Track which queue_ids have active notification watchers to avoid re-registration.
+    let mut watched_queue_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
     let m = shared_metrics();
 
     loop {
+        // Register this connection's Notify for any NEW subscription queue_ids.
+        if let Some(notifier) = group_notifier {
+            for sub in session.delivery_info() {
+                if watched_queue_ids.insert(sub.queue_id) {
+                    notifier.watch(sub.queue_id, &delivery_notify);
+                }
+            }
+        }
+
         tokio::select! {
             // Inbound: read from TCP with keep-alive timeout.
             read_result = tokio::time::timeout(keep_alive_timeout, stream.read_buf(read_buf)) => {
@@ -1372,12 +1377,31 @@ async fn connection_loop(
                         // Process all complete packets in the buffer.
                         // Use zero-copy decode: freeze the packet bytes so PUBLISH
                         // topic/payload are Bytes::slice() from the frozen buffer.
+                        //
+                        // PUBLISH batching: accumulate flat messages from consecutive
+                        // PUBLISH packets and flush as a single publish_to_exchange
+                        // after all packets in this read are processed.
+                        publish_ranges.clear();
+                        msg_buf.clear();
+                        retained_batch.clear();
+                        ack_buf.clear();
+                        let mut need_disconnect = false;
                         loop {
                             match codec::parse_fixed_header(read_buf) {
-                                Ok((_, _, remaining_length, header_size)) => {
+                                Ok((packet_type, flags, remaining_length, header_size)) => {
                                     let total_size = header_size + remaining_length;
                                     if read_buf.len() < total_size {
                                         break; // incomplete
+                                    }
+
+                                    // Validate fixed header flags per MQTT spec.
+                                    if let Err(e) = codec::validate_fixed_header_flags(packet_type, flags) {
+                                        return Err(send_disconnect_and_close(
+                                            stream, stats, write_buf,
+                                            session.protocol_version,
+                                            crate::types::ReasonCode::MALFORMED_PACKET.0,
+                                            Some(&e.to_string()),
+                                        ).await);
                                     }
 
                                     // Maximum Packet Size enforcement — inbound (M10).
@@ -1397,33 +1421,86 @@ async fn connection_loop(
                                         ).await);
                                     }
 
-                                    // Freeze exactly the packet bytes for zero-copy slicing.
-                                    let packet_bytes: Bytes = read_buf.split_to(total_size).freeze();
-                                    match codec::decode_packet_from_bytes_versioned(&packet_bytes, session.protocol_version) {
-                                        Ok((packet, _)) => {
-                                            stats.total_packets_received
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            m.packets_received.increment(1);
+                                    stats.total_packets_received
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    m.packets_received.increment(1);
 
-                                            let is_disconnect = matches!(packet, MqttPacket::Disconnect(_));
+                                    // Dispatch directly on packet type u8 — no MqttPacket enum.
+                                    let is_v5 = session.protocol_version == ProtocolVersion::V5;
+                                    match packet_type {
+                                        // PUBLISH (3): batch path — accumulate messages.
+                                        3 => {
+                                            m.publishes_in.increment(1);
+                                            // Freeze for zero-copy Publish decode.
+                                            let packet_bytes: Bytes = read_buf.split_to(total_size).freeze();
+                                            match codec::decode_publish_from_frozen(
+                                                &packet_bytes, header_size, total_size, flags, is_v5,
+                                            ) {
+                                                Ok(publish) => {
+                                                    let plan = session.handle_publish(&publish, &mut msg_buf);
+                                                    if !session.out_buf.is_empty() {
+                                                        ack_buf.extend_from_slice(&session.out_buf);
+                                                    }
+                                                    if plan.need_disconnect {
+                                                        need_disconnect = true;
+                                                    }
+                                                    if plan.has_message() {
+                                                        publish_ranges.push((plan.msg_start, plan.msg_len));
+                                                        if let Some(retained) = plan.retained {
+                                                            retained_batch.push(retained);
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    return Err(send_disconnect_and_close(
+                                                        stream, stats, write_buf,
+                                                        session.protocol_version,
+                                                        crate::types::ReasonCode::MALFORMED_PACKET.0,
+                                                        Some(&e.to_string()),
+                                                    ).await);
+                                                }
+                                            }
+                                        }
+                                        // Non-PUBLISH: flush any accumulated PUBLISH batch first,
+                                        // then dispatch per packet type.
+                                        _ => {
+                                            if !ack_buf.is_empty() {
+                                                stream.write_all(&ack_buf).await?;
+                                                stats.total_packets_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                ack_buf.clear();
+                                            }
+                                            if !publish_ranges.is_empty() {
+                                                flush_publish_batch(
+                                                    session, batcher, &mut publish_ranges,
+                                                    &mut msg_buf, &mut retained_batch,
+                                                ).await?;
+                                            }
 
-                                            process_inbound_packet(
-                                                &packet, session, batcher, log_reader, stream, stats, write_buf,
-                                            ).await?;
+                                            // Freeze for zero-copy decode of types that need Bytes.
+                                            let packet_bytes: Bytes = read_buf.split_to(total_size).freeze();
 
-                                            if is_disconnect {
+                                            if let Err(e) = dispatch_inbound_packet(
+                                                packet_type, flags, header_size, total_size,
+                                                remaining_length, &packet_bytes,
+                                                session, batcher, log_reader, stream, stats,
+                                                write_buf, m,
+                                            ).await {
+                                                return Err(e);
+                                            }
+
+                                            // DISCONNECT (14): clean close.
+                                            if packet_type == 14 {
                                                 return Ok(());
                                             }
                                         }
-                                        Err(e) => {
-                                            // Send server-initiated DISCONNECT for protocol errors (M12).
-                                            return Err(send_disconnect_and_close(
-                                                stream, stats, write_buf,
-                                                session.protocol_version,
-                                                crate::types::ReasonCode::MALFORMED_PACKET.0,
-                                                Some(&e.to_string()),
-                                            ).await);
+                                    }
+
+                                    if need_disconnect {
+                                        if !ack_buf.is_empty() {
+                                            stream.write_all(&ack_buf).await?;
+                                            stats.total_packets_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
+                                        return Err(ConnectionError::Codec(CodecError::ProtocolError));
                                     }
                                 }
                                 Err(CodecError::Incomplete) => break,
@@ -1436,6 +1513,19 @@ async fn connection_loop(
                                     ).await);
                                 }
                             }
+                        }
+
+                        // Flush accumulated PUBLISH batch after processing all
+                        // complete packets from this read.
+                        if !ack_buf.is_empty() {
+                            stream.write_all(&ack_buf).await?;
+                            stats.total_packets_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if !publish_ranges.is_empty() {
+                            flush_publish_batch(
+                                session, batcher, &mut publish_ranges,
+                                &mut msg_buf, &mut retained_batch,
+                            ).await?;
                         }
                     }
                     Ok(Err(e)) => return Err(ConnectionError::Io(e)),
@@ -1458,7 +1548,13 @@ async fn connection_loop(
                 }
             }
 
-            // Outbound: deliver messages from subscription queues.
+            // Outbound (push-based): wake immediately when any subscription queue
+            // has new messages. Single Notify per connection — coalescing semantics.
+            _ = delivery_notify.notified(), if has_push_delivery && !watched_queue_ids.is_empty() && !session.is_inflight_full() && session.subscription_count() > 0 => {
+                deliver_outbound(session, batcher, log_reader.as_ref(), stream, stats, delivery_batch_size, write_buf, &mut sub_buf, &mut flat_messages_buf).await?;
+            }
+
+            // Outbound (poll fallback): safety net for push-based, or primary for non-push.
             _ = delivery_interval.tick(), if !session.is_inflight_full() && session.subscription_count() > 0 => {
                 deliver_outbound(session, batcher, log_reader.as_ref(), stream, stats, delivery_batch_size, write_buf, &mut sub_buf, &mut flat_messages_buf).await?;
             }
@@ -1487,81 +1583,113 @@ async fn connection_loop(
 // Inbound Packet Processing
 // =============================================================================
 
-/// Process a single inbound MQTT packet with full orchestration.
-async fn process_inbound_packet(
-    packet: &MqttPacket,
+/// Dispatch a single inbound MQTT packet by type, with full orchestration.
+///
+/// Dispatches on the raw packet type u8 from the fixed header — no MqttPacket enum.
+/// For ack packets (PUBACK/PUBREC/PUBREL/PUBCOMP), reads packet_id directly from
+/// the wire bytes without constructing intermediate structs.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_inbound_packet(
+    packet_type: u8,
+    _flags: u8,
+    header_size: usize,
+    total_size: usize,
+    remaining_length: usize,
+    packet_bytes: &Bytes,
     session: &mut MqttSession,
     batcher: &MqWriteBatcher,
     log_reader: &Arc<MqReader>,
     stream: &mut TcpStream,
     stats: &MqttServerStats,
     write_buf: &mut BytesMut,
+    m: &MqttMetrics,
 ) -> Result<(), ConnectionError> {
-    let m = shared_metrics();
     let version = session.protocol_version;
+    let is_v5 = version == ProtocolVersion::V5;
 
-    match packet {
-        // Second CONNECT rejection (m11): a connected session must not receive another CONNECT.
-        MqttPacket::Connect(_) => {
+    match packet_type {
+        // CONNECT (1): second CONNECT rejection.
+        1 => {
             warn!(client_id = %session.client_id, "received second CONNECT, disconnecting");
-            // Send DISCONNECT with PROTOCOL_ERROR reason code.
-            let disconnect = MqttPacket::Disconnect(crate::types::Disconnect {
-                reason_code: Some(crate::types::ReasonCode::PROTOCOL_ERROR.0),
-                properties: crate::types::Properties {
-                    reason_string: Some("second CONNECT not allowed".into()),
-                    ..Default::default()
-                },
-            });
-            send_packets(
-                stream,
-                std::slice::from_ref(&disconnect),
-                stats,
-                write_buf,
-                version,
-            )
-            .await?;
+            if is_v5 {
+                write_buf.clear();
+                codec::encode_disconnect_reason(
+                    crate::types::ReasonCode::PROTOCOL_ERROR.0,
+                    Some(b"second CONNECT not allowed"),
+                    write_buf,
+                );
+                let _ = stream.write_all(write_buf).await;
+                stats
+                    .total_packets_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return Err(ConnectionError::Codec(CodecError::InvalidFixedHeaderFlags(
                 1,
             )));
         }
 
-        MqttPacket::Publish(publish) => {
-            m.publishes_in.increment(1);
-            // Full orchestration: session builds plan, server resolves IDs.
-            let plan = session.handle_publish(publish);
+        // PUBLISH (3): should not reach here — handled in batch loop.
+        3 => unreachable!("PUBLISH handled in batch loop"),
 
-            // Send immediate responses (PUBACK/PUBREC) before orchestrating.
-            send_packets(stream, &plan.responses, stats, write_buf, version).await?;
-
-            // If the session flagged a disconnect (e.g., receive maximum exceeded,
-            // topic alias 0), send the DISCONNECT and close.
-            if let Some(ref disconnect_pkt) = plan.disconnect {
-                send_packets(
-                    stream,
-                    std::slice::from_ref(disconnect_pkt),
-                    stats,
-                    write_buf,
-                    version,
-                )
-                .await?;
-                return Err(ConnectionError::Codec(CodecError::ProtocolError));
+        // PUBACK (4): read packet_id directly from wire bytes.
+        4 => {
+            let packet_id = codec::read_ack_packet_id(packet_bytes, header_size)?;
+            session.handle_puback(packet_id);
+            for i in 0..session.cmd_buf.len() {
+                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
             }
-
-            // Orchestrate the actual publish through the exchange.
-            orchestrate_publish(session, batcher, plan).await?;
         }
 
-        MqttPacket::Subscribe(subscribe) => {
+        // PUBREC (5): read packet_id directly from wire bytes.
+        5 => {
+            let packet_id = codec::read_ack_packet_id(packet_bytes, header_size)?;
+            session.handle_pubrec(packet_id);
+            if !session.out_buf.is_empty() {
+                stream.write_all(&session.out_buf).await?;
+                stats
+                    .total_packets_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // PUBREL (6): read packet_id directly from wire bytes.
+        6 => {
+            let packet_id = codec::read_ack_packet_id(packet_bytes, header_size)?;
+            session.handle_pubrel(packet_id);
+            if !session.out_buf.is_empty() {
+                stream.write_all(&session.out_buf).await?;
+                stats
+                    .total_packets_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // PUBCOMP (7): read packet_id directly from wire bytes.
+        7 => {
+            let packet_id = codec::read_ack_packet_id(packet_bytes, header_size)?;
+            session.handle_pubcomp(packet_id);
+            for i in 0..session.cmd_buf.len() {
+                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+            }
+        }
+
+        // SUBSCRIBE (8): decode full Subscribe struct.
+        8 => {
             m.subscribes.increment(1);
-            // Full orchestration: create exchange, queues, bindings.
+            let subscribe =
+                codec::decode_subscribe_raw(packet_bytes, header_size, total_size, is_v5).map_err(
+                    |e| {
+                        warn!(error = %e, "failed to decode SUBSCRIBE");
+                        ConnectionError::Codec(e)
+                    },
+                )?;
+
             let mut plan = session.handle_subscribe(
                 subscribe.packet_id,
                 &subscribe.filters,
-                subscribe.properties.subscription_identifier,
+                subscribe.subscription_identifier,
             );
 
-            // Split filter plans: extract filter string + scalars for retained delivery,
-            // leave queue_name/routing_key for orchestration to move into cache.
             let mut retained_infos: SmallVec<[RetainedFilterInfo; 4]> = SmallVec::new();
             let mut orch_filters: SmallVec<[SubscribeFilterPlan; 4]> = SmallVec::new();
             for mut fp in std::mem::take(&mut plan.filters) {
@@ -1575,7 +1703,6 @@ async fn process_inbound_packet(
                 orch_filters.push(fp);
             }
 
-            // Orchestrate entity creation — moves queue_name/routing_key into cache (zero alloc).
             if let Err(e) = orchestrate_subscribe(
                 session,
                 batcher,
@@ -1589,17 +1716,14 @@ async fn process_inbound_packet(
                 warn!(error = %e, "subscribe orchestration failed");
             }
 
-            // Send SUBACK after orchestration so IDs are resolved.
-            send_packets(
-                stream,
-                std::slice::from_ref(&plan.suback),
-                stats,
-                write_buf,
-                version,
-            )
-            .await?;
+            // SUBACK already encoded in session.out_buf by handle_subscribe.
+            if !session.out_buf.is_empty() {
+                stream.write_all(&session.out_buf).await?;
+                stats
+                    .total_packets_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
-            // Deliver retained messages for the newly subscribed filters.
             if let Err(e) = deliver_retained_on_subscribe(
                 session,
                 log_reader.as_ref(),
@@ -1614,13 +1738,56 @@ async fn process_inbound_packet(
             }
         }
 
-        MqttPacket::Disconnect(disconnect) => {
-            // Session handles state cleanup; M11: will on V5 DISCONNECT reason 0x04.
-            let (will_plan, cmds) = session.handle_disconnect(Some(disconnect));
-            for cmd in cmds {
-                let _ = batcher.submit(cmd).await;
+        // UNSUBSCRIBE (10): decode full Unsubscribe struct.
+        10 => {
+            let unsubscribe =
+                codec::decode_unsubscribe_raw(packet_bytes, header_size, total_size, is_v5)
+                    .map_err(|e| ConnectionError::Codec(e))?;
+            let string_filters: smallvec::SmallVec<[String; 4]> = unsubscribe
+                .filters
+                .iter()
+                .map(|b| unsafe { std::str::from_utf8_unchecked(b) }.to_string())
+                .collect();
+            session.handle_unsubscribe(unsubscribe.packet_id, &string_filters);
+            for i in 0..session.cmd_buf.len() {
+                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
             }
-            // Publish will message if DISCONNECT with Will Message (0x04).
+            if !session.out_buf.is_empty() {
+                stream.write_all(&session.out_buf).await?;
+                stats
+                    .total_packets_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // PINGREQ (12): no decode needed.
+        12 => {
+            session.handle_pingreq();
+            for i in 0..session.cmd_buf.len() {
+                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+            }
+            if !session.out_buf.is_empty() {
+                stream.write_all(&session.out_buf).await?;
+                stats
+                    .total_packets_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // DISCONNECT (14): extract fields directly from wire bytes.
+        14 => {
+            let (reason_code, session_expiry_interval) =
+                codec::read_disconnect_fields(packet_bytes, header_size, remaining_length)?;
+            let disconnect = crate::types::Disconnect {
+                reason_code,
+                session_expiry_interval,
+                reason_string: None,
+                server_reference: None,
+            };
+            let will_plan = session.handle_disconnect(Some(&disconnect));
+            for i in 0..session.cmd_buf.len() {
+                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+            }
             if let Some(plan) = will_plan {
                 if let Err(e) = orchestrate_publish(session, batcher, plan).await {
                     warn!(error = %e, "failed to publish will on V5 disconnect");
@@ -1628,91 +1795,29 @@ async fn process_inbound_packet(
             }
         }
 
-        // Inline dispatch for ack packets — avoids Vec allocations on hot path.
-        MqttPacket::PubAck(puback) => {
-            if let Some(cmd) = session.handle_puback(puback.packet_id) {
-                let _ = batcher.submit(cmd).await;
+        // AUTH (15): decode full Auth struct.
+        15 => {
+            let auth =
+                codec::decode_auth_raw(packet_bytes, header_size, total_size, remaining_length)
+                    .map_err(|e| ConnectionError::Codec(e))?;
+            session.handle_auth(&auth);
+            for i in 0..session.cmd_buf.len() {
+                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+            }
+            if !session.out_buf.is_empty() {
+                stream.write_all(&session.out_buf).await?;
+                stats
+                    .total_packets_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
-        MqttPacket::PubRec(pubrec) => {
-            let pubrel = session.handle_pubrec(pubrec.packet_id);
-            send_packets(
-                stream,
-                std::slice::from_ref(&pubrel),
-                stats,
-                write_buf,
-                version,
-            )
-            .await?;
-        }
-
-        MqttPacket::PubRel(pubrel) => {
-            let pubcomp = session.handle_pubrel(pubrel.packet_id);
-            send_packets(
-                stream,
-                std::slice::from_ref(&pubcomp),
-                stats,
-                write_buf,
-                version,
-            )
-            .await?;
-        }
-
-        MqttPacket::PubComp(pubcomp) => {
-            if let Some(cmd) = session.handle_pubcomp(pubcomp.packet_id) {
-                let _ = batcher.submit(cmd).await;
-            }
-        }
-
-        MqttPacket::PingReq => {
-            let (cmd, pong) = session.handle_pingreq();
-            let _ = batcher.submit(cmd).await;
-            send_packets(
-                stream,
-                std::slice::from_ref(&pong),
-                stats,
-                write_buf,
-                version,
-            )
-            .await?;
-        }
-
-        // Remaining packet types (ConnAck, SubAck, UnsubAck, PingResp, Auth)
-        // are unexpected from clients or handled via process_packet fallback.
+        // Server-originated packets should not arrive from client.
         _ => {
-            let (commands, responses) = session.process_packet(packet);
-            for cmd in commands {
-                if let Err(e) = batcher.submit(cmd).await {
-                    warn!(error = %e, "failed to submit command");
-                }
-            }
-            send_packets(stream, &responses, stats, write_buf, version).await?;
+            warn!(packet_type, "unexpected packet from client");
         }
     }
 
-    Ok(())
-}
-
-/// Send a slice of MQTT packets to the client using the reusable write buffer.
-async fn send_packets(
-    stream: &mut TcpStream,
-    packets: &[MqttPacket],
-    stats: &MqttServerStats,
-    write_buf: &mut BytesMut,
-    version: ProtocolVersion,
-) -> Result<(), ConnectionError> {
-    // Batch-encode all packets into the reusable buffer, then flush once.
-    write_buf.clear();
-    for packet in packets {
-        codec::encode_packet_versioned(packet, version, write_buf);
-    }
-    if !write_buf.is_empty() {
-        stream.write_all(write_buf).await?;
-        stats
-            .total_packets_sent
-            .fetch_add(packets.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    }
     Ok(())
 }
 
@@ -1730,23 +1835,16 @@ async fn send_disconnect_and_close(
     reason_string: Option<&str>,
 ) -> ConnectionError {
     if version == ProtocolVersion::V5 {
-        let mut properties = crate::types::Properties::default();
-        if let Some(rs) = reason_string {
-            properties.reason_string = Some(rs.to_string());
-        }
-        let disconnect = MqttPacket::Disconnect(crate::types::Disconnect {
-            reason_code: Some(reason_code),
-            properties,
-        });
-        // Best-effort send; ignore errors since we're closing anyway.
-        let _ = send_packets(
-            stream,
-            std::slice::from_ref(&disconnect),
-            stats,
+        write_buf.clear();
+        codec::encode_disconnect_reason(
+            reason_code,
+            reason_string.map(|s| s.as_bytes()),
             write_buf,
-            version,
-        )
-        .await;
+        );
+        let _ = stream.write_all(write_buf).await;
+        stats
+            .total_packets_sent
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     ConnectionError::Codec(CodecError::InvalidFixedHeaderFlags(reason_code))
 }
@@ -1837,7 +1935,7 @@ async fn deliver_single_retained(
     write_buf: &mut BytesMut,
 ) -> Result<(), ConnectionError> {
     if let Some(msg_bytes) = log_reader.read_latest_topic_message(topic_id) {
-        if let Some(flat) = FlatMessage::new(msg_bytes) {
+        if let Some(flat) = FlatMessage::new(&msg_bytes) {
             let is_v5 = session.protocol_version == ProtocolVersion::V5;
 
             // Message Expiry enforcement for retained messages (MQTT 5.0 §3.3.2.3.3).
@@ -2027,80 +2125,75 @@ mod tests {
         assert!(mqtt_topic_matches_filter("a/b/c", "+/b/c"));
     }
 
-    fn build_flat(builder: bisque_mq::flat::FlatMessageBuilder) -> FlatMessage {
-        FlatMessage::new(builder.build()).expect("valid FlatMessage")
+    fn build_flat_bytes(builder: bisque_mq::flat::FlatMessageBuilder) -> bytes::Bytes {
+        let buf = builder.build();
+        FlatMessage::new(&buf).expect("valid FlatMessage");
+        buf
+    }
+
+    // --- Phase 3 Opt 2: publisher_id via FlatMessage fixed header ---
+
+    #[test]
+    fn test_flat_publisher_id_present() {
+        use bisque_mq::flat::FlatMessageBuilder;
+        let buf = build_flat_bytes(FlatMessageBuilder::new(b"payload").publisher_id(42));
+        let msg = FlatMessage::new(&buf).unwrap();
+        assert_eq!(msg.publisher_id(), 42);
     }
 
     #[test]
-    fn test_extract_publisher_session_id_present() {
+    fn test_flat_publisher_id_absent() {
         use bisque_mq::flat::FlatMessageBuilder;
-        let msg = build_flat(
-            FlatMessageBuilder::new(Bytes::from_static(b"payload")).header(
-                Bytes::from_static(b"mqtt.publisher_session_id"),
-                Bytes::copy_from_slice(&42u64.to_be_bytes()),
-            ),
-        );
-        assert_eq!(extract_publisher_session_id(&msg), Some(42));
+        let buf = build_flat_bytes(FlatMessageBuilder::new(b"payload"));
+        let msg = FlatMessage::new(&buf).unwrap();
+        assert_eq!(msg.publisher_id(), 0);
     }
 
     #[test]
-    fn test_extract_publisher_session_id_absent() {
+    fn test_flat_publisher_id_no_local_match() {
         use bisque_mq::flat::FlatMessageBuilder;
-        let msg = build_flat(FlatMessageBuilder::new(Bytes::from_static(b"payload")));
-        assert_eq!(extract_publisher_session_id(&msg), None);
+        let session_id = 99u64;
+        let buf = build_flat_bytes(FlatMessageBuilder::new(b"payload").publisher_id(session_id));
+        let msg = FlatMessage::new(&buf).unwrap();
+        // No-local: skip if publisher_id matches session_id
+        let pub_id = msg.publisher_id();
+        assert!(pub_id != 0 && pub_id == session_id);
     }
 
     #[test]
-    fn test_extract_publisher_session_id_wrong_length() {
+    fn test_flat_publisher_id_no_local_no_match() {
         use bisque_mq::flat::FlatMessageBuilder;
-        let msg = build_flat(
-            FlatMessageBuilder::new(Bytes::from_static(b"payload")).header(
-                Bytes::from_static(b"mqtt.publisher_session_id"),
-                Bytes::from_static(b"short"),
-            ),
-        );
-        assert_eq!(extract_publisher_session_id(&msg), None);
+        let buf = build_flat_bytes(FlatMessageBuilder::new(b"payload").publisher_id(42));
+        let msg = FlatMessage::new(&buf).unwrap();
+        let my_session_id = 99u64;
+        let pub_id = msg.publisher_id();
+        assert!(pub_id == 0 || pub_id != my_session_id);
+    }
+
+    // --- Phase 3 Opt 3: retain flag via FlatMessage FLAG_RETAIN ---
+
+    #[test]
+    fn test_flat_retain_flag_true() {
+        use bisque_mq::flat::FlatMessageBuilder;
+        let buf = build_flat_bytes(FlatMessageBuilder::new(b"payload").retain(true));
+        let msg = FlatMessage::new(&buf).unwrap();
+        assert!(msg.is_retain());
     }
 
     #[test]
-    fn test_extract_original_retain_true() {
+    fn test_flat_retain_flag_false() {
         use bisque_mq::flat::FlatMessageBuilder;
-        let msg = build_flat(
-            FlatMessageBuilder::new(Bytes::from_static(b"payload")).header(
-                Bytes::from_static(b"mqtt.original_retain"),
-                Bytes::from_static(&[1]),
-            ),
-        );
-        assert!(extract_original_retain(&msg));
+        let buf = build_flat_bytes(FlatMessageBuilder::new(b"payload").retain(false));
+        let msg = FlatMessage::new(&buf).unwrap();
+        assert!(!msg.is_retain());
     }
 
     #[test]
-    fn test_extract_original_retain_false() {
+    fn test_flat_retain_flag_absent() {
         use bisque_mq::flat::FlatMessageBuilder;
-        let msg = build_flat(
-            FlatMessageBuilder::new(Bytes::from_static(b"payload")).header(
-                Bytes::from_static(b"mqtt.original_retain"),
-                Bytes::from_static(&[0]),
-            ),
-        );
-        assert!(!extract_original_retain(&msg));
-    }
-
-    #[test]
-    fn test_extract_original_retain_absent() {
-        use bisque_mq::flat::FlatMessageBuilder;
-        let msg = build_flat(FlatMessageBuilder::new(Bytes::from_static(b"payload")));
-        assert!(!extract_original_retain(&msg));
-    }
-
-    #[test]
-    fn test_extract_original_retain_empty_value() {
-        use bisque_mq::flat::FlatMessageBuilder;
-        let msg = build_flat(
-            FlatMessageBuilder::new(Bytes::from_static(b"payload"))
-                .header(Bytes::from_static(b"mqtt.original_retain"), Bytes::new()),
-        );
-        assert!(!extract_original_retain(&msg));
+        let buf = build_flat_bytes(FlatMessageBuilder::new(b"payload"));
+        let msg = FlatMessage::new(&buf).unwrap();
+        assert!(!msg.is_retain());
     }
 
     #[test]
@@ -2159,7 +2252,7 @@ mod tests {
         assert_eq!(extract_entity_id(&MqResponse::Ok), None);
         assert_eq!(
             extract_entity_id(&MqResponse::Error(MqError::NotFound {
-                entity: bisque_mq::types::EntityKind::Queue,
+                entity: bisque_mq::types::EntityKind::ConsumerGroup,
                 id: 1,
             })),
             None
@@ -2170,8 +2263,8 @@ mod tests {
     async fn test_encode_decode_integration() {
         use crate::types::*;
 
-        let connect = MqttPacket::Connect(Connect {
-            protocol_name: "MQTT".to_string(),
+        let connect = Connect {
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V311,
             flags: ConnectFlags {
                 username: false,
@@ -2182,28 +2275,28 @@ mod tests {
                 clean_session: true,
             },
             keep_alive: 30,
-            client_id: "integration-test".to_string(),
+            client_id: Bytes::from("integration-test"),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
-        });
+            properties_raw: Vec::new(),
+        };
 
         let mut buf = BytesMut::new();
-        codec::encode_packet(&connect, &mut buf);
+        codec::encode_connect(&connect, &mut buf);
 
-        let (decoded, consumed) = codec::decode_packet(&buf).unwrap();
+        let (decoded, consumed) = codec::decode_buf::connect(&buf).unwrap();
         assert_eq!(consumed, buf.len());
 
         let mut session = MqttSession::new(MqttSessionConfig::default());
-        let (commands, responses) = session.process_packet(&decoded);
+        session.handle_connect(&decoded);
 
         assert!(session.connected);
         assert_eq!(session.client_id, "integration-test");
         assert_eq!(session.keep_alive, 30);
-        assert!(!commands.is_empty());
-        assert_eq!(responses.len(), 1);
-        assert!(matches!(responses[0], MqttPacket::ConnAck(_)));
+        assert!(!session.cmd_buf.is_empty());
+        assert!(!session.out_buf.is_empty());
+        let (_connack, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
     }
 
     // =========================================================================
@@ -2291,59 +2384,51 @@ mod tests {
 
         // Connect.
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V311,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "flow-test".to_string(),
+            client_id: Bytes::from("flow-test"),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
         let mut session = MqttSession::new(MqttSessionConfig::default());
-        let (cmds, connack) = session.handle_connect(&connect);
+        session.handle_connect(&connect);
         assert!(session.connected);
-        assert!(!cmds.is_empty());
-        match connack {
-            MqttPacket::ConnAck(ca) => assert_eq!(ca.return_code, 0x00),
-            _ => panic!("expected ConnAck"),
-        }
+        assert!(!session.cmd_buf.is_empty());
+        let (ca, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert_eq!(ca.return_code, 0x00);
 
         // Subscribe.
         let filters: smallvec::SmallVec<[TopicFilter; 4]> = smallvec::smallvec![TopicFilter {
-            filter: "sensor/+/temp".to_string(),
+            filter: Bytes::from("sensor/+/temp"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
             retain_handling: 0,
         }];
         let plan = session.handle_subscribe(1, &filters, None);
-        match plan.suback {
-            MqttPacket::SubAck(sa) => {
-                assert_eq!(sa.packet_id, 1);
-                assert_eq!(sa.return_codes[0], QoS::AtLeastOnce.as_u8());
-            }
-            _ => panic!("expected SubAck"),
-        }
+        let (sa, _) = crate::codec::decode_buf::suback(&session.out_buf).unwrap();
+        assert_eq!(sa.packet_id, 1);
+        assert_eq!(sa.return_codes[0], QoS::AtLeastOnce.as_u8());
 
         // Publish QoS 0.
         let publish = Publish {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: Bytes::from_static(b"sensor/1/temp"),
+            topic: b"sensor/1/temp",
             packet_id: None,
-            payload: Bytes::from_static(b"22.5"),
+            payload: b"22.5",
             properties: Properties::default(),
         };
-        let pub_plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let pub_plan = session.handle_publish(&publish, &mut msg_buf);
+        assert!(pub_plan.has_message(), "publish should produce a message");
         assert!(
-            !pub_plan.flat_message.is_empty(),
-            "publish should produce a message"
-        );
-        assert!(
-            pub_plan.responses.is_empty(),
+            session.out_buf.is_empty(),
             "QoS 0 should not produce a response"
         );
 
@@ -2352,21 +2437,20 @@ mod tests {
             dup: false,
             qos: QoS::AtLeastOnce,
             retain: false,
-            topic: Bytes::from_static(b"sensor/2/temp"),
+            topic: b"sensor/2/temp",
             packet_id: Some(2),
-            payload: Bytes::from_static(b"23.1"),
+            payload: b"23.1",
             properties: Properties::default(),
         };
-        let pub_plan_q1 = session.handle_publish(&publish_q1);
-        assert!(!pub_plan_q1.flat_message.is_empty());
-        assert_eq!(pub_plan_q1.responses.len(), 1);
-        match &pub_plan_q1.responses[0] {
-            MqttPacket::PubAck(pa) => assert_eq!(pa.packet_id, 2),
-            _ => panic!("expected PubAck"),
-        }
+        let mut msg_buf_q1 = BytesMut::new();
+        let pub_plan_q1 = session.handle_publish(&publish_q1, &mut msg_buf_q1);
+        assert!(pub_plan_q1.has_message());
+        assert!(!session.out_buf.is_empty());
+        let (pa, _) = crate::codec::decode_buf::puback(&session.out_buf).unwrap();
+        assert_eq!(pa.packet_id, 2);
 
         // Disconnect.
-        let (will_plan, _) = session.handle_disconnect(None);
+        let will_plan = session.handle_disconnect(None);
         assert!(will_plan.is_none());
         assert!(!session.connected);
     }
@@ -2434,7 +2518,7 @@ mod tests {
 
         let mut session = MqttSession::new(MqttSessionConfig::default());
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags {
                 username: false,
@@ -2445,16 +2529,16 @@ mod tests {
                 clean_session: true,
             },
             keep_alive: 60,
-            client_id: "shared-test".to_string(),
+            client_id: Bytes::from("shared-test"),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
         session.handle_connect(&connect);
 
         let filters = [TopicFilter {
-            filter: "$share/mygroup/topic/test".to_string(),
+            filter: Bytes::from("$share/mygroup/topic/test"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -2465,5 +2549,121 @@ mod tests {
         // Shared subscription plan should have shared_group set.
         assert_eq!(plan.filters.len(), 1);
         assert_eq!(plan.filters[0].shared_group, Some("mygroup".to_string()));
+    }
+
+    // --- Phase 3 Opt 1: Push-based delivery via GroupNotifier (Notify-based) ---
+
+    #[tokio::test]
+    async fn test_group_notifier_watch_and_notify() {
+        use bisque_mq::notifier::GroupNotifier;
+
+        let notifier = GroupNotifier::new();
+        let conn_notify = Arc::new(tokio::sync::Notify::new());
+        notifier.watch(42, &conn_notify);
+
+        // Register notified() BEFORE calling notify (matches HighWaterMark pattern).
+        let notified = conn_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        notifier.notify(42);
+        let result = tokio::time::timeout(Duration::from_millis(100), notified).await;
+        assert!(result.is_ok(), "should receive notification within 100ms");
+    }
+
+    #[tokio::test]
+    async fn test_group_notifier_multiple_watchers() {
+        use bisque_mq::notifier::GroupNotifier;
+
+        let notifier = GroupNotifier::new();
+        let n1 = Arc::new(tokio::sync::Notify::new());
+        let n2 = Arc::new(tokio::sync::Notify::new());
+        notifier.watch(42, &n1);
+        notifier.watch(42, &n2);
+
+        let f1 = n1.notified();
+        let f2 = n2.notified();
+        tokio::pin!(f1, f2);
+        f1.as_mut().enable();
+        f2.as_mut().enable();
+
+        notifier.notify(42);
+
+        let r1 = tokio::time::timeout(Duration::from_millis(100), f1).await;
+        let r2 = tokio::time::timeout(Duration::from_millis(100), f2).await;
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_group_notifier_no_notification_for_other_group() {
+        use bisque_mq::notifier::GroupNotifier;
+
+        let notifier = GroupNotifier::new();
+        let conn_notify = Arc::new(tokio::sync::Notify::new());
+        notifier.watch(42, &conn_notify);
+
+        let notified = conn_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // Notify a different group — should NOT wake our watcher.
+        notifier.notify(99);
+        let result = tokio::time::timeout(Duration::from_millis(50), notified).await;
+        assert!(
+            result.is_err(),
+            "should NOT receive notification for other group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_notifier_merged_connection_notify() {
+        use bisque_mq::notifier::GroupNotifier;
+
+        let notifier = GroupNotifier::new();
+        // Single connection Notify registered for two groups.
+        let conn_notify = Arc::new(tokio::sync::Notify::new());
+        notifier.watch(10, &conn_notify);
+        notifier.watch(20, &conn_notify);
+
+        // Notify group 10 — connection should wake.
+        let notified = conn_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        notifier.notify(10);
+        let r = tokio::time::timeout(Duration::from_millis(100), notified).await;
+        assert!(r.is_ok(), "should wake on group 10 notification");
+
+        // Notify group 20 — connection should also wake.
+        let notified = conn_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        notifier.notify(20);
+        let r = tokio::time::timeout(Duration::from_millis(100), notified).await;
+        assert!(r.is_ok(), "should wake on group 20 notification");
+    }
+
+    #[test]
+    fn test_mqtt_server_with_group_notifier() {
+        use bisque_mq::notifier::GroupNotifier;
+
+        let notifier = Arc::new(GroupNotifier::new());
+        let conn_notify = Arc::new(tokio::sync::Notify::new());
+        notifier.watch(1, &conn_notify);
+    }
+
+    #[tokio::test]
+    async fn test_group_notifier_unwatch_cleans_up() {
+        use bisque_mq::notifier::GroupNotifier;
+
+        let notifier = GroupNotifier::new();
+        let conn_notify = Arc::new(tokio::sync::Notify::new());
+        notifier.watch(42, &conn_notify);
+
+        // Unwatch removes all watchers.
+        notifier.unwatch(42);
+
+        // Notify after unwatch should be a no-op (no panic).
+        notifier.notify(42);
     }
 }

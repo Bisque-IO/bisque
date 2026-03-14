@@ -4,15 +4,45 @@
 //! QoS levels, connect flags, and property types.
 
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+
+/// Property wire sizes for pre-computing remaining length.
+pub const PROP_SIZE_U8: usize = 2; // id(1) + u8(1)
+pub const PROP_SIZE_U16: usize = 3; // id(1) + u16(2)
+pub const PROP_SIZE_U32: usize = 5; // id(1) + u32(4)
+
+/// Wire size of a length-prefixed string/bytes property.
+#[inline]
+pub const fn prop_size_str(len: usize) -> usize {
+    1 + 2 + len // id(1) + len_prefix(2) + data
+}
+
+/// Wire size of a variable-byte integer property (subscription identifier).
+#[inline]
+pub const fn prop_size_varint(v: u32) -> usize {
+    1 + varint_size(v) // id(1) + varint
+}
+
+/// Size of a variable-byte integer encoding.
+#[inline]
+pub const fn varint_size(v: u32) -> usize {
+    if v < 128 {
+        1
+    } else if v < 16384 {
+        2
+    } else if v < 2_097_152 {
+        3
+    } else {
+        4
+    }
+}
 
 // =============================================================================
 // Protocol Version
 // =============================================================================
 
 /// MQTT protocol version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolVersion {
     /// MQTT 3.1.1 (protocol level 4).
     V311,
@@ -44,7 +74,7 @@ impl ProtocolVersion {
 // =============================================================================
 
 /// MQTT Quality of Service level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum QoS {
     /// At most once delivery.
@@ -77,7 +107,7 @@ impl QoS {
 // =============================================================================
 
 /// MQTT control packet type (4-bit value from fixed header byte 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketType {
     Connect = 1,
@@ -126,7 +156,7 @@ impl PacketType {
 // =============================================================================
 
 /// Flags parsed from the CONNECT packet's Connect Flags byte.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ConnectFlags {
     pub username: bool,
     pub password: bool,
@@ -190,7 +220,7 @@ impl ConnectFlags {
 // =============================================================================
 
 /// CONNACK return code for MQTT 3.1.1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ConnectReturnCode {
     Accepted = 0x00,
@@ -220,7 +250,7 @@ impl ConnectReturnCode {
 /// Note: In MQTT 5.0, several reason codes share the same numeric value (0x00)
 /// but are used in different packet contexts (CONNACK, SUBACK, DISCONNECT, etc.).
 /// We represent them as constants rather than enum variants to avoid conflicts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReasonCode(pub u8);
 
 impl ReasonCode {
@@ -274,7 +304,7 @@ impl ReasonCode {
 // =============================================================================
 
 /// MQTT 5.0 property identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PropertyId {
     PayloadFormatIndicator = 0x01,
@@ -306,63 +336,606 @@ pub enum PropertyId {
     SharedSubscriptionAvailable = 0x2A,
 }
 
-/// Container for MQTT 5.0 properties attached to a packet.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Properties {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload_format_indicator: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_expiry_interval: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_topic: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub correlation_data: Option<Bytes>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subscription_identifier: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_expiry_interval: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assigned_client_identifier: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_keep_alive: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authentication_method: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authentication_data: Option<Bytes>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receive_maximum: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub topic_alias_maximum: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub topic_alias: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maximum_qos: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retain_available: Option<bool>,
-    #[serde(default, skip_serializing_if = "SmallVec::is_empty")]
-    pub user_properties: SmallVec<[(String, String); 4]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maximum_packet_size: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wildcard_subscription_available: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subscription_identifier_available: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shared_subscription_available: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason_string: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_reference: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub will_delay_interval: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_problem_information: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_response_information: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_information: Option<String>,
+/// Zero-copy MQTT 5.0 properties, backed by raw wire-format bytes.
+///
+/// Property bytes are stored in MQTT wire format (tag-value pairs without the
+/// variable-length integer prefix). Accessor methods scan the raw bytes on
+/// demand, avoiding heap allocations during decode.
+#[derive(Clone)]
+pub struct Properties<'a> {
+    /// Raw property bytes (content after the variable-length integer prefix).
+    /// Empty for MQTT 3.1.1 or when no properties are present.
+    raw: &'a [u8],
+}
+
+impl Default for Properties<'_> {
+    fn default() -> Self {
+        Self { raw: &[] }
+    }
+}
+
+impl std::fmt::Debug for Properties<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Properties")
+            .field("len", &self.raw.len())
+            .finish()
+    }
+}
+
+impl<'a> Properties<'a> {
+    /// Create from raw property bytes (wire format, without varint prefix).
+    pub fn from_raw(raw: &'a [u8]) -> Self {
+        Self { raw }
+    }
+
+    /// Get the raw property bytes for re-encoding.
+    pub fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// Whether no properties are present.
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    // ---- Private scanning helpers ----
+
+    /// Compute the size of a property value given its ID and the remaining data.
+    /// Returns None if the data is truncated or the ID is unknown.
+    #[inline]
+    pub(crate) fn skip_value(id: u8, data: &[u8]) -> Option<usize> {
+        match id {
+            // u8 / bool
+            0x01 | 0x17 | 0x19 | 0x24 | 0x25 | 0x28 | 0x29 | 0x2A => {
+                if data.is_empty() {
+                    return None;
+                }
+                Some(1)
+            }
+            // u16
+            0x13 | 0x21 | 0x22 | 0x23 => {
+                if data.len() < 2 {
+                    return None;
+                }
+                Some(2)
+            }
+            // u32
+            0x02 | 0x11 | 0x18 | 0x27 => {
+                if data.len() < 4 {
+                    return None;
+                }
+                Some(4)
+            }
+            // UTF-8 string or binary data (2-byte length prefix)
+            0x03 | 0x08 | 0x09 | 0x12 | 0x15 | 0x16 | 0x1A | 0x1C | 0x1F => {
+                if data.len() < 2 {
+                    return None;
+                }
+                let len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                if data.len() < 2 + len {
+                    return None;
+                }
+                Some(2 + len)
+            }
+            // Variable Byte Integer (subscription identifier)
+            0x0B => {
+                for i in 0..4.min(data.len()) {
+                    if data[i] & 0x80 == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                None
+            }
+            // User Property: two UTF-8 strings
+            0x26 => {
+                if data.len() < 2 {
+                    return None;
+                }
+                let key_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                let off = 2 + key_len;
+                if data.len() < off + 2 {
+                    return None;
+                }
+                let val_len = u16::from_be_bytes([data[off], data[off + 1]]) as usize;
+                let total = off + 2 + val_len;
+                if data.len() < total {
+                    return None;
+                }
+                Some(total)
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn find_u8_prop(&self, target: u8) -> Option<u8> {
+        let data = self.raw;
+        let mut pos = 0;
+        while pos < data.len() {
+            let id = data[pos];
+            pos += 1;
+            if id == target {
+                return data.get(pos).copied();
+            }
+            pos += Self::skip_value(id, &data[pos..])?;
+        }
+        None
+    }
+
+    #[inline]
+    fn find_u16_prop(&self, target: u8) -> Option<u16> {
+        let data = self.raw;
+        let mut pos = 0;
+        while pos < data.len() {
+            let id = data[pos];
+            pos += 1;
+            if id == target && data.len() >= pos + 2 {
+                return Some(u16::from_be_bytes([data[pos], data[pos + 1]]));
+            }
+            pos += Self::skip_value(id, &data[pos..])?;
+        }
+        None
+    }
+
+    #[inline]
+    fn find_u32_prop(&self, target: u8) -> Option<u32> {
+        let data = self.raw;
+        let mut pos = 0;
+        while pos < data.len() {
+            let id = data[pos];
+            pos += 1;
+            if id == target && data.len() >= pos + 4 {
+                return Some(u32::from_be_bytes([
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                ]));
+            }
+            pos += Self::skip_value(id, &data[pos..])?;
+        }
+        None
+    }
+
+    #[inline]
+    fn find_str_prop(&self, target: u8) -> Option<&'a str> {
+        let data = self.raw;
+        let mut pos = 0;
+        while pos < data.len() {
+            let id = data[pos];
+            pos += 1;
+            if id == target && data.len() >= pos + 2 {
+                let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                if data.len() >= pos + 2 + len {
+                    // Safety: validated as UTF-8 during decode
+                    return std::str::from_utf8(&data[pos + 2..pos + 2 + len]).ok();
+                }
+                return None;
+            }
+            pos += Self::skip_value(id, &data[pos..])?;
+        }
+        None
+    }
+
+    /// Find a string property and return it as a borrowed slice.
+    #[inline]
+    pub(crate) fn find_str_as_bytes(&self, target: u8) -> Option<&'a [u8]> {
+        self.find_str_ref(target)
+    }
+
+    /// Find a string property and return it as a borrowed slice.
+    #[inline]
+    pub(crate) fn find_str_ref(&self, target: u8) -> Option<&'a [u8]> {
+        let data = self.raw;
+        let mut pos = 0;
+        while pos < data.len() {
+            let id = data[pos];
+            pos += 1;
+            if id == target && data.len() >= pos + 2 {
+                let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                if data.len() >= pos + 2 + len {
+                    return Some(&data[pos + 2..pos + 2 + len]);
+                }
+                return None;
+            }
+            pos += Self::skip_value(id, &data[pos..])?;
+        }
+        None
+    }
+
+    /// Find a binary data property and return it as a zero-copy `Bytes` slice.
+    #[inline]
+    fn find_bytes_prop(&self, target: u8) -> Option<&'a [u8]> {
+        let data = self.raw;
+        let mut pos = 0;
+        while pos < data.len() {
+            let id = data[pos];
+            pos += 1;
+            if id == target && data.len() >= pos + 2 {
+                let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                if data.len() >= pos + 2 + len {
+                    return Some(&data[pos + 2..pos + 2 + len]);
+                }
+                return None;
+            }
+            pos += Self::skip_value(id, &data[pos..])?;
+        }
+        None
+    }
+
+    /// Find a binary data property and return a borrowed slice.
+    #[inline]
+    fn find_bytes_as_bytes(&self, target: u8) -> Option<&'a [u8]> {
+        self.find_bytes_prop(target)
+    }
+
+    #[inline]
+    fn find_bool_prop(&self, target: u8) -> Option<bool> {
+        self.find_u8_prop(target).map(|v| v != 0)
+    }
+
+    // ---- Public accessors ----
+
+    pub fn payload_format_indicator(&self) -> Option<u8> {
+        self.find_u8_prop(0x01)
+    }
+
+    pub fn message_expiry_interval(&self) -> Option<u32> {
+        self.find_u32_prop(0x02)
+    }
+
+    pub fn content_type(&self) -> Option<&'a str> {
+        self.find_str_prop(0x03)
+    }
+
+    /// Borrowed slice of the content type string.
+    pub fn content_type_bytes(&self) -> Option<&'a [u8]> {
+        self.find_str_as_bytes(0x03)
+    }
+
+    pub fn response_topic(&self) -> Option<&'a str> {
+        self.find_str_prop(0x08)
+    }
+
+    /// Borrowed slice of the response topic string.
+    pub fn response_topic_bytes(&self) -> Option<&'a [u8]> {
+        self.find_str_as_bytes(0x08)
+    }
+
+    pub fn correlation_data(&self) -> Option<&'a [u8]> {
+        self.find_bytes_prop(0x09)
+    }
+
+    /// Borrowed slice of the correlation data.
+    pub fn correlation_data_bytes(&self) -> Option<&'a [u8]> {
+        self.find_bytes_as_bytes(0x09)
+    }
+
+    pub fn subscription_identifier(&self) -> Option<u32> {
+        let data = self.raw;
+        let mut pos = 0;
+        while pos < data.len() {
+            let id = data[pos];
+            pos += 1;
+            if id == 0x0B {
+                let mut val: u32 = 0;
+                let mut mult: u32 = 1;
+                for i in 0..4 {
+                    if pos + i >= data.len() {
+                        return None;
+                    }
+                    val += (data[pos + i] as u32 & 0x7F) * mult;
+                    if data[pos + i] & 0x80 == 0 {
+                        return Some(val);
+                    }
+                    mult *= 128;
+                }
+                return None;
+            }
+            pos += Self::skip_value(id, &data[pos..])?;
+        }
+        None
+    }
+
+    pub fn session_expiry_interval(&self) -> Option<u32> {
+        self.find_u32_prop(0x11)
+    }
+
+    pub fn assigned_client_identifier(&self) -> Option<&'a str> {
+        self.find_str_prop(0x12)
+    }
+
+    pub fn server_keep_alive(&self) -> Option<u16> {
+        self.find_u16_prop(0x13)
+    }
+
+    pub fn authentication_method(&self) -> Option<&'a str> {
+        self.find_str_prop(0x15)
+    }
+
+    pub fn authentication_data(&self) -> Option<&'a [u8]> {
+        self.find_bytes_prop(0x16)
+    }
+
+    /// Borrowed slice of the authentication data.
+    pub fn authentication_data_bytes(&self) -> Option<&'a [u8]> {
+        self.find_bytes_as_bytes(0x16)
+    }
+
+    pub fn request_problem_information(&self) -> Option<u8> {
+        self.find_u8_prop(0x17)
+    }
+
+    pub fn will_delay_interval(&self) -> Option<u32> {
+        self.find_u32_prop(0x18)
+    }
+
+    pub fn request_response_information(&self) -> Option<u8> {
+        self.find_u8_prop(0x19)
+    }
+
+    pub fn response_information(&self) -> Option<&'a str> {
+        self.find_str_prop(0x1A)
+    }
+
+    pub fn server_reference(&self) -> Option<&'a str> {
+        self.find_str_prop(0x1C)
+    }
+
+    pub fn reason_string(&self) -> Option<&'a str> {
+        self.find_str_prop(0x1F)
+    }
+
+    pub fn receive_maximum(&self) -> Option<u16> {
+        self.find_u16_prop(0x21)
+    }
+
+    pub fn topic_alias_maximum(&self) -> Option<u16> {
+        self.find_u16_prop(0x22)
+    }
+
+    pub fn topic_alias(&self) -> Option<u16> {
+        self.find_u16_prop(0x23)
+    }
+
+    pub fn maximum_qos(&self) -> Option<u8> {
+        self.find_u8_prop(0x24)
+    }
+
+    pub fn retain_available(&self) -> Option<bool> {
+        self.find_bool_prop(0x25)
+    }
+
+    /// Iterate over user properties as `(&str, &str)` pairs.
+    pub fn user_properties(&self) -> UserPropertiesIter<'a> {
+        UserPropertiesIter {
+            data: self.raw,
+            pos: 0,
+        }
+    }
+
+    pub fn maximum_packet_size(&self) -> Option<u32> {
+        self.find_u32_prop(0x27)
+    }
+
+    pub fn wildcard_subscription_available(&self) -> Option<bool> {
+        self.find_bool_prop(0x28)
+    }
+
+    pub fn subscription_identifier_available(&self) -> Option<bool> {
+        self.find_bool_prop(0x29)
+    }
+
+    pub fn shared_subscription_available(&self) -> Option<bool> {
+        self.find_bool_prop(0x2A)
+    }
+}
+
+/// Iterator over MQTT 5.0 user properties (property ID 0x26).
+pub struct UserPropertiesIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for UserPropertiesIter<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.pos < self.data.len() {
+            let id = self.data[self.pos];
+            self.pos += 1;
+            let vsize = Properties::skip_value(id, &self.data[self.pos..])?;
+            if id == 0x26 {
+                let d = &self.data[self.pos..];
+                let key_len = u16::from_be_bytes([d[0], d[1]]) as usize;
+                let key = std::str::from_utf8(&d[2..2 + key_len]).ok()?;
+                let off = 2 + key_len;
+                let val_len = u16::from_be_bytes([d[off], d[off + 1]]) as usize;
+                let val = std::str::from_utf8(&d[off + 2..off + 2 + val_len]).ok()?;
+                self.pos += vsize;
+                return Some((key, val));
+            }
+            self.pos += vsize;
+        }
+        None
+    }
+}
+
+/// Builder for MQTT 5.0 Properties (used in tests and for constructing Properties
+/// for Publish and Connect packets).
+pub struct PropertiesBuilder {
+    buf: Vec<u8>,
+}
+
+impl PropertiesBuilder {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    pub fn build(self) -> Vec<u8> {
+        self.buf
+    }
+
+    fn put_u8(&mut self, id: u8, val: u8) -> &mut Self {
+        self.buf.push(id);
+        self.buf.push(val);
+        self
+    }
+
+    fn put_u16(&mut self, id: u8, val: u16) -> &mut Self {
+        self.buf.push(id);
+        self.buf.extend_from_slice(&val.to_be_bytes());
+        self
+    }
+
+    fn put_u32(&mut self, id: u8, val: u32) -> &mut Self {
+        self.buf.push(id);
+        self.buf.extend_from_slice(&val.to_be_bytes());
+        self
+    }
+
+    fn put_str(&mut self, id: u8, val: &str) -> &mut Self {
+        self.buf.push(id);
+        self.buf
+            .extend_from_slice(&(val.len() as u16).to_be_bytes());
+        self.buf.extend_from_slice(val.as_bytes());
+        self
+    }
+
+    fn put_bytes(&mut self, id: u8, val: &[u8]) -> &mut Self {
+        self.buf.push(id);
+        self.buf
+            .extend_from_slice(&(val.len() as u16).to_be_bytes());
+        self.buf.extend_from_slice(val);
+        self
+    }
+
+    fn put_varint(&mut self, id: u8, mut val: u32) -> &mut Self {
+        self.buf.push(id);
+        loop {
+            let mut byte = (val & 0x7F) as u8;
+            val >>= 7;
+            if val > 0 {
+                byte |= 0x80;
+            }
+            self.buf.push(byte);
+            if val == 0 {
+                break;
+            }
+        }
+        self
+    }
+
+    pub fn payload_format_indicator(mut self, v: u8) -> Self {
+        self.put_u8(0x01, v);
+        self
+    }
+    pub fn message_expiry_interval(mut self, v: u32) -> Self {
+        self.put_u32(0x02, v);
+        self
+    }
+    pub fn content_type(mut self, v: &str) -> Self {
+        self.put_str(0x03, v);
+        self
+    }
+    pub fn response_topic(mut self, v: &str) -> Self {
+        self.put_str(0x08, v);
+        self
+    }
+    pub fn correlation_data(mut self, v: &[u8]) -> Self {
+        self.put_bytes(0x09, v);
+        self
+    }
+    pub fn subscription_identifier(mut self, v: u32) -> Self {
+        self.put_varint(0x0B, v);
+        self
+    }
+    pub fn session_expiry_interval(mut self, v: u32) -> Self {
+        self.put_u32(0x11, v);
+        self
+    }
+    pub fn assigned_client_identifier(mut self, v: &str) -> Self {
+        self.put_str(0x12, v);
+        self
+    }
+    pub fn server_keep_alive(mut self, v: u16) -> Self {
+        self.put_u16(0x13, v);
+        self
+    }
+    pub fn authentication_method(mut self, v: &str) -> Self {
+        self.put_str(0x15, v);
+        self
+    }
+    pub fn authentication_data(mut self, v: &[u8]) -> Self {
+        self.put_bytes(0x16, v);
+        self
+    }
+    pub fn will_delay_interval(mut self, v: u32) -> Self {
+        self.put_u32(0x18, v);
+        self
+    }
+    pub fn reason_string(mut self, v: &str) -> Self {
+        self.put_str(0x1F, v);
+        self
+    }
+    pub fn receive_maximum(mut self, v: u16) -> Self {
+        self.put_u16(0x21, v);
+        self
+    }
+    pub fn topic_alias_maximum(mut self, v: u16) -> Self {
+        self.put_u16(0x22, v);
+        self
+    }
+    pub fn topic_alias(mut self, v: u16) -> Self {
+        self.put_u16(0x23, v);
+        self
+    }
+    pub fn maximum_qos(mut self, v: u8) -> Self {
+        self.put_u8(0x24, v);
+        self
+    }
+    pub fn retain_available(mut self, v: bool) -> Self {
+        self.put_u8(0x25, v as u8);
+        self
+    }
+    pub fn user_property(mut self, k: &str, v: &str) -> Self {
+        self.buf.push(0x26);
+        self.buf.extend_from_slice(&(k.len() as u16).to_be_bytes());
+        self.buf.extend_from_slice(k.as_bytes());
+        self.buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
+        self.buf.extend_from_slice(v.as_bytes());
+        self
+    }
+    pub fn maximum_packet_size(mut self, v: u32) -> Self {
+        self.put_u32(0x27, v);
+        self
+    }
+    pub fn response_information(mut self, v: &str) -> Self {
+        self.put_str(0x1A, v);
+        self
+    }
+    pub fn server_reference(mut self, v: &str) -> Self {
+        self.put_str(0x1C, v);
+        self
+    }
+    pub fn wildcard_subscription_available(mut self, v: bool) -> Self {
+        self.put_u8(0x28, v as u8);
+        self
+    }
+    pub fn subscription_identifier_available(mut self, v: bool) -> Self {
+        self.put_u8(0x29, v as u8);
+        self
+    }
+    pub fn shared_subscription_available(mut self, v: bool) -> Self {
+        self.put_u8(0x2A, v as u8);
+        self
+    }
+
+    /// Wire size of the variable-int prefix + content.
+    pub fn wire_size(&self) -> usize {
+        let content = self.buf.len();
+        varint_size(content as u32) + content
+    }
 }
 
 // =============================================================================
@@ -370,15 +943,20 @@ pub struct Properties {
 // =============================================================================
 
 /// Last Will and Testament message from CONNECT.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct WillMessage {
-    pub topic: String,
+    pub topic: Bytes,
     pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
-    /// MQTT 5.0 will properties.
-    #[serde(default)]
-    pub properties: Properties,
+    pub properties_raw: Vec<u8>,
+}
+
+impl WillMessage {
+    /// Get a borrowed Properties view over the raw property bytes.
+    pub fn properties(&self) -> Properties<'_> {
+        Properties::from_raw(&self.properties_raw)
+    }
 }
 
 // =============================================================================
@@ -386,19 +964,22 @@ pub struct WillMessage {
 // =============================================================================
 
 /// A single topic filter + options from a SUBSCRIBE packet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TopicFilter {
-    pub filter: String,
+    pub filter: Bytes,
     pub qos: QoS,
-    /// MQTT 5.0: No Local option (don't receive own publishes).
-    #[serde(default)]
     pub no_local: bool,
-    /// MQTT 5.0: Retain As Published.
-    #[serde(default)]
     pub retain_as_published: bool,
-    /// MQTT 5.0: Retain handling (0=send on subscribe, 1=send if new, 2=don't send).
-    #[serde(default)]
     pub retain_handling: u8,
+}
+
+impl TopicFilter {
+    /// Returns the filter as a UTF-8 string slice (validated during decode).
+    #[inline]
+    pub fn filter_str(&self) -> &str {
+        // SAFETY: validated as UTF-8 during decode.
+        unsafe { std::str::from_utf8_unchecked(&self.filter) }
+    }
 }
 
 // =============================================================================
@@ -406,150 +987,223 @@ pub struct TopicFilter {
 // =============================================================================
 
 /// CONNECT packet payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Connect {
-    pub protocol_name: String,
+    pub protocol_name: Bytes,
     pub protocol_version: ProtocolVersion,
     pub flags: ConnectFlags,
     pub keep_alive: u16,
-    pub client_id: String,
-    #[serde(default)]
+    pub client_id: Bytes,
     pub will: Option<WillMessage>,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
+    pub username: Option<Bytes>,
     pub password: Option<Bytes>,
-    /// MQTT 5.0 properties.
-    #[serde(default)]
-    pub properties: Properties,
+    pub properties_raw: Vec<u8>,
+}
+
+impl Connect {
+    /// Get a borrowed Properties view over the raw property bytes.
+    pub fn properties(&self) -> Properties<'_> {
+        Properties::from_raw(&self.properties_raw)
+    }
+
+    /// Client ID as a UTF-8 string slice (validated during decode).
+    #[inline]
+    pub fn client_id_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.client_id) }
+    }
+
+    /// Username as a UTF-8 string slice (validated during decode).
+    #[inline]
+    pub fn username_str(&self) -> Option<&str> {
+        self.username
+            .as_ref()
+            .map(|b| unsafe { std::str::from_utf8_unchecked(b) })
+    }
 }
 
 /// CONNACK packet payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Properties are individual typed fields — encode writes them directly
+/// into the output buffer with zero intermediate allocation.
+#[derive(Debug, Clone, Default)]
 pub struct ConnAck {
     pub session_present: bool,
     pub return_code: u8,
-    /// MQTT 5.0 properties.
-    #[serde(default)]
-    pub properties: Properties,
+    // V5 properties
+    pub session_expiry_interval: Option<u32>,
+    pub receive_maximum: Option<u16>,
+    pub maximum_qos: Option<u8>,
+    pub retain_available: Option<bool>,
+    pub maximum_packet_size: Option<u32>,
+    pub assigned_client_identifier: Option<Bytes>,
+    pub topic_alias_maximum: Option<u16>,
+    pub reason_string: Option<Bytes>,
+    pub response_information: Option<Bytes>,
+    pub wildcard_subscription_available: Option<bool>,
+    pub subscription_identifier_available: Option<bool>,
+    pub shared_subscription_available: Option<bool>,
+    pub server_keep_alive: Option<u16>,
+    pub authentication_method: Option<Bytes>,
+    pub authentication_data: Option<Bytes>,
+    pub server_reference: Option<Bytes>,
+}
+
+impl ConnAck {
+    /// Compute the wire size of the V5 properties section content.
+    pub fn properties_size(&self) -> usize {
+        let mut n = 0;
+        if self.session_expiry_interval.is_some() {
+            n += PROP_SIZE_U32;
+        }
+        if self.receive_maximum.is_some() {
+            n += PROP_SIZE_U16;
+        }
+        if self.maximum_qos.is_some() {
+            n += PROP_SIZE_U8;
+        }
+        if self.retain_available.is_some() {
+            n += PROP_SIZE_U8;
+        }
+        if self.maximum_packet_size.is_some() {
+            n += PROP_SIZE_U32;
+        }
+        if let Some(ref v) = self.assigned_client_identifier {
+            n += prop_size_str(v.len());
+        }
+        if self.topic_alias_maximum.is_some() {
+            n += PROP_SIZE_U16;
+        }
+        if let Some(ref v) = self.reason_string {
+            n += prop_size_str(v.len());
+        }
+        if let Some(ref v) = self.response_information {
+            n += prop_size_str(v.len());
+        }
+        if self.wildcard_subscription_available.is_some() {
+            n += PROP_SIZE_U8;
+        }
+        if self.subscription_identifier_available.is_some() {
+            n += PROP_SIZE_U8;
+        }
+        if self.shared_subscription_available.is_some() {
+            n += PROP_SIZE_U8;
+        }
+        if self.server_keep_alive.is_some() {
+            n += PROP_SIZE_U16;
+        }
+        if let Some(ref v) = self.authentication_method {
+            n += prop_size_str(v.len());
+        }
+        if let Some(ref v) = self.authentication_data {
+            n += prop_size_str(v.len());
+        }
+        if let Some(ref v) = self.server_reference {
+            n += prop_size_str(v.len());
+        }
+        n
+    }
 }
 
 /// PUBLISH packet payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Publish {
+///
+/// The `'a` lifetime borrows topic and payload from the network buffer.
+/// `handle_publish` consumes the Publish synchronously, so the borrow is valid.
+#[derive(Debug, Clone)]
+pub struct Publish<'a> {
     pub dup: bool,
     pub qos: QoS,
     pub retain: bool,
-    /// Topic name as raw bytes (validated UTF-8 on decode).
-    /// Using `Bytes` instead of `String` enables zero-copy from the read buffer.
-    pub topic: Bytes,
-    /// Packet identifier (present for QoS 1 and 2).
-    #[serde(default)]
+    pub topic: &'a [u8],
     pub packet_id: Option<u16>,
-    pub payload: Bytes,
-    /// MQTT 5.0 properties.
-    #[serde(default)]
-    pub properties: Properties,
+    pub payload: &'a [u8],
+    pub properties: Properties<'a>,
 }
 
 /// PUBACK packet (QoS 1 acknowledgment).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PubAck {
+#[derive(Debug, Clone)]
+pub struct PubAck<'a> {
     pub packet_id: u16,
-    /// MQTT 5.0 reason code.
-    #[serde(default)]
     pub reason_code: Option<u8>,
-    #[serde(default)]
-    pub properties: Properties,
+    pub reason_string: Option<&'a [u8]>,
 }
 
 /// PUBREC packet (QoS 2, step 1 response).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PubRec {
+#[derive(Debug, Clone)]
+pub struct PubRec<'a> {
     pub packet_id: u16,
-    #[serde(default)]
     pub reason_code: Option<u8>,
-    #[serde(default)]
-    pub properties: Properties,
+    pub reason_string: Option<&'a [u8]>,
 }
 
 /// PUBREL packet (QoS 2, step 2).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PubRel {
+#[derive(Debug, Clone)]
+pub struct PubRel<'a> {
     pub packet_id: u16,
-    #[serde(default)]
     pub reason_code: Option<u8>,
-    #[serde(default)]
-    pub properties: Properties,
+    pub reason_string: Option<&'a [u8]>,
 }
 
 /// PUBCOMP packet (QoS 2, step 3 response).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PubComp {
+#[derive(Debug, Clone)]
+pub struct PubComp<'a> {
     pub packet_id: u16,
-    #[serde(default)]
     pub reason_code: Option<u8>,
-    #[serde(default)]
-    pub properties: Properties,
+    pub reason_string: Option<&'a [u8]>,
 }
 
 /// SUBSCRIBE packet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Subscribe {
     pub packet_id: u16,
     pub filters: SmallVec<[TopicFilter; 4]>,
-    #[serde(default)]
-    pub properties: Properties,
+    /// Subscription Identifier from V5 properties (parsed eagerly).
+    pub subscription_identifier: Option<u32>,
 }
 
 /// SUBACK packet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SubAck {
     pub packet_id: u16,
-    /// Return codes / reason codes per subscription.
     pub return_codes: SmallVec<[u8; 8]>,
-    #[serde(default)]
-    pub properties: Properties,
+    pub reason_string: Option<Bytes>,
 }
 
 /// UNSUBSCRIBE packet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Unsubscribe {
     pub packet_id: u16,
-    pub filters: SmallVec<[String; 4]>,
-    #[serde(default)]
-    pub properties: Properties,
+    pub filters: SmallVec<[Bytes; 4]>,
 }
 
 /// UNSUBACK packet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct UnsubAck {
     pub packet_id: u16,
-    /// MQTT 5.0 reason codes per filter.
-    #[serde(default)]
     pub reason_codes: SmallVec<[u8; 8]>,
-    #[serde(default)]
-    pub properties: Properties,
+    pub reason_string: Option<Bytes>,
 }
 
 /// DISCONNECT packet (MQTT 5.0 adds reason code + properties).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Disconnect {
-    #[serde(default)]
     pub reason_code: Option<u8>,
-    #[serde(default)]
-    pub properties: Properties,
+    // Inbound V5 property (parsed eagerly during decode)
+    pub session_expiry_interval: Option<u32>,
+    // Outbound V5 properties (written directly during encode)
+    pub reason_string: Option<Bytes>,
+    pub server_reference: Option<Bytes>,
 }
 
 /// AUTH packet (MQTT 5.0 only — Enhanced Authentication).
 ///
 /// Used for multi-step SASL-like authentication flows (SCRAM, Kerberos, etc.).
 /// Reason codes: 0x00 (Success), 0x18 (Continue Authentication), 0x19 (Re-authenticate).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Auth {
     pub reason_code: u8,
-    #[serde(default)]
-    pub properties: Properties,
+    pub authentication_method: Option<Bytes>,
+    pub authentication_data: Option<Bytes>,
+    pub reason_string: Option<Bytes>,
 }
 
 impl Auth {
@@ -562,52 +1216,6 @@ impl Auth {
 }
 
 // =============================================================================
-// Top-Level Packet Enum
-// =============================================================================
-
-/// A decoded MQTT control packet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MqttPacket {
-    Connect(Connect),
-    ConnAck(ConnAck),
-    Publish(Publish),
-    PubAck(PubAck),
-    PubRec(PubRec),
-    PubRel(PubRel),
-    PubComp(PubComp),
-    Subscribe(Subscribe),
-    SubAck(SubAck),
-    Unsubscribe(Unsubscribe),
-    UnsubAck(UnsubAck),
-    PingReq,
-    PingResp,
-    Disconnect(Disconnect),
-    Auth(Auth),
-}
-
-impl MqttPacket {
-    /// Return the packet type discriminant.
-    pub fn packet_type(&self) -> PacketType {
-        match self {
-            Self::Connect(_) => PacketType::Connect,
-            Self::ConnAck(_) => PacketType::ConnAck,
-            Self::Publish(_) => PacketType::Publish,
-            Self::PubAck(_) => PacketType::PubAck,
-            Self::PubRec(_) => PacketType::PubRec,
-            Self::PubRel(_) => PacketType::PubRel,
-            Self::PubComp(_) => PacketType::PubComp,
-            Self::Subscribe(_) => PacketType::Subscribe,
-            Self::SubAck(_) => PacketType::SubAck,
-            Self::Unsubscribe(_) => PacketType::Unsubscribe,
-            Self::UnsubAck(_) => PacketType::UnsubAck,
-            Self::PingReq => PacketType::PingReq,
-            Self::PingResp => PacketType::PingResp,
-            Self::Disconnect(_) => PacketType::Disconnect,
-            Self::Auth(_) => PacketType::Auth,
-        }
-    }
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -682,55 +1290,60 @@ mod tests {
     }
 
     #[test]
-    fn test_mqtt_packet_type_method() {
-        let pkt = MqttPacket::PingReq;
-        assert_eq!(pkt.packet_type(), PacketType::PingReq);
-
-        let pkt = MqttPacket::Disconnect(Disconnect {
-            reason_code: None,
-            properties: Properties::default(),
-        });
-        assert_eq!(pkt.packet_type(), PacketType::Disconnect);
-    }
-
-    #[test]
     fn test_properties_default() {
         let props = Properties::default();
-        assert!(props.message_expiry_interval.is_none());
-        assert!(props.user_properties.is_empty());
-        assert!(props.topic_alias.is_none());
+        assert!(props.is_empty());
+        assert!(props.message_expiry_interval().is_none());
+        assert!(props.topic_alias().is_none());
+        assert_eq!(props.user_properties().count(), 0);
     }
 
     #[test]
-    fn test_will_message_serde() {
-        let will = WillMessage {
-            topic: "last/will".to_string(),
-            payload: Bytes::from_static(b"goodbye"),
-            qos: QoS::AtLeastOnce,
-            retain: true,
-            properties: Properties::default(),
-        };
-        let json = serde_json::to_string(&will).unwrap();
-        let decoded: WillMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.topic, "last/will");
-        assert_eq!(decoded.qos, QoS::AtLeastOnce);
-        assert!(decoded.retain);
+    fn test_properties_scan_accessors() {
+        // Build raw property bytes manually (wire format)
+        let mut raw = Vec::new();
+        // message_expiry_interval (0x02) = 300
+        raw.push(0x02);
+        raw.extend_from_slice(&300u32.to_be_bytes());
+        // payload_format_indicator (0x01) = 1
+        raw.push(0x01);
+        raw.push(1);
+        // topic_alias (0x23) = 42
+        raw.push(0x23);
+        raw.extend_from_slice(&42u16.to_be_bytes());
+
+        let props = Properties::from_raw(&raw);
+        assert!(!props.is_empty());
+        assert_eq!(props.message_expiry_interval(), Some(300));
+        assert_eq!(props.payload_format_indicator(), Some(1));
+        assert_eq!(props.topic_alias(), Some(42));
+        assert!(props.session_expiry_interval().is_none());
     }
 
     #[test]
-    fn test_topic_filter_serde() {
-        let filter = TopicFilter {
-            filter: "sensor/+/data".to_string(),
-            qos: QoS::ExactlyOnce,
-            no_local: true,
-            retain_as_published: false,
-            retain_handling: 1,
+    fn test_connack_properties_size() {
+        let connack = ConnAck {
+            session_present: false,
+            return_code: 0,
+            receive_maximum: Some(100),
+            maximum_qos: Some(1),
+            topic_alias_maximum: Some(50),
+            ..Default::default()
         };
-        let json = serde_json::to_string(&filter).unwrap();
-        let decoded: TopicFilter = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.filter, "sensor/+/data");
-        assert_eq!(decoded.qos, QoS::ExactlyOnce);
-        assert!(decoded.no_local);
+        // receive_maximum: 3 + maximum_qos: 2 + topic_alias_maximum: 3 = 8
+        assert_eq!(connack.properties_size(), 8);
+    }
+
+    #[test]
+    fn test_prop_size_constants() {
+        assert_eq!(PROP_SIZE_U8, 2);
+        assert_eq!(PROP_SIZE_U16, 3);
+        assert_eq!(PROP_SIZE_U32, 5);
+        assert_eq!(prop_size_str(5), 8); // id + 2-byte len + 5 data
+        assert_eq!(varint_size(0), 1);
+        assert_eq!(varint_size(127), 1);
+        assert_eq!(varint_size(128), 2);
+        assert_eq!(varint_size(16384), 3);
     }
 
     // ---- Will flags validation (M15) ----
@@ -839,110 +1452,6 @@ mod tests {
         assert_eq!(ReasonCode::DISCONNECT_WITH_WILL.0, 0x04);
         assert_eq!(ReasonCode::CONNECTION_RATE_EXCEEDED.0, 0x9F);
         assert_eq!(ReasonCode::MAXIMUM_CONNECT_TIME.0, 0xA0);
-    }
-
-    #[test]
-    fn test_mqtt_packet_type_all_variants() {
-        use super::*;
-        let packets: Vec<MqttPacket> = vec![
-            MqttPacket::Connect(Connect {
-                protocol_name: "MQTT".into(),
-                protocol_version: ProtocolVersion::V311,
-                flags: ConnectFlags::from_byte(0x02).unwrap(),
-                keep_alive: 60,
-                client_id: "c".into(),
-                will: None,
-                username: None,
-                password: None,
-                properties: Properties::default(),
-            }),
-            MqttPacket::ConnAck(ConnAck {
-                session_present: false,
-                return_code: 0,
-                properties: Properties::default(),
-            }),
-            MqttPacket::Publish(Publish {
-                dup: false,
-                qos: QoS::AtMostOnce,
-                retain: false,
-                topic: Bytes::new(),
-                packet_id: None,
-                payload: Bytes::new(),
-                properties: Properties::default(),
-            }),
-            MqttPacket::PubAck(PubAck {
-                packet_id: 1,
-                reason_code: None,
-                properties: Properties::default(),
-            }),
-            MqttPacket::PubRec(PubRec {
-                packet_id: 1,
-                reason_code: None,
-                properties: Properties::default(),
-            }),
-            MqttPacket::PubRel(PubRel {
-                packet_id: 1,
-                reason_code: None,
-                properties: Properties::default(),
-            }),
-            MqttPacket::PubComp(PubComp {
-                packet_id: 1,
-                reason_code: None,
-                properties: Properties::default(),
-            }),
-            MqttPacket::Subscribe(Subscribe {
-                packet_id: 1,
-                filters: SmallVec::new(),
-                properties: Properties::default(),
-            }),
-            MqttPacket::SubAck(SubAck {
-                packet_id: 1,
-                return_codes: SmallVec::new(),
-                properties: Properties::default(),
-            }),
-            MqttPacket::Unsubscribe(Unsubscribe {
-                packet_id: 1,
-                filters: SmallVec::new(),
-                properties: Properties::default(),
-            }),
-            MqttPacket::UnsubAck(UnsubAck {
-                packet_id: 1,
-                reason_codes: SmallVec::new(),
-                properties: Properties::default(),
-            }),
-            MqttPacket::PingReq,
-            MqttPacket::PingResp,
-            MqttPacket::Disconnect(Disconnect {
-                reason_code: None,
-                properties: Properties::default(),
-            }),
-            MqttPacket::Auth(Auth {
-                reason_code: 0,
-                properties: Properties::default(),
-            }),
-        ];
-
-        let expected_types = vec![
-            PacketType::Connect,
-            PacketType::ConnAck,
-            PacketType::Publish,
-            PacketType::PubAck,
-            PacketType::PubRec,
-            PacketType::PubRel,
-            PacketType::PubComp,
-            PacketType::Subscribe,
-            PacketType::SubAck,
-            PacketType::Unsubscribe,
-            PacketType::UnsubAck,
-            PacketType::PingReq,
-            PacketType::PingResp,
-            PacketType::Disconnect,
-            PacketType::Auth,
-        ];
-
-        for (pkt, expected) in packets.iter().zip(expected_types.iter()) {
-            assert_eq!(pkt.packet_type(), *expected);
-        }
     }
 
     #[test]

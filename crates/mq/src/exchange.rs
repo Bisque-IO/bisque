@@ -180,12 +180,21 @@ impl ExchangeState {
                 }
             }
             ExchangeType::Topic => {
-                // Deliver to topics whose binding pattern matches the routing key
+                // Deliver to topics whose binding pattern matches the routing key.
                 let key = routing_key.unwrap_or("");
+                // MQTT §4.7.2: topics starting with '$' must not match subscriptions
+                // whose filter begins with a wildcard (+, #, *).
+                let is_dollar_topic = key.as_bytes().first() == Some(&b'$');
                 bindings
                     .values()
                     .filter(|b| {
                         let pattern = b.routing_key.as_deref().unwrap_or("");
+                        if is_dollar_topic {
+                            let first = pattern.as_bytes().first().copied().unwrap_or(0);
+                            if first == b'+' || first == b'#' || first == b'*' {
+                                return false;
+                            }
+                        }
                         topic_pattern_matches(pattern, key)
                     })
                     .map(|b| b.target_topic_id)
@@ -427,5 +436,54 @@ mod tests {
         assert_eq!(ex.route(Some("key")).as_slice(), &[10]);
         ex.remove_binding(1);
         assert!(ex.route(Some("key")).is_empty());
+    }
+
+    #[test]
+    fn test_dollar_topic_filtering() {
+        // MQTT §4.7.2: $-topics must not match wildcard-starting filters.
+        let meta = ExchangeMeta::new(1, "topic".to_string(), 100, ExchangeType::Topic);
+        let mut ex = ExchangeState::new(meta);
+        // Wildcard subscription: +/info
+        ex.add_binding(Binding {
+            binding_id: 1,
+            exchange_id: 1,
+            target_topic_id: 10,
+            routing_key: Some("+/info".to_string()),
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
+        });
+        // Wildcard subscription: #
+        ex.add_binding(Binding {
+            binding_id: 2,
+            exchange_id: 1,
+            target_topic_id: 20,
+            routing_key: Some("#".to_string()),
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
+        });
+        // Explicit $SYS subscription: $SYS/#
+        ex.add_binding(Binding {
+            binding_id: 3,
+            exchange_id: 1,
+            target_topic_id: 30,
+            routing_key: Some("$SYS/#".to_string()),
+            no_local: false,
+            shared_group: None,
+            subscription_id: None,
+        });
+
+        // Normal topic: matches +/info and #
+        let targets = ex.route(Some("sensor/info"));
+        assert!(targets.contains(&10));
+        assert!(targets.contains(&20));
+        assert!(!targets.contains(&30));
+
+        // $SYS topic: must NOT match +/info or #, but MUST match $SYS/#
+        let targets = ex.route(Some("$SYS/info"));
+        assert!(!targets.contains(&10), "$-topic must not match +/info");
+        assert!(!targets.contains(&20), "$-topic must not match #");
+        assert!(targets.contains(&30), "$-topic must match $SYS/#");
     }
 }

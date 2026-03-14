@@ -343,8 +343,23 @@ impl AckVariantState {
             let message_id = log_index + i as u64;
 
             // Parse header once — extract all fields from single read
-            let meta_parsed = crate::flat::FlatMessageMeta::parse(msg);
-            let value_len = crate::flat::FlatMessageMeta::value_len(msg).unwrap_or(0);
+            let is_envelope = crate::flat::is_mqtt_envelope(msg);
+            let envelope_meta = if is_envelope {
+                crate::flat::MqttEnvelopeMeta::parse(msg)
+            } else {
+                None
+            };
+            let flat_meta = if !is_envelope {
+                crate::flat::FlatMessageMeta::parse(msg)
+            } else {
+                None
+            };
+
+            let value_len = if is_envelope {
+                crate::flat::MqttEnvelopeMeta::value_len(msg).unwrap_or(0)
+            } else {
+                crate::flat::FlatMessageMeta::value_len(msg).unwrap_or(0)
+            };
             total_bytes_acc += value_len as u64;
 
             // Delayed messages go to compact delay index
@@ -356,27 +371,50 @@ impl AckVariantState {
                 continue;
             }
 
-            // Extract fields from the single parsed header
-            let (priority, ttl_ms, has_reply_to, has_corr) = match meta_parsed {
-                Some(ref m) => (
-                    m.priority,
-                    m.ttl_ms_opt().unwrap_or(0),
-                    m.has_reply_to(),
-                    m.has_correlation_id(),
-                ),
-                None => (0, 0, false, false),
-            };
-
-            let reply_to = if has_reply_to {
-                crate::flat::FlatMessage::new(msg.clone()).and_then(|f| f.reply_to())
-            } else {
-                None
-            };
-            let correlation_id = if has_corr {
-                crate::flat::FlatMessage::new(msg.clone()).and_then(|f| f.correlation_id())
-            } else {
-                None
-            };
+            // Extract fields from the parsed header
+            let (priority, ttl_ms, publisher_id, reply_to, correlation_id) =
+                if let Some(ref em) = envelope_meta {
+                    let env = crate::flat::MqttEnvelope::new(msg);
+                    let reply = env
+                        .as_ref()
+                        .and_then(|e| e.reply_to())
+                        .map(Bytes::copy_from_slice);
+                    let corr = env
+                        .as_ref()
+                        .and_then(|e| e.correlation_id())
+                        .map(Bytes::copy_from_slice);
+                    let ttl = if em.flags & (1 << 2) != 0 {
+                        em.ttl_ms
+                    } else {
+                        0
+                    };
+                    (0u8, ttl, em.publisher_id, reply, corr)
+                } else if let Some(ref m) = flat_meta {
+                    let flat = crate::flat::FlatMessage::new(msg);
+                    let reply = if m.has_reply_to() {
+                        flat.as_ref()
+                            .and_then(|f| f.reply_to())
+                            .map(Bytes::copy_from_slice)
+                    } else {
+                        None
+                    };
+                    let corr = if m.has_correlation_id() {
+                        flat.as_ref()
+                            .and_then(|f| f.correlation_id())
+                            .map(Bytes::copy_from_slice)
+                    } else {
+                        None
+                    };
+                    (
+                        m.priority,
+                        m.ttl_ms_opt().unwrap_or(0),
+                        m.publisher_id,
+                        reply,
+                        corr,
+                    )
+                } else {
+                    (0, 0, 0, None, None)
+                };
 
             let expires_at = if ttl_ms > 0 {
                 Some(current_time + ttl_ms)
@@ -401,6 +439,7 @@ impl AckVariantState {
                 reply_to,
                 correlation_id,
                 value_len,
+                publisher_id,
             };
 
             self.messages.pin().insert(message_id, ack_meta);
@@ -850,13 +889,22 @@ impl AckVariantState {
             let meta = crate::flat::FlatMessageMeta::parse(msg);
             let has_reply_to = meta.as_ref().map_or(false, |m| m.has_reply_to());
             let has_corr = meta.as_ref().map_or(false, |m| m.has_correlation_id());
+            let flat = if has_reply_to || has_corr {
+                crate::flat::FlatMessage::new(msg)
+            } else {
+                None
+            };
             let rt = if has_reply_to {
-                crate::flat::FlatMessage::new(msg.clone()).and_then(|f| f.reply_to())
+                flat.as_ref()
+                    .and_then(|f| f.reply_to())
+                    .map(Bytes::copy_from_slice)
             } else {
                 None
             };
             let ci = if has_corr {
-                crate::flat::FlatMessage::new(msg.clone()).and_then(|f| f.correlation_id())
+                flat.as_ref()
+                    .and_then(|f| f.correlation_id())
+                    .map(Bytes::copy_from_slice)
             } else {
                 None
             };
@@ -870,6 +918,7 @@ impl AckVariantState {
             None
         };
 
+        let publisher_id = crate::flat::FlatMessageMeta::parse(msg).map_or(0, |m| m.publisher_id);
         let meta = AckMessageMeta {
             message_id,
             group_id,
@@ -885,6 +934,7 @@ impl AckVariantState {
             reply_to,
             correlation_id,
             value_len,
+            publisher_id,
         };
 
         self.messages.pin().insert(message_id, meta);
@@ -1967,7 +2017,7 @@ mod tests {
         let ack = group.ack_state().unwrap();
 
         // Enqueue
-        let msg = crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"hello"))
+        let msg = crate::flat::FlatMessageBuilder::new(b"hello")
             .timestamp(1000)
             .build();
         let count = ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
@@ -1991,7 +2041,7 @@ mod tests {
         let config = AckVariantConfig::default();
         let ack = group.ack_state().unwrap();
 
-        let msg = crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"data"))
+        let msg = crate::flat::FlatMessageBuilder::new(b"data")
             .timestamp(1000)
             .build();
         ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
@@ -2007,7 +2057,7 @@ mod tests {
         let config = AckVariantConfig::default();
         let ack = group.ack_state().unwrap();
 
-        let msg = crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"data"))
+        let msg = crate::flat::FlatMessageBuilder::new(b"data")
             .timestamp(1000)
             .build();
         ack.apply_enqueue(&config, 1, 100, &[msg], &[None], 1000);
@@ -2129,20 +2179,20 @@ mod tests {
     }
 
     fn build_msg(payload: &[u8]) -> Bytes {
-        crate::flat::FlatMessageBuilder::new(Bytes::from(payload.to_vec()))
+        crate::flat::FlatMessageBuilder::new(payload)
             .timestamp(1000)
             .build()
     }
 
     fn build_msg_with_priority(payload: &[u8], prio: u8) -> Bytes {
-        crate::flat::FlatMessageBuilder::new(Bytes::from(payload.to_vec()))
+        crate::flat::FlatMessageBuilder::new(payload)
             .timestamp(1000)
             .priority(prio)
             .build()
     }
 
     fn build_msg_with_ttl(payload: &[u8], ttl: u64) -> Bytes {
-        crate::flat::FlatMessageBuilder::new(Bytes::from(payload.to_vec()))
+        crate::flat::FlatMessageBuilder::new(payload)
             .timestamp(1000)
             .ttl_ms(ttl)
             .build()

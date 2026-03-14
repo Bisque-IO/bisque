@@ -27,15 +27,13 @@ fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-mqtt-opt-test"))
 }
 
-fn make_flat_msg(value: &[u8]) -> Bytes {
-    FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-        .timestamp(1000)
-        .build()
+fn make_flat_msg(value: &[u8]) -> bytes::Bytes {
+    FlatMessageBuilder::new(value).timestamp(1000).build()
 }
 
-fn make_flat_msg_with_routing_key(value: &[u8], routing_key: &str) -> Bytes {
-    FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-        .routing_key(Bytes::from(routing_key.to_owned()))
+fn make_flat_msg_with_routing_key(value: &[u8], routing_key: &str) -> bytes::Bytes {
+    FlatMessageBuilder::new(value)
+        .routing_key(routing_key.as_bytes())
         .timestamp(1000)
         .build()
 }
@@ -148,18 +146,16 @@ fn deliver_messages(
 
 #[test]
 fn test_opt5_flag_retain_roundtrip() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
+    let msg = FlatMessageBuilder::new(b"hello")
         .timestamp(1000)
         .retain(true)
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
     assert!(flat.is_retain(), "retain flag should be set");
 
     // Without retain
-    let msg2 = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
-        .timestamp(1000)
-        .build();
-    let flat2 = FlatMessage::new(msg2).unwrap();
+    let msg2 = FlatMessageBuilder::new(b"hello").timestamp(1000).build();
+    let flat2 = FlatMessage::new(&msg2).unwrap();
     assert!(
         !flat2.is_retain(),
         "retain flag should not be set by default"
@@ -168,17 +164,15 @@ fn test_opt5_flag_retain_roundtrip() {
 
 #[test]
 fn test_opt5_flag_no_local_roundtrip() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
+    let msg = FlatMessageBuilder::new(b"hello")
         .timestamp(1000)
         .no_local(true)
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
     assert!(flat.is_no_local(), "no_local flag should be set");
 
-    let msg2 = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
-        .timestamp(1000)
-        .build();
-    let flat2 = FlatMessage::new(msg2).unwrap();
+    let msg2 = FlatMessageBuilder::new(b"hello").timestamp(1000).build();
+    let flat2 = FlatMessage::new(&msg2).unwrap();
     assert!(
         !flat2.is_no_local(),
         "no_local flag should not be set by default"
@@ -187,17 +181,15 @@ fn test_opt5_flag_no_local_roundtrip() {
 
 #[test]
 fn test_opt5_flag_utf8_payload_roundtrip() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
+    let msg = FlatMessageBuilder::new(b"hello")
         .timestamp(1000)
         .utf8_payload(true)
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
     assert!(flat.is_utf8_payload(), "utf8_payload flag should be set");
 
-    let msg2 = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
-        .timestamp(1000)
-        .build();
-    let flat2 = FlatMessage::new(msg2).unwrap();
+    let msg2 = FlatMessageBuilder::new(b"hello").timestamp(1000).build();
+    let flat2 = FlatMessage::new(&msg2).unwrap();
     assert!(
         !flat2.is_utf8_payload(),
         "utf8_payload flag should not be set by default"
@@ -206,13 +198,13 @@ fn test_opt5_flag_utf8_payload_roundtrip() {
 
 #[test]
 fn test_opt5_all_new_flags_combined() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"data"))
+    let msg = FlatMessageBuilder::new(b"data")
         .timestamp(2000)
         .retain(true)
         .no_local(true)
         .utf8_payload(true)
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
     assert!(flat.is_retain());
     assert!(flat.is_no_local());
     assert!(flat.is_utf8_payload());
@@ -220,17 +212,17 @@ fn test_opt5_all_new_flags_combined() {
 
 #[test]
 fn test_opt5_new_flags_dont_affect_existing_fields() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"value-data"))
+    let msg = FlatMessageBuilder::new(b"value-data")
         .timestamp(5000)
-        .key(Bytes::from_static(b"my-key"))
-        .routing_key(Bytes::from_static(b"sensors/temp"))
+        .key(b"my-key")
+        .routing_key(b"sensors/temp")
         .ttl(30000)
         .delay(1000)
         .retain(true)
         .no_local(true)
-        .header(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))
+        .header(b"h1", b"v1")
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
 
     // Verify existing fields are unaffected
     assert_eq!(&flat.value()[..], b"value-data");
@@ -252,10 +244,10 @@ fn test_opt5_new_flags_dont_affect_existing_fields() {
 #[test]
 fn test_opt5_flags_backward_compat() {
     // A message built without new flags should have all new checks return false
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"old-message"))
+    let msg = FlatMessageBuilder::new(b"old-message")
         .timestamp(1000)
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
     assert!(!flat.is_retain());
     assert!(!flat.is_no_local());
     assert!(!flat.is_utf8_payload());
@@ -267,52 +259,47 @@ fn test_opt5_flags_backward_compat() {
 
 #[test]
 fn test_opt8_publisher_id_roundtrip() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
+    let msg = FlatMessageBuilder::new(b"hello")
         .timestamp(1000)
         .publisher_id(12345)
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
     assert_eq!(flat.publisher_id(), 12345);
 }
 
 #[test]
 fn test_opt8_publisher_id_zero_default() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
-        .timestamp(1000)
-        .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let msg = FlatMessageBuilder::new(b"hello").timestamp(1000).build();
+    let flat = FlatMessage::new(&msg).unwrap();
     assert_eq!(flat.publisher_id(), 0);
 }
 
 #[test]
 fn test_opt8_publisher_id_large_value() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
+    let msg = FlatMessageBuilder::new(b"hello")
         .timestamp(1000)
         .publisher_id(u64::MAX)
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
     assert_eq!(flat.publisher_id(), u64::MAX);
 }
 
 #[test]
 fn test_opt8_publisher_id_with_all_fields() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"payload"))
+    let msg = FlatMessageBuilder::new(b"payload")
         .timestamp(9999)
-        .key(Bytes::from_static(b"key"))
-        .routing_key(Bytes::from_static(b"a/b/c"))
-        .reply_to(Bytes::from_static(b"reply-topic"))
-        .correlation_id(Bytes::from_static(b"corr-123"))
+        .key(b"key")
+        .routing_key(b"a/b/c")
+        .reply_to(b"reply-topic")
+        .correlation_id(b"corr-123")
         .ttl(60000)
         .delay(5000)
         .publisher_id(42)
         .retain(true)
-        .header(
-            Bytes::from_static(b"hdr-key"),
-            Bytes::from_static(b"hdr-val"),
-        )
-        .header(Bytes::from_static(b"hdr2"), Bytes::from_static(b"val2"))
+        .header(b"hdr-key", b"hdr-val")
+        .header(b"hdr2", b"val2")
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
 
     // All fields should work correctly with 40-byte header
     assert_eq!(&flat.value()[..], b"payload");
@@ -336,17 +323,14 @@ fn test_opt8_publisher_id_with_all_fields() {
 
 #[test]
 fn test_opt8_combined_retain_publisher_full_message() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"sensor-reading"))
+    let msg = FlatMessageBuilder::new(b"sensor-reading")
         .timestamp(1000)
-        .routing_key(Bytes::from_static(b"sensors/temp/room1"))
+        .routing_key(b"sensors/temp/room1")
         .retain(true)
         .publisher_id(999)
-        .header(
-            Bytes::from_static(b"content-type"),
-            Bytes::from_static(b"application/json"),
-        )
+        .header(b"content-type", b"application/json")
         .build();
-    let flat = FlatMessage::new(msg).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
 
     assert!(flat.is_retain());
     assert_eq!(flat.publisher_id(), 999);
@@ -357,11 +341,11 @@ fn test_opt8_combined_retain_publisher_full_message() {
 
 #[test]
 fn test_opt8_zero_copy_preserved() {
-    let msg = FlatMessageBuilder::new(Bytes::from_static(b"zero-copy-test"))
+    let msg = FlatMessageBuilder::new(b"zero-copy-test")
         .timestamp(1000)
         .publisher_id(1)
         .build();
-    let flat = FlatMessage::new(msg.clone()).unwrap();
+    let flat = FlatMessage::new(&msg).unwrap();
     let value = flat.value();
     // Bytes should be a zero-copy slice -- no allocation
     assert_eq!(&value[..], b"zero-copy-test");

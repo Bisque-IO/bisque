@@ -1439,9 +1439,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     fn make_msg(value: &[u8]) -> bytes::Bytes {
-        FlatMessageBuilder::new(bytes::Bytes::from(value.to_vec()))
-            .timestamp(1000)
-            .build()
+        FlatMessageBuilder::new(value).timestamp(1000).build()
     }
 
     #[test]

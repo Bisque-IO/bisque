@@ -10,6 +10,7 @@
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use smallvec::SmallVec;
 
 use crate::types::QoS;
 
@@ -28,9 +29,9 @@ pub struct PersistedSession {
     /// Subscriptions (filter -> persisted mapping info).
     pub subscriptions: Vec<PersistedSubscription>,
     /// QoS 1 outbound inflight packet IDs that need re-delivery.
-    pub pending_qos1: Vec<u16>,
+    pub pending_qos1: SmallVec<[u16; 16]>,
     /// QoS 2 outbound inflight packet IDs that need completion.
-    pub pending_qos2: Vec<u16>,
+    pub pending_qos2: SmallVec<[u16; 16]>,
     /// Session expiry interval in seconds (from CONNECT properties).
     pub session_expiry_interval: u32,
     /// When the session was disconnected (for expiry calculation).
@@ -242,8 +243,8 @@ mod tests {
                 retain_handling: 0,
                 shared_group: None,
             }],
-            pending_qos1: vec![1, 2],
-            pending_qos2: vec![3],
+            pending_qos1: smallvec::smallvec![1, 2],
+            pending_qos2: smallvec::smallvec![3],
             session_expiry_interval: expiry,
             disconnected_at: None,
             inbound_qos_inflight: 0,
@@ -261,7 +262,7 @@ mod tests {
         let s = loaded.unwrap();
         assert_eq!(s.client_id, "client-1");
         assert_eq!(s.subscriptions.len(), 1);
-        assert_eq!(s.pending_qos1, vec![1, 2]);
+        assert_eq!(s.pending_qos1.as_slice(), &[1u16, 2]);
     }
 
     #[test]
@@ -343,13 +344,13 @@ mod tests {
 
         // Overwrite with updated session.
         let mut updated = make_session("client-1", 7200);
-        updated.pending_qos1 = vec![10, 20, 30];
+        updated.pending_qos1 = smallvec::smallvec![10, 20, 30];
         store.save(updated);
         assert_eq!(store.count(), 1);
 
         let loaded = store.load("client-1").unwrap();
         assert_eq!(loaded.session_expiry_interval, 7200);
-        assert_eq!(loaded.pending_qos1, vec![10, 20, 30]);
+        assert_eq!(loaded.pending_qos1.as_slice(), &[10u16, 20, 30]);
     }
 
     #[test]
@@ -514,8 +515,8 @@ mod tests {
                     shared_group: Some("monitors".to_string()),
                 },
             ],
-            pending_qos1: vec![1, 5, 10],
-            pending_qos2: vec![2, 7],
+            pending_qos1: smallvec::smallvec![1, 5, 10],
+            pending_qos2: smallvec::smallvec![2, 7],
             session_expiry_interval: 0xFFFFFFFF,
             disconnected_at: Some(Instant::now()),
             inbound_qos_inflight: 3,
@@ -535,8 +536,8 @@ mod tests {
             Some("monitors")
         );
         assert!(loaded.subscriptions[1].retain_as_published);
-        assert_eq!(loaded.pending_qos1, vec![1, 5, 10]);
-        assert_eq!(loaded.pending_qos2, vec![2, 7]);
+        assert_eq!(loaded.pending_qos1.as_slice(), &[1u16, 5, 10]);
+        assert_eq!(loaded.pending_qos2.as_slice(), &[2u16, 7]);
     }
 
     #[test]

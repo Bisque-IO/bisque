@@ -5110,13 +5110,11 @@ mod tests {
 
         let (handler, _, _) = make_test_handler();
 
-        let msg1 = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
+        let msg1 = FlatMessageBuilder::new(b"hello")
             .timestamp(1000)
-            .key(Bytes::from_static(b"k1"))
+            .key(b"k1")
             .build();
-        let msg2 = FlatMessageBuilder::new(Bytes::from_static(b"world"))
-            .timestamp(1005)
-            .build();
+        let msg2 = FlatMessageBuilder::new(b"world").timestamp(1005).build();
 
         let flat_msgs = vec![(0u64, msg1), (1, msg2)];
         let result = handler.build_record_batch_from_flat(&flat_msgs, 0);

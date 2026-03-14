@@ -1131,9 +1131,9 @@ pub fn encode_record_batch_from_flat(
 
     // Parse first and last message metadata for batch header fields
     let first_flat =
-        bisque_mq::flat::FlatMessage::new(messages[0].1.clone()).expect("invalid FlatMessage");
+        bisque_mq::flat::FlatMessage::new(&messages[0].1).expect("invalid FlatMessage");
     let last_flat = if messages.len() > 1 {
-        bisque_mq::flat::FlatMessage::new(messages[messages.len() - 1].1.clone())
+        bisque_mq::flat::FlatMessage::new(&messages[messages.len() - 1].1)
     } else {
         None
     };
@@ -1176,8 +1176,7 @@ pub fn encode_record_batch_from_flat(
 
     // -- Encode records directly from FlatMessage bytes --
     for (i, (_offset, flat_bytes)) in messages.iter().enumerate() {
-        let flat =
-            bisque_mq::flat::FlatMessage::new(flat_bytes.clone()).expect("invalid FlatMessage");
+        let flat = bisque_mq::flat::FlatMessage::new(flat_bytes).expect("invalid FlatMessage");
         let timestamp_delta = flat.timestamp() as i64 - first_ts;
         encode_record_from_flat(buf, timestamp_delta, i as i32, &flat);
     }
@@ -1318,14 +1317,14 @@ pub fn batch_records_to_flat_messages(batch: &RecordBatch) -> Vec<Bytes> {
         } else {
             now_ms
         };
-        let mut builder =
-            bisque_mq::flat::FlatMessageBuilder::new(r.value.clone().unwrap_or_default())
-                .timestamp(timestamp);
+        let default_value = Bytes::new();
+        let value_ref = r.value.as_ref().unwrap_or(&default_value);
+        let mut builder = bisque_mq::flat::FlatMessageBuilder::new(value_ref).timestamp(timestamp);
         if let Some(ref key) = r.key {
-            builder = builder.key(key.clone());
+            builder = builder.key(key);
         }
         for h in &r.headers {
-            builder = builder.header(h.key.clone(), h.value.clone());
+            builder = builder.header(&h.key, &h.value);
         }
         messages.push(builder.build());
     }
@@ -5026,9 +5025,9 @@ mod tests {
     fn test_encode_record_batch_from_flat_single_message() {
         use bisque_mq::flat::{FlatMessage, FlatMessageBuilder};
 
-        let flat_msg = FlatMessageBuilder::new(Bytes::from_static(b"hello world"))
+        let flat_msg = FlatMessageBuilder::new(b"hello world")
             .timestamp(1000)
-            .key(Bytes::from_static(b"key1"))
+            .key(b"key1")
             .build();
 
         let messages = vec![(0u64, flat_msg)];
@@ -5053,17 +5052,15 @@ mod tests {
     fn test_encode_record_batch_from_flat_multiple_messages() {
         use bisque_mq::flat::FlatMessageBuilder;
 
-        let msg1 = FlatMessageBuilder::new(Bytes::from_static(b"value1"))
+        let msg1 = FlatMessageBuilder::new(b"value1")
             .timestamp(1000)
-            .key(Bytes::from_static(b"k1"))
+            .key(b"k1")
             .build();
-        let msg2 = FlatMessageBuilder::new(Bytes::from_static(b"value2"))
-            .timestamp(1005)
-            .build();
-        let msg3 = FlatMessageBuilder::new(Bytes::from_static(b"value3"))
+        let msg2 = FlatMessageBuilder::new(b"value2").timestamp(1005).build();
+        let msg3 = FlatMessageBuilder::new(b"value3")
             .timestamp(1010)
-            .key(Bytes::from_static(b"k3"))
-            .header("content-type", &b"text/plain"[..])
+            .key(b"k3")
+            .header(b"content-type", b"text/plain")
             .build();
 
         let messages = vec![(10u64, msg1), (11, msg2), (12, msg3)];
@@ -5114,11 +5111,11 @@ mod tests {
     fn test_encode_record_batch_from_flat_with_multiple_headers() {
         use bisque_mq::flat::FlatMessageBuilder;
 
-        let msg = FlatMessageBuilder::new(Bytes::from_static(b"payload"))
+        let msg = FlatMessageBuilder::new(b"payload")
             .timestamp(5000)
-            .header("h1", &b"v1"[..])
-            .header("h2", &b"v2"[..])
-            .header("h3", &b"v3"[..])
+            .header(b"h1", b"v1")
+            .header(b"h2", b"v2")
+            .header(b"h3", b"v3")
             .build();
 
         let messages = vec![(0u64, msg)];
@@ -5231,13 +5228,13 @@ mod tests {
         let flat_msgs = batch_records_to_flat_messages(&batch);
         assert_eq!(flat_msgs.len(), 2);
 
-        let m1 = FlatMessage::new(flat_msgs[0].clone()).unwrap();
+        let m1 = FlatMessage::new(&flat_msgs[0]).unwrap();
         assert_eq!(m1.value(), Bytes::from_static(b"val1"));
         assert_eq!(m1.key().as_deref(), Some(b"key1".as_ref()));
         assert_eq!(m1.timestamp(), 1000);
         assert_eq!(m1.header_count(), 0);
 
-        let m2 = FlatMessage::new(flat_msgs[1].clone()).unwrap();
+        let m2 = FlatMessage::new(&flat_msgs[1]).unwrap();
         assert_eq!(m2.value(), Bytes::from_static(b"val2"));
         assert_eq!(m2.key(), None);
         assert_eq!(m2.timestamp(), 1001);
@@ -5271,7 +5268,7 @@ mod tests {
         };
 
         let flat_msgs = batch_records_to_flat_messages(&batch);
-        let m = FlatMessage::new(flat_msgs[0].clone()).unwrap();
+        let m = FlatMessage::new(&flat_msgs[0]).unwrap();
         assert!(m.value().is_empty());
     }
 
@@ -5386,13 +5383,13 @@ mod tests {
 
         // Create messages with various field combinations
         let msgs = vec![
-            FlatMessageBuilder::new(Bytes::from_static(b"v1"))
+            FlatMessageBuilder::new(b"v1")
                 .timestamp(1000)
-                .key(Bytes::from_static(b"k1"))
+                .key(b"k1")
                 .build(),
-            FlatMessageBuilder::new(Bytes::from_static(b"v2"))
+            FlatMessageBuilder::new(b"v2")
                 .timestamp(1005)
-                .header("h1", &b"hv1"[..])
+                .header(b"h1", b"hv1")
                 .build(),
         ];
 
@@ -5401,13 +5398,21 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, flat_bytes)| {
-                let flat = bisque_mq::flat::FlatMessage::new(flat_bytes.clone()).unwrap();
+                let flat = bisque_mq::flat::FlatMessage::new(&flat_bytes).unwrap();
                 super::super::handler::FetchedMessage {
                     offset: i as u64,
                     timestamp: flat.timestamp(),
-                    key: flat.key(),
-                    value: flat.value(),
-                    headers: flat.headers().collect(),
+                    key: flat.key().map(bytes::Bytes::copy_from_slice),
+                    value: bytes::Bytes::copy_from_slice(flat.value()),
+                    headers: flat
+                        .headers()
+                        .map(|(k, v)| {
+                            (
+                                bytes::Bytes::copy_from_slice(k),
+                                bytes::Bytes::copy_from_slice(v),
+                            )
+                        })
+                        .collect(),
                 }
             })
             .collect();

@@ -9,7 +9,6 @@ use base64::Engine as _;
 use bisque_mq::flat::FlatMessageBuilder;
 use bisque_mq::types::{DeliveredMessage, EntityStats, MqCommand, MqError, MqResponse, name_hash};
 use bisque_mq::write_batcher::MqWriteBatcher;
-use bytes::Bytes;
 
 /// Shared state for the SQS handler.
 pub struct SqsState {
@@ -175,19 +174,18 @@ impl SqsState {
 
         // Compute MD5 from borrowed bytes, then take ownership — zero-copy.
         let md5 = Self::md5_hex(req.message_body.as_bytes());
-        let value = Bytes::from(req.message_body.into_bytes());
+        let value = req.message_body.into_bytes();
 
         // Take ownership directly — no clone.
-        let key = req.message_group_id.map(|s| Bytes::from(s.into_bytes()));
-        let mut headers = Vec::new();
+        let key = req.message_group_id.map(|s| s.into_bytes());
+        let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
         if let Some(attrs) = req.message_attributes {
             for (k, v) in attrs {
                 if let Some(sv) = v.get("StringValue").and_then(|v| v.as_str()) {
-                    // Zero-copy: copy_from_slice instead of to_string().into_bytes()
-                    headers.push((k, Bytes::copy_from_slice(sv.as_bytes())));
+                    headers.push((k, sv.as_bytes().to_vec()));
                 } else if let Some(bv) = v.get("BinaryValue").and_then(|v| v.as_str()) {
                     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(bv) {
-                        headers.push((k, Bytes::from(decoded)));
+                        headers.push((k, decoded));
                     }
                 }
             }
@@ -198,12 +196,12 @@ impl SqsState {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut builder = FlatMessageBuilder::new(value).timestamp(now_ms);
-        if let Some(k) = key {
+        let mut builder = FlatMessageBuilder::new(&value).timestamp(now_ms);
+        if let Some(ref k) = key {
             builder = builder.key(k);
         }
-        for (hk, hv) in headers {
-            builder = builder.header(Bytes::from(hk), hv);
+        for (hk, hv) in &headers {
+            builder = builder.header(hk.as_bytes(), &hv[..]);
         }
         let flat_msg = builder.build();
 
@@ -243,10 +241,10 @@ impl SqsState {
         // Consume entries by value — zero-copy, no clones.
         for entry in req.entries {
             md5s.push(Self::md5_hex(entry.message_body.as_bytes()));
-            let value = Bytes::from(entry.message_body.into_bytes());
-            let key = entry.message_group_id.map(|s| Bytes::from(s.into_bytes()));
-            let mut builder = FlatMessageBuilder::new(value).timestamp(now_ms);
-            if let Some(k) = key {
+            let value = entry.message_body.into_bytes();
+            let key = entry.message_group_id.map(|s| s.into_bytes());
+            let mut builder = FlatMessageBuilder::new(&value).timestamp(now_ms);
+            if let Some(ref k) = key {
                 builder = builder.key(k);
             }
             messages.push(builder.build());
@@ -562,7 +560,7 @@ fn to_sqs_message(
     prefetcher: &bisque_raft::SegmentPrefetcher,
 ) -> SqsMessage {
     let body = if let Some(flat_bytes) = bisque_mq::read_message_at(prefetcher, msg.message_id) {
-        if let Some(flat) = bisque_mq::flat::FlatMessage::new(flat_bytes) {
+        if let Some(flat) = bisque_mq::flat::FlatMessage::new(&flat_bytes) {
             let val = flat.value();
             // Try zero-copy String::from_utf8 first (common case: valid UTF-8).
             // Falls back to lossy only for invalid data.

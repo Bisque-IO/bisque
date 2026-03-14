@@ -828,10 +828,10 @@ impl SegmentIndexMap {
             }
             MqCommand::TAG_BATCH => {
                 let batch = cmd.as_batch();
-                for sub_cmd in batch.commands() {
-                    match sub_cmd.tag() {
+                for sub_buf in batch.commands() {
+                    match crate::types::buf_tag(sub_buf) {
                         MqCommand::TAG_PUBLISH => {
-                            let topic_id = sub_cmd.field_u64(8);
+                            let topic_id = crate::types::buf_field_u64(sub_buf, 8);
                             self.add_entry(seg_id, ENTITY_TOPIC, topic_id, rec_offset, cmd_len);
                         }
                         _ => {}

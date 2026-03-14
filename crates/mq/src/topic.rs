@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::exchange::RetainedValue;
-use crate::flat::FlatMessageMeta;
+use crate::flat::{FlatMessageMeta, MqttEnvelopeMeta, is_mqtt_envelope};
 use crate::types::{
     PartitionInfo, RetentionPolicy, TopicCronConfig, TopicDedupConfig, TopicLifetimePolicy,
     name_hash,
@@ -678,7 +678,11 @@ impl TopicState {
         let mut last_pos: usize = 0;
         let mut last_msg: Option<Bytes> = None;
         for (i, m) in messages.enumerate() {
-            total_bytes += FlatMessageMeta::value_len(&m).unwrap_or(0) as u64;
+            total_bytes += if is_mqtt_envelope(&m) {
+                MqttEnvelopeMeta::value_len(&m).unwrap_or(0) as u64
+            } else {
+                FlatMessageMeta::value_len(&m).unwrap_or(0) as u64
+            };
             last_pos = i;
             if self.meta.retained {
                 last_msg = Some(m);
@@ -882,9 +886,7 @@ mod tests {
     }
 
     fn make_msg(value: &[u8]) -> Bytes {
-        FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-            .timestamp(1000)
-            .build()
+        FlatMessageBuilder::new(value).timestamp(1000).build()
     }
 
     #[test]

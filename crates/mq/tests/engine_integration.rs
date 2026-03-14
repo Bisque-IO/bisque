@@ -18,14 +18,12 @@ fn make_engine() -> MqEngine {
 }
 
 fn make_flat_msg(value: &[u8]) -> Bytes {
-    FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-        .timestamp(1000)
-        .build()
+    FlatMessageBuilder::new(value).timestamp(1000).build()
 }
 
 fn make_flat_msg_with_key(key: &[u8], value: &[u8]) -> Bytes {
-    FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-        .key(Bytes::from(key.to_vec()))
+    FlatMessageBuilder::new(value)
+        .key(key)
         .timestamp(1000)
         .build()
 }

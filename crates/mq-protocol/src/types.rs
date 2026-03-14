@@ -1087,22 +1087,29 @@ impl ClientFrame {
 pub struct WireMessage {
     pub sub_id: u32,
     pub message_id: u64,
-    pub flat: FlatMessage,
+    /// Raw flat message bytes. Use `flat()` to get a `FlatMessage` view.
+    pub flat_bytes: Bytes,
 }
 
 impl PartialEq for WireMessage {
     fn eq(&self, other: &Self) -> bool {
         self.sub_id == other.sub_id
             && self.message_id == other.message_id
-            && self.flat.as_bytes() == other.flat.as_bytes()
+            && self.flat_bytes == other.flat_bytes
     }
 }
 
 impl WireMessage {
+    /// Get a `FlatMessage` view over the raw bytes.
+    #[inline]
+    pub fn flat(&self) -> Option<FlatMessage<'_>> {
+        FlatMessage::new(&self.flat_bytes)
+    }
+
     /// Total byte size of message payload (flat message buffer).
     #[inline]
     pub fn payload_bytes(&self) -> u64 {
-        self.flat.as_bytes().len() as u64
+        self.flat_bytes.len() as u64
     }
 
     /// Encode the message body (without frame tag) into a writer.
@@ -1110,14 +1117,14 @@ impl WireMessage {
     fn encode_body<W: Write>(&self, w: &mut W) -> Result<(), ProtocolError> {
         self.sub_id.encode(w)?;
         self.message_id.encode(w)?;
-        encode_bytes_u32(w, self.flat.as_bytes())?;
+        encode_bytes_u32(w, &self.flat_bytes)?;
         Ok(())
     }
 
     /// Encoded size of the message body (without frame tag).
     #[inline]
     fn body_encoded_size(&self) -> usize {
-        4 + 8 + encoded_size_bytes_u32(self.flat.as_bytes())
+        4 + 8 + encoded_size_bytes_u32(&self.flat_bytes)
     }
 
     /// Decode message body from an `io::Read` (without tag byte).
@@ -1126,14 +1133,17 @@ impl WireMessage {
         let sub_id = u32::decode(r)?;
         let message_id = u64::decode(r)?;
         let flat_bytes = Bytes::from(decode_bytes_u32(r)?);
-        let flat = FlatMessage::new(flat_bytes).ok_or_else(|| ProtocolError::Truncated {
-            need: crate::flat::HEADER_SIZE,
-            have: 0,
-        })?;
+        // Validate the flat message is structurally sound.
+        if FlatMessage::new(&flat_bytes).is_none() {
+            return Err(ProtocolError::Truncated {
+                need: crate::flat::HEADER_SIZE,
+                have: flat_bytes.len(),
+            });
+        }
         Ok(Self {
             sub_id,
             message_id,
-            flat,
+            flat_bytes,
         })
     }
 
@@ -1143,14 +1153,16 @@ impl WireMessage {
         let sub_id = read_u32_le_buf(buf)?;
         let message_id = read_u64_le_buf(buf)?;
         let flat_bytes = split_bytes_u32(buf)?;
-        let flat = FlatMessage::new(flat_bytes).ok_or_else(|| ProtocolError::Truncated {
-            need: crate::flat::HEADER_SIZE,
-            have: 0,
-        })?;
+        if FlatMessage::new(&flat_bytes).is_none() {
+            return Err(ProtocolError::Truncated {
+                need: crate::flat::HEADER_SIZE,
+                have: flat_bytes.len(),
+            });
+        }
         Ok(Self {
             sub_id,
             message_id,
-            flat,
+            flat_bytes,
         })
     }
 }
@@ -1932,17 +1944,17 @@ mod tests {
         headers: &[(&[u8], &[u8])],
     ) -> WireMessage {
         use crate::flat::FlatMessageBuilder;
-        let mut builder = FlatMessageBuilder::new(Bytes::from(value.to_vec())).timestamp(timestamp);
+        let mut builder = FlatMessageBuilder::new(value).timestamp(timestamp);
         if let Some(k) = key {
-            builder = builder.key(Bytes::from(k.to_vec()));
+            builder = builder.key(k);
         }
         for (name, val) in headers {
-            builder = builder.header(Bytes::from(name.to_vec()), Bytes::from(val.to_vec()));
+            builder = builder.header(*name, *val);
         }
         WireMessage {
             sub_id,
             message_id,
-            flat: FlatMessage::new(builder.build()).unwrap(),
+            flat_bytes: builder.build(),
         }
     }
 
@@ -2122,19 +2134,24 @@ mod tests {
     #[test]
     fn test_message_many_headers() {
         use crate::flat::FlatMessageBuilder;
-        let mut builder = FlatMessageBuilder::new(Bytes::from_static(b"v"))
-            .key(Bytes::from_static(b"k"))
+        let hdrs: Vec<(Vec<u8>, Vec<u8>)> = (0..200)
+            .map(|i| {
+                (
+                    format!("header-{}", i).into_bytes(),
+                    format!("value-{}", i).into_bytes(),
+                )
+            })
+            .collect();
+        let mut builder = FlatMessageBuilder::new(b"v")
+            .key(b"k")
             .timestamp(1_700_000_000);
-        for i in 0..200 {
-            builder = builder.header(
-                Bytes::from(format!("header-{}", i).into_bytes()),
-                Bytes::from(format!("value-{}", i).into_bytes()),
-            );
+        for (hname, hval) in &hdrs {
+            builder = builder.header(hname, hval);
         }
         let frame = ServerFrame::Message(WireMessage {
             sub_id: 10,
             message_id: 999,
-            flat: FlatMessage::new(builder.build()).unwrap(),
+            flat_bytes: builder.build(),
         });
         assert_eq!(roundtrip_server(&frame), frame);
     }

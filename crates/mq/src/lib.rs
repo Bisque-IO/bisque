@@ -23,6 +23,7 @@ pub use async_apply::{
     AsyncApplyManager, ClientRegistry, HighWaterMark, PendingRequest, PendingRequests,
     ResponseEntry,
 };
+pub use codec::MqCommandBuffer;
 pub use config::MqConfig;
 pub use cursor::{
     MqReader, MqSegmentCursor, MqSegmentScanner, SegmentRecord, read_command,

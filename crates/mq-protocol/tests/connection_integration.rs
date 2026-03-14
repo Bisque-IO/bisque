@@ -17,17 +17,17 @@ fn make_wire_msg(
     value: &[u8],
     headers: &[(&[u8], &[u8])],
 ) -> WireMessage {
-    let mut builder = FlatMessageBuilder::new(Bytes::from(value.to_vec())).timestamp(timestamp);
+    let mut builder = FlatMessageBuilder::new(value).timestamp(timestamp);
     if let Some(k) = key {
-        builder = builder.key(Bytes::from(k.to_vec()));
+        builder = builder.key(k);
     }
     for (name, val) in headers {
-        builder = builder.header(Bytes::from(name.to_vec()), Bytes::from(val.to_vec()));
+        builder = builder.header(*name, *val);
     }
     WireMessage {
         sub_id,
         message_id,
-        flat: FlatMessage::new(builder.build()).unwrap(),
+        flat_bytes: builder.build(),
     }
 }
 
@@ -257,8 +257,9 @@ async fn test_subscribe_and_receive_messages() {
             ServerFrame::Message(msg) => {
                 assert_eq!(msg.sub_id, 1);
                 assert_eq!(msg.message_id, 100 + i);
-                assert_eq!(msg.flat.key(), Some(Bytes::from(format!("key-{}", i))));
-                assert_eq!(msg.flat.value(), Bytes::from(format!("payload-{}", i)));
+                let flat = msg.flat().expect("valid flat message");
+                assert_eq!(flat.key(), Some(format!("key-{}", i).as_bytes()));
+                assert_eq!(flat.value(), format!("payload-{}", i).as_bytes());
             }
             _ => panic!("expected Message"),
         }

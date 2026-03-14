@@ -64,9 +64,7 @@ async fn append_and_flush(
 
 fn make_flat_msg(payload_size: usize) -> Bytes {
     let value = vec![0xABu8; payload_size];
-    FlatMessageBuilder::new(Bytes::from(value))
-        .timestamp(1000)
-        .build()
+    FlatMessageBuilder::new(&value).timestamp(1000).build()
 }
 
 // =============================================================================
@@ -116,6 +114,7 @@ async fn bench_async_apply(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
+        None,
         None,
         0,
         0,

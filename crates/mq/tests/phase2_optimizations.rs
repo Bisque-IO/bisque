@@ -6,8 +6,6 @@
 //!   Opt 6: Shared subscription no-local validation
 //!   Opt 7: Subscription metadata (group_id) in delivery response
 
-use bytes::Bytes;
-
 use bisque_mq::config::MqConfig;
 use bisque_mq::engine::MqEngine;
 use bisque_mq::flat::FlatMessageBuilder;
@@ -21,15 +19,13 @@ fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-phase2-opt-test"))
 }
 
-fn make_flat_msg(value: &[u8]) -> Bytes {
-    FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-        .timestamp(1000)
-        .build()
+fn make_flat_msg(value: &[u8]) -> bytes::Bytes {
+    FlatMessageBuilder::new(value).timestamp(1000).build()
 }
 
-fn make_flat_msg_with_routing_key(value: &[u8], routing_key: &str) -> Bytes {
-    FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-        .routing_key(Bytes::from(routing_key.to_owned()))
+fn make_flat_msg_with_routing_key(value: &[u8], routing_key: &str) -> bytes::Bytes {
+    FlatMessageBuilder::new(value)
+        .routing_key(routing_key.as_bytes())
         .timestamp(1000)
         .build()
 }
@@ -107,7 +103,7 @@ fn set_will(
     exchange_id: u64,
     delay_secs: u32,
     routing_key: &str,
-    message: &Bytes,
+    message: &bytes::Bytes,
     log_index: u64,
     time: u64,
 ) {

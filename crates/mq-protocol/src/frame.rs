@@ -163,7 +163,6 @@ pub fn encode_client_frame_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
 
     #[tokio::test]
     async fn test_tcp_frame_roundtrip() {
@@ -196,15 +195,15 @@ mod tests {
         use crate::types::WireMessage;
         let (mut client, mut server) = tokio::io::duplex(8192);
 
-        let flat = FlatMessageBuilder::new(Bytes::from_static(b"hello"))
-            .key(Bytes::from_static(b"key"))
+        let flat = FlatMessageBuilder::new(b"hello")
+            .key(b"key")
             .timestamp(1_700_000_000)
-            .header(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))
+            .header(b"h1", b"v1")
             .build();
         let frame = ServerFrame::Message(WireMessage {
             sub_id: 5,
             message_id: 42,
-            flat: FlatMessage::new(flat).unwrap(),
+            flat_bytes: flat,
         });
         let encoded = encode_server_frame(&frame).unwrap();
 
@@ -289,15 +288,15 @@ mod tests {
         use crate::types::WireMessage;
         let (mut writer, mut reader) = tokio::io::duplex(8192);
 
-        let flat = FlatMessageBuilder::new(Bytes::from_static(b"value"))
-            .key(Bytes::from_static(b"key"))
+        let flat = FlatMessageBuilder::new(b"value")
+            .key(b"key")
             .timestamp(1000)
-            .header(Bytes::from_static(b"h1"), Bytes::from_static(b"v1"))
+            .header(b"h1", b"v1")
             .build();
         let frame = ServerFrame::Message(WireMessage {
             sub_id: 1,
             message_id: 42,
-            flat: FlatMessage::new(flat).unwrap(),
+            flat_bytes: flat,
         });
         let encoded = encode_server_frame(&frame).unwrap();
         write_tcp_frame(&mut writer, &encoded).await.unwrap();
@@ -315,13 +314,11 @@ mod tests {
         use crate::types::WireMessage;
         let (mut writer, mut reader) = tokio::io::duplex(8192);
 
-        let flat = FlatMessageBuilder::new(Bytes::from_static(b"test"))
-            .timestamp(1)
-            .build();
+        let flat = FlatMessageBuilder::new(b"test").timestamp(1).build();
         let frame = ServerFrame::Message(WireMessage {
             sub_id: 1,
             message_id: 1,
-            flat: FlatMessage::new(flat).unwrap(),
+            flat_bytes: flat,
         });
 
         let mut buf = Vec::new();

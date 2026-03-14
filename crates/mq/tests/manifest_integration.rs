@@ -27,7 +27,7 @@ fn make_engine() -> MqEngine {
 }
 
 fn make_msg(value: &[u8]) -> Bytes {
-    bisque_mq::flat::FlatMessageBuilder::new(Bytes::from(value.to_vec()))
+    bisque_mq::flat::FlatMessageBuilder::new(value)
         .timestamp(1000)
         .build()
 }

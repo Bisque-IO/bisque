@@ -67,9 +67,7 @@ fn make_callback() -> (
 }
 
 fn make_flat_msg(value: &[u8]) -> Bytes {
-    FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-        .timestamp(1000)
-        .build()
+    FlatMessageBuilder::new(value).timestamp(1000).build()
 }
 
 /// Create storage + log with small segments for multi-segment testing.

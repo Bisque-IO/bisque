@@ -164,7 +164,6 @@ pub fn decode_u64s_at(buf: &[u8], data_offset: usize, count: usize) -> DecodeU64
 /// ```
 pub(crate) struct CommandBuilder {
     buf: SmallVec<[u8; 128]>,
-    segments: Option<Vec<Bytes>>,
 }
 
 impl CommandBuilder {
@@ -183,10 +182,7 @@ impl CommandBuilder {
         buf[4..6].copy_from_slice(&(fixed_size as u16).to_le_bytes());
         buf[6] = tag;
         buf[7] = flags;
-        Self {
-            buf,
-            segments: None,
-        }
+        Self { buf }
     }
 
     /// Create a new builder pre-sized for `total_capacity` bytes.
@@ -202,10 +198,7 @@ impl CommandBuilder {
         buf[4..6].copy_from_slice(&(fixed_size as u16).to_le_bytes());
         buf[6] = tag;
         buf[7] = flags;
-        Self {
-            buf,
-            segments: None,
-        }
+        Self { buf }
     }
 
     #[inline]
@@ -314,33 +307,29 @@ impl CommandBuilder {
         self
     }
 
-    /// Set a vec_bytes slot in scatter mode: writes descriptor table into `buf`
-    /// and takes ownership of the payload `Bytes` for zero-copy scatter encoding.
-    /// The descriptor offsets are computed as if the payloads follow contiguously
-    /// after `buf`, so `Encode::encode()` must write `buf` then each segment.
-    ///
-    /// Takes `Vec<Bytes>` by value — no atomic refcount operations.
-    pub fn set_vec_bytes_scatter(mut self, offset: usize, segments: Vec<Bytes>) -> Self {
-        self.buf[offset..offset + 4].copy_from_slice(&(segments.len() as u32).to_le_bytes());
-        if segments.is_empty() {
+    /// Set a vec_bytes slot from borrowed slices. Identical wire format to
+    /// `set_vec_bytes` but accepts `&[&[u8]]` — no `Bytes` allocation needed.
+    pub fn set_vec_slices(mut self, offset: usize, values: &[&[u8]]) -> Self {
+        self.buf[offset..offset + 4].copy_from_slice(&(values.len() as u32).to_le_bytes());
+        if values.is_empty() {
             return self;
         }
         let table_offset = self.buf.len();
         self.buf[offset + 4..offset + 8].copy_from_slice(&(table_offset as u32).to_le_bytes());
-        // Allocate descriptor table in buf
-        let table_size = segments.len() * 8;
+        // Pre-calculate total size: descriptor table + all data
+        let table_size = values.len() * 8;
+        let data_size: usize = values.iter().map(|v| v.len()).sum();
+        self.buf.reserve(table_size + data_size);
         self.buf.resize(self.buf.len() + table_size, 0);
-        // Compute offsets as if payloads follow buf contiguously.
-        let header_len = self.buf.len();
-        let mut running_offset = header_len;
-        for (i, v) in segments.iter().enumerate() {
+        // Write data and fill descriptors
+        for (i, v) in values.iter().enumerate() {
+            let data_offset = self.buf.len();
+            self.buf.extend_from_slice(v);
             let desc_off = table_offset + i * 8;
             self.buf[desc_off..desc_off + 4].copy_from_slice(&(v.len() as u32).to_le_bytes());
             self.buf[desc_off + 4..desc_off + 8]
-                .copy_from_slice(&(running_offset as u32).to_le_bytes());
-            running_offset += v.len();
+                .copy_from_slice(&(data_offset as u32).to_le_bytes());
         }
-        self.segments = Some(segments);
         self
     }
 
@@ -399,15 +388,399 @@ impl CommandBuilder {
     /// Finalize the command: patch the size header and return MqCommand.
     #[inline]
     pub fn finish(mut self) -> MqCommand {
-        let total_size = match &self.segments {
-            None => self.buf.len(),
-            Some(segs) => self.buf.len() + segs.iter().map(|s| s.len()).sum::<usize>(),
-        };
+        let total_size = self.buf.len();
         self.buf[0..4].copy_from_slice(&(total_size as u32).to_le_bytes());
         MqCommand {
-            buf: Bytes::from(self.buf.into_vec()),
-            segments: self.segments,
+            buf: self.buf.into_vec(),
         }
+    }
+
+    /// Begin building a `vec_bytes` field by writing the count and reserving
+    /// the descriptor table. Returns a [`VecBytesWriter`] that lets callers
+    /// write entries directly into the command buffer — zero intermediate copies.
+    #[inline]
+    pub fn begin_vec_bytes(mut self, offset: usize, count: usize) -> VecBytesWriter {
+        self.buf[offset..offset + 4].copy_from_slice(&(count as u32).to_le_bytes());
+        if count == 0 {
+            return VecBytesWriter {
+                builder: self,
+                table_start: 0,
+                count: 0,
+                index: 0,
+            };
+        }
+        let table_offset = self.buf.len();
+        self.buf[offset + 4..offset + 8].copy_from_slice(&(table_offset as u32).to_le_bytes());
+        let table_size = count * 8;
+        self.buf.resize(self.buf.len() + table_size, 0);
+        VecBytesWriter {
+            builder: self,
+            table_start: table_offset,
+            count,
+            index: 0,
+        }
+    }
+}
+
+/// Zero-copy writer for building `vec_bytes` entries directly inside a
+/// [`CommandBuilder`]'s buffer. Each entry is written in-place — no
+/// intermediate `BytesMut` or `Vec<Bytes>` needed.
+///
+/// Usage:
+/// ```ignore
+/// let mut w = CommandBuilder::new(tag, 0, 24)
+///     .set_u64(8, exchange_id)
+///     .begin_vec_bytes(16, batch_size);
+/// for msg in &messages {
+///     let start = w.position();
+///     w.buf_mut().extend_from_slice(msg);
+///     w.commit(start);
+/// }
+/// let cmd = w.finish();
+/// ```
+pub struct VecBytesWriter {
+    builder: CommandBuilder,
+    table_start: usize,
+    count: usize,
+    index: usize,
+}
+
+impl VecBytesWriter {
+    /// Append one entry's bytes directly via a closure that writes into
+    /// the command's internal `Vec<u8>`. The descriptor is filled automatically.
+    ///
+    /// For publish batches, use with [`write_flat_message_vec`] or
+    /// [`MqttEnvelopeWriter::write_vec`] to write messages with zero
+    /// intermediate copies.
+    #[inline]
+    pub fn push<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut Vec<u8>),
+    {
+        debug_assert!(self.index < self.count);
+        // For batch commands the SmallVec is always heap-spilled (>128 bytes),
+        // so into_vec()/from_vec() are O(1) pointer moves — no copy.
+        let mut vec = std::mem::take(&mut self.builder.buf).into_vec();
+        let data_offset = vec.len();
+        f(&mut vec);
+        let len = vec.len() - data_offset;
+        self.builder.buf = SmallVec::from_vec(vec);
+
+        let desc_off = self.table_start + self.index * 8;
+        self.builder.buf[desc_off..desc_off + 4].copy_from_slice(&(len as u32).to_le_bytes());
+        self.builder.buf[desc_off + 4..desc_off + 8]
+            .copy_from_slice(&(data_offset as u32).to_le_bytes());
+        self.index += 1;
+    }
+
+    /// Append a pre-built entry (convenience for `push(|v| v.extend_from_slice(data))`).
+    #[inline]
+    pub fn push_slice(&mut self, data: &[u8]) {
+        debug_assert!(self.index < self.count);
+        let data_offset = self.builder.buf.len();
+        self.builder.buf.extend_from_slice(data);
+        let len = data.len();
+        let desc_off = self.table_start + self.index * 8;
+        self.builder.buf[desc_off..desc_off + 4].copy_from_slice(&(len as u32).to_le_bytes());
+        self.builder.buf[desc_off + 4..desc_off + 8]
+            .copy_from_slice(&(data_offset as u32).to_le_bytes());
+        self.index += 1;
+    }
+
+    /// Finalize the command. Panics in debug mode if not all entries were written.
+    #[inline]
+    pub fn finish(self) -> MqCommand {
+        debug_assert_eq!(self.index, self.count);
+        self.builder.finish()
+    }
+}
+
+// =============================================================================
+// CommandWriter — zero-copy command builder that writes directly into &mut Vec<u8>
+// =============================================================================
+
+/// Builds a command directly into an external `Vec<u8>`. Unlike `CommandBuilder`
+/// which uses an internal `SmallVec` then copies out, `CommandWriter` writes
+/// every byte exactly once into the target buffer.
+pub(crate) struct CommandWriter<'a> {
+    buf: &'a mut Vec<u8>,
+    /// Byte offset in `buf` where this command starts.
+    cmd_start: usize,
+}
+
+#[allow(dead_code)]
+impl<'a> CommandWriter<'a> {
+    /// Begin a new command. Reserves `fixed_size` zeroed bytes in `buf`.
+    #[inline]
+    fn new(buf: &'a mut Vec<u8>, tag: u8, flags: u8, fixed_size: usize) -> Self {
+        debug_assert!(fixed_size >= 8 && fixed_size % 8 == 0);
+        let cmd_start = buf.len();
+        buf.resize(cmd_start + fixed_size, 0);
+        // Header: [size:4][fixed:2][tag:1][flags:1]
+        buf[cmd_start + 4..cmd_start + 6].copy_from_slice(&(fixed_size as u16).to_le_bytes());
+        buf[cmd_start + 6] = tag;
+        buf[cmd_start + 7] = flags;
+        Self { buf, cmd_start }
+    }
+
+    /// Begin a new command with pre-reserved capacity for the total size.
+    #[inline]
+    fn with_capacity(
+        buf: &'a mut Vec<u8>,
+        tag: u8,
+        flags: u8,
+        fixed_size: usize,
+        total_capacity: usize,
+    ) -> Self {
+        debug_assert!(fixed_size >= 8 && fixed_size % 8 == 0);
+        buf.reserve(total_capacity);
+        Self::new(buf, tag, flags, fixed_size)
+    }
+
+    #[inline]
+    fn set_u64(&mut self, offset: usize, value: u64) {
+        let off = self.cmd_start + offset;
+        self.buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn set_u32(&mut self, offset: usize, value: u32) {
+        let off = self.cmd_start + offset;
+        self.buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Write a flex8 field: small (≤7 bytes) inlined, large appended to flex region.
+    #[inline]
+    fn set_flex8(&mut self, offset: usize, data: &[u8]) {
+        let off = self.cmd_start + offset;
+        if data.len() <= 7 {
+            self.buf[off] = (data.len() as u8) << 1;
+            self.buf[off + 1..off + 1 + data.len()].copy_from_slice(data);
+        } else {
+            let data_offset = self.buf.len();
+            self.buf.extend_from_slice(data);
+            let encoded = ((data_offset as u32) << 1) | 1;
+            self.buf[off..off + 4].copy_from_slice(&encoded.to_le_bytes());
+            self.buf[off + 4..off + 8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        }
+    }
+
+    #[inline]
+    fn set_str(&mut self, offset: usize, s: &str) {
+        self.set_flex8(offset, s.as_bytes());
+    }
+
+    /// Write a vec_u64 field: `[count:4][offset:4]` in fixed, u64 data in flex.
+    #[inline]
+    fn set_vec_u64(&mut self, offset: usize, values: &[u64]) {
+        let off = self.cmd_start + offset;
+        self.buf[off..off + 4].copy_from_slice(&(values.len() as u32).to_le_bytes());
+        if values.is_empty() {
+            return;
+        }
+        // Pad to 8-byte alignment
+        let pad = (8 - (self.buf.len() % 8)) % 8;
+        self.buf.extend_from_slice(&[0u8; 8][..pad]);
+        let data_offset = self.buf.len();
+        self.buf[off + 4..off + 8].copy_from_slice(&(data_offset as u32).to_le_bytes());
+        for &v in values {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// Write an optional flex8 bytes field.
+    #[inline]
+    fn set_opt_bytes(&mut self, offset: usize, b: Option<&Bytes>) {
+        if let Some(b) = b {
+            self.set_flex8(offset, b);
+        }
+    }
+
+    /// Finalize: patch the size header. Returns `(start, len)`.
+    #[inline]
+    fn finish(self) -> (u32, u32) {
+        let total_size = self.buf.len() - self.cmd_start;
+        let start = self.cmd_start;
+        self.buf[start..start + 4].copy_from_slice(&(total_size as u32).to_le_bytes());
+        (start as u32, total_size as u32)
+    }
+}
+
+// =============================================================================
+// MqCommandBuffer — reusable buffer for zero-alloc command building
+// =============================================================================
+
+/// A reusable buffer for building multiple `MqCommand`s without per-command
+/// heap allocation. Commands are serialized contiguously into a single `Vec<u8>`.
+/// The buffer tracks command boundaries so callers can drain them individually.
+///
+/// All `write_*` methods build commands directly into the buffer — every byte
+/// is written exactly once. No intermediate `SmallVec` or `CommandBuilder`.
+///
+/// The buffer persists across calls — `clear()` resets length but keeps the
+/// allocation, so subsequent writes reuse the same memory.
+pub struct MqCommandBuffer {
+    buf: Vec<u8>,
+    /// Command boundaries: (start, len) pairs.
+    ranges: SmallVec<[(u32, u32); 8]>,
+}
+
+impl MqCommandBuffer {
+    /// Create a new buffer with the given initial capacity.
+    #[inline]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+            ranges: SmallVec::new(),
+        }
+    }
+
+    /// Reset the buffer for reuse. Keeps the underlying allocation.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.ranges.clear();
+    }
+
+    /// Number of commands in the buffer.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Whether the buffer has no commands.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Get the raw bytes for the command at `index`.
+    #[inline]
+    pub fn get(&self, index: usize) -> &[u8] {
+        let (start, len) = self.ranges[index];
+        &self.buf[start as usize..(start + len) as usize]
+    }
+
+    /// Create an `MqCommand` from the command at `index` (copies bytes).
+    #[inline]
+    pub fn to_command(&self, index: usize) -> MqCommand {
+        MqCommand::from_vec(self.get(index).to_vec())
+    }
+
+    /// Raw buffer access.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Mutable raw buffer access.
+    #[inline]
+    pub fn buf_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+
+    /// Push a pre-built command range (for callers that write directly into buf).
+    #[inline]
+    pub fn push_range(&mut self, start: u32, len: u32) {
+        self.ranges.push((start, len));
+    }
+
+    // -- Write methods: one per MqCommand constructor used by MQTT session --
+    // Each writes directly into self.buf via CommandWriter. Zero intermediate copies.
+
+    /// Write a `group_ack` command. @8 group_id:8, @16 message_ids:vec_u64, @24 response:opt_flex8
+    #[inline]
+    pub fn write_group_ack(
+        &mut self,
+        group_id: u64,
+        message_ids: &[u64],
+        response: Option<&Bytes>,
+    ) {
+        let resp_size = response.map_or(0, |b| if b.len() > 7 { b.len() } else { 0 });
+        let mut w = CommandWriter::with_capacity(
+            &mut self.buf,
+            MqCommand::TAG_GROUP_ACK,
+            0,
+            32,
+            32 + message_ids.len() * 8 + resp_size,
+        );
+        w.set_u64(8, group_id);
+        w.set_vec_u64(16, message_ids);
+        w.set_opt_bytes(24, response);
+        let range = w.finish();
+        self.ranges.push(range);
+    }
+
+    /// Write a `group_nack` command. @8 group_id:8, @16 message_ids:vec_u64
+    #[inline]
+    pub fn write_group_nack(&mut self, group_id: u64, message_ids: &[u64]) {
+        let mut w = CommandWriter::with_capacity(
+            &mut self.buf,
+            MqCommand::TAG_GROUP_NACK,
+            0,
+            24,
+            24 + message_ids.len() * 8,
+        );
+        w.set_u64(8, group_id);
+        w.set_vec_u64(16, message_ids);
+        let range = w.finish();
+        self.ranges.push(range);
+    }
+
+    /// Write a `heartbeat_session` command. @8 session_id:8
+    #[inline]
+    pub fn write_heartbeat_session(&mut self, session_id: u64) {
+        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_HEARTBEAT_SESSION, 0, 16);
+        w.set_u64(8, session_id);
+        let range = w.finish();
+        self.ranges.push(range);
+    }
+
+    /// Write a `create_session` command. @8 session_id:8, @16 keep_alive_ms:8,
+    /// @24 session_expiry_ms:8, @32 client_id:flex8
+    #[inline]
+    pub fn write_create_session(
+        &mut self,
+        session_id: u64,
+        client_id: &str,
+        keep_alive_ms: u64,
+        session_expiry_ms: u64,
+    ) {
+        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_CREATE_SESSION, 0, 40);
+        w.set_u64(8, session_id);
+        w.set_u64(16, keep_alive_ms);
+        w.set_u64(24, session_expiry_ms);
+        w.set_str(32, client_id);
+        let range = w.finish();
+        self.ranges.push(range);
+    }
+
+    /// Write a `disconnect_session` command. flags[0]=publish_will, @8 session_id:8
+    #[inline]
+    pub fn write_disconnect_session(&mut self, session_id: u64, publish_will: bool) {
+        let flags = if publish_will { 1u8 } else { 0u8 };
+        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_DISCONNECT_SESSION, flags, 16);
+        w.set_u64(8, session_id);
+        let range = w.finish();
+        self.ranges.push(range);
+    }
+
+    /// Write a `delete_binding` command. @8 binding_id:8
+    #[inline]
+    pub fn write_delete_binding(&mut self, binding_id: u64) {
+        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_DELETE_BINDING, 0, 16);
+        w.set_u64(8, binding_id);
+        let range = w.finish();
+        self.ranges.push(range);
+    }
+
+    /// Write a `delete_consumer_group` command. @8 group_id:8
+    #[inline]
+    pub fn write_delete_consumer_group(&mut self, group_id: u64) {
+        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_DELETE_CONSUMER_GROUP, 0, 16);
+        w.set_u64(8, group_id);
+        let range = w.finish();
+        self.ranges.push(range);
     }
 }
 
@@ -925,17 +1298,12 @@ impl Encode for MqCommand {
     #[inline]
     fn encode<W: Write>(&self, w: &mut W) -> Result<(), CodecError> {
         w.write_all(&self.buf)?;
-        if let Some(ref segs) = self.segments {
-            for seg in segs {
-                w.write_all(seg)?;
-            }
-        }
         Ok(())
     }
 
     #[inline]
     fn encoded_size(&self) -> usize {
-        self.total_encoded_size()
+        self.buf.len()
     }
 }
 
@@ -947,17 +1315,11 @@ impl Decode for MqCommand {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
-        Ok(MqCommand {
-            buf: Bytes::from(buf),
-            segments: None,
-        })
+        Ok(MqCommand { buf })
     }
 
     fn decode_from_bytes(data: Bytes) -> Result<Self, CodecError> {
-        Ok(MqCommand {
-            buf: data,
-            segments: None,
-        })
+        Ok(MqCommand { buf: data.to_vec() })
     }
 }
 
@@ -1000,21 +1362,19 @@ impl MqCommand {
             .finish()
     }
 
-    /// Zero-copy scatter publish: takes ownership of the messages Vec,
-    /// builds header + descriptor table only.  No payload memcpy, no atomic
-    /// refcount ops.  Produces identical wire format when encoded.
+    /// Publish with owned messages Vec. Produces identical wire format to `publish`.
     pub fn publish_scatter(topic_id: u64, messages: Vec<Bytes>) -> Self {
         CommandBuilder::new(Self::TAG_PUBLISH, 0, 24)
             .set_u64(8, topic_id)
-            .set_vec_bytes_scatter(16, messages)
+            .set_vec_bytes(16, &messages)
             .finish()
     }
 
-    /// Zero-copy scatter exchange publish — takes ownership of messages.
+    /// Exchange publish with owned messages Vec.
     pub fn publish_to_exchange_scatter(exchange_id: u64, messages: Vec<Bytes>) -> Self {
         CommandBuilder::new(Self::TAG_PUBLISH_TO_EXCHANGE, 0, 24)
             .set_u64(8, exchange_id)
-            .set_vec_bytes_scatter(16, messages)
+            .set_vec_bytes(16, &messages)
             .finish()
     }
 
@@ -1128,6 +1488,66 @@ impl MqCommand {
         .set_u64(8, exchange_id)
         .set_vec_bytes(16, messages)
         .finish()
+    }
+
+    /// @8 exchange_id:8, @16 messages:vec_bytes (slice variant, same wire format)
+    pub fn publish_to_exchange_slices(exchange_id: u64, messages: &[&[u8]]) -> Self {
+        let table_size = messages.len() * 8;
+        let data_size: usize = messages.iter().map(|m| m.len()).sum();
+        CommandBuilder::with_capacity(
+            Self::TAG_PUBLISH_TO_EXCHANGE,
+            0,
+            24,
+            24 + table_size + data_size,
+        )
+        .set_u64(8, exchange_id)
+        .set_vec_slices(16, messages)
+        .finish()
+    }
+
+    /// Begin building a publish-to-exchange command where messages are written
+    /// directly into the command buffer — zero intermediate copies.
+    ///
+    /// `capacity_hint` is the estimated total size of all message bytes
+    /// (excluding the descriptor table). Pass `0` to let the buffer grow
+    /// dynamically.
+    ///
+    /// Returns a [`VecBytesWriter`]; call `.push()` for each message,
+    /// then `.finish()` to produce the `MqCommand`.
+    pub fn begin_publish_to_exchange(
+        tag: u8,
+        exchange_id: u64,
+        count: usize,
+        capacity_hint: usize,
+    ) -> VecBytesWriter {
+        let table_size = count * 8;
+        CommandBuilder::with_capacity(tag, 0, 24, 24 + table_size + capacity_hint)
+            .set_u64(8, exchange_id)
+            .begin_vec_bytes(16, count)
+    }
+
+    /// @8 exchange_id:8, @16 messages:vec_bytes — MQTT exchange publish variant
+    pub fn publish_to_exchange_mqtt(exchange_id: u64, messages: &[&[u8]]) -> Self {
+        let table_size = messages.len() * 8;
+        let data_size: usize = messages.iter().map(|m| m.len()).sum();
+        CommandBuilder::with_capacity(
+            Self::TAG_PUBLISH_TO_EXCHANGE_MQTT,
+            0,
+            24,
+            24 + table_size + data_size,
+        )
+        .set_u64(8, exchange_id)
+        .set_vec_slices(16, messages)
+        .finish()
+    }
+
+    /// @8 exchange_id:8, @16 routing_key:flex8, @24 message:flex8 — MQTT retained variant
+    pub fn set_retained_mqtt(exchange_id: u64, routing_key: &str, message: &[u8]) -> Self {
+        CommandBuilder::new(Self::TAG_SET_RETAINED_MQTT, 0, 32)
+            .set_u64(8, exchange_id)
+            .set_str(16, routing_key)
+            .set_bytes(24, message)
+            .finish()
     }
 
     // -- Consumer Groups (11-18) --
@@ -1368,11 +1788,36 @@ impl MqCommand {
     // -- Ack Variant (19-29) --
 
     /// @8 group_id:8, @16 consumer_id:8, @24 max_count:4
+    /// @8 group_id:8, @16 consumer_id:8, @24 max_count:4, @32 exclude_publisher_id:8, @40 current_time_ms:8
+    ///
+    /// `exclude_publisher_id`: when non-zero, messages with this publisher_id are
+    /// auto-ACKed at engine level (MQTT no-local filtering).
+    /// `current_time_ms`: when non-zero, messages whose TTL has expired are
+    /// auto-ACKed at engine level (MQTT message expiry filtering).
     pub fn group_deliver(group_id: u64, consumer_id: u64, max_count: u32) -> Self {
-        CommandBuilder::new(Self::TAG_GROUP_DELIVER, 0, 32)
+        CommandBuilder::new(Self::TAG_GROUP_DELIVER, 0, 48)
             .set_u64(8, group_id)
             .set_u64(16, consumer_id)
             .set_u32(24, max_count)
+            .set_u64(32, 0) // exclude_publisher_id (disabled)
+            .set_u64(40, 0) // current_time_ms (disabled)
+            .finish()
+    }
+
+    /// Extended group_deliver with no-local and expiry filtering support.
+    pub fn group_deliver_filtered(
+        group_id: u64,
+        consumer_id: u64,
+        max_count: u32,
+        exclude_publisher_id: u64,
+        current_time_ms: u64,
+    ) -> Self {
+        CommandBuilder::new(Self::TAG_GROUP_DELIVER, 0, 48)
+            .set_u64(8, group_id)
+            .set_u64(16, consumer_id)
+            .set_u32(24, max_count)
+            .set_u64(32, exclude_publisher_id)
+            .set_u64(40, current_time_ms)
             .finish()
     }
 
@@ -1720,13 +2165,7 @@ impl MqCommand {
         // Pad each to 8-byte boundary for alignment.
         for cmd in commands {
             b.buf.extend_from_slice(&cmd.buf);
-            // Scatter: append payload segments inline.
-            if let Some(ref segs) = cmd.segments {
-                for seg in segs {
-                    b.buf.extend_from_slice(seg);
-                }
-            }
-            let len = cmd.total_encoded_size();
+            let len = cmd.buf.len();
             let pad = (8 - (len % 8)) % 8;
             if pad > 0 {
                 b.buf.extend_from_slice(&[0u8; 8][..pad]);
@@ -1751,140 +2190,93 @@ impl MqCommand {
 // =============================================================================
 
 impl MqCommand {
-    pub fn as_create_topic(&self) -> CmdCreateTopic {
-        CmdCreateTopic {
-            buf: self.buf.clone(),
-        }
+    pub fn as_create_topic(&self) -> CmdCreateTopic<'_> {
+        CmdCreateTopic { buf: &self.buf }
     }
 
-    pub fn as_publish(&self) -> CmdPublish {
-        CmdPublish {
-            buf: self.buf.clone(),
-        }
+    pub fn as_publish(&self) -> CmdPublish<'_> {
+        CmdPublish { buf: &self.buf }
     }
 
-    /// Collect publish/exchange-publish messages handling both contiguous and
-    /// scatter modes.  Returns the segments directly for scatter commands,
-    /// or collects from the descriptor table for contiguous commands.
+    /// Collect publish/exchange-publish messages from the descriptor table.
     pub fn collect_publish_messages(&self) -> Vec<Bytes> {
-        if let Some(ref segs) = self.segments {
-            return segs.clone();
-        }
         let v = self.as_publish();
         v.messages().collect()
     }
 
-    /// Take ownership of scatter segments (if any), leaving the command in
-    /// contiguous mode.  For contiguous commands, collects from the descriptor
-    /// table.  Used by the write batcher for merge operations.
+    /// Collect publish messages from the descriptor table.
+    /// Used by the write batcher for merge operations.
     pub fn take_publish_segments(&mut self) -> Vec<Bytes> {
-        if let Some(segs) = self.segments.take() {
-            return segs;
-        }
-        let v = self.as_publish();
+        let v = CmdPublish { buf: &self.buf };
         v.messages().collect()
     }
 
-    pub fn as_create_exchange(&self) -> CmdCreateExchange {
-        CmdCreateExchange {
-            buf: self.buf.clone(),
-        }
+    pub fn as_create_exchange(&self) -> CmdCreateExchange<'_> {
+        CmdCreateExchange { buf: &self.buf }
     }
 
-    pub fn as_create_binding(&self) -> CmdCreateBinding {
-        CmdCreateBinding {
-            buf: self.buf.clone(),
-        }
+    pub fn as_create_binding(&self) -> CmdCreateBinding<'_> {
+        CmdCreateBinding { buf: &self.buf }
     }
 
-    pub fn as_publish_to_exchange(&self) -> CmdPublishToExchange {
-        CmdPublishToExchange {
-            buf: self.buf.clone(),
-        }
+    pub fn as_publish_to_exchange(&self) -> CmdPublishToExchange<'_> {
+        CmdPublishToExchange { buf: &self.buf }
     }
 
-    pub fn as_batch(&self) -> CmdBatch {
-        CmdBatch {
-            buf: self.buf.clone(),
-        }
+    pub fn as_batch(&self) -> CmdBatch<'_> {
+        CmdBatch { buf: &self.buf }
     }
 
-    pub fn as_create_consumer_group(&self) -> CmdCreateConsumerGroup {
-        CmdCreateConsumerGroup {
-            buf: self.buf.clone(),
-        }
+    pub fn as_create_consumer_group(&self) -> CmdCreateConsumerGroup<'_> {
+        CmdCreateConsumerGroup { buf: &self.buf }
     }
 
-    pub fn as_commit_group_offset(&self) -> CmdCommitGroupOffset {
-        CmdCommitGroupOffset {
-            buf: self.buf.clone(),
-        }
+    pub fn as_commit_group_offset(&self) -> CmdCommitGroupOffset<'_> {
+        CmdCommitGroupOffset { buf: &self.buf }
     }
 
-    pub fn as_join_consumer_group(&self) -> CmdJoinConsumerGroup {
-        CmdJoinConsumerGroup {
-            buf: self.buf.clone(),
-        }
+    pub fn as_join_consumer_group(&self) -> CmdJoinConsumerGroup<'_> {
+        CmdJoinConsumerGroup { buf: &self.buf }
     }
 
-    pub fn as_sync_consumer_group(&self) -> CmdSyncConsumerGroup {
-        CmdSyncConsumerGroup {
-            buf: self.buf.clone(),
-        }
+    pub fn as_sync_consumer_group(&self) -> CmdSyncConsumerGroup<'_> {
+        CmdSyncConsumerGroup { buf: &self.buf }
     }
 
-    pub fn as_leave_consumer_group(&self) -> CmdLeaveConsumerGroup {
-        CmdLeaveConsumerGroup {
-            buf: self.buf.clone(),
-        }
+    pub fn as_leave_consumer_group(&self) -> CmdLeaveConsumerGroup<'_> {
+        CmdLeaveConsumerGroup { buf: &self.buf }
     }
 
-    pub fn as_heartbeat_consumer_group(&self) -> CmdHeartbeatConsumerGroup {
-        CmdHeartbeatConsumerGroup {
-            buf: self.buf.clone(),
-        }
+    pub fn as_heartbeat_consumer_group(&self) -> CmdHeartbeatConsumerGroup<'_> {
+        CmdHeartbeatConsumerGroup { buf: &self.buf }
     }
 
-    pub fn as_set_retained(&self) -> CmdSetRetained {
-        CmdSetRetained {
-            buf: self.buf.clone(),
-        }
+    pub fn as_set_retained(&self) -> CmdSetRetained<'_> {
+        CmdSetRetained { buf: &self.buf }
     }
 
-    pub fn as_get_retained(&self) -> CmdGetRetained {
-        CmdGetRetained {
-            buf: self.buf.clone(),
-        }
+    pub fn as_get_retained(&self) -> CmdGetRetained<'_> {
+        CmdGetRetained { buf: &self.buf }
     }
 
-    pub fn as_delete_retained(&self) -> CmdDeleteRetained {
-        CmdDeleteRetained {
-            buf: self.buf.clone(),
-        }
+    pub fn as_delete_retained(&self) -> CmdDeleteRetained<'_> {
+        CmdDeleteRetained { buf: &self.buf }
     }
 
-    pub fn as_set_will(&self) -> CmdSetWill {
-        CmdSetWill {
-            buf: self.buf.clone(),
-        }
+    pub fn as_set_will(&self) -> CmdSetWill<'_> {
+        CmdSetWill { buf: &self.buf }
     }
 
-    pub fn as_persist_session(&self) -> CmdPersistSession {
-        CmdPersistSession {
-            buf: self.buf.clone(),
-        }
+    pub fn as_persist_session(&self) -> CmdPersistSession<'_> {
+        CmdPersistSession { buf: &self.buf }
     }
 
-    pub fn as_restore_session(&self) -> CmdRestoreSession {
-        CmdRestoreSession {
-            buf: self.buf.clone(),
-        }
+    pub fn as_restore_session(&self) -> CmdRestoreSession<'_> {
+        CmdRestoreSession { buf: &self.buf }
     }
 
-    pub fn as_publish_to_dlq(&self) -> CmdPublishToDlq {
-        CmdPublishToDlq {
-            buf: self.buf.clone(),
-        }
+    pub fn as_publish_to_dlq(&self) -> CmdPublishToDlq<'_> {
+        CmdPublishToDlq { buf: &self.buf }
     }
 
     // -- Message extraction helpers --
@@ -1892,20 +2284,38 @@ impl MqCommand {
     /// For `Publish` or `PublishToExchange`: iterate messages zero-copy via vec_bytes.
     /// Returns `None` for other command types.
     #[inline]
-    pub fn publish_messages(&self) -> Option<VecBytesIter> {
+    pub fn publish_messages(&self) -> Option<VecBytesIter<'_>> {
         let tag = self.tag();
-        if tag != Self::TAG_PUBLISH && tag != Self::TAG_PUBLISH_TO_EXCHANGE {
+        if tag != Self::TAG_PUBLISH
+            && tag != Self::TAG_PUBLISH_TO_EXCHANGE
+            && tag != Self::TAG_PUBLISH_TO_EXCHANGE_MQTT
+        {
             return None;
         }
         // vec_bytes slot at @16: [count:4][offset:4]
         let count = self.field_vec_bytes_count(16);
-        Some(VecBytesIter::new(self, 16, count))
+        Some(VecBytesIter::new(&self.buf, 16, count))
+    }
+
+    /// For `Publish`, `PublishToExchange`, or `PublishToExchangeMqtt`: iterate
+    /// messages as borrowed slices — avoids `Bytes::slice()` overhead.
+    /// Returns `None` for other command types.
+    #[inline]
+    pub fn publish_messages_slice_iter(&self) -> Option<VecSliceIter<'_>> {
+        let tag = self.tag();
+        if tag != Self::TAG_PUBLISH
+            && tag != Self::TAG_PUBLISH_TO_EXCHANGE
+            && tag != Self::TAG_PUBLISH_TO_EXCHANGE_MQTT
+        {
+            return None;
+        }
+        Some(VecSliceIter::new(&self.buf, 16))
     }
 
     /// If this is a `Publish` for the given `topic_id`, return a zero-copy
     /// message iterator. Returns `None` otherwise.
     #[inline]
-    pub fn publish_messages_for_topic(&self, topic_id: u64) -> Option<VecBytesIter> {
+    pub fn publish_messages_for_topic(&self, topic_id: u64) -> Option<VecBytesIter<'_>> {
         if self.tag() != Self::TAG_PUBLISH {
             return None;
         }
@@ -1914,7 +2324,7 @@ impl MqCommand {
             return None;
         }
         let count = self.field_vec_bytes_count(16);
-        Some(VecBytesIter::new(self, 16, count))
+        Some(VecBytesIter::new(&self.buf, 16, count))
     }
 }
 
@@ -1965,17 +2375,21 @@ fn read_blob(buf: &[u8], offset: usize) -> &[u8] {
 
 /// Zero-copy view over a CreateTopic command.
 /// Layout: @8 name:flex8, @16 retention:blob, @24 partition_count:u32
-pub struct CmdCreateTopic {
-    buf: Bytes,
+pub struct CmdCreateTopic<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdCreateTopic {
+impl<'a> CmdCreateTopic<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn name(&self) -> &str {
-        std::str::from_utf8(read_flex8(&self.buf, 8)).unwrap_or("")
+        std::str::from_utf8(read_flex8(self.buf, 8)).unwrap_or("")
     }
 
     pub fn retention(&self) -> RetentionPolicy {
-        let blob = read_blob(&self.buf, 16);
+        let blob = read_blob(self.buf, 16);
         if blob.is_empty() {
             return RetentionPolicy::default();
         }
@@ -1990,11 +2404,15 @@ impl CmdCreateTopic {
 
 /// Zero-copy view over a Publish command.
 /// Layout: @8 topic_id:u64, @16 messages:vec_bytes
-pub struct CmdPublish {
-    buf: Bytes,
+pub struct CmdPublish<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdPublish {
+impl<'a> CmdPublish<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn topic_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
@@ -2003,25 +2421,30 @@ impl CmdPublish {
         u32::from_le_bytes(self.buf[16..20].try_into().unwrap())
     }
 
-    pub fn messages(&self) -> VecBytesIter {
+    pub fn messages(&self) -> VecBytesIter<'a> {
         let count = self.message_count();
-        let cmd = MqCommand {
-            buf: self.buf.clone(),
-            segments: None,
-        };
-        VecBytesIter::new(&cmd, 16, count)
+        VecBytesIter::new(self.buf, 16, count)
+    }
+
+    /// Borrowed-slice iterator over the messages.
+    pub fn messages_slice_iter(&self) -> VecSliceIter<'a> {
+        VecSliceIter::new(self.buf, 16)
     }
 }
 
 /// Zero-copy view over a CreateExchange command.
 /// Layout: flags=exchange_type, @8 name:flex8
-pub struct CmdCreateExchange {
-    buf: Bytes,
+pub struct CmdCreateExchange<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdCreateExchange {
+impl<'a> CmdCreateExchange<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn name(&self) -> &str {
-        read_flex8_str(&self.buf, 8)
+        read_flex8_str(self.buf, 8)
     }
 
     pub fn exchange_type(&self) -> ExchangeType {
@@ -2038,11 +2461,15 @@ impl CmdCreateExchange {
 /// Zero-copy view over a CreateBinding command.
 /// Layout: flags[0]=no_local, @8 exchange_id:u64, @16 topic_id:u64,
 ///         @24 routing_key:opt_flex8, @32 shared_group:opt_flex8
-pub struct CmdCreateBinding {
-    buf: Bytes,
+pub struct CmdCreateBinding<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdCreateBinding {
+impl<'a> CmdCreateBinding<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn exchange_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
@@ -2052,7 +2479,7 @@ impl CmdCreateBinding {
     }
 
     pub fn routing_key(&self) -> Option<String> {
-        let data = read_flex8(&self.buf, 24);
+        let data = read_flex8(self.buf, 24);
         if data.is_empty() {
             None
         } else {
@@ -2065,7 +2492,7 @@ impl CmdCreateBinding {
     }
 
     pub fn shared_group(&self) -> Option<String> {
-        let data = read_flex8(&self.buf, 32);
+        let data = read_flex8(self.buf, 32);
         if data.is_empty() {
             None
         } else {
@@ -2085,33 +2512,42 @@ impl CmdCreateBinding {
 
 /// Zero-copy view over a PublishToExchange command.
 /// Layout: @8 exchange_id:u64, @16 messages:vec_bytes
-pub struct CmdPublishToExchange {
-    buf: Bytes,
+pub struct CmdPublishToExchange<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdPublishToExchange {
+impl<'a> CmdPublishToExchange<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn exchange_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
-    pub fn messages(&self) -> VecBytesIter {
+    pub fn messages(&self) -> VecBytesIter<'a> {
         let count = u32::from_le_bytes(self.buf[16..20].try_into().unwrap());
-        let cmd = MqCommand {
-            buf: self.buf.clone(),
-            segments: None,
-        };
-        VecBytesIter::new(&cmd, 16, count)
+        VecBytesIter::new(self.buf, 16, count)
+    }
+
+    /// Borrowed-slice iterator over the messages — avoids `Bytes::slice()` overhead.
+    pub fn messages_slice_iter(&self) -> VecSliceIter<'a> {
+        VecSliceIter::new(self.buf, 16)
     }
 }
 
 /// Zero-copy view over a PublishToDlq command.
 /// Layout: @8 source_group_id:u64, @16 dlq_topic_id:u64,
 ///         @24 dead_letter_ids:vec_u64, @32 messages:vec_bytes
-pub struct CmdPublishToDlq {
-    buf: Bytes,
+pub struct CmdPublishToDlq<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdPublishToDlq {
+impl<'a> CmdPublishToDlq<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn source_group_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
@@ -2136,31 +2572,31 @@ impl CmdPublishToDlq {
         v
     }
 
-    pub fn messages(&self) -> VecBytesIter {
+    pub fn messages(&self) -> VecBytesIter<'a> {
         let count = u32::from_le_bytes(self.buf[32..36].try_into().unwrap());
-        let cmd = MqCommand {
-            buf: self.buf.clone(),
-            segments: None,
-        };
-        VecBytesIter::new(&cmd, 32, count)
+        VecBytesIter::new(self.buf, 32, count)
     }
 }
 
 /// Zero-copy view over a Batch command.
 /// Layout: @8 count:u32, fixed=16, flex: self-sized sub-commands with 8-byte padding
-pub struct CmdBatch {
-    buf: Bytes,
+pub struct CmdBatch<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdBatch {
+impl<'a> CmdBatch<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn count(&self) -> u32 {
         u32::from_le_bytes(self.buf[8..12].try_into().unwrap())
     }
 
-    pub fn commands(&self) -> BatchIter {
+    pub fn commands(&self) -> BatchIter<'a> {
         // Sub-commands start at offset 16 (fixed_size)
         BatchIter {
-            buf: self.buf.clone(),
+            buf: self.buf,
             offset: 16,
             remaining: self.count(),
         }
@@ -2175,13 +2611,17 @@ impl CmdBatch {
 /// Layout: @8 name:flex8, @16 dlq_topic_name:flex8, @24 response_topic_name:flex8,
 ///         @32 variant_config:blob, @40 topic_retention:blob, @48 topic_dedup:blob,
 ///         @56 auto_offset_reset:u8, auto_create_topic:u8, topic_lifetime:u8
-pub struct CmdCreateConsumerGroup {
-    buf: Bytes,
+pub struct CmdCreateConsumerGroup<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdCreateConsumerGroup {
+impl<'a> CmdCreateConsumerGroup<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn name(&self) -> &str {
-        read_flex8_str(&self.buf, 8)
+        read_flex8_str(self.buf, 8)
     }
 
     pub fn auto_offset_reset(&self) -> u8 {
@@ -2189,7 +2629,7 @@ impl CmdCreateConsumerGroup {
     }
 
     pub fn variant_config(&self) -> VariantConfig {
-        let blob = read_blob(&self.buf, 32);
+        let blob = read_blob(self.buf, 32);
         if blob.is_empty() {
             return VariantConfig::default();
         }
@@ -2202,7 +2642,7 @@ impl CmdCreateConsumerGroup {
     }
 
     pub fn topic_retention(&self) -> RetentionPolicy {
-        let blob = read_blob(&self.buf, 40);
+        let blob = read_blob(self.buf, 40);
         if blob.is_empty() {
             return RetentionPolicy::default();
         }
@@ -2211,7 +2651,7 @@ impl CmdCreateConsumerGroup {
     }
 
     pub fn topic_dedup(&self) -> Option<TopicDedupConfig> {
-        let blob = read_blob(&self.buf, 48);
+        let blob = read_blob(self.buf, 48);
         if blob.is_empty() {
             return None;
         }
@@ -2227,7 +2667,7 @@ impl CmdCreateConsumerGroup {
     }
 
     pub fn dlq_topic_name(&self) -> Option<String> {
-        let data = read_flex8(&self.buf, 16);
+        let data = read_flex8(self.buf, 16);
         if data.is_empty() {
             None
         } else {
@@ -2236,7 +2676,7 @@ impl CmdCreateConsumerGroup {
     }
 
     pub fn response_topic_name(&self) -> Option<String> {
-        let data = read_flex8(&self.buf, 24);
+        let data = read_flex8(self.buf, 24);
         if data.is_empty() {
             None
         } else {
@@ -2249,11 +2689,15 @@ impl CmdCreateConsumerGroup {
 /// Layout: @8 group_id:u64, @16 topic_id:u64, @24 offset:u64,
 ///         @32 timestamp:u64, @40 metadata:opt_flex8,
 ///         @48 generation:i32, partition_index:u32
-pub struct CmdCommitGroupOffset {
-    buf: Bytes,
+pub struct CmdCommitGroupOffset<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdCommitGroupOffset {
+impl<'a> CmdCommitGroupOffset<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn group_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
@@ -2275,7 +2719,7 @@ impl CmdCommitGroupOffset {
     }
 
     pub fn metadata(&self) -> Option<&str> {
-        let data = read_flex8(&self.buf, 40);
+        let data = read_flex8(self.buf, 40);
         if data.is_empty() {
             None
         } else {
@@ -2283,13 +2727,10 @@ impl CmdCommitGroupOffset {
         }
     }
 
-    /// Zero-copy metadata slice from the command buffer.
-    pub fn metadata_bytes(&self) -> Option<Bytes> {
-        let cmd = MqCommand {
-            buf: self.buf.clone(),
-            segments: None,
-        };
-        cmd.field_opt_flex8_bytes(40)
+    /// Zero-copy metadata bytes from the command buffer.
+    pub fn metadata_bytes(&self) -> Option<&'a [u8]> {
+        let data = read_flex8(self.buf, 40);
+        if data.is_empty() { None } else { Some(data) }
     }
 
     pub fn timestamp(&self) -> u64 {
@@ -2301,21 +2742,25 @@ impl CmdCommitGroupOffset {
 /// Layout: @8 group_id:u64, @16 member_id:flex8, @24 client_id:flex8,
 ///         @32 protocol_type:flex8, @40 session_timeout_ms:i32|rebalance_timeout_ms:i32,
 ///         @48 protocols:vec_kv
-pub struct CmdJoinConsumerGroup {
-    buf: Bytes,
+pub struct CmdJoinConsumerGroup<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdJoinConsumerGroup {
+impl<'a> CmdJoinConsumerGroup<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn group_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
     pub fn member_id(&self) -> &str {
-        read_flex8_str(&self.buf, 16)
+        read_flex8_str(self.buf, 16)
     }
 
     pub fn client_id(&self) -> &str {
-        read_flex8_str(&self.buf, 24)
+        read_flex8_str(self.buf, 24)
     }
 
     pub fn session_timeout_ms(&self) -> i32 {
@@ -2327,7 +2772,7 @@ impl CmdJoinConsumerGroup {
     }
 
     pub fn protocol_type(&self) -> &str {
-        read_flex8_str(&self.buf, 32)
+        read_flex8_str(self.buf, 32)
     }
 
     pub fn protocols_count(&self) -> u32 {
@@ -2343,8 +2788,8 @@ impl CmdJoinConsumerGroup {
         let mut result = Vec::with_capacity(count);
         for i in 0..count {
             let entry_off = table_offset + i * 16;
-            let name = read_flex8_str(&self.buf, entry_off);
-            let val = read_flex8(&self.buf, entry_off + 8);
+            let name = read_flex8_str(self.buf, entry_off);
+            let val = read_flex8(self.buf, entry_off + 8);
             result.push((name.to_string(), Bytes::copy_from_slice(val)));
         }
         result
@@ -2354,11 +2799,15 @@ impl CmdJoinConsumerGroup {
 /// Zero-copy view over a SyncConsumerGroup command.
 /// Layout: @8 group_id:u64, @16 member_id:flex8, @24 generation:i32,
 ///         @32 assignments:vec_kv
-pub struct CmdSyncConsumerGroup {
-    buf: Bytes,
+pub struct CmdSyncConsumerGroup<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdSyncConsumerGroup {
+impl<'a> CmdSyncConsumerGroup<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn group_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
@@ -2368,7 +2817,7 @@ impl CmdSyncConsumerGroup {
     }
 
     pub fn member_id(&self) -> &str {
-        read_flex8_str(&self.buf, 16)
+        read_flex8_str(self.buf, 16)
     }
 
     pub fn assignments_count(&self) -> u32 {
@@ -2384,8 +2833,8 @@ impl CmdSyncConsumerGroup {
         let mut result = Vec::with_capacity(count);
         for i in 0..count {
             let entry_off = table_offset + i * 16;
-            let mid = read_flex8_str(&self.buf, entry_off);
-            let data = read_flex8(&self.buf, entry_off + 8);
+            let mid = read_flex8_str(self.buf, entry_off);
+            let data = read_flex8(self.buf, entry_off + 8);
             result.push((mid.to_string(), data.to_vec()));
         }
         result
@@ -2394,33 +2843,41 @@ impl CmdSyncConsumerGroup {
 
 /// Zero-copy view over a LeaveConsumerGroup command.
 /// Layout: @8 group_id:u64, @16 member_id:flex8
-pub struct CmdLeaveConsumerGroup {
-    buf: Bytes,
+pub struct CmdLeaveConsumerGroup<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdLeaveConsumerGroup {
+impl<'a> CmdLeaveConsumerGroup<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn group_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
     pub fn member_id(&self) -> &str {
-        read_flex8_str(&self.buf, 16)
+        read_flex8_str(self.buf, 16)
     }
 }
 
 /// Zero-copy view over a HeartbeatConsumerGroup command.
 /// Layout: @8 group_id:u64, @16 member_id:flex8, @24 generation:i32
-pub struct CmdHeartbeatConsumerGroup {
-    buf: Bytes,
+pub struct CmdHeartbeatConsumerGroup<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdHeartbeatConsumerGroup {
+impl<'a> CmdHeartbeatConsumerGroup<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn group_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
     pub fn member_id(&self) -> &str {
-        read_flex8_str(&self.buf, 16)
+        read_flex8_str(self.buf, 16)
     }
 
     pub fn generation(&self) -> i32 {
@@ -2433,40 +2890,49 @@ impl CmdHeartbeatConsumerGroup {
 // =============================================================================
 
 /// Layout: @8 exchange_id:u64, @16 routing_key:flex8, @24 message:flex8
-pub struct CmdSetRetained {
-    buf: Bytes,
+pub struct CmdSetRetained<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdSetRetained {
+impl<'a> CmdSetRetained<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn exchange_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
     pub fn routing_key(&self) -> &str {
-        read_flex8_str(&self.buf, 16)
+        read_flex8_str(self.buf, 16)
     }
 
     pub fn message(&self) -> Bytes {
-        let cmd = MqCommand {
-            buf: self.buf.clone(),
-            segments: None,
-        };
-        cmd.field_opt_flex8_bytes(24).unwrap_or_default()
+        Bytes::copy_from_slice(read_flex8(self.buf, 24))
+    }
+
+    /// Zero-copy message slice from the command buffer.
+    pub fn message_bytes(&self) -> &'a [u8] {
+        read_flex8(self.buf, 24)
     }
 }
 
 /// Layout: @8 exchange_id:u64, @16 filter:opt_flex8
-pub struct CmdGetRetained {
-    buf: Bytes,
+pub struct CmdGetRetained<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdGetRetained {
+impl<'a> CmdGetRetained<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn exchange_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
     pub fn routing_key_filter(&self) -> Option<String> {
-        let data = read_flex8(&self.buf, 16);
+        let data = read_flex8(self.buf, 16);
         if data.is_empty() {
             None
         } else {
@@ -2476,27 +2942,35 @@ impl CmdGetRetained {
 }
 
 /// Layout: @8 exchange_id:u64, @16 routing_key:flex8
-pub struct CmdDeleteRetained {
-    buf: Bytes,
+pub struct CmdDeleteRetained<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdDeleteRetained {
+impl<'a> CmdDeleteRetained<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn exchange_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
     pub fn routing_key(&self) -> &str {
-        read_flex8_str(&self.buf, 16)
+        read_flex8_str(self.buf, 16)
     }
 }
 
 /// Layout: flags=[qos:2bits|retain:1bit], @8 session_id:u64, @16 topic_id:u64,
 ///         @24 routing_key:flex8, @32 message:flex8, @40 delay_secs:u32
-pub struct CmdSetWill {
-    buf: Bytes,
+pub struct CmdSetWill<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdSetWill {
+impl<'a> CmdSetWill<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn consumer_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
@@ -2518,32 +2992,32 @@ impl CmdSetWill {
     }
 
     pub fn routing_key(&self) -> String {
-        read_flex8_str(&self.buf, 24).to_string()
+        read_flex8_str(self.buf, 24).to_string()
     }
 
     pub fn message(&self) -> Bytes {
-        let cmd = MqCommand {
-            buf: self.buf.clone(),
-            segments: None,
-        };
-        cmd.field_opt_flex8_bytes(32).unwrap_or_default()
+        Bytes::copy_from_slice(read_flex8(self.buf, 32))
     }
 }
 
 /// Layout: @8 session_id:u64, @16 remaining_quota:u64, @24 client_id:flex8,
 ///         @32 subscription_data:flex8, @40 session_expiry_secs:u32|inbound_qos_inflight:u32,
 ///         @48 outbound_qos1_count:u32
-pub struct CmdPersistSession {
-    buf: Bytes,
+pub struct CmdPersistSession<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdPersistSession {
+impl<'a> CmdPersistSession<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn consumer_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
     pub fn client_id(&self) -> &str {
-        read_flex8_str(&self.buf, 24)
+        read_flex8_str(self.buf, 24)
     }
 
     pub fn session_expiry_secs(&self) -> u32 {
@@ -2551,11 +3025,7 @@ impl CmdPersistSession {
     }
 
     pub fn subscription_data(&self) -> Bytes {
-        let cmd = MqCommand {
-            buf: self.buf.clone(),
-            segments: None,
-        };
-        cmd.field_opt_flex8_bytes(32).unwrap_or_default()
+        Bytes::copy_from_slice(read_flex8(self.buf, 32))
     }
 
     pub fn inbound_qos_inflight(&self) -> u32 {
@@ -2572,13 +3042,17 @@ impl CmdPersistSession {
 }
 
 /// Layout: @8 client_id:flex8
-pub struct CmdRestoreSession {
-    buf: Bytes,
+pub struct CmdRestoreSession<'a> {
+    buf: &'a [u8],
 }
 
-impl CmdRestoreSession {
+impl<'a> CmdRestoreSession<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
     pub fn client_id(&self) -> &str {
-        read_flex8_str(&self.buf, 8)
+        read_flex8_str(self.buf, 8)
     }
 }
 
@@ -2586,14 +3060,14 @@ impl CmdRestoreSession {
 // Iterators
 // =============================================================================
 
-pub struct BatchIter {
-    buf: Bytes,
+pub struct BatchIter<'a> {
+    buf: &'a [u8],
     offset: usize,
     remaining: u32,
 }
 
-impl Iterator for BatchIter {
-    type Item = MqCommand;
+impl<'a> Iterator for BatchIter<'a> {
+    type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
@@ -2603,14 +3077,11 @@ impl Iterator for BatchIter {
         // Each sub-command is self-sized: first 4 bytes = total size (including header)
         let size =
             u32::from_le_bytes(self.buf[self.offset..self.offset + 4].try_into().unwrap()) as usize;
-        let cmd = MqCommand {
-            buf: self.buf.slice(self.offset..self.offset + size),
-            segments: None,
-        };
+        let slice = &self.buf[self.offset..self.offset + size];
         // Advance by size, padded to 8-byte boundary
         let padded = (size + 7) & !7;
         self.offset += padded;
-        Some(cmd)
+        Some(slice)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -2619,31 +3090,27 @@ impl Iterator for BatchIter {
     }
 }
 
-impl ExactSizeIterator for BatchIter {}
+impl ExactSizeIterator for BatchIter<'_> {}
 
 /// Zero-copy iterator over vec_bytes descriptor table.
 /// Uses O(1) random access per element via [size:4][offset:4] descriptors.
-pub struct VecBytesIter {
-    buf: Bytes,
+pub struct VecBytesIter<'a> {
+    buf: &'a [u8],
     table_offset: usize,
     index: usize,
     count: usize,
 }
 
-impl VecBytesIter {
-    /// Create from a command and slot offset. `count` is the element count.
-    pub fn new(cmd: &MqCommand, slot_offset: usize, count: u32) -> Self {
+impl<'a> VecBytesIter<'a> {
+    /// Create from a raw buffer and slot offset. `count` is the element count.
+    pub fn new(buf: &'a [u8], slot_offset: usize, count: u32) -> Self {
         let table_offset = if count == 0 {
             0
         } else {
-            u32::from_le_bytes(
-                cmd.buf[slot_offset + 4..slot_offset + 8]
-                    .try_into()
-                    .unwrap(),
-            ) as usize
+            u32::from_le_bytes(buf[slot_offset + 4..slot_offset + 8].try_into().unwrap()) as usize
         };
         Self {
-            buf: cmd.buf.clone(),
+            buf,
             table_offset,
             index: 0,
             count: count as usize,
@@ -2656,7 +3123,7 @@ impl VecBytesIter {
     }
 }
 
-impl Iterator for VecBytesIter {
+impl<'a> Iterator for VecBytesIter<'a> {
     type Item = Bytes;
 
     #[inline]
@@ -2669,7 +3136,9 @@ impl Iterator for VecBytesIter {
         let data_offset =
             u32::from_le_bytes(self.buf[desc + 4..desc + 8].try_into().unwrap()) as usize;
         self.index += 1;
-        Some(self.buf.slice(data_offset..data_offset + size))
+        Some(Bytes::copy_from_slice(
+            &self.buf[data_offset..data_offset + size],
+        ))
     }
 
     #[inline]
@@ -2679,15 +3148,71 @@ impl Iterator for VecBytesIter {
     }
 }
 
-impl ExactSizeIterator for VecBytesIter {}
+impl ExactSizeIterator for VecBytesIter<'_> {}
 
-pub struct FlatOptBytes {
-    buf: Bytes,
+/// Iterator over vec_bytes descriptor table that yields `&[u8]` slices
+/// instead of `Bytes`.
+pub struct VecSliceIter<'a> {
+    buf: &'a [u8],
+    count: usize,
+    table_offset: usize,
+    index: usize,
+}
+
+impl<'a> VecSliceIter<'a> {
+    /// Create from a raw buffer and the slot offset where `[count:4][table_offset:4]` lives.
+    pub fn new(buf: &'a [u8], slot_offset: usize) -> Self {
+        let count =
+            u32::from_le_bytes(buf[slot_offset..slot_offset + 4].try_into().unwrap()) as usize;
+        let table_offset = if count == 0 {
+            0
+        } else {
+            u32::from_le_bytes(buf[slot_offset + 4..slot_offset + 8].try_into().unwrap()) as usize
+        };
+        Self {
+            buf,
+            count,
+            table_offset,
+            index: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for VecSliceIter<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.index >= self.count {
+            return None;
+        }
+        let desc = self.table_offset + self.index * 8;
+        let len = u32::from_le_bytes(self.buf[desc..desc + 4].try_into().unwrap()) as usize;
+        let offset = u32::from_le_bytes(self.buf[desc + 4..desc + 8].try_into().unwrap()) as usize;
+        self.index += 1;
+        Some(&self.buf[offset..offset + len])
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let r = self.count - self.index;
+        (r, Some(r))
+    }
+}
+
+impl ExactSizeIterator for VecSliceIter<'_> {
+    fn len(&self) -> usize {
+        self.count - self.index
+    }
+}
+
+pub struct FlatOptBytes<'a> {
+    buf: &'a [u8],
     offset: usize,
     remaining: u32,
 }
 
-impl Iterator for FlatOptBytes {
+impl<'a> Iterator for FlatOptBytes<'a> {
     type Item = Option<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2703,7 +3228,7 @@ impl Iterator for FlatOptBytes {
             let len = u32::from_le_bytes(self.buf[self.offset..self.offset + 4].try_into().unwrap())
                 as usize;
             self.offset += 4;
-            let val = self.buf.slice(self.offset..self.offset + len);
+            let val = Bytes::copy_from_slice(&self.buf[self.offset..self.offset + len]);
             self.offset += len;
             Some(Some(val))
         }
@@ -2715,23 +3240,23 @@ impl Iterator for FlatOptBytes {
     }
 }
 
-impl ExactSizeIterator for FlatOptBytes {}
+impl ExactSizeIterator for FlatOptBytes<'_> {}
 
 /// Zero-copy iterator over length-prefixed messages in a flat command buffer.
-pub struct FlatMessages {
-    buf: Bytes,
+pub struct FlatMessages<'a> {
+    buf: &'a [u8],
     offset: usize,
     remaining: u32,
 }
 
-impl FlatMessages {
+impl FlatMessages<'_> {
     #[inline]
     pub fn remaining(&self) -> u32 {
         self.remaining
     }
 }
 
-impl Iterator for FlatMessages {
+impl<'a> Iterator for FlatMessages<'a> {
     type Item = Bytes;
 
     #[inline]
@@ -2751,7 +3276,7 @@ impl Iterator for FlatMessages {
             self.remaining = 0;
             return None;
         }
-        let slice = self.buf.slice(self.offset..self.offset + len);
+        let slice = Bytes::copy_from_slice(&self.buf[self.offset..self.offset + len]);
         self.offset += len;
         self.remaining -= 1;
         Some(slice)
@@ -2764,7 +3289,7 @@ impl Iterator for FlatMessages {
     }
 }
 
-impl ExactSizeIterator for FlatMessages {}
+impl ExactSizeIterator for FlatMessages<'_> {}
 
 // =============================================================================
 // fmt_mq_command — Display formatter for MqCommand
@@ -2803,7 +3328,7 @@ pub fn fmt_mq_command(cmd: &MqCommand, f: &mut std::fmt::Formatter<'_>) -> std::
                 cmd.field_u64(16)
             )
         }
-        MqCommand::TAG_SET_RETAINED => {
+        MqCommand::TAG_SET_RETAINED | MqCommand::TAG_SET_RETAINED_MQTT => {
             let v = cmd.as_set_retained();
             write!(
                 f,
@@ -2845,7 +3370,7 @@ pub fn fmt_mq_command(cmd: &MqCommand, f: &mut std::fmt::Formatter<'_>) -> std::
             )
         }
         MqCommand::TAG_DELETE_BINDING => write!(f, "DeleteBinding({})", cmd.field_u64(8)),
-        MqCommand::TAG_PUBLISH_TO_EXCHANGE => {
+        MqCommand::TAG_PUBLISH_TO_EXCHANGE | MqCommand::TAG_PUBLISH_TO_EXCHANGE_MQTT => {
             let v = cmd.as_publish_to_exchange();
             write!(f, "PublishToExchange(exchange={})", v.exchange_id())
         }
@@ -3441,11 +3966,17 @@ mod tests {
         let cmd = MqCommand::batch(&cmds);
         let v = cmd.as_batch();
         assert_eq!(v.count(), 3);
-        let sub_cmds: Vec<MqCommand> = v.commands().collect();
+        let sub_cmds: Vec<&[u8]> = v.commands().collect();
         assert_eq!(sub_cmds.len(), 3);
-        assert_eq!(sub_cmds[0].tag(), MqCommand::TAG_DELETE_TOPIC);
-        assert_eq!(sub_cmds[1].tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(sub_cmds[2].tag(), MqCommand::TAG_HEARTBEAT_SESSION);
+        assert_eq!(
+            crate::types::buf_tag(sub_cmds[0]),
+            MqCommand::TAG_DELETE_TOPIC
+        );
+        assert_eq!(crate::types::buf_tag(sub_cmds[1]), MqCommand::TAG_PUBLISH);
+        assert_eq!(
+            crate::types::buf_tag(sub_cmds[2]),
+            MqCommand::TAG_HEARTBEAT_SESSION
+        );
     }
 
     #[test]
@@ -3530,10 +4061,7 @@ mod tests {
             ),
             (MqCommand::delete_topic(42), "DeleteTopic(42)"),
             (
-                MqCommand::publish(
-                    1,
-                    &[crate::flat::FlatMessageBuilder::new(Bytes::from_static(b"x")).build()],
-                ),
+                MqCommand::publish(1, &[crate::flat::FlatMessageBuilder::new(b"x").build()]),
                 "Publish(topic=1, count=1)",
             ),
             (
@@ -3942,11 +4470,11 @@ mod tests {
         ];
         let batch = MqCommand::batch(&cmds);
         let v = batch.as_batch();
-        let sub_cmds: Vec<MqCommand> = v.commands().collect();
+        let sub_cmds: Vec<&[u8]> = v.commands().collect();
         assert_eq!(sub_cmds.len(), 3);
-        assert_eq!(sub_cmds[0].field_u64(8), 1);
-        assert_eq!(sub_cmds[1].field_u64(8), 2);
-        assert_eq!(sub_cmds[2].field_u64(8), 3);
+        assert_eq!(crate::types::buf_field_u64(sub_cmds[0], 8), 1);
+        assert_eq!(crate::types::buf_field_u64(sub_cmds[1], 8), 2);
+        assert_eq!(crate::types::buf_field_u64(sub_cmds[2], 8), 3);
     }
 
     #[test]
@@ -3957,16 +4485,22 @@ mod tests {
             MqCommand::delete_topic(99),
         ];
         let batch = MqCommand::batch(&cmds);
-        let sub_cmds: Vec<MqCommand> = batch.as_batch().commands().collect();
+        let sub_cmds: Vec<&[u8]> = batch.as_batch().commands().collect();
         assert_eq!(sub_cmds.len(), 3);
-        assert_eq!(sub_cmds[0].tag(), MqCommand::TAG_CREATE_TOPIC);
-        assert_eq!(sub_cmds[0].as_create_topic().name(), "short");
-        assert_eq!(sub_cmds[1].tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(sub_cmds[1].as_publish().topic_id(), 1);
-        let msgs: Vec<Bytes> = sub_cmds[1].as_publish().messages().collect();
+        assert_eq!(
+            crate::types::buf_tag(sub_cmds[0]),
+            MqCommand::TAG_CREATE_TOPIC
+        );
+        assert_eq!(CmdCreateTopic::from_buf(sub_cmds[0]).name(), "short");
+        assert_eq!(crate::types::buf_tag(sub_cmds[1]), MqCommand::TAG_PUBLISH);
+        assert_eq!(CmdPublish::from_buf(sub_cmds[1]).topic_id(), 1);
+        let msgs: Vec<Bytes> = CmdPublish::from_buf(sub_cmds[1]).messages().collect();
         assert_eq!(msgs[0], Bytes::from_static(b"hello world data"));
-        assert_eq!(sub_cmds[2].tag(), MqCommand::TAG_DELETE_TOPIC);
-        assert_eq!(sub_cmds[2].field_u64(8), 99);
+        assert_eq!(
+            crate::types::buf_tag(sub_cmds[2]),
+            MqCommand::TAG_DELETE_TOPIC
+        );
+        assert_eq!(crate::types::buf_field_u64(sub_cmds[2], 8), 99);
     }
 
     #[test]
@@ -4173,11 +4707,11 @@ mod tests {
         let batch = MqCommand::batch(&cmds);
         let v = batch.as_batch();
         assert_eq!(v.count(), 50);
-        let sub_cmds: Vec<MqCommand> = v.commands().collect();
+        let sub_cmds: Vec<&[u8]> = v.commands().collect();
         assert_eq!(sub_cmds.len(), 50);
         for (i, sub) in sub_cmds.iter().enumerate() {
-            assert_eq!(sub.tag(), MqCommand::TAG_DELETE_TOPIC);
-            assert_eq!(sub.field_u64(8), i as u64);
+            assert_eq!(crate::types::buf_tag(sub), MqCommand::TAG_DELETE_TOPIC);
+            assert_eq!(crate::types::buf_field_u64(sub, 8), i as u64);
         }
     }
 
@@ -4192,10 +4726,6 @@ mod tests {
         let contiguous = MqCommand::publish(42, &msgs);
         let scatter = MqCommand::publish_scatter(42, msgs.clone());
 
-        // Scatter should not be contiguous
-        assert!(scatter.is_scatter());
-        assert!(!contiguous.is_scatter());
-
         // Encoded sizes must match
         assert_eq!(contiguous.encoded_size(), scatter.encoded_size());
 
@@ -4204,7 +4734,7 @@ mod tests {
         let s_bytes = scatter.encode_to_vec().unwrap();
         assert_eq!(c_bytes, s_bytes);
 
-        // Decode the scatter-encoded bytes and verify field access works
+        // Decode the encoded bytes and verify field access works
         let decoded = MqCommand::decode_from_bytes(Bytes::from(s_bytes)).unwrap();
         let v = decoded.as_publish();
         assert_eq!(v.topic_id(), 42);
@@ -4219,8 +4749,6 @@ mod tests {
     fn publish_scatter_empty() {
         let contiguous = MqCommand::publish(99, &[]);
         let scatter = MqCommand::publish_scatter(99, vec![]);
-        // Empty scatter should not have segments
-        assert!(!scatter.is_scatter());
         assert_eq!(
             contiguous.encode_to_vec().unwrap(),
             scatter.encode_to_vec().unwrap()
@@ -4231,7 +4759,7 @@ mod tests {
     fn batch_with_scatter_subcommands() {
         let msgs: Vec<Bytes> = vec![Bytes::from_static(b"aaa"), Bytes::from_static(b"bbb")];
 
-        // Batch containing a mix of scatter and contiguous commands
+        // Batch containing publish_scatter and contiguous commands
         let scatter_pub = MqCommand::publish_scatter(1, msgs.clone());
         let contiguous_pub = MqCommand::publish(2, &msgs);
         let delete = MqCommand::delete_topic(3);
@@ -4240,26 +4768,26 @@ mod tests {
         let v = batch.as_batch();
         assert_eq!(v.count(), 3);
 
-        let sub_cmds: Vec<MqCommand> = v.commands().collect();
-        // Verify first sub-command (was scatter, now contiguous in batch)
-        let pub1 = sub_cmds[0].as_publish();
+        let sub_cmds: Vec<&[u8]> = v.commands().collect();
+        let pub1 = CmdPublish::from_buf(sub_cmds[0]);
         assert_eq!(pub1.topic_id(), 1);
         let m1: Vec<Bytes> = pub1.messages().collect();
         assert_eq!(m1, msgs);
 
-        // Verify second sub-command (was contiguous)
-        let pub2 = sub_cmds[1].as_publish();
+        let pub2 = CmdPublish::from_buf(sub_cmds[1]);
         assert_eq!(pub2.topic_id(), 2);
         let m2: Vec<Bytes> = pub2.messages().collect();
         assert_eq!(m2, msgs);
 
-        // Verify third sub-command
-        assert_eq!(sub_cmds[2].tag(), MqCommand::TAG_DELETE_TOPIC);
-        assert_eq!(sub_cmds[2].field_u64(8), 3);
+        assert_eq!(
+            crate::types::buf_tag(sub_cmds[2]),
+            MqCommand::TAG_DELETE_TOPIC
+        );
+        assert_eq!(crate::types::buf_field_u64(sub_cmds[2], 8), 3);
     }
 
     #[test]
-    fn collect_publish_messages_scatter() {
+    fn collect_publish_messages_equivalence() {
         let msgs: Vec<Bytes> = vec![Bytes::from_static(b"x"), Bytes::from_static(b"yy")];
         let scatter = MqCommand::publish_scatter(1, msgs.clone());
         let collected = scatter.collect_publish_messages();

@@ -1,16 +1,23 @@
+use std::sync::Arc;
+
 use smallvec::SmallVec;
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 /// Push-based consumer group delivery notifier.
 ///
-/// Protocol adapters register interest in specific consumer groups via `watch()`.
-/// When the engine enqueues a message, it calls `notify()` to wake all
-/// watchers immediately — eliminating polling interval.
+/// Protocol adapters create a single `Arc<Notify>` per connection and register
+/// it for each consumer group they subscribe to via `watch()`. When the engine
+/// enqueues a message, `notify()` wakes all connections watching that group.
+///
+/// Uses `tokio::sync::Notify` with coalescing `notify_waiters()` semantics,
+/// matching the `HighWaterMark` pattern from `async_apply.rs`. Multiple
+/// `notify()` calls before a connection wakes coalesce into a single wakeup.
 ///
 /// This is a local (non-raft-replicated) mechanism; each node maintains
 /// its own notifier for its local protocol adapter connections.
 pub struct GroupNotifier {
-    watchers: papaya::HashMap<u64, SmallVec<[mpsc::UnboundedSender<()>; 4]>>,
+    /// group_id → list of per-connection Notify handles.
+    watchers: papaya::HashMap<u64, SmallVec<[Arc<Notify>; 4]>>,
 }
 
 impl GroupNotifier {
@@ -20,25 +27,29 @@ impl GroupNotifier {
         }
     }
 
-    /// Register a watcher for the given group. Returns a receiver that
-    /// will be signalled each time a message is available.
-    pub fn watch(&self, group_id: u64) -> mpsc::UnboundedReceiver<()> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// Register a connection-level `Notify` for the given group.
+    ///
+    /// The caller owns the `Arc<Notify>` and awaits `.notified()` in its
+    /// connection loop. When the engine calls `notify(group_id)`, all
+    /// registered Notifys are woken.
+    pub fn watch(&self, group_id: u64, notify: &Arc<Notify>) {
         let guard = self.watchers.pin();
-        let mut senders = guard.get(&group_id).cloned().unwrap_or_default();
-        senders.push(tx);
-        guard.insert(group_id, senders);
-        rx
+        let mut list = guard.get(&group_id).cloned().unwrap_or_default();
+        list.push(Arc::clone(notify));
+        guard.insert(group_id, list);
     }
 
     /// Notify all watchers for the given group that a message is available.
-    /// Dead senders (whose receivers have been dropped) are cleaned up.
+    ///
+    /// Iterates the registered Notify handles by reference (no clone).
+    /// Uses `notify_waiters()` for coalescing semantics.
+    #[inline]
     pub fn notify(&self, group_id: u64) {
         let guard = self.watchers.pin();
-        if let Some(senders) = guard.get(&group_id).cloned() {
-            let mut senders = senders;
-            senders.retain(|tx| tx.send(()).is_ok());
-            guard.insert(group_id, senders);
+        if let Some(list) = guard.get(&group_id) {
+            for n in list.iter() {
+                n.notify_waiters();
+            }
         }
     }
 

@@ -13,17 +13,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bisque_mq::MqCommand;
-use bisque_mq::flat::{FlatMessage, FlatMessageBuilder};
-use bytes::Bytes;
+use bisque_mq::MqCommandBuffer;
+use bisque_mq::flat::{self, FlatMessageBuilder};
+use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
 use tracing::{debug, warn};
 
 use crate::auth::{AuthProvider, AuthResult, AuthState};
-use crate::codec::{validate_topic_filter, validate_topic_name};
+use crate::codec::{
+    encode_auth, encode_connack_v, encode_disconnect, encode_disconnect_reason, encode_ping_resp,
+    encode_puback_raw, encode_pubcomp_v, encode_pubrec_raw, encode_pubrel_v, encode_suback_raw,
+    encode_unsuback_v, validate_topic_filter, validate_topic_name,
+};
 use crate::types::{
-    Auth, ConnAck, Connect, ConnectReturnCode, Disconnect, MqttPacket, Properties, ProtocolVersion,
-    PubAck, PubComp, PubRec, PubRel, Publish, QoS, SubAck, UnsubAck, WillMessage,
+    Auth, ConnAck, Connect, ConnectReturnCode, Properties, ProtocolVersion, PubComp, PubRel,
+    Publish, QoS, UnsubAck, WillMessage,
 };
 
 // =============================================================================
@@ -37,8 +41,6 @@ pub(crate) const MQTT_EXCHANGE_NAME: &str = "mqtt/exchange";
 /// Static header key constants to avoid per-message allocation.
 static HDR_CONTENT_TYPE: Bytes = Bytes::from_static(b"mqtt.content_type");
 static HDR_PAYLOAD_FORMAT: Bytes = Bytes::from_static(b"mqtt.payload_format");
-static HDR_PUBLISHER_SESSION_ID: Bytes = Bytes::from_static(b"mqtt.publisher_session_id");
-static HDR_ORIGINAL_RETAIN: Bytes = Bytes::from_static(b"mqtt.original_retain");
 
 // =============================================================================
 // Session Configuration
@@ -68,6 +70,9 @@ pub struct MqttSessionConfig {
     /// Maximum cumulative PUBLISH quota per client (0 = unlimited).
     /// When exhausted, further PUBLISHes receive 0x97 (Quota exceeded).
     pub max_publish_quota: u64,
+    /// Skip MQTT topic name validation on inbound PUBLISH.
+    /// Trades correctness for throughput — only use in trusted environments.
+    pub skip_topic_validation: bool,
 }
 
 impl Default for MqttSessionConfig {
@@ -81,6 +86,7 @@ impl Default for MqttSessionConfig {
             maximum_qos: QoS::ExactlyOnce,
             max_publish_rate: 0,
             max_publish_quota: 0,
+            skip_topic_validation: false,
         }
     }
 }
@@ -242,22 +248,38 @@ pub struct SubDeliveryInfo {
 
 /// Plan for publishing a message. The server resolves entity IDs and submits
 /// commands in order.
+///
+/// ACK responses (PUBACK/PUBREC) and error DISCONNECTs are written directly
+/// to `session.out_buf` during `handle_publish` — no MqttPacket intermediaries.
 #[derive(Debug)]
 pub struct PublishPlan {
     /// The exchange name to route through.
     pub exchange_name: &'static str,
     /// Cached exchange_id if already known.
     pub cached_exchange_id: Option<u64>,
-    /// The flat message bytes to publish through the exchange.
-    pub flat_message: Bytes,
-    /// MQTT response packets to send back to the client (PUBACK/PUBREC).
-    pub responses: SmallVec<[MqttPacket; 2]>,
+    /// Start offset of the flat message in the shared `msg_buf`.
+    /// Used together with `msg_len` to extract the message slice.
+    /// When `msg_len == 0`, the publish is skipped (error/skip sentinel).
+    pub msg_start: usize,
+    /// Length of the flat message in the shared `msg_buf`.
+    pub msg_len: usize,
+    /// Owned flat message bytes for will messages and other cases that need
+    /// owned storage (e.g., delayed will publish after session is gone).
+    /// When `Some`, this takes precedence over `msg_start`/`msg_len`.
+    pub flat_message: Option<Bytes>,
     /// Optional retained message plan.
     pub retained: Option<RetainedPlan>,
-    /// If set, the server must disconnect the client with this DISCONNECT packet
-    /// after sending any response packets. Used for protocol errors detected
-    /// during PUBLISH handling (e.g., receive maximum exceeded, topic alias 0).
-    pub disconnect: Option<MqttPacket>,
+    /// If true, the server must disconnect the client after flushing out_buf.
+    /// The DISCONNECT packet is already encoded in out_buf.
+    pub need_disconnect: bool,
+}
+
+impl PublishPlan {
+    /// Returns true if this plan has no message to publish (skip/error sentinel).
+    #[inline]
+    pub fn has_message(&self) -> bool {
+        self.flat_message.is_some() || self.msg_len > 0
+    }
 }
 
 /// Plan for storing a retained message.
@@ -272,6 +294,9 @@ pub struct RetainedPlan {
 }
 
 /// Plan for subscribing to a topic filter.
+///
+/// The SUBACK response is written directly to `session.out_buf` during
+/// `handle_subscribe` — no MqttPacket intermediary.
 #[derive(Debug)]
 pub struct SubscribePlan {
     /// The exchange name (global MQTT exchange).
@@ -280,8 +305,6 @@ pub struct SubscribePlan {
     pub cached_exchange_id: Option<u64>,
     /// Per-filter subscription details.
     pub filters: SmallVec<[SubscribeFilterPlan; 4]>,
-    /// The SUBACK response packet.
-    pub suback: MqttPacket,
 }
 
 /// Per-filter subscription plan.
@@ -399,8 +422,6 @@ pub struct MqttSession {
     cached_delivery_info: Vec<SubDeliveryInfo>,
     /// True when cached_delivery_info needs rebuild.
     delivery_info_dirty: bool,
-    /// Pre-computed session ID as big-endian Bytes (avoids per-publish allocation).
-    session_id_bytes: Bytes,
 
     // -- MQTT 5.0 Problem Information --
     /// MQTT 5.0 SS 3.1.2.11.7: If false, the server MUST NOT send
@@ -420,6 +441,83 @@ pub struct MqttSession {
     rate_window_start_ms: u64,
     /// Remaining publish quota (decremented per PUBLISH). 0 = unlimited.
     remaining_quota: u64,
+
+    // -- Command output buffer --
+    /// Shared output buffer for MqCommands. Methods write commands directly
+    /// here via `MqCommandBuffer::write_*`. Callers drain commands after
+    /// each method call — zero per-command heap allocation.
+    pub cmd_buf: MqCommandBuffer,
+
+    // -- MQTT packet output buffer --
+    /// Reusable output buffer for MQTT response packets. Session methods
+    /// encode response bytes (ConnAck, PubRel, PubComp, PingResp, etc.)
+    /// directly here instead of returning MqttPacket values.
+    /// Callers flush this buffer to the TCP stream after each method call.
+    pub out_buf: BytesMut,
+}
+
+// ---------------------------------------------------------------------------
+// Raw property scanning helpers — used by handle_publish_fused to extract
+// specific property values without constructing a Properties struct.
+// ---------------------------------------------------------------------------
+
+/// Scan raw MQTT property bytes for a u16 property by ID.
+#[inline]
+fn scan_property_u16(props: &[u8], target_id: u8) -> Option<u16> {
+    let mut pos = 0;
+    while pos < props.len() {
+        let id = props[pos];
+        pos += 1;
+        if id == target_id {
+            if pos + 2 > props.len() {
+                return None;
+            }
+            return Some(u16::from_be_bytes([props[pos], props[pos + 1]]));
+        }
+        pos = flat::skip_mqtt_property(props, pos, id)?;
+    }
+    None
+}
+
+/// Scan raw MQTT property bytes for a u32 property by ID.
+#[inline]
+fn scan_property_u32(props: &[u8], target_id: u8) -> Option<u32> {
+    let mut pos = 0;
+    while pos < props.len() {
+        let id = props[pos];
+        pos += 1;
+        if id == target_id {
+            if pos + 4 > props.len() {
+                return None;
+            }
+            return Some(u32::from_be_bytes([
+                props[pos],
+                props[pos + 1],
+                props[pos + 2],
+                props[pos + 3],
+            ]));
+        }
+        pos = flat::skip_mqtt_property(props, pos, id)?;
+    }
+    None
+}
+
+/// Scan raw MQTT property bytes for a byte property by ID.
+#[inline]
+fn scan_property_byte(props: &[u8], target_id: u8) -> Option<u8> {
+    let mut pos = 0;
+    while pos < props.len() {
+        let id = props[pos];
+        pos += 1;
+        if id == target_id {
+            if pos >= props.len() {
+                return None;
+            }
+            return Some(props[pos]);
+        }
+        pos = flat::skip_mqtt_property(props, pos, id)?;
+    }
+    None
 }
 
 impl MqttSession {
@@ -457,13 +555,14 @@ impl MqttSession {
             queue_to_sub_id: HashMap::new(),
             cached_delivery_info: Vec::new(),
             delivery_info_dirty: true,
-            session_id_bytes: Bytes::copy_from_slice(&session_id.to_be_bytes()),
             request_problem_information: true,
             auth_state: AuthState::None,
             auth_provider: None,
             rate_window_count: 0,
             rate_window_start_ms: 0,
             remaining_quota: 0,
+            cmd_buf: MqCommandBuffer::new(256),
+            out_buf: BytesMut::with_capacity(128),
         }
     }
 
@@ -478,18 +577,21 @@ impl MqttSession {
     pub fn will_delay_interval(&self) -> u32 {
         self.will
             .as_ref()
-            .and_then(|w| w.properties.will_delay_interval)
+            .and_then(|w| w.properties().will_delay_interval())
             .unwrap_or(0)
     }
 
     /// Strip reason_string and user_properties from properties if
     /// request_problem_information is false (MQTT 5.0 SS 3.1.2.11.7).
     /// Only applies to non-CONNACK/DISCONNECT packets.
-    fn strip_problem_info(&self, props: &mut Properties) {
-        if !self.request_problem_information {
-            props.reason_string = None;
-            props.user_properties.clear();
-        }
+    ///
+    /// With zero-copy Properties, this is a no-op when called on
+    /// `Properties::default()` (which has no reason_string or user_properties).
+    /// For non-default properties, the caller should avoid adding those fields
+    /// to the builder when `request_problem_information` is false.
+    fn strip_problem_info(&self, _props: &Properties) {
+        // Properties is now a zero-copy type — fields cannot be mutated.
+        // This is a no-op since it is only called on Properties::default().
     }
 
     /// Check publish rate and quota limits. Returns `Ok(())` if allowed, or
@@ -702,8 +804,10 @@ impl MqttSession {
 
     /// Handle an incoming CONNECT packet.
     ///
-    /// Returns a list of `MqCommand`s to execute and the CONNACK response packet.
-    pub fn handle_connect(&mut self, connect: &Connect) -> (SmallVec<[MqCommand; 4]>, MqttPacket) {
+    /// Commands written to `cmd_buf`. Returns the CONNACK response packet.
+    pub fn handle_connect(&mut self, connect: &Connect) {
+        self.cmd_buf.clear();
+        self.out_buf.clear();
         self.protocol_version = connect.protocol_version;
         self.clean_session = connect.flags.clean_session;
         self.will = connect.will.clone();
@@ -720,19 +824,19 @@ impl MqttSession {
                         self.client_id = format!("auto-{:016x}", self.session_id);
                     } else {
                         // Return CONNACK with IdentifierRejected.
-                        return (
-                            SmallVec::new(),
-                            MqttPacket::ConnAck(ConnAck {
+                        encode_connack_v(
+                            &ConnAck {
                                 session_present: false,
                                 return_code: ConnectReturnCode::IdentifierRejected as u8,
-                                properties: Properties {
-                                    reason_string: Some(
-                                        "empty client ID requires clean_session=true".into(),
-                                    ),
-                                    ..Properties::default()
-                                },
-                            }),
+                                reason_string: Some(Bytes::from(
+                                    "empty client ID requires clean_session=true",
+                                )),
+                                ..ConnAck::default()
+                            },
+                            &mut self.out_buf,
+                            false,
                         );
+                        return;
                     }
                 }
                 ProtocolVersion::V5 => {
@@ -742,7 +846,7 @@ impl MqttSession {
                 }
             }
         } else {
-            self.client_id = connect.client_id.clone();
+            self.client_id = connect.client_id_str().to_string();
         }
 
         // Negotiate keep-alive (M16): only override keep_alive=0 with default for V3.1.1.
@@ -755,46 +859,48 @@ impl MqttSession {
             };
 
         // MQTT 5.0: extract properties
-        if let Some(max) = connect.properties.topic_alias_maximum {
+        if let Some(max) = connect.properties().topic_alias_maximum() {
             self.max_topic_alias = max;
         }
-        if let Some(rm) = connect.properties.receive_maximum {
+        if let Some(rm) = connect.properties().receive_maximum() {
             self.client_receive_maximum = rm;
         }
-        if let Some(mps) = connect.properties.maximum_packet_size {
+        if let Some(mps) = connect.properties().maximum_packet_size() {
             self.client_maximum_packet_size = mps;
         }
-        if let Some(sei) = connect.properties.session_expiry_interval {
+        if let Some(sei) = connect.properties().session_expiry_interval() {
             self.session_expiry_interval = sei;
         }
         // MQTT 5.0 SS 3.1.2.11.7: Request Problem Information.
         // Default is true (1). If 0, suppress reason_string and user_properties
         // on all packets except CONNACK and DISCONNECT.
-        if let Some(rpi) = connect.properties.request_problem_information {
+        if let Some(rpi) = connect.properties().request_problem_information() {
             self.request_problem_information = rpi != 0;
         }
 
         // Enhanced Authentication (MQTT 5.0, SS 3.1.2.11.9):
         // If the CONNECT contains an authentication_method, initiate the enhanced auth flow.
         if connect.protocol_version == ProtocolVersion::V5 {
-            if let Some(ref method) = connect.properties.authentication_method {
+            if let Some(method) = connect.properties().authentication_method() {
                 if let Some(ref provider) = self.auth_provider {
                     if !provider.supports_method(method) {
-                        return (
-                            SmallVec::new(),
-                            MqttPacket::ConnAck(ConnAck {
+                        encode_connack_v(
+                            &ConnAck {
                                 session_present: false,
                                 return_code: 0x8C, // Bad authentication method
-                                properties: Properties {
-                                    reason_string: Some("unsupported authentication method".into()),
-                                    ..Properties::default()
-                                },
-                            }),
+                                reason_string: Some(Bytes::from(
+                                    "unsupported authentication method",
+                                )),
+                                ..ConnAck::default()
+                            },
+                            &mut self.out_buf,
+                            true,
                         );
+                        return;
                     }
 
-                    let auth_data = connect.properties.authentication_data.as_deref();
-                    let username = connect.username.as_deref();
+                    let auth_data = connect.properties().authentication_data();
+                    let username = connect.username_str();
                     let password = connect.password.as_ref().map(|b| b.as_ref());
                     let result = provider.authenticate_connect(
                         method,
@@ -813,51 +919,52 @@ impl MqttSession {
                         } => {
                             // Send AUTH challenge, wait for client response.
                             self.auth_state = AuthState::WaitingForResponse {
-                                method: method.clone(),
+                                method: method.to_string(),
                                 step: 1,
                             };
-                            return (
-                                SmallVec::new(),
-                                MqttPacket::Auth(Auth {
+                            encode_auth(
+                                &Auth {
                                     reason_code: Auth::CONTINUE_AUTHENTICATION,
-                                    properties: Properties {
-                                        authentication_method: Some(method.clone()),
-                                        authentication_data: Some(authentication_data),
-                                        ..Properties::default()
-                                    },
-                                }),
+                                    authentication_method: Some(Bytes::from(method.to_string())),
+                                    authentication_data: Some(authentication_data),
+                                    reason_string: None,
+                                },
+                                &mut self.out_buf,
                             );
+                            return;
                         }
                         AuthResult::Failed {
                             reason_code,
                             reason_string,
                         } => {
-                            return (
-                                SmallVec::new(),
-                                MqttPacket::ConnAck(ConnAck {
+                            encode_connack_v(
+                                &ConnAck {
                                     session_present: false,
                                     return_code: reason_code,
-                                    properties: Properties {
-                                        reason_string,
-                                        ..Properties::default()
-                                    },
-                                }),
+                                    reason_string: reason_string.map(|s| Bytes::from(s)),
+                                    ..ConnAck::default()
+                                },
+                                &mut self.out_buf,
+                                true,
                             );
+                            return;
                         }
                     }
                 } else {
                     // No auth provider configured but client sent authentication_method.
-                    return (
-                        SmallVec::new(),
-                        MqttPacket::ConnAck(ConnAck {
+                    encode_connack_v(
+                        &ConnAck {
                             session_present: false,
                             return_code: 0x8C, // Bad authentication method
-                            properties: Properties {
-                                reason_string: Some("server does not support enhanced auth".into()),
-                                ..Properties::default()
-                            },
-                        }),
+                            reason_string: Some(Bytes::from(
+                                "server does not support enhanced auth",
+                            )),
+                            ..ConnAck::default()
+                        },
+                        &mut self.out_buf,
+                        true,
                     );
+                    return;
                 }
             }
         }
@@ -865,18 +972,17 @@ impl MqttSession {
         self.connected = true;
         // Set the server's receive maximum for inbound flow control enforcement.
         self.server_receive_maximum = self.config.max_inflight.min(65535) as u16;
-        let mut commands = SmallVec::new();
 
         // Compute consumer/producer name once to avoid double format! allocation.
         let consumer_name = format!("mqtt/{}", self.client_id);
 
         // Register this session with bisque-mq (unified consumer+producer).
-        commands.push(MqCommand::create_session(
+        self.cmd_buf.write_create_session(
             self.session_id,
             &consumer_name,
             (self.keep_alive as u64) * 1000,
             (self.session_expiry_interval as u64) * 1000,
-        ));
+        );
 
         // If clean session, clear any old subscription state.
         if self.clean_session {
@@ -897,39 +1003,51 @@ impl MqttSession {
         }
 
         // Build CONNACK with capabilities for MQTT 5.0.
-        let properties = if connect.protocol_version == ProtocolVersion::V5 {
+        let is_v5 = connect.protocol_version == ProtocolVersion::V5;
+        let response_info = if is_v5 {
             // MQTT 5.0 SS 3.1.2.11.7: If client sets request_response_information=1,
             // server MAY include response_information in CONNACK.
-            let response_information = if connect.properties.request_response_information == Some(1)
-            {
-                // Provide a response topic prefix the client can use for request/response.
-                Some(format!("mqtt/response/{}", self.client_id))
+            if connect.properties().request_response_information() == Some(1) {
+                Some(Bytes::from(format!("mqtt/response/{}", self.client_id)))
             } else {
                 None
-            };
-            Properties {
-                maximum_qos: Some(self.config.maximum_qos.as_u8()),
-                retain_available: Some(true),
-                maximum_packet_size: Some(self.config.max_packet_size as u32),
-                topic_alias_maximum: Some(65535),
-                wildcard_subscription_available: Some(true),
-                subscription_identifier_available: Some(true),
-                shared_subscription_available: Some(true),
-                receive_maximum: Some(self.config.max_inflight.min(65535) as u16),
-                server_keep_alive: Some(self.keep_alive),
-                assigned_client_identifier: assigned_client_id,
-                response_information,
-                ..Properties::default()
             }
         } else {
-            Properties::default()
+            None
         };
 
-        let connack = MqttPacket::ConnAck(ConnAck {
-            session_present: !self.clean_session,
-            return_code: ConnectReturnCode::Accepted as u8,
-            properties,
-        });
+        encode_connack_v(
+            &ConnAck {
+                session_present: !self.clean_session,
+                return_code: ConnectReturnCode::Accepted as u8,
+                maximum_qos: if is_v5 {
+                    Some(self.config.maximum_qos.as_u8())
+                } else {
+                    None
+                },
+                retain_available: if is_v5 { Some(true) } else { None },
+                maximum_packet_size: if is_v5 {
+                    Some(self.config.max_packet_size as u32)
+                } else {
+                    None
+                },
+                topic_alias_maximum: if is_v5 { Some(65535) } else { None },
+                wildcard_subscription_available: if is_v5 { Some(true) } else { None },
+                subscription_identifier_available: if is_v5 { Some(true) } else { None },
+                shared_subscription_available: if is_v5 { Some(true) } else { None },
+                receive_maximum: if is_v5 {
+                    Some(self.config.max_inflight.min(65535) as u16)
+                } else {
+                    None
+                },
+                server_keep_alive: if is_v5 { Some(self.keep_alive) } else { None },
+                assigned_client_identifier: assigned_client_id.map(|id| Bytes::from(id)),
+                response_information: response_info,
+                ..ConnAck::default()
+            },
+            &mut self.out_buf,
+            is_v5,
+        );
 
         debug!(
             client_id = %self.client_id,
@@ -938,8 +1056,24 @@ impl MqttSession {
             clean = self.clean_session,
             "MQTT session connected"
         );
+    }
 
-        (commands, connack)
+    /// Patch the session_present flag in an already-encoded ConnAck in `out_buf`.
+    ///
+    /// ConnAck wire layout: `[0x20][remaining_len(1-4 bytes)][session_present][return_code]...`
+    /// This patches the session_present byte (first byte after remaining_length).
+    pub fn patch_connack_session_present(&mut self, present: bool) {
+        if self.out_buf.len() >= 3 && self.out_buf[0] == 0x20 {
+            // Skip past fixed header byte (0x20) + remaining length varint.
+            let mut offset = 1;
+            while offset < self.out_buf.len() && (self.out_buf[offset] & 0x80) != 0 {
+                offset += 1;
+            }
+            offset += 1; // skip final byte of remaining_length
+            if offset < self.out_buf.len() {
+                self.out_buf[offset] = if present { 0x01 } else { 0x00 };
+            }
+        }
     }
 
     // =========================================================================
@@ -948,24 +1082,26 @@ impl MqttSession {
 
     /// Handle an incoming AUTH packet during an enhanced authentication flow.
     ///
-    /// Returns `(commands, response_packets)` — the response is either another AUTH
-    /// challenge (continue), a CONNACK (success/failure), or a DISCONNECT + CONNACK (failure).
-    pub fn handle_auth(
-        &mut self,
-        auth: &Auth,
-    ) -> (SmallVec<[MqCommand; 4]>, SmallVec<[MqttPacket; 2]>) {
+    /// Commands written to `cmd_buf`. Response packets encoded to `out_buf`.
+    pub fn handle_auth(&mut self, auth: &Auth) {
+        self.cmd_buf.clear();
+        self.out_buf.clear();
+
         let (method, step) = match &self.auth_state {
             AuthState::WaitingForResponse { method, step } => (method.clone(), *step),
             _ => {
                 warn!("received AUTH packet but no auth flow in progress");
-                let disconnect = MqttPacket::Disconnect(crate::types::Disconnect {
-                    reason_code: Some(0x82), // Protocol Error
-                    properties: Properties::default(),
-                });
-                let (_will, cmds) = self.handle_disconnect(None);
-                let mut pkts = SmallVec::new();
-                pkts.push(disconnect);
-                return (SmallVec::from_iter(cmds), pkts);
+                encode_disconnect(
+                    &crate::types::Disconnect {
+                        reason_code: Some(0x82), // Protocol Error
+                        reason_string: None,
+                        session_expiry_interval: None,
+                        server_reference: None,
+                    },
+                    &mut self.out_buf,
+                );
+                let _will = self.handle_disconnect(None);
+                return;
             }
         };
 
@@ -976,31 +1112,39 @@ impl MqttSession {
                 "unexpected AUTH reason code"
             );
             self.auth_state = AuthState::Complete;
-            let connack = MqttPacket::ConnAck(ConnAck {
-                session_present: false,
-                return_code: 0x82, // Protocol Error
-                properties: Properties {
-                    reason_string: Some("unexpected AUTH reason code".into()),
-                    ..Properties::default()
+            encode_connack_v(
+                &ConnAck {
+                    session_present: false,
+                    return_code: 0x82, // Protocol Error
+                    reason_string: Some(Bytes::from("unexpected AUTH reason code")),
+                    ..ConnAck::default()
                 },
-            });
-            return (SmallVec::new(), SmallVec::from_elem(connack, 1));
+                &mut self.out_buf,
+                true,
+            );
+            return;
         }
 
         // Validate method matches
-        if let Some(ref pkt_method) = auth.properties.authentication_method {
-            if pkt_method != &method {
+        if let Some(pkt_method) = auth
+            .authentication_method
+            .as_ref()
+            .map(|b| unsafe { std::str::from_utf8_unchecked(b) })
+        {
+            if pkt_method != method {
                 warn!(expected = %method, got = %pkt_method, "AUTH method mismatch");
                 self.auth_state = AuthState::Complete;
-                let connack = MqttPacket::ConnAck(ConnAck {
-                    session_present: false,
-                    return_code: 0x8C, // Bad authentication method
-                    properties: Properties {
-                        reason_string: Some("authentication method mismatch".into()),
-                        ..Properties::default()
+                encode_connack_v(
+                    &ConnAck {
+                        session_present: false,
+                        return_code: 0x8C, // Bad authentication method
+                        reason_string: Some(Bytes::from("authentication method mismatch")),
+                        ..ConnAck::default()
                     },
-                });
-                return (SmallVec::new(), SmallVec::from_elem(connack, 1));
+                    &mut self.out_buf,
+                    true,
+                );
+                return;
             }
         }
 
@@ -1008,19 +1152,21 @@ impl MqttSession {
             Some(p) => Arc::clone(p),
             None => {
                 self.auth_state = AuthState::Complete;
-                let connack = MqttPacket::ConnAck(ConnAck {
-                    session_present: false,
-                    return_code: 0x8C,
-                    properties: Properties {
-                        reason_string: Some("server does not support enhanced auth".into()),
-                        ..Properties::default()
+                encode_connack_v(
+                    &ConnAck {
+                        session_present: false,
+                        return_code: 0x8C,
+                        reason_string: Some(Bytes::from("server does not support enhanced auth")),
+                        ..ConnAck::default()
                     },
-                });
-                return (SmallVec::new(), SmallVec::from_elem(connack, 1));
+                    &mut self.out_buf,
+                    true,
+                );
+                return;
             }
         };
 
-        let auth_data = auth.properties.authentication_data.as_deref();
+        let auth_data = auth.authentication_data.as_deref();
         let result = provider.authenticate_continue(&method, &self.client_id, auth_data, step);
 
         match result {
@@ -1028,42 +1174,39 @@ impl MqttSession {
                 self.auth_state = AuthState::Complete;
                 self.connected = true;
 
-                // Build CONNACK + registration commands (same as handle_connect completion).
+                // Registration commands written to cmd_buf (same as handle_connect completion).
                 let consumer_name = format!("mqtt/{}", self.client_id);
-                let mut commands = SmallVec::new();
-                commands.push(MqCommand::create_session(
+                self.cmd_buf.write_create_session(
                     self.session_id,
                     &consumer_name,
                     (self.keep_alive as u64) * 1000,
                     (self.session_expiry_interval as u64) * 1000,
-                ));
-
-                let properties = Properties {
-                    maximum_qos: Some(self.config.maximum_qos.as_u8()),
-                    retain_available: Some(true),
-                    maximum_packet_size: Some(self.config.max_packet_size as u32),
-                    topic_alias_maximum: Some(65535),
-                    wildcard_subscription_available: Some(true),
-                    subscription_identifier_available: Some(true),
-                    shared_subscription_available: Some(true),
-                    receive_maximum: Some(self.config.max_inflight.min(65535) as u16),
-                    server_keep_alive: Some(self.keep_alive),
-                    authentication_method: Some(method),
-                    ..Properties::default()
-                };
-
-                let connack = MqttPacket::ConnAck(ConnAck {
-                    session_present: !self.clean_session,
-                    return_code: ConnectReturnCode::Accepted as u8,
-                    properties,
-                });
+                );
 
                 debug!(
                     client_id = %self.client_id,
                     "enhanced auth completed successfully"
                 );
 
-                (commands, SmallVec::from_elem(connack, 1))
+                encode_connack_v(
+                    &ConnAck {
+                        session_present: !self.clean_session,
+                        return_code: ConnectReturnCode::Accepted as u8,
+                        maximum_qos: Some(self.config.maximum_qos.as_u8()),
+                        retain_available: Some(true),
+                        maximum_packet_size: Some(self.config.max_packet_size as u32),
+                        topic_alias_maximum: Some(65535),
+                        wildcard_subscription_available: Some(true),
+                        subscription_identifier_available: Some(true),
+                        shared_subscription_available: Some(true),
+                        receive_maximum: Some(self.config.max_inflight.min(65535) as u16),
+                        server_keep_alive: Some(self.keep_alive),
+                        authentication_method: Some(Bytes::from(method.clone())),
+                        ..ConnAck::default()
+                    },
+                    &mut self.out_buf,
+                    true,
+                );
             }
             AuthResult::Continue {
                 authentication_data,
@@ -1072,30 +1215,31 @@ impl MqttSession {
                     method: method.clone(),
                     step: step + 1,
                 };
-                let auth_pkt = MqttPacket::Auth(Auth {
-                    reason_code: Auth::CONTINUE_AUTHENTICATION,
-                    properties: Properties {
-                        authentication_method: Some(method),
+                encode_auth(
+                    &Auth {
+                        reason_code: Auth::CONTINUE_AUTHENTICATION,
+                        authentication_method: Some(Bytes::from(method.clone())),
                         authentication_data: Some(authentication_data),
-                        ..Properties::default()
+                        reason_string: None,
                     },
-                });
-                (SmallVec::new(), SmallVec::from_elem(auth_pkt, 1))
+                    &mut self.out_buf,
+                );
             }
             AuthResult::Failed {
                 reason_code,
                 reason_string,
             } => {
                 self.auth_state = AuthState::Complete;
-                let connack = MqttPacket::ConnAck(ConnAck {
-                    session_present: false,
-                    return_code: reason_code,
-                    properties: Properties {
-                        reason_string,
-                        ..Properties::default()
+                encode_connack_v(
+                    &ConnAck {
+                        session_present: false,
+                        return_code: reason_code,
+                        reason_string: reason_string.map(|s| Bytes::from(s)),
+                        ..ConnAck::default()
                     },
-                });
-                (SmallVec::new(), SmallVec::from_elem(connack, 1))
+                    &mut self.out_buf,
+                    true,
+                );
             }
         }
     }
@@ -1113,14 +1257,18 @@ impl MqttSession {
         PublishPlan {
             exchange_name: MQTT_EXCHANGE_NAME,
             cached_exchange_id: None,
-            flat_message: Bytes::new(),
-            responses: SmallVec::new(),
+            msg_start: 0,
+            msg_len: 0,
+            flat_message: None,
             retained: None,
-            disconnect: None,
+            need_disconnect: false,
         }
     }
 
-    pub fn handle_publish(&mut self, publish: &Publish) -> PublishPlan {
+    pub fn handle_publish(&mut self, publish: &Publish, msg_buf: &mut BytesMut) -> PublishPlan {
+        self.out_buf.clear();
+        let is_v5 = self.protocol_version == ProtocolVersion::V5;
+
         // Max QoS enforcement: reject PUBLISH with QoS above server's maximum_qos.
         // MQTT 5.0 SS 3.2.2.3.4: server MUST NOT forward QoS > advertised maximum_qos.
         if publish.qos > self.config.maximum_qos {
@@ -1129,50 +1277,21 @@ impl MqttSession {
                 max_qos = self.config.maximum_qos.as_u8(),
                 "PUBLISH QoS exceeds server maximum_qos"
             );
-            // For QoS 1, respond with PUBACK + error reason code (0x9B = QoS not supported).
-            // For QoS 2, respond with PUBREC + error reason code.
-            let mut responses = SmallVec::new();
             if let Some(packet_id) = publish.packet_id {
+                let rc = if is_v5 { Some(0x9B) } else { None };
                 match publish.qos {
-                    QoS::AtLeastOnce => {
-                        responses.push(MqttPacket::PubAck(PubAck {
-                            packet_id,
-                            reason_code: if self.protocol_version == ProtocolVersion::V5 {
-                                Some(0x9B)
-                            } else {
-                                None
-                            },
-                            properties: Properties::default(),
-                        }));
-                    }
-                    QoS::ExactlyOnce => {
-                        responses.push(MqttPacket::PubRec(PubRec {
-                            packet_id,
-                            reason_code: if self.protocol_version == ProtocolVersion::V5 {
-                                Some(0x9B)
-                            } else {
-                                None
-                            },
-                            properties: Properties::default(),
-                        }));
-                    }
+                    QoS::AtLeastOnce => encode_puback_raw(packet_id, rc, &mut self.out_buf, is_v5),
+                    QoS::ExactlyOnce => encode_pubrec_raw(packet_id, rc, &mut self.out_buf, is_v5),
                     _ => {}
                 }
             }
-            return PublishPlan {
-                exchange_name: MQTT_EXCHANGE_NAME,
-                cached_exchange_id: None,
-                flat_message: Bytes::new(),
-                responses,
-                retained: None,
-                disconnect: None,
-            };
+            return Self::empty_publish_plan();
         }
 
         // MQTT 5.0 SS 3.3.4: Receive Maximum enforcement.
         // If the client sends more QoS 1/2 PUBLISH packets than the server's
         // Receive Maximum without receiving acknowledgments, disconnect with 0x93.
-        if publish.qos != QoS::AtMostOnce && self.protocol_version == ProtocolVersion::V5 {
+        if publish.qos != QoS::AtMostOnce && is_v5 {
             if self.inbound_qos_inflight >= self.server_receive_maximum as usize {
                 warn!(
                     client_id = %self.client_id,
@@ -1180,20 +1299,14 @@ impl MqttSession {
                     receive_maximum = self.server_receive_maximum,
                     "receive maximum exceeded"
                 );
-                return PublishPlan {
-                    exchange_name: MQTT_EXCHANGE_NAME,
-                    cached_exchange_id: None,
-                    flat_message: Bytes::new(),
-                    responses: SmallVec::new(),
-                    retained: None,
-                    disconnect: Some(MqttPacket::Disconnect(Disconnect {
-                        reason_code: Some(0x93), // Receive Maximum Exceeded
-                        properties: Properties {
-                            reason_string: Some("receive maximum exceeded".into()),
-                            ..Properties::default()
-                        },
-                    })),
-                };
+                encode_disconnect_reason(
+                    0x93,
+                    Some(b"receive maximum exceeded"),
+                    &mut self.out_buf,
+                );
+                let mut plan = Self::empty_publish_plan();
+                plan.need_disconnect = true;
+                return plan;
             }
             self.inbound_qos_inflight += 1;
         }
@@ -1205,53 +1318,39 @@ impl MqttSession {
                 reason_code,
                 "publish rate/quota limit exceeded"
             );
-            return PublishPlan {
-                exchange_name: MQTT_EXCHANGE_NAME,
-                cached_exchange_id: None,
-                flat_message: Bytes::new(),
-                responses: SmallVec::new(),
-                retained: None,
-                disconnect: Some(MqttPacket::Disconnect(Disconnect {
-                    reason_code: Some(reason_code),
-                    properties: Properties {
-                        reason_string: Some(if reason_code == 0x96 {
-                            "message rate too high".into()
-                        } else {
-                            "quota exceeded".into()
-                        }),
-                        ..Properties::default()
-                    },
-                })),
+            let reason_str: &[u8] = if reason_code == 0x96 {
+                b"message rate too high"
+            } else {
+                b"quota exceeded"
             };
+            encode_disconnect_reason(reason_code, Some(reason_str), &mut self.out_buf);
+            let mut plan = Self::empty_publish_plan();
+            plan.need_disconnect = true;
+            return plan;
         }
 
         // Resolve topic alias if present (MQTT 5.0).
         // Topic is Bytes (UTF-8 validated on decode).
-        let topic: Bytes = if let Some(alias) = publish.properties.topic_alias {
+        // Gate behind has_props: V3.1.1 has no properties, skip the scan entirely.
+        let has_props = !publish.properties.is_empty();
+        let topic: Bytes = if has_props && let Some(alias) = publish.properties.topic_alias() {
             // Topic alias validation: alias must be 1..=server's topic_alias_maximum (65535).
             // MQTT 5.0 SS 3.3.2.3.4: alias of 0 is a protocol error.
             if alias == 0 {
                 warn!("topic alias 0 is invalid");
-                // Topic alias 0 is a Protocol Error (MQTT 5.0 SS 3.3.2.3.4).
-                return PublishPlan {
-                    exchange_name: MQTT_EXCHANGE_NAME,
-                    cached_exchange_id: None,
-                    flat_message: Bytes::new(),
-                    responses: SmallVec::new(),
-                    retained: None,
-                    disconnect: Some(MqttPacket::Disconnect(Disconnect {
-                        reason_code: Some(0x82), // Protocol Error
-                        properties: Properties {
-                            reason_string: Some("topic alias must not be 0".into()),
-                            ..Properties::default()
-                        },
-                    })),
-                };
+                encode_disconnect_reason(
+                    0x82,
+                    Some(b"topic alias must not be 0"),
+                    &mut self.out_buf,
+                );
+                let mut plan = Self::empty_publish_plan();
+                plan.need_disconnect = true;
+                return plan;
             }
             if !publish.topic.is_empty() {
-                self.inbound_topic_aliases
-                    .insert(alias, publish.topic.clone());
-                publish.topic.clone()
+                let t = Bytes::copy_from_slice(publish.topic);
+                self.inbound_topic_aliases.insert(alias, t.clone());
+                t
             } else if let Some(resolved) = self.inbound_topic_aliases.get(&alias) {
                 resolved.clone()
             } else {
@@ -1259,11 +1358,11 @@ impl MqttSession {
                 return Self::empty_publish_plan();
             }
         } else {
-            publish.topic.clone()
+            Bytes::copy_from_slice(publish.topic)
         };
 
         // Validate topic name (M3): reject wildcards, empty, and null bytes.
-        if validate_topic_name(&topic).is_err() {
+        if !self.config.skip_topic_validation && validate_topic_name(&topic).is_err() {
             warn!(topic = ?std::str::from_utf8(&topic).unwrap_or("<invalid>"), "invalid topic name in PUBLISH");
             return Self::empty_publish_plan();
         }
@@ -1283,135 +1382,85 @@ impl MqttSession {
                     topic = topic_str,
                     "publish not authorized"
                 );
-                let mut responses = SmallVec::new();
                 if let Some(packet_id) = publish.packet_id {
                     match publish.qos {
                         QoS::AtLeastOnce => {
-                            responses.push(MqttPacket::PubAck(PubAck {
-                                packet_id,
-                                reason_code: Some(0x87), // Not Authorized
-                                properties: Properties::default(),
-                            }));
+                            encode_puback_raw(packet_id, Some(0x87), &mut self.out_buf, is_v5);
                         }
                         QoS::ExactlyOnce => {
-                            responses.push(MqttPacket::PubRec(PubRec {
-                                packet_id,
-                                reason_code: Some(0x87), // Not Authorized
-                                properties: Properties::default(),
-                            }));
+                            encode_pubrec_raw(packet_id, Some(0x87), &mut self.out_buf, is_v5);
                         }
                         _ => {}
                     }
                 }
-                return PublishPlan {
-                    exchange_name: MQTT_EXCHANGE_NAME,
-                    cached_exchange_id: None,
-                    flat_message: Bytes::new(),
-                    responses,
-                    retained: None,
-                    disconnect: None,
-                };
+                return Self::empty_publish_plan();
             }
         }
 
         // Payload format UTF-8 validation (MQTT 5.0 SS 3.3.2.3.2):
         // If payload_format_indicator = 1, the payload MUST be valid UTF-8.
-        if publish.properties.payload_format_indicator == Some(1) {
-            if std::str::from_utf8(&publish.payload).is_err() {
+        // Read once and reuse below to avoid scanning properties twice.
+        let pfi = if has_props {
+            publish.properties.payload_format_indicator()
+        } else {
+            None
+        };
+        if pfi == Some(1) {
+            if std::str::from_utf8(publish.payload).is_err() {
                 warn!("payload_format_indicator=1 but payload is not valid UTF-8");
-                // Return PUBACK/PUBREC with reason code 0x99 (Payload Format Invalid).
-                let mut responses = SmallVec::new();
                 if let Some(packet_id) = publish.packet_id {
                     match publish.qos {
                         QoS::AtLeastOnce => {
-                            responses.push(MqttPacket::PubAck(PubAck {
-                                packet_id,
-                                reason_code: Some(0x99),
-                                properties: Properties::default(),
-                            }));
+                            encode_puback_raw(packet_id, Some(0x99), &mut self.out_buf, is_v5);
                         }
                         QoS::ExactlyOnce => {
-                            responses.push(MqttPacket::PubRec(PubRec {
-                                packet_id,
-                                reason_code: Some(0x99),
-                                properties: Properties::default(),
-                            }));
+                            encode_pubrec_raw(packet_id, Some(0x99), &mut self.out_buf, is_v5);
                         }
                         _ => {}
                     }
                 }
-                return PublishPlan {
-                    exchange_name: MQTT_EXCHANGE_NAME,
-                    cached_exchange_id: None,
-                    flat_message: Bytes::new(),
-                    responses,
-                    retained: None,
-                    disconnect: None,
-                };
+                return Self::empty_publish_plan();
             }
         }
 
         let now = Self::now_ms();
 
-        // Build the flat message with native fields (not headers) for reply_to
-        // and correlation_id so the engine's ACK-with-response routing works.
-        // Topic is already Bytes — no String→Bytes conversion needed.
-        let mut builder = FlatMessageBuilder::new(publish.payload.clone())
+        // Build MqttEnvelope: 40-byte header + raw topic + raw properties + payload.
+        // No span index, no header key/value encoding — raw MQTT passthrough.
+        let ttl = if has_props {
+            publish
+                .properties
+                .message_expiry_interval()
+                .map(|secs| secs as u64 * 1000)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let props_raw_ref: &[u8] = if has_props {
+            publish.properties.raw()
+        } else {
+            &[]
+        };
+        // Write MqttEnvelope directly into the shared msg_buf (zero alloc).
+        let msg_start = msg_buf.len();
+        flat::MqttEnvelopeWriter::new(msg_buf, &topic, publish.payload)
             .timestamp(now)
-            .routing_key(topic.clone());
+            .publisher_id(self.session_id)
+            .retain(publish.retain)
+            .is_v5(self.protocol_version == ProtocolVersion::V5)
+            .no_local(false)
+            .utf8_payload(pfi == Some(1))
+            .properties_raw(props_raw_ref)
+            .ttl_ms(ttl)
+            .finish();
+        let msg_len = msg_buf.len() - msg_start;
 
-        // MQTT 5.0 request/response -> FlatMessage native fields.
-        if let Some(ref rt) = publish.properties.response_topic {
-            builder = builder.reply_to(Bytes::copy_from_slice(rt.as_bytes()));
-        }
-        if let Some(ref cd) = publish.properties.correlation_data {
-            builder = builder.correlation_id(cd.clone());
-        }
-
-        // Store remaining MQTT 5.0 properties as headers using static keys.
-        if let Some(ref ct) = publish.properties.content_type {
-            builder = builder.header(
-                HDR_CONTENT_TYPE.clone(),
-                Bytes::copy_from_slice(ct.as_bytes()),
-            );
-        }
-        if let Some(pfi) = publish.properties.payload_format_indicator {
-            builder = builder.header(HDR_PAYLOAD_FORMAT.clone(), Bytes::copy_from_slice(&[pfi]));
-        }
-        for (key, val) in &publish.properties.user_properties {
-            // Build "mqtt.user.<key>" without intermediate String by writing to a BytesMut.
-            let mut hdr_key = bytes::BytesMut::with_capacity(10 + key.len());
-            hdr_key.extend_from_slice(b"mqtt.user.");
-            hdr_key.extend_from_slice(key.as_bytes());
-            builder = builder.header(hdr_key.freeze(), Bytes::copy_from_slice(val.as_bytes()));
-        }
-        if let Some(secs) = publish.properties.message_expiry_interval {
-            builder = builder.ttl_ms(secs as u64 * 1000);
-        }
-
-        // Store publisher session ID for No Local enforcement (M6).
-        // Uses pre-computed Bytes (refcount bump only, no allocation).
-        builder = builder.header(
-            HDR_PUBLISHER_SESSION_ID.clone(),
-            self.session_id_bytes.clone(),
-        );
-
-        // Store original retain flag for Retain As Published enforcement (M7).
-        if publish.retain {
-            builder = builder.header(HDR_ORIGINAL_RETAIN.clone(), Bytes::from_static(&[1]));
-        }
-
-        let flat_message = builder.build();
-
-        // Build response packets and track in-flight state.
-        let mut responses = SmallVec::new();
+        // Track in-flight state and encode ACK response directly to out_buf.
         match publish.qos {
-            QoS::AtMostOnce => {
-                // QoS 0: no acknowledgment needed.
-            }
+            QoS::AtMostOnce => {}
             QoS::AtLeastOnce => {
                 if let Some(packet_id) = publish.packet_id {
-                    // Track as inbound QoS 1 (no mq IDs needed for inbound).
                     self.mark_packet_id(packet_id);
                     self.qos1_inflight.insert(
                         packet_id,
@@ -1421,16 +1470,8 @@ impl MqttSession {
                             direction: Direction::Inbound,
                         },
                     );
-                    let rc = if self.protocol_version == ProtocolVersion::V5 {
-                        Some(0x00) // Success
-                    } else {
-                        None
-                    };
-                    responses.push(MqttPacket::PubAck(PubAck {
-                        packet_id,
-                        reason_code: rc,
-                        properties: Properties::default(),
-                    }));
+                    let rc = if is_v5 { Some(0x00) } else { None };
+                    encode_puback_raw(packet_id, rc, &mut self.out_buf, is_v5);
                 }
             }
             QoS::ExactlyOnce => {
@@ -1439,37 +1480,15 @@ impl MqttSession {
                     // in PubRecSent state, respond with PUBREC but skip the publish.
                     if let Some(QoS2InboundState::PubRecSent) = self.qos2_inbound.get(&packet_id) {
                         debug!(packet_id, "QoS 2 duplicate PUBLISH, resending PUBREC");
-                        let rc = if self.protocol_version == ProtocolVersion::V5 {
-                            Some(0x00)
-                        } else {
-                            None
-                        };
-                        return PublishPlan {
-                            exchange_name: MQTT_EXCHANGE_NAME,
-                            cached_exchange_id: None,
-                            flat_message: Bytes::new(), // skip actual publish
-                            responses: smallvec::smallvec![MqttPacket::PubRec(PubRec {
-                                packet_id,
-                                reason_code: rc,
-                                properties: Properties::default(),
-                            })],
-                            retained: None,
-                            disconnect: None,
-                        };
+                        let rc = if is_v5 { Some(0x00) } else { None };
+                        encode_pubrec_raw(packet_id, rc, &mut self.out_buf, is_v5);
+                        return Self::empty_publish_plan();
                     }
                     self.mark_packet_id(packet_id);
                     self.qos2_inbound
                         .insert(packet_id, QoS2InboundState::PubRecSent);
-                    let rc = if self.protocol_version == ProtocolVersion::V5 {
-                        Some(0x00) // Success
-                    } else {
-                        None
-                    };
-                    responses.push(MqttPacket::PubRec(PubRec {
-                        packet_id,
-                        reason_code: rc,
-                        properties: Properties::default(),
-                    }));
+                    let rc = if is_v5 { Some(0x00) } else { None };
+                    encode_pubrec_raw(packet_id, rc, &mut self.out_buf, is_v5);
                 }
             }
         }
@@ -1488,10 +1507,13 @@ impl MqttSession {
                     flat_message: None,
                 })
             } else {
+                // Retained messages need owned storage — copy from msg_buf.
                 Some(RetainedPlan {
                     topic_name: retained_name,
                     cached_topic_id,
-                    flat_message: Some(flat_message.clone()),
+                    flat_message: Some(Bytes::copy_from_slice(
+                        &msg_buf[msg_start..msg_start + msg_len],
+                    )),
                 })
             }
         } else {
@@ -1501,10 +1523,223 @@ impl MqttSession {
         PublishPlan {
             exchange_name: MQTT_EXCHANGE_NAME,
             cached_exchange_id: self.entity_cache.exchanges.get(MQTT_EXCHANGE_NAME).copied(),
-            flat_message,
-            responses,
+            msg_start,
+            msg_len,
+            flat_message: None,
             retained,
-            disconnect: None,
+            need_disconnect: false,
+        }
+    }
+
+    /// Fast-path PUBLISH handler for pre-built MqttEnvelope from fused decode.
+    ///
+    /// Takes a mutable envelope buffer + metadata from `decode_publish_to_envelope`.
+    /// Handles topic alias resolution, TTL patching, QoS tracking, and retained
+    /// message planning — but skips the intermediate Publish struct, Properties
+    /// construction, and separate MqttEnvelopeBuilder allocation.
+    ///
+    /// ACK responses and disconnect are encoded directly to `self.out_buf`.
+    pub fn handle_publish_fused(
+        &mut self,
+        envelope: &mut BytesMut,
+        meta: &crate::codec::PublishMeta,
+        msg_buf: &mut BytesMut,
+    ) -> PublishPlan {
+        self.out_buf.clear();
+        let is_v5 = self.protocol_version == ProtocolVersion::V5;
+
+        // Max QoS enforcement.
+        if meta.qos > self.config.maximum_qos {
+            if let Some(packet_id) = meta.packet_id {
+                match meta.qos {
+                    QoS::AtLeastOnce => {
+                        encode_puback_raw(packet_id, Some(0x9B), &mut self.out_buf, is_v5)
+                    }
+                    QoS::ExactlyOnce => {
+                        encode_pubrec_raw(packet_id, Some(0x9B), &mut self.out_buf, is_v5)
+                    }
+                    _ => {}
+                }
+            }
+            return Self::empty_publish_plan();
+        }
+
+        // Receive maximum enforcement (QoS 1/2 only).
+        if meta.qos != QoS::AtMostOnce
+            && is_v5
+            && self.inbound_qos_inflight >= self.server_receive_maximum as usize
+        {
+            encode_disconnect_reason(0x93, None, &mut self.out_buf);
+            let mut plan = Self::empty_publish_plan();
+            plan.need_disconnect = true;
+            return plan;
+        }
+
+        // Extract topic from envelope for alias resolution + validation.
+        let topic_bytes = &envelope[meta.topic_offset..meta.topic_offset + meta.topic_len];
+
+        // Topic alias resolution (V5 only, when props are present).
+        let topic = if is_v5 && meta.props_len > 0 {
+            let props_start = 40 + meta.topic_len;
+            let props_end = props_start + meta.props_len;
+            let props = &envelope[props_start..props_end];
+            let alias = scan_property_u16(props, 0x23);
+
+            if let Some(alias_val) = alias {
+                if alias_val == 0 {
+                    encode_disconnect_reason(0x82, None, &mut self.out_buf);
+                    let mut plan = Self::empty_publish_plan();
+                    plan.need_disconnect = true;
+                    return plan;
+                }
+                if meta.topic_len > 0 {
+                    let t = Bytes::copy_from_slice(topic_bytes);
+                    self.inbound_topic_aliases.insert(alias_val, t.clone());
+                    t
+                } else if let Some(resolved) = self.inbound_topic_aliases.get(&alias_val) {
+                    resolved.clone()
+                } else {
+                    encode_disconnect_reason(0x82, None, &mut self.out_buf);
+                    let mut plan = Self::empty_publish_plan();
+                    plan.need_disconnect = true;
+                    return plan;
+                }
+            } else {
+                Bytes::copy_from_slice(topic_bytes)
+            }
+        } else {
+            Bytes::copy_from_slice(topic_bytes)
+        };
+
+        // Topic validation.
+        if !self.config.skip_topic_validation && validate_topic_name(&topic).is_err() {
+            if let Some(packet_id) = meta.packet_id {
+                match meta.qos {
+                    QoS::AtLeastOnce => {
+                        encode_puback_raw(packet_id, Some(0x90), &mut self.out_buf, is_v5)
+                    }
+                    QoS::ExactlyOnce => {
+                        encode_pubrec_raw(packet_id, Some(0x99), &mut self.out_buf, is_v5)
+                    }
+                    _ => {}
+                }
+            }
+            return Self::empty_publish_plan();
+        }
+
+        // Extract TTL from properties (scan for message_expiry_interval 0x02).
+        let ttl_ms = if meta.props_len > 0 {
+            let props_start = 40 + meta.topic_len;
+            let props = &envelope[props_start..props_start + meta.props_len];
+            scan_property_u32(props, 0x02)
+                .map(|secs| secs as u64 * 1000)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Patch the envelope in-place: set TTL, utf8 flag, no_local flag.
+        let mut extra_flags: u16 = 0;
+        if meta.props_len > 0 {
+            let props_start = 40 + meta.topic_len;
+            let props = &envelope[props_start..props_start + meta.props_len];
+            if scan_property_byte(props, 0x01) == Some(1) {
+                extra_flags |= 1 << 4; // MQTT_FLAG_UTF8_PAYLOAD
+            }
+        }
+        crate::codec::patch_envelope_ttl_flags(envelope, ttl_ms, extra_flags);
+
+        // Write the envelope into the shared msg_buf (zero alloc).
+        let msg_start = msg_buf.len();
+        if meta.topic_len == 0 && !topic.is_empty() {
+            let payload_start = 40 + meta.topic_len + meta.props_len;
+            let props_slice = if meta.props_len > 0 {
+                let ps = 40 + meta.topic_len;
+                &envelope[ps..ps + meta.props_len]
+            } else {
+                &[]
+            };
+            flat::MqttEnvelopeWriter::new(msg_buf, &topic, &envelope[payload_start..])
+                .timestamp(Self::now_ms())
+                .publisher_id(self.session_id)
+                .retain(meta.retain)
+                .is_v5(is_v5)
+                .properties_raw(props_slice)
+                .ttl_ms(ttl_ms)
+                .finish();
+        } else {
+            let env_bytes = envelope.split();
+            msg_buf.extend_from_slice(&env_bytes);
+        };
+        let msg_len = msg_buf.len() - msg_start;
+
+        // QoS tracking + ACK response encoded directly to out_buf.
+        match meta.qos {
+            QoS::AtMostOnce => {}
+            QoS::AtLeastOnce => {
+                if let Some(packet_id) = meta.packet_id {
+                    self.mark_packet_id(packet_id);
+                    self.qos1_inflight.insert(
+                        packet_id,
+                        QoS1InFlight {
+                            mq_message_id: None,
+                            mq_queue_id: None,
+                            direction: Direction::Inbound,
+                        },
+                    );
+                    let rc = if is_v5 { Some(0x00) } else { None };
+                    encode_puback_raw(packet_id, rc, &mut self.out_buf, is_v5);
+                }
+            }
+            QoS::ExactlyOnce => {
+                if let Some(packet_id) = meta.packet_id {
+                    if let Some(QoS2InboundState::PubRecSent) = self.qos2_inbound.get(&packet_id) {
+                        let rc = if is_v5 { Some(0x00) } else { None };
+                        encode_pubrec_raw(packet_id, rc, &mut self.out_buf, is_v5);
+                        return Self::empty_publish_plan();
+                    }
+                    self.mark_packet_id(packet_id);
+                    self.inbound_qos_inflight += 1;
+                    self.qos2_inbound
+                        .insert(packet_id, QoS2InboundState::PubRecSent);
+                    let rc = if is_v5 { Some(0x00) } else { None };
+                    encode_pubrec_raw(packet_id, rc, &mut self.out_buf, is_v5);
+                }
+            }
+        }
+
+        // Retained message handling.
+        let retained = if meta.retain {
+            let topic_str = std::str::from_utf8(&topic).unwrap_or("");
+            let retained_name = self.retained_topic_name(topic_str);
+            let cached_topic_id = self.entity_cache.topics.get(&retained_name).copied();
+            if msg_len == 0 {
+                Some(RetainedPlan {
+                    topic_name: retained_name,
+                    cached_topic_id,
+                    flat_message: None,
+                })
+            } else {
+                Some(RetainedPlan {
+                    topic_name: retained_name,
+                    cached_topic_id,
+                    flat_message: Some(Bytes::copy_from_slice(
+                        &msg_buf[msg_start..msg_start + msg_len],
+                    )),
+                })
+            }
+        } else {
+            None
+        };
+
+        PublishPlan {
+            exchange_name: MQTT_EXCHANGE_NAME,
+            cached_exchange_id: self.entity_cache.exchanges.get(MQTT_EXCHANGE_NAME).copied(),
+            msg_start,
+            msg_len,
+            flat_message: None,
+            retained,
+            need_disconnect: false,
         }
     }
 
@@ -1515,7 +1750,8 @@ impl MqttSession {
     /// Handle PUBACK from client (QoS 1 acknowledgment for server -> client delivery).
     ///
     /// Returns an ACK command if this was an outbound delivery, None otherwise.
-    pub fn handle_puback(&mut self, packet_id: u16) -> Option<MqCommand> {
+    pub fn handle_puback(&mut self, packet_id: u16) {
+        self.cmd_buf.clear();
         if let Some(inflight) = self.qos1_inflight.remove(&packet_id) {
             self.clear_packet_id(packet_id);
             let is_outbound = inflight.direction == Direction::Outbound;
@@ -1530,19 +1766,19 @@ impl MqttSession {
                 if let (Some(queue_id), Some(message_id)) =
                     (inflight.mq_queue_id, inflight.mq_message_id)
                 {
-                    return Some(MqCommand::group_ack(queue_id, &[message_id], None));
+                    self.cmd_buf.write_group_ack(queue_id, &[message_id], None);
                 }
             }
         } else {
             warn!(packet_id, "PUBACK for unknown packet ID");
         }
-        None
     }
 
     /// Handle PUBREC from client (QoS 2, client acknowledges our outbound PUBLISH).
     ///
     /// Returns the PUBREL response packet. No MqCommands needed at this stage.
-    pub fn handle_pubrec(&mut self, packet_id: u16) -> MqttPacket {
+    pub fn handle_pubrec(&mut self, packet_id: u16) {
+        self.out_buf.clear();
         // Transition outbound QoS 2 from PublishSent -> PubRelSent.
         let mut found = true;
         if let Some(state) = self.qos2_outbound.remove(&packet_id) {
@@ -1574,17 +1810,23 @@ impl MqttSession {
         } else {
             None
         };
-        MqttPacket::PubRel(PubRel {
-            packet_id,
-            reason_code,
-            properties: Properties::default(),
-        })
+        let is_v5 = self.protocol_version == ProtocolVersion::V5;
+        encode_pubrel_v(
+            &PubRel {
+                packet_id,
+                reason_code,
+                reason_string: None,
+            },
+            &mut self.out_buf,
+            is_v5,
+        );
     }
 
     /// Handle PUBREL from client (QoS 2 inbound, step 2).
     ///
     /// Returns the PUBCOMP response packet. No MqCommands needed at this stage.
-    pub fn handle_pubrel(&mut self, packet_id: u16) -> MqttPacket {
+    pub fn handle_pubrel(&mut self, packet_id: u16) {
+        self.out_buf.clear();
         let mut found = false;
         if let Some(state) = self.qos2_inbound.get(&packet_id) {
             match state {
@@ -1611,17 +1853,23 @@ impl MqttSession {
         } else {
             None
         };
-        MqttPacket::PubComp(PubComp {
-            packet_id,
-            reason_code,
-            properties: Properties::default(),
-        })
+        let is_v5 = self.protocol_version == ProtocolVersion::V5;
+        encode_pubcomp_v(
+            &PubComp {
+                packet_id,
+                reason_code,
+                reason_string: None,
+            },
+            &mut self.out_buf,
+            is_v5,
+        );
     }
 
     /// Handle PUBCOMP from client (QoS 2 outbound complete).
     ///
     /// Returns an ACK command if the QoS 2 flow completed successfully, None otherwise.
-    pub fn handle_pubcomp(&mut self, packet_id: u16) -> Option<MqCommand> {
+    pub fn handle_pubcomp(&mut self, packet_id: u16) {
+        self.cmd_buf.clear();
         if let Some(state) = self.qos2_outbound.remove(&packet_id) {
             self.clear_packet_id(packet_id);
             match state {
@@ -1631,7 +1879,8 @@ impl MqttSession {
                 } => {
                     // QoS 2 delivery complete. ACK in bisque-mq.
                     debug!(packet_id, "QoS 2 outbound delivery complete");
-                    return Some(MqCommand::group_ack(mq_queue_id, &[mq_message_id], None));
+                    self.cmd_buf
+                        .write_group_ack(mq_queue_id, &[mq_message_id], None);
                 }
                 QoS2OutboundState::PublishSent { .. } => {
                     warn!(
@@ -1643,7 +1892,6 @@ impl MqttSession {
         } else {
             warn!(packet_id, "PUBCOMP for unknown packet ID");
         }
-        None
     }
 
     // =========================================================================
@@ -1659,13 +1907,14 @@ impl MqttSession {
         filters: &[crate::types::TopicFilter],
         subscription_id: Option<u32>,
     ) -> SubscribePlan {
+        self.out_buf.clear();
         let mut filter_plans = SmallVec::new();
-        let mut return_codes = SmallVec::new();
+        let mut return_codes: SmallVec<[u8; 8]> = SmallVec::new();
 
         for filter in filters {
             // Validate topic filter (M4).
-            if validate_topic_filter(&filter.filter).is_err() {
-                warn!(filter = %filter.filter, "invalid topic filter in SUBSCRIBE");
+            if validate_topic_filter(filter.filter_str()).is_err() {
+                warn!(filter = %filter.filter_str(), "invalid topic filter in SUBSCRIBE");
                 return_codes.push(0x80); // Failure
                 continue;
             }
@@ -1673,17 +1922,19 @@ impl MqttSession {
             // Check for shared subscription. For non-shared, avoid cloning
             // filter.filter into actual_filter — use a borrow instead.
             let (shared_group, actual_filter_owned) =
-                if let Some((group, f)) = Self::parse_shared_subscription(&filter.filter) {
+                if let Some((group, f)) = Self::parse_shared_subscription(filter.filter_str()) {
                     (Some(group.to_string()), Some(f.to_string()))
                 } else {
                     (None, None)
                 };
-            let actual_filter = actual_filter_owned.as_deref().unwrap_or(&filter.filter);
+            let actual_filter = actual_filter_owned
+                .as_deref()
+                .unwrap_or(filter.filter_str());
 
             // MQTT 5.0 SS 3.8.3.1: It is a Protocol Error to set the No Local
             // bit to 1 on a Shared Subscription.
             if shared_group.is_some() && filter.no_local {
-                warn!(filter = %filter.filter, "no_local=1 on shared subscription is a protocol error");
+                warn!(filter = %filter.filter_str(), "no_local=1 on shared subscription is a protocol error");
                 return_codes.push(0xA2); // Shared Subscriptions not supported (closest reason code)
                 continue;
             }
@@ -1699,7 +1950,7 @@ impl MqttSession {
                 ) {
                     warn!(
                         client_id = %self.client_id,
-                        filter = %filter.filter,
+                        filter = %filter.filter_str(),
                         "subscribe not authorized"
                     );
                     return_codes.push(0x87); // Not Authorized
@@ -1731,10 +1982,10 @@ impl MqttSession {
             };
 
             // Check if this subscription already exists (for retain_handling=1).
-            let is_new_subscription = !self.subscriptions.contains_key(&filter.filter);
+            let is_new_subscription = !self.subscriptions.contains_key(filter.filter_str());
 
             filter_plans.push(SubscribeFilterPlan {
-                filter: filter.filter.clone(),
+                filter: filter.filter_str().to_string(),
                 queue_name,
                 cached_queue_id,
                 routing_key,
@@ -1749,12 +2000,12 @@ impl MqttSession {
 
             // Track the subscription. Use the owned actual_filter when available
             // (shared subs) to avoid an extra clone; otherwise clone from filter.filter.
-            let sub_filter = actual_filter_owned.unwrap_or_else(|| filter.filter.clone());
+            let sub_filter = actual_filter_owned.unwrap_or_else(|| filter.filter_str().to_string());
             self.subscriptions.insert(
-                filter.filter.clone(),
+                filter.filter_str().to_string(),
                 SubscriptionMapping {
-                    filter_starts_with_wildcard: filter.filter.starts_with('+')
-                        || filter.filter.starts_with('#'),
+                    filter_starts_with_wildcard: filter.filter_str().starts_with('+')
+                        || filter.filter_str().starts_with('#'),
                     filter: sub_filter,
                     max_qos: granted_qos,
                     exchange_id: cached_exchange_id,
@@ -1784,25 +2035,20 @@ impl MqttSession {
 
             debug!(
                 client_id = %self.client_id,
-                filter = %filter.filter,
+                filter = %filter.filter_str(),
                 qos = ?filter.qos,
                 "subscription added"
             );
         }
 
-        let mut suback_props = Properties::default();
-        self.strip_problem_info(&mut suback_props);
-        let suback = MqttPacket::SubAck(SubAck {
-            packet_id,
-            return_codes,
-            properties: suback_props,
-        });
+        // Encode SUBACK directly to out_buf — no MqttPacket intermediary.
+        let is_v5 = self.protocol_version == ProtocolVersion::V5;
+        encode_suback_raw(packet_id, &return_codes, &mut self.out_buf, is_v5);
 
         SubscribePlan {
             exchange_name: MQTT_EXCHANGE_NAME,
             cached_exchange_id: self.entity_cache.exchanges.get(MQTT_EXCHANGE_NAME).copied(),
             filters: filter_plans,
-            suback,
         }
     }
 
@@ -1813,24 +2059,22 @@ impl MqttSession {
     /// Handle an UNSUBSCRIBE packet.
     ///
     /// Returns MqCommands to tear down bindings and an UNSUBACK response.
-    pub fn handle_unsubscribe(
-        &mut self,
-        packet_id: u16,
-        filters: &[String],
-    ) -> (SmallVec<[MqCommand; 4]>, MqttPacket) {
-        let mut commands = SmallVec::new();
+    /// Commands written to `cmd_buf`. Returns UNSUBACK response.
+    pub fn handle_unsubscribe(&mut self, packet_id: u16, filters: &[String]) {
+        self.cmd_buf.clear();
+        self.out_buf.clear();
         let mut reason_codes = SmallVec::new();
 
         for filter in filters {
             if let Some(mapping) = self.subscriptions.remove(filter) {
                 // Delete the exchange binding.
                 if let Some(binding_id) = mapping.binding_id {
-                    commands.push(MqCommand::delete_binding(binding_id));
+                    self.cmd_buf.write_delete_binding(binding_id);
                 }
                 // Delete subscription queue if clean session and not shared.
                 if self.clean_session && mapping.shared_group.is_none() {
                     if let Some(queue_id) = mapping.queue_id {
-                        commands.push(MqCommand::delete_consumer_group(queue_id));
+                        self.cmd_buf.write_delete_consumer_group(queue_id);
                     }
                 }
                 // Remove from queue_to_sub_id reverse index.
@@ -1852,25 +2096,28 @@ impl MqttSession {
         // Recalculate cached subscription ID after removals.
         self.cached_first_sub_id = self.subscriptions.values().find_map(|m| m.subscription_id);
 
-        let mut unsuback_props = Properties::default();
-        self.strip_problem_info(&mut unsuback_props);
-        let unsuback = MqttPacket::UnsubAck(UnsubAck {
-            packet_id,
-            reason_codes,
-            properties: unsuback_props,
-        });
-
-        (commands, unsuback)
+        let is_v5 = self.protocol_version == ProtocolVersion::V5;
+        encode_unsuback_v(
+            &UnsubAck {
+                packet_id,
+                reason_codes,
+                reason_string: None,
+            },
+            &mut self.out_buf,
+            is_v5,
+        );
     }
 
     // =========================================================================
     // PINGREQ handling
     // =========================================================================
 
-    /// Handle a PINGREQ packet.
-    pub fn handle_pingreq(&self) -> (MqCommand, MqttPacket) {
-        let cmd = MqCommand::heartbeat_session(self.session_id);
-        (cmd, MqttPacket::PingResp)
+    /// Handle a PINGREQ packet. Command written to `cmd_buf`, PingResp to `out_buf`.
+    pub fn handle_pingreq(&mut self) {
+        self.cmd_buf.clear();
+        self.out_buf.clear();
+        self.cmd_buf.write_heartbeat_session(self.session_id);
+        encode_ping_resp(&mut self.out_buf);
     }
 
     // =========================================================================
@@ -1879,37 +2126,47 @@ impl MqttSession {
 
     /// Build a FlatMessage from a WillMessage, preserving all MQTT 5.0 properties.
     fn build_will_flat_message(will: &WillMessage, now: u64, include_delay: bool) -> Bytes {
-        let mut builder = FlatMessageBuilder::new(will.payload.clone())
+        // Hoist all property bytes into variables that outlive the builder.
+        let reply_to = will.properties().response_topic_bytes();
+        let correlation_id = will.properties().correlation_data_bytes();
+        let content_type = will.properties().content_type_bytes();
+        let pfi_byte = will.properties().payload_format_indicator().map(|v| [v]);
+        let will_props = will.properties();
+        let user_props: Vec<_> = will_props
+            .user_properties()
+            .map(|(k, v): (&str, &str)| {
+                let mut hdr_key = Vec::with_capacity(10 + k.len());
+                hdr_key.extend_from_slice(b"mqtt.user.");
+                hdr_key.extend_from_slice(k.as_bytes());
+                (hdr_key, v.to_string())
+            })
+            .collect();
+
+        let mut builder = FlatMessageBuilder::new(&will.payload)
             .timestamp(now)
-            .routing_key(Bytes::from(will.topic.clone()));
+            .routing_key(&will.topic);
 
         // MQTT 5.0 will properties.
-        if let Some(ref rt) = will.properties.response_topic {
-            builder = builder.reply_to(Bytes::copy_from_slice(rt.as_bytes()));
+        if let Some(ref rt) = reply_to {
+            builder = builder.reply_to(rt);
         }
-        if let Some(ref cd) = will.properties.correlation_data {
-            builder = builder.correlation_id(cd.clone());
+        if let Some(ref cd) = correlation_id {
+            builder = builder.correlation_id(cd);
         }
-        if let Some(secs) = will.properties.message_expiry_interval {
+        if let Some(secs) = will.properties().message_expiry_interval() {
             builder = builder.ttl_ms(secs as u64 * 1000);
         }
-        if let Some(ref ct) = will.properties.content_type {
-            builder = builder.header(
-                HDR_CONTENT_TYPE.clone(),
-                Bytes::copy_from_slice(ct.as_bytes()),
-            );
+        if let Some(ref ct) = content_type {
+            builder = builder.header(&HDR_CONTENT_TYPE[..], ct);
         }
-        if let Some(pfi) = will.properties.payload_format_indicator {
-            builder = builder.header(HDR_PAYLOAD_FORMAT.clone(), Bytes::copy_from_slice(&[pfi]));
+        if let Some(ref b) = pfi_byte {
+            builder = builder.header(&HDR_PAYLOAD_FORMAT[..], b);
         }
-        for (k, v) in &will.properties.user_properties {
-            let mut hdr_key = bytes::BytesMut::with_capacity(10 + k.len());
-            hdr_key.extend_from_slice(b"mqtt.user.");
-            hdr_key.extend_from_slice(k.as_bytes());
-            builder = builder.header(hdr_key.freeze(), Bytes::copy_from_slice(v.as_bytes()));
+        for (k, v) in &user_props {
+            builder = builder.header(k, v.as_bytes());
         }
         if include_delay {
-            if let Some(delay_secs) = will.properties.will_delay_interval {
+            if let Some(delay_secs) = will.properties().will_delay_interval() {
                 if delay_secs > 0 {
                     builder = builder.delay_ms(delay_secs as u64 * 1000);
                 }
@@ -1928,20 +2185,20 @@ impl MqttSession {
     pub fn handle_disconnect(
         &mut self,
         disconnect: Option<&crate::types::Disconnect>,
-    ) -> (Option<PublishPlan>, SmallVec<[MqCommand; 8]>) {
+    ) -> Option<PublishPlan> {
+        self.cmd_buf.clear();
+
         // MQTT 5.0: Update session expiry interval from DISCONNECT properties (SS 3.14.2.2.2).
         // It is a Protocol Error to set a non-zero Session Expiry Interval if the
         // Session Expiry Interval in the CONNECT packet was zero.
         if self.protocol_version == ProtocolVersion::V5 {
             if let Some(d) = disconnect {
-                if let Some(new_sei) = d.properties.session_expiry_interval {
+                if let Some(new_sei) = d.session_expiry_interval {
                     if self.session_expiry_interval == 0 && new_sei != 0 {
                         warn!(
                             client_id = %self.client_id,
                             "protocol error: cannot set non-zero session expiry on DISCONNECT when CONNECT had 0"
                         );
-                        // Protocol Error — but we're already disconnecting, so just
-                        // log and ignore the update (the session will expire immediately).
                     } else {
                         self.session_expiry_interval = new_sei;
                     }
@@ -1971,10 +2228,13 @@ impl MqttSession {
                         .exchanges
                         .get(MQTT_EXCHANGE_NAME)
                         .copied(),
-                    flat_message,
-                    responses: SmallVec::new(),
+                    msg_start: 0,
+                    msg_len: 0,
+                    flat_message: Some(flat_message),
                     retained: if will.retain && !will.payload.is_empty() {
-                        let retained_name = self.retained_topic_name(&will.topic);
+                        let retained_name = self.retained_topic_name(unsafe {
+                            std::str::from_utf8_unchecked(&will.topic)
+                        });
                         let cached_topic_id = self.entity_cache.topics.get(&retained_name).copied();
                         let ret_msg = Self::build_will_flat_message(&will, now, false);
                         Some(RetainedPlan {
@@ -1985,7 +2245,7 @@ impl MqttSession {
                     } else {
                         None
                     },
-                    disconnect: None,
+                    need_disconnect: false,
                 }
             })
         } else {
@@ -1995,19 +2255,18 @@ impl MqttSession {
 
         self.connected = false;
 
-        let mut commands = SmallVec::new();
-
-        commands.push(MqCommand::disconnect_session(self.session_id, publish_will));
+        self.cmd_buf
+            .write_disconnect_session(self.session_id, publish_will);
 
         // If clean session, remove all subscription bindings and queues.
         if self.clean_session {
             for mapping in self.subscriptions.values() {
                 if let Some(binding_id) = mapping.binding_id {
-                    commands.push(MqCommand::delete_binding(binding_id));
+                    self.cmd_buf.write_delete_binding(binding_id);
                 }
                 if mapping.shared_group.is_none() {
                     if let Some(queue_id) = mapping.queue_id {
-                        commands.push(MqCommand::delete_consumer_group(queue_id));
+                        self.cmd_buf.write_delete_consumer_group(queue_id);
                     }
                 }
             }
@@ -2023,7 +2282,7 @@ impl MqttSession {
             "MQTT session disconnected (clean)"
         );
 
-        (will_plan, commands)
+        will_plan
     }
 
     // =========================================================================
@@ -2033,8 +2292,8 @@ impl MqttSession {
     /// Handle an unclean disconnect (TCP connection dropped without DISCONNECT).
     ///
     /// Returns a `PublishPlan` for the will message (if any) and cleanup commands.
-    pub fn handle_unclean_disconnect(&mut self) -> (Option<PublishPlan>, SmallVec<[MqCommand; 8]>) {
-        let mut commands = SmallVec::new();
+    pub fn handle_unclean_disconnect(&mut self) -> Option<PublishPlan> {
+        self.cmd_buf.clear();
 
         // Build will message plan if present.
         let will_plan = if let Some(ref will) = self.will {
@@ -2044,12 +2303,13 @@ impl MqttSession {
             Some(PublishPlan {
                 exchange_name: MQTT_EXCHANGE_NAME,
                 cached_exchange_id: self.entity_cache.exchanges.get(MQTT_EXCHANGE_NAME).copied(),
-                flat_message,
-                responses: SmallVec::new(),
+                msg_start: 0,
+                msg_len: 0,
+                flat_message: Some(flat_message),
                 retained: if will.retain && !will.payload.is_empty() {
-                    let retained_name = self.retained_topic_name(&will.topic);
+                    let retained_name = self
+                        .retained_topic_name(unsafe { std::str::from_utf8_unchecked(&will.topic) });
                     let cached_topic_id = self.entity_cache.topics.get(&retained_name).copied();
-                    // Rebuild without delay for the retained copy.
                     let ret_msg = Self::build_will_flat_message(will, now, false);
                     Some(RetainedPlan {
                         topic_name: retained_name,
@@ -2059,7 +2319,7 @@ impl MqttSession {
                 } else {
                     None
                 },
-                disconnect: None,
+                need_disconnect: false,
             })
         } else {
             None
@@ -2069,7 +2329,7 @@ impl MqttSession {
         self.connected = false;
 
         // Disconnect session. For unclean disconnect, publish will message.
-        commands.push(MqCommand::disconnect_session(self.session_id, true));
+        self.cmd_buf.write_disconnect_session(self.session_id, true);
 
         // Collect all outbound NACK message IDs, grouped by queue_id.
         // Uses SmallVec to avoid HashMap allocation for the common case.
@@ -2107,7 +2367,7 @@ impl MqttSession {
                 }
                 let mids: SmallVec<[u64; 8]> =
                     nack_pairs[start..i].iter().map(|(_, mid)| *mid).collect();
-                commands.push(MqCommand::group_nack(cur_qid, &mids));
+                self.cmd_buf.write_group_nack(cur_qid, &mids);
             }
         }
 
@@ -2125,183 +2385,12 @@ impl MqttSession {
             "MQTT session disconnected (unclean)"
         );
 
-        (will_plan, commands)
+        will_plan
     }
 
     // =========================================================================
     // Outbound message delivery (bisque-mq -> MQTT client)
     // =========================================================================
-
-    /// Build an outbound PUBLISH packet for delivering a bisque-mq message to
-    /// the MQTT client, decoding the FlatMessage to reconstruct MQTT properties.
-    pub fn build_outbound_publish_from_flat(
-        &mut self,
-        flat_msg: &FlatMessage,
-        effective_qos: QoS,
-        retain: bool,
-        mq_queue_id: u64,
-        mq_message_id: u64,
-    ) -> Option<MqttPacket> {
-        if self.is_inflight_full() {
-            return None;
-        }
-
-        // Zero-copy: routing_key() returns Bytes (refcount bump from mmap).
-        let topic = flat_msg
-            .routing_key()
-            .unwrap_or_else(|| Bytes::from_static(b"unknown"));
-
-        let payload = flat_msg.value();
-
-        // Reconstruct MQTT 5.0 properties from FlatMessage.
-        let mut properties = Properties::default();
-
-        if self.protocol_version == ProtocolVersion::V5 {
-            // Native FlatMessage fields -> MQTT properties.
-            if let Some(reply_to) = flat_msg.reply_to() {
-                properties.response_topic = Some(String::from_utf8_lossy(&reply_to).into_owned());
-            }
-            if let Some(corr_id) = flat_msg.correlation_id() {
-                properties.correlation_data = Some(corr_id);
-            }
-
-            // Reconstruct from headers — compare raw bytes to avoid String alloc.
-            for i in 0..flat_msg.header_count() {
-                let (k, v) = flat_msg.header(i);
-                if &k[..] == b"mqtt.content_type" {
-                    properties.content_type = Some(String::from_utf8_lossy(&v).into_owned());
-                } else if &k[..] == b"mqtt.payload_format" && !v.is_empty() {
-                    properties.payload_format_indicator = Some(v[0]);
-                } else if k.starts_with(b"mqtt.user.") {
-                    let prop_key = String::from_utf8_lossy(&k[10..]).into_owned();
-                    properties
-                        .user_properties
-                        .push((prop_key, String::from_utf8_lossy(&v).into_owned()));
-                }
-            }
-
-            // Reconstruct message_expiry_interval from TTL.
-            if let Some(ttl_ms) = flat_msg.ttl_ms() {
-                let remaining_secs = ttl_ms / 1000;
-                if remaining_secs > 0 {
-                    properties.message_expiry_interval = Some(remaining_secs as u32);
-                }
-            }
-
-            // Per-queue subscription identifier lookup (MQTT 5.0 SS 3.3.4).
-            if let Some(sub_id) = self.find_subscription_id_for_queue(mq_queue_id) {
-                properties.subscription_identifier = Some(sub_id);
-            }
-
-            // Outbound topic alias assignment (m7: empty topic on existing alias).
-            if let Some((alias, _is_new)) = self.resolve_outbound_topic_alias(&topic) {
-                properties.topic_alias = Some(alias);
-                // Note: For the struct-based path, we keep the full topic in the
-                // Publish struct. The encode_publish_versioned encoder uses
-                // properties.topic_alias presence to determine alias usage, but
-                // always writes the topic from the struct. The m7 optimization
-                // (empty topic on existing alias) is primarily for the zero-alloc
-                // encode_publish_from_flat path which handles it via the bool flag.
-            }
-        }
-
-        let packet_id = if effective_qos != QoS::AtMostOnce {
-            let id = self.alloc_packet_id();
-
-            match effective_qos {
-                QoS::AtLeastOnce => {
-                    self.qos1_inflight.insert(
-                        id,
-                        QoS1InFlight {
-                            mq_message_id: Some(mq_message_id),
-                            mq_queue_id: Some(mq_queue_id),
-                            direction: Direction::Outbound,
-                        },
-                    );
-                    self.outbound_qos1_count += 1;
-                }
-                QoS::ExactlyOnce => {
-                    self.qos2_outbound.insert(
-                        id,
-                        QoS2OutboundState::PublishSent {
-                            mq_queue_id,
-                            mq_message_id,
-                        },
-                    );
-                }
-                _ => {}
-            }
-
-            Some(id)
-        } else {
-            None
-        };
-
-        Some(MqttPacket::Publish(Publish {
-            dup: false,
-            qos: effective_qos,
-            retain,
-            topic,
-            packet_id,
-            payload,
-            properties,
-        }))
-    }
-
-    /// Legacy build_outbound_publish for raw payloads (kept for backward compat).
-    pub fn build_outbound_publish(
-        &mut self,
-        topic: &str,
-        payload: Bytes,
-        qos: QoS,
-        retain: bool,
-        mq_queue_id: Option<u64>,
-        mq_message_id: Option<u64>,
-    ) -> MqttPacket {
-        let packet_id = if qos != QoS::AtMostOnce {
-            let id = self.alloc_packet_id();
-
-            match qos {
-                QoS::AtLeastOnce => {
-                    self.qos1_inflight.insert(
-                        id,
-                        QoS1InFlight {
-                            mq_message_id,
-                            mq_queue_id,
-                            direction: Direction::Outbound,
-                        },
-                    );
-                    self.outbound_qos1_count += 1;
-                }
-                QoS::ExactlyOnce => {
-                    if let (Some(qid), Some(mid)) = (mq_queue_id, mq_message_id) {
-                        self.qos2_outbound.insert(
-                            id,
-                            QoS2OutboundState::PublishSent {
-                                mq_queue_id: qid,
-                                mq_message_id: mid,
-                            },
-                        );
-                    }
-                }
-                _ => {}
-            }
-
-            Some(id)
-        } else {
-            None
-        };
-
-        MqttPacket::Publish(Publish {
-            dup: false,
-            qos,
-            retain,
-            topic: Bytes::copy_from_slice(topic.as_bytes()),
-            packet_id,
-            payload,
-            properties: Properties::default(),
-        })
-    }
 
     // =========================================================================
     // Outbound delivery tracking (zero-alloc hot path)
@@ -2490,21 +2579,23 @@ impl MqttSession {
     }
 
     /// Check if any subscription with the given queue_id has no_local=true.
-    pub fn has_no_local_for_queue(&self, queue_id: u64) -> bool {
-        self.subscriptions
-            .values()
-            .any(|m| m.queue_id == Some(queue_id) && m.no_local)
+    /// O(1) via cached delivery info scan (small vec, typically < 10 entries).
+    pub fn has_no_local_for_queue(&mut self, queue_id: u64) -> bool {
+        self.delivery_info()
+            .iter()
+            .any(|d| d.queue_id == queue_id && d.no_local)
     }
 
     /// Check if any subscription with the given queue_id has retain_as_published=true.
-    pub fn has_retain_as_published_for_queue(&self, queue_id: u64) -> bool {
-        self.subscriptions
-            .values()
-            .any(|m| m.queue_id == Some(queue_id) && m.retain_as_published)
+    /// O(1) via cached delivery info scan (small vec, typically < 10 entries).
+    pub fn has_retain_as_published_for_queue(&mut self, queue_id: u64) -> bool {
+        self.delivery_info()
+            .iter()
+            .any(|d| d.queue_id == queue_id && d.retain_as_published)
     }
 
     /// Return outbound QoS 1 in-flight packet IDs (for session persistence).
-    pub fn pending_qos1_packet_ids(&self) -> Vec<u16> {
+    pub fn pending_qos1_packet_ids(&self) -> SmallVec<[u16; 16]> {
         self.qos1_inflight
             .iter()
             .filter(|(_, v)| v.direction == Direction::Outbound)
@@ -2513,7 +2604,7 @@ impl MqttSession {
     }
 
     /// Return outbound QoS 2 in-flight packet IDs (for session persistence).
-    pub fn pending_qos2_packet_ids(&self) -> Vec<u16> {
+    pub fn pending_qos2_packet_ids(&self) -> SmallVec<[u16; 16]> {
         self.qos2_outbound.keys().copied().collect()
     }
 
@@ -2530,9 +2621,9 @@ impl MqttSession {
         for sub in persisted {
             let filter = crate::types::TopicFilter {
                 filter: if let Some(ref group) = sub.shared_group {
-                    format!("$share/{}/{}", group, sub.filter)
+                    Bytes::from(format!("$share/{}/{}", group, sub.filter))
                 } else {
-                    sub.filter.clone()
+                    Bytes::from(sub.filter.clone())
                 },
                 qos: sub.max_qos,
                 no_local: sub.no_local,
@@ -2547,35 +2638,33 @@ impl MqttSession {
         plans
     }
 
-    /// Generate packets to retransmit on session resumption (MQTT 5.0 SS 4.4).
+    /// Encode retransmit packets to `out_buf` for session resumption (MQTT 5.0 SS 4.4).
     ///
-    /// Returns PUBLISH (DUP=1) for unacked outbound QoS 1, and PUBREL for
-    /// outbound QoS 2 in PubRelSent state.
-    pub fn pending_retransmits(&self) -> SmallVec<[MqttPacket; 4]> {
-        let mut packets = SmallVec::new();
-
-        // Retransmit outbound QoS 1 PUBLISH (DUP=1).
-        // Note: we don't have the original payload cached, so we send a placeholder
-        // that the server must fill from the queue. For now, just retransmit PUBRELs
-        // which are fully reconstructable.
+    /// Encodes PUBREL for outbound QoS 2 in PubRelSent state.
+    /// Returns the number of packets encoded.
+    pub fn pending_retransmits(&mut self) -> usize {
+        self.out_buf.clear();
+        let is_v5 = self.protocol_version == ProtocolVersion::V5;
+        let mut count = 0;
 
         // Retransmit PUBREL for outbound QoS 2 in PubRelSent state.
         for (&packet_id, state) in &self.qos2_outbound {
             if matches!(state, QoS2OutboundState::PubRelSent { .. }) {
-                let rc = if self.protocol_version == ProtocolVersion::V5 {
-                    Some(0x00)
-                } else {
-                    None
-                };
-                packets.push(MqttPacket::PubRel(PubRel {
-                    packet_id,
-                    reason_code: rc,
-                    properties: Properties::default(),
-                }));
+                let rc = if is_v5 { Some(0x00) } else { None };
+                encode_pubrel_v(
+                    &PubRel {
+                        packet_id,
+                        reason_code: rc,
+                        reason_string: None,
+                    },
+                    &mut self.out_buf,
+                    is_v5,
+                );
+                count += 1;
             }
         }
 
-        packets
+        count
     }
 
     /// Update a subscription mapping with resolved bisque-mq entity IDs.
@@ -2606,92 +2695,6 @@ impl MqttSession {
             }
         }
     }
-
-    /// Process incoming MQTT packet and return (commands, response_packets).
-    /// For PUBLISH and SUBSCRIBE, use handle_publish / handle_subscribe instead
-    /// (they return structured plans for the server to orchestrate).
-    ///
-    /// This dispatch method handles simple packets that don't need orchestration.
-    pub fn process_packet(
-        &mut self,
-        packet: &MqttPacket,
-    ) -> (SmallVec<[MqCommand; 4]>, SmallVec<[MqttPacket; 2]>) {
-        match packet {
-            MqttPacket::Connect(connect) => {
-                let (cmds, connack) = self.handle_connect(connect);
-                (cmds, smallvec::smallvec![connack])
-            }
-            MqttPacket::Publish(_publish) => {
-                // PUBLISH requires orchestration via handle_publish + server logic.
-                // The server should call handle_publish() directly.
-                // For backward compatibility, we still handle it here.
-                let plan = self.handle_publish(_publish);
-                // Return the responses from the plan; the server must separately
-                // orchestrate the exchange publish.
-                (SmallVec::new(), plan.responses)
-            }
-            MqttPacket::PubAck(puback) => {
-                let cmds: SmallVec<[MqCommand; 4]> =
-                    self.handle_puback(puback.packet_id).into_iter().collect();
-                (cmds, SmallVec::new())
-            }
-            MqttPacket::PubRec(pubrec) => {
-                let pubrel = self.handle_pubrec(pubrec.packet_id);
-                (SmallVec::new(), smallvec::smallvec![pubrel])
-            }
-            MqttPacket::PubRel(pubrel) => {
-                let pubcomp = self.handle_pubrel(pubrel.packet_id);
-                (SmallVec::new(), smallvec::smallvec![pubcomp])
-            }
-            MqttPacket::PubComp(pubcomp) => {
-                let cmds: SmallVec<[MqCommand; 4]> =
-                    self.handle_pubcomp(pubcomp.packet_id).into_iter().collect();
-                (cmds, SmallVec::new())
-            }
-            MqttPacket::Subscribe(subscribe) => {
-                // SUBSCRIBE requires orchestration via handle_subscribe + server.
-                let plan = self.handle_subscribe(
-                    subscribe.packet_id,
-                    &subscribe.filters,
-                    subscribe.properties.subscription_identifier,
-                );
-                (SmallVec::new(), smallvec::smallvec![plan.suback])
-            }
-            MqttPacket::Unsubscribe(unsubscribe) => {
-                let (cmds, unsuback) =
-                    self.handle_unsubscribe(unsubscribe.packet_id, &unsubscribe.filters);
-                (cmds, smallvec::smallvec![unsuback])
-            }
-            MqttPacket::PingReq => {
-                let (cmd, pong) = self.handle_pingreq();
-                (smallvec::smallvec![cmd], smallvec::smallvec![pong])
-            }
-            MqttPacket::Disconnect(disconnect) => {
-                let (_will_plan, cmds) = self.handle_disconnect(Some(disconnect));
-                // Note: will_plan is returned but process_packet can't orchestrate it.
-                // The server's process_inbound_packet handles this directly.
-                (SmallVec::from_iter(cmds), SmallVec::new())
-            }
-            // AUTH is only valid in MQTT 5.0 enhanced authentication flows,
-            // which we do not support. Respond with DISCONNECT reason code 0x8C
-            // (Bad authentication method).
-            MqttPacket::Auth(auth) => {
-                let (cmds, pkts) = self.handle_auth(auth);
-                (cmds, SmallVec::from_iter(pkts))
-            }
-            // Server-originated packets should not arrive from client.
-            MqttPacket::ConnAck(_)
-            | MqttPacket::SubAck(_)
-            | MqttPacket::UnsubAck(_)
-            | MqttPacket::PingResp => {
-                warn!(
-                    packet_type = ?packet.packet_type(),
-                    "unexpected packet from client"
-                );
-                (SmallVec::new(), SmallVec::new())
-            }
-        }
-    }
 }
 
 // =============================================================================
@@ -2701,7 +2704,10 @@ impl MqttSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec;
     use crate::types::*;
+    use bisque_mq::MqCommand;
+    use bisque_mq::flat::FlatMessage;
 
     fn make_session() -> MqttSession {
         MqttSession::new(MqttSessionConfig::default())
@@ -2709,7 +2715,7 @@ mod tests {
 
     fn make_connect(client_id: &str, clean: bool) -> Connect {
         Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V311,
             flags: ConnectFlags {
                 username: false,
@@ -2720,17 +2726,17 @@ mod tests {
                 clean_session: clean,
             },
             keep_alive: 60,
-            client_id: client_id.to_string(),
+            client_id: Bytes::copy_from_slice(client_id.as_bytes()),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         }
     }
 
     fn make_connect_v5(client_id: &str, clean: bool) -> Connect {
         Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags {
                 username: false,
@@ -2741,16 +2747,15 @@ mod tests {
                 clean_session: clean,
             },
             keep_alive: 60,
-            client_id: client_id.to_string(),
+            client_id: Bytes::copy_from_slice(client_id.as_bytes()),
             will: None,
             username: None,
             password: None,
-            properties: Properties {
-                topic_alias_maximum: Some(10),
-                receive_maximum: Some(100),
-                session_expiry_interval: Some(3600),
-                ..Properties::default()
-            },
+            properties_raw: PropertiesBuilder::new()
+                .topic_alias_maximum(10)
+                .receive_maximum(100)
+                .session_expiry_interval(3600)
+                .build(),
         }
     }
 
@@ -2761,24 +2766,22 @@ mod tests {
         let mut session = make_session();
         let connect = make_connect("test-client", true);
 
-        let (commands, response) = session.handle_connect(&connect);
+        session.handle_connect(&connect);
 
         assert!(session.connected);
         assert_eq!(session.client_id, "test-client");
         assert!(session.clean_session);
         assert_eq!(session.keep_alive, 60);
 
-        assert_eq!(commands.len(), 2);
-        assert_eq!(commands[0].tag(), MqCommand::TAG_REGISTER_CONSUMER);
-        assert_eq!(commands[1].tag(), MqCommand::TAG_REGISTER_PRODUCER);
+        assert_eq!(session.cmd_buf.len(), 1);
+        assert_eq!(
+            session.cmd_buf.to_command(0).tag(),
+            MqCommand::TAG_CREATE_SESSION
+        );
 
-        match response {
-            MqttPacket::ConnAck(connack) => {
-                assert_eq!(connack.return_code, 0x00);
-                assert!(!connack.session_present);
-            }
-            _ => panic!("expected ConnAck"),
-        }
+        let (connack, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert_eq!(connack.return_code, 0x00);
+        assert!(!connack.session_present);
     }
 
     #[test]
@@ -2786,22 +2789,18 @@ mod tests {
         let mut session = make_session();
         let connect = make_connect_v5("v5-client", true);
 
-        let (_commands, response) = session.handle_connect(&connect);
+        session.handle_connect(&connect);
 
         assert_eq!(session.max_topic_alias, 10);
         assert_eq!(session.client_receive_maximum, 100);
         assert_eq!(session.session_expiry_interval, 3600);
 
-        match response {
-            MqttPacket::ConnAck(connack) => {
-                assert!(connack.properties.maximum_qos.is_some());
-                assert!(connack.properties.retain_available.is_some());
-                assert!(connack.properties.shared_subscription_available.is_some());
-                assert!(connack.properties.wildcard_subscription_available.is_some());
-                assert!(connack.properties.receive_maximum.is_some());
-            }
-            _ => panic!("expected ConnAck"),
-        }
+        let (connack, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert!(connack.maximum_qos.is_some());
+        assert!(connack.retain_available.is_some());
+        assert!(connack.shared_subscription_available.is_some());
+        assert!(connack.wildcard_subscription_available.is_some());
+        assert!(connack.receive_maximum.is_some());
     }
 
     // ---- PUBLISH tests ----
@@ -2815,17 +2814,18 @@ mod tests {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: Bytes::from_static(b"sensor/1/temp"),
+            topic: b"sensor/1/temp",
             packet_id: None,
-            payload: Bytes::from_static(b"22.5"),
+            payload: b"22.5",
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
 
         assert_eq!(plan.exchange_name, MQTT_EXCHANGE_NAME);
-        assert!(!plan.flat_message.is_empty());
-        assert!(plan.responses.is_empty()); // QoS 0: no ack
+        assert!(plan.has_message());
+        assert!(session.out_buf.is_empty()); // QoS 0: no ack
         assert!(plan.retained.is_none());
     }
 
@@ -2838,19 +2838,18 @@ mod tests {
             dup: false,
             qos: QoS::AtLeastOnce,
             retain: false,
-            topic: Bytes::from_static(b"sensor/1/temp"),
+            topic: b"sensor/1/temp",
             packet_id: Some(1),
-            payload: Bytes::from_static(b"22.5"),
+            payload: b"22.5",
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
 
-        assert_eq!(plan.responses.len(), 1);
-        match &plan.responses[0] {
-            MqttPacket::PubAck(puback) => assert_eq!(puback.packet_id, 1),
-            _ => panic!("expected PubAck"),
-        }
+        assert!(!session.out_buf.is_empty());
+        let (puback, _) = codec::decode_buf::puback(&session.out_buf).unwrap();
+        assert_eq!(puback.packet_id, 1);
     }
 
     #[test]
@@ -2862,24 +2861,23 @@ mod tests {
             dup: false,
             qos: QoS::ExactlyOnce,
             retain: false,
-            topic: Bytes::from_static(b"important/data"),
+            topic: b"important/data",
             packet_id: Some(10),
-            payload: Bytes::from_static(b"critical"),
+            payload: b"critical",
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
 
-        assert_eq!(plan.responses.len(), 1);
-        match &plan.responses[0] {
-            MqttPacket::PubRec(pubrec) => assert_eq!(pubrec.packet_id, 10),
-            _ => panic!("expected PubRec"),
-        }
+        assert!(!session.out_buf.is_empty());
+        let (pubrec, _) = codec::decode_buf::pubrec(&session.out_buf).unwrap();
+        assert_eq!(pubrec.packet_id, 10);
         assert_eq!(session.qos2_inflight_count(), 1);
 
         // PUBREL completes the inbound QoS 2.
-        let pubcomp = session.handle_pubrel(10);
-        assert!(matches!(pubcomp, MqttPacket::PubComp(_)));
+        session.handle_pubrel(10);
+        codec::decode_buf::pubcomp(&session.out_buf).unwrap();
     }
 
     #[test]
@@ -2887,27 +2885,29 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect("rr-client", true));
 
+        let props_raw = PropertiesBuilder::new()
+            .response_topic("reply/topic")
+            .correlation_data(b"corr-123")
+            .build();
         let publish = Publish {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: Bytes::from_static(b"request/topic"),
+            topic: b"request/topic",
             packet_id: None,
-            payload: Bytes::from_static(b"request body"),
-            properties: Properties {
-                response_topic: Some("reply/topic".to_string()),
-                correlation_data: Some(Bytes::from_static(b"corr-123")),
-                ..Properties::default()
-            },
+            payload: b"request body",
+            properties: Properties::from_raw(&props_raw),
         };
 
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
 
-        // Verify the flat message has native reply_to and correlation_id.
-        let flat = FlatMessage::new(plan.flat_message).expect("valid flat message");
-        let reply_to = flat.reply_to().expect("should have reply_to");
+        // Verify the MqttEnvelope has reply_to and correlation_id from raw properties.
+        let msg_slice = &msg_buf[plan.msg_start..plan.msg_start + plan.msg_len];
+        let env = bisque_mq::flat::MqttEnvelope::new(msg_slice).expect("valid mqtt envelope");
+        let reply_to = env.reply_to().expect("should have reply_to");
         assert_eq!(&reply_to[..], b"reply/topic");
-        let corr_id = flat.correlation_id().expect("should have correlation_id");
+        let corr_id = env.correlation_id().expect("should have correlation_id");
         assert_eq!(&corr_id[..], b"corr-123");
     }
 
@@ -2916,22 +2916,22 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect("ttl-client", true));
 
+        let props_raw = PropertiesBuilder::new().message_expiry_interval(60).build();
         let publish = Publish {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: Bytes::from_static(b"expiring"),
+            topic: b"expiring",
             packet_id: None,
-            payload: Bytes::from_static(b"data"),
-            properties: Properties {
-                message_expiry_interval: Some(60),
-                ..Properties::default()
-            },
+            payload: b"data",
+            properties: Properties::from_raw(&props_raw),
         };
 
-        let plan = session.handle_publish(&publish);
-        let flat = FlatMessage::new(plan.flat_message).expect("valid flat message");
-        assert_eq!(flat.ttl_ms(), Some(60_000));
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        let msg_slice = &msg_buf[plan.msg_start..plan.msg_start + plan.msg_len];
+        let env = bisque_mq::flat::MqttEnvelope::new(msg_slice).expect("valid mqtt envelope");
+        assert_eq!(env.ttl_ms(), Some(60_000));
     }
 
     #[test]
@@ -2943,13 +2943,14 @@ mod tests {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: true,
-            topic: Bytes::from_static(b"status/device1"),
+            topic: b"status/device1",
             packet_id: None,
-            payload: Bytes::from_static(b"online"),
+            payload: b"online",
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
         let retained = plan.retained.as_ref().expect("should have retained plan");
         assert_eq!(retained.topic_name, "$mqtt/retained/status/device1");
         assert!(retained.flat_message.is_some());
@@ -2964,13 +2965,14 @@ mod tests {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: true,
-            topic: Bytes::from_static(b"status/device1"),
+            topic: b"status/device1",
             packet_id: None,
-            payload: Bytes::new(), // Empty = clear
+            payload: b"", // Empty = clear
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
         let retained = plan.retained.as_ref().expect("should have retained plan");
         assert!(retained.flat_message.is_none()); // Clear signal
     }
@@ -2984,14 +2986,14 @@ mod tests {
 
         let filters = vec![
             TopicFilter {
-                filter: "sensor/+/data".to_string(),
+                filter: Bytes::from("sensor/+/data"),
                 qos: QoS::AtLeastOnce,
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
             },
             TopicFilter {
-                filter: "control/#".to_string(),
+                filter: Bytes::from("control/#"),
                 qos: QoS::AtMostOnce,
                 no_local: false,
                 retain_as_published: false,
@@ -3014,13 +3016,9 @@ mod tests {
 
         assert_eq!(session.subscription_count(), 2);
 
-        match plan.suback {
-            MqttPacket::SubAck(sa) => {
-                assert_eq!(sa.packet_id, 1);
-                assert_eq!(sa.return_codes.as_slice(), &[1, 0]);
-            }
-            _ => panic!("expected SubAck"),
-        }
+        let (sa, _) = codec::decode_buf::suback(&session.out_buf).unwrap();
+        assert_eq!(sa.packet_id, 1);
+        assert_eq!(sa.return_codes.as_slice(), &[1, 0]);
     }
 
     #[test]
@@ -3029,7 +3027,7 @@ mod tests {
         session.handle_connect(&make_connect("shared-client", true));
 
         let filters = vec![TopicFilter {
-            filter: "$share/mygroup/sensor/+/data".to_string(),
+            filter: Bytes::from("$share/mygroup/sensor/+/data"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -3052,7 +3050,7 @@ mod tests {
         session.handle_connect(&make_connect("subid-client", true));
 
         let filters = vec![TopicFilter {
-            filter: "test/#".to_string(),
+            filter: Bytes::from("test/#"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -3074,7 +3072,7 @@ mod tests {
         session.handle_connect(&make_connect("sub-client", true));
 
         let filters = vec![TopicFilter {
-            filter: "sensor/+/data".to_string(),
+            filter: Bytes::from("sensor/+/data"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -3083,16 +3081,12 @@ mod tests {
         session.handle_subscribe(1, &filters, None);
         assert_eq!(session.subscription_count(), 1);
 
-        let (_, unsuback) = session.handle_unsubscribe(2, &["sensor/+/data".to_string()]);
+        session.handle_unsubscribe(2, &["sensor/+/data".to_string()]);
         assert_eq!(session.subscription_count(), 0);
 
-        match unsuback {
-            MqttPacket::UnsubAck(ua) => {
-                assert_eq!(ua.packet_id, 2);
-                assert_eq!(ua.reason_codes.as_slice(), &[0x00]);
-            }
-            _ => panic!("expected UnsubAck"),
-        }
+        let (ua, _) = codec::decode_buf::unsuback(&session.out_buf).unwrap();
+        assert_eq!(ua.packet_id, 2);
+        assert_eq!(ua.reason_codes.as_slice(), &[0x00]);
     }
 
     // ---- PING tests ----
@@ -3102,9 +3096,12 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect("ping-client", true));
 
-        let (cmd, response) = session.handle_pingreq();
-        assert_eq!(cmd.tag(), MqCommand::TAG_HEARTBEAT);
-        assert!(matches!(response, MqttPacket::PingResp));
+        session.handle_pingreq();
+        assert_eq!(
+            session.cmd_buf.to_command(0).tag(),
+            MqCommand::TAG_HEARTBEAT_SESSION
+        );
+        assert!(!session.out_buf.is_empty());
     }
 
     // ---- DISCONNECT tests ----
@@ -3115,7 +3112,7 @@ mod tests {
         session.handle_connect(&make_connect("dc-client", true));
 
         let filters = vec![TopicFilter {
-            filter: "test/#".to_string(),
+            filter: Bytes::from("test/#"),
             qos: QoS::AtMostOnce,
             no_local: false,
             retain_as_published: false,
@@ -3123,11 +3120,15 @@ mod tests {
         }];
         session.handle_subscribe(1, &filters, None);
 
-        let (will_plan, commands) = session.handle_disconnect(None);
+        let will_plan = session.handle_disconnect(None);
         assert!(!session.connected);
         assert!(session.will.is_none());
         assert!(will_plan.is_none());
-        assert!(commands.len() >= 2);
+        assert!(session.cmd_buf.len() >= 1);
+        assert_eq!(
+            session.cmd_buf.to_command(0).tag(),
+            MqCommand::TAG_DISCONNECT_SESSION
+        );
         assert_eq!(session.subscription_count(), 0);
     }
 
@@ -3136,15 +3137,15 @@ mod tests {
         let mut session = make_session();
 
         let will = WillMessage {
-            topic: "client/status".to_string(),
+            topic: Bytes::from_static(b"client/status"),
             payload: Bytes::from_static(b"offline"),
             qos: QoS::AtMostOnce,
             retain: false,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
 
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V311,
             flags: ConnectFlags {
                 username: false,
@@ -3155,27 +3156,31 @@ mod tests {
                 clean_session: true,
             },
             keep_alive: 60,
-            client_id: "will-client".to_string(),
+            client_id: Bytes::from("will-client"),
             will: Some(will),
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
 
         session.handle_connect(&connect);
         assert!(session.will.is_some());
 
-        let (will_plan, commands) = session.handle_unclean_disconnect();
+        let will_plan = session.handle_unclean_disconnect();
         assert!(!session.connected);
         assert!(session.will.is_none());
         assert!(will_plan.is_some());
 
         let plan = will_plan.unwrap();
         assert_eq!(plan.exchange_name, MQTT_EXCHANGE_NAME);
-        assert!(!plan.flat_message.is_empty());
+        assert!(plan.has_message());
 
-        // Should have DisconnectConsumer + DisconnectProducer.
-        assert!(commands.len() >= 2);
+        // Should have DisconnectSession.
+        assert!(session.cmd_buf.len() >= 1);
+        assert_eq!(
+            session.cmd_buf.to_command(0).tag(),
+            MqCommand::TAG_DISCONNECT_SESSION
+        );
     }
 
     #[test]
@@ -3183,22 +3188,21 @@ mod tests {
         let mut session = make_session();
 
         let will = WillMessage {
-            topic: "status".to_string(),
+            topic: Bytes::from_static(b"status"),
             payload: Bytes::from_static(b"gone"),
             qos: QoS::AtMostOnce,
             retain: false,
-            properties: Properties {
-                response_topic: Some("reply/status".to_string()),
-                correlation_data: Some(Bytes::from_static(b"will-corr")),
-                content_type: Some("text/plain".to_string()),
-                message_expiry_interval: Some(300),
-                will_delay_interval: Some(10),
-                ..Properties::default()
-            },
+            properties_raw: PropertiesBuilder::new()
+                .response_topic("reply/status")
+                .correlation_data(b"will-corr")
+                .content_type("text/plain")
+                .message_expiry_interval(300)
+                .will_delay_interval(10)
+                .build(),
         };
 
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags {
                 username: false,
@@ -3209,18 +3213,22 @@ mod tests {
                 clean_session: true,
             },
             keep_alive: 60,
-            client_id: "v5-will".to_string(),
+            client_id: Bytes::from("v5-will"),
             will: Some(will),
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
 
         session.handle_connect(&connect);
-        let (will_plan, _commands) = session.handle_unclean_disconnect();
+        let will_plan = session.handle_unclean_disconnect();
 
         let plan = will_plan.unwrap();
-        let flat = FlatMessage::new(plan.flat_message).expect("valid flat message");
+        let flat_bytes = plan
+            .flat_message
+            .as_ref()
+            .expect("will plan should have owned flat_message");
+        let flat = FlatMessage::new(flat_bytes).expect("valid flat message");
 
         // Native fields preserved.
         let reply_to = flat.reply_to().expect("should have reply_to");
@@ -3243,25 +3251,16 @@ mod tests {
         session.handle_connect(&make_connect("q2-client", true));
 
         // Server delivers a message to client as QoS 2.
-        let packet = session.build_outbound_publish(
-            "test/topic",
-            Bytes::from_static(b"data"),
-            QoS::ExactlyOnce,
-            false,
-            Some(100),
-            Some(42),
-        );
-
-        let packet_id = match &packet {
-            MqttPacket::Publish(p) => p.packet_id.unwrap(),
-            _ => panic!("expected Publish"),
-        };
+        let packet_id = session
+            .track_outbound_delivery(QoS::ExactlyOnce, 100, 42)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(session.qos2_outbound.len(), 1);
 
         // Client sends PUBREC.
-        let pubrel = session.handle_pubrec(packet_id);
-        assert!(matches!(pubrel, MqttPacket::PubRel(_)));
+        session.handle_pubrec(packet_id);
+        codec::decode_buf::pubrel(&session.out_buf).unwrap();
 
         // State should be PubRelSent now.
         assert!(matches!(
@@ -3270,11 +3269,14 @@ mod tests {
         ));
 
         // Client sends PUBCOMP.
-        let cmd = session.handle_pubcomp(packet_id);
+        session.handle_pubcomp(packet_id);
 
         // Should ACK in bisque-mq.
-        let cmd = cmd.expect("should return ACK command");
-        assert_eq!(cmd.tag(), MqCommand::TAG_ACK);
+        assert!(!session.cmd_buf.is_empty(), "should return ACK command");
+        assert_eq!(
+            session.cmd_buf.to_command(0).tag(),
+            MqCommand::TAG_GROUP_ACK
+        );
         assert!(session.qos2_outbound.is_empty());
     }
 
@@ -3285,30 +3287,19 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect("out-client", true));
 
-        let packet = session.build_outbound_publish(
-            "sensor/1/temp",
-            Bytes::from_static(b"22.5"),
-            QoS::AtLeastOnce,
-            false,
-            Some(100),
-            Some(42),
-        );
-
-        match packet {
-            MqttPacket::Publish(p) => {
-                assert_eq!(&p.topic[..], b"sensor/1/temp");
-                assert_eq!(p.qos, QoS::AtLeastOnce);
-                assert!(p.packet_id.is_some());
-            }
-            _ => panic!("expected Publish"),
-        }
+        let result = session.track_outbound_delivery(QoS::AtLeastOnce, 100, 42);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_some()); // QoS 1 gets a packet_id
 
         assert_eq!(session.qos1_inflight_count(), 1);
 
         // PUBACK from client should ACK in bisque-mq.
-        let cmd = session.handle_puback(1);
-        let cmd = cmd.expect("should return ACK command");
-        assert_eq!(cmd.tag(), MqCommand::TAG_ACK);
+        session.handle_puback(1);
+        assert!(!session.cmd_buf.is_empty(), "should return ACK command");
+        assert_eq!(
+            session.cmd_buf.to_command(0).tag(),
+            MqCommand::TAG_GROUP_ACK
+        );
     }
 
     // ---- Entity cache tests ----
@@ -3442,92 +3433,26 @@ mod tests {
         assert_ne!(id1, id2);
     }
 
-    // ---- process_packet dispatch tests ----
+    // ---- dispatch tests ----
 
     #[test]
-    fn test_process_packet_dispatch() {
+    fn test_dispatch_connect_and_pingreq() {
         let mut session = make_session();
 
-        let connect = MqttPacket::Connect(make_connect("dispatch-client", true));
-        let (cmds, responses) = session.process_packet(&connect);
-        assert!(!cmds.is_empty());
-        assert_eq!(responses.len(), 1);
-        assert!(matches!(responses[0], MqttPacket::ConnAck(_)));
+        session.handle_connect(&make_connect("dispatch-client", true));
+        assert!(!session.cmd_buf.is_empty());
+        assert!(!session.out_buf.is_empty());
+        codec::decode_buf::connack(&session.out_buf).unwrap();
 
-        let (cmds, responses) = session.process_packet(&MqttPacket::PingReq);
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].tag(), MqCommand::TAG_HEARTBEAT);
-        assert_eq!(responses.len(), 1);
-        assert!(matches!(responses[0], MqttPacket::PingResp));
-    }
-
-    // ---- FlatMessage outbound decode tests ----
-
-    #[test]
-    fn test_build_outbound_publish_from_flat() {
-        let mut session = make_session();
-        session.handle_connect(&make_connect_v5("outf-client", true));
-
-        // Build a flat message with all properties.
-        let flat_bytes = FlatMessageBuilder::new(Bytes::from_static(b"sensor data"))
-            .timestamp(1000)
-            .routing_key(Bytes::from_static(b"sensor/1/temp"))
-            .reply_to(Bytes::from_static(b"reply/sensor"))
-            .correlation_id(Bytes::from_static(b"corr-abc"))
-            .ttl_ms(60_000)
-            .header("mqtt.content_type", Bytes::from_static(b"application/json"))
-            .header("mqtt.user.custom-key", Bytes::from_static(b"custom-value"))
-            .build();
-
-        let flat = FlatMessage::new(flat_bytes).unwrap();
-
-        let packet = session
-            .build_outbound_publish_from_flat(&flat, QoS::AtLeastOnce, false, 100, 42)
-            .expect("should produce packet");
-
-        match packet {
-            MqttPacket::Publish(p) => {
-                assert_eq!(&p.topic[..], b"sensor/1/temp");
-                assert_eq!(p.payload, Bytes::from_static(b"sensor data"));
-                assert_eq!(p.qos, QoS::AtLeastOnce);
-
-                // MQTT 5.0 properties reconstructed.
-                assert_eq!(
-                    p.properties.response_topic,
-                    Some("reply/sensor".to_string())
-                );
-                assert_eq!(
-                    p.properties.correlation_data,
-                    Some(Bytes::from_static(b"corr-abc"))
-                );
-                assert_eq!(
-                    p.properties.content_type,
-                    Some("application/json".to_string())
-                );
-                assert_eq!(p.properties.message_expiry_interval, Some(60));
-                assert_eq!(p.properties.user_properties.len(), 1);
-                assert_eq!(p.properties.user_properties[0].0, "custom-key");
-                assert_eq!(p.properties.user_properties[0].1, "custom-value");
-            }
-            _ => panic!("expected Publish"),
-        }
-    }
-
-    #[test]
-    fn test_build_outbound_publish_from_flat_respects_inflight_limit() {
-        let mut session = MqttSession::new(MqttSessionConfig {
-            max_inflight: 0, // Full immediately
-            ..MqttSessionConfig::default()
-        });
-        session.handle_connect(&make_connect("limit-client", true));
-
-        let flat_bytes = FlatMessageBuilder::new(Bytes::from_static(b"data"))
-            .routing_key(Bytes::from_static(b"test"))
-            .build();
-        let flat = FlatMessage::new(flat_bytes).unwrap();
-
-        let result = session.build_outbound_publish_from_flat(&flat, QoS::AtLeastOnce, false, 1, 1);
-        assert!(result.is_none());
+        session.out_buf.clear();
+        session.cmd_buf.clear();
+        session.handle_pingreq();
+        assert_eq!(session.cmd_buf.len(), 1);
+        assert_eq!(
+            session.cmd_buf.to_command(0).tag(),
+            MqCommand::TAG_HEARTBEAT_SESSION
+        );
+        assert!(!session.out_buf.is_empty());
     }
 
     // =========================================================================
@@ -3540,53 +3465,49 @@ mod tests {
     fn test_empty_client_id_v311_clean_generates_id() {
         let mut session = make_session();
         let connect = make_connect("", true);
-        let (_cmds, connack) = session.handle_connect(&connect);
+        session.handle_connect(&connect);
 
         assert!(session.client_id.starts_with("auto-"));
         assert!(session.connected);
-        match connack {
-            MqttPacket::ConnAck(c) => assert_eq!(c.return_code, 0x00),
-            _ => panic!("expected ConnAck"),
-        }
+        let (c, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert_eq!(c.return_code, 0x00);
     }
 
     #[test]
     fn test_empty_client_id_v311_not_clean_rejected() {
         let mut session = make_session();
         let connect = make_connect("", false);
-        let (cmds, connack) = session.handle_connect(&connect);
+        session.handle_connect(&connect);
 
         // Should return IdentifierRejected and no commands
-        assert!(cmds.is_empty());
-        match connack {
-            MqttPacket::ConnAck(c) => {
-                assert_eq!(c.return_code, ConnectReturnCode::IdentifierRejected as u8);
-            }
-            _ => panic!("expected ConnAck"),
-        }
+        assert!(session.cmd_buf.is_empty());
+        let (c, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert_eq!(c.return_code, ConnectReturnCode::IdentifierRejected as u8);
     }
 
     #[test]
     fn test_empty_client_id_v5_generates_id_and_assigns() {
         let mut session = make_session();
         let connect = make_connect_v5("", true);
-        let (_cmds, connack) = session.handle_connect(&connect);
+        session.handle_connect(&connect);
 
         assert!(session.client_id.starts_with("auto-"));
         assert!(session.connected);
-        match connack {
-            MqttPacket::ConnAck(c) => {
-                assert_eq!(c.return_code, 0x00);
-                assert!(c.properties.assigned_client_identifier.is_some());
-                assert!(
-                    c.properties
-                        .assigned_client_identifier
-                        .unwrap()
-                        .starts_with("auto-")
-                );
-            }
-            _ => panic!("expected ConnAck"),
-        }
+        let (c, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert_eq!(c.return_code, 0x00);
+        assert!(
+            c.assigned_client_identifier
+                .as_ref()
+                .map(|b| unsafe { std::str::from_utf8_unchecked(b) })
+                .is_some()
+        );
+        assert!(
+            c.assigned_client_identifier
+                .as_ref()
+                .map(|b| unsafe { std::str::from_utf8_unchecked(b) })
+                .unwrap()
+                .starts_with("auto-")
+        );
     }
 
     // ---- Keep-alive=0 for V5 (M16) ----
@@ -3620,35 +3541,35 @@ mod tests {
             dup: false,
             qos: QoS::ExactlyOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/dup"),
+            topic: b"test/dup",
             packet_id: Some(42),
-            payload: Bytes::from_static(b"first"),
+            payload: b"first",
             properties: Properties::default(),
         };
 
         // First PUBLISH
-        let plan1 = session.handle_publish(&publish);
-        assert!(!plan1.flat_message.is_empty()); // Message is published
-        assert_eq!(plan1.responses.len(), 1);
+        let mut msg_buf = BytesMut::new();
+        let plan1 = session.handle_publish(&publish, &mut msg_buf);
+        assert!(plan1.has_message()); // Message is published
+        assert!(!session.out_buf.is_empty());
 
         // Second PUBLISH with same packet_id (duplicate)
         let dup_publish = Publish {
             dup: true,
             qos: QoS::ExactlyOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/dup"),
+            topic: b"test/dup",
             packet_id: Some(42),
-            payload: Bytes::from_static(b"duplicate"),
+            payload: b"duplicate",
             properties: Properties::default(),
         };
 
-        let plan2 = session.handle_publish(&dup_publish);
-        assert!(plan2.flat_message.is_empty()); // Message is NOT published
-        assert_eq!(plan2.responses.len(), 1); // But PUBREC is still sent
-        match &plan2.responses[0] {
-            MqttPacket::PubRec(pubrec) => assert_eq!(pubrec.packet_id, 42),
-            _ => panic!("expected PubRec"),
-        }
+        let mut msg_buf2 = BytesMut::new();
+        let plan2 = session.handle_publish(&dup_publish, &mut msg_buf2);
+        assert!(!plan2.has_message()); // Message is NOT published
+        assert!(!session.out_buf.is_empty()); // But PUBREC is still sent
+        let (pubrec, _) = codec::decode_buf::pubrec(&session.out_buf).unwrap();
+        assert_eq!(pubrec.packet_id, 42);
     }
 
     // ---- Topic validation in handlers (task 14) ----
@@ -3663,14 +3584,15 @@ mod tests {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: Bytes::from_static(b"sensor/+/data"),
+            topic: b"sensor/+/data",
             packet_id: None,
-            payload: Bytes::from_static(b"data"),
+            payload: b"data",
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
-        assert!(plan.flat_message.is_empty());
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        assert!(!plan.has_message());
     }
 
     #[test]
@@ -3680,14 +3602,14 @@ mod tests {
 
         let filters = vec![
             crate::types::TopicFilter {
-                filter: "sensor/+data".to_string(), // Invalid: + not occupying entire level
+                filter: Bytes::from("sensor/+data"), // Invalid: + not occupying entire level
                 qos: QoS::AtMostOnce,
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
             },
             crate::types::TopicFilter {
-                filter: "valid/topic".to_string(), // Valid
+                filter: Bytes::from("valid/topic"), // Valid
                 qos: QoS::AtLeastOnce,
                 no_local: false,
                 retain_as_published: false,
@@ -3696,14 +3618,10 @@ mod tests {
         ];
 
         let plan = session.handle_subscribe(1, &filters, None);
-        match plan.suback {
-            MqttPacket::SubAck(ref suback) => {
-                assert_eq!(suback.return_codes.len(), 2);
-                assert_eq!(suback.return_codes[0], 0x80); // Failure for invalid filter
-                assert_eq!(suback.return_codes[1], QoS::AtLeastOnce.as_u8()); // Success for valid
-            }
-            _ => panic!("expected SubAck"),
-        }
+        let (suback, _) = codec::decode_buf::suback(&session.out_buf).unwrap();
+        assert_eq!(suback.return_codes.len(), 2);
+        assert_eq!(suback.return_codes[0], 0x80); // Failure for invalid filter
+        assert_eq!(suback.return_codes[1], QoS::AtLeastOnce.as_u8()); // Success for valid
     }
 
     // ---- Phase 3: Packet ID reuse check (M9) ----
@@ -3742,7 +3660,7 @@ mod tests {
         session.handle_connect(&make_connect("qos-client", true));
 
         let filters = vec![TopicFilter {
-            filter: "test/topic".to_string(),
+            filter: Bytes::from("test/topic"),
             qos: QoS::ExactlyOnce, // Request QoS 2
             no_local: false,
             retain_as_published: false,
@@ -3750,13 +3668,9 @@ mod tests {
         }];
 
         let plan = session.handle_subscribe(1, &filters, None);
-        match plan.suback {
-            MqttPacket::SubAck(ref suback) => {
-                // Should be downgraded to QoS 1.
-                assert_eq!(suback.return_codes[0], QoS::AtLeastOnce.as_u8());
-            }
-            _ => panic!("expected SubAck"),
-        }
+        let (suback, _) = codec::decode_buf::suback(&session.out_buf).unwrap();
+        // Should be downgraded to QoS 1.
+        assert_eq!(suback.return_codes[0], QoS::AtLeastOnce.as_u8());
         // Subscription mapping should also have the downgraded QoS.
         let mapping = session.subscriptions.get("test/topic").unwrap();
         assert_eq!(mapping.max_qos, QoS::AtLeastOnce);
@@ -3770,7 +3684,7 @@ mod tests {
         session.handle_connect(&make_connect_v5("opts-client", true));
 
         let filters = vec![TopicFilter {
-            filter: "test/topic".to_string(),
+            filter: Bytes::from("test/topic"),
             qos: QoS::AtLeastOnce,
             no_local: true,
             retain_as_published: true,
@@ -3796,7 +3710,7 @@ mod tests {
         session.handle_connect(&make_connect_v5("exist-client", true));
 
         let filters = vec![TopicFilter {
-            filter: "test/topic".to_string(),
+            filter: Bytes::from("test/topic"),
             qos: QoS::AtMostOnce,
             no_local: false,
             retain_as_published: false,
@@ -3812,7 +3726,7 @@ mod tests {
         assert!(!plan2.filters[0].is_new_subscription);
     }
 
-    // ---- Phase 3: Publisher session ID in FlatMessage ----
+    // ---- Phase 3 Opt 2: Publisher session ID via FlatMessage.publisher_id ----
 
     #[test]
     fn test_publish_stores_session_id_in_flat_message() {
@@ -3824,29 +3738,22 @@ mod tests {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/topic"),
+            topic: b"test/topic",
             packet_id: None,
-            payload: Bytes::from_static(b"data"),
+            payload: b"data",
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
-        let flat = bisque_mq::flat::FlatMessage::new(plan.flat_message).unwrap();
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        let msg_slice = &msg_buf[plan.msg_start..plan.msg_start + plan.msg_len];
+        let env = bisque_mq::flat::MqttEnvelope::new(msg_slice).unwrap();
 
-        // Verify publisher session ID header.
-        let mut found_session_id = false;
-        for i in 0..flat.header_count() {
-            let (k, v) = flat.header(i);
-            if &k[..] == b"mqtt.publisher_session_id" {
-                assert_eq!(v.len(), 8);
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&v);
-                assert_eq!(u64::from_be_bytes(buf), session_id);
-                found_session_id = true;
-            }
-        }
-        assert!(found_session_id, "publisher session ID header not found");
+        // Verify publisher_id is set via MqttEnvelope fixed header (O(1) access).
+        assert_eq!(env.publisher_id(), session_id);
     }
+
+    // ---- Phase 3 Opt 3: Retain flag via FlatMessage.FLAG_RETAIN ----
 
     #[test]
     fn test_publish_retained_stores_retain_flag() {
@@ -3857,24 +3764,41 @@ mod tests {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: true,
-            topic: Bytes::from_static(b"test/retained"),
+            topic: b"test/retained",
             packet_id: None,
-            payload: Bytes::from_static(b"data"),
+            payload: b"data",
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
-        let flat = bisque_mq::flat::FlatMessage::new(plan.flat_message).unwrap();
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        let msg_slice = &msg_buf[plan.msg_start..plan.msg_start + plan.msg_len];
+        let env = bisque_mq::flat::MqttEnvelope::new(msg_slice).unwrap();
 
-        let mut found_retain = false;
-        for i in 0..flat.header_count() {
-            let (k, v) = flat.header(i);
-            if &k[..] == b"mqtt.original_retain" {
-                assert_eq!(v[0], 1);
-                found_retain = true;
-            }
-        }
-        assert!(found_retain, "original retain header not found");
+        // Verify retain flag via MqttEnvelope FLAG_RETAIN bit (O(1) access).
+        assert!(env.is_retain());
+    }
+
+    #[test]
+    fn test_publish_non_retained_does_not_set_retain_flag() {
+        let mut session = make_session();
+        session.handle_connect(&make_connect("no-ret", true));
+
+        let publish = Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: b"test/topic",
+            packet_id: None,
+            payload: b"data",
+            properties: Properties::default(),
+        };
+
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        let msg_slice = &msg_buf[plan.msg_start..plan.msg_start + plan.msg_len];
+        let env = bisque_mq::flat::MqttEnvelope::new(msg_slice).unwrap();
+        assert!(!env.is_retain());
     }
 
     // ---- Phase 3: Topic alias new vs existing ----
@@ -3915,11 +3839,11 @@ mod tests {
         let mut connect = make_connect_v5("will-client", true);
         connect.flags.will = true;
         connect.will = Some(WillMessage {
-            topic: "will/topic".to_string(),
+            topic: Bytes::from_static(b"will/topic"),
             payload: Bytes::from_static(b"goodbye"),
             qos: QoS::AtMostOnce,
             retain: false,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         });
         session.handle_connect(&connect);
         assert!(session.will.is_some());
@@ -3927,9 +3851,11 @@ mod tests {
         // Normal DISCONNECT (reason 0x00): will should be cleared.
         let disconnect = crate::types::Disconnect {
             reason_code: Some(0x00),
-            properties: Properties::default(),
+            reason_string: None,
+            session_expiry_interval: None,
+            server_reference: None,
         };
-        let (will_plan, _cmds) = session.handle_disconnect(Some(&disconnect));
+        let will_plan = session.handle_disconnect(Some(&disconnect));
         assert!(will_plan.is_none());
         assert!(session.will.is_none());
     }
@@ -3940,11 +3866,11 @@ mod tests {
         let mut connect = make_connect_v5("will-client", true);
         connect.flags.will = true;
         connect.will = Some(WillMessage {
-            topic: "will/topic".to_string(),
+            topic: Bytes::from_static(b"will/topic"),
             payload: Bytes::from_static(b"goodbye"),
             qos: QoS::AtMostOnce,
             retain: false,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         });
         session.handle_connect(&connect);
         assert!(session.will.is_some());
@@ -3952,12 +3878,14 @@ mod tests {
         // DISCONNECT with reason 0x04 (Disconnect with Will Message): will should be published.
         let disconnect = crate::types::Disconnect {
             reason_code: Some(0x04),
-            properties: Properties::default(),
+            reason_string: None,
+            session_expiry_interval: None,
+            server_reference: None,
         };
-        let (will_plan, _cmds) = session.handle_disconnect(Some(&disconnect));
+        let will_plan = session.handle_disconnect(Some(&disconnect));
         assert!(will_plan.is_some());
         let plan = will_plan.unwrap();
-        assert!(!plan.flat_message.is_empty());
+        assert!(plan.has_message());
     }
 
     #[test]
@@ -3966,17 +3894,17 @@ mod tests {
         let mut connect = make_connect("will-v3", true);
         connect.flags.will = true;
         connect.will = Some(WillMessage {
-            topic: "will/topic".to_string(),
+            topic: Bytes::from_static(b"will/topic"),
             payload: Bytes::from_static(b"goodbye"),
             qos: QoS::AtMostOnce,
             retain: false,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         });
         session.handle_connect(&connect);
         assert!(session.will.is_some());
 
         // V3.1.1 has no reason code — will is always cleared on DISCONNECT.
-        let (will_plan, _cmds) = session.handle_disconnect(None);
+        let will_plan = session.handle_disconnect(None);
         assert!(will_plan.is_none());
         assert!(session.will.is_none());
     }
@@ -4028,36 +3956,34 @@ mod tests {
         let mut session = MqttSession::with_auth_provider(Default::default(), provider);
 
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "auth-client".to_string(),
+            client_id: Bytes::from("auth-client"),
             will: None,
             username: None,
             password: None,
-            properties: Properties {
-                authentication_method: Some("TEST-CHALLENGE".to_string()),
-                ..Properties::default()
-            },
+            properties_raw: PropertiesBuilder::new()
+                .authentication_method("TEST-CHALLENGE")
+                .build(),
         };
 
-        let (cmds, pkt) = session.handle_connect(&connect);
+        session.handle_connect(&connect);
         // Should return AUTH challenge, not CONNACK.
-        assert!(cmds.is_empty(), "no commands until auth completes");
-        match &pkt {
-            MqttPacket::Auth(auth) => {
-                assert_eq!(
-                    auth.reason_code,
-                    crate::types::Auth::CONTINUE_AUTHENTICATION
-                );
-                assert_eq!(
-                    auth.properties.authentication_data.as_deref(),
-                    Some(b"server-challenge".as_slice())
-                );
-            }
-            other => panic!("expected AUTH, got {:?}", other),
-        }
+        assert!(
+            session.cmd_buf.is_empty(),
+            "no commands until auth completes"
+        );
+        let (auth, _) = codec::decode_buf::auth(&session.out_buf).unwrap();
+        assert_eq!(
+            auth.reason_code,
+            crate::types::Auth::CONTINUE_AUTHENTICATION
+        );
+        assert_eq!(
+            auth.authentication_data.as_deref(),
+            Some(b"server-challenge".as_slice())
+        );
         assert!(!session.connected);
     }
 
@@ -4068,45 +3994,44 @@ mod tests {
 
         // Start auth flow.
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "auth-client".to_string(),
+            client_id: Bytes::from("auth-client"),
             will: None,
             username: None,
             password: None,
-            properties: Properties {
-                authentication_method: Some("TEST-CHALLENGE".to_string()),
-                ..Properties::default()
-            },
+            properties_raw: PropertiesBuilder::new()
+                .authentication_method("TEST-CHALLENGE")
+                .build(),
         };
         session.handle_connect(&connect);
 
         // Send correct response.
         let auth_pkt = crate::types::Auth {
             reason_code: crate::types::Auth::CONTINUE_AUTHENTICATION,
-            properties: Properties {
-                authentication_method: Some("TEST-CHALLENGE".to_string()),
-                authentication_data: Some(Bytes::from_static(b"correct-response")),
-                ..Properties::default()
-            },
+            authentication_method: Some(Bytes::from("TEST-CHALLENGE")),
+            authentication_data: Some(Bytes::from_static(b"correct-response")),
+            reason_string: None,
         };
-        let (cmds, pkts) = session.handle_auth(&auth_pkt);
+        session.handle_auth(&auth_pkt);
 
         // Should get CONNACK success + registration commands.
-        assert!(!cmds.is_empty(), "should have registration commands");
-        assert_eq!(pkts.len(), 1);
-        match &pkts[0] {
-            MqttPacket::ConnAck(connack) => {
-                assert_eq!(connack.return_code, 0x00); // Accepted
-                assert_eq!(
-                    connack.properties.authentication_method.as_deref(),
-                    Some("TEST-CHALLENGE")
-                );
-            }
-            other => panic!("expected ConnAck, got {:?}", other),
-        }
+        assert!(
+            !session.cmd_buf.is_empty(),
+            "should have registration commands"
+        );
+        assert!(!session.out_buf.is_empty());
+        let (connack, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert_eq!(connack.return_code, 0x00); // Accepted
+        assert_eq!(
+            connack
+                .authentication_method
+                .as_ref()
+                .map(|b| unsafe { std::str::from_utf8_unchecked(b) }),
+            Some("TEST-CHALLENGE")
+        );
         assert!(session.connected);
     }
 
@@ -4116,40 +4041,33 @@ mod tests {
         let mut session = MqttSession::with_auth_provider(Default::default(), provider);
 
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "auth-client".to_string(),
+            client_id: Bytes::from("auth-client"),
             will: None,
             username: None,
             password: None,
-            properties: Properties {
-                authentication_method: Some("TEST-CHALLENGE".to_string()),
-                ..Properties::default()
-            },
+            properties_raw: PropertiesBuilder::new()
+                .authentication_method("TEST-CHALLENGE")
+                .build(),
         };
         session.handle_connect(&connect);
 
         // Send wrong response.
         let auth_pkt = crate::types::Auth {
             reason_code: crate::types::Auth::CONTINUE_AUTHENTICATION,
-            properties: Properties {
-                authentication_method: Some("TEST-CHALLENGE".to_string()),
-                authentication_data: Some(Bytes::from_static(b"wrong-response")),
-                ..Properties::default()
-            },
+            authentication_method: Some(Bytes::from("TEST-CHALLENGE")),
+            authentication_data: Some(Bytes::from_static(b"wrong-response")),
+            reason_string: None,
         };
-        let (cmds, pkts) = session.handle_auth(&auth_pkt);
+        session.handle_auth(&auth_pkt);
 
-        assert!(cmds.is_empty());
-        assert_eq!(pkts.len(), 1);
-        match &pkts[0] {
-            MqttPacket::ConnAck(connack) => {
-                assert_eq!(connack.return_code, 0x86); // Bad credentials
-            }
-            other => panic!("expected ConnAck, got {:?}", other),
-        }
+        assert!(session.cmd_buf.is_empty());
+        assert!(!session.out_buf.is_empty());
+        let (connack, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert_eq!(connack.return_code, 0x86); // Bad credentials
         assert!(!session.connected);
     }
 
@@ -4159,28 +4077,23 @@ mod tests {
         let mut session = MqttSession::with_auth_provider(Default::default(), provider);
 
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "auth-client".to_string(),
+            client_id: Bytes::from("auth-client"),
             will: None,
             username: None,
             password: None,
-            properties: Properties {
-                authentication_method: Some("UNKNOWN-METHOD".to_string()),
-                ..Properties::default()
-            },
+            properties_raw: PropertiesBuilder::new()
+                .authentication_method("UNKNOWN-METHOD")
+                .build(),
         };
 
-        let (cmds, pkt) = session.handle_connect(&connect);
-        assert!(cmds.is_empty());
-        match &pkt {
-            MqttPacket::ConnAck(connack) => {
-                assert_eq!(connack.return_code, 0x8C); // Bad authentication method
-            }
-            other => panic!("expected ConnAck, got {:?}", other),
-        }
+        session.handle_connect(&connect);
+        assert!(session.cmd_buf.is_empty());
+        let (connack, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert_eq!(connack.return_code, 0x8C); // Bad authentication method
     }
 
     #[test]
@@ -4188,17 +4101,15 @@ mod tests {
         let mut session = MqttSession::new(Default::default());
         let auth_pkt = crate::types::Auth {
             reason_code: crate::types::Auth::CONTINUE_AUTHENTICATION,
-            properties: Properties::default(),
+            authentication_method: None,
+            authentication_data: None,
+            reason_string: None,
         };
-        let (_cmds, pkts) = session.handle_auth(&auth_pkt);
-        assert!(!pkts.is_empty());
+        session.handle_auth(&auth_pkt);
+        assert!(!session.out_buf.is_empty());
         // Should get a DISCONNECT
-        match &pkts[0] {
-            MqttPacket::Disconnect(d) => {
-                assert_eq!(d.reason_code, Some(0x82)); // Protocol Error
-            }
-            other => panic!("expected Disconnect, got {:?}", other),
-        }
+        let (d, _) = codec::decode_buf::disconnect(&session.out_buf).unwrap();
+        assert_eq!(d.reason_code, Some(0x82)); // Protocol Error
     }
 
     // ---- Gap fix tests ----
@@ -4210,15 +4121,15 @@ mod tests {
         let mut session = MqttSession::new(config);
 
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "test".to_string(),
+            client_id: Bytes::from("test"),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
         session.handle_connect(&connect);
 
@@ -4227,137 +4138,120 @@ mod tests {
             dup: false,
             qos: QoS::ExactlyOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/topic"),
+            topic: b"test/topic",
             packet_id: Some(1),
-            payload: Bytes::from_static(b"hello"),
+            payload: b"hello",
             properties: Properties::default(),
         };
-        let plan = session.handle_publish(&publish);
-        assert!(
-            plan.flat_message.is_empty(),
-            "message should not be published"
-        );
-        assert_eq!(plan.responses.len(), 1);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        assert!(!plan.has_message(), "message should not be published");
+        assert!(!session.out_buf.is_empty());
         // Should get PUBREC with reason code 0x9B (QoS not supported)
-        match &plan.responses[0] {
-            MqttPacket::PubRec(pubrec) => {
-                assert_eq!(pubrec.reason_code, Some(0x9B));
-            }
-            other => panic!("expected PubRec, got {:?}", other),
-        }
+        let (pubrec, _) = codec::decode_buf::pubrec(&session.out_buf).unwrap();
+        assert_eq!(pubrec.reason_code, Some(0x9B));
     }
 
     #[test]
     fn test_publish_payload_format_utf8_validation() {
         let mut session = MqttSession::new(Default::default());
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "test".to_string(),
+            client_id: Bytes::from("test"),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
         session.handle_connect(&connect);
 
         // Publish with payload_format_indicator=1 but invalid UTF-8 payload
+        let props_raw = PropertiesBuilder::new().payload_format_indicator(1).build();
         let publish = Publish {
             dup: false,
             qos: QoS::AtLeastOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/topic"),
+            topic: b"test/topic",
             packet_id: Some(1),
-            payload: Bytes::from_static(&[0xFF, 0xFE, 0xFD]), // invalid UTF-8
-            properties: Properties {
-                payload_format_indicator: Some(1),
-                ..Properties::default()
-            },
+            payload: &[0xFF, 0xFE, 0xFD], // invalid UTF-8
+            properties: Properties::from_raw(&props_raw),
         };
-        let plan = session.handle_publish(&publish);
-        assert!(plan.flat_message.is_empty());
-        assert_eq!(plan.responses.len(), 1);
-        match &plan.responses[0] {
-            MqttPacket::PubAck(puback) => {
-                assert_eq!(puback.reason_code, Some(0x99)); // Payload Format Invalid
-            }
-            other => panic!("expected PubAck, got {:?}", other),
-        }
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        assert!(!plan.has_message());
+        assert!(!session.out_buf.is_empty());
+        let (puback, _) = codec::decode_buf::puback(&session.out_buf).unwrap();
+        assert_eq!(puback.reason_code, Some(0x99)); // Payload Format Invalid
     }
 
     #[test]
     fn test_publish_payload_format_valid_utf8_passes() {
         let mut session = MqttSession::new(Default::default());
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "test".to_string(),
+            client_id: Bytes::from("test"),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
         session.handle_connect(&connect);
 
+        let props_raw = PropertiesBuilder::new().payload_format_indicator(1).build();
         let publish = Publish {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/topic"),
+            topic: b"test/topic",
             packet_id: None,
-            payload: Bytes::from_static(b"valid utf-8 string"),
-            properties: Properties {
-                payload_format_indicator: Some(1),
-                ..Properties::default()
-            },
+            payload: b"valid utf-8 string",
+            properties: Properties::from_raw(&props_raw),
         };
-        let plan = session.handle_publish(&publish);
-        assert!(
-            !plan.flat_message.is_empty(),
-            "valid UTF-8 should be published"
-        );
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        assert!(plan.has_message(), "valid UTF-8 should be published");
     }
 
     #[test]
     fn test_topic_alias_zero_rejected_in_publish() {
         let mut session = MqttSession::new(Default::default());
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "test".to_string(),
+            client_id: Bytes::from("test"),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
         session.handle_connect(&connect);
 
+        let props_raw = PropertiesBuilder::new()
+            .topic_alias(0) // Invalid: 0 is not allowed
+            .build();
         let publish = Publish {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/topic"),
+            topic: b"test/topic",
             packet_id: None,
-            payload: Bytes::from_static(b"hello"),
-            properties: Properties {
-                topic_alias: Some(0), // Invalid: 0 is not allowed
-                ..Properties::default()
-            },
+            payload: b"hello",
+            properties: Properties::from_raw(&props_raw),
         };
-        let plan = session.handle_publish(&publish);
-        assert!(
-            plan.flat_message.is_empty(),
-            "topic alias 0 should be rejected"
-        );
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        assert!(!plan.has_message(), "topic alias 0 should be rejected");
         // MQTT 5.0: topic alias 0 should trigger a disconnect with Protocol Error.
         assert!(
-            plan.disconnect.is_some(),
+            plan.need_disconnect,
             "topic alias 0 should trigger disconnect"
         );
     }
@@ -4366,22 +4260,22 @@ mod tests {
     fn test_find_subscription_id_for_queue() {
         let mut session = MqttSession::new(Default::default());
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "test".to_string(),
+            client_id: Bytes::from("test"),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
         session.handle_connect(&connect);
 
         // Subscribe with subscription ID
         let filters: smallvec::SmallVec<[crate::types::TopicFilter; 4]> =
             smallvec::smallvec![crate::types::TopicFilter {
-                filter: "test/+".to_string(),
+                filter: Bytes::from("test/+"),
                 qos: QoS::AtLeastOnce,
                 no_local: false,
                 retain_as_published: false,
@@ -4401,35 +4295,28 @@ mod tests {
     fn test_v5_pubrec_pubrel_pubcomp_include_reason_codes() {
         let mut session = MqttSession::new(Default::default());
         let connect = Connect {
-            protocol_name: "MQTT".to_string(),
+            protocol_name: Bytes::from("MQTT"),
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::from_byte(0x02).unwrap(),
             keep_alive: 60,
-            client_id: "test".to_string(),
+            client_id: Bytes::from("test"),
             will: None,
             username: None,
             password: None,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         };
         session.handle_connect(&connect);
 
         // PUBREC for unknown ID should return reason code 0x92
-        let pubrel = session.handle_pubrec(999);
-        match pubrel {
-            MqttPacket::PubRel(pr) => {
-                assert_eq!(pr.reason_code, Some(0x92));
-            }
-            _ => panic!("expected PubRel"),
-        }
+        session.handle_pubrec(999);
+        let (pr, _) = codec::decode_buf::pubrel(&session.out_buf).unwrap();
+        assert_eq!(pr.reason_code, Some(0x92));
 
         // PUBREL for unknown ID should return PUBCOMP with 0x92
-        let pubcomp = session.handle_pubrel(888);
-        match pubcomp {
-            MqttPacket::PubComp(pc) => {
-                assert_eq!(pc.reason_code, Some(0x92));
-            }
-            _ => panic!("expected PubComp"),
-        }
+        session.out_buf.clear();
+        session.handle_pubrel(888);
+        let (pc, _) = codec::decode_buf::pubcomp(&session.out_buf).unwrap();
+        assert_eq!(pc.reason_code, Some(0x92));
     }
 
     #[test]
@@ -4476,38 +4363,40 @@ mod tests {
     fn test_request_response_information() {
         let mut session = MqttSession::new(Default::default());
         let mut connect = make_connect_v5("rri-test", true);
-        connect.properties.request_response_information = Some(1);
-        let (_, connack) = session.handle_connect(&connect);
-        match connack {
-            MqttPacket::ConnAck(ca) => {
-                assert!(
-                    ca.properties.response_information.is_some(),
-                    "expected response_information in CONNACK"
-                );
-                let ri = ca.properties.response_information.unwrap();
-                assert!(
-                    ri.contains("rri-test"),
-                    "response_information should contain client_id"
-                );
-            }
-            _ => panic!("expected ConnAck"),
+        // Rebuild properties with request_response_information=1 included.
+        {
+            let mut raw = Vec::new();
+            // Existing properties from make_connect_v5
+            raw.extend_from_slice(connect.properties().raw());
+            // Add request_response_information = 1 (property ID 0x19)
+            raw.push(0x19);
+            raw.push(1);
+            connect.properties_raw = raw;
         }
+        session.handle_connect(&connect);
+        let (ca, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert!(
+            ca.response_information.is_some(),
+            "expected response_information in CONNACK"
+        );
+        let ri = ca.response_information.clone().unwrap();
+        let ri_str = std::str::from_utf8(&ri).unwrap();
+        assert!(
+            ri_str.contains("rri-test"),
+            "response_information should contain client_id"
+        );
     }
 
     #[test]
     fn test_request_response_information_not_requested() {
         let mut session = MqttSession::new(Default::default());
         let connect = make_connect_v5("rri-test", true);
-        let (_, connack) = session.handle_connect(&connect);
-        match connack {
-            MqttPacket::ConnAck(ca) => {
-                assert!(
-                    ca.properties.response_information.is_none(),
-                    "should not include response_information unless requested"
-                );
-            }
-            _ => panic!("expected ConnAck"),
-        }
+        session.handle_connect(&connect);
+        let (ca, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert!(
+            ca.response_information.is_none(),
+            "should not include response_information unless requested"
+        );
     }
 
     // =========================================================================
@@ -4526,23 +4415,21 @@ mod tests {
             dup: false,
             qos: QoS::AtLeastOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/topic"),
+            topic: b"test/topic",
             packet_id: Some(1),
-            payload: Bytes::from_static(b"hi"),
+            payload: b"hi",
             properties: Properties::default(),
         };
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
         // handle_publish tracks QoS1 inbound in qos1_inflight and returns a PUBACK response.
-        assert!(
-            plan.responses
-                .iter()
-                .any(|r| matches!(r, MqttPacket::PubAck(_)))
-        );
+        assert!(!session.out_buf.is_empty());
+        codec::decode_buf::puback(&session.out_buf).unwrap();
 
         // Now handle the PUBACK for the inbound message (this is the server's own ack).
         // For inbound messages, handle_puback should not return an MqCommand.
-        let cmd = session.handle_puback(1);
-        assert!(cmd.is_none());
+        session.handle_puback(1);
+        assert!(session.cmd_buf.is_empty());
     }
 
     #[test]
@@ -4550,8 +4437,8 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect("c", true));
         // PUBACK for a packet_id that was never sent.
-        let cmd = session.handle_puback(999);
-        assert!(cmd.is_none());
+        session.handle_puback(999);
+        assert!(session.cmd_buf.is_empty());
     }
 
     #[test]
@@ -4560,22 +4447,14 @@ mod tests {
         session.handle_connect(&make_connect("c", true));
 
         // Simulate an outbound QoS 1 delivery.
-        let pkt = session.build_outbound_publish(
-            "out/topic",
-            Bytes::from_static(b"data"),
-            QoS::AtLeastOnce,
-            false,
-            Some(42),  // mq_queue_id
-            Some(100), // mq_message_id
-        );
-        let packet_id = match pkt {
-            MqttPacket::Publish(p) => p.packet_id.unwrap(),
-            _ => panic!("expected Publish"),
-        };
+        let packet_id = session
+            .track_outbound_delivery(QoS::AtLeastOnce, 42, 100)
+            .unwrap()
+            .unwrap();
 
-        let cmd = session.handle_puback(packet_id);
+        session.handle_puback(packet_id);
         assert!(
-            cmd.is_some(),
+            !session.cmd_buf.is_empty(),
             "outbound PUBACK should produce an ACK command"
         );
     }
@@ -4586,25 +4465,18 @@ mod tests {
         session.handle_connect(&make_connect("c", true));
 
         // Manually set up a QoS 2 outbound in PublishSent state.
-        let pkt = session.build_outbound_publish(
-            "qos2/topic",
-            Bytes::from_static(b"data"),
-            QoS::ExactlyOnce,
-            false,
-            Some(10),
-            Some(20),
-        );
-        let packet_id = match pkt {
-            MqttPacket::Publish(p) => p.packet_id.unwrap(),
-            _ => panic!("expected Publish"),
-        };
+        let packet_id = session
+            .track_outbound_delivery(QoS::ExactlyOnce, 10, 20)
+            .unwrap()
+            .unwrap();
 
         // First PUBREC transitions to PubRelSent.
-        let _pubrel = session.handle_pubrec(packet_id);
+        session.handle_pubrec(packet_id);
         // Duplicate PUBREC while already in PubRelSent state.
-        let pubrel2 = session.handle_pubrec(packet_id);
+        session.out_buf.clear();
+        session.handle_pubrec(packet_id);
         // Should still return a PUBREL.
-        assert!(matches!(pubrel2, MqttPacket::PubRel(_)));
+        codec::decode_buf::pubrel(&session.out_buf).unwrap();
     }
 
     #[test]
@@ -4614,14 +4486,10 @@ mod tests {
         connect.flags.clean_session = true;
         session.handle_connect(&connect);
 
-        let pubrel = session.handle_pubrec(999);
+        session.handle_pubrec(999);
         // V5 should return reason_code 0x92 (Packet Identifier Not Found).
-        match pubrel {
-            MqttPacket::PubRel(pr) => {
-                assert_eq!(pr.reason_code, Some(0x92));
-            }
-            _ => panic!("expected PubRel"),
-        }
+        let (pr, _) = codec::decode_buf::pubrel(&session.out_buf).unwrap();
+        assert_eq!(pr.reason_code, Some(0x92));
     }
 
     #[test]
@@ -4630,14 +4498,10 @@ mod tests {
         let connect = make_connect_v5("c", true);
         session.handle_connect(&connect);
 
-        let pubcomp = session.handle_pubrel(999);
+        session.handle_pubrel(999);
         // V5 should return reason_code 0x92 (Packet Identifier Not Found).
-        match pubcomp {
-            MqttPacket::PubComp(pc) => {
-                assert_eq!(pc.reason_code, Some(0x92));
-            }
-            _ => panic!("expected PubComp"),
-        }
+        let (pc, _) = codec::decode_buf::pubcomp(&session.out_buf).unwrap();
+        assert_eq!(pc.reason_code, Some(0x92));
     }
 
     #[test]
@@ -4650,17 +4514,19 @@ mod tests {
             dup: false,
             qos: QoS::ExactlyOnce,
             retain: false,
-            topic: Bytes::from_static(b"qos2/in"),
+            topic: b"qos2/in",
             packet_id: Some(50),
-            payload: Bytes::from_static(b"data"),
+            payload: b"data",
             properties: Properties::default(),
         };
-        let _plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let _plan = session.handle_publish(&publish, &mut msg_buf);
         // PUBREL completes the transaction.
-        let _pubcomp = session.handle_pubrel(50);
+        session.handle_pubrel(50);
         // Duplicate PUBREL should still succeed (already Complete state).
-        let pubcomp2 = session.handle_pubrel(50);
-        assert!(matches!(pubcomp2, MqttPacket::PubComp(_)));
+        session.out_buf.clear();
+        session.handle_pubrel(50);
+        codec::decode_buf::pubcomp(&session.out_buf).unwrap();
     }
 
     #[test]
@@ -4669,23 +4535,15 @@ mod tests {
         session.handle_connect(&make_connect("c", true));
 
         // Set up outbound QoS 2 in PublishSent state.
-        let pkt = session.build_outbound_publish(
-            "t",
-            Bytes::from_static(b"d"),
-            QoS::ExactlyOnce,
-            false,
-            Some(1),
-            Some(2),
-        );
-        let packet_id = match pkt {
-            MqttPacket::Publish(p) => p.packet_id.unwrap(),
-            _ => panic!("expected Publish"),
-        };
+        let packet_id = session
+            .track_outbound_delivery(QoS::ExactlyOnce, 1, 2)
+            .unwrap()
+            .unwrap();
 
         // Send PUBCOMP without PUBREC first (protocol violation).
-        let cmd = session.handle_pubcomp(packet_id);
+        session.handle_pubcomp(packet_id);
         assert!(
-            cmd.is_none(),
+            session.cmd_buf.is_empty(),
             "PUBCOMP in PublishSent should not produce ACK"
         );
     }
@@ -4694,8 +4552,8 @@ mod tests {
     fn test_pubcomp_unknown_packet_id() {
         let mut session = make_session();
         session.handle_connect(&make_connect("c", true));
-        let cmd = session.handle_pubcomp(999);
-        assert!(cmd.is_none());
+        session.handle_pubcomp(999);
+        assert!(session.cmd_buf.is_empty());
     }
 
     #[test]
@@ -4707,7 +4565,7 @@ mod tests {
 
         // Subscribe to a topic.
         let filters: smallvec::SmallVec<[TopicFilter; 4]> = smallvec::smallvec![TopicFilter {
-            filter: "a/b".to_string(),
+            filter: Bytes::from("a/b"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -4735,7 +4593,7 @@ mod tests {
         session.handle_connect(&connect);
 
         let filters: smallvec::SmallVec<[TopicFilter; 4]> = smallvec::smallvec![TopicFilter {
-            filter: "x/y".to_string(),
+            filter: Bytes::from("x/y"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -4760,7 +4618,7 @@ mod tests {
         session.handle_connect(&connect);
 
         let filters: smallvec::SmallVec<[TopicFilter; 4]> = smallvec::smallvec![TopicFilter {
-            filter: "keep/me".to_string(),
+            filter: Bytes::from("keep/me"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -4768,16 +4626,19 @@ mod tests {
         }];
         session.handle_subscribe(1, &filters, None);
 
-        let (will_plan, commands) = session.handle_disconnect(Some(&Disconnect {
+        let will_plan = session.handle_disconnect(Some(&Disconnect {
             reason_code: None,
-            properties: Properties::default(),
+            reason_string: None,
+            session_expiry_interval: None,
+            server_reference: None,
         }));
 
         assert!(will_plan.is_none());
         // With clean_session=false, no delete_binding or delete_queue commands.
-        let has_delete = commands.iter().any(|cmd| {
+        let has_delete = (0..session.cmd_buf.len()).any(|i| {
+            let cmd = session.cmd_buf.to_command(i);
             cmd.tag() == bisque_mq::types::MqCommand::TAG_DELETE_BINDING
-                || cmd.tag() == bisque_mq::types::MqCommand::TAG_DELETE_QUEUE
+                || cmd.tag() == bisque_mq::types::MqCommand::TAG_DELETE_CONSUMER_GROUP
         });
         assert!(
             !has_delete,
@@ -4792,7 +4653,7 @@ mod tests {
         session.handle_connect(&make_connect("c", true));
 
         let filters: smallvec::SmallVec<[TopicFilter; 4]> = smallvec::smallvec![TopicFilter {
-            filter: "upd/test".to_string(),
+            filter: Bytes::from("upd/test"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -4828,7 +4689,7 @@ mod tests {
         session.handle_connect(&make_connect_v5("c", true));
 
         let filters: smallvec::SmallVec<[TopicFilter; 4]> = smallvec::smallvec![TopicFilter {
-            filter: "local/test".to_string(),
+            filter: Bytes::from("local/test"),
             qos: QoS::AtLeastOnce,
             no_local: true,
             retain_as_published: false,
@@ -4847,7 +4708,7 @@ mod tests {
         session.handle_connect(&make_connect_v5("c", true));
 
         let filters: smallvec::SmallVec<[TopicFilter; 4]> = smallvec::smallvec![TopicFilter {
-            filter: "retain/test".to_string(),
+            filter: Bytes::from("retain/test"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: true,
@@ -4864,7 +4725,11 @@ mod tests {
     fn test_topic_alias_limit_exceeded() {
         let mut session = make_session();
         let mut connect = make_connect_v5("c", true);
-        connect.properties.topic_alias_maximum = Some(2);
+        connect.properties_raw = PropertiesBuilder::new()
+            .topic_alias_maximum(2)
+            .receive_maximum(100)
+            .session_expiry_interval(3600)
+            .build();
         session.handle_connect(&connect);
 
         // First two aliases should succeed.
@@ -4891,27 +4756,19 @@ mod tests {
         let mut session = make_session();
         // First connect with clean_session=false.
         let connect = make_connect("sp", false);
-        let (_, connack) = session.handle_connect(&connect);
-        match connack {
-            MqttPacket::ConnAck(ca) => {
-                // session_present is !clean_session, so true on first connect too.
-                assert!(ca.session_present);
-            }
-            _ => panic!("expected ConnAck"),
-        }
+        session.handle_connect(&connect);
+        let (ca, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        // session_present is !clean_session, so true on first connect too.
+        assert!(ca.session_present);
     }
 
     #[test]
     fn test_session_present_false_on_clean() {
         let mut session = make_session();
         let connect = make_connect("sp", true);
-        let (_, connack) = session.handle_connect(&connect);
-        match connack {
-            MqttPacket::ConnAck(ca) => {
-                assert!(!ca.session_present);
-            }
-            _ => panic!("expected ConnAck"),
-        }
+        session.handle_connect(&connect);
+        let (ca, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert!(!ca.session_present);
     }
 
     #[test]
@@ -4920,22 +4777,16 @@ mod tests {
         session.handle_connect(&make_connect("c", true));
 
         // Build multiple outbound QoS 1 deliveries.
-        for i in 0..3 {
-            session.build_outbound_publish(
-                "topic",
-                Bytes::from_static(b"d"),
-                QoS::AtLeastOnce,
-                false,
-                Some(42), // same queue
-                Some(100 + i),
-            );
+        for i in 0..3u64 {
+            session.track_outbound_delivery(QoS::AtLeastOnce, 42, 100 + i);
         }
 
-        let (_, commands) = session.handle_unclean_disconnect();
+        let _ = session.handle_unclean_disconnect();
         // Should have disconnect_consumer, disconnect_producer, and NACK commands.
-        let nack_count = commands
-            .iter()
-            .filter(|cmd| cmd.tag() == bisque_mq::types::MqCommand::TAG_NACK)
+        let nack_count = (0..session.cmd_buf.len())
+            .filter(|&i| {
+                session.cmd_buf.to_command(i).tag() == bisque_mq::types::MqCommand::TAG_GROUP_NACK
+            })
             .count();
         assert!(nack_count >= 1, "should have at least one NACK command");
     }
@@ -4995,14 +4846,7 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect("c", true));
 
-        session.build_outbound_publish(
-            "t",
-            Bytes::new(),
-            QoS::AtLeastOnce,
-            false,
-            Some(1),
-            Some(2),
-        );
+        session.track_outbound_delivery(QoS::AtLeastOnce, 1, 2);
         let ids = session.pending_qos1_packet_ids();
         assert_eq!(ids.len(), 1);
     }
@@ -5012,52 +4856,13 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect("c", true));
 
-        session.build_outbound_publish(
-            "t",
-            Bytes::new(),
-            QoS::ExactlyOnce,
-            false,
-            Some(1),
-            Some(2),
-        );
+        session.track_outbound_delivery(QoS::ExactlyOnce, 1, 2);
         let ids = session.pending_qos2_packet_ids();
         assert_eq!(ids.len(), 1);
     }
 
-    #[test]
-    fn test_process_packet_unexpected_server_packets() {
-        let mut session = make_session();
-        session.handle_connect(&make_connect("c", true));
-
-        // Server-originated packets from client should be silently ignored.
-        let (cmds, pkts) = session.process_packet(&MqttPacket::PingResp);
-        assert!(cmds.is_empty());
-        assert!(pkts.is_empty());
-
-        let (cmds, pkts) = session.process_packet(&MqttPacket::ConnAck(ConnAck {
-            session_present: false,
-            return_code: 0,
-            properties: Properties::default(),
-        }));
-        assert!(cmds.is_empty());
-        assert!(pkts.is_empty());
-
-        let (cmds, pkts) = session.process_packet(&MqttPacket::SubAck(SubAck {
-            packet_id: 1,
-            return_codes: smallvec::smallvec![0],
-            properties: Properties::default(),
-        }));
-        assert!(cmds.is_empty());
-        assert!(pkts.is_empty());
-
-        let (cmds, pkts) = session.process_packet(&MqttPacket::UnsubAck(UnsubAck {
-            packet_id: 1,
-            reason_codes: smallvec::smallvec![0],
-            properties: Properties::default(),
-        }));
-        assert!(cmds.is_empty());
-        assert!(pkts.is_empty());
-    }
+    // test_process_packet_unexpected_server_packets removed: process_packet no longer exists.
+    // Server-originated packets are handled at the codec/server layer.
 
     #[test]
     fn test_subscription_queue_name_format() {
@@ -5114,7 +4919,11 @@ mod tests {
     fn test_client_receive_maximum_stored() {
         let mut session = make_session();
         let mut connect = make_connect_v5("c", true);
-        connect.properties.receive_maximum = Some(50);
+        connect.properties_raw = PropertiesBuilder::new()
+            .topic_alias_maximum(10)
+            .receive_maximum(50)
+            .session_expiry_interval(3600)
+            .build();
         session.handle_connect(&connect);
         // remaining_inflight should respect client_receive_maximum.
         assert!(session.remaining_inflight() <= 50);
@@ -5125,10 +4934,14 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect("c", true));
 
-        let (will_plan, commands) = session.handle_unclean_disconnect();
+        let will_plan = session.handle_unclean_disconnect();
         assert!(will_plan.is_none());
-        // Should still have disconnect_consumer and disconnect_producer.
-        assert!(commands.len() >= 2);
+        // Should have disconnect_session command.
+        assert!(session.cmd_buf.len() >= 1);
+        assert_eq!(
+            session.cmd_buf.to_command(0).tag(),
+            MqCommand::TAG_DISCONNECT_SESSION
+        );
         assert!(!session.connected);
     }
 
@@ -5137,27 +4950,15 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect("c", true)); // V3.1.1
 
-        let pkt = session.build_outbound_publish(
-            "t",
-            Bytes::new(),
-            QoS::ExactlyOnce,
-            false,
-            Some(1),
-            Some(2),
-        );
-        let packet_id = match pkt {
-            MqttPacket::Publish(p) => p.packet_id.unwrap(),
-            _ => panic!("expected Publish"),
-        };
+        let packet_id = session
+            .track_outbound_delivery(QoS::ExactlyOnce, 1, 2)
+            .unwrap()
+            .unwrap();
 
-        let pubrel = session.handle_pubrec(packet_id);
-        match pubrel {
-            MqttPacket::PubRel(pr) => {
-                // V3.1.1 should not include reason_code.
-                assert_eq!(pr.reason_code, None);
-            }
-            _ => panic!("expected PubRel"),
-        }
+        session.handle_pubrec(packet_id);
+        let (pr, _) = codec::decode_buf::pubrel(&session.out_buf).unwrap();
+        // V3.1.1 should not include reason_code.
+        assert_eq!(pr.reason_code, None);
     }
 
     // =========================================================================
@@ -5171,17 +4972,13 @@ mod tests {
         // MQTT-3.2.2-4: Non-zero return code must have Session Present = 0.
         let mut session = make_session();
         let connect = make_connect("", false); // empty ClientId + clean=false
-        let (_cmds, connack) = session.handle_connect(&connect);
-        match connack {
-            MqttPacket::ConnAck(ca) => {
-                assert_eq!(ca.return_code, ConnectReturnCode::IdentifierRejected as u8);
-                assert!(
-                    !ca.session_present,
-                    "Session Present must be 0 on rejection"
-                );
-            }
-            _ => panic!("expected ConnAck"),
-        }
+        session.handle_connect(&connect);
+        let (ca, _) = codec::decode_buf::connack(&session.out_buf).unwrap();
+        assert_eq!(ca.return_code, ConnectReturnCode::IdentifierRejected as u8);
+        assert!(
+            !ca.session_present,
+            "Session Present must be 0 on rejection"
+        );
     }
 
     // ---- Pending retransmits on session resumption [MQTT-4.4.0-1] ----
@@ -5192,41 +4989,30 @@ mod tests {
         session.handle_connect(&make_connect("retrans", false));
 
         // Build outbound QoS 2, then process PUBREC to get into PubRelSent state.
-        let pkt = session.build_outbound_publish(
-            "qos2/retrans",
-            Bytes::from_static(b"data"),
-            QoS::ExactlyOnce,
-            false,
-            Some(100),
-            Some(42),
-        );
-        let packet_id = match &pkt {
-            MqttPacket::Publish(p) => p.packet_id.unwrap(),
-            _ => panic!("expected Publish"),
-        };
+        let packet_id = session
+            .track_outbound_delivery(QoS::ExactlyOnce, 100, 42)
+            .unwrap()
+            .unwrap();
 
         // PUBREC transitions to PubRelSent state.
-        let _pubrel = session.handle_pubrec(packet_id);
+        session.handle_pubrec(packet_id);
+        session.out_buf.clear();
 
         // pending_retransmits should include the PUBREL.
-        let retransmits = session.pending_retransmits();
-        assert_eq!(retransmits.len(), 1);
-        match &retransmits[0] {
-            MqttPacket::PubRel(pr) => {
-                assert_eq!(pr.packet_id, packet_id);
-                // V3.1.1: no reason code.
-                assert_eq!(pr.reason_code, None);
-            }
-            _ => panic!("expected PubRel retransmit"),
-        }
+        let count = session.pending_retransmits();
+        assert_eq!(count, 1);
+        let (pr, _) = codec::decode_buf::pubrel(&session.out_buf).unwrap();
+        assert_eq!(pr.packet_id, packet_id);
+        // V3.1.1: no reason code.
+        assert_eq!(pr.reason_code, None);
     }
 
     #[test]
     fn test_pending_retransmits_empty_when_no_inflight() {
         let mut session = make_session();
         session.handle_connect(&make_connect("empty-retrans", true));
-        let retransmits = session.pending_retransmits();
-        assert!(retransmits.is_empty());
+        let count = session.pending_retransmits();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -5234,29 +5020,20 @@ mod tests {
         let mut session = make_session();
         session.handle_connect(&make_connect_v5("retrans-v5", false));
 
-        let pkt = session.build_outbound_publish(
-            "qos2/retrans",
-            Bytes::from_static(b"data"),
-            QoS::ExactlyOnce,
-            false,
-            Some(100),
-            Some(42),
-        );
-        let packet_id = match &pkt {
-            MqttPacket::Publish(p) => p.packet_id.unwrap(),
-            _ => panic!("expected Publish"),
-        };
+        let packet_id = session
+            .track_outbound_delivery(QoS::ExactlyOnce, 100, 42)
+            .unwrap()
+            .unwrap();
 
         session.handle_pubrec(packet_id);
+        session.out_buf.clear();
 
-        let retransmits = session.pending_retransmits();
-        assert_eq!(retransmits.len(), 1);
-        match &retransmits[0] {
-            MqttPacket::PubRel(pr) => {
-                assert_eq!(pr.reason_code, Some(0x00)); // V5: success reason code
-            }
-            _ => panic!("expected PubRel"),
-        }
+        let count = session.pending_retransmits();
+        assert_eq!(count, 1);
+        let (pr, _) = codec::decode_buf::pubrel(&session.out_buf).unwrap();
+        // V5: success (0x00) with no properties is omitted on wire per SS 3.6.2.1.
+        // Decoded as None, semantically equivalent to 0x00.
+        assert!(pr.reason_code.is_none() || pr.reason_code == Some(0x00));
     }
 
     // ---- In-flight QoS completes after unsubscribe [MQTT-3.10.4-3] ----
@@ -5267,22 +5044,14 @@ mod tests {
         session.handle_connect(&make_connect("unsub-inflight", true));
 
         // Simulate outbound QoS 1 delivery.
-        let pkt = session.build_outbound_publish(
-            "topic/a",
-            Bytes::from_static(b"data"),
-            QoS::AtLeastOnce,
-            false,
-            Some(42),
-            Some(100),
-        );
-        let packet_id = match &pkt {
-            MqttPacket::Publish(p) => p.packet_id.unwrap(),
-            _ => panic!("expected Publish"),
-        };
+        let packet_id = session
+            .track_outbound_delivery(QoS::AtLeastOnce, 42, 100)
+            .unwrap()
+            .unwrap();
 
         // Subscribe and then unsubscribe.
         let filters: smallvec::SmallVec<[TopicFilter; 4]> = smallvec::smallvec![TopicFilter {
-            filter: "topic/a".to_string(),
+            filter: Bytes::from("topic/a"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -5295,8 +5064,11 @@ mod tests {
         session.handle_unsubscribe(2, &unsub_filters);
 
         // PUBACK should still work (in-flight must complete).
-        let cmd = session.handle_puback(packet_id);
-        assert!(cmd.is_some(), "PUBACK must succeed even after unsubscribe");
+        session.handle_puback(packet_id);
+        assert!(
+            !session.cmd_buf.is_empty(),
+            "PUBACK must succeed even after unsubscribe"
+        );
     }
 
     // ---- QoS 2 full inbound flow [MQTT-4.3.3-2] ----
@@ -5311,26 +5083,24 @@ mod tests {
             dup: false,
             qos: QoS::ExactlyOnce,
             retain: false,
-            topic: Bytes::from_static(b"qos2/inbound"),
+            topic: b"qos2/inbound",
             packet_id: Some(10),
-            payload: Bytes::from_static(b"exactly once"),
+            payload: b"exactly once",
             properties: Properties::default(),
         };
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
 
         // Server responds with PUBREC.
-        assert_eq!(plan.responses.len(), 1);
-        match &plan.responses[0] {
-            MqttPacket::PubRec(pr) => assert_eq!(pr.packet_id, 10),
-            _ => panic!("expected PubRec"),
-        }
+        assert!(!session.out_buf.is_empty());
+        let (pr, _) = codec::decode_buf::pubrec(&session.out_buf).unwrap();
+        assert_eq!(pr.packet_id, 10);
 
         // Client sends PUBREL.
-        let pubcomp = session.handle_pubrel(10);
-        match pubcomp {
-            MqttPacket::PubComp(pc) => assert_eq!(pc.packet_id, 10),
-            _ => panic!("expected PubComp"),
-        }
+        session.out_buf.clear();
+        session.handle_pubrel(10);
+        let (pc, _) = codec::decode_buf::pubcomp(&session.out_buf).unwrap();
+        assert_eq!(pc.packet_id, 10);
     }
 
     // ---- Will message handling [MQTT-3.1.2-8 through 3.1.2-12] ----
@@ -5341,17 +5111,17 @@ mod tests {
         let mut connect = make_connect("will-clean", true);
         connect.flags.will = true;
         connect.will = Some(WillMessage {
-            topic: "status".to_string(),
+            topic: Bytes::from_static(b"status"),
             payload: Bytes::from_static(b"offline"),
             qos: QoS::AtMostOnce,
             retain: false,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         });
         session.handle_connect(&connect);
         assert!(session.will.is_some());
 
         // Clean DISCONNECT should NOT publish will.
-        let (will_plan, _) = session.handle_disconnect(None);
+        let will_plan = session.handle_disconnect(None);
         assert!(
             will_plan.is_none(),
             "will should not be published on clean disconnect"
@@ -5370,22 +5140,22 @@ mod tests {
         connect.flags.will_retain = true;
         connect.flags.will_qos = QoS::AtLeastOnce;
         connect.will = Some(WillMessage {
-            topic: "clients/status".to_string(),
+            topic: Bytes::from_static(b"clients/status"),
             payload: Bytes::from_static(b"gone"),
             qos: QoS::AtLeastOnce,
             retain: true,
-            properties: Properties::default(),
+            properties_raw: Vec::new(),
         });
         session.handle_connect(&connect);
 
-        let (will_plan, _) = session.handle_unclean_disconnect();
+        let will_plan = session.handle_unclean_disconnect();
         assert!(
             will_plan.is_some(),
             "will must be published on unclean disconnect"
         );
 
         let plan = will_plan.unwrap();
-        assert!(!plan.flat_message.is_empty());
+        assert!(plan.has_message());
         assert_eq!(plan.exchange_name, MQTT_EXCHANGE_NAME);
     }
 
@@ -5397,7 +5167,7 @@ mod tests {
         session.handle_connect(&connect);
         assert!(session.will.is_none());
 
-        let (will_plan, _) = session.handle_unclean_disconnect();
+        let will_plan = session.handle_unclean_disconnect();
         assert!(
             will_plan.is_none(),
             "no will should be published when will flag=0"
@@ -5418,21 +5188,11 @@ mod tests {
     // ---- CONNECT packet processing [MQTT-3.1.0-1] ----
 
     #[test]
-    fn test_process_packet_before_connect_rejects_publish() {
+    fn test_publish_before_connect_not_connected() {
         let mut session = make_session();
-        // Not connected yet — PUBLISH should be ignored.
-        let publish = MqttPacket::Publish(Publish {
-            dup: false,
-            qos: QoS::AtMostOnce,
-            retain: false,
-            topic: Bytes::from_static(b"test"),
-            packet_id: None,
-            payload: Bytes::from_static(b"data"),
-            properties: Properties::default(),
-        });
-        let (cmds, pkts) = session.process_packet(&publish);
-        assert!(cmds.is_empty(), "should not process PUBLISH before CONNECT");
-        assert!(pkts.is_empty());
+        // Before CONNECT, session.connected is false.
+        assert!(!session.connected);
+        // Server should check session.connected before calling handle_publish.
     }
 
     // ---- Subscription count tracking ----
@@ -5444,14 +5204,14 @@ mod tests {
 
         let filters: smallvec::SmallVec<[TopicFilter; 4]> = smallvec::smallvec![
             TopicFilter {
-                filter: "a/b".to_string(),
+                filter: Bytes::from("a/b"),
                 qos: QoS::AtMostOnce,
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
             },
             TopicFilter {
-                filter: "c/d".to_string(),
+                filter: Bytes::from("c/d"),
                 qos: QoS::AtLeastOnce,
                 no_local: false,
                 retain_as_published: false,
@@ -5493,40 +5253,35 @@ mod tests {
             dup: false,
             qos: QoS::AtLeastOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/dup"),
+            topic: b"test/dup",
             packet_id: Some(1),
-            payload: Bytes::from_static(b"first"),
+            payload: b"first",
             properties: Properties::default(),
         };
-        let plan1 = session.handle_publish(&publish);
-        assert!(
-            !plan1.flat_message.is_empty(),
-            "first publish should produce message"
-        );
-        assert!(
-            plan1
-                .responses
-                .iter()
-                .any(|r| matches!(r, MqttPacket::PubAck(_)))
-        );
+        let mut msg_buf = BytesMut::new();
+        let plan1 = session.handle_publish(&publish, &mut msg_buf);
+        assert!(plan1.has_message(), "first publish should produce message");
+        assert!(!session.out_buf.is_empty());
+        codec::decode_buf::puback(&session.out_buf).unwrap();
 
         // PUBACK frees the packet ID.
         session.handle_puback(1);
 
         // New publish with same packet ID (reuse after ACK) should succeed.
-        let plan2 = session.handle_publish(&Publish {
-            dup: false,
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            topic: Bytes::from_static(b"test/dup"),
-            packet_id: Some(1),
-            payload: Bytes::from_static(b"second"),
-            properties: Properties::default(),
-        });
-        assert!(
-            !plan2.flat_message.is_empty(),
-            "reused packet ID should succeed"
+        let mut msg_buf2 = BytesMut::new();
+        let plan2 = session.handle_publish(
+            &Publish {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: b"test/dup",
+                packet_id: Some(1),
+                payload: b"second",
+                properties: Properties::default(),
+            },
+            &mut msg_buf2,
         );
+        assert!(plan2.has_message(), "reused packet ID should succeed");
     }
 
     // ---- Unsubscribe nonexistent topic is valid [MQTT-3.10.4-5] ----
@@ -5538,13 +5293,9 @@ mod tests {
 
         let unsub_filters: smallvec::SmallVec<[String; 4]> =
             smallvec::smallvec!["no/such/filter".to_string()];
-        let (_cmds, unsuback) = session.handle_unsubscribe(1, &unsub_filters);
-        match unsuback {
-            MqttPacket::UnsubAck(ua) => {
-                assert_eq!(ua.packet_id, 1, "UNSUBACK must echo packet ID");
-            }
-            _ => panic!("expected UnsubAck"),
-        }
+        session.handle_unsubscribe(1, &unsub_filters);
+        let (ua, _) = codec::decode_buf::unsuback(&session.out_buf).unwrap();
+        assert_eq!(ua.packet_id, 1, "UNSUBACK must echo packet ID");
     }
 
     // ---- PUBLISH to retained topic stores correctly ----
@@ -5558,13 +5309,14 @@ mod tests {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: true,
-            topic: Bytes::from_static(b"devices/sensor1/temp"),
+            topic: b"devices/sensor1/temp",
             packet_id: None,
-            payload: Bytes::from_static(b"22.5"),
+            payload: b"22.5",
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
         // Retained publishes should produce a retained plan.
         assert!(
             plan.retained.is_some(),
@@ -5587,14 +5339,7 @@ mod tests {
         session.handle_connect(&connect);
 
         // Build an outbound QoS 1 delivery.
-        session.build_outbound_publish(
-            "t",
-            Bytes::from_static(b"d"),
-            QoS::AtLeastOnce,
-            false,
-            Some(1),
-            Some(2),
-        );
+        session.track_outbound_delivery(QoS::AtLeastOnce, 1, 2);
         assert!(session.outbound_inflight_count() > 0);
 
         // Reconnect with clean_session=true.
@@ -5605,31 +5350,6 @@ mod tests {
             0,
             "clean_session=true must clear inflight"
         );
-    }
-
-    #[test]
-    fn test_build_outbound_publish_legacy() {
-        let mut session = make_session();
-        session.handle_connect(&make_connect("c", true));
-
-        let pkt = session.build_outbound_publish(
-            "legacy/topic",
-            Bytes::from_static(b"payload"),
-            QoS::AtMostOnce,
-            true,
-            None,
-            None,
-        );
-        match pkt {
-            MqttPacket::Publish(p) => {
-                assert_eq!(&p.topic[..], b"legacy/topic");
-                assert_eq!(&p.payload[..], b"payload");
-                assert!(p.retain);
-                assert_eq!(p.qos, QoS::AtMostOnce);
-                assert!(p.packet_id.is_none());
-            }
-            _ => panic!("expected Publish"),
-        }
     }
 
     // ---- Rate / Quota Limiting tests (GAP-12) ----
@@ -5692,22 +5412,21 @@ mod tests {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: false,
-            topic: Bytes::from_static(b"test/topic"),
+            topic: b"test/topic",
             packet_id: None,
-            payload: Bytes::from_static(b"hello"),
+            payload: b"hello",
             properties: Properties::default(),
         };
-        let plan = session.handle_publish(&publish);
-        assert!(plan.disconnect.is_none());
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
+        assert!(!plan.need_disconnect);
 
         // Second publish in same window should trigger disconnect.
-        let plan2 = session.handle_publish(&publish);
-        assert!(plan2.disconnect.is_some());
-        if let Some(MqttPacket::Disconnect(d)) = &plan2.disconnect {
-            assert_eq!(d.reason_code, Some(0x96));
-        } else {
-            panic!("expected Disconnect packet");
-        }
+        let mut msg_buf2 = BytesMut::new();
+        let plan2 = session.handle_publish(&publish, &mut msg_buf2);
+        assert!(plan2.need_disconnect);
+        let (d, _) = codec::decode_buf::disconnect(&session.out_buf).unwrap();
+        assert_eq!(d.reason_code, Some(0x96));
     }
 
     #[test]
@@ -5775,23 +5494,20 @@ mod tests {
             dup: false,
             qos: QoS::AtLeastOnce,
             retain: false,
-            topic: Bytes::from_static(b"secret/topic"),
+            topic: b"secret/topic",
             packet_id: Some(1),
-            payload: Bytes::from_static(b"data"),
+            payload: b"data",
             properties: Properties::default(),
         };
 
-        let plan = session.handle_publish(&publish);
+        let mut msg_buf = BytesMut::new();
+        let plan = session.handle_publish(&publish, &mut msg_buf);
         // Should get a PUBACK with 0x87 (Not Authorized).
-        assert!(!plan.responses.is_empty());
-        match &plan.responses[0] {
-            MqttPacket::PubAck(ack) => {
-                assert_eq!(ack.reason_code, Some(0x87));
-            }
-            _ => panic!("expected PubAck"),
-        }
+        assert!(!session.out_buf.is_empty());
+        let (ack, _) = codec::decode_buf::puback(&session.out_buf).unwrap();
+        assert_eq!(ack.reason_code, Some(0x87));
         // flat_message should be empty (not processed).
-        assert!(plan.flat_message.is_empty());
+        assert!(!plan.has_message());
     }
 
     #[test]
@@ -5841,7 +5557,7 @@ mod tests {
         session.handle_connect(&connect);
 
         let filters = [TopicFilter {
-            filter: "secret/topic".to_string(),
+            filter: Bytes::from("secret/topic"),
             qos: QoS::AtLeastOnce,
             no_local: false,
             retain_as_published: false,
@@ -5850,12 +5566,8 @@ mod tests {
 
         let plan = session.handle_subscribe(1, &filters, None);
         // The SUBACK should contain 0x87 (Not Authorized) for the filter.
-        match &plan.suback {
-            MqttPacket::SubAck(suback) => {
-                assert_eq!(suback.return_codes[0], 0x87);
-            }
-            _ => panic!("expected SubAck"),
-        }
+        let (suback, _) = codec::decode_buf::suback_v5(&session.out_buf).unwrap();
+        assert_eq!(suback.return_codes[0], 0x87);
         // No subscription plans should be generated.
         assert!(plan.filters.is_empty());
     }

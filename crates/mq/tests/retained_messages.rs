@@ -37,9 +37,7 @@ fn make_engine() -> MqEngine {
 }
 
 fn make_msg(value: &[u8]) -> Bytes {
-    FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-        .timestamp(1000)
-        .build()
+    FlatMessageBuilder::new(value).timestamp(1000).build()
 }
 
 fn create_exchange(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) -> u64 {

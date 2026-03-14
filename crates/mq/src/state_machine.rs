@@ -919,18 +919,25 @@ pub(crate) enum StructuralKind {
 }
 
 pub(crate) fn classify_structural(cmd: &MqCommand) -> StructuralKind {
-    match cmd.tag() {
+    classify_structural_buf(cmd.as_bytes())
+}
+
+fn classify_structural_buf(buf: &[u8]) -> StructuralKind {
+    use crate::codec::{CmdBatch, CmdDeleteRetained, CmdSetRetained};
+    use crate::types::{buf_field_u64, buf_tag};
+
+    match buf_tag(buf) {
         MqCommand::TAG_CREATE_TOPIC => StructuralKind::CreateTopic,
-        MqCommand::TAG_DELETE_TOPIC => StructuralKind::DeleteTopic(cmd.field_u64(8)),
+        MqCommand::TAG_DELETE_TOPIC => StructuralKind::DeleteTopic(buf_field_u64(buf, 8)),
         MqCommand::TAG_CREATE_EXCHANGE => StructuralKind::CreateExchange,
-        MqCommand::TAG_DELETE_EXCHANGE => StructuralKind::DeleteExchange(cmd.field_u64(8)),
+        MqCommand::TAG_DELETE_EXCHANGE => StructuralKind::DeleteExchange(buf_field_u64(buf, 8)),
         MqCommand::TAG_CREATE_CONSUMER_GROUP => StructuralKind::CreateConsumerGroup,
         MqCommand::TAG_DELETE_CONSUMER_GROUP => {
-            StructuralKind::DeleteConsumerGroup(cmd.field_u64(8))
+            StructuralKind::DeleteConsumerGroup(buf_field_u64(buf, 8))
         }
         MqCommand::TAG_CREATE_SESSION => StructuralKind::CreateSession,
-        MqCommand::TAG_SET_RETAINED => {
-            let v = cmd.as_set_retained();
+        MqCommand::TAG_SET_RETAINED | MqCommand::TAG_SET_RETAINED_MQTT => {
+            let v = CmdSetRetained::from_buf(buf);
             StructuralKind::SetRetained {
                 exchange_id: v.exchange_id(),
                 routing_key: v.routing_key().to_owned(),
@@ -938,16 +945,18 @@ pub(crate) fn classify_structural(cmd: &MqCommand) -> StructuralKind {
             }
         }
         MqCommand::TAG_DELETE_RETAINED => {
-            let v = cmd.as_delete_retained();
+            let v = CmdDeleteRetained::from_buf(buf);
             StructuralKind::DeleteRetained {
                 exchange_id: v.exchange_id(),
                 routing_key: v.routing_key().to_owned(),
             }
         }
         MqCommand::TAG_BATCH => {
-            let batch = cmd.as_batch();
-            let kinds: Vec<StructuralKind> =
-                batch.commands().map(|c| classify_structural(&c)).collect();
+            let batch = CmdBatch::from_buf(buf);
+            let kinds: Vec<StructuralKind> = batch
+                .commands()
+                .map(|c| classify_structural_buf(c))
+                .collect();
             if kinds.iter().all(|k| matches!(k, StructuralKind::None)) {
                 StructuralKind::None
             } else {

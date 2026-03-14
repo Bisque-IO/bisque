@@ -279,6 +279,10 @@ pub struct AckMessageMeta {
     /// Value payload size in bytes, stored for byte-level accounting.
     #[serde(default)]
     pub value_len: u32,
+    /// Publisher session ID for no-local filtering (MQTT 5.0).
+    /// 0 = not set (no filtering).
+    #[serde(default)]
+    pub publisher_id: u64,
 }
 
 /// Ack variant configuration.
@@ -473,25 +477,17 @@ pub enum EntityStats {
 // MqCommand — zero-copy view over flat-encoded command buffer
 // =============================================================================
 
-/// Zero-copy command type for the MQ engine.
+/// Command type for the MQ engine.
 ///
-/// Wraps a flat-encoded binary buffer (`Bytes`). On the write path, constructor
+/// Wraps a flat-encoded binary buffer (`Vec<u8>`). On the write path, constructor
 /// methods encode fields into the buffer. On the read path (state machine apply),
-/// the buffer is wrapped zero-copy from the mmap-backed raft log.
+/// the buffer is decoded from the raft log.
 ///
-/// Per-variant accessor structs (in `codec`) provide typed zero-copy APIs
+/// Per-variant accessor structs (in `codec`) provide typed APIs
 /// over the raw buffer.
 #[derive(Clone)]
 pub struct MqCommand {
-    pub(crate) buf: Bytes,
-    /// Scatter payload segments for zero-copy write path.
-    /// When `Some`, `buf` contains only the header + descriptor table and the
-    /// payloads live in these separate `Bytes` references.  `Encode::encode()`
-    /// writes `buf` then each segment sequentially, producing a contiguous
-    /// result in the Raft log writer's buffer.
-    /// On the read path (decoded from mmap) this is always `None` — the data
-    /// is already contiguous in `buf`.
-    pub(crate) segments: Option<Vec<Bytes>>,
+    pub(crate) buf: Vec<u8>,
 }
 
 // Tag constants for MqCommand discriminants — unified allocation.
@@ -568,6 +564,10 @@ impl MqCommand {
 
     // -- Dedup --
     pub const TAG_PRUNE_DEDUP_WINDOW: u8 = 50;
+
+    // -- MQTT slice variants --
+    pub const TAG_PUBLISH_TO_EXCHANGE_MQTT: u8 = 53;
+    pub const TAG_SET_RETAINED_MQTT: u8 = 54;
 }
 
 /// Command header offsets.
@@ -591,6 +591,45 @@ impl MqCommand {
     pub const OFF_TAG: usize = 6;
     /// Byte offset of the `flags` field in the header.
     pub const OFF_FLAGS: usize = 7;
+}
+
+// =============================================================================
+// Free-standing buffer accessors — read from raw &[u8] command buffers
+// =============================================================================
+
+/// Read the command tag from a raw buffer (byte at offset 6).
+#[inline]
+pub fn buf_tag(buf: &[u8]) -> u8 {
+    buf[MqCommand::OFF_TAG]
+}
+
+/// Read the flags byte from a raw buffer (byte at offset 7).
+#[inline]
+pub fn buf_flags(buf: &[u8]) -> u8 {
+    buf[MqCommand::OFF_FLAGS]
+}
+
+/// Read a u64 LE field from a raw buffer at the given byte offset.
+#[inline]
+pub fn buf_field_u64(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
+}
+
+/// Read a u32 LE field from a raw buffer at the given byte offset.
+#[inline]
+pub fn buf_field_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+}
+
+/// Read a vec_u64 slot from a raw buffer: `[count:4][offset:4]` in fixed.
+#[inline]
+pub fn buf_field_vec_u64(buf: &[u8], offset: usize) -> crate::codec::DecodeU64s<'_> {
+    let count = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+    if count == 0 {
+        return crate::codec::DecodeU64s::Owned(SmallVec::new());
+    }
+    let data_offset = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
+    crate::codec::decode_u64s_at(buf, data_offset, count)
 }
 
 impl MqCommand {
@@ -686,7 +725,9 @@ impl MqCommand {
             if len == 0 {
                 return None;
             }
-            Some(self.buf.slice(offset + 1..offset + 1 + len))
+            Some(Bytes::copy_from_slice(
+                &self.buf[offset + 1..offset + 1 + len],
+            ))
         } else {
             let raw = u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap());
             let data_offset = (raw >> 1) as usize;
@@ -695,7 +736,9 @@ impl MqCommand {
             if size == 0 {
                 None
             } else {
-                Some(self.buf.slice(data_offset..data_offset + size))
+                Some(Bytes::copy_from_slice(
+                    &self.buf[data_offset..data_offset + size],
+                ))
             }
         }
     }
@@ -743,7 +786,7 @@ impl MqCommand {
         &self.buf[data_offset..data_offset + size]
     }
 
-    /// Get the i-th element from a vec_bytes descriptor table as Bytes (zero-copy).
+    /// Get the i-th element from a vec_bytes descriptor table as Bytes.
     #[inline]
     pub(crate) fn field_vec_bytes_get_bytes(&self, slot_offset: usize, index: usize) -> Bytes {
         let table_offset = u32::from_le_bytes(
@@ -759,7 +802,7 @@ impl MqCommand {
                 .try_into()
                 .unwrap(),
         ) as usize;
-        self.buf.slice(data_offset..data_offset + size)
+        Bytes::copy_from_slice(&self.buf[data_offset..data_offset + size])
     }
 
     /// Raw buffer access.
@@ -768,28 +811,22 @@ impl MqCommand {
         &self.buf
     }
 
-    /// Wrap raw bytes as an MqCommand (zero-copy).
+    /// Wrap raw bytes as an MqCommand.
     #[inline]
     pub fn from_bytes(buf: Bytes) -> Self {
-        Self {
-            buf,
-            segments: None,
-        }
+        Self { buf: buf.to_vec() }
     }
 
-    /// Returns `true` if this command uses scatter mode (payloads not in buf).
+    /// Wrap a Vec<u8> as an MqCommand.
     #[inline]
-    pub fn is_scatter(&self) -> bool {
-        self.segments.is_some()
+    pub fn from_vec(buf: Vec<u8>) -> Self {
+        Self { buf }
     }
 
-    /// Total encoded size including scatter segments.
+    /// Total encoded size.
     #[inline]
     pub fn total_encoded_size(&self) -> usize {
-        match &self.segments {
-            None => self.buf.len(),
-            Some(segs) => self.buf.len() + segs.iter().map(|s| s.len()).sum::<usize>(),
-        }
+        self.buf.len()
     }
 }
 
@@ -803,10 +840,9 @@ impl fmt::Debug for MqCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "MqCommand(tag={}, {} bytes{})",
+            "MqCommand(tag={}, {} bytes)",
             self.tag(),
             self.total_encoded_size(),
-            if self.is_scatter() { ", scatter" } else { "" }
         )
     }
 }
@@ -816,28 +852,14 @@ impl fmt::Debug for MqCommand {
 
 impl Serialize for MqCommand {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match &self.segments {
-            None => serializer.serialize_bytes(&self.buf),
-            Some(segs) => {
-                // Materialize scatter segments for serde (not hot path).
-                let mut all = Vec::with_capacity(self.total_encoded_size());
-                all.extend_from_slice(&self.buf);
-                for seg in segs {
-                    all.extend_from_slice(seg);
-                }
-                serializer.serialize_bytes(&all)
-            }
-        }
+        serializer.serialize_bytes(&self.buf)
     }
 }
 
 impl<'de> Deserialize<'de> for MqCommand {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes = <Vec<u8>>::deserialize(deserializer)?;
-        Ok(Self {
-            buf: Bytes::from(bytes),
-            segments: None,
-        })
+        Ok(Self { buf: bytes })
     }
 }
 
@@ -1189,6 +1211,7 @@ mod tests {
             reply_to: Some(Bytes::from_static(b"reply-topic")),
             correlation_id: Some(Bytes::from_static(b"corr-123")),
             value_len: 256,
+            publisher_id: 0,
         };
         let bytes = bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap();
         let (decoded, _): (AckMessageMeta, _) =

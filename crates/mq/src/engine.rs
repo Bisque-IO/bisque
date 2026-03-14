@@ -376,9 +376,17 @@ impl MqEngine {
                 };
 
                 let messages: SmallVec<[Bytes; 16]> = v.messages().collect();
-                let routing_key_bytes = messages.first().and_then(|m| {
-                    crate::flat::FlatMessage::new(m.clone()).and_then(|f| f.routing_key())
-                });
+                let first_msg = messages.first();
+                let envelope = first_msg.and_then(|m| crate::flat::MqttEnvelope::new(m));
+                let flat = if envelope.is_none() {
+                    first_msg.and_then(|m| crate::flat::FlatMessage::new(m))
+                } else {
+                    None
+                };
+                let routing_key_bytes: Option<&[u8]> = envelope
+                    .as_ref()
+                    .map(|e| e.topic())
+                    .or_else(|| flat.as_ref().and_then(|f| f.routing_key()));
                 let routing_key_str = routing_key_bytes
                     .as_ref()
                     .and_then(|b| std::str::from_utf8(b).ok());
@@ -815,7 +823,7 @@ impl MqEngine {
                         topic_id: v.topic_id(),
                         partition_index: v.partition_index(),
                         committed_offset: v.offset(),
-                        metadata: v.metadata_bytes(),
+                        metadata: v.metadata_bytes().map(Bytes::copy_from_slice),
                         committed_at: v.timestamp(),
                     },
                 );
@@ -857,10 +865,15 @@ impl MqEngine {
             // Ack Variant (19-29)
             // =================================================================
             MqCommand::TAG_GROUP_DELIVER => {
-                // Wire: [tag:1][group_id:8][consumer_id:8][max_count:4]
+                // Wire: @8 group_id:8, @16 consumer_id:8, @24 max_count:4,
+                //       @32 exclude_publisher_id:8, @40 current_time_ms:8
                 let group_id = cmd.field_u64(8);
                 let consumer_id = cmd.field_u64(16);
                 let max_count = cmd.field_u32(24);
+                // Extended fields (backward-compat: default to 0 if fixed region is shorter).
+                let fixed_sz = cmd.fixed_size() as usize;
+                let exclude_publisher_id = if fixed_sz >= 40 { cmd.field_u64(32) } else { 0 };
+                let deliver_time_ms = if fixed_sz >= 48 { cmd.field_u64(40) } else { 0 };
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
                     if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
@@ -875,18 +888,46 @@ impl MqEngine {
                             md.track_session_group(consumer_id, group_id);
                         }
                         let msgs_guard = ack.messages.pin();
+
+                        // Engine-level filtering: no-local and message expiry.
+                        let needs_filter = exclude_publisher_id != 0 || deliver_time_ms != 0;
+                        let mut filtered_ids: SmallVec<[u64; 4]> = SmallVec::new();
                         let msgs: SmallVec<[DeliveredMessage; 8]> = delivered
                             .iter()
-                            .map(|&msg_id| {
+                            .filter_map(|&msg_id| {
+                                if needs_filter {
+                                    if let Some(meta) = msgs_guard.get(&msg_id) {
+                                        // No-local: skip messages from same publisher session.
+                                        if exclude_publisher_id != 0
+                                            && meta.publisher_id == exclude_publisher_id
+                                        {
+                                            filtered_ids.push(msg_id);
+                                            return None;
+                                        }
+                                        // Message expiry: skip messages past TTL.
+                                        if deliver_time_ms != 0 {
+                                            if let Some(expires_at) = meta.expires_at {
+                                                if deliver_time_ms >= expires_at {
+                                                    filtered_ids.push(msg_id);
+                                                    return None;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 let attempt = msgs_guard.get(&msg_id).map_or(1, |m| m.attempts);
-                                DeliveredMessage {
+                                Some(DeliveredMessage {
                                     message_id: msg_id,
                                     attempt,
                                     original_timestamp: current_time,
                                     group_id,
-                                }
+                                })
                             })
                             .collect();
+                        // ACK filtered messages at engine level.
+                        if !filtered_ids.is_empty() {
+                            ack.apply_ack(&filtered_ids);
+                        }
                         md.group_notifier.notify(group_id);
                         return MqResponse::Messages { messages: msgs };
                     }
@@ -1565,19 +1606,19 @@ impl MqEngine {
     ) -> MqResponse {
         let batch = cmd.as_batch();
         let count = batch.count() as usize;
-        let cmds: SmallVec<[MqCommand; 16]> = batch.commands().collect();
+        let cmds: SmallVec<[&[u8]; 16]> = batch.commands().collect();
         let mut responses: SmallVec<[MqResponse; 8]> = SmallVec::with_capacity(count);
 
         let mut i = 0;
         while i < cmds.len() {
-            let tag = cmds[i].tag();
+            let tag = buf_tag(cmds[i]);
 
             // Detect consecutive runs of same (tag, entity_id) for batch optimization.
             // Entity ID is at @8 (offset 8..16) in v2 format.
-            let has_entity_id = cmds[i].buf.len() >= 16;
+            let has_entity_id = cmds[i].len() >= 16;
 
             if has_entity_id && tag == MqCommand::TAG_PUBLISH {
-                let topic_id = cmds[i].field_u64(8);
+                let topic_id = buf_field_u64(cmds[i], 8);
                 let run_end = self.find_run_end(&cmds, i, tag, topic_id);
 
                 if run_end - i > 1 {
@@ -1602,7 +1643,7 @@ impl MqEngine {
                         | MqCommand::TAG_GROUP_RELEASE
                 )
             {
-                let group_id = cmds[i].field_u64(8);
+                let group_id = buf_field_u64(cmds[i], 8);
                 let run_end = self.find_run_end(&cmds, i, tag, group_id);
 
                 if run_end - i > 1 {
@@ -1612,8 +1653,9 @@ impl MqEngine {
                 }
             }
 
-            // Default: process single command
-            responses.push(self.apply_command(&cmds[i], log_index, current_time, segment_id));
+            // Default: process single sub-command via temporary MqCommand wrapper
+            let sub_cmd = MqCommand::from_vec(cmds[i].to_vec());
+            responses.push(self.apply_command(&sub_cmd, log_index, current_time, segment_id));
             i += 1;
         }
 
@@ -1622,12 +1664,12 @@ impl MqEngine {
 
     /// Find the end of a consecutive run of commands with the same tag and entity_id.
     #[inline]
-    fn find_run_end(&self, cmds: &[MqCommand], start: usize, tag: u8, entity_id: u64) -> usize {
+    fn find_run_end(&self, cmds: &[&[u8]], start: usize, tag: u8, entity_id: u64) -> usize {
         let mut end = start + 1;
         while end < cmds.len()
-            && cmds[end].tag() == tag
-            && cmds[end].buf.len() >= 16
-            && cmds[end].field_u64(8) == entity_id
+            && buf_tag(cmds[end]) == tag
+            && cmds[end].len() >= 16
+            && buf_field_u64(cmds[end], 8) == entity_id
         {
             end += 1;
         }
@@ -1638,13 +1680,14 @@ impl MqEngine {
     /// Single map lookup for the entire run.
     fn apply_publish_run(
         &self,
-        cmds: &[MqCommand],
+        cmds: &[&[u8]],
         topic_id: u64,
         log_index: u64,
         current_time: u64,
         segment_id: Option<u64>,
         responses: &mut SmallVec<[MqResponse; 8]>,
     ) {
+        use crate::codec::CmdPublish;
         let md = &self.metadata;
         if let Some(topic) = md.topics.pin().get(&topic_id) {
             let has_groups = !topic.consumer_group_ids.is_empty();
@@ -1652,7 +1695,7 @@ impl MqEngine {
                 let mut all_messages: SmallVec<[SmallVec<[Bytes; 16]>; 4]> =
                     SmallVec::with_capacity(cmds.len());
                 for sub in cmds {
-                    let v = sub.as_publish();
+                    let v = CmdPublish::from_buf(sub);
                     let msgs: SmallVec<[Bytes; 16]> = v.messages().collect();
                     let msg_count = msgs.len() as u64;
                     let base_offset =
@@ -1680,7 +1723,7 @@ impl MqEngine {
                 }
             } else {
                 for sub in cmds {
-                    let v = sub.as_publish();
+                    let v = CmdPublish::from_buf(sub);
                     let msg_count = v.message_count() as u64;
                     let base_offset = topic.apply_publish(log_index, v.messages(), segment_id);
                     responses.push(MqResponse::Published {
@@ -1705,7 +1748,7 @@ impl MqEngine {
     fn apply_ack_variant_run(
         &self,
         tag: u8,
-        cmds: &[MqCommand],
+        cmds: &[&[u8]],
         group_id: u64,
         responses: &mut SmallVec<[MqResponse; 8]>,
     ) {
@@ -1713,7 +1756,7 @@ impl MqEngine {
         if let Some(group) = md.consumer_groups.pin().get(&group_id) {
             if let Some(ack) = group.ack_state() {
                 for sub in cmds {
-                    let ids = sub.field_vec_u64(16);
+                    let ids = buf_field_vec_u64(sub, 16);
                     match tag {
                         MqCommand::TAG_GROUP_ACK => {
                             ack.apply_ack(&ids);
@@ -1782,8 +1825,8 @@ impl MqEngine {
         }
         // Fall back to exchange routing
         if let Some(exchange) = md.exchanges.pin().get(&topic_id) {
-            let routing_key_bytes =
-                crate::flat::FlatMessage::new(payload.clone()).and_then(|f| f.routing_key());
+            let flat = crate::flat::FlatMessage::new(&payload);
+            let routing_key_bytes = flat.as_ref().and_then(|f| f.routing_key());
             let routing_key_str = routing_key_bytes
                 .as_ref()
                 .and_then(|b| std::str::from_utf8(b).ok());
@@ -2268,9 +2311,7 @@ mod tests {
     }
 
     fn make_msg(value: &[u8]) -> Bytes {
-        FlatMessageBuilder::new(Bytes::from(value.to_vec()))
-            .timestamp(1000)
-            .build()
+        FlatMessageBuilder::new(value).timestamp(1000).build()
     }
 
     // =========================================================================
