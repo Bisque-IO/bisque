@@ -19,6 +19,7 @@ use crate::config::MqConfig;
 use crate::engine::MqEngine;
 use crate::manifest::{GroupMeta, MqManifestManager, StructuralWrite};
 use crate::metadata::MqMetadata;
+use crate::retention::RetentionEvaluator;
 use crate::segment_index::SegmentIndexMap;
 use crate::types::{MqCommand, MqResponse, MqSnapshotData};
 
@@ -55,11 +56,14 @@ pub struct MqStateMachine {
     /// Per-segment index builders — lives outside the engine for
     /// lock-free concurrent reads during applies.
     segment_indexes: Arc<SegmentIndexMap>,
-    /// Shared with log storage — purged segment IDs are pushed here
-    /// when segments are deleted. Drained after each apply batch.
+    /// Shared with log storage — unpinned segment IDs are pushed here
+    /// when segments are unpinned (Level 1). Drained after each apply batch.
     purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
     /// Pull-based async apply manager.
     async_apply: Option<AsyncApplyManager>,
+    /// Level 2 retention evaluator — deletes segment files based on
+    /// per-entity retention policies.
+    retention_evaluator: Option<Arc<RetentionEvaluator>>,
 }
 
 impl MqStateMachine {
@@ -80,6 +84,7 @@ impl MqStateMachine {
             segment_indexes: Arc::new(SegmentIndexMap::new()),
             purged_segments: None,
             async_apply: None,
+            retention_evaluator: None,
         }
     }
 
@@ -96,11 +101,40 @@ impl MqStateMachine {
             Arc::clone(&self.engine),
             prefetcher,
             self.manifest.clone(),
+            self.purged_segments.clone(),
             self.group_id,
             initial_cursor,
             &config.catalog_name,
         );
         self.async_apply = Some(manager);
+    }
+
+    /// Initialize the Level 2 retention evaluator. Call after all builder
+    /// methods are invoked. Requires a manifest, purge_floor, and group_dir.
+    pub fn init_retention(&mut self, config: &MqConfig) {
+        let manifest = match self.manifest.as_ref() {
+            Some(m) => Arc::clone(m),
+            None => return, // no manifest → no retention
+        };
+        let purge_floor = match self.purge_floor.as_ref() {
+            Some(f) => Arc::clone(f),
+            None => return,
+        };
+        let group_dir = match self.group_dir.as_ref() {
+            Some(d) => d.clone(),
+            None => return,
+        };
+
+        let evaluator = RetentionEvaluator::new(
+            group_dir,
+            self.group_id,
+            manifest,
+            self.engine.shared_metadata(),
+            purge_floor,
+            config.retention_eval_interval,
+            &config.catalog_name,
+        );
+        self.retention_evaluator = Some(Arc::new(evaluator));
     }
 
     pub fn with_purge_floor(mut self, floor: Arc<AtomicU64>) -> Self {
@@ -436,6 +470,15 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                 return Ok(());
             }
 
+            // Drain purged segment IDs that workers have already swept.
+            // Workers peek the list and sweep before advancing their cursors,
+            // so by the time we enter the next apply() call all workers from
+            // the previous cycle have finished sweeping.
+            {
+                let async_apply = self.async_apply.as_ref().unwrap();
+                async_apply.drain_purged_segments();
+            }
+
             // Advance HWM — workers wake and pull from the log.
             if let Some(ref la) = self.last_applied {
                 let async_apply = self.async_apply.as_ref().unwrap();
@@ -529,44 +572,65 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
         // Sweep retained messages referencing purged mmap segments.
         // Detach (copy to heap) so the segment can be freed, then batch-persist
         // the detached retained data to MDBX for fast recovery.
-        if let Some(ref purged_segments) = self.purged_segments {
-            let purged_ids: Vec<u64> = {
-                let mut guard = purged_segments.lock();
-                if guard.is_empty() {
-                    Vec::new()
-                } else {
-                    std::mem::take(&mut *guard)
-                }
-            };
+        //
+        // With async apply, each partition worker sweeps its own exchanges
+        // after processing each range — no global sweep needed here.
+        if self.async_apply.is_none() {
+            if let Some(ref purged_segments) = self.purged_segments {
+                let purged_ids: Vec<u64> = {
+                    let mut guard = purged_segments.lock();
+                    if guard.is_empty() {
+                        Vec::new()
+                    } else {
+                        std::mem::take(&mut *guard)
+                    }
+                };
 
-            if !purged_ids.is_empty() {
-                let meta = self.engine.metadata();
-                let exchanges_guard = meta.exchanges.pin();
+                if !purged_ids.is_empty() {
+                    let meta = self.engine.metadata();
 
-                for (&exchange_id, exchange) in exchanges_guard.iter() {
-                    let mut retained = exchange.retained.write();
-                    let mut detached = false;
-                    for rv in retained.values_mut() {
-                        if let Some(seg_id) = rv.segment_id {
-                            if purged_ids.contains(&seg_id) {
-                                rv.detach();
-                                detached = true;
+                    // Sweep exchange retained messages.
+                    let exchanges_guard = meta.exchanges.pin();
+                    for (&exchange_id, exchange) in exchanges_guard.iter() {
+                        let mut retained = exchange.retained.write();
+                        let mut detached = false;
+                        for rv in retained.values_mut() {
+                            if let Some(seg_id) = rv.segment_id {
+                                if purged_ids.contains(&seg_id) {
+                                    rv.detach();
+                                    detached = true;
+                                }
+                            }
+                        }
+
+                        // Batch-persist all retained messages for this exchange
+                        if detached {
+                            if let Some(ref manifest) = self.manifest {
+                                let entries: Vec<(String, Vec<u8>)> = retained
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.message.to_vec()))
+                                    .collect();
+                                manifest.persist_retained_fire_and_forget(
+                                    self.group_id,
+                                    exchange_id,
+                                    entries,
+                                );
                             }
                         }
                     }
 
-                    // Batch-persist all retained messages for this exchange
-                    if detached {
-                        if let Some(ref manifest) = self.manifest {
-                            let entries: Vec<(String, Vec<u8>)> = retained
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.message.to_vec()))
-                                .collect();
-                            manifest.persist_retained_fire_and_forget(
-                                self.group_id,
-                                exchange_id,
-                                entries,
-                            );
+                    // Sweep topic retained messages.
+                    let topics_guard = meta.topics.pin();
+                    for (_, topic) in topics_guard.iter() {
+                        if topic.meta.retained {
+                            let mut retained = topic.retained_message.write();
+                            if let Some(ref mut rv) = *retained {
+                                if let Some(seg_id) = rv.segment_id {
+                                    if purged_ids.contains(&seg_id) {
+                                        rv.detach();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -623,6 +687,26 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                             }
                         }
                     }
+                });
+            }
+        }
+
+        // Level 2 retention evaluation — periodically check if unpinned
+        // segments can be permanently deleted based on retention policies.
+        if let Some(ref evaluator) = self.retention_evaluator {
+            // Update the active segment ID so it's never deleted.
+            if let Some(ref la) = self.last_applied {
+                if let Some(ref prefetcher) = self.prefetcher {
+                    if let Some(loc) = prefetcher.log_location(la.index) {
+                        evaluator.set_active_segment(loc.segment_id);
+                    }
+                }
+            }
+
+            if evaluator.should_evaluate() {
+                let eval = Arc::clone(evaluator);
+                tokio::task::spawn_blocking(move || {
+                    eval.evaluate();
                 });
             }
         }

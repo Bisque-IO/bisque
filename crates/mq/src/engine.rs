@@ -133,12 +133,13 @@ impl MqEngine {
                 if let Some(topic) = md.topics.pin().get(&topic_id) {
                     if topic.consumer_group_ids.is_empty() {
                         // Fast path: no attached groups, skip collect + enqueue
-                        let base_offset = topic.apply_publish(log_index, v.messages());
+                        let base_offset = topic.apply_publish(log_index, v.messages(), segment_id);
                         self.on_message_added(log_index);
                         MqResponse::Published { base_offset, count }
                     } else {
                         let messages: SmallVec<[Bytes; 16]> = v.messages().collect();
-                        let base_offset = topic.apply_publish(log_index, messages.iter().cloned());
+                        let base_offset =
+                            topic.apply_publish(log_index, messages.iter().cloned(), segment_id);
                         let group_ids: SmallVec<[u64; 4]> = topic
                             .consumer_group_ids
                             .pin()
@@ -386,7 +387,7 @@ impl MqEngine {
                 let mut total_count = 0u64;
                 for &target_id in &targets {
                     if let Some(topic) = md.topics.pin().get(&target_id) {
-                        topic.apply_publish(log_index, messages.iter().cloned());
+                        topic.apply_publish(log_index, messages.iter().cloned(), segment_id);
                         total_count += messages.len() as u64;
                         if !topic.consumer_group_ids.is_empty() {
                             let group_ids: SmallVec<[u64; 4]> = topic
@@ -410,7 +411,11 @@ impl MqEngine {
                         let group_id = target_id;
                         if src != 0 {
                             if let Some(topic) = md.topics.pin().get(&src) {
-                                topic.apply_publish(log_index, messages.iter().cloned());
+                                topic.apply_publish(
+                                    log_index,
+                                    messages.iter().cloned(),
+                                    segment_id,
+                                );
                                 total_count += messages.len() as u64;
                             }
                         }
@@ -922,7 +927,11 @@ impl MqEngine {
                             if let Some(&topic_id) = md.topic_names.pin().get(&hash) {
                                 if let Some(topic) = md.topics.pin().get(&topic_id) {
                                     // Publish an empty acknowledgment to the reply topic
-                                    topic.apply_publish(log_index, std::iter::once(Bytes::new()));
+                                    topic.apply_publish(
+                                        log_index,
+                                        std::iter::once(Bytes::new()),
+                                        segment_id,
+                                    );
                                     self.on_message_added(log_index);
                                 }
                             }
@@ -1023,7 +1032,7 @@ impl MqEngine {
 
                 // Publish dead-lettered messages to the DLQ topic
                 if let Some(topic) = md.topics.pin().get(&dlq_topic_id) {
-                    topic.apply_publish(log_index, messages);
+                    topic.apply_publish(log_index, messages, None);
                     self.on_message_added(log_index);
                 }
                 // Remove dead-lettered messages from the source group's ack state
@@ -1151,7 +1160,11 @@ impl MqEngine {
                             let hash = name_hash_bytes(&reply_name);
                             if let Some(&topic_id) = md.topic_names.pin().get(&hash) {
                                 if let Some(topic) = md.topics.pin().get(&topic_id) {
-                                    topic.apply_publish(log_index, std::iter::once(Bytes::new()));
+                                    topic.apply_publish(
+                                        log_index,
+                                        std::iter::once(Bytes::new()),
+                                        segment_id,
+                                    );
                                     self.on_message_added(log_index);
                                 }
                             }
@@ -1265,7 +1278,7 @@ impl MqEngine {
                         .as_ref()
                         .and_then(|c| c.payload.clone())
                         .unwrap_or_else(Bytes::new);
-                    topic.apply_publish(log_index, std::iter::once(payload));
+                    topic.apply_publish(log_index, std::iter::once(payload), None);
                     topic.apply_cron_trigger(triggered_at);
                     self.on_message_added(log_index);
                     MqResponse::Ok
@@ -1521,12 +1534,8 @@ impl MqEngine {
             // Dedup (50)
             // =================================================================
             MqCommand::TAG_PRUNE_DEDUP_WINDOW => {
-                // Wire: [tag:1][topic_id:8][before_ts:8]
-                let topic_id = cmd.field_u64(8);
-                let before_ts = cmd.field_u64(16);
-                if let Some(topic) = md.topics.pin().get(&topic_id) {
-                    topic.prune_dedup(before_ts);
-                }
+                // Legacy — dedup GC is now local (not Raft-replicated).
+                // Kept as no-op for rolling-upgrade wire compatibility.
                 MqResponse::Ok
             }
 
@@ -1577,6 +1586,7 @@ impl MqEngine {
                         topic_id,
                         log_index,
                         current_time,
+                        segment_id,
                         &mut responses,
                     );
                     i = run_end;
@@ -1632,6 +1642,7 @@ impl MqEngine {
         topic_id: u64,
         log_index: u64,
         current_time: u64,
+        segment_id: Option<u64>,
         responses: &mut SmallVec<[MqResponse; 8]>,
     ) {
         let md = &self.metadata;
@@ -1644,7 +1655,8 @@ impl MqEngine {
                     let v = sub.as_publish();
                     let msgs: SmallVec<[Bytes; 16]> = v.messages().collect();
                     let msg_count = msgs.len() as u64;
-                    let base_offset = topic.apply_publish(log_index, msgs.iter().cloned());
+                    let base_offset =
+                        topic.apply_publish(log_index, msgs.iter().cloned(), segment_id);
                     responses.push(MqResponse::Published {
                         base_offset,
                         count: msg_count,
@@ -1670,7 +1682,7 @@ impl MqEngine {
                 for sub in cmds {
                     let v = sub.as_publish();
                     let msg_count = v.message_count() as u64;
-                    let base_offset = topic.apply_publish(log_index, v.messages());
+                    let base_offset = topic.apply_publish(log_index, v.messages(), segment_id);
                     responses.push(MqResponse::Published {
                         base_offset,
                         count: msg_count,
@@ -1764,7 +1776,7 @@ impl MqEngine {
         let current_time = 0; // Will messages use log_index for message_id
         // Try direct topic first
         if let Some(topic) = md.topics.pin().get(&topic_id) {
-            topic.apply_publish(log_index, std::iter::once(payload));
+            topic.apply_publish(log_index, std::iter::once(payload), None);
             self.on_message_added(log_index);
             return true;
         }
@@ -1780,7 +1792,7 @@ impl MqEngine {
             for &target_id in &targets {
                 // Try direct topic publish
                 if let Some(topic) = md.topics.pin().get(&target_id) {
-                    topic.apply_publish(log_index, std::iter::once(payload.clone()));
+                    topic.apply_publish(log_index, std::iter::once(payload.clone()), None);
                     published = true;
                 } else if let Some(group) = md.consumer_groups.pin().get(&target_id) {
                     // Target is a consumer group — publish to its source topic
@@ -1789,7 +1801,7 @@ impl MqEngine {
                     let group_id = target_id;
                     if src != 0 {
                         if let Some(topic) = md.topics.pin().get(&src) {
-                            topic.apply_publish(log_index, std::iter::once(payload.clone()));
+                            topic.apply_publish(log_index, std::iter::once(payload.clone()), None);
                             published = true;
                         }
                     }

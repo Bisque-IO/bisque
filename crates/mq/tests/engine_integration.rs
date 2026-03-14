@@ -117,7 +117,10 @@ fn test_full_snapshot_restore_roundtrip() {
             "tasks",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
-            Some(&TopicDedupConfig { window_secs: 60 }),
+            Some(&TopicDedupConfig {
+                window_secs: 60,
+                max_entries: 100_000,
+            }),
             false,
             None,
             false,

@@ -714,17 +714,22 @@ impl Decode for TopicLifetimePolicy {
 
 impl Encode for TopicDedupConfig {
     fn encode<W: Write>(&self, w: &mut W) -> Result<(), CodecError> {
-        self.window_secs.encode(w)
+        self.window_secs.encode(w)?;
+        self.max_entries.encode(w)
     }
     fn encoded_size(&self) -> usize {
-        8
+        16
     }
 }
 
 impl Decode for TopicDedupConfig {
     fn decode<R: Read>(r: &mut R) -> Result<Self, CodecError> {
+        let window_secs = u64::decode(r)?;
+        // Backwards compat: old wire format only had window_secs (8 bytes).
+        let max_entries = u64::decode(r).unwrap_or(100_000);
         Ok(Self {
-            window_secs: u64::decode(r)?,
+            window_secs,
+            max_entries,
         })
     }
 }

@@ -24,7 +24,7 @@ use crate::consumer_group::ConsumerGroupState;
 use crate::exchange::ExchangeState;
 use crate::notifier::GroupNotifier;
 use crate::session::SessionState;
-use crate::topic::TopicState;
+use crate::topic::{DedupIndex, TopicState};
 use crate::types::{PendingWill, TopicAliasEntry};
 
 // ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ pub struct MqMetadata {
     topics_by_name: papaya::HashMap<String, u64>,
 
     // -- Full entity stores (papaya + Arc for epoch-based read concurrency) --
-    pub(crate) topics: papaya::HashMap<u64, Arc<TopicState>>,
+    pub topics: papaya::HashMap<u64, Arc<TopicState>>,
     pub(crate) exchanges: papaya::HashMap<u64, Arc<ExchangeState>>,
 
     // -- Consumer groups (unified — Offset, Ack, Actor variants) --
@@ -268,6 +268,9 @@ pub struct MqMetadata {
 
     /// Server start time (epoch ms) — used for compact delay index offsets.
     pub(crate) server_start_ms: u64,
+
+    /// Global dedup reverse index (scc::TreeIndex) shared across all topics.
+    pub dedup_index: DedupIndex,
 }
 
 impl MqMetadata {
@@ -298,6 +301,7 @@ impl MqMetadata {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            dedup_index: DedupIndex::new(),
         }
     }
 

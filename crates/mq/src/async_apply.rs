@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -348,6 +349,10 @@ struct PartitionWorker {
     client_registry: Arc<ClientRegistry>,
     client_id_table: Arc<ClientIdTable>,
     manifest: Option<Arc<MqManifestManager>>,
+    /// Purged segment IDs shared with log storage. Workers peek (without
+    /// draining) after each range to sweep retained messages on their own
+    /// exchanges. Detach is idempotent so overlapping sweeps are safe.
+    purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
     group_id: u64,
     cursor_notify: Arc<tokio::sync::Notify>,
     m_apply_count: metrics::Counter,
@@ -381,6 +386,7 @@ impl PartitionWorker {
 
             let from = cursor_val + 1;
             self.process_range(from, hwm, &mut scanner);
+            self.sweep_purged_retained();
             self.cursor.store(hwm, Ordering::Release);
             self.cursor_notify.notify_waiters();
         }
@@ -489,6 +495,78 @@ impl PartitionWorker {
         }
     }
 
+    /// Sweep retained messages on this worker's exchanges and topics that
+    /// reference purged mmap segments. Copies the message bytes to heap so
+    /// the segment can be freed. Only sweeps entities owned by this partition
+    /// (`entity_id % num_partitions == partition_id`).
+    fn sweep_purged_retained(&self) {
+        let purged = match self.purged_segments {
+            Some(ref p) => p,
+            None => return,
+        };
+
+        // Peek — don't drain. The state machine drains after all workers
+        // have caught up. Detach is idempotent so double-sweeps are harmless.
+        let purged_ids: Vec<u64> = {
+            let guard = purged.lock();
+            if guard.is_empty() {
+                return;
+            }
+            guard.clone()
+        };
+
+        let meta = self.engine.metadata();
+
+        // Sweep exchange retained messages.
+        let exchanges_guard = meta.exchanges.pin();
+        for (&exchange_id, exchange) in exchanges_guard.iter() {
+            if (exchange_id as usize) % self.num_partitions != self.partition_id {
+                continue;
+            }
+
+            let mut retained = exchange.retained.write();
+            let mut detached = false;
+            for rv in retained.values_mut() {
+                if let Some(seg_id) = rv.segment_id {
+                    if purged_ids.contains(&seg_id) {
+                        rv.detach();
+                        detached = true;
+                    }
+                }
+            }
+
+            if detached {
+                if let Some(ref manifest) = self.manifest {
+                    let entries: Vec<(String, Vec<u8>)> = retained
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.message.to_vec()))
+                        .collect();
+                    manifest.persist_retained_fire_and_forget(self.group_id, exchange_id, entries);
+                }
+            }
+        }
+
+        // Sweep topic retained messages.
+        let topics_guard = meta.topics.pin();
+        for (&topic_id, topic) in topics_guard.iter() {
+            if !topic.meta.retained {
+                continue;
+            }
+            if (topic_id as usize) % self.num_partitions != self.partition_id {
+                continue;
+            }
+
+            let mut retained = topic.retained_message.write();
+            if let Some(ref mut rv) = *retained {
+                if let Some(seg_id) = rv.segment_id {
+                    if purged_ids.contains(&seg_id) {
+                        rv.detach();
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_structural_writes(&self, cmd: &MqCommand, response: &MqResponse, log_index: u64) {
         let manifest = match self.manifest {
             Some(ref m) => m,
@@ -523,6 +601,10 @@ pub struct AsyncApplyManager {
     worker_handles: Vec<tokio::task::JoinHandle<()>>,
     cursor_notify: Arc<tokio::sync::Notify>,
     num_partitions: usize,
+    /// Shared with log storage — workers peek after each range to sweep
+    /// retained messages on their own exchanges. The state machine drains
+    /// after all workers have caught up.
+    purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
 }
 
 impl AsyncApplyManager {
@@ -532,6 +614,7 @@ impl AsyncApplyManager {
         engine: Arc<MqEngine>,
         prefetcher: SegmentPrefetcher,
         manifest: Option<Arc<MqManifestManager>>,
+        purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
         group_id: u64,
         initial_cursor: u64,
         catalog_name: &str,
@@ -572,6 +655,7 @@ impl AsyncApplyManager {
                 client_registry: Arc::clone(&client_registry),
                 client_id_table: Arc::clone(&client_id_table),
                 manifest: manifest.clone(),
+                purged_segments: purged_segments.clone(),
                 group_id,
                 cursor_notify: Arc::clone(&cursor_notify),
                 m_apply_count,
@@ -592,6 +676,7 @@ impl AsyncApplyManager {
             worker_handles,
             cursor_notify,
             num_partitions: n,
+            purged_segments,
         }
     }
 
@@ -633,6 +718,18 @@ impl AsyncApplyManager {
             .map(|c| c.load(Ordering::Acquire))
             .min()
             .unwrap_or(0)
+    }
+
+    /// Drain the purged segments vec. Call after all workers have had a
+    /// chance to sweep (i.e., after their cursors have advanced past the
+    /// HWM at which the segments were purged).
+    pub fn drain_purged_segments(&self) {
+        if let Some(ref purged) = self.purged_segments {
+            let mut guard = purged.lock();
+            if !guard.is_empty() {
+                guard.clear();
+            }
+        }
     }
 
     /// Number of partition workers.

@@ -6,10 +6,10 @@
 //! record boundaries and extract the command payload — the raft metadata
 //! (term, node_id, log_index) is ignored by the reader.
 //!
-//! ## Record Layout
+//! ## Record Layout (8-byte aligned)
 //!
 //! ```text
-//! Raft record:    [len:4][type:1][group_id:3][payload...][crc:8]
+//! Raft record:    [len:4][type:1][group_id:3][payload...][crc:8][pad:0-7]
 //! Entry payload:  [term:8][node_id:8][index:8][tag:1][data...]
 //! ```
 //!
@@ -17,7 +17,7 @@
 //! The cursor extracts just the `data` portion as a zero-copy `Bytes` slice.
 
 use bisque_raft::SegmentView;
-use bisque_raft::record_format::{CRC64_SIZE, HEADER_SIZE, LENGTH_SIZE};
+use bisque_raft::record_format::{CRC64_SIZE, HEADER_SIZE, LENGTH_SIZE, align8};
 use bytes::Bytes;
 
 use crate::types::MqCommand;
@@ -28,42 +28,6 @@ const ENTRY_HEADER_SIZE: usize = 25;
 /// Minimum raft record size that can contain a Normal entry:
 /// header(8) + entry_header(25) + crc(8) = 41 bytes.
 const MIN_ENTRY_RECORD_SIZE: usize = HEADER_SIZE + ENTRY_HEADER_SIZE + CRC64_SIZE;
-
-/// Segment data source — either a live mmap view or a fixed snapshot.
-///
-/// `View` reads `logical_size` atomically on every `len()` call, so it
-/// sees data appended after the cursor was created (for the active segment).
-/// `Snapshot` is a fixed `Bytes` slice (sealed segments, tests).
-enum SegmentData {
-    View(SegmentView),
-    Snapshot(Bytes),
-}
-
-impl SegmentData {
-    #[inline]
-    fn len(&self) -> usize {
-        match self {
-            Self::View(v) => v.len(),
-            Self::Snapshot(b) => b.len(),
-        }
-    }
-
-    #[inline]
-    fn read_bytes(&self, offset: usize, len: usize) -> &[u8] {
-        match self {
-            Self::View(v) => v.read_slice(offset, len),
-            Self::Snapshot(b) => &b[offset..offset + len],
-        }
-    }
-
-    #[inline]
-    fn slice_bytes(&self, start: usize, end: usize) -> Bytes {
-        match self {
-            Self::View(v) => v.slice_bytes(start, end - start),
-            Self::Snapshot(b) => b.slice(start..end),
-        }
-    }
-}
 
 /// A record yielded by the cursor.
 pub struct SegmentRecord {
@@ -84,12 +48,10 @@ pub struct SegmentRecord {
 /// individual sub-commands, yielding each one separately with the same
 /// `log_index` as the batch entry.
 pub struct MqSegmentCursor {
-    /// Segment data — live mmap view or fixed snapshot.
-    data: SegmentData,
+    /// Segment view — live mmap or fixed bytes snapshot.
+    view: SegmentView,
     /// Current byte offset within the segment.
     offset: usize,
-    /// Segment ID for diagnostics / prefetching.
-    segment_id: u64,
     /// When exploding a TAG_BATCH, holds the batch payload bytes.
     batch_data: Option<Bytes>,
     /// Current byte offset within `batch_data` (after tag+count header).
@@ -103,33 +65,15 @@ pub struct MqSegmentCursor {
 }
 
 impl MqSegmentCursor {
-    /// Create a cursor from a fixed `Bytes` snapshot.
+    /// Create a cursor from a `SegmentView`.
     ///
-    /// Use for sealed segments or tests. For the active segment,
-    /// prefer `new_live()` which sees newly appended data.
-    pub fn new(segment_id: u64, data: Bytes) -> Self {
+    /// For live (active) segments the view reads `logical_size` atomically,
+    /// so the cursor sees data appended after creation. For sealed segments
+    /// or tests, use `SegmentView::from_bytes()`.
+    pub fn new(view: SegmentView) -> Self {
         Self {
-            data: SegmentData::Snapshot(data),
+            view,
             offset: 0,
-            segment_id,
-            batch_data: None,
-            batch_offset: 0,
-            batch_remaining: 0,
-            batch_log_index: 0,
-            batch_record_offset: 0,
-        }
-    }
-
-    /// Create a cursor from a live `SegmentView`.
-    ///
-    /// `len()` reads `logical_size` atomically, so the cursor sees
-    /// data appended after creation. Use for the active segment.
-    pub fn new_live(view: SegmentView) -> Self {
-        let segment_id = view.segment_id();
-        Self {
-            data: SegmentData::View(view),
-            offset: 0,
-            segment_id,
             batch_data: None,
             batch_offset: 0,
             batch_remaining: 0,
@@ -141,7 +85,7 @@ impl MqSegmentCursor {
     /// The segment ID this cursor is scanning.
     #[inline]
     pub fn segment_id(&self) -> u64 {
-        self.segment_id
+        self.view.segment_id()
     }
 
     /// Current byte offset within the segment.
@@ -153,7 +97,7 @@ impl MqSegmentCursor {
     /// Whether the cursor has reached the end of valid data.
     #[inline]
     pub fn is_exhausted(&self) -> bool {
-        self.offset + LENGTH_SIZE > self.data.len()
+        self.offset + LENGTH_SIZE > self.view.len()
     }
 
     /// Reset the cursor to the beginning of the segment.
@@ -194,13 +138,13 @@ impl MqSegmentCursor {
         }
 
         loop {
-            if self.offset + LENGTH_SIZE > self.data.len() {
+            if self.offset + LENGTH_SIZE > self.view.len() {
                 return None;
             }
 
             let record_len = u32::from_le_bytes(
-                self.data
-                    .read_bytes(self.offset, LENGTH_SIZE)
+                self.view
+                    .read_slice(self.offset, LENGTH_SIZE)
                     .try_into()
                     .unwrap(),
             ) as usize;
@@ -213,14 +157,14 @@ impl MqSegmentCursor {
                 self.offset += LENGTH_SIZE;
                 return None;
             }
-            if self.offset + total > self.data.len() {
+            if self.offset + total > self.view.len() {
                 // Don't advance offset — for live views the record may
                 // complete when more data is appended.
                 return None;
             }
 
             let record_start = self.offset;
-            self.offset += total;
+            self.offset += align8(total);
 
             // Minimum size check: must fit raft header + entry header + CRC.
             if total < MIN_ENTRY_RECORD_SIZE {
@@ -228,14 +172,14 @@ impl MqSegmentCursor {
             }
 
             // Check record type: must be Entry (0x02).
-            let record_type = self.data.read_bytes(record_start + LENGTH_SIZE, 1)[0];
+            let record_type = self.view.read_slice(record_start + LENGTH_SIZE, 1)[0];
             if record_type != 0x02 {
                 continue;
             }
 
             // Check entry tag: must be Normal (1).
             // Entry tag is at: record_start + HEADER_SIZE + 24 (after term+node_id+index).
-            let entry_tag = self.data.read_bytes(record_start + HEADER_SIZE + 24, 1)[0];
+            let entry_tag = self.view.read_slice(record_start + HEADER_SIZE + 24, 1)[0];
             if entry_tag != 1 {
                 continue;
             }
@@ -243,16 +187,16 @@ impl MqSegmentCursor {
             // Extract log_index from the entry header.
             let index_offset = record_start + HEADER_SIZE + 16; // after term(8) + node_id(8)
             let log_index =
-                u64::from_le_bytes(self.data.read_bytes(index_offset, 8).try_into().unwrap());
+                u64::from_le_bytes(self.view.read_slice(index_offset, 8).try_into().unwrap());
 
-            // Extract MqCommand data: after entry header, before CRC.
+            // Extract MqCommand data: after entry header, before CRC (unpadded content boundary).
             let data_start = record_start + HEADER_SIZE + ENTRY_HEADER_SIZE;
             let data_end = record_start + total - CRC64_SIZE;
             if data_start >= data_end {
                 continue;
             }
 
-            let cmd_bytes = self.data.slice_bytes(data_start, data_end);
+            let cmd_bytes = self.view.slice_bytes(data_start, data_end - data_start);
 
             // Explode TAG_BATCH: store the bytes and re-enter to yield first sub-command.
             // Layout: [TAG_BATCH:1][count:4][len1:4][cmd1][len2:4][cmd2]...
@@ -331,13 +275,13 @@ impl MqSegmentCursor {
         self.batch_remaining = 0;
 
         loop {
-            if self.offset + LENGTH_SIZE > self.data.len() {
+            if self.offset + LENGTH_SIZE > self.view.len() {
                 return None;
             }
 
             let record_len = u32::from_le_bytes(
-                self.data
-                    .read_bytes(self.offset, LENGTH_SIZE)
+                self.view
+                    .read_slice(self.offset, LENGTH_SIZE)
                     .try_into()
                     .unwrap(),
             ) as usize;
@@ -347,30 +291,30 @@ impl MqSegmentCursor {
                 self.offset += LENGTH_SIZE;
                 return None;
             }
-            if self.offset + total > self.data.len() {
+            if self.offset + total > self.view.len() {
                 return None;
             }
 
             let record_start = self.offset;
-            self.offset += total;
+            self.offset += align8(total);
 
             if total < MIN_ENTRY_RECORD_SIZE {
                 continue;
             }
 
-            let record_type = self.data.read_bytes(record_start + LENGTH_SIZE, 1)[0];
+            let record_type = self.view.read_slice(record_start + LENGTH_SIZE, 1)[0];
             if record_type != 0x02 {
                 continue;
             }
 
-            let entry_tag = self.data.read_bytes(record_start + HEADER_SIZE + 24, 1)[0];
+            let entry_tag = self.view.read_slice(record_start + HEADER_SIZE + 24, 1)[0];
             if entry_tag != 1 {
                 continue;
             }
 
             let index_offset = record_start + HEADER_SIZE + 16;
             let log_index =
-                u64::from_le_bytes(self.data.read_bytes(index_offset, 8).try_into().unwrap());
+                u64::from_le_bytes(self.view.read_slice(index_offset, 8).try_into().unwrap());
 
             let data_start = record_start + HEADER_SIZE + ENTRY_HEADER_SIZE;
             let data_end = record_start + total - CRC64_SIZE;
@@ -378,7 +322,7 @@ impl MqSegmentCursor {
                 continue;
             }
 
-            let cmd_bytes = self.data.slice_bytes(data_start, data_end);
+            let cmd_bytes = self.view.slice_bytes(data_start, data_end - data_start);
 
             return Some(SegmentRecord {
                 log_index,
@@ -543,23 +487,15 @@ impl MqSegmentScanner {
             let seg_id = self.next_segment_id;
             self.next_segment_id += 1;
 
-            let is_active = seg_id == self.active_segment_id;
-            if is_active {
-                // Active segment: use live SegmentView so we see appended data.
-                if let Some(view) = self.prefetcher.segment_view(seg_id) {
-                    self.cursor = Some(MqSegmentCursor::new_live(view));
-                    return true;
+            if let Some(view) = self.prefetcher.segment_view(seg_id) {
+                // Prefetch the next sealed segment.
+                if seg_id != self.active_segment_id
+                    && self.next_segment_id <= self.active_segment_id
+                {
+                    self.prefetcher.prefetch_next(0);
                 }
-            } else {
-                // Sealed segment: snapshot is fine (data is immutable).
-                if let Some(data) = self.prefetcher.segment_bytes(seg_id) {
-                    // Prefetch the segment after this one.
-                    if self.next_segment_id <= self.active_segment_id {
-                        self.prefetcher.prefetch_next(0);
-                    }
-                    self.cursor = Some(MqSegmentCursor::new(seg_id, data));
-                    return true;
-                }
+                self.cursor = Some(MqSegmentCursor::new(view));
+                return true;
             }
             // Segment not pinned — skip it (may have been evicted or purged).
         }
@@ -680,8 +616,8 @@ impl MqReader {
 
     /// Create a segment cursor for the given segment.
     pub fn segment_cursor(&self, segment_id: u64) -> Option<MqSegmentCursor> {
-        let data = self.prefetcher.segment_bytes(segment_id)?;
-        Some(MqSegmentCursor::new(segment_id, data))
+        let view = self.prefetcher.segment_view(segment_id)?;
+        Some(MqSegmentCursor::new(view))
     }
 }
 
@@ -743,7 +679,7 @@ mod tests {
     #[test]
     fn cursor_empty_segment() {
         let data = Bytes::new();
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
         assert!(cursor.is_exhausted());
         assert!(cursor.next_record().is_none());
     }
@@ -756,7 +692,7 @@ mod tests {
             MqCommand::publish(30, &[Bytes::from_static(b"msg")]),
         ];
         let data = build_test_segment(&cmds);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         let rec1 = cursor.next_record().expect("should get record 1");
         assert_eq!(rec1.log_index, 1);
@@ -785,7 +721,7 @@ mod tests {
             MqCommand::publish(3, &[Bytes::from_static(b"c")]),
         ];
         let data = build_mixed_segment(&cmds);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         let records = cursor.collect_all();
         assert_eq!(records.len(), 3);
@@ -804,7 +740,7 @@ mod tests {
             MqCommand::publish(10, &[Bytes::from_static(b"e")]),
         ];
         let data = build_test_segment(&cmds);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         // Filter for Publish to topic 10.
         let records = cursor.collect_for_entity(MqCommand::TAG_PUBLISH, 10);
@@ -824,7 +760,7 @@ mod tests {
     fn cursor_rewind() {
         let cmds = vec![MqCommand::publish(1, &[Bytes::from_static(b"x")])];
         let data = build_test_segment(&cmds);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         assert!(cursor.next_record().is_some());
         assert!(cursor.next_record().is_none());
@@ -841,7 +777,7 @@ mod tests {
             &[Bytes::from_static(b"hello"), Bytes::from_static(b"world")],
         )];
         let data = build_test_segment(&cmds);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         let rec = cursor.next_record().unwrap();
         let msgs: Vec<Bytes> = rec.command.publish_messages().unwrap().collect();
@@ -877,7 +813,7 @@ mod tests {
         append_record_into(&mut buf, RecordType::Entry, 0, &payload2);
 
         let data = Bytes::from(buf);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         // Should skip the Membership entry and return only the Normal one.
         let rec = cursor.next_record().unwrap();
@@ -893,7 +829,7 @@ mod tests {
             .map(|i| MqCommand::publish(i % 10, &[Bytes::from(format!("msg-{i}"))]))
             .collect();
         let data = build_test_segment(&cmds);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         let all = cursor.collect_all();
         assert_eq!(all.len(), 1000);
@@ -922,7 +858,7 @@ mod tests {
             MqCommand::publish(2, &[Bytes::from_static(b"after")]),
         ];
         let data = build_test_segment(&cmds);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         // Record 1: standalone publish.
         let rec = cursor.next_record().unwrap();
@@ -968,7 +904,7 @@ mod tests {
             batch,
         ];
         let data = build_test_segment(&cmds);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         let records = cursor.collect_for_entity(MqCommand::TAG_PUBLISH, 10);
         // 1 standalone + 2 from batch (sub1, sub3) = 3 total.
@@ -987,7 +923,7 @@ mod tests {
         ]);
         let batch2 = MqCommand::batch(&[MqCommand::publish(3, &[Bytes::from_static(b"c")])]);
         let data = build_test_segment(&[batch1, batch2]);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         let all = cursor.collect_all();
         assert_eq!(all.len(), 3);
@@ -1007,7 +943,7 @@ mod tests {
             MqCommand::publish(1, &[Bytes::from_static(b"after")]),
         ];
         let data = build_test_segment(&cmds);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         let all = cursor.collect_all();
         assert_eq!(all.len(), 1);
@@ -1023,9 +959,9 @@ mod tests {
             MqCommand::publish(2, &[Bytes::from_static(b"truncated")]),
         ];
         let full = build_test_segment(&cmds);
-        // Truncate to remove the second record partially.
-        let truncated = full.slice(..full.len() - 5);
-        let mut cursor = MqSegmentCursor::new(1, truncated);
+        // Truncate well into the second record's content (past any alignment padding).
+        let truncated = full.slice(..full.len() - 16);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, truncated));
 
         // First record should succeed.
         let rec = cursor.next_record().unwrap();
@@ -1043,7 +979,7 @@ mod tests {
             MqCommand::publish(3, &[Bytes::from_static(b"c")]),
         ]);
         let data = build_test_segment(&[batch]);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         // Read first sub-command from batch.
         let rec = cursor.next_record().unwrap();
@@ -1068,7 +1004,7 @@ mod tests {
             MqCommand::publish(20, &[Bytes::from_static(b"p4")]),
         ]);
         let data = build_test_segment(&[batch]);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
         // Filter for publishes to topic 10.
         let pubs = cursor.collect_for_entity(MqCommand::TAG_PUBLISH, 10);
@@ -1084,7 +1020,7 @@ mod tests {
     fn cursor_only_length_prefix_no_data() {
         // Segment with just a 4-byte zero length prefix — should stop immediately.
         let data = Bytes::from_static(&[0, 0, 0, 0]);
-        let mut cursor = MqSegmentCursor::new(1, data);
+        let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
         assert!(cursor.next_record().is_none());
         assert!(cursor.is_exhausted());
     }

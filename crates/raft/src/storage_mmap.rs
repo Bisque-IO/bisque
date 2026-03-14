@@ -24,8 +24,8 @@ use crate::codec::{BorrowPayload, Decode, Encode};
 use crate::manifest_mdbx::{ManifestManager, SegmentLocation, SegmentMeta};
 use crate::record_format::{
     AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, HEADER_SIZE, LENGTH_SIZE, LogIndex,
-    LogLocation, MAX_GROUPS, RecordType, RecordTypeFlags, append_record_into, validate_record,
-    write_u24_le,
+    LogLocation, MAX_GROUPS, RecordType, RecordTypeFlags, align8, append_record_into,
+    validate_record, write_u24_le,
 };
 use arc_swap::ArcSwap;
 use crossfire::{MAsyncTx, mpsc::Array};
@@ -214,6 +214,7 @@ pub fn scan_segment_ids(group_dir: &Path) -> io::Result<Vec<u64>> {
 
 /// A single mmap'd segment file. ONE mmap per segment, used for both reading and writing.
 /// Size tracking is done via atomics — no locks on the read path.
+#[repr(C, align(128))]
 struct Segment {
     segment_id: u64,
     mmap: MmapRaw,
@@ -355,24 +356,61 @@ fn bytes_from_segment(segment: &Arc<Segment>, offset: usize, len: usize) -> byte
 /// `SegmentView` reads `logical_size` atomically on every `len()` call,
 /// so it always sees newly appended data without re-acquiring the segment.
 ///
-/// Holds an `Arc<Segment>` to keep the mmap pinned.
+/// Holds a pre-built `Bytes` covering the full mmap capacity. All
+/// `slice_bytes()` calls slice from this local `Bytes` — no `Arc` cloning,
+/// no atomic contention on the hot path. The `Arc<Segment>` is kept only
+/// to pin the mmap in memory and to read `logical_size` for live segments.
 #[derive(Clone)]
 pub struct SegmentView {
-    segment: Arc<Segment>,
+    /// Keeps the mmap pinned. `None` for test/bytes-only views.
+    segment: Option<Arc<Segment>>,
+    /// Segment ID.
+    id: u64,
+    /// Pre-built `Bytes` covering the full mmap (or test data).
+    /// `slice_bytes()` slices from this — no Arc clone, no atomics.
+    data: bytes::Bytes,
 }
 
 impl SegmentView {
+    /// Create a `SegmentView` from a fixed `Bytes` snapshot.
+    ///
+    /// Useful for tests and sealed-segment reads where the data is immutable.
+    pub fn from_bytes(segment_id: u64, data: bytes::Bytes) -> Self {
+        Self {
+            segment: None,
+            id: segment_id,
+            data,
+        }
+    }
+
+    /// Create a `SegmentView` backed by an mmap segment.
+    ///
+    /// Pre-builds a `Bytes` covering the full mmap capacity so that all
+    /// subsequent `slice_bytes()` calls avoid `Arc` cloning.
+    fn from_segment(segment: Arc<Segment>) -> Self {
+        let id = segment.segment_id;
+        let data = bytes_from_segment(&segment, 0, segment.capacity());
+        Self {
+            segment: Some(segment),
+            id,
+            data,
+        }
+    }
+
     /// The segment ID.
     #[inline]
     pub fn segment_id(&self) -> u64 {
-        self.segment.segment_id
+        self.id
     }
 
-    /// Current valid byte count — reads `logical_size` atomically.
-    /// Grows as new entries are appended to the active segment.
+    /// Current valid byte count — reads `logical_size` atomically for live
+    /// mmap segments, returns `data.len()` for bytes-backed views.
     #[inline]
     pub fn len(&self) -> usize {
-        self.segment.logical_size.load(Ordering::Acquire) as usize
+        match &self.segment {
+            Some(seg) => seg.logical_size.load(Ordering::Acquire) as usize,
+            None => self.data.len(),
+        }
     }
 
     /// Whether the segment has no data.
@@ -381,21 +419,30 @@ impl SegmentView {
         self.len() == 0
     }
 
+    /// Read a byte at `[offset..offset+len]`.
+    ///
+    /// # Safety
+    /// Caller must ensure `offset + 1 <= self.len()`.
+    #[inline]
+    pub fn read_byte(&self, offset: usize) -> u8 {
+        self.data[offset]
+    }
+
     /// Read a byte slice at `[offset..offset+len]`.
     ///
     /// # Safety
     /// Caller must ensure `offset + len <= self.len()`.
     #[inline]
     pub fn read_slice(&self, offset: usize, len: usize) -> &[u8] {
-        self.segment.read_slice(offset, len)
+        &self.data[offset..offset + len]
     }
 
     /// Create a zero-copy `Bytes` handle for `[offset..offset+len]`.
     ///
-    /// The returned `Bytes` holds the `Arc<Segment>` alive.
+    /// Slices from the pre-built `Bytes` — no `Arc` clone, no atomic ops.
     #[inline]
     pub fn slice_bytes(&self, offset: usize, len: usize) -> bytes::Bytes {
-        bytes_from_segment(&self.segment, offset, len)
+        self.data.slice(offset..offset + len)
     }
 }
 
@@ -449,7 +496,7 @@ fn build_entry_index(mmap: &[u8], valid_bytes: usize) -> SegmentEntryIndex {
                 }
             }
         }
-        offset += total;
+        offset += align8(total);
     }
 
     SegmentEntryIndex {
@@ -759,20 +806,24 @@ impl MmapSegmentMap {
         self.active.store(segment);
     }
 
-    /// Update pins: remove segments fully below `purge_up_to` (delete files)
-    /// and unpin segments fully above pin_ceiling (close but keep files).
-    /// Returns `(paths_to_delete, purged_segment_ids)`.
-    fn update_pins(&self, purge_up_to: u64) -> (Vec<PathBuf>, Vec<u64>) {
+    /// Unpin segments fully below `purge_up_to` or fully above `pin_ceiling`.
+    ///
+    /// **Does NOT delete segment files.** File deletion is handled by Level 2
+    /// retention evaluation. This only releases mmap memory.
+    ///
+    /// Returns the IDs of segments that were unpinned because they are fully
+    /// below the purge floor. These IDs are used to trigger retained message
+    /// detach sweeps (the mmap backing is gone once unpinned).
+    fn update_pins(&self, purge_up_to: u64) -> Vec<u64> {
         let ceiling = self.pin_ceiling.load(Ordering::Acquire);
         let mut pinned = self.pinned.lock();
-        let mut removed_paths = Vec::new();
-        let mut purged_ids = Vec::new();
+        let mut unpinned_ids = Vec::new();
 
         pinned.retain(|&seg_id, entry| {
             if entry.max_index <= purge_up_to {
-                // Fully purged — unpin and delete
-                removed_paths.push(entry.segment.path.clone());
-                purged_ids.push(seg_id);
+                // Fully below purge floor — unpin (release mmap memory).
+                // File stays on disk for Level 2 retention evaluation.
+                unpinned_ids.push(seg_id);
                 false
             } else if ceiling > 0 && entry.min_index > ceiling {
                 // Fully above pin ceiling — unpin but keep file
@@ -782,7 +833,7 @@ impl MmapSegmentMap {
             }
         });
 
-        (removed_paths, purged_ids)
+        unpinned_ids
     }
 
     /// Remove pinned segments with min_index > after_index for truncation.
@@ -838,7 +889,7 @@ fn scan_first_entry_index(mmap: &[u8], valid_bytes: usize) -> Option<u64> {
                 return None;
             }
         }
-        offset += LENGTH_SIZE + record_len;
+        offset += align8(LENGTH_SIZE + record_len);
     }
     None
 }
@@ -862,7 +913,7 @@ fn scan_last_entry_index(mmap: &[u8], valid_bytes: usize) -> Option<u64> {
                 }
             }
         }
-        offset += LENGTH_SIZE + record_len;
+        offset += align8(LENGTH_SIZE + record_len);
     }
     last_entry_index
 }
@@ -1645,7 +1696,7 @@ fn scan_valid_bytes_up_to_index(data: &[u8], target_index: u64) -> usize {
             }
         }
         let total = LENGTH_SIZE + record_len;
-        offset += total;
+        offset += align8(total);
         last_valid_end = offset;
     }
     last_valid_end
@@ -1891,7 +1942,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
                         );
                         entry_offsets.push((offset as u64, total as u32));
                         entry_index += 1;
-                        offset += total;
+                        offset += align8(total);
                     }
 
                     if let Some(min) = m.min_index {
@@ -2124,12 +2175,12 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             // Quick CRC check
             let payload_end = record_data.len() - CRC64_SIZE;
             let stored_crc = u64::from_le_bytes(record_data[payload_end..].try_into().unwrap());
-            let mut digest = crc64fast_nvme::Digest::new();
-            digest.write(&record_data[..payload_end]);
-            if digest.sum64() != stored_crc {
+            let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
+            digest.update(&record_data[..payload_end]);
+            if digest.finalize() != stored_crc {
                 break;
             }
-            offset += total;
+            offset += align8(total);
         }
         offset
     }
@@ -2172,7 +2223,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
 
             if let Ok(parsed) = validate_record(record_data, max_record_size) {
                 if parsed.group_id != group_id {
-                    offset += total;
+                    offset += align8(total);
                     continue;
                 }
                 match parsed.record_type {
@@ -2227,7 +2278,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             } else {
                 break; // Corrupt record, stop scanning
             }
-            offset += total;
+            offset += align8(total);
         }
 
         ScanMeta {
@@ -2641,7 +2692,7 @@ impl SegmentPrefetcher {
         if segment.logical_size.load(Ordering::Acquire) == 0 {
             return None;
         }
-        Some(SegmentView { segment })
+        Some(SegmentView::from_segment(segment))
     }
 
     /// Return the full valid region of a segment as a single `Bytes`.
@@ -3025,10 +3076,13 @@ where
                 openraft::EntryPayload::Blank => {
                     // Entry: [term:8][node_id:8][index:8][tag:1] = 25 bytes payload
                     // Record: [len:4][type:1][group_id:3][payload:25][crc:8] = 41 bytes
+                    // Aligned: 48 bytes (7 bytes padding)
                     let payload_len = 25;
                     let record_body_len = 1 + GROUP_ID_SIZE + payload_len + CRC64_SIZE;
-                    let total = LENGTH_SIZE + record_body_len;
-                    self.encode_buf.reserve(total);
+                    let content_size = LENGTH_SIZE + record_body_len;
+                    let aligned_size = align8(content_size);
+                    let padding = aligned_size - content_size;
+                    self.encode_buf.reserve(aligned_size);
 
                     // Record header: [len:4][type:1][group_id:3]
                     let mut header = [0u8; HEADER_SIZE];
@@ -3042,13 +3096,13 @@ where
                     let idx_bytes = entry.log_id.index.to_le_bytes();
 
                     // CRC over [type + group_id + payload]
-                    let mut digest = crc64fast_nvme::Digest::new();
-                    digest.write(&header[LENGTH_SIZE..]);
-                    digest.write(&term_bytes);
-                    digest.write(&node_bytes);
-                    digest.write(&idx_bytes);
-                    digest.write(&[0u8]); // Blank tag
-                    let crc = digest.sum64();
+                    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
+                    digest.update(&header[LENGTH_SIZE..]);
+                    digest.update(&term_bytes);
+                    digest.update(&node_bytes);
+                    digest.update(&idx_bytes);
+                    digest.update(&[0u8]); // Blank tag
+                    let crc = digest.finalize();
 
                     self.encode_buf.extend_from_slice(&header);
                     self.encode_buf.extend_from_slice(&term_bytes);
@@ -3056,7 +3110,10 @@ where
                     self.encode_buf.extend_from_slice(&idx_bytes);
                     self.encode_buf.push(0); // Blank tag
                     self.encode_buf.extend_from_slice(&crc.to_le_bytes());
-                    total
+                    if padding > 0 {
+                        self.encode_buf.extend_from_slice(&[0u8; 7][..padding]);
+                    }
+                    content_size
                 }
                 openraft::EntryPayload::Normal(_) | openraft::EntryPayload::Membership(_) => {
                     // Full entry encoding via the codec. This ensures multi-variant
@@ -3220,20 +3277,19 @@ where
         };
         self.state.last_purged_log_id.store(Some(&effective_log_id));
 
-        // Purge from LogIndex and update pins (removes segments below purge index)
+        // Purge from LogIndex and unpin segments below the purge floor.
+        // Level 1: only releases mmap memory, does NOT delete files.
+        // File deletion is handled by Level 2 retention evaluation.
         self.state.log_index.purge_to(index);
-        let (removed_paths, purged_ids) = self.state.segment_map.update_pins(index);
-        for path in &removed_paths {
-            let _ = std::fs::remove_file(path);
-        }
+        let unpinned_ids = self.state.segment_map.update_pins(index);
 
-        // Notify the state machine about purged segment IDs so it can detach
-        // any mmap-backed retained messages referencing these segments.
-        if !purged_ids.is_empty() {
+        // Notify the state machine about unpinned segment IDs so it can
+        // detach any mmap-backed retained messages referencing these segments.
+        if !unpinned_ids.is_empty() {
             self.state
                 .purged_segments
                 .lock()
-                .extend_from_slice(&purged_ids);
+                .extend_from_slice(&unpinned_ids);
         }
 
         Ok(())
@@ -4252,7 +4308,7 @@ mod tests {
                 use std::io::Read;
                 file.seek(std::io::SeekFrom::Start(0)).unwrap();
                 file.read_exact(&mut data).unwrap();
-                // Find end of valid records
+                // Find end of valid records (8-byte aligned)
                 let mut valid_end = 0;
                 let mut offset = 0;
                 while offset + 4 <= data.len() {
@@ -4261,7 +4317,7 @@ mod tests {
                     if rlen == 0 || offset + 4 + rlen > data.len() {
                         break;
                     }
-                    offset += 4 + rlen;
+                    offset += align8(4 + rlen);
                     valid_end = offset;
                 }
                 // Write a partial record: length says 100 but only write 10 bytes
@@ -4336,9 +4392,9 @@ mod tests {
                 file.seek(std::io::SeekFrom::Start(0)).unwrap();
                 file.read_exact(&mut data).unwrap();
 
-                // Find second record
+                // Find second record (records are 8-byte aligned)
                 let rlen1 = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                let second_start = 4 + rlen1;
+                let second_start = align8(4 + rlen1);
                 let rlen2 =
                     u32::from_le_bytes(data[second_start..second_start + 4].try_into().unwrap())
                         as usize;
@@ -4481,7 +4537,7 @@ mod tests {
                 file.seek(std::io::SeekFrom::Start(0)).unwrap();
                 file.read_exact(&mut data).unwrap();
 
-                // Find end of records
+                // Find end of records (8-byte aligned)
                 let mut offset = 0;
                 while offset + 4 <= data.len() {
                     let rlen =
@@ -4489,7 +4545,7 @@ mod tests {
                     if rlen == 0 || offset + 4 + rlen > data.len() {
                         break;
                     }
-                    offset += 4 + rlen;
+                    offset += align8(4 + rlen);
                 }
                 // Write explicit zero length at end of valid data
                 if offset + 4 <= data.len() {
@@ -5358,12 +5414,18 @@ mod tests {
             };
             log.purge(purge_lid).await.unwrap();
 
-            // Some segment files should have been removed
-            let seg_count_after = count_segment_files(tmp.path());
-            assert!(
-                seg_count_after < seg_count_before,
-                "Purge should remove old segment files: before={seg_count_before}, after={seg_count_after}"
-            );
+            // Level 1 purge only unpins segments — files remain on disk for
+            // Level 2 retention evaluation.  Verify segments were unpinned.
+            {
+                let pinned = log.state.segment_map.pinned.lock();
+                for (_seg_id, entry) in pinned.iter() {
+                    assert!(
+                        entry.max_index > 25,
+                        "Purged segment should not be pinned, got max_index={}",
+                        entry.max_index
+                    );
+                }
+            }
 
             // Remaining entries still readable
             let result = log.try_get_log_entries(26..31).await.unwrap();
@@ -6902,15 +6964,15 @@ mod tests {
 
     #[test]
     fn test_record_format_roundtrip() {
-        use crate::record_format::{RecordType, encode_record_into, validate_record};
+        use crate::record_format::{RecordType, align8, encode_record_into, validate_record};
         let mut buf = Vec::new();
         let payload = b"hello world";
 
-        let size = encode_record_into(&mut buf, RecordType::Entry, 42, payload);
-        assert_eq!(buf.len(), size);
+        let content_size = encode_record_into(&mut buf, RecordType::Entry, 42, payload);
+        assert_eq!(buf.len(), align8(content_size));
 
-        // Validate the record (skip 4-byte length prefix)
-        let record = validate_record(&buf[4..], 1024 * 1024).unwrap();
+        // Validate the record (skip 4-byte length prefix, use content size)
+        let record = validate_record(&buf[4..content_size], 1024 * 1024).unwrap();
         assert_eq!(record.record_type, RecordType::Entry);
         assert_eq!(record.group_id, 42);
         assert_eq!(record.payload, payload);
@@ -6918,12 +6980,12 @@ mod tests {
 
     #[test]
     fn test_record_format_empty_payload() {
-        use crate::record_format::{RecordType, encode_record_into, validate_record};
+        use crate::record_format::{RecordType, align8, encode_record_into, validate_record};
         let mut buf = Vec::new();
-        let size = encode_record_into(&mut buf, RecordType::Vote, 0, &[]);
-        assert_eq!(buf.len(), size);
+        let content_size = encode_record_into(&mut buf, RecordType::Vote, 0, &[]);
+        assert_eq!(buf.len(), align8(content_size));
 
-        let record = validate_record(&buf[4..], 1024).unwrap();
+        let record = validate_record(&buf[4..content_size], 1024).unwrap();
         assert_eq!(record.record_type, RecordType::Vote);
         assert_eq!(record.group_id, 0);
         assert_eq!(record.payload.len(), 0);
@@ -6934,9 +6996,9 @@ mod tests {
         use crate::record_format::{RecordType, encode_record_into, validate_record};
         let mut buf = Vec::new();
         let max_group_id = 0xFF_FFFFu64; // u24 max
-        encode_record_into(&mut buf, RecordType::Entry, max_group_id, b"test");
+        let content_size = encode_record_into(&mut buf, RecordType::Entry, max_group_id, b"test");
 
-        let record = validate_record(&buf[4..], 1024).unwrap();
+        let record = validate_record(&buf[4..content_size], 1024).unwrap();
         assert_eq!(record.group_id, max_group_id);
     }
 
@@ -6944,12 +7006,12 @@ mod tests {
     fn test_record_format_crc_mismatch() {
         use crate::record_format::{RecordType, encode_record_into, validate_record};
         let mut buf = Vec::new();
-        encode_record_into(&mut buf, RecordType::Entry, 0, b"payload");
+        let content_size = encode_record_into(&mut buf, RecordType::Entry, 0, b"payload");
 
         // Flip a bit in the payload
         buf[8] ^= 0x01;
 
-        let result = validate_record(&buf[4..], 1024);
+        let result = validate_record(&buf[4..content_size], 1024);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("CRC mismatch"),
@@ -6971,10 +7033,10 @@ mod tests {
         use crate::record_format::{RecordType, encode_record_into, validate_record};
         let mut buf = Vec::new();
         let large_payload = vec![0u8; 2000];
-        encode_record_into(&mut buf, RecordType::Entry, 0, &large_payload);
+        let content_size = encode_record_into(&mut buf, RecordType::Entry, 0, &large_payload);
 
         // Validate with a small max_record_size
-        let result = validate_record(&buf[4..], 100);
+        let result = validate_record(&buf[4..content_size], 100);
         assert!(result.is_err());
         assert!(
             result
@@ -7696,7 +7758,7 @@ mod tests {
                 file.seek(std::io::SeekFrom::Start(0)).unwrap();
                 file.read_exact(&mut data).unwrap();
 
-                // Walk to find start of last record
+                // Walk to find start of last record (8-byte aligned)
                 let mut offset = 0;
                 let mut last_offset = 0;
                 while offset + 4 <= data.len() {
@@ -7706,7 +7768,7 @@ mod tests {
                         break;
                     }
                     last_offset = offset;
-                    offset += 4 + rlen;
+                    offset += align8(4 + rlen);
                 }
                 // Corrupt CRC of last record
                 let rlen =
@@ -7840,7 +7902,7 @@ mod tests {
                 file.seek(std::io::SeekFrom::Start(0)).unwrap();
                 file.read_exact(&mut data).unwrap();
 
-                // Find end of valid records
+                // Find end of valid records (8-byte aligned)
                 let mut offset = 0;
                 while offset + 4 <= data.len() {
                     let rlen =
@@ -7848,7 +7910,7 @@ mod tests {
                     if rlen == 0 || offset + 4 + rlen > data.len() {
                         break;
                     }
-                    offset += 4 + rlen;
+                    offset += align8(4 + rlen);
                 }
                 // Write random garbage after valid data
                 if offset + 20 <= data.len() {
@@ -8487,7 +8549,7 @@ mod tests {
                 file.seek(std::io::SeekFrom::Start(0)).unwrap();
                 file.read_exact(&mut data).unwrap();
 
-                // Skip past first 3 entry records to find vote record
+                // Skip past first 3 entry records to find vote record (8-byte aligned)
                 let mut offset = 0;
                 for _ in 0..3 {
                     let rlen =
@@ -8495,7 +8557,7 @@ mod tests {
                     if rlen == 0 {
                         break;
                     }
-                    offset += 4 + rlen;
+                    offset += align8(4 + rlen);
                 }
                 // Now at vote record — corrupt its CRC
                 let rlen =
@@ -9129,13 +9191,14 @@ mod tests {
             };
             log.purge(purge_lid).await.unwrap();
 
-            // Some segment files should have been deleted
+            // Level 1 purge only unpins segments — files remain on disk for
+            // Level 2 retention evaluation.  Verify segments below purge
+            // index are unpinned but files still exist.
             let seg_count_after = count_segment_files(tmp.path());
-            assert!(
-                seg_count_after < seg_count_before,
-                "Purge should delete segment files: before={}, after={}",
-                seg_count_before,
-                seg_count_after
+            assert_eq!(
+                seg_count_after, seg_count_before,
+                "Level 1 purge should NOT delete segment files: before={}, after={}",
+                seg_count_before, seg_count_after
             );
 
             // Verify no pinned segment has max_index <= 30

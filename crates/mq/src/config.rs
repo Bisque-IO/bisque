@@ -48,6 +48,9 @@ pub struct MqConfig {
     pub session_expiry_interval: Duration,
     /// Parallel apply configuration.
     pub parallel_apply: ParallelApplyConfig,
+    /// How often to evaluate segment retention policies (default: 30s).
+    /// Set to Duration::ZERO to disable retention evaluation.
+    pub retention_eval_interval: Duration,
 }
 
 impl MqConfig {
@@ -68,6 +71,7 @@ impl MqConfig {
             group_offset_retention_ms: 7 * 24 * 60 * 60 * 1000, // 7 days
             session_expiry_interval: Duration::from_secs(5),
             parallel_apply: ParallelApplyConfig::default(),
+            retention_eval_interval: Duration::from_secs(30),
         }
     }
 

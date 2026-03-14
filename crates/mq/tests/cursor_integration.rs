@@ -680,8 +680,8 @@ fn cursor_from_real_segment_bytes() {
         append_entries(&mut log, entries).await;
 
         let active_id = prefetcher.active_segment_id();
-        let data = prefetcher.segment_bytes(active_id).unwrap();
-        let mut cursor = MqSegmentCursor::new(active_id, data);
+        let view = prefetcher.segment_view(active_id).unwrap();
+        let mut cursor = MqSegmentCursor::new(view);
 
         let all = cursor.collect_all();
         assert_eq!(all.len(), 3);
@@ -713,8 +713,8 @@ fn cursor_entity_filter_with_real_storage() {
         append_entries(&mut log, entries).await;
 
         let active_id = prefetcher.active_segment_id();
-        let data = prefetcher.segment_bytes(active_id).unwrap();
-        let mut cursor = MqSegmentCursor::new(active_id, data);
+        let view = prefetcher.segment_view(active_id).unwrap();
+        let mut cursor = MqSegmentCursor::new(view);
 
         let filtered = cursor.collect_for_entity(MqCommand::TAG_PUBLISH, 100);
         assert_eq!(filtered.len(), 5);
@@ -746,8 +746,8 @@ fn cursor_batch_with_real_storage() {
         append_entries(&mut log, entries).await;
 
         let active_id = prefetcher.active_segment_id();
-        let data = prefetcher.segment_bytes(active_id).unwrap();
-        let mut cursor = MqSegmentCursor::new(active_id, data);
+        let view = prefetcher.segment_view(active_id).unwrap();
+        let mut cursor = MqSegmentCursor::new(view);
 
         let all = cursor.collect_all();
         // 1 solo + 3 from batch = 4

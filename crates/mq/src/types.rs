@@ -1,7 +1,6 @@
 use std::fmt;
 
 use bytes::Bytes;
-use crc64fast_nvme::Digest;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
@@ -15,9 +14,7 @@ pub fn name_hash(name: &str) -> u64 {
 /// `Bytes` to avoid a UTF-8 validation / String allocation round-trip.
 #[inline]
 pub fn name_hash_bytes(b: &[u8]) -> u64 {
-    let mut digest = Digest::new();
-    digest.write(b);
-    digest.sum64()
+    crc_fast::crc64_nvme(b)
 }
 
 // =============================================================================
@@ -180,6 +177,14 @@ impl Default for TopicLifetimePolicy {
 pub struct TopicDedupConfig {
     /// Dedup window duration in seconds.
     pub window_secs: u64,
+    /// Maximum number of dedup entries before inline GC is triggered.
+    /// Default: 100_000.
+    #[serde(default = "default_dedup_max_entries")]
+    pub max_entries: u64,
+}
+
+fn default_dedup_max_entries() -> u64 {
+    100_000
 }
 
 /// Cron auto-publish configuration for a topic. Replaces the Job entity type.

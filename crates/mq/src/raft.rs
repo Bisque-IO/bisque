@@ -134,19 +134,22 @@ impl MqRaftNode {
             ));
         }
 
-        // 5. Dedup window pruning
+        // 5. Dedup window pruning (local — no Raft command needed, deterministic)
         {
             let meta = Arc::clone(&metadata);
-            handles.push(self.spawn_leader_task(
-                "mq-dedup-prune",
-                self.config.dedup_prune_interval,
-                move |raft, _node_id| {
-                    let meta = Arc::clone(&meta);
-                    Box::pin(async move {
-                        Self::prune_dedup_windows(&raft, &meta).await;
-                    })
-                },
-            ));
+            let interval = self.config.dedup_prune_interval;
+            let shutdown = self.shutdown.clone();
+            handles.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => prune_dedup_local(&meta),
+                        _ = shutdown.notified() => break,
+                    }
+                }
+                debug!("mq-dedup-prune local task exiting");
+            }));
         }
 
         // 6. Actor idle eviction
@@ -310,13 +313,7 @@ impl MqRaftNode {
         }
     }
 
-    async fn prune_dedup_windows(raft: &Raft<MqTypeConfig>, meta: &Arc<MqMetadata>) {
-        let commands = collect_dedup_prune_commands(meta, unix_ms());
-        if !commands.is_empty() {
-            debug!(count = commands.len(), "proposing dedup prune commands");
-            let _ = raft.client_write(MqCommand::batch(&commands)).await;
-        }
-    }
+    // prune_dedup_windows removed — dedup GC is now local (see prune_dedup_local)
 
     async fn evict_idle_actors(raft: &Raft<MqTypeConfig>, meta: &Arc<MqMetadata>) {
         let commands = collect_idle_actor_evictions(meta, unix_ms());
@@ -456,20 +453,71 @@ pub(crate) fn collect_dead_sessions(
     commands
 }
 
-/// Collect PruneDedupWindow commands for topics with active dedup windows.
-pub(crate) fn collect_dedup_prune_commands(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
-    let mut commands = Vec::new();
+/// Prune dedup windows locally on every node using the global `DedupIndex`.
+///
+/// Computes the minimum cutoff across all dedup-enabled topics, then does a
+/// single range scan on the global `scc::TreeIndex` to collect expired entries.
+/// Each expired key is dispatched to its topic's forward map for removal.
+///
+/// Also does a per-topic forward-map sweep for any entries not in the global
+/// index (e.g. entries inserted via the non-indexed path or before the index
+/// was enabled).
+pub fn prune_dedup_local(meta: &MqMetadata) {
+    let now_ms = unix_ms();
+
+    // Find the minimum cutoff across all dedup-enabled topics.
+    let mut min_before_ms = u64::MAX;
     let guard = meta.topics.pin();
-    for (&topic_id, topic) in guard.iter() {
+    for (_, topic) in guard.iter() {
         if let Some(ref dedup_config) = topic.meta.dedup_config {
             if topic.dedup.is_some() {
-                let window_secs = dedup_config.window_secs;
-                let before_timestamp = now_ms.saturating_sub(window_secs * 1000);
-                commands.push(MqCommand::prune_dedup_window(topic_id, before_timestamp));
+                let window_ms = dedup_config.window_secs * 1000;
+                let before_ms = now_ms.saturating_sub(window_ms);
+                min_before_ms = min_before_ms.min(before_ms);
             }
         }
     }
-    commands
+
+    if min_before_ms == u64::MAX {
+        return; // No dedup-enabled topics.
+    }
+
+    // Single range scan on the global reverse index.
+    let expired = meta.dedup_index.prune_before(min_before_ms);
+
+    if !expired.is_empty() {
+        // Group expired keys by topic_id for batch removal from forward maps.
+        let mut current_topic_id = expired[0].0;
+        let mut keys_buf: Vec<u128> = Vec::new();
+
+        for &(tid, dk) in &expired {
+            if tid != current_topic_id {
+                if let Some(topic) = guard.get(&current_topic_id) {
+                    topic.remove_dedup_keys(&keys_buf);
+                }
+                keys_buf.clear();
+                current_topic_id = tid;
+            }
+            keys_buf.push(dk);
+        }
+        if !keys_buf.is_empty() {
+            if let Some(topic) = guard.get(&current_topic_id) {
+                topic.remove_dedup_keys(&keys_buf);
+            }
+        }
+    }
+
+    // Per-topic forward-map sweep: catches entries not in the global index
+    // and handles per-topic windows that differ from the minimum cutoff.
+    for (_, topic) in guard.iter() {
+        if let Some(ref dedup_config) = topic.meta.dedup_config {
+            if topic.dedup.is_some() {
+                let window_ms = dedup_config.window_secs * 1000;
+                let topic_before_ms = now_ms.saturating_sub(window_ms);
+                topic.prune_dedup(topic_before_ms);
+            }
+        }
+    }
 }
 
 /// Collect GroupEvictIdle commands for all consumer groups (Actor variant).
@@ -586,10 +634,10 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_prune_empty() {
+    fn test_dedup_prune_local_empty() {
         let engine = make_engine();
-        let cmds = collect_dedup_prune_commands(engine.metadata(), 100_000);
-        assert!(cmds.is_empty());
+        // Should not panic with no topics having dedup enabled.
+        prune_dedup_local(engine.metadata());
     }
 
     #[test]

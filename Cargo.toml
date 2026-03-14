@@ -84,7 +84,7 @@ cfg-if = "1"
 congee = "0.4.1"
 core_affinity = "0.8"
 crc32fast = "1.4"
-crc64fast-nvme = "1.2"
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 cron = "0.15"
 crossbeam = "0.8"
@@ -93,6 +93,7 @@ crossbeam-utils = "0.8"
 crossfire = "3.1"
 dashmap = "6.1"
 papaya = "0.2"
+scc = "3.6.9"
 derive_more = { version = "2", features = [
     "std",
     "from",

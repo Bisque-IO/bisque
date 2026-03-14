@@ -11,6 +11,7 @@ pub mod metadata;
 pub mod notifier;
 pub mod purge;
 pub mod raft;
+pub mod retention;
 pub mod segment_index;
 pub mod session;
 pub mod state_machine;

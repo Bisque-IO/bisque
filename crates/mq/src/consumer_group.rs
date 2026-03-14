@@ -157,7 +157,7 @@ pub struct ConsumerGroupSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AckStateSnapshot {
     pub messages: Vec<AckMessageMeta>,
-    pub dedup_entries: Vec<(u64, Vec<Bytes>)>,
+    pub dedup_entries: Vec<(u128, u64)>,
     /// Delayed message entries: (delay_offset_ms, message_ids).
     #[serde(default)]
     pub delayed_entries: Vec<(u32, Vec<u64>)>,

@@ -43,6 +43,7 @@ pub use storage_mmap::MmapStorageConfig;
 pub use storage_mmap::MmapStorageConfig as MultiplexedStorageConfig;
 pub use storage_mmap::SegmentPrefetcher;
 pub use storage_mmap::SegmentView;
+pub use storage_mmap::scan_segment_ids;
 pub use transport_tcp::{
     BisqueTcpTransport, BisqueTcpTransportConfig, BisqueTransportError, BoxedReader, BoxedWriter,
     DefaultNodeRegistry, NodeAddressResolver,

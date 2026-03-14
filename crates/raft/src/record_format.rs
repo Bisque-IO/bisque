@@ -4,18 +4,22 @@
 //! and shared primitives (atomic vote/log-id, congee-based log index)
 //! used by the mmap storage backend.
 //!
-//! ## Log Record Format
+//! ## Log Record Format (8-byte aligned)
 //!
 //! ```text
-//! +----------+----------+----------+-------------+----------+
-//! | len (4B) | type (1B)| group_id | payload     | crc64    |
-//! |  u32 LE  |   u8     | u24 LE   | (variable)  | (8B) LE  |
-//! +----------+----------+----------+-------------+----------+
+//! +----------+----------+----------+-------------+----------+---------+
+//! | len (4B) | type (1B)| group_id | payload     | crc64    | padding |
+//! |  u32 LE  |   u8     | u24 LE   | (variable)  | (8B) LE  | (0-7B)  |
+//! +----------+----------+----------+-------------+----------+---------+
 //! ```
+//!
+//! Each record is padded with zeros to the next 8-byte boundary.
+//! The `len` field stores the unpadded body size (type + group_id + payload + crc).
+//! Sequential scanners advance by `align8(LENGTH_SIZE + len)` to find the next record.
 
 use congee::U64Congee;
 use congee::epoch;
-use crc64fast_nvme::Digest;
+use crc_fast::{CrcAlgorithm, Digest};
 use openraft::{LogId, RaftTypeConfig};
 use parking_lot::RwLock;
 use std::io;
@@ -127,6 +131,15 @@ pub const HEADER_SIZE: usize = LENGTH_SIZE + 1 + GROUP_ID_SIZE;
 /// Maximum number of raft groups supported (4K)
 pub const MAX_GROUPS: usize = 4096;
 
+/// Round `n` up to the next multiple of 8.
+#[inline]
+pub const fn align8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+/// Zero-fill padding bytes (max 7).
+const ZERO_PAD: [u8; 7] = [0u8; 7];
+
 // ---------------------------------------------------------------------------
 // u24 helpers
 // ---------------------------------------------------------------------------
@@ -166,8 +179,9 @@ pub fn encode_record_into(
     append_record_into(buf, record_type, group_id, payload)
 }
 
-/// Appends a log record to `buf` (does NOT clear first).
-/// Returns the number of bytes appended.
+/// Appends a log record to `buf` (does NOT clear first), padded to 8-byte alignment.
+/// Returns the **content size** (unpadded: `LENGTH_SIZE + record_len`).
+/// The buffer is zero-padded to the next 8-byte boundary after the CRC.
 pub fn append_record_into(
     buf: &mut Vec<u8>,
     record_type: RecordType,
@@ -176,9 +190,11 @@ pub fn append_record_into(
 ) -> usize {
     // Total record size (excluding the len field itself)
     let record_len = 1 + GROUP_ID_SIZE + payload.len() + CRC64_SIZE; // type + group_id + payload + crc
-    let total_size = LENGTH_SIZE + record_len;
+    let content_size = LENGTH_SIZE + record_len;
+    let aligned_size = align8(content_size);
+    let padding = aligned_size - content_size;
 
-    buf.reserve(total_size);
+    buf.reserve(aligned_size);
 
     // Build header: [len][type][group_id]
     let mut header: [u8; HEADER_SIZE] = [0u8; HEADER_SIZE];
@@ -187,17 +203,20 @@ pub fn append_record_into(
     write_u24_le(&mut header, 5, group_id);
 
     // Compute CRC64 incrementally over [type + group_id + payload]
-    let mut digest = Digest::new();
-    digest.write(&header[LENGTH_SIZE..]); // type + group_id (4 bytes)
-    digest.write(payload);
-    let crc = digest.sum64();
+    let mut digest = Digest::new(CrcAlgorithm::Crc64Nvme);
+    digest.update(&header[LENGTH_SIZE..]); // type + group_id (4 bytes)
+    digest.update(payload);
+    let crc = digest.finalize();
 
     // Append everything to buffer
     buf.extend_from_slice(&header);
     buf.extend_from_slice(payload);
     buf.extend_from_slice(&crc.to_le_bytes());
+    if padding > 0 {
+        buf.extend_from_slice(&ZERO_PAD[..padding]);
+    }
 
-    total_size
+    content_size
 }
 
 /// A parsed record from the log
@@ -236,9 +255,9 @@ pub fn validate_record(data: &[u8], max_record_size: usize) -> io::Result<Parsed
     let stored_crc = u64::from_le_bytes(data[payload_end..].try_into().unwrap());
 
     // Verify CRC
-    let mut digest = Digest::new();
-    digest.write(checksummed_data);
-    let computed_crc = digest.sum64();
+    let mut digest = Digest::new(CrcAlgorithm::Crc64Nvme);
+    digest.update(checksummed_data);
+    let computed_crc = digest.finalize();
 
     if computed_crc != stored_crc {
         return Err(io::Error::new(

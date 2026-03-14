@@ -1001,6 +1001,75 @@ impl GroupMdbxEnv {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(deleted)
     }
+
+    /// Read all entities that have data in a specific segment.
+    ///
+    /// Scans every key in `mq_segment_ranges` and checks dup values for the
+    /// given `segment_id`. Returns `(entity_type, entity_id, record_count,
+    /// total_bytes)` for each matching entity.
+    fn read_entities_for_segment(&self, segment_id: u64) -> io::Result<Vec<(u8, u64, u64, u64)>> {
+        let txn = self
+            .db
+            .begin_ro_txn()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let tbl = unsafe { self.segment_ranges_table_ro(&txn) };
+
+        let mut cursor = txn
+            .cursor(&tbl)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let target_val = segment_range_value(segment_id, 0, 0);
+        let mut results = Vec::new();
+
+        // Collect distinct keys
+        let mut keys: Vec<[u8; 9]> = Vec::new();
+        {
+            let iter = cursor.iter::<std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>>();
+            let mut last_key = [0u8; 9];
+            for item in iter {
+                let (k, _) = match item {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                if k.len() == 9 {
+                    let mut key = [0u8; 9];
+                    key.copy_from_slice(&k);
+                    if key != last_key {
+                        keys.push(key);
+                        last_key = key;
+                    }
+                }
+            }
+        }
+
+        // Re-open cursor for lookup pass
+        drop(cursor);
+        let mut cursor = txn
+            .cursor(&tbl)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        for key in &keys {
+            let found: Option<std::borrow::Cow<[u8]>> =
+                match cursor.get_both_range(&key[..], &target_val) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+            if let Some(val) = found {
+                if val.len() == SEGMENT_RANGE_VALUE_SIZE {
+                    let (found_seg_id, record_count, total_bytes) =
+                        decode_segment_range_value(&val);
+                    if found_seg_id == segment_id {
+                        let entity_type = key[0];
+                        let entity_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                        results.push((entity_type, entity_id, record_count, total_bytes));
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 /// Key for segment_ranges multimap: `[entity_type:1][entity_id:8 BE]`.
@@ -1116,7 +1185,7 @@ impl MqManifestManager {
     }
 
     /// Fire-and-forget write of segment ranges when a segment is sealed.
-    pub(crate) fn sealed_segment_fire_and_forget(
+    pub fn sealed_segment_fire_and_forget(
         &self,
         group_id: u64,
         segment_id: u64,
@@ -1167,6 +1236,23 @@ impl MqManifestManager {
             None => return Ok(Vec::new()),
         };
         env.read_segment_ranges(entity_type, entity_id)
+    }
+
+    /// Read all entities that have data in a specific segment.
+    ///
+    /// Returns `(entity_type, entity_id, record_count, total_bytes)` for each
+    /// entity with data in the segment.
+    pub fn read_entities_for_segment(
+        &self,
+        group_id: u64,
+        segment_id: u64,
+    ) -> io::Result<Vec<(u8, u64, u64, u64)>> {
+        let envs = self.read_envs.read();
+        let env = match envs.get(&group_id) {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+        env.read_entities_for_segment(segment_id)
     }
 
     /// Read persisted raft state for a group.
