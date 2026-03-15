@@ -6,9 +6,12 @@
 //! raft log and is tested via the state machine integration tests.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use bytes::{BufMut, BytesMut};
 
 use bisque_mq::async_apply::{
-    ClientRegistry, HighWaterMark, PendingRequest, PendingRequests, ResponseEntry,
+    ClientRegistry, HighWaterMark, PendingRequest, PendingRequests, ResponseCallback, ResponseEntry,
 };
 use bisque_mq::types::MqResponse;
 
@@ -146,55 +149,68 @@ fn response_entry_large_log_index() {
 
 #[tokio::test]
 async fn client_registry_concurrent_register_unregister() {
-    let registry = Arc::new(ClientRegistry::new());
+    let registry = ClientRegistry::new(4, 256);
 
-    let mut handles = Vec::new();
-    for _ in 0..10 {
-        let reg = Arc::clone(&registry);
-        handles.push(tokio::spawn(async move {
-            let (id, mut rx) = reg.register();
-            reg.send(id, ResponseEntry::ok(id));
-            let entry = rx.recv().await.unwrap();
-            assert_eq!(entry.log_index(), id);
-            reg.unregister(id);
-            id
-        }));
-    }
+    let received_total = Arc::new(AtomicUsize::new(0));
+    let all_done = Arc::new(tokio::sync::Notify::new());
 
     let mut ids = Vec::new();
-    for h in handles {
-        ids.push(h.await.unwrap());
+    for _ in 0..10 {
+        let count = Arc::clone(&received_total);
+        let done = Arc::clone(&all_done);
+        let cb: ResponseCallback = Arc::new(move |_slab, _offset, _msg, is_done| {
+            if !is_done {
+                if count.fetch_add(1, Ordering::Relaxed) + 1 >= 10 {
+                    done.notify_one();
+                }
+            }
+        });
+        ids.push(registry.register(cb));
     }
 
     // All IDs should be unique.
-    ids.sort();
-    ids.dedup();
-    assert_eq!(ids.len(), 10);
+    let id_set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    assert_eq!(id_set.len(), 10);
 
-    // All clients should be unregistered.
-    assert_eq!(registry.client_count(), 0);
+    for &id in &ids {
+        let p = (id as usize) % registry.num_partitions();
+        let mut frame = BytesMut::with_capacity(24);
+        ResponseEntry::encode_frame_into(&mut frame, id, id as u64, &MqResponse::Ok);
+        registry.send_to_partition(p, frame.freeze());
+    }
+    all_done.notified().await;
+
+    for id in ids {
+        registry.unregister(id);
+    }
 }
 
 #[tokio::test]
 async fn client_registry_high_throughput() {
-    let registry = Arc::new(ClientRegistry::new());
-    let (id, mut rx) = registry.register();
+    let registry = ClientRegistry::new(4, 4096);
 
-    let sender_reg = Arc::clone(&registry);
-    let sender = tokio::spawn(async move {
-        for i in 0..1000u64 {
-            sender_reg.send(id, ResponseEntry::ok(i));
+    let received = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(tokio::sync::Notify::new());
+    let received_cb = Arc::clone(&received);
+    let done_cb = Arc::clone(&done);
+    let cb: ResponseCallback = Arc::new(move |_slab, _offset, _msg, is_done| {
+        if !is_done {
+            if received_cb.fetch_add(1, Ordering::Relaxed) + 1 >= 1000 {
+                done_cb.notify_one();
+            }
         }
     });
+    let id = registry.register(cb);
 
-    sender.await.unwrap();
-
-    let mut count = 0;
-    while let Ok(entry) = rx.try_recv() {
-        assert_eq!(entry.log_index(), count);
-        count += 1;
+    let p = (id as usize) % registry.num_partitions();
+    for i in 0..1000u64 {
+        let mut frame = BytesMut::with_capacity(24);
+        ResponseEntry::encode_frame_into(&mut frame, id, i, &MqResponse::Ok);
+        registry.send_to_partition(p, frame.freeze());
     }
-    assert_eq!(count, 1000);
+    done.notified().await;
+    assert_eq!(received.load(Ordering::Relaxed), 1000);
+    registry.unregister(id);
 }
 
 // =============================================================================

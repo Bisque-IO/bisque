@@ -29,10 +29,15 @@ serde_json = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [features]
+default = ["tls"]
 test-util = []
+tls = ["dep:tokio-rustls", "dep:rustls"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

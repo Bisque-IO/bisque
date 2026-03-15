@@ -108,7 +108,10 @@ async fn bench_async_apply(
     let prefetcher = log.prefetcher();
     let dir = tmp.path().join("engine");
     let engine = Arc::new(MqEngine::new(MqConfig::new(dir.to_str().unwrap())));
-    let config = ParallelApplyConfig { num_partitions };
+    let config = ParallelApplyConfig {
+        num_partitions,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,

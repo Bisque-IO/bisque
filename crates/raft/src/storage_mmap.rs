@@ -25,7 +25,7 @@ use crate::manifest_mdbx::{ManifestManager, SegmentLocation, SegmentMeta};
 use crate::record_format::{
     AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, HEADER_SIZE, LENGTH_SIZE, LogIndex,
     LogLocation, MAX_GROUPS, RecordType, RecordTypeFlags, align8, append_record_into,
-    validate_record, write_u24_le,
+    append_record_into_scattered, append_record_into_scattered_many, validate_record, write_u24_le,
 };
 use arc_swap::ArcSwap;
 use crossfire::{MAsyncTx, mpsc::Array};
@@ -3115,10 +3115,53 @@ where
                     }
                     content_size
                 }
-                openraft::EntryPayload::Normal(_) | openraft::EntryPayload::Membership(_) => {
-                    // Full entry encoding via the codec. This ensures multi-variant
-                    // command types (e.g. CreateTable, DropTable, AppendRecords) are
-                    // all stored correctly and can be decoded via Entry::decode.
+                openraft::EntryPayload::Normal(data) => {
+                    // BorrowPayload fast path: encode the 25-byte log-id + Normal tag
+                    // as a prefix, then scatter the raw command bytes as the suffix.
+                    // Eliminates the intermediate payload_buf copy for the hot path.
+                    //
+                    // Wire layout (matches Entry::encode):
+                    //   [term:8][node_id:8][index:8][Normal_tag:1][cmd.buf bytes...]
+                    let term = log_id.leader_id.term.to_le_bytes();
+                    let node = log_id.leader_id.node_id.to_le_bytes();
+                    let idx = log_id.index.to_le_bytes();
+                    let mut prefix = [0u8; 25];
+                    prefix[0..8].copy_from_slice(&term);
+                    prefix[8..16].copy_from_slice(&node);
+                    prefix[16..24].copy_from_slice(&idx);
+                    prefix[24] = 1u8; // EntryPayloadType::Normal
+                    let extra = data.extra_payload_segments();
+                    if extra.is_empty() {
+                        // Single-segment fast path (all commands except multi-partition batch).
+                        append_record_into_scattered(
+                            &mut self.encode_buf,
+                            RecordType::Entry,
+                            self.group_id,
+                            &prefix,
+                            data.payload_bytes(),
+                        )
+                    } else {
+                        // Vectored path: multi-partition TAG_FORWARDED_BATCH.
+                        // Build suffixes slice on the stack without a heap allocation
+                        // for the common ≤8-partition case.
+                        let first = data.payload_bytes();
+                        let mut suffixes: smallvec::SmallVec<[&[u8]; 8]> =
+                            smallvec::SmallVec::with_capacity(1 + extra.len());
+                        suffixes.push(first);
+                        for seg in extra {
+                            suffixes.push(seg.as_ref());
+                        }
+                        append_record_into_scattered_many(
+                            &mut self.encode_buf,
+                            RecordType::Entry,
+                            self.group_id,
+                            &prefix,
+                            &suffixes,
+                        )
+                    }
+                }
+                openraft::EntryPayload::Membership(_) => {
+                    // Membership changes are rare; use the full encode path.
                     self.payload_buf.clear();
                     entry
                         .encode_into(&mut self.payload_buf)
@@ -3372,20 +3415,20 @@ mod tests {
             &self,
             writer: &mut W,
         ) -> Result<(), crate::codec::CodecError> {
-            (self.0.len() as u32).encode(writer)?;
+            // Raw bytes — no length prefix. Matches BorrowPayload::payload_bytes()
+            // so the BorrowPayload fast path in append_entries produces identical bytes.
             writer.write_all(&self.0)?;
             Ok(())
         }
         fn encoded_size(&self) -> usize {
-            4 + self.0.len()
+            self.0.len()
         }
     }
 
     impl Decode for TestData {
         fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, crate::codec::CodecError> {
-            let len = u32::decode(reader)? as usize;
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf)?;
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf)?;
             Ok(Self(buf))
         }
     }
@@ -6188,9 +6231,9 @@ mod tests {
                 file.seek(std::io::SeekFrom::Start(0)).unwrap();
                 file.read_exact(&mut data).unwrap();
 
-                // Find start of second record
+                // Find start of second record (records are 8-byte aligned).
                 let rlen1 = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                let second_start = 4 + rlen1;
+                let second_start = align8(4 + rlen1);
 
                 // Overwrite length field of second record with 0xFFFFFFFF
                 file.seek(std::io::SeekFrom::Start(second_start as u64))
@@ -6264,9 +6307,9 @@ mod tests {
                 file.seek(std::io::SeekFrom::Start(0)).unwrap();
                 file.read_exact(&mut data).unwrap();
 
-                // Find start of second record, corrupt its type byte
+                // Find start of second record (records are 8-byte aligned), corrupt its type byte.
                 let rlen1 = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                let second_start = 4 + rlen1;
+                let second_start = align8(4 + rlen1);
                 // Type byte is at second_start + 4 (after length field)
                 file.seek(std::io::SeekFrom::Start((second_start + 4) as u64))
                     .unwrap();

@@ -7,6 +7,18 @@ pub struct ParallelApplyConfig {
     /// Number of partition workers. Always pre-allocated at startup.
     /// Fixed for the lifetime of the node — no rebalancing, fully deterministic.
     pub num_partitions: usize,
+    /// Capacity of each [`ClientPartition`]'s crossfire MPSC channel (in `Bytes` chunks).
+    /// Higher values allow more in-flight response chunks before backpressure kicks in.
+    pub response_partition_capacity: usize,
+    /// Flush the forwarded-response output buffer after this many sub-command entries
+    /// have been accumulated by a single [`PartitionWorker`]. Default: 64.
+    pub response_flush_entries: usize,
+    /// Flush the forwarded-response output buffer after this many bytes have been
+    /// accumulated by a single [`PartitionWorker`]. Default: 8192.
+    pub response_flush_bytes: usize,
+    /// Capacity of the per-follower [`FollowerResponder`] crossfire MPSC channel
+    /// (in `Bytes` chunks). Default: 256.
+    pub responder_channel_capacity: usize,
 }
 
 impl Default for ParallelApplyConfig {
@@ -15,6 +27,10 @@ impl Default for ParallelApplyConfig {
             num_partitions: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
+            response_partition_capacity: 4096,
+            response_flush_entries: 64,
+            response_flush_bytes: 8192,
+            responder_channel_capacity: 256,
         }
     }
 }

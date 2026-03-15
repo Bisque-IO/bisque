@@ -46,6 +46,7 @@ const TAG_RESP_SESSION_NOT_FOUND: u8 = 13;
 const TAG_RESP_MULTI_MESSAGES: u8 = 14;
 const TAG_RESP_TOPIC_ALIASES: u8 = 15;
 const TAG_RESP_WILLS_FIRED: u8 = 16;
+const TAG_RESP_COMMITTED: u8 = 17;
 
 // =============================================================================
 // Bytes encoding helpers
@@ -391,7 +392,8 @@ impl CommandBuilder {
         let total_size = self.buf.len();
         self.buf[0..4].copy_from_slice(&(total_size as u32).to_le_bytes());
         MqCommand {
-            buf: self.buf.into_vec(),
+            buf: Bytes::from(self.buf.into_vec()),
+            extra: SmallVec::new(),
         }
     }
 
@@ -1315,17 +1317,27 @@ impl Decode for MqCommand {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
-        Ok(MqCommand { buf })
+        Ok(MqCommand {
+            buf: Bytes::from(buf),
+            extra: SmallVec::new(),
+        })
     }
 
     fn decode_from_bytes(data: Bytes) -> Result<Self, CodecError> {
-        Ok(MqCommand { buf: data.to_vec() })
+        Ok(MqCommand {
+            buf: data,
+            extra: SmallVec::new(),
+        })
     }
 }
 
 impl BorrowPayload for MqCommand {
     fn payload_bytes(&self) -> &[u8] {
         &self.buf
+    }
+
+    fn extra_payload_segments(&self) -> &[bytes::Bytes] {
+        &self.extra
     }
 }
 
@@ -2183,6 +2195,53 @@ impl MqCommand {
             .set_u64(16, before_timestamp)
             .finish()
     }
+
+    // -- ForwardedBatch (55) --
+
+    /// Build a TAG_FORWARDED_BATCH command from pre-encoded sub-frames.
+    ///
+    /// `frames` must already be in wire format: concatenated
+    /// `[len:4][client_id:4][cmd_bytes]` sub-frames (no padding).
+    ///
+    /// Fixed region layout:
+    /// ```text
+    /// @8  node_id: u32
+    /// @12 count:   u32
+    /// @16 [sub-frames...]
+    /// ```
+    pub fn forwarded_batch(node_id: u32, count: u32, frames: &[u8]) -> Self {
+        let total = 16 + frames.len(); // header(8) + fixed(8) + frames
+        let mut buf = Vec::with_capacity(total);
+        // header placeholder (patched below)
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&node_id.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(frames);
+        // Patch size and fixed fields in header.
+        buf[0..4].copy_from_slice(&(total as u32).to_le_bytes());
+        buf[4..6].copy_from_slice(&16u16.to_le_bytes()); // fixed region = 16
+        buf[6] = Self::TAG_FORWARDED_BATCH;
+        buf[7] = 0; // flags
+        MqCommand {
+            buf: Bytes::from(buf),
+            extra: SmallVec::new(),
+        }
+    }
+
+    /// Write the TAG_FORWARDED_BATCH header into the first 16 bytes of `buf`.
+    ///
+    /// `buf` must have been pre-allocated with at least 16 bytes of zeroed
+    /// space at the front (via `buf.put_bytes(0, 16)`), followed by sub-frames.
+    /// Call this after all sub-frames have been written.
+    pub fn write_forwarded_batch_header(buf: &mut bytes::BytesMut, node_id: u32, count: u32) {
+        let total = buf.len() as u32;
+        buf[0..4].copy_from_slice(&total.to_le_bytes());
+        buf[4..6].copy_from_slice(&16u16.to_le_bytes()); // fixed region = 16
+        buf[6] = Self::TAG_FORWARDED_BATCH;
+        buf[7] = 0; // flags
+        buf[8..12].copy_from_slice(&node_id.to_le_bytes());
+        buf[12..16].copy_from_slice(&count.to_le_bytes());
+    }
 }
 
 // =============================================================================
@@ -2225,6 +2284,10 @@ impl MqCommand {
 
     pub fn as_batch(&self) -> CmdBatch<'_> {
         CmdBatch { buf: &self.buf }
+    }
+
+    pub fn as_forwarded_batch(&self) -> CmdForwardedBatch<'_> {
+        CmdForwardedBatch { buf: &self.buf }
     }
 
     pub fn as_create_consumer_group(&self) -> CmdCreateConsumerGroup<'_> {
@@ -3092,6 +3155,87 @@ impl<'a> Iterator for BatchIter<'a> {
 
 impl ExactSizeIterator for BatchIter<'_> {}
 
+// =============================================================================
+// CmdForwardedBatch / CmdForwardedBatchIter — TAG_FORWARDED_BATCH (55)
+// =============================================================================
+
+/// Zero-copy view over a TAG_FORWARDED_BATCH command.
+///
+/// Fixed region:
+/// ```text
+/// @8  node_id: u32  — originating follower node ID
+/// @12 count:   u32  — number of sub-frames
+/// @16 [sub-frames...]
+/// ```
+///
+/// Each sub-frame:
+/// ```text
+/// [len:4][client_id:4][cmd_bytes + pad8]
+/// ```
+/// `len` = `4 + cmd_bytes.len()` (includes client_id, excludes the len field itself).
+/// Total sub-frame size: `4 + align8(len)` bytes.
+pub struct CmdForwardedBatch<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> CmdForwardedBatch<'a> {
+    /// Originating follower node ID (`0` means local/leader).
+    #[inline]
+    pub fn node_id(&self) -> u32 {
+        u32::from_le_bytes(self.buf[8..12].try_into().unwrap())
+    }
+
+    /// Number of sub-frames in this batch.
+    #[inline]
+    pub fn count(&self) -> u32 {
+        u32::from_le_bytes(self.buf[12..16].try_into().unwrap())
+    }
+
+    /// Iterate over `(client_id, cmd_bytes)` sub-frames.
+    #[inline]
+    pub fn iter(&self) -> CmdForwardedBatchIter<'a> {
+        CmdForwardedBatchIter {
+            buf: self.buf,
+            pos: 16, // sub-frames start at offset 16
+        }
+    }
+}
+
+/// Zero-copy iterator over sub-frames in a [`CmdForwardedBatch`].
+///
+/// Each call to [`next`](Iterator::next) parses one sub-frame header and returns
+/// `(client_id: u32, cmd_bytes: &[u8])` with no allocation.
+pub struct CmdForwardedBatchIter<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for CmdForwardedBatchIter<'a> {
+    type Item = (u32, &'a [u8]);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos + 4 > self.buf.len() {
+            return None;
+        }
+        // len = client_id (4) + cmd_bytes — excludes the 4-byte len field itself.
+        let len = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+        if len < 4 || self.pos + 4 + len > self.buf.len() {
+            return None;
+        }
+        let client_id =
+            u32::from_le_bytes(self.buf[self.pos + 4..self.pos + 8].try_into().unwrap());
+        let cmd_bytes = &self.buf[self.pos + 8..self.pos + 4 + len];
+        self.pos += 4 + len;
+        Some((client_id, cmd_bytes))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None) // count not tracked here; use CmdForwardedBatch::count()
+    }
+}
+
 /// Zero-copy iterator over vec_bytes descriptor table.
 /// Uses O(1) random access per element via [size:4][offset:4] descriptors.
 pub struct VecBytesIter<'a> {
@@ -3718,6 +3862,10 @@ impl Encode for MqResponse {
                 TAG_RESP_WILLS_FIRED.encode(w)?;
                 count.encode(w)
             }
+            MqResponse::Committed { log_index } => {
+                TAG_RESP_COMMITTED.encode(w)?;
+                log_index.encode(w)
+            }
         }
     }
 
@@ -3778,6 +3926,7 @@ impl Encode for MqResponse {
                     .sum::<usize>()
             }
             MqResponse::WillsFired { .. } => 4,
+            MqResponse::Committed { .. } => 8,
         }
     }
 }
@@ -3897,6 +4046,9 @@ impl Decode for MqResponse {
             }
             TAG_RESP_WILLS_FIRED => Ok(MqResponse::WillsFired {
                 count: u32::decode(r)?,
+            }),
+            TAG_RESP_COMMITTED => Ok(MqResponse::Committed {
+                log_index: u64::decode(r)?,
             }),
             t => Err(CodecError::InvalidDiscriminant(t)),
         }

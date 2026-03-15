@@ -202,6 +202,14 @@ impl MqStateMachine {
         current_time: u64,
         responder: Option<openraft::storage::ApplyResponder<MqTypeConfig>>,
     ) {
+        if cmd.tag() == MqCommand::TAG_FORWARDED_BATCH {
+            self.apply_forwarded_batch_inline(cmd, log_index, current_time);
+            if let Some(r) = responder {
+                r.send(MqResponse::Ok);
+            }
+            return;
+        }
+
         let loc = self.prefetcher.as_ref().and_then(|p| {
             let l = p.log_location(log_index)?;
             Some((l.segment_id as u32, l.offset as u32))
@@ -236,6 +244,19 @@ impl MqStateMachine {
 
         if let Some(r) = responder {
             r.send(response);
+        }
+    }
+
+    /// Apply each sub-command in a TAG_FORWARDED_BATCH.
+    ///
+    /// Response routing is handled asynchronously by [`PartitionWorker`]s after
+    /// reading the committed entry from the mmap log — not here.
+    fn apply_forwarded_batch_inline(&self, cmd: &MqCommand, log_index: u64, current_time: u64) {
+        let view = cmd.as_forwarded_batch();
+        for (_, sub_cmd_bytes) in view.iter() {
+            let sub_cmd = MqCommand::from_bytes(cmd.buf.slice_ref(sub_cmd_bytes));
+            self.engine
+                .apply_command(&sub_cmd, log_index, current_time, None);
         }
     }
 
@@ -436,7 +457,9 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                     EntryPayload::Normal(cmd) => {
                         let log_index = entry.log_id.index;
 
-                        if cmd.tag() == MqCommand::TAG_BATCH {
+                        if cmd.tag() == MqCommand::TAG_BATCH
+                            || cmd.tag() == MqCommand::TAG_FORWARDED_BATCH
+                        {
                             // Barrier: wait for workers to process all entries
                             // before this batch so ordering is preserved.
                             let async_apply = self.async_apply.as_ref().unwrap();
@@ -447,10 +470,10 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                             // Process batch synchronously.
                             self.apply_batch_inline(&cmd, log_index, current_time, responder);
                         } else {
-                            // Stash responder for worker to pick up after applying.
+                            // Complete raft responder immediately with log index.
+                            // Actual result delivered via client channel.
                             if let Some(r) = responder {
-                                let async_apply = self.async_apply.as_ref().unwrap();
-                                async_apply.responder_table.insert(log_index, r);
+                                r.send(MqResponse::Committed { log_index });
                             }
                         }
                     }
@@ -963,6 +986,9 @@ fn classify_structural_buf(buf: &[u8]) -> StructuralKind {
                 StructuralKind::Batch(kinds)
             }
         }
+        // ForwardedBatch sub-commands are applied by the engine one at a time;
+        // structural writes from individual sub-commands are handled inline.
+        MqCommand::TAG_FORWARDED_BATCH => StructuralKind::None,
         _ => StructuralKind::None,
     }
 }

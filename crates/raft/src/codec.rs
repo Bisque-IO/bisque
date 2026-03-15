@@ -13,6 +13,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor, Read, Write};
 
+use bytes::Bytes;
+
 use openraft::RaftTypeConfig;
 
 /// Error type for codec operations
@@ -337,10 +339,24 @@ impl<A: Decode, B: Decode> Decode for (A, B) {
 /// Trait for borrowing the raw payload bytes without allocation.
 /// Implementors can provide zero-copy encoding of application data for the
 /// storage fast path, avoiding full Encode overhead.
+///
+/// For vectored payloads (e.g. multi-partition TAG_FORWARDED_BATCH), the
+/// payload consists of `payload_bytes()` followed by each slice returned by
+/// `extra_payload_segments()`. The raft log encoder writes all segments in
+/// order with a single CRC pass via `append_record_into_scattered_many`.
 pub trait BorrowPayload {
     fn payload_bytes(&self) -> &[u8];
     fn payload_len(&self) -> usize {
         self.payload_bytes().len()
+            + self
+                .extra_payload_segments()
+                .iter()
+                .map(|s| s.len())
+                .sum::<usize>()
+    }
+    /// Extra payload segments beyond `payload_bytes()`. Default: empty.
+    fn extra_payload_segments(&self) -> &[bytes::Bytes] {
+        &[]
     }
 }
 

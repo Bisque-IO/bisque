@@ -90,15 +90,19 @@ async fn async_apply_workers_process_entries_from_raft_log() {
     let prefetcher = log.prefetcher();
     let engine = Arc::new(MqEngine::new(MqConfig::new("/tmp/mq-async-raft-test")));
 
-    let config = ParallelApplyConfig { num_partitions: 2 };
+    let config = ParallelApplyConfig {
+        num_partitions: 2,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
         None, // no manifest in test
+        None,
         0,
-        0, // initial cursor
+        0,
         "test",
     );
 
@@ -164,12 +168,16 @@ async fn async_apply_multiple_topics_and_publishes() {
     let prefetcher = log.prefetcher();
     let engine = Arc::new(MqEngine::new(MqConfig::new("/tmp/mq-async-raft-multi")));
 
-    let config = ParallelApplyConfig { num_partitions: 4 };
+    let config = ParallelApplyConfig {
+        num_partitions: 4,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
+        None,
         None,
         0,
         0,
@@ -235,10 +243,21 @@ async fn async_apply_skips_blank_entries() {
     let prefetcher = log.prefetcher();
     let engine = Arc::new(MqEngine::new(MqConfig::new("/tmp/mq-async-blank")));
 
-    let config = ParallelApplyConfig { num_partitions: 2 };
+    let config = ParallelApplyConfig {
+        num_partitions: 2,
+        ..Default::default()
+    };
 
-    let mut manager =
-        AsyncApplyManager::new(&config, Arc::clone(&engine), prefetcher, None, 0, 0, "test");
+    let mut manager = AsyncApplyManager::new(
+        &config,
+        Arc::clone(&engine),
+        prefetcher,
+        None,
+        None,
+        0,
+        0,
+        "test",
+    );
 
     manager.advance_and_wait(3).await;
 
@@ -276,12 +295,16 @@ async fn async_apply_batch_entries_skipped_by_workers() {
     let prefetcher = log.prefetcher();
     let engine = Arc::new(MqEngine::new(MqConfig::new("/tmp/mq-async-batch")));
 
-    let config = ParallelApplyConfig { num_partitions: 2 };
+    let config = ParallelApplyConfig {
+        num_partitions: 2,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
+        None,
         None,
         0,
         0,
@@ -352,10 +375,21 @@ async fn async_apply_cursor_tracks_worker_progress() {
     let prefetcher = log.prefetcher();
     let engine = Arc::new(MqEngine::new(MqConfig::new("/tmp/mq-async-cursor")));
 
-    let config = ParallelApplyConfig { num_partitions: 4 };
+    let config = ParallelApplyConfig {
+        num_partitions: 4,
+        ..Default::default()
+    };
 
-    let mut manager =
-        AsyncApplyManager::new(&config, Arc::clone(&engine), prefetcher, None, 0, 0, "test");
+    let mut manager = AsyncApplyManager::new(
+        &config,
+        Arc::clone(&engine),
+        prefetcher,
+        None,
+        None,
+        0,
+        0,
+        "test",
+    );
 
     // Advance to 5 first.
     manager.advance_and_wait(5).await;
@@ -401,12 +435,16 @@ async fn async_apply_high_throughput() {
     let prefetcher = log.prefetcher();
     let engine = Arc::new(MqEngine::new(MqConfig::new("/tmp/mq-async-throughput")));
 
-    let config = ParallelApplyConfig { num_partitions: 4 };
+    let config = ParallelApplyConfig {
+        num_partitions: 4,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
+        None,
         None,
         0,
         0,
@@ -463,12 +501,16 @@ async fn async_apply_segment_index_tracking() {
     let prefetcher = log.prefetcher();
     let engine = Arc::new(MqEngine::new(MqConfig::new("/tmp/mq-async-segidx")));
 
-    let config = ParallelApplyConfig { num_partitions: 2 };
+    let config = ParallelApplyConfig {
+        num_partitions: 2,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
+        None,
         None,
         0,
         0,
@@ -515,10 +557,21 @@ async fn async_apply_shutdown_sentinel() {
     let prefetcher = log.prefetcher();
     let engine = Arc::new(MqEngine::new(MqConfig::new("/tmp/mq-async-shutdown")));
 
-    let config = ParallelApplyConfig { num_partitions: 4 };
+    let config = ParallelApplyConfig {
+        num_partitions: 4,
+        ..Default::default()
+    };
 
-    let mut manager =
-        AsyncApplyManager::new(&config, Arc::clone(&engine), prefetcher, None, 0, 0, "test");
+    let mut manager = AsyncApplyManager::new(
+        &config,
+        Arc::clone(&engine),
+        prefetcher,
+        None,
+        None,
+        0,
+        0,
+        "test",
+    );
 
     // Shutdown without processing any entries — workers should exit cleanly.
     manager.shutdown().await;
@@ -552,10 +605,21 @@ async fn async_apply_purge_floor_accounts_for_workers() {
     let prefetcher = log.prefetcher();
     let engine = Arc::new(MqEngine::new(MqConfig::new("/tmp/mq-async-purge")));
 
-    let config = ParallelApplyConfig { num_partitions: 2 };
+    let config = ParallelApplyConfig {
+        num_partitions: 2,
+        ..Default::default()
+    };
 
-    let mut manager =
-        AsyncApplyManager::new(&config, Arc::clone(&engine), prefetcher, None, 0, 0, "test");
+    let mut manager = AsyncApplyManager::new(
+        &config,
+        Arc::clone(&engine),
+        prefetcher,
+        None,
+        None,
+        0,
+        0,
+        "test",
+    );
 
     // Advance only to 3.
     manager.advance_and_wait(3).await;
@@ -611,12 +675,16 @@ async fn async_apply_benchmark_flow_8_topics_4_partitions() {
         bisque_mq::config::MqConfig::new(dir.to_str().unwrap()),
     ));
 
-    let config = ParallelApplyConfig { num_partitions };
+    let config = ParallelApplyConfig {
+        num_partitions,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
+        None,
         None,
         0,
         0,
@@ -716,12 +784,16 @@ async fn async_apply_three_phase_persistent_scanner() {
         bisque_mq::config::MqConfig::new(dir.to_str().unwrap()),
     ));
 
-    let config = ParallelApplyConfig { num_partitions };
+    let config = ParallelApplyConfig {
+        num_partitions,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
+        None,
         None,
         0,
         0,
@@ -825,12 +897,16 @@ async fn async_apply_stress_16_partitions_16_topics() {
         bisque_mq::config::MqConfig::new(dir.to_str().unwrap()),
     ));
 
-    let config = ParallelApplyConfig { num_partitions };
+    let config = ParallelApplyConfig {
+        num_partitions,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
+        None,
         None,
         0,
         0,
@@ -927,12 +1003,16 @@ async fn async_apply_benchmark_exact_mirror() {
         bisque_mq::config::MqConfig::new(dir.to_str().unwrap()),
     ));
 
-    let config = ParallelApplyConfig { num_partitions };
+    let config = ParallelApplyConfig {
+        num_partitions,
+        ..Default::default()
+    };
 
     let mut manager = AsyncApplyManager::new(
         &config,
         Arc::clone(&engine),
         prefetcher.clone(),
+        None,
         None,
         0,
         0,

@@ -164,12 +164,18 @@ fn deliver_messages(
 // Opt 1: Event-Driven Delivery Wiring (GroupNotifier)
 // =============================================================================
 
-#[test]
-fn test_opt1_notifier_triggered_on_enqueue() {
+#[tokio::test]
+async fn test_opt1_notifier_triggered_on_enqueue() {
     let mut engine = make_engine();
     let queue_id = create_queue(&mut engine, "notify-q", 1, 1000);
 
-    let mut rx = engine.metadata().group_notifier.watch(queue_id);
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine.metadata().group_notifier.watch(queue_id, &notify);
+
+    // Spawn a waiter before triggering so notify_waiters() finds it.
+    let n = notify.clone();
+    let waiter = tokio::spawn(async move { n.notified().await });
+    tokio::task::yield_now().await;
 
     let msg = make_flat_msg(b"hello");
     engine.apply_command(
@@ -179,18 +185,17 @@ fn test_opt1_notifier_triggered_on_enqueue() {
         None,
     );
 
-    assert!(
-        rx.try_recv().is_ok(),
-        "should receive notification after enqueue"
-    );
+    tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+        .await
+        .expect("should receive notification after enqueue")
+        .unwrap();
 }
 
-#[test]
-fn test_opt1_notifier_triggered_on_exchange_publish() {
+#[tokio::test]
+async fn test_opt1_notifier_triggered_on_exchange_publish() {
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/ex", 1, 1000);
     let queue_id = create_queue(&mut engine, "sub-q", 2, 1001);
-    // Bind exchange to the queue's source topic so exchange publish routes there
     create_binding(
         &mut engine,
         exchange_id,
@@ -200,7 +205,12 @@ fn test_opt1_notifier_triggered_on_exchange_publish() {
         1002,
     );
 
-    let mut rx = engine.metadata().group_notifier.watch(queue_id);
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine.metadata().group_notifier.watch(queue_id, &notify);
+
+    let n = notify.clone();
+    let waiter = tokio::spawn(async move { n.notified().await });
+    tokio::task::yield_now().await;
 
     let msg = make_flat_msg_with_routing_key(b"temp=22", "sensors/temp");
     engine.apply_command(
@@ -210,14 +220,14 @@ fn test_opt1_notifier_triggered_on_exchange_publish() {
         None,
     );
 
-    assert!(
-        rx.try_recv().is_ok(),
-        "should receive notification after exchange publish"
-    );
+    tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+        .await
+        .expect("should receive notification after exchange publish")
+        .unwrap();
 }
 
-#[test]
-fn test_opt1_notifier_triggered_on_nack() {
+#[tokio::test]
+async fn test_opt1_notifier_triggered_on_nack() {
     let mut engine = make_engine();
     let queue_id = create_queue(&mut engine, "nack-q", 1, 1000);
     create_session(&mut engine, 100, "consumer-1", 2, 1001);
@@ -226,24 +236,37 @@ fn test_opt1_notifier_triggered_on_nack() {
     let msgs = deliver_messages(&mut engine, queue_id, 100, 1, 4, 1003);
     assert_eq!(msgs.len(), 1);
 
-    let mut rx = engine.metadata().group_notifier.watch(queue_id);
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine.metadata().group_notifier.watch(queue_id, &notify);
+
+    let n = notify.clone();
+    let waiter = tokio::spawn(async move { n.notified().await });
+    tokio::task::yield_now().await;
 
     let msg_ids: Vec<u64> = msgs.iter().map(|m| m.message_id).collect();
     engine.apply_command(&MqCommand::group_nack(queue_id, &msg_ids), 5, 1004, None);
 
-    assert!(
-        rx.try_recv().is_ok(),
-        "should receive notification after nack"
-    );
+    tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+        .await
+        .expect("should receive notification after nack")
+        .unwrap();
 }
 
-#[test]
-fn test_opt1_notifier_multiple_watchers() {
+#[tokio::test]
+async fn test_opt1_notifier_multiple_watchers() {
     let mut engine = make_engine();
     let queue_id = create_queue(&mut engine, "multi-watch-q", 1, 1000);
 
-    let mut rx1 = engine.metadata().group_notifier.watch(queue_id);
-    let mut rx2 = engine.metadata().group_notifier.watch(queue_id);
+    let n1 = std::sync::Arc::new(tokio::sync::Notify::new());
+    let n2 = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine.metadata().group_notifier.watch(queue_id, &n1);
+    engine.metadata().group_notifier.watch(queue_id, &n2);
+
+    let n1c = n1.clone();
+    let n2c = n2.clone();
+    let w1 = tokio::spawn(async move { n1c.notified().await });
+    let w2 = tokio::spawn(async move { n2c.notified().await });
+    tokio::task::yield_now().await;
 
     let msg = make_flat_msg(b"hello");
     engine.apply_command(
@@ -253,24 +276,32 @@ fn test_opt1_notifier_multiple_watchers() {
         None,
     );
 
-    assert!(
-        rx1.try_recv().is_ok(),
-        "watcher 1 should receive notification"
-    );
-    assert!(
-        rx2.try_recv().is_ok(),
-        "watcher 2 should receive notification"
-    );
+    tokio::time::timeout(std::time::Duration::from_millis(100), w1)
+        .await
+        .expect("watcher 1 should receive notification")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(100), w2)
+        .await
+        .expect("watcher 2 should receive notification")
+        .unwrap();
 }
 
-#[test]
-fn test_opt1_notifier_no_spurious_for_other_queues() {
+#[tokio::test]
+async fn test_opt1_notifier_no_spurious_for_other_queues() {
     let mut engine = make_engine();
     let q1 = create_queue(&mut engine, "q1", 1, 1000);
     let q2 = create_queue(&mut engine, "q2", 2, 1001);
 
-    let mut rx1 = engine.metadata().group_notifier.watch(q1);
-    let mut rx2 = engine.metadata().group_notifier.watch(q2);
+    let n1 = std::sync::Arc::new(tokio::sync::Notify::new());
+    let n2 = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine.metadata().group_notifier.watch(q1, &n1);
+    engine.metadata().group_notifier.watch(q2, &n2);
+
+    let n1c = n1.clone();
+    let n2c = n2.clone();
+    let w1 = tokio::spawn(async move { n1c.notified().await });
+    let w2 = tokio::spawn(async move { n2c.notified().await });
+    tokio::task::yield_now().await;
 
     let msg = make_flat_msg(b"only-q1");
     engine.apply_command(
@@ -280,9 +311,15 @@ fn test_opt1_notifier_no_spurious_for_other_queues() {
         None,
     );
 
-    assert!(rx1.try_recv().is_ok(), "q1 watcher should get notification");
+    tokio::time::timeout(std::time::Duration::from_millis(100), w1)
+        .await
+        .expect("q1 watcher should get notification")
+        .unwrap();
+    // q2 should NOT be notified — expect timeout.
     assert!(
-        rx2.try_recv().is_err(),
+        tokio::time::timeout(std::time::Duration::from_millis(50), w2)
+            .await
+            .is_err(),
         "q2 watcher should NOT get notification"
     );
 }

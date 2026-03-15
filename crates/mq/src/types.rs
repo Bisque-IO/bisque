@@ -479,15 +479,25 @@ pub enum EntityStats {
 
 /// Command type for the MQ engine.
 ///
-/// Wraps a flat-encoded binary buffer (`Vec<u8>`). On the write path, constructor
+/// Wraps a flat-encoded binary buffer (`Bytes`). On the write path, constructor
 /// methods encode fields into the buffer. On the read path (state machine apply),
-/// the buffer is decoded from the raft log.
+/// the buffer is decoded from the raft log zero-copy.
 ///
 /// Per-variant accessor structs (in `codec`) provide typed APIs
 /// over the raw buffer.
+///
+/// For multi-partition `TAG_FORWARDED_BATCH` commands, the payload may be
+/// split across multiple `Bytes` segments (`buf` + `extra`) to avoid a
+/// concatenation copy. The raft encoder writes all segments via
+/// `append_record_into_scattered_many` with a single CRC pass. Once decoded
+/// from the raft log, the command is always a single contiguous `Bytes`.
 #[derive(Clone)]
 pub struct MqCommand {
-    pub(crate) buf: Vec<u8>,
+    pub(crate) buf: Bytes,
+    /// Extra payload segments for vectored TAG_FORWARDED_BATCH (multi-partition batcher).
+    /// Empty for all other commands and for single-partition batches.
+    /// Inline capacity 1 covers the 2-partition case without a heap allocation.
+    pub(crate) extra: SmallVec<[Bytes; 1]>,
 }
 
 // Tag constants for MqCommand discriminants — unified allocation.
@@ -568,6 +578,22 @@ impl MqCommand {
     // -- MQTT slice variants --
     pub const TAG_PUBLISH_TO_EXCHANGE_MQTT: u8 = 53;
     pub const TAG_SET_RETAINED_MQTT: u8 = 54;
+
+    // -- Forwarded batch (55) --
+    /// A batch of commands forwarded from a follower node to the leader.
+    ///
+    /// Wire format (all 8-byte aligned):
+    /// ```text
+    /// @0  [size:4][fixed:2][tag:1][flags:1]   MqCommand header
+    /// @8  node_id: u32                        originating follower node
+    /// @12 count:   u32                        number of sub-frames
+    /// @16 Frame 0: [len:4][client_id:4][cmd_bytes + pad8]
+    /// @.. Frame 1: [len:4][client_id:4][cmd_bytes + pad8]
+    /// ```
+    ///
+    /// Sub-frame `len` = `4 + cmd_bytes.len()` (client_id + cmd, excludes len field).
+    /// Each sub-frame is padded to 8-byte alignment.
+    pub const TAG_FORWARDED_BATCH: u8 = 55;
 }
 
 /// Command header offsets.
@@ -811,16 +837,22 @@ impl MqCommand {
         &self.buf
     }
 
-    /// Wrap raw bytes as an MqCommand.
+    /// Wrap raw bytes as an MqCommand (zero-copy).
     #[inline]
     pub fn from_bytes(buf: Bytes) -> Self {
-        Self { buf: buf.to_vec() }
+        Self {
+            buf,
+            extra: SmallVec::new(),
+        }
     }
 
     /// Wrap a Vec<u8> as an MqCommand.
     #[inline]
     pub fn from_vec(buf: Vec<u8>) -> Self {
-        Self { buf }
+        Self {
+            buf: Bytes::from(buf),
+            extra: SmallVec::new(),
+        }
     }
 
     /// Total encoded size.
@@ -859,7 +891,10 @@ impl Serialize for MqCommand {
 impl<'de> Deserialize<'de> for MqCommand {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes = <Vec<u8>>::deserialize(deserializer)?;
-        Ok(Self { buf: bytes })
+        Ok(Self {
+            buf: Bytes::from(bytes),
+            extra: SmallVec::new(),
+        })
     }
 }
 
@@ -1017,6 +1052,10 @@ pub enum MqResponse {
     WillsFired {
         count: u32,
     },
+    /// Raft entry committed — actual result delivered via client channel.
+    Committed {
+        log_index: u64,
+    },
 }
 
 impl fmt::Display for MqResponse {
@@ -1076,6 +1115,7 @@ impl fmt::Display for MqResponse {
                 write!(f, "TopicAliases(count={})", aliases.len())
             }
             Self::WillsFired { count } => write!(f, "WillsFired(count={count})"),
+            Self::Committed { log_index } => write!(f, "Committed(log_index={log_index})"),
         }
     }
 }

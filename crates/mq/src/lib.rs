@@ -6,6 +6,7 @@ pub mod cursor;
 pub mod engine;
 pub mod exchange;
 pub mod flat;
+pub mod forward;
 pub mod manifest;
 pub mod metadata;
 pub mod notifier;
@@ -21,7 +22,7 @@ pub mod write_batcher;
 
 pub use async_apply::{
     AsyncApplyManager, ClientRegistry, HighWaterMark, PendingRequest, PendingRequests,
-    ResponseEntry,
+    ResponseCallback, ResponseEntry, SharedResponderTxs,
 };
 pub use codec::MqCommandBuffer;
 pub use config::MqConfig;
@@ -30,12 +31,18 @@ pub use cursor::{
     read_latest_topic_message, read_message_at, read_messages_at_into,
 };
 pub use engine::MqEngine;
+pub use forward::{
+    ForwardAcceptor, ForwardClient, ForwardConfig, ForwardHandle, ForwardedBatch,
+    ForwardedBatchIter,
+};
 pub use manifest::MqManifestManager;
 pub use metadata::{MqMetadata, TopicMeta};
 pub use raft::MqRaftNode;
 pub use state_machine::MqStateMachine;
 pub use types::{MqCommand, MqResponse};
-pub use write_batcher::{MqBatcherError, MqWriteBatcher, MqWriteBatcherConfig};
+pub use write_batcher::{
+    LocalBatcher, MqBatcherError, MqWriteBatcher, MqWriteBatcherConfig, SubmitWriter,
+};
 
 /// Raft type configuration for bisque-mq.
 pub type MqTypeConfig = bisque_raft::BisqueRaftTypeConfig<MqCommand, MqResponse>;

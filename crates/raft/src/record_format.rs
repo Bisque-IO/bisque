@@ -219,6 +219,96 @@ pub fn append_record_into(
     content_size
 }
 
+/// Appends a log record to `buf` where the payload is split into two contiguous slices
+/// (`prefix` + `suffix`). Avoids an intermediate buffer when the caller already holds
+/// the payload in two separate regions (e.g. a fixed log-id header + a large data blob).
+///
+/// Identical layout and CRC coverage to [`append_record_into`].
+pub fn append_record_into_scattered(
+    buf: &mut Vec<u8>,
+    record_type: RecordType,
+    group_id: u64,
+    prefix: &[u8],
+    suffix: &[u8],
+) -> usize {
+    let payload_len = prefix.len() + suffix.len();
+    let record_len = 1 + GROUP_ID_SIZE + payload_len + CRC64_SIZE;
+    let content_size = LENGTH_SIZE + record_len;
+    let aligned_size = align8(content_size);
+    let padding = aligned_size - content_size;
+
+    buf.reserve(aligned_size);
+
+    let mut header: [u8; HEADER_SIZE] = [0u8; HEADER_SIZE];
+    header[0..4].copy_from_slice(&(record_len as u32).to_le_bytes());
+    header[4] = record_type as u8;
+    write_u24_le(&mut header, 5, group_id);
+
+    let mut digest = Digest::new(CrcAlgorithm::Crc64Nvme);
+    digest.update(&header[LENGTH_SIZE..]);
+    digest.update(prefix);
+    digest.update(suffix);
+    let crc = digest.finalize();
+
+    buf.extend_from_slice(&header);
+    buf.extend_from_slice(prefix);
+    buf.extend_from_slice(suffix);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    if padding > 0 {
+        buf.extend_from_slice(&ZERO_PAD[..padding]);
+    }
+
+    content_size
+}
+
+/// Appends a log record to `buf` where the payload is split into a `prefix` and zero or more
+/// `suffixes`. Computes a single CRC64 pass over all segments in order — avoids an intermediate
+/// buffer when the payload is scattered across multiple regions (e.g. a fixed log-id header
+/// prefix + two or more data segments from different source buffers).
+///
+/// Identical layout and CRC coverage to [`append_record_into`].
+pub fn append_record_into_scattered_many(
+    buf: &mut Vec<u8>,
+    record_type: RecordType,
+    group_id: u64,
+    prefix: &[u8],
+    suffixes: &[&[u8]],
+) -> usize {
+    let suffix_total: usize = suffixes.iter().map(|s| s.len()).sum();
+    let payload_len = prefix.len() + suffix_total;
+    let record_len = 1 + GROUP_ID_SIZE + payload_len + CRC64_SIZE;
+    let content_size = LENGTH_SIZE + record_len;
+    let aligned_size = align8(content_size);
+    let padding = aligned_size - content_size;
+
+    buf.reserve(aligned_size);
+
+    let mut header: [u8; HEADER_SIZE] = [0u8; HEADER_SIZE];
+    header[0..4].copy_from_slice(&(record_len as u32).to_le_bytes());
+    header[4] = record_type as u8;
+    write_u24_le(&mut header, 5, group_id);
+
+    let mut digest = Digest::new(CrcAlgorithm::Crc64Nvme);
+    digest.update(&header[LENGTH_SIZE..]);
+    digest.update(prefix);
+    for s in suffixes {
+        digest.update(s);
+    }
+    let crc = digest.finalize();
+
+    buf.extend_from_slice(&header);
+    buf.extend_from_slice(prefix);
+    for s in suffixes {
+        buf.extend_from_slice(s);
+    }
+    buf.extend_from_slice(&crc.to_le_bytes());
+    if padding > 0 {
+        buf.extend_from_slice(&ZERO_PAD[..padding]);
+    }
+
+    content_size
+}
+
 /// A parsed record from the log
 #[derive(Debug)]
 pub struct ParsedRecord<'a> {

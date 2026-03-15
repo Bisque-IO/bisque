@@ -8,12 +8,13 @@
 //! Batch entries (`TAG_BATCH`) are processed synchronously in `apply()`
 //! with a barrier to preserve ordering. Workers skip them when scanning.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex as ParkingMutex;
-use tokio::sync::mpsc;
 use tracing::debug;
 
 use bisque_raft::SegmentPrefetcher;
@@ -81,59 +82,6 @@ impl HighWaterMark {
     #[inline]
     pub fn current(&self) -> u64 {
         self.value.load(Ordering::Acquire)
-    }
-}
-
-// =============================================================================
-// Responder Table
-// =============================================================================
-
-/// Maps log_index → stashed ApplyResponder for leader entries.
-///
-/// During `apply()`, the state machine stashes responders for non-batch
-/// Normal entries. Workers take responders after applying to send the
-/// response back through the Raft machinery (completing `client_write()`).
-///
-/// `ApplyResponder` is not `Clone`, so we wrap it in `Arc<parking_lot::Mutex<Option<...>>>`
-/// to satisfy papaya's `Clone` requirement while allowing single-consumer take semantics.
-pub(crate) struct ResponderTable {
-    entries: papaya::HashMap<
-        u64,
-        Arc<parking_lot::Mutex<Option<openraft::storage::ApplyResponder<crate::MqTypeConfig>>>>,
-    >,
-}
-
-impl ResponderTable {
-    pub fn new() -> Self {
-        Self {
-            entries: papaya::HashMap::new(),
-        }
-    }
-
-    pub fn insert(
-        &self,
-        log_index: u64,
-        responder: openraft::storage::ApplyResponder<crate::MqTypeConfig>,
-    ) {
-        self.entries.pin().insert(
-            log_index,
-            Arc::new(parking_lot::Mutex::new(Some(responder))),
-        );
-    }
-
-    pub fn take(
-        &self,
-        log_index: u64,
-    ) -> Option<openraft::storage::ApplyResponder<crate::MqTypeConfig>> {
-        let guard = self.entries.pin();
-        let slot = guard.get(&log_index)?.clone();
-        guard.remove(&log_index);
-        slot.lock().take()
-    }
-
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.entries.pin().len()
     }
 }
 
@@ -246,55 +194,337 @@ impl ResponseEntry {
     pub fn log_index(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
+
+    /// Write a complete dispatch frame into `buf` without a separate allocation.
+    ///
+    /// Frame layout: `[len:4 LE][client_id:4 LE][ResponseEntry bytes...]`
+    /// where `len` = `4 (client_id field) + ResponseEntry byte count`.
+    pub fn encode_frame_into(
+        buf: &mut BytesMut,
+        client_id: u32,
+        log_index: u64,
+        response: &MqResponse,
+    ) {
+        let len_pos = buf.len();
+        buf.put_u32_le(0); // placeholder — filled after encoding the entry
+        buf.put_u32_le(client_id);
+        let entry_start = buf.len();
+        match response {
+            MqResponse::Ok => {
+                buf.put_u8(Self::TAG_OK);
+                buf.put_u8(Self::STATUS_OK);
+                buf.put_bytes(0, 6);
+                buf.put_u64_le(log_index);
+            }
+            MqResponse::Published { base_offset, count } => {
+                buf.put_u8(Self::TAG_PUBLISHED);
+                buf.put_u8(Self::STATUS_OK);
+                buf.put_bytes(0, 6);
+                buf.put_u64_le(log_index);
+                buf.put_u64_le(*base_offset);
+                buf.put_u64_le(*count);
+            }
+            MqResponse::EntityCreated { id } => {
+                buf.put_u8(Self::TAG_ENTITY_CREATED);
+                buf.put_u8(Self::STATUS_OK);
+                buf.put_bytes(0, 6);
+                buf.put_u64_le(log_index);
+                buf.put_u64_le(*id);
+            }
+            MqResponse::Error(e) => {
+                let msg = e.to_string();
+                let msg_bytes = msg.as_bytes();
+                let padded_msg_len = (msg_bytes.len() + 7) & !7;
+                buf.put_u8(Self::TAG_ERROR);
+                buf.put_u8(Self::STATUS_ERROR);
+                buf.put_bytes(0, 6);
+                buf.put_u64_le(log_index);
+                buf.put_u32_le(1u32); // error_code
+                buf.put_u32_le(msg_bytes.len() as u32);
+                buf.put_slice(msg_bytes);
+                let pad = padded_msg_len - msg_bytes.len();
+                if pad > 0 {
+                    buf.put_bytes(0, pad);
+                }
+            }
+            _ => {
+                buf.put_u8(Self::TAG_OK);
+                buf.put_u8(Self::STATUS_OK);
+                buf.put_bytes(0, 6);
+                buf.put_u64_le(log_index);
+            }
+        }
+        let payload_len = (buf.len() - len_pos - 4) as u32; // client_id(4) + entry bytes
+        buf[len_pos..len_pos + 4].copy_from_slice(&payload_len.to_le_bytes());
+        let _ = entry_start; // used only to document the split point
+    }
+
+    /// Write a log-index-only dispatch frame into `buf` without a separate allocation.
+    ///
+    /// Frame layout: `[len:4=12 LE][client_id:4 LE][log_index:8 LE]`
+    #[inline]
+    pub fn encode_log_index_frame(buf: &mut BytesMut, client_id: u32, log_index: u64) {
+        buf.put_u32_le(12u32); // len = client_id(4) + log_index(8)
+        buf.put_u32_le(client_id);
+        buf.put_u64_le(log_index);
+    }
+}
+
+// =============================================================================
+// Shared responder channel type
+// =============================================================================
+
+/// Per-follower responder tx table, indexed directly by node_id (< 64).
+pub type ResponderTxVec = Box<[Option<crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>>; 64]>;
+
+/// Shared, atomically-swappable reference to the live responder channel table.
+/// Used by [`ForwardAcceptor`] for its own `push_response` calls.
+pub type SharedResponderTxs = Arc<ArcSwap<ResponderTxVec>>;
+
+/// Message type for responder update notifications sent to [`PartitionWorker`]s.
+pub type ResponderUpdateMsg = (
+    u32,
+    Option<crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>>,
+);
+
+/// Broadcasts follower connect/disconnect events to all [`PartitionWorker`]s.
+///
+/// Each worker owns its local responder table and drains updates from its
+/// `UnboundedReceiver` at the top of each apply loop iteration — no shared
+/// state, no locking on the hot path.
+#[derive(Clone)]
+pub struct ResponderBroadcast {
+    txs: Vec<tokio::sync::mpsc::UnboundedSender<ResponderUpdateMsg>>,
+}
+
+impl ResponderBroadcast {
+    /// Create a broadcast handle with no registered workers (useful for tests/benches).
+    pub fn new_empty() -> Self {
+        Self { txs: vec![] }
+    }
+
+    pub fn insert(&self, node_id: u32, tx: crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>) {
+        for sender in &self.txs {
+            let _ = sender.send((node_id, Some(tx.clone())));
+        }
+    }
+
+    pub fn remove(&self, node_id: u32) {
+        for sender in &self.txs {
+            let _ = sender.send((node_id, None));
+        }
+    }
+}
+
+// =============================================================================
+// ResponseCallback / ClientPartition
+// =============================================================================
+
+/// Callback invoked by a [`ClientPartition`] when a response frame arrives.
+///
+/// - `slab`: the owning `Bytes` buffer — zero-copy clone via
+///   `slab.slice(offset..offset + message.len())` if you need to retain it.
+/// - `offset`: byte offset of `message` within `slab`.
+/// - `message`: response payload (`[payload...]` after `[len:4][client_id:4]`).
+/// - `is_done`: `true` after the partition has exhausted the current drain cycle;
+///   the callback can use this signal to flush or batch its own output.
+pub type ResponseCallback = Arc<dyn Fn(&Bytes, usize, &[u8], bool) + Send + Sync + 'static>;
+
+enum ClientPartitionMsg {
+    Register(u32, ResponseCallback),
+    Unregister(u32),
+}
+
+/// Per-partition task that dispatches response frames to registered client callbacks.
+///
+/// Receives [`Bytes`] chunks via a crossfire MPSC channel. Each chunk contains
+/// one or more wire frames: `[len:4 LE][client_id:4 LE][payload...]`.
+/// The task scans linearly, invokes the matching callback for frames belonging
+/// to its partition (`client_id % num_partitions == partition_id`), and signals
+/// `is_done = true` to all touched callbacks after draining the channel.
+///
+/// The callback map is owned exclusively by this task — no mutex required.
+struct ClientPartition {
+    partition_id: usize,
+    num_partitions: usize,
+    bytes_rx: crossfire::AsyncRx<crossfire::mpsc::Array<Bytes>>,
+    reg_rx: tokio::sync::mpsc::UnboundedReceiver<ClientPartitionMsg>,
+    callbacks: HashMap<u32, ResponseCallback>,
+    seen_ids: HashSet<u32>,
+}
+
+impl ClientPartition {
+    /// Scan `slab` for complete frames belonging to this partition and invoke callbacks.
+    ///
+    /// When `num_partitions > 1` the slab is the full read buffer broadcast to all workers;
+    /// each worker skips records whose `client_id % num_partitions != partition_id`.  The slab
+    /// is already in L1/L2 cache from the TCP read so the extra linear scan is cheap.
+    fn dispatch(&mut self, slab: &Bytes) {
+        if self.callbacks.is_empty() {
+            return;
+        }
+        let n = self.num_partitions;
+        let p = self.partition_id;
+        let buf = slab.as_ref();
+        let mut pos = 0;
+        while pos + 4 <= buf.len() {
+            let frame_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            if frame_len < 4 || pos + 4 + frame_len > buf.len() {
+                break;
+            }
+            let payload_start = pos + 4;
+            let client_id =
+                u32::from_le_bytes(buf[payload_start..payload_start + 4].try_into().unwrap());
+            if n == 1 || (client_id as usize) % n == p {
+                if let Some(cb) = self.callbacks.get(&client_id) {
+                    let msg_offset = payload_start + 4;
+                    let msg_end = payload_start + frame_len;
+                    cb(slab, msg_offset, &buf[msg_offset..msg_end], false);
+                    self.seen_ids.insert(client_id);
+                }
+            }
+            pos = payload_start + frame_len;
+        }
+    }
+
+    fn handle_reg(&mut self, msg: ClientPartitionMsg) {
+        match msg {
+            ClientPartitionMsg::Register(id, cb) => {
+                self.callbacks.insert(id, cb);
+            }
+            ClientPartitionMsg::Unregister(id) => {
+                self.callbacks.remove(&id);
+            }
+        }
+    }
+
+    async fn run(mut self) {
+        let empty = Bytes::new();
+        loop {
+            // Drain pending registrations without blocking.
+            while let Ok(msg) = self.reg_rx.try_recv() {
+                self.handle_reg(msg);
+            }
+
+            tokio::select! {
+                biased;
+                msg = self.reg_rx.recv() => {
+                    match msg {
+                        Some(m) => self.handle_reg(m),
+                        None => return,
+                    }
+                }
+                result = self.bytes_rx.recv() => {
+                    let slab = match result {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    };
+                    self.dispatch(&slab);
+                    while let Ok(more) = self.bytes_rx.try_recv() {
+                        self.dispatch(&more);
+                    }
+                    // Signal all touched callbacks: drain cycle complete.
+                    for &id in &self.seen_ids {
+                        if let Some(cb) = self.callbacks.get(&id) {
+                            cb(&empty, 0, &[], true);
+                        }
+                    }
+                    self.seen_ids.clear();
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
 // Client Registry
 // =============================================================================
 
-/// Registry of active client response channels.
+/// Registry of active client response partitions.
 ///
-/// Workers look up channels by client_id after applying each command.
-/// Adapters register on connect, unregister on disconnect.
+/// Each client is assigned to a [`ClientPartition`] by `client_id % num_partitions`.
+/// The partition task owns the callback map for its shard — no mutex required.
+/// Response frames are pushed via crossfire MPSC channels; registrations via
+/// unbounded tokio channels.
 pub struct ClientRegistry {
-    clients: papaya::HashMap<u64, mpsc::UnboundedSender<ResponseEntry>>,
-    next_id: AtomicU64,
+    next_id: AtomicU32,
+    num_partitions: usize,
+    bytes_txs: Vec<crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>>,
+    reg_txs: Vec<tokio::sync::mpsc::UnboundedSender<ClientPartitionMsg>>,
 }
 
 impl ClientRegistry {
-    pub fn new() -> Self {
-        Self {
-            clients: papaya::HashMap::new(),
-            next_id: AtomicU64::new(1),
+    /// Create a new `ClientRegistry` with `num_partitions` client partitions,
+    /// each backed by a live [`ClientPartition`] task with the given channel `capacity`.
+    ///
+    /// Spawns `num_partitions` tokio tasks — must be called from within a tokio runtime.
+    pub fn new(num_partitions: usize, capacity: usize) -> Arc<Self> {
+        let n = num_partitions.max(1);
+        let mut bytes_txs = Vec::with_capacity(n);
+        let mut reg_txs = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let (bytes_tx, bytes_rx) = crossfire::mpsc::bounded_async::<Bytes>(capacity);
+            let (reg_tx, reg_rx) = tokio::sync::mpsc::unbounded_channel::<ClientPartitionMsg>();
+            bytes_txs.push(bytes_tx);
+            reg_txs.push(reg_tx);
+
+            let partition = ClientPartition {
+                partition_id: i,
+                num_partitions: n,
+                bytes_rx,
+                reg_rx,
+                callbacks: HashMap::new(),
+                seen_ids: HashSet::new(),
+            };
+            tokio::spawn(partition.run());
         }
+
+        Arc::new(Self {
+            next_id: AtomicU32::new(1),
+            num_partitions: n,
+            bytes_txs,
+            reg_txs,
+        })
     }
 
-    /// Register a new client. Returns (client_id, receiver).
-    pub fn register(&self) -> (u64, mpsc::UnboundedReceiver<ResponseEntry>) {
+    pub fn num_partitions(&self) -> usize {
+        self.num_partitions
+    }
+
+    /// Register a client with a response callback. Returns the assigned `client_id`.
+    pub fn register(&self, callback: ResponseCallback) -> u32 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.clients.pin().insert(id, tx);
-        (id, rx)
+        let partition = (id as usize) % self.num_partitions;
+        let _ = self.reg_txs[partition].send(ClientPartitionMsg::Register(id, callback));
+        id
     }
 
-    /// Unregister a client. Pending responses are discarded.
-    pub fn unregister(&self, client_id: u64) {
-        self.clients.pin().remove(&client_id);
+    /// Unregister a client. The partition task drops the callback asynchronously.
+    pub fn unregister(&self, client_id: u32) {
+        let partition = (client_id as usize) % self.num_partitions;
+        let _ = self.reg_txs[partition].send(ClientPartitionMsg::Unregister(client_id));
     }
 
-    /// Send a response to a client. Returns false if disconnected.
-    #[inline]
-    pub fn send(&self, client_id: u64, entry: ResponseEntry) -> bool {
-        let guard = self.clients.pin();
-        if let Some(tx) = guard.get(&client_id) {
-            tx.send(entry).is_ok()
-        } else {
-            false
+    /// Push a raw [`Bytes`] chunk (complete wire frames) to a specific partition.
+    ///
+    /// Used by the TCP inbound loop after bitmap-based partition selection.
+    /// Non-blocking — drops if full.
+    pub fn send_to_partition(&self, partition: usize, bytes: Bytes) {
+        debug_assert!(partition < self.num_partitions);
+        let _ = self.bytes_txs[partition].try_send(bytes);
+    }
+
+    /// Async variant of [`send_to_partition`] — try_send first (fast path, no future
+    /// machinery when the channel has space), falling back to a blocking await only if the
+    /// channel is momentarily full (rare with the default 4096-chunk capacity).
+    pub async fn send_to_partition_async(&self, partition: usize, bytes: Bytes) {
+        if partition < self.num_partitions {
+            let tx = &self.bytes_txs[partition];
+            if let Err(e) = tx.try_send(bytes) {
+                let _ = tx.send(e.into_inner()).await;
+            }
         }
-    }
-
-    pub fn client_count(&self) -> usize {
-        self.clients.pin().len()
     }
 }
 
@@ -307,7 +537,7 @@ impl ClientRegistry {
 /// Populated by `apply()` when client_id is available. Workers read
 /// and remove after applying.
 pub(crate) struct ClientIdTable {
-    entries: papaya::HashMap<u64, u64>,
+    entries: papaya::HashMap<u64, u32>,
 }
 
 impl ClientIdTable {
@@ -318,17 +548,25 @@ impl ClientIdTable {
     }
 
     #[allow(dead_code)]
-    pub fn insert(&self, log_index: u64, client_id: u64) {
+    pub fn insert(&self, log_index: u64, client_id: u32) {
         self.entries.pin().insert(log_index, client_id);
     }
 
-    pub fn take(&self, log_index: u64) -> Option<u64> {
-        let guard = self.entries.pin();
-        let value = guard.get(&log_index).copied();
-        if value.is_some() {
-            guard.remove(&log_index);
-        }
-        value
+    pub fn take(&self, log_index: u64) -> Option<u32> {
+        self.entries.pin().remove(&log_index).copied()
+    }
+
+    /// Acquire an owned (Send) epoch guard for reuse across multiple `take` calls.
+    pub fn guard(
+        &self,
+    ) -> papaya::HashMapRef<
+        '_,
+        u64,
+        u32,
+        std::collections::hash_map::RandomState,
+        papaya::OwnedGuard<'_>,
+    > {
+        self.entries.pin_owned()
     }
 }
 
@@ -345,9 +583,28 @@ struct PartitionWorker {
     hwm: Arc<HighWaterMark>,
     prefetcher: SegmentPrefetcher,
     engine: Arc<MqEngine>,
-    responder_table: Arc<ResponderTable>,
     client_registry: Arc<ClientRegistry>,
     client_id_table: Arc<ClientIdTable>,
+    /// Owned per-follower responder tx table, indexed by node_id.
+    /// Updated via `responder_update_rx` when followers connect/disconnect.
+    responder_txs: Box<[Option<crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>>; 64]>,
+    /// Receives (node_id, Option<tx>) updates from [`ResponderBroadcast`].
+    responder_update_rx: tokio::sync::mpsc::UnboundedReceiver<ResponderUpdateMsg>,
+    /// Per-follower output buffers indexed directly by node_id (< 64).
+    /// Tight-packed `[client_id:4 LE][log_index:8 LE]` records, 12 bytes each.
+    /// Direct indexing: O(1) access, no search required.
+    response_buf: Box<[BytesMut; 64]>,
+    /// Bitmask of non-empty slots in `response_buf`. Bit `i` is set when
+    /// `response_buf[i]` contains data. Enables O(popcount) flush iteration.
+    response_buf_mask: u64,
+    /// Number of forwarded sub-command entries accumulated since last flush.
+    entries_since_flush: usize,
+    /// Number of bytes accumulated across all `response_buf` entries since last flush.
+    bytes_since_flush: usize,
+    /// Flush after this many accumulated entries (from config).
+    config_flush_entries: usize,
+    /// Flush after this many accumulated bytes (from config).
+    config_flush_bytes: usize,
     manifest: Option<Arc<MqManifestManager>>,
     /// Purged segment IDs shared with log storage. Workers peek (without
     /// draining) after each range to sweep retained messages on their own
@@ -360,7 +617,7 @@ struct PartitionWorker {
 }
 
 impl PartitionWorker {
-    async fn run(self) {
+    async fn run(mut self) {
         debug!(
             partition = self.partition_id,
             "async partition worker started"
@@ -372,6 +629,7 @@ impl PartitionWorker {
         let mut scanner: Option<MqSegmentScanner> = None;
 
         loop {
+            self.drain_responder_updates();
             let cursor_val = self.cursor.load(Ordering::Acquire);
             let hwm = self.hwm.wait_for(cursor_val).await;
 
@@ -385,18 +643,56 @@ impl PartitionWorker {
             }
 
             let from = cursor_val + 1;
-            self.process_range(from, hwm, &mut scanner);
+            self.process_range(from, hwm, &mut scanner).await;
             self.sweep_purged_retained();
             self.cursor.store(hwm, Ordering::Release);
             self.cursor_notify.notify_waiters();
         }
     }
 
-    fn process_range(&self, from: u64, to: u64, scanner: &mut Option<MqSegmentScanner>) {
+    fn drain_responder_updates(&mut self) {
+        while let Ok((node_id, tx)) = self.responder_update_rx.try_recv() {
+            self.responder_txs[node_id as usize] = tx;
+        }
+    }
+
+    /// Flush accumulated forwarded-response bytes to the appropriate follower
+    /// responder channels.  Called at end-of-range (and optionally mid-range).
+    async fn flush_response_buf(&mut self) {
+        if self.response_buf_mask == 0 {
+            return;
+        }
+
+        let mut mask = self.response_buf_mask;
+        self.response_buf_mask = 0;
+        self.entries_since_flush = 0;
+        self.bytes_since_flush = 0;
+
+        while mask != 0 {
+            let node_id = mask.trailing_zeros();
+            mask &= mask - 1;
+            let buf = &mut self.response_buf[node_id as usize];
+            if buf.is_empty() {
+                continue;
+            }
+            let bytes = buf.split().freeze();
+            if let Some(tx) = &self.responder_txs[node_id as usize] {
+                let _ = tx.send(bytes).await;
+            }
+        }
+    }
+
+    async fn process_range(&mut self, from: u64, to: u64, scanner: &mut Option<MqSegmentScanner>) {
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+
+        // One epoch guard for the entire range instead of one per applied entry.
+        // Clone the Arc so the guard's lifetime is independent of `self`, allowing
+        // `&mut self` borrows (e.g. flush_response_buf) to coexist.
+        let cid_table = Arc::clone(&self.client_id_table);
+        let cid_guard = cid_table.guard();
 
         // Reuse persistent scanner if available, otherwise create a new one.
         // The scanner's active segment uses a live SegmentView, so it always
@@ -430,8 +726,39 @@ impl PartitionWorker {
 
             let cmd = rec.command;
 
-            // Batch entries are handled by apply() synchronously. Skip.
+            // TAG_BATCH is applied synchronously by the state machine. Skip.
             if cmd.tag() == MqCommand::TAG_BATCH {
+                continue;
+            }
+
+            // TAG_FORWARDED_BATCH: state machine already applied the sub-commands.
+            // Accumulate [client_id:4 LE][log_index:8 LE] records into the
+            // per-follower output buffer for all sub-commands owned by this
+            // partition.  Flush to the FollowerResponder channel when thresholds
+            // are met or at end-of-range.
+            if cmd.tag() == MqCommand::TAG_FORWARDED_BATCH {
+                let view = cmd.as_forwarded_batch();
+                let node_id = view.node_id();
+                debug_assert!(
+                    (node_id as usize) < 64,
+                    "node_id {node_id} exceeds response_buf capacity"
+                );
+                for (client_id, _) in view.iter() {
+                    if (client_id as usize) % self.num_partitions == self.partition_id {
+                        let buf = &mut self.response_buf[node_id as usize];
+                        buf.put_u32_le(12u32); // length prefix: 4 (client_id) + 8 (log_index)
+                        buf.put_u32_le(client_id);
+                        buf.put_u64_le(rec.log_index);
+                        self.response_buf_mask |= 1u64 << node_id;
+                        self.entries_since_flush += 1;
+                        self.bytes_since_flush += 16;
+                    }
+                }
+                if self.entries_since_flush >= self.config_flush_entries
+                    || self.bytes_since_flush >= self.config_flush_bytes
+                {
+                    self.flush_response_buf().await;
+                }
                 continue;
             }
 
@@ -452,13 +779,13 @@ impl PartitionWorker {
             // Post-apply: structural writes to MDBX.
             self.handle_structural_writes(&cmd, &response, rec.log_index);
 
-            // Deliver response through stashed raft responder (leader path).
-            if let Some(responder) = self.responder_table.take(rec.log_index) {
-                responder.send(response);
-            } else if let Some(client_id) = self.client_id_table.take(rec.log_index) {
-                // Client channel path (Phase 4).
-                let entry = ResponseEntry::from_response(rec.log_index, &response);
-                let _ = self.client_registry.send(client_id, entry);
+            // Deliver response to the owning ClientPartition.
+            if let Some(client_id) = cid_guard.remove(&rec.log_index).copied() {
+                let partition = (client_id as usize) % self.num_partitions;
+                let mut frame = BytesMut::with_capacity(4 + 4 + 32);
+                ResponseEntry::encode_frame_into(&mut frame, client_id, rec.log_index, &response);
+                self.client_registry
+                    .send_to_partition(partition, frame.freeze());
             }
 
             apply_count += 1;
@@ -470,6 +797,9 @@ impl PartitionWorker {
         if skip_count > 0 {
             self.m_skip_count.increment(skip_count);
         }
+
+        // End-of-range flush: always send any remaining response bytes.
+        self.flush_response_buf().await;
     }
 
     /// Determine if this worker should process the given command.
@@ -507,12 +837,12 @@ impl PartitionWorker {
 
         // Peek — don't drain. The state machine drains after all workers
         // have caught up. Detach is idempotent so double-sweeps are harmless.
-        let purged_ids: Vec<u64> = {
+        let purged_set: HashSet<u64> = {
             let guard = purged.lock();
             if guard.is_empty() {
                 return;
             }
-            guard.clone()
+            guard.iter().copied().collect()
         };
 
         let meta = self.engine.metadata();
@@ -528,7 +858,7 @@ impl PartitionWorker {
             let mut detached = false;
             for rv in retained.values_mut() {
                 if let Some(seg_id) = rv.segment_id {
-                    if purged_ids.contains(&seg_id) {
+                    if purged_set.contains(&seg_id) {
                         rv.detach();
                         detached = true;
                     }
@@ -559,7 +889,7 @@ impl PartitionWorker {
             let mut retained = topic.retained_message.write();
             if let Some(ref mut rv) = *retained {
                 if let Some(seg_id) = rv.segment_id {
-                    if purged_ids.contains(&seg_id) {
+                    if purged_set.contains(&seg_id) {
                         rv.detach();
                     }
                 }
@@ -594,7 +924,6 @@ impl PartitionWorker {
 #[allow(dead_code)]
 pub struct AsyncApplyManager {
     pub(crate) hwm: Arc<HighWaterMark>,
-    pub(crate) responder_table: Arc<ResponderTable>,
     pub(crate) client_registry: Arc<ClientRegistry>,
     pub(crate) client_id_table: Arc<ClientIdTable>,
     worker_cursors: Vec<Arc<AtomicU64>>,
@@ -605,10 +934,12 @@ pub struct AsyncApplyManager {
     /// retained messages on their own exchanges. The state machine drains
     /// after all workers have caught up.
     purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
+    /// Broadcasts follower connect/disconnect events to all partition workers.
+    responder_broadcast: ResponderBroadcast,
 }
 
 impl AsyncApplyManager {
-    /// Create the manager and spawn partition workers.
+    /// Create the manager and spawn partition workers + client partitions.
     pub fn new(
         config: &ParallelApplyConfig,
         engine: Arc<MqEngine>,
@@ -621,10 +952,49 @@ impl AsyncApplyManager {
     ) -> Self {
         let n = config.num_partitions;
         let hwm = Arc::new(HighWaterMark::new(initial_cursor));
-        let responder_table = Arc::new(ResponderTable::new());
-        let client_registry = Arc::new(ClientRegistry::new());
         let client_id_table = Arc::new(ClientIdTable::new());
         let cursor_notify = Arc::new(tokio::sync::Notify::new());
+        let mut responder_update_txs = Vec::with_capacity(n);
+        let mut responder_update_rxs: Vec<
+            tokio::sync::mpsc::UnboundedReceiver<ResponderUpdateMsg>,
+        > = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            responder_update_txs.push(tx);
+            responder_update_rxs.push(rx);
+        }
+        let responder_broadcast = ResponderBroadcast {
+            txs: responder_update_txs,
+        };
+
+        // Build ClientRegistry channels and spawn ClientPartition tasks.
+        let mut bytes_txs = Vec::with_capacity(n);
+        let mut reg_txs = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let (bytes_tx, bytes_rx) =
+                crossfire::mpsc::bounded_async::<Bytes>(config.response_partition_capacity);
+            let (reg_tx, reg_rx) = tokio::sync::mpsc::unbounded_channel::<ClientPartitionMsg>();
+            bytes_txs.push(bytes_tx);
+            reg_txs.push(reg_tx);
+
+            let partition = ClientPartition {
+                partition_id: i,
+                num_partitions: n,
+                bytes_rx,
+                reg_rx,
+                callbacks: HashMap::new(),
+                seen_ids: HashSet::new(),
+            };
+            tokio::spawn(partition.run());
+        }
+
+        let client_registry = Arc::new(ClientRegistry {
+            next_id: AtomicU32::new(1),
+            num_partitions: n,
+            bytes_txs,
+            reg_txs,
+        });
 
         let mut worker_cursors = Vec::with_capacity(n);
         let mut worker_handles = Vec::with_capacity(n);
@@ -651,9 +1021,16 @@ impl AsyncApplyManager {
                 hwm: Arc::clone(&hwm),
                 prefetcher: prefetcher.clone(),
                 engine: Arc::clone(&engine),
-                responder_table: Arc::clone(&responder_table),
                 client_registry: Arc::clone(&client_registry),
                 client_id_table: Arc::clone(&client_id_table),
+                responder_txs: Box::new(std::array::from_fn(|_| None)),
+                responder_update_rx: responder_update_rxs.remove(0),
+                response_buf: Box::new(std::array::from_fn(|_| BytesMut::new())),
+                response_buf_mask: 0,
+                entries_since_flush: 0,
+                bytes_since_flush: 0,
+                config_flush_entries: config.response_flush_entries,
+                config_flush_bytes: config.response_flush_bytes,
                 manifest: manifest.clone(),
                 purged_segments: purged_segments.clone(),
                 group_id,
@@ -669,7 +1046,6 @@ impl AsyncApplyManager {
 
         Self {
             hwm,
-            responder_table,
             client_registry,
             client_id_table,
             worker_cursors,
@@ -677,7 +1053,12 @@ impl AsyncApplyManager {
             cursor_notify,
             num_partitions: n,
             purged_segments,
+            responder_broadcast,
         }
+    }
+
+    pub fn responder_broadcast(&self) -> ResponderBroadcast {
+        self.responder_broadcast.clone()
     }
 
     /// Advance the HWM to the given index.
@@ -773,9 +1154,9 @@ pub enum PendingRequest {
     /// AMQP disposition awaiting settlement.
     Disposition { delivery_id: u32 },
     /// Kafka produce awaiting partition response.
-    ProducePartition { topic: String, partition: i32 },
+    ProducePartition { topic: Arc<str>, partition: i32 },
     /// Entity creation (topic, exchange, consumer group, etc.).
-    CreateEntity { name: String },
+    CreateEntity { name: Arc<str> },
     /// Generic request with no protocol-specific metadata.
     Generic,
 }
@@ -881,18 +1262,6 @@ mod tests {
         assert_eq!(hwm.current(), 100);
     }
 
-    // ---- ResponderTable tests ----
-
-    #[test]
-    fn responder_table_insert_take() {
-        let table = ResponderTable::new();
-        assert_eq!(table.len(), 0);
-
-        // We can't easily create an ApplyResponder in tests, so just test
-        // the empty take path.
-        assert!(table.take(1).is_none());
-    }
-
     // ---- ResponseEntry tests ----
 
     #[test]
@@ -980,55 +1349,72 @@ mod tests {
     // ---- ClientRegistry tests ----
 
     #[tokio::test]
-    async fn client_registry_register_send_unregister() {
-        let registry = ClientRegistry::new();
-        assert_eq!(registry.client_count(), 0);
+    async fn client_registry_register_and_dispatch() {
+        use std::sync::atomic::AtomicU64;
 
-        let (id, mut rx) = registry.register();
-        assert_eq!(id, 1);
-        assert_eq!(registry.client_count(), 1);
+        let registry = ClientRegistry::new(2, 64);
 
-        // Send a response.
-        let sent = registry.send(id, ResponseEntry::ok(42));
-        assert!(sent);
+        let log_idx = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let log_idx_cb = Arc::clone(&log_idx);
+        let done_cb = Arc::clone(&done);
 
-        let entry = rx.recv().await.unwrap();
-        assert_eq!(entry.log_index(), 42);
+        let cb: ResponseCallback = Arc::new(move |_slab, _offset, msg, is_done| {
+            if !is_done && msg.len() >= 16 {
+                // ResponseEntry::ok layout: [tag:1][status:1][pad:6][log_index:8]
+                let li = u64::from_le_bytes(msg[8..16].try_into().unwrap());
+                log_idx_cb.store(li, Ordering::Relaxed);
+                done_cb.notify_one();
+            }
+        });
+        let id = registry.register(cb);
+        assert!(id >= 1);
 
-        // Send to non-existent client.
-        assert!(!registry.send(999, ResponseEntry::ok(1)));
+        let p = (id as usize) % registry.num_partitions();
+        let mut frame = BytesMut::with_capacity(24);
+        ResponseEntry::encode_frame_into(&mut frame, id, 42, &MqResponse::Ok);
+        registry.send_to_partition(p, frame.freeze());
+        done.notified().await;
+        assert_eq!(log_idx.load(Ordering::Relaxed), 42);
 
-        // Unregister.
         registry.unregister(id);
-        assert_eq!(registry.client_count(), 0);
-        assert!(!registry.send(id, ResponseEntry::ok(2)));
-    }
-
-    #[tokio::test]
-    async fn client_registry_disconnect_detection() {
-        let registry = ClientRegistry::new();
-        let (id, rx) = registry.register();
-
-        // Drop receiver — simulates client disconnect.
-        drop(rx);
-
-        // send should return false (channel closed).
-        assert!(!registry.send(id, ResponseEntry::ok(1)));
     }
 
     #[tokio::test]
     async fn client_registry_multiple_clients() {
-        let registry = ClientRegistry::new();
-        let (id1, mut rx1) = registry.register();
-        let (id2, mut rx2) = registry.register();
-        assert_ne!(id1, id2);
-        assert_eq!(registry.client_count(), 2);
+        let registry = ClientRegistry::new(2, 64);
+        let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = Arc::new(tokio::sync::Notify::new());
 
-        registry.send(id1, ResponseEntry::ok(1));
-        registry.send(id2, ResponseEntry::ok(2));
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let total_cb = Arc::clone(&total);
+            let done_cb = Arc::clone(&done);
+            let cb: ResponseCallback = Arc::new(move |_slab, _offset, _msg, is_done| {
+                if !is_done {
+                    if total_cb.fetch_add(1, Ordering::Relaxed) + 1 >= 4 {
+                        done_cb.notify_one();
+                    }
+                }
+            });
+            ids.push(registry.register(cb));
+        }
+        // IDs should be unique.
+        let id_set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(id_set.len(), 4);
 
-        assert_eq!(rx1.recv().await.unwrap().log_index(), 1);
-        assert_eq!(rx2.recv().await.unwrap().log_index(), 2);
+        for &id in &ids {
+            let p = (id as usize) % registry.num_partitions();
+            let mut frame = BytesMut::with_capacity(24);
+            ResponseEntry::encode_frame_into(&mut frame, id, 1, &MqResponse::Ok);
+            registry.send_to_partition(p, frame.freeze());
+        }
+        done.notified().await;
+        assert_eq!(total.load(Ordering::Relaxed), 4);
+
+        for id in ids {
+            registry.unregister(id);
+        }
     }
 
     // ---- ClientIdTable tests ----
@@ -1106,14 +1492,14 @@ mod tests {
         pending.insert(
             3,
             PendingRequest::ProducePartition {
-                topic: "test-topic".to_string(),
+                topic: Arc::from("test-topic"),
                 partition: 3,
             },
         );
         pending.insert(
             4,
             PendingRequest::CreateEntity {
-                name: "my-queue".to_string(),
+                name: Arc::from("my-queue"),
             },
         );
         pending.insert(5, PendingRequest::Generic);
@@ -1121,7 +1507,7 @@ mod tests {
 
         match pending.remove(3) {
             Some(PendingRequest::ProducePartition { topic, partition }) => {
-                assert_eq!(topic, "test-topic");
+                assert_eq!(&*topic, "test-topic");
                 assert_eq!(partition, 3);
             }
             _ => panic!("expected ProducePartition"),
@@ -1129,7 +1515,7 @@ mod tests {
 
         match pending.remove(4) {
             Some(PendingRequest::CreateEntity { name }) => {
-                assert_eq!(name, "my-queue");
+                assert_eq!(&*name, "my-queue");
             }
             _ => panic!("expected CreateEntity"),
         }
@@ -1265,10 +1651,11 @@ mod tests {
 
     #[tokio::test]
     async fn client_registry_ids_are_unique() {
-        let registry = ClientRegistry::new();
-        let (id1, _rx1) = registry.register();
-        let (id2, _rx2) = registry.register();
-        let (id3, _rx3) = registry.register();
+        let registry = ClientRegistry::new(2, 64);
+        let noop: ResponseCallback = Arc::new(|_, _, _, _| {});
+        let id1 = registry.register(Arc::clone(&noop));
+        let id2 = registry.register(Arc::clone(&noop));
+        let id3 = registry.register(Arc::clone(&noop));
         assert_ne!(id1, id2);
         assert_ne!(id2, id3);
         assert_ne!(id1, id3);
@@ -1276,17 +1663,29 @@ mod tests {
 
     #[tokio::test]
     async fn client_registry_send_multiple_responses() {
-        let registry = ClientRegistry::new();
-        let (id, mut rx) = registry.register();
-
+        use std::sync::atomic::AtomicUsize;
+        let registry = ClientRegistry::new(2, 64);
+        let count = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let count_cb = Arc::clone(&count);
+        let done_cb = Arc::clone(&done);
+        let cb: ResponseCallback = Arc::new(move |_slab, _offset, _msg, is_done| {
+            if !is_done {
+                if count_cb.fetch_add(1, Ordering::Relaxed) + 1 >= 10 {
+                    done_cb.notify_one();
+                }
+            }
+        });
+        let id = registry.register(cb);
+        let p = (id as usize) % registry.num_partitions();
         for i in 0..10u64 {
-            assert!(registry.send(id, ResponseEntry::ok(i)));
+            let mut frame = BytesMut::with_capacity(24);
+            ResponseEntry::encode_frame_into(&mut frame, id, i, &MqResponse::Ok);
+            registry.send_to_partition(p, frame.freeze());
         }
-
-        for i in 0..10u64 {
-            let entry = rx.recv().await.unwrap();
-            assert_eq!(entry.log_index(), i);
-        }
+        done.notified().await;
+        assert_eq!(count.load(Ordering::Relaxed), 10);
+        registry.unregister(id);
     }
 
     // ---- Worker routing tests ----
@@ -1399,15 +1798,5 @@ mod tests {
 
         let cmd = MqCommand::create_topic("t", crate::types::RetentionPolicy::default(), 0);
         assert_eq!(route_partition(&cmd, 456, 1), 0);
-    }
-
-    // ---- ResponderTable extended tests ----
-
-    #[test]
-    fn responder_table_take_nonexistent() {
-        let table = ResponderTable::new();
-        // Take from empty table.
-        assert!(table.take(0).is_none());
-        assert!(table.take(u64::MAX).is_none());
     }
 }
