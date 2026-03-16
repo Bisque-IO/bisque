@@ -19,12 +19,18 @@ use bisque_raft::{
     SegmentSyncClient, SegmentSyncClientConfig, SegmentSyncServer, SegmentSyncServerConfig,
     SnapshotFileEntry,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{LogId, SnapshotMeta, StoredMembership};
 use tokio::net::TcpListener;
 
-type MqTypeConfig = bisque_raft::BisqueRaftTypeConfig<MqCommand, MqResponse>;
+use bisque_mq::MqApplyResponse;
+type MqTypeConfig = bisque_raft::BisqueRaftTypeConfig<MqCommand, MqApplyResponse>;
+
+fn apply(engine: &MqEngine, cmd: &MqCommand, log_index: u64, current_time: u64) {
+    let mut buf = BytesMut::new();
+    engine.apply_command(cmd, &mut buf, log_index, current_time, None);
+}
 
 fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-segment-sync-test"))
@@ -98,6 +104,7 @@ async fn start_sync_server(
 /// install_snapshot with segment file sync.
 #[tokio::test]
 async fn test_snapshot_install_with_segment_sync() {
+    let mut buf = bytes::BytesMut::new();
     let leader_dir = tempfile::tempdir().unwrap();
     let follower_dir = tempfile::tempdir().unwrap();
 
@@ -113,20 +120,22 @@ async fn test_snapshot_install_with_segment_sync() {
 
     // --- Leader side: build snapshot with file manifest ---
     let mut leader_engine = make_engine();
-    leader_engine.apply_command(
-        &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
+    apply(
+        &leader_engine,
+        &MqCommand::create_topic(&mut buf, "events", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
     );
-    leader_engine.apply_command(
-        &MqCommand::publish(1, &[make_msg(b"msg1"), make_msg(b"msg2")]),
+    apply(
+        &leader_engine,
+        &MqCommand::publish(&mut buf, 1, &[make_msg(b"msg1"), make_msg(b"msg2")]),
         2,
         1001,
-        None,
     );
-    leader_engine.apply_command(
+    apply(
+        &leader_engine,
         &MqCommand::create_queue(
+            &mut buf,
             "tasks",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -138,7 +147,6 @@ async fn test_snapshot_install_with_segment_sync() {
         ),
         3,
         1002,
-        None,
     );
 
     // Create leader state machine with group_dir and sync_addr
@@ -232,12 +240,13 @@ async fn test_snapshot_install_without_sync_client() {
 /// (no segment files to sync — fresh cluster).
 #[tokio::test]
 async fn test_snapshot_install_empty_manifest() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
-    engine.apply_command(
-        &MqCommand::create_topic("t", RetentionPolicy::default(), 0),
+    apply(
+        &engine,
+        &MqCommand::create_topic(&mut buf, "t", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
     );
 
     let snap_data = engine.snapshot();

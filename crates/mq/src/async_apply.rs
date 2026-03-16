@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use arc_swap::ArcSwap;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex as ParkingMutex;
 use tracing::debug;
@@ -24,7 +23,7 @@ use crate::cursor::MqSegmentScanner;
 use crate::engine::MqEngine;
 use crate::manifest::MqManifestManager;
 use crate::state_machine::{classify_structural, collect_structural_writes};
-use crate::types::{MqCommand, MqResponse};
+use crate::types::MqCommand;
 
 // =============================================================================
 // High-Water Mark
@@ -96,8 +95,24 @@ impl HighWaterMark {
 ///
 /// All field offsets are multiples of their natural alignment,
 /// enabling zero-copy access via direct reads.
+#[derive(Clone, Debug)]
 pub struct ResponseEntry {
     pub buf: Bytes,
+}
+
+impl serde::Serialize for ResponseEntry {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(&self.buf)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ResponseEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = <Vec<u8> as serde::Deserialize>::deserialize(d)?;
+        Ok(Self {
+            buf: bytes::Bytes::from(v),
+        })
+    }
 }
 
 impl ResponseEntry {
@@ -110,46 +125,61 @@ impl ResponseEntry {
     pub const TAG_ERROR: u8 = 0x04;
     pub const TAG_MESSAGES: u8 = 0x05;
     pub const TAG_BATCH: u8 = 0x06;
+    pub const TAG_GROUP_JOINED: u8 = 0x07;
+    pub const TAG_GROUP_SYNCED: u8 = 0x08;
+    pub const TAG_DEAD_LETTERED: u8 = 0x09;
+    pub const TAG_RETAINED_MESSAGES: u8 = 0x0A;
+    pub const TAG_WILL_PENDING: u8 = 0x0B;
+    pub const TAG_SESSION_RESTORED: u8 = 0x0C;
+    pub const TAG_SESSION_NOT_FOUND: u8 = 0x0D;
+    pub const TAG_MULTI_MESSAGES: u8 = 0x0E;
+    pub const TAG_TOPIC_ALIASES: u8 = 0x0F;
+    pub const TAG_WILLS_FIRED: u8 = 0x10;
+    pub const TAG_STATS: u8 = 0x11;
+    pub const TAG_COMMITTED: u8 = 0x12;
 
-    /// Encode a Published response (32 bytes).
-    pub fn published(log_index: u64, base_offset: u64, count: u64) -> Self {
-        let mut buf = BytesMut::with_capacity(32);
+    pub const ERR_CUSTOM: u8 = 0;
+    pub const ERR_NOT_FOUND: u8 = 1;
+    pub const ERR_ALREADY_EXISTS: u8 = 2;
+    pub const ERR_MAILBOX_FULL: u8 = 3;
+    pub const ERR_BACK_PRESSURE: u8 = 4;
+    pub const ERR_ILLEGAL_GENERATION: u8 = 5;
+    pub const ERR_REBALANCE_IN_PROGRESS: u8 = 6;
+    pub const ERR_UNKNOWN_MEMBER_ID: u8 = 7;
+
+    pub fn split_from(buf: &mut BytesMut) -> Self {
+        Self {
+            buf: buf.split().freeze(),
+        }
+    }
+
+    pub fn write_ok(buf: &mut BytesMut, log_index: u64) {
+        buf.put_u8(Self::TAG_OK);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 6);
+        buf.put_u64_le(log_index);
+    }
+
+    pub fn write_published(buf: &mut BytesMut, log_index: u64, base_offset: u64, count: u64) {
         buf.put_u8(Self::TAG_PUBLISHED);
         buf.put_u8(Self::STATUS_OK);
-        buf.put_bytes(0, 6); // pad to 8
+        buf.put_bytes(0, 6);
         buf.put_u64_le(log_index);
         buf.put_u64_le(base_offset);
         buf.put_u64_le(count);
-        Self { buf: buf.freeze() }
     }
 
-    /// Encode an EntityCreated response (24 bytes).
-    pub fn entity_created(log_index: u64, entity_id: u64) -> Self {
-        let mut buf = BytesMut::with_capacity(24);
+    pub fn write_entity_created(buf: &mut BytesMut, log_index: u64, entity_id: u64) {
         buf.put_u8(Self::TAG_ENTITY_CREATED);
         buf.put_u8(Self::STATUS_OK);
         buf.put_bytes(0, 6);
         buf.put_u64_le(log_index);
         buf.put_u64_le(entity_id);
-        Self { buf: buf.freeze() }
     }
 
-    /// Encode an Ok response (16 bytes).
-    pub fn ok(log_index: u64) -> Self {
-        let mut buf = BytesMut::with_capacity(16);
-        buf.put_u8(Self::TAG_OK);
-        buf.put_u8(Self::STATUS_OK);
-        buf.put_bytes(0, 6);
-        buf.put_u64_le(log_index);
-        Self { buf: buf.freeze() }
-    }
-
-    /// Encode an Error response (24+ bytes).
-    pub fn error(log_index: u64, error_code: u32, msg: &str) -> Self {
+    pub fn write_error(buf: &mut BytesMut, log_index: u64, error_code: u32, msg: &str) {
         let msg_bytes = msg.as_bytes();
         let padded_msg_len = (msg_bytes.len() + 7) & !7;
-        let total = 24 + padded_msg_len;
-        let mut buf = BytesMut::with_capacity(total);
         buf.put_u8(Self::TAG_ERROR);
         buf.put_u8(Self::STATUS_ERROR);
         buf.put_bytes(0, 6);
@@ -161,20 +191,357 @@ impl ResponseEntry {
         if pad > 0 {
             buf.put_bytes(0, pad);
         }
-        Self { buf: buf.freeze() }
     }
 
-    /// Construct from an MqResponse.
-    pub fn from_response(log_index: u64, response: &MqResponse) -> Self {
-        match response {
-            MqResponse::Ok => Self::ok(log_index),
-            MqResponse::Published { base_offset, count } => {
-                Self::published(log_index, *base_offset, *count)
-            }
-            MqResponse::EntityCreated { id } => Self::entity_created(log_index, *id),
-            MqResponse::Error(e) => Self::error(log_index, 1, &e.to_string()),
-            _ => Self::ok(log_index), // fallback for complex responses
+    pub fn write_mq_error(buf: &mut BytesMut, log_index: u64, error: &crate::types::MqError) {
+        use crate::types::MqError;
+        let (error_kind, entity_id) = match error {
+            MqError::NotFound { id, .. } => (Self::ERR_NOT_FOUND, *id),
+            MqError::AlreadyExists { id, .. } => (Self::ERR_ALREADY_EXISTS, *id),
+            MqError::MailboxFull { pending } => (Self::ERR_MAILBOX_FULL, *pending as u64),
+            MqError::BackPressure { group_id } => (Self::ERR_BACK_PRESSURE, *group_id),
+            MqError::IllegalGeneration => (Self::ERR_ILLEGAL_GENERATION, 0),
+            MqError::RebalanceInProgress => (Self::ERR_REBALANCE_IN_PROGRESS, 0),
+            MqError::UnknownMemberId => (Self::ERR_UNKNOWN_MEMBER_ID, 0),
+            MqError::Custom(_) => (Self::ERR_CUSTOM, 0),
+        };
+        let msg = error.to_string();
+        let msg_bytes = msg.as_bytes();
+        let padded_msg_len = (msg_bytes.len() + 7) & !7;
+        buf.put_u8(Self::TAG_ERROR);
+        buf.put_u8(Self::STATUS_ERROR);
+        buf.put_u8(error_kind);
+        buf.put_bytes(0, 5); // pad to 8
+        buf.put_u64_le(log_index);
+        buf.put_u64_le(entity_id);
+        buf.put_u32_le(msg_bytes.len() as u32);
+        buf.put_bytes(0, 4); // pad
+        buf.put_slice(msg_bytes);
+        if padded_msg_len > msg_bytes.len() {
+            buf.put_bytes(0, padded_msg_len - msg_bytes.len());
         }
+    }
+
+    pub fn write_messages(
+        buf: &mut BytesMut,
+        log_index: u64,
+        messages: &[crate::types::DeliveredMessage],
+    ) {
+        buf.put_u8(Self::TAG_MESSAGES);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_u16_le(messages.len() as u16);
+        buf.put_bytes(0, 4); // pad
+        buf.put_u64_le(log_index);
+        for m in messages {
+            buf.put_u64_le(m.message_id);
+            buf.put_u64_le(m.original_timestamp);
+            buf.put_u64_le(m.group_id);
+            buf.put_u32_le(m.attempt);
+            buf.put_bytes(0, 4); // pad
+        }
+    }
+
+    pub fn write_batch_response(buf: &mut BytesMut, log_index: u64, entries: &[ResponseEntry]) {
+        buf.put_u8(Self::TAG_BATCH);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_u16_le(entries.len() as u16);
+        buf.put_bytes(0, 4); // pad
+        buf.put_u64_le(log_index);
+        for entry in entries {
+            let entry_bytes = entry.buf.as_ref();
+            let padded = (entry_bytes.len() + 7) & !7;
+            buf.put_u32_le(entry_bytes.len() as u32);
+            buf.put_bytes(0, 4); // pad
+            buf.put_slice(entry_bytes);
+            let pad = padded - entry_bytes.len();
+            if pad > 0 {
+                buf.put_bytes(0, pad);
+            }
+        }
+    }
+
+    pub fn write_group_joined(
+        buf: &mut BytesMut,
+        log_index: u64,
+        generation: i32,
+        leader: &str,
+        member_id: &str,
+        protocol_name: &str,
+        is_leader: bool,
+        phase_complete: bool,
+        members: &[(String, bytes::Bytes)],
+    ) {
+        let flags: u8 = (is_leader as u8) | ((phase_complete as u8) << 1);
+        let member_count = if is_leader { members.len() } else { 0 };
+        buf.put_u8(Self::TAG_GROUP_JOINED);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_u8(flags);
+        buf.put_u8(0); // pad
+        buf.put_i32_le(generation);
+        buf.put_u64_le(log_index);
+        buf.put_u16_le(leader.len() as u16);
+        buf.put_u16_le(member_id.len() as u16);
+        buf.put_u16_le(protocol_name.len() as u16);
+        buf.put_u16_le(member_count as u16);
+        // Write variable strings
+        let strings_start = buf.len();
+        buf.put_slice(leader.as_bytes());
+        buf.put_slice(member_id.as_bytes());
+        buf.put_slice(protocol_name.as_bytes());
+        let strings_len = buf.len() - strings_start;
+        let strings_pad = (8 - (strings_len % 8)) % 8;
+        if strings_pad > 0 {
+            buf.put_bytes(0, strings_pad);
+        }
+        // Write member list (only if leader)
+        if is_leader {
+            for (mid, meta) in members {
+                let mid_padded = (mid.len() + 7) & !7;
+                let meta_padded = (meta.len() + 7) & !7;
+                buf.put_u32_le(mid.len() as u32);
+                buf.put_u32_le(meta.len() as u32);
+                buf.put_slice(mid.as_bytes());
+                if mid_padded > mid.len() {
+                    buf.put_bytes(0, mid_padded - mid.len());
+                }
+                buf.put_slice(meta.as_ref());
+                if meta_padded > meta.len() {
+                    buf.put_bytes(0, meta_padded - meta.len());
+                }
+            }
+        }
+    }
+
+    pub fn write_group_synced(
+        buf: &mut BytesMut,
+        log_index: u64,
+        assignment: &[u8],
+        phase_complete: bool,
+    ) {
+        let padded = (assignment.len() + 7) & !7;
+        buf.put_u8(Self::TAG_GROUP_SYNCED);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_u8(phase_complete as u8);
+        buf.put_bytes(0, 5); // pad
+        buf.put_u64_le(log_index);
+        buf.put_u32_le(assignment.len() as u32);
+        buf.put_bytes(0, 4); // pad
+        buf.put_slice(assignment);
+        if padded > assignment.len() {
+            buf.put_bytes(0, padded - assignment.len());
+        }
+    }
+
+    pub fn write_dead_lettered(
+        buf: &mut BytesMut,
+        log_index: u64,
+        dlq_topic_id: u64,
+        dead_letter_ids: &[u64],
+    ) {
+        buf.put_u8(Self::TAG_DEAD_LETTERED);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 2); // pad
+        buf.put_u32_le(dead_letter_ids.len() as u32);
+        buf.put_u64_le(log_index);
+        buf.put_u64_le(dlq_topic_id);
+        for &id in dead_letter_ids {
+            buf.put_u64_le(id);
+        }
+    }
+
+    pub fn write_retained_messages(
+        buf: &mut BytesMut,
+        log_index: u64,
+        messages: &[crate::types::RetainedEntry],
+    ) {
+        buf.put_u8(Self::TAG_RETAINED_MESSAGES);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 2); // pad
+        buf.put_u32_le(messages.len() as u32);
+        buf.put_u64_le(log_index);
+        for entry in messages {
+            let rk_padded = (entry.routing_key.len() + 7) & !7;
+            let msg_padded = (entry.message.len() + 7) & !7;
+            buf.put_u32_le(entry.routing_key.len() as u32);
+            buf.put_u32_le(entry.message.len() as u32);
+            buf.put_slice(&entry.routing_key);
+            if rk_padded > entry.routing_key.len() {
+                buf.put_bytes(0, rk_padded - entry.routing_key.len());
+            }
+            buf.put_slice(&entry.message);
+            if msg_padded > entry.message.len() {
+                buf.put_bytes(0, msg_padded - entry.message.len());
+            }
+        }
+    }
+
+    pub fn write_will_pending(buf: &mut BytesMut, log_index: u64, session_id: u64, delay_ms: u64) {
+        buf.put_u8(Self::TAG_WILL_PENDING);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 6); // pad
+        buf.put_u64_le(log_index);
+        buf.put_u64_le(session_id);
+        buf.put_u64_le(delay_ms);
+    }
+
+    pub fn write_session_restored(
+        buf: &mut BytesMut,
+        log_index: u64,
+        session_id: u64,
+        session_expiry_ms: u64,
+        subscription_data: &[u8],
+    ) {
+        let padded = (subscription_data.len() + 7) & !7;
+        buf.put_u8(Self::TAG_SESSION_RESTORED);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 6); // pad
+        buf.put_u64_le(log_index);
+        buf.put_u64_le(session_id);
+        buf.put_u64_le(session_expiry_ms);
+        buf.put_u32_le(subscription_data.len() as u32);
+        buf.put_bytes(0, 4); // pad
+        buf.put_slice(subscription_data);
+        if padded > subscription_data.len() {
+            buf.put_bytes(0, padded - subscription_data.len());
+        }
+    }
+
+    pub fn write_session_not_found(buf: &mut BytesMut, log_index: u64) {
+        buf.put_u8(Self::TAG_SESSION_NOT_FOUND);
+        buf.put_u8(Self::STATUS_ERROR);
+        buf.put_bytes(0, 6); // pad
+        buf.put_u64_le(log_index);
+    }
+
+    pub fn write_multi_messages(
+        buf: &mut BytesMut,
+        log_index: u64,
+        groups: &[(u64, smallvec::SmallVec<[crate::types::DeliveredMessage; 8]>)],
+    ) {
+        buf.put_u8(Self::TAG_MULTI_MESSAGES);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 2); // pad
+        buf.put_u32_le(groups.len() as u32);
+        buf.put_u64_le(log_index);
+        for (group_id, messages) in groups {
+            buf.put_u64_le(*group_id);
+            buf.put_u32_le(messages.len() as u32);
+            buf.put_bytes(0, 4); // pad
+            for m in messages {
+                buf.put_u64_le(m.message_id);
+                buf.put_u64_le(m.original_timestamp);
+                buf.put_u64_le(m.group_id);
+                buf.put_u32_le(m.attempt);
+                buf.put_bytes(0, 4); // pad
+            }
+        }
+    }
+
+    pub fn write_topic_aliases(
+        buf: &mut BytesMut,
+        log_index: u64,
+        aliases: &[crate::types::TopicAliasEntry],
+    ) {
+        buf.put_u8(Self::TAG_TOPIC_ALIASES);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 2); // pad
+        buf.put_u32_le(aliases.len() as u32);
+        buf.put_u64_le(log_index);
+        for alias in aliases {
+            let name_bytes = alias.topic_name.as_bytes();
+            let name_padded = (name_bytes.len() + 7) & !7;
+            buf.put_u16_le(alias.alias);
+            buf.put_u16_le(name_bytes.len() as u16);
+            buf.put_bytes(0, 4); // pad
+            buf.put_slice(name_bytes);
+            if name_padded > name_bytes.len() {
+                buf.put_bytes(0, name_padded - name_bytes.len());
+            }
+        }
+    }
+
+    pub fn write_committed(buf: &mut BytesMut, log_index: u64) {
+        buf.put_u8(Self::TAG_COMMITTED);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 6); // pad
+        buf.put_u64_le(log_index);
+    }
+
+    pub fn write_wills_fired(buf: &mut BytesMut, log_index: u64, count: u32) {
+        buf.put_u8(Self::TAG_WILLS_FIRED);
+        buf.put_u8(Self::STATUS_OK);
+        buf.put_bytes(0, 2); // pad
+        buf.put_u32_le(count);
+        buf.put_u64_le(log_index);
+    }
+
+    pub fn write_stats(buf: &mut BytesMut, log_index: u64, stats: &crate::types::EntityStats) {
+        use crate::types::EntityStats;
+        match stats {
+            EntityStats::Topic {
+                topic_id,
+                message_count,
+                head_index,
+                tail_index,
+            } => {
+                buf.put_u8(Self::TAG_STATS);
+                buf.put_u8(Self::STATUS_OK);
+                buf.put_u8(0); // kind=Topic
+                buf.put_bytes(0, 5); // pad
+                buf.put_u64_le(log_index);
+                buf.put_u64_le(*topic_id);
+                buf.put_u64_le(*message_count);
+                buf.put_u64_le(*head_index);
+                buf.put_u64_le(*tail_index);
+            }
+            EntityStats::ConsumerGroup {
+                group_id,
+                variant,
+                pending_count,
+                in_flight_count,
+                dlq_count,
+                active_actor_count,
+            } => {
+                buf.put_u8(Self::TAG_STATS);
+                buf.put_u8(Self::STATUS_OK);
+                buf.put_u8(1); // kind=ConsumerGroup
+                buf.put_bytes(0, 5); // pad
+                buf.put_u64_le(log_index);
+                buf.put_u64_le(*group_id);
+                buf.put_u32_le(*variant as u32);
+                buf.put_bytes(0, 4); // pad
+                buf.put_u64_le(*pending_count);
+                buf.put_u64_le(*in_flight_count);
+                buf.put_u64_le(*dlq_count);
+                buf.put_u64_le(*active_actor_count);
+            }
+        }
+    }
+
+    pub fn ok(log_index: u64) -> Self {
+        let mut buf = BytesMut::with_capacity(16);
+        Self::write_ok(&mut buf, log_index);
+        Self::split_from(&mut buf)
+    }
+
+    pub fn published(log_index: u64, base_offset: u64, count: u64) -> Self {
+        let mut buf = BytesMut::with_capacity(32);
+        Self::write_published(&mut buf, log_index, base_offset, count);
+        Self::split_from(&mut buf)
+    }
+
+    pub fn entity_created(log_index: u64, entity_id: u64) -> Self {
+        let mut buf = BytesMut::with_capacity(24);
+        Self::write_entity_created(&mut buf, log_index, entity_id);
+        Self::split_from(&mut buf)
+    }
+
+    pub fn error(log_index: u64, error_code: u32, msg: &str) -> Self {
+        let msg_bytes = msg.as_bytes();
+        let padded_msg_len = (msg_bytes.len() + 7) & !7;
+        let mut buf = BytesMut::with_capacity(24 + padded_msg_len);
+        Self::write_error(&mut buf, log_index, error_code, msg);
+        Self::split_from(&mut buf)
     }
 
     // Zero-copy accessors.
@@ -195,68 +562,258 @@ impl ResponseEntry {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
+    /// For TAG_PUBLISHED: base_offset at buf[16..24]
+    pub fn base_offset(&self) -> u64 {
+        u64::from_le_bytes(self.buf[16..24].try_into().unwrap())
+    }
+
+    /// For TAG_PUBLISHED: count at buf[24..32]
+    pub fn published_count(&self) -> u64 {
+        u64::from_le_bytes(self.buf[24..32].try_into().unwrap())
+    }
+
+    /// For TAG_ENTITY_CREATED: entity_id at buf[16..24]
+    pub fn entity_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[16..24].try_into().unwrap())
+    }
+
+    /// For TAG_MESSAGES: message count at buf[2..4] as u16
+    pub fn message_count(&self) -> u16 {
+        u16::from_le_bytes(self.buf[2..4].try_into().unwrap())
+    }
+
+    /// For TAG_MESSAGES: iterate delivered messages
+    pub fn messages(&self) -> impl Iterator<Item = crate::types::DeliveredMessage> + '_ {
+        let count = self.message_count() as usize;
+        (0..count).map(move |i| {
+            let off = 16 + i * 32;
+            crate::types::DeliveredMessage {
+                message_id: u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap()),
+                original_timestamp: u64::from_le_bytes(
+                    self.buf[off + 8..off + 16].try_into().unwrap(),
+                ),
+                group_id: u64::from_le_bytes(self.buf[off + 16..off + 24].try_into().unwrap()),
+                attempt: u32::from_le_bytes(self.buf[off + 24..off + 28].try_into().unwrap()),
+            }
+        })
+    }
+
+    /// For TAG_ERROR: error_kind at buf[2]
+    pub fn error_kind(&self) -> u8 {
+        self.buf[2]
+    }
+
+    /// For TAG_ERROR (write_mq_error format): entity_id at buf[16..24]
+    pub fn error_entity_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[16..24].try_into().unwrap())
+    }
+
+    /// For TAG_ERROR (write_mq_error format): error message string at buf[32..]
+    pub fn error_message(&self) -> &str {
+        let msg_len = u32::from_le_bytes(self.buf[24..28].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.buf[32..32 + msg_len]).unwrap_or("")
+    }
+
+    /// For TAG_STATS ConsumerGroup: pending_count at buf[32..40]
+    pub fn stats_pending_count(&self) -> u64 {
+        u64::from_le_bytes(self.buf[32..40].try_into().unwrap())
+    }
+
+    /// For TAG_STATS ConsumerGroup: in_flight_count at buf[40..48]
+    pub fn stats_in_flight_count(&self) -> u64 {
+        u64::from_le_bytes(self.buf[40..48].try_into().unwrap())
+    }
+
+    /// For TAG_STATS ConsumerGroup: dlq_count at buf[48..56]
+    pub fn stats_dlq_count(&self) -> u64 {
+        u64::from_le_bytes(self.buf[48..56].try_into().unwrap())
+    }
+
+    /// For TAG_STATS: kind byte at buf[2]; 0 = Topic, 1 = ConsumerGroup
+    pub fn stats_kind(&self) -> u8 {
+        self.buf[2]
+    }
+
+    /// Returns true if this is TAG_ERROR with ERR_ALREADY_EXISTS kind
+    pub fn is_already_exists(&self) -> bool {
+        self.tag() == Self::TAG_ERROR && self.buf[2] == Self::ERR_ALREADY_EXISTS
+    }
+
+    /// For TAG_BATCH: sub-entry count at buf[2..4]
+    pub fn batch_count(&self) -> u16 {
+        u16::from_le_bytes(self.buf[2..4].try_into().unwrap())
+    }
+
+    /// For TAG_BATCH: iterate sub-entries
+    pub fn batch_entries(&self) -> impl Iterator<Item = ResponseEntry> + '_ {
+        let count = self.batch_count() as usize;
+        let mut pos = 16usize; // after [tag:1][status:1][count:2][pad:4][log_index:8]
+        let buf = self.buf.clone();
+        (0..count).map(move |_| {
+            let entry_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 8; // skip [entry_len:4][pad:4]
+            let entry_buf = buf.slice(pos..pos + entry_len);
+            let padded = (entry_len + 7) & !7;
+            pos += padded;
+            ResponseEntry { buf: entry_buf }
+        })
+    }
+
+    /// For TAG_DEAD_LETTERED: dlq_topic_id at buf[16..24]
+    pub fn dlq_topic_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[16..24].try_into().unwrap())
+    }
+
+    /// For TAG_DEAD_LETTERED: count at buf[4..8]
+    pub fn dead_letter_count(&self) -> u32 {
+        u32::from_le_bytes(self.buf[4..8].try_into().unwrap())
+    }
+
+    /// For TAG_DEAD_LETTERED: iterate dead letter ids
+    pub fn dead_letter_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        let count = self.dead_letter_count() as usize;
+        (0..count).map(move |i| {
+            let off = 24 + i * 8;
+            u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap())
+        })
+    }
+
+    /// For TAG_WILL_PENDING: session_id at buf[16..24]
+    pub fn will_pending_session_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[16..24].try_into().unwrap())
+    }
+
+    /// For TAG_WILL_PENDING: delay_ms at buf[24..32]
+    pub fn will_pending_delay_ms(&self) -> u64 {
+        u64::from_le_bytes(self.buf[24..32].try_into().unwrap())
+    }
+
+    /// For TAG_WILLS_FIRED: count at buf[4..8]
+    pub fn wills_fired_count(&self) -> u32 {
+        u32::from_le_bytes(self.buf[4..8].try_into().unwrap())
+    }
+
+    /// For TAG_GROUP_SYNCED: phase_complete from buf[2]
+    pub fn group_synced_phase_complete(&self) -> bool {
+        self.buf[2] != 0
+    }
+
+    /// For TAG_GROUP_SYNCED: assignment bytes
+    pub fn group_synced_assignment(&self) -> &[u8] {
+        let len = u32::from_le_bytes(self.buf[16..20].try_into().unwrap()) as usize;
+        &self.buf[24..24 + len]
+    }
+
+    /// For TAG_GROUP_JOINED: generation from buf[4..8] as i32
+    pub fn group_joined_generation(&self) -> i32 {
+        i32::from_le_bytes(self.buf[4..8].try_into().unwrap())
+    }
+
+    /// For TAG_GROUP_JOINED: is_leader flag (bit 0 of buf[2])
+    pub fn group_joined_is_leader(&self) -> bool {
+        self.buf[2] & 1 != 0
+    }
+
+    /// For TAG_GROUP_JOINED: phase_complete flag (bit 1 of buf[2])
+    pub fn group_joined_phase_complete(&self) -> bool {
+        self.buf[2] & 2 != 0
+    }
+
+    /// For TAG_GROUP_JOINED: parse leader, member_id, protocol_name, members
+    /// Returns (leader, member_id, protocol_name, members: Vec<(String, Bytes)>)
+    pub fn group_joined_fields(&self) -> (String, String, String, Vec<(String, bytes::Bytes)>) {
+        let leader_len = u16::from_le_bytes(self.buf[16..18].try_into().unwrap()) as usize;
+        let member_id_len = u16::from_le_bytes(self.buf[18..20].try_into().unwrap()) as usize;
+        let protocol_len = u16::from_le_bytes(self.buf[20..22].try_into().unwrap()) as usize;
+        let member_count = u16::from_le_bytes(self.buf[22..24].try_into().unwrap()) as usize;
+
+        let mut pos = 24usize;
+        let leader = String::from_utf8_lossy(&self.buf[pos..pos + leader_len]).into_owned();
+        pos += leader_len;
+        let member_id = String::from_utf8_lossy(&self.buf[pos..pos + member_id_len]).into_owned();
+        pos += member_id_len;
+        let protocol_name =
+            String::from_utf8_lossy(&self.buf[pos..pos + protocol_len]).into_owned();
+        pos += protocol_len;
+        // Pad to 8-byte boundary
+        let strings_total = leader_len + member_id_len + protocol_len;
+        let strings_pad = (8 - (strings_total % 8)) % 8;
+        pos += strings_pad;
+
+        let mut members = Vec::with_capacity(member_count);
+        for _ in 0..member_count {
+            let mid_len = u32::from_le_bytes(self.buf[pos..pos + 4].try_into().unwrap()) as usize;
+            let meta_len =
+                u32::from_le_bytes(self.buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            let mid_padded = (mid_len + 7) & !7;
+            let meta_padded = (meta_len + 7) & !7;
+            let mid = String::from_utf8_lossy(&self.buf[pos..pos + mid_len]).into_owned();
+            pos += mid_padded;
+            let meta = self.buf.slice(pos..pos + meta_len);
+            pos += meta_padded;
+            members.push((mid, meta));
+        }
+        (leader, member_id, protocol_name, members)
+    }
+
+    /// For TAG_SESSION_RESTORED: session_id at buf[16..24]
+    pub fn session_restored_id(&self) -> u64 {
+        u64::from_le_bytes(self.buf[16..24].try_into().unwrap())
+    }
+
+    /// For TAG_SESSION_RESTORED: session_expiry_ms at buf[24..32]
+    pub fn session_restored_expiry_ms(&self) -> u64 {
+        u64::from_le_bytes(self.buf[24..32].try_into().unwrap())
+    }
+
+    /// For TAG_SESSION_RESTORED: subscription_data bytes
+    pub fn session_restored_subscription_data(&self) -> bytes::Bytes {
+        let len = u32::from_le_bytes(self.buf[32..36].try_into().unwrap()) as usize;
+        self.buf.slice(40..40 + len)
+    }
+
+    /// For TAG_RETAINED_MESSAGES: parse all entries into a Vec.
+    ///
+    /// Binary layout: `[tag:1][pad:3][count:4][pad:8][entries...]`
+    /// Each entry: `[rk_len:4][msg_len:4][rk_bytes (padded to 8)][msg_bytes (padded to 8)]`
+    pub fn retained_messages(&self) -> impl Iterator<Item = crate::types::RetainedEntry> + '_ {
+        let count = u32::from_le_bytes(self.buf[4..8].try_into().unwrap()) as usize;
+        let mut pos = 16usize;
+        let mut remaining = count;
+        let buf = self.buf.clone();
+        std::iter::from_fn(move || {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            let rk_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            let msg_len = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            let rk_padded = (rk_len + 7) & !7;
+            let msg_padded = (msg_len + 7) & !7;
+            let routing_key = buf.slice(pos..pos + rk_len);
+            pos += rk_padded;
+            let message = buf.slice(pos..pos + msg_len);
+            pos += msg_padded;
+            Some(crate::types::RetainedEntry {
+                routing_key,
+                message,
+            })
+        })
+    }
+
     /// Write a complete dispatch frame into `buf` without a separate allocation.
     ///
     /// Frame layout: `[len:4 LE][client_id:4 LE][ResponseEntry bytes...]`
     /// where `len` = `4 (client_id field) + ResponseEntry byte count`.
-    pub fn encode_frame_into(
-        buf: &mut BytesMut,
-        client_id: u32,
-        log_index: u64,
-        response: &MqResponse,
-    ) {
+    pub fn encode_frame_into(buf: &mut BytesMut, client_id: u32, response: &ResponseEntry) {
         let len_pos = buf.len();
         buf.put_u32_le(0); // placeholder — filled after encoding the entry
         buf.put_u32_le(client_id);
-        let entry_start = buf.len();
-        match response {
-            MqResponse::Ok => {
-                buf.put_u8(Self::TAG_OK);
-                buf.put_u8(Self::STATUS_OK);
-                buf.put_bytes(0, 6);
-                buf.put_u64_le(log_index);
-            }
-            MqResponse::Published { base_offset, count } => {
-                buf.put_u8(Self::TAG_PUBLISHED);
-                buf.put_u8(Self::STATUS_OK);
-                buf.put_bytes(0, 6);
-                buf.put_u64_le(log_index);
-                buf.put_u64_le(*base_offset);
-                buf.put_u64_le(*count);
-            }
-            MqResponse::EntityCreated { id } => {
-                buf.put_u8(Self::TAG_ENTITY_CREATED);
-                buf.put_u8(Self::STATUS_OK);
-                buf.put_bytes(0, 6);
-                buf.put_u64_le(log_index);
-                buf.put_u64_le(*id);
-            }
-            MqResponse::Error(e) => {
-                let msg = e.to_string();
-                let msg_bytes = msg.as_bytes();
-                let padded_msg_len = (msg_bytes.len() + 7) & !7;
-                buf.put_u8(Self::TAG_ERROR);
-                buf.put_u8(Self::STATUS_ERROR);
-                buf.put_bytes(0, 6);
-                buf.put_u64_le(log_index);
-                buf.put_u32_le(1u32); // error_code
-                buf.put_u32_le(msg_bytes.len() as u32);
-                buf.put_slice(msg_bytes);
-                let pad = padded_msg_len - msg_bytes.len();
-                if pad > 0 {
-                    buf.put_bytes(0, pad);
-                }
-            }
-            _ => {
-                buf.put_u8(Self::TAG_OK);
-                buf.put_u8(Self::STATUS_OK);
-                buf.put_bytes(0, 6);
-                buf.put_u64_le(log_index);
-            }
-        }
+        buf.put_slice(&response.buf);
         let payload_len = (buf.len() - len_pos - 4) as u32; // client_id(4) + entry bytes
         buf[len_pos..len_pos + 4].copy_from_slice(&payload_len.to_le_bytes());
-        let _ = entry_start; // used only to document the split point
     }
 
     /// Write a log-index-only dispatch frame into `buf` without a separate allocation.
@@ -276,10 +833,6 @@ impl ResponseEntry {
 
 /// Per-follower responder tx table, indexed directly by node_id (< 64).
 pub type ResponderTxVec = Box<[Option<crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>>; 64]>;
-
-/// Shared, atomically-swappable reference to the live responder channel table.
-/// Used by [`ForwardAcceptor`] for its own `push_response` calls.
-pub type SharedResponderTxs = Arc<ArcSwap<ResponderTxVec>>;
 
 /// Message type for responder update notifications sent to [`PartitionWorker`]s.
 pub type ResponderUpdateMsg = (
@@ -369,7 +922,8 @@ impl ClientPartition {
         let mut pos = 0;
         while pos + 4 <= buf.len() {
             let frame_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-            if frame_len < 4 || pos + 4 + frame_len > buf.len() {
+            // Minimum frame: client_id(4) + request_seq(8) + log_index(8) = 20
+            if frame_len < 20 || pos + 4 + frame_len > buf.len() {
                 break;
             }
             let payload_start = pos + 4;
@@ -377,6 +931,7 @@ impl ClientPartition {
                 u32::from_le_bytes(buf[payload_start..payload_start + 4].try_into().unwrap());
             if n == 1 || (client_id as usize) % n == p {
                 if let Some(cb) = self.callbacks.get(&client_id) {
+                    // msg starts after client_id: [request_seq:8][log_index:8][response_bytes]
                     let msg_offset = payload_start + 4;
                     let msg_end = payload_start + frame_len;
                     cb(slab, msg_offset, &buf[msg_offset..msg_end], false);
@@ -585,6 +1140,7 @@ struct PartitionWorker {
     engine: Arc<MqEngine>,
     client_registry: Arc<ClientRegistry>,
     client_id_table: Arc<ClientIdTable>,
+    batch_registry: Arc<ParkingMutex<HashMap<u32, tokio::sync::oneshot::Sender<ResponseEntry>>>>,
     /// Owned per-follower responder tx table, indexed by node_id.
     /// Updated via `responder_update_rx` when followers connect/disconnect.
     responder_txs: Box<[Option<crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>>; 64]>,
@@ -726,16 +1282,34 @@ impl PartitionWorker {
 
             let cmd = rec.command;
 
-            // TAG_BATCH is applied synchronously by the state machine. Skip.
+            // TAG_BATCH: designated worker (log_index % num_partitions == partition_id)
+            // applies the full batch and delivers response via batch_registry.
             if cmd.tag() == MqCommand::TAG_BATCH {
+                if (rec.log_index as usize) % self.num_partitions == self.partition_id {
+                    let segment_id = scan.current_segment_id().unwrap_or(0);
+                    let batch_id = cmd.as_batch().batch_id();
+                    let mut resp_buf = BytesMut::new();
+                    self.engine.apply_command(
+                        &cmd,
+                        &mut resp_buf,
+                        rec.log_index,
+                        current_time,
+                        Some(segment_id),
+                    );
+                    let response = ResponseEntry::split_from(&mut resp_buf);
+                    self.handle_structural_writes(&cmd, &response, rec.log_index);
+                    // Deliver to batcher via registry.
+                    if batch_id != 0 {
+                        if let Some(tx) = self.batch_registry.lock().remove(&batch_id) {
+                            let _ = tx.send(response);
+                        }
+                    }
+                }
                 continue;
             }
 
-            // TAG_FORWARDED_BATCH: state machine already applied the sub-commands.
-            // Accumulate [client_id:4 LE][log_index:8 LE] records into the
-            // per-follower output buffer for all sub-commands owned by this
-            // partition.  Flush to the FollowerResponder channel when thresholds
-            // are met or at end-of-range.
+            // TAG_FORWARDED_BATCH: accumulate response frames for follower responders
+            // (by client_id % N), and apply sub-commands to the engine (by primary_id % N).
             if cmd.tag() == MqCommand::TAG_FORWARDED_BATCH {
                 let view = cmd.as_forwarded_batch();
                 let node_id = view.node_id();
@@ -743,21 +1317,45 @@ impl PartitionWorker {
                     (node_id as usize) < 64,
                     "node_id {node_id} exceeds response_buf capacity"
                 );
-                for (client_id, _) in view.iter() {
+                // Response routing: accumulate frames for sub-commands owned by this partition.
+                for (client_id, request_seq, _) in view.iter() {
                     if (client_id as usize) % self.num_partitions == self.partition_id {
                         let buf = &mut self.response_buf[node_id as usize];
-                        buf.put_u32_le(12u32); // length prefix: 4 (client_id) + 8 (log_index)
+                        // Frame: [len:4][client_id:4][request_seq:8][log_index:8]
+                        buf.put_u32_le(20u32); // 4 (client_id) + 8 (request_seq) + 8 (log_index)
                         buf.put_u32_le(client_id);
+                        buf.put_u64_le(request_seq);
                         buf.put_u64_le(rec.log_index);
                         self.response_buf_mask |= 1u64 << node_id;
                         self.entries_since_flush += 1;
-                        self.bytes_since_flush += 16;
+                        self.bytes_since_flush += 24;
                     }
                 }
                 if self.entries_since_flush >= self.config_flush_entries
                     || self.bytes_since_flush >= self.config_flush_bytes
                 {
                     self.flush_response_buf().await;
+                }
+                // Engine apply: apply sub-commands owned by this partition (by primary_id % N).
+                for (_, _, sub_cmd_bytes) in view.iter() {
+                    let sub_cmd = MqCommand::from_bytes(cmd.buf.slice_ref(sub_cmd_bytes));
+                    if sub_cmd.tag() == MqCommand::TAG_RESUME {
+                        continue;
+                    }
+                    if !self.should_process(&sub_cmd, rec.log_index) {
+                        continue;
+                    }
+                    let segment_id = scan.current_segment_id().unwrap_or(0);
+                    let mut resp_buf = BytesMut::new();
+                    self.engine.apply_command(
+                        &sub_cmd,
+                        &mut resp_buf,
+                        rec.log_index,
+                        current_time,
+                        Some(segment_id),
+                    );
+                    let response = ResponseEntry::split_from(&mut resp_buf);
+                    self.handle_structural_writes(&sub_cmd, &response, rec.log_index);
                 }
                 continue;
             }
@@ -772,9 +1370,15 @@ impl PartitionWorker {
             let segment_id = scan.current_segment_id().unwrap();
 
             // Apply command.
-            let response =
-                self.engine
-                    .apply_command(&cmd, rec.log_index, current_time, Some(segment_id));
+            let mut resp_buf = BytesMut::new();
+            self.engine.apply_command(
+                &cmd,
+                &mut resp_buf,
+                rec.log_index,
+                current_time,
+                Some(segment_id),
+            );
+            let response = ResponseEntry::split_from(&mut resp_buf);
 
             // Post-apply: structural writes to MDBX.
             self.handle_structural_writes(&cmd, &response, rec.log_index);
@@ -783,7 +1387,7 @@ impl PartitionWorker {
             if let Some(client_id) = cid_guard.remove(&rec.log_index).copied() {
                 let partition = (client_id as usize) % self.num_partitions;
                 let mut frame = BytesMut::with_capacity(4 + 4 + 32);
-                ResponseEntry::encode_frame_into(&mut frame, client_id, rec.log_index, &response);
+                ResponseEntry::encode_frame_into(&mut frame, client_id, &response);
                 self.client_registry
                     .send_to_partition(partition, frame.freeze());
             }
@@ -897,7 +1501,7 @@ impl PartitionWorker {
         }
     }
 
-    fn handle_structural_writes(&self, cmd: &MqCommand, response: &MqResponse, log_index: u64) {
+    fn handle_structural_writes(&self, cmd: &MqCommand, response: &ResponseEntry, log_index: u64) {
         let manifest = match self.manifest {
             Some(ref m) => m,
             None => return,
@@ -936,6 +1540,11 @@ pub struct AsyncApplyManager {
     purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
     /// Broadcasts follower connect/disconnect events to all partition workers.
     responder_broadcast: ResponderBroadcast,
+    /// Registry for TAG_BATCH response delivery. Batcher registers before raft write,
+    /// designated worker sends response after apply.
+    pub(crate) batch_registry:
+        Arc<ParkingMutex<HashMap<u32, tokio::sync::oneshot::Sender<ResponseEntry>>>>,
+    batch_id_counter: Arc<AtomicU32>,
 }
 
 impl AsyncApplyManager {
@@ -996,6 +1605,11 @@ impl AsyncApplyManager {
             reg_txs,
         });
 
+        let batch_registry: Arc<
+            ParkingMutex<HashMap<u32, tokio::sync::oneshot::Sender<ResponseEntry>>>,
+        > = Arc::new(ParkingMutex::new(HashMap::new()));
+        let batch_id_counter = Arc::new(AtomicU32::new(1));
+
         let mut worker_cursors = Vec::with_capacity(n);
         let mut worker_handles = Vec::with_capacity(n);
 
@@ -1023,6 +1637,7 @@ impl AsyncApplyManager {
                 engine: Arc::clone(&engine),
                 client_registry: Arc::clone(&client_registry),
                 client_id_table: Arc::clone(&client_id_table),
+                batch_registry: Arc::clone(&batch_registry),
                 responder_txs: Box::new(std::array::from_fn(|_| None)),
                 responder_update_rx: responder_update_rxs.remove(0),
                 response_buf: Box::new(std::array::from_fn(|_| BytesMut::new())),
@@ -1054,11 +1669,20 @@ impl AsyncApplyManager {
             num_partitions: n,
             purged_segments,
             responder_broadcast,
+            batch_registry,
+            batch_id_counter,
         }
     }
 
     pub fn responder_broadcast(&self) -> ResponderBroadcast {
         self.responder_broadcast.clone()
+    }
+
+    /// Allocate a batch_id and register a response sender. Call BEFORE raft write.
+    pub fn alloc_batch(&self, tx: tokio::sync::oneshot::Sender<ResponseEntry>) -> u32 {
+        let id = self.batch_id_counter.fetch_add(1, Ordering::Relaxed);
+        self.batch_registry.lock().insert(id, tx);
+        id
     }
 
     /// Advance the HWM to the given index.
@@ -1318,20 +1942,14 @@ mod tests {
 
     #[test]
     fn response_entry_from_mq_response() {
-        let entry = ResponseEntry::from_response(1, &MqResponse::Ok);
+        let entry = ResponseEntry::ok(1);
         assert_eq!(entry.tag(), ResponseEntry::TAG_OK);
 
-        let entry = ResponseEntry::from_response(
-            2,
-            &MqResponse::Published {
-                base_offset: 10,
-                count: 5,
-            },
-        );
+        let entry = ResponseEntry::published(2, 10, 5);
         assert_eq!(entry.tag(), ResponseEntry::TAG_PUBLISHED);
         assert_eq!(entry.log_index(), 2);
 
-        let entry = ResponseEntry::from_response(3, &MqResponse::EntityCreated { id: 77 });
+        let entry = ResponseEntry::entity_created(3, 77);
         assert_eq!(entry.tag(), ResponseEntry::TAG_ENTITY_CREATED);
     }
 
@@ -1372,7 +1990,8 @@ mod tests {
 
         let p = (id as usize) % registry.num_partitions();
         let mut frame = BytesMut::with_capacity(24);
-        ResponseEntry::encode_frame_into(&mut frame, id, 42, &MqResponse::Ok);
+        let ok_entry = ResponseEntry::ok(42);
+        ResponseEntry::encode_frame_into(&mut frame, id, &ok_entry);
         registry.send_to_partition(p, frame.freeze());
         done.notified().await;
         assert_eq!(log_idx.load(Ordering::Relaxed), 42);
@@ -1406,7 +2025,8 @@ mod tests {
         for &id in &ids {
             let p = (id as usize) % registry.num_partitions();
             let mut frame = BytesMut::with_capacity(24);
-            ResponseEntry::encode_frame_into(&mut frame, id, 1, &MqResponse::Ok);
+            let ok_entry = ResponseEntry::ok(1);
+            ResponseEntry::encode_frame_into(&mut frame, id, &ok_entry);
             registry.send_to_partition(p, frame.freeze());
         }
         done.notified().await;
@@ -1532,41 +2152,17 @@ mod tests {
     #[test]
     fn response_entry_from_error() {
         use crate::types::{EntityKind, MqError};
-        let err = MqResponse::Error(MqError::NotFound {
+        let err = MqError::NotFound {
             entity: EntityKind::Topic,
             id: 42,
-        });
-        let entry = ResponseEntry::from_response(99, &err);
+        };
+        let mut buf = BytesMut::new();
+        ResponseEntry::write_mq_error(&mut buf, 99, &err);
+        let entry = ResponseEntry::split_from(&mut buf);
         assert_eq!(entry.tag(), ResponseEntry::TAG_ERROR);
         assert!(!entry.is_ok());
         assert_eq!(entry.log_index(), 99);
         assert_eq!(entry.buf.len() % 8, 0);
-    }
-
-    #[test]
-    fn response_entry_from_messages() {
-        // Messages variant falls through to Ok (fallback).
-        let resp = MqResponse::Messages {
-            messages: Default::default(),
-        };
-        let entry = ResponseEntry::from_response(50, &resp);
-        // Complex responses fall back to TAG_OK.
-        assert_eq!(entry.tag(), ResponseEntry::TAG_OK);
-        assert_eq!(entry.log_index(), 50);
-    }
-
-    #[test]
-    fn response_entry_from_batch_response() {
-        let resp = MqResponse::BatchResponse(Box::new(smallvec::smallvec![
-            MqResponse::Ok,
-            MqResponse::Published {
-                base_offset: 0,
-                count: 1
-            },
-        ]));
-        let entry = ResponseEntry::from_response(60, &resp);
-        // BatchResponse falls back to TAG_OK.
-        assert_eq!(entry.tag(), ResponseEntry::TAG_OK);
     }
 
     #[test]
@@ -1680,7 +2276,8 @@ mod tests {
         let p = (id as usize) % registry.num_partitions();
         for i in 0..10u64 {
             let mut frame = BytesMut::with_capacity(24);
-            ResponseEntry::encode_frame_into(&mut frame, id, i, &MqResponse::Ok);
+            let ok_entry = ResponseEntry::ok(i);
+            ResponseEntry::encode_frame_into(&mut frame, id, &ok_entry);
             registry.send_to_partition(p, frame.freeze());
         }
         done.notified().await;
@@ -1712,7 +2309,14 @@ mod tests {
         let num_partitions = 4;
 
         // CREATE_TOPIC at log_index=9 → 9 % 4 = 1
-        let cmd = MqCommand::create_topic("test", crate::types::RetentionPolicy::default(), 1);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(
+            &mut buf,
+            "test",
+            &crate::types::RetentionPolicy::default(),
+            1,
+        );
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(route_partition(&cmd, 9, num_partitions), 1);
     }
 
@@ -1720,25 +2324,45 @@ mod tests {
     fn worker_routing_data_plane_by_primary_id() {
         let num_partitions = 4;
 
-        let cmd = MqCommand::publish(7, &[]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 7, &[]);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(route_partition(&cmd, 0, num_partitions), 3); // 7 % 4 = 3
 
-        let cmd = MqCommand::publish(8, &[]);
+        MqCommand::write_publish_bytes(&mut buf, 8, &[]);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(route_partition(&cmd, 0, num_partitions), 0); // 8 % 4 = 0
     }
 
     #[test]
     fn worker_routing_all_structural_tags() {
         let n = 4;
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "t", &crate::types::RetentionPolicy::default(), 0);
+        let cmd_create_topic = MqCommand::split_from(&mut buf);
+        MqCommand::write_delete_topic(&mut buf, 1);
+        let cmd_delete_topic = MqCommand::split_from(&mut buf);
+        MqCommand::write_create_exchange(&mut buf, "e", crate::types::ExchangeType::Fanout);
+        let cmd_create_exchange = MqCommand::split_from(&mut buf);
+        MqCommand::write_delete_exchange(&mut buf, 1);
+        let cmd_delete_exchange = MqCommand::split_from(&mut buf);
+        MqCommand::write_create_consumer_group(&mut buf, "g", 1);
+        let cmd_create_consumer_group = MqCommand::split_from(&mut buf);
+        MqCommand::write_delete_consumer_group(&mut buf, 1);
+        let cmd_delete_consumer_group = MqCommand::split_from(&mut buf);
+        MqCommand::write_create_session(&mut buf, 1, "c", 30000, 0);
+        let cmd_create_session = MqCommand::split_from(&mut buf);
+        MqCommand::write_disconnect_session(&mut buf, 1, false);
+        let cmd_disconnect_session = MqCommand::split_from(&mut buf);
         let structural_cmds = vec![
-            MqCommand::create_topic("t", crate::types::RetentionPolicy::default(), 0),
-            MqCommand::delete_topic(1),
-            MqCommand::create_exchange("e", crate::types::ExchangeType::Fanout),
-            MqCommand::delete_exchange(1),
-            MqCommand::create_consumer_group("g", 1),
-            MqCommand::delete_consumer_group(1),
-            MqCommand::create_session(1, "c", 30000, 0),
-            MqCommand::disconnect_session(1, false),
+            cmd_create_topic,
+            cmd_delete_topic,
+            cmd_create_exchange,
+            cmd_delete_exchange,
+            cmd_create_consumer_group,
+            cmd_delete_consumer_group,
+            cmd_create_session,
+            cmd_disconnect_session,
         ];
 
         for cmd in &structural_cmds {
@@ -1758,9 +2382,13 @@ mod tests {
     #[test]
     fn worker_routing_data_plane_deterministic() {
         let n = 8;
+        let mut buf = BytesMut::new();
         for topic_id in 0..100u64 {
-            let cmd = MqCommand::publish(topic_id, &[]);
+            MqCommand::write_publish_bytes(&mut buf, topic_id, &[]);
+            let cmd = MqCommand::split_from(&mut buf);
             let p1 = route_partition(&cmd, 1, n);
+            MqCommand::write_publish_bytes(&mut buf, topic_id, &[]);
+            let cmd = MqCommand::split_from(&mut buf);
             let p2 = route_partition(&cmd, 999, n);
             // Same primary_id always maps to same partition regardless of log_index.
             assert_eq!(
@@ -1774,7 +2402,11 @@ mod tests {
     fn worker_routing_batch_not_structural() {
         // TAG_BATCH should NOT match any structural tag, so it falls through
         // to data-plane routing (which workers skip entirely for batch).
-        let batch = MqCommand::batch(&[MqCommand::publish(1, &[])]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[]);
+        let inner = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[inner]);
+        let batch = MqCommand::split_from(&mut buf);
         assert_eq!(batch.tag(), MqCommand::TAG_BATCH);
 
         // Verify TAG_BATCH is not in the structural set.
@@ -1786,17 +2418,22 @@ mod tests {
 
     #[test]
     fn worker_routing_commit_offset_by_primary_id() {
-        let cmd = MqCommand::commit_offset(42, 1, 100);
+        let mut buf = BytesMut::new();
+        MqCommand::write_commit_offset(&mut buf, 42, 1, 100);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(route_partition(&cmd, 0, 8), (42usize) % 8);
     }
 
     #[test]
     fn worker_routing_single_partition() {
         // With 1 partition, everything goes to partition 0.
-        let cmd = MqCommand::publish(999, &[]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 999, &[]);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(route_partition(&cmd, 123, 1), 0);
 
-        let cmd = MqCommand::create_topic("t", crate::types::RetentionPolicy::default(), 0);
+        MqCommand::write_create_topic(&mut buf, "t", &crate::types::RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(route_partition(&cmd, 456, 1), 0);
     }
 }

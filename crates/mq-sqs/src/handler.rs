@@ -1,3 +1,4 @@
+use bytes::BytesMut;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,8 +7,9 @@ use crate::error::SqsError;
 use crate::types::*;
 use axum::Json;
 use base64::Engine as _;
+use bisque_mq::async_apply::ResponseEntry;
 use bisque_mq::flat::FlatMessageBuilder;
-use bisque_mq::types::{DeliveredMessage, EntityStats, MqCommand, MqError, MqResponse, name_hash};
+use bisque_mq::types::{DeliveredMessage, MqCommand, name_hash};
 use bisque_mq::write_batcher::MqWriteBatcher;
 
 /// Shared state for the SQS handler.
@@ -79,6 +81,7 @@ impl SqsState {
     /// Decode binary receipt handle back to (queue_id, message_id).
     /// Uses stack buffer — zero heap allocation.
     fn decode_receipt_handle(handle: &str) -> Result<(u64, u64), SqsError> {
+        let mut buf = BytesMut::new();
         let mut buf = [0u8; RECEIPT_HANDLE_RAW_LEN];
         let len = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode_slice(handle, &mut buf)
@@ -93,6 +96,7 @@ impl SqsState {
 
     /// Stack-based hex encoding — single allocation with exact capacity.
     fn md5_hex(data: &[u8]) -> String {
+        let mut buf = BytesMut::new();
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let len_val = data.len() as u64;
         let crc_val = crc(data);
@@ -116,35 +120,35 @@ impl SqsState {
         &self,
         req: CreateQueueRequest,
     ) -> Result<Json<CreateQueueResponse>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         // TODO: Map SQS-specific attributes (visibility_timeout, delay, dedup, redrive)
         // to engine-level AckVariantConfig once the full integration is wired up.
-        let cmd = MqCommand::create_consumer_group(&req.queue_name, 0);
+        let cmd = MqCommand::create_consumer_group(&mut buf, &req.queue_name, 0);
 
         let resp = self.batcher.submit(cmd).await?;
-        match resp {
-            MqResponse::EntityCreated { id: _ } => Ok(Json(CreateQueueResponse {
+        if resp.tag() == ResponseEntry::TAG_ENTITY_CREATED || resp.is_already_exists() {
+            Ok(Json(CreateQueueResponse {
                 queue_url: self.queue_url(&req.queue_name),
-            })),
-            MqResponse::Error(MqError::AlreadyExists { .. }) => {
-                // SQS returns the existing queue URL if attributes match
-                Ok(Json(CreateQueueResponse {
-                    queue_url: self.queue_url(&req.queue_name),
-                }))
-            }
-            MqResponse::Error(e) => Err(SqsError::Internal(e.to_string())),
-            _ => Err(SqsError::Internal("unexpected response".into())),
+            }))
+        } else if resp.tag() == ResponseEntry::TAG_ERROR {
+            Err(SqsError::Internal(resp.error_message().to_string()))
+        } else {
+            Err(SqsError::Internal("unexpected response".into()))
         }
     }
 
     pub async fn delete_queue(&self, req: DeleteQueueRequest) -> Result<Json<()>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let queue_name = self.parse_queue_name(&req.queue_url)?;
         let hash = name_hash(queue_name);
-        let cmd = MqCommand::delete_consumer_group(hash);
+        let cmd = MqCommand::delete_consumer_group(&mut buf, hash);
         let resp = self.batcher.submit(cmd).await?;
-        match resp {
-            MqResponse::Ok => Ok(Json(())),
-            MqResponse::Error(e) => Err(SqsError::QueueNotFound(e.to_string())),
-            _ => Err(SqsError::Internal("unexpected response".into())),
+        if resp.is_ok() {
+            Ok(Json(()))
+        } else if resp.tag() == ResponseEntry::TAG_ERROR {
+            Err(SqsError::QueueNotFound(resp.error_message().to_string()))
+        } else {
+            Err(SqsError::Internal("unexpected response".into()))
         }
     }
 
@@ -152,16 +156,19 @@ impl SqsState {
         &self,
         req: GetQueueUrlRequest,
     ) -> Result<Json<GetQueueUrlResponse>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         // Verify queue exists by getting attributes
         let hash = name_hash(&req.queue_name);
-        let cmd = MqCommand::group_get_attributes(hash);
+        let cmd = MqCommand::group_get_attributes(&mut buf, hash);
         let resp = self.batcher.submit(cmd).await?;
-        match resp {
-            MqResponse::Stats(_) => Ok(Json(GetQueueUrlResponse {
+        if resp.tag() == ResponseEntry::TAG_STATS {
+            Ok(Json(GetQueueUrlResponse {
                 queue_url: self.queue_url(&req.queue_name),
-            })),
-            MqResponse::Error(_) => Err(SqsError::QueueNotFound(req.queue_name)),
-            _ => Err(SqsError::Internal("unexpected response".into())),
+            }))
+        } else if resp.tag() == ResponseEntry::TAG_ERROR {
+            Err(SqsError::QueueNotFound(req.queue_name))
+        } else {
+            Err(SqsError::Internal("unexpected response".into()))
         }
     }
 
@@ -169,6 +176,7 @@ impl SqsState {
         &self,
         req: SendMessageRequest,
     ) -> Result<Json<SendMessageResponse>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let queue_name = self.parse_queue_name(&req.queue_url)?;
         let queue_id = name_hash(queue_name);
 
@@ -205,19 +213,22 @@ impl SqsState {
         }
         let flat_msg = builder.build();
 
-        let cmd = MqCommand::publish(queue_id, &[flat_msg]);
+        let cmd = MqCommand::publish(&mut buf, queue_id, &[flat_msg]);
 
         let resp = self.batcher.submit(cmd).await?;
         self.m_send_count.increment(1);
 
-        match resp {
-            MqResponse::Published { base_offset, .. } => Ok(Json(SendMessageResponse {
+        if resp.tag() == ResponseEntry::TAG_PUBLISHED {
+            let base_offset = resp.base_offset();
+            Ok(Json(SendMessageResponse {
                 message_id: base_offset.to_string(),
                 md5_of_message_body: md5,
                 sequence_number: Some(base_offset.to_string()),
-            })),
-            MqResponse::Error(e) => Err(SqsError::Internal(e.to_string())),
-            _ => Err(SqsError::Internal("unexpected response".into())),
+            }))
+        } else if resp.tag() == ResponseEntry::TAG_ERROR {
+            Err(SqsError::Internal(resp.error_message().to_string()))
+        } else {
+            Err(SqsError::Internal("unexpected response".into()))
         }
     }
 
@@ -225,6 +236,7 @@ impl SqsState {
         &self,
         req: SendMessageBatchRequest,
     ) -> Result<Json<SendMessageBatchResponse>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let queue_name = self.parse_queue_name(&req.queue_url)?;
         let queue_id = name_hash(queue_name);
 
@@ -251,34 +263,34 @@ impl SqsState {
             entry_ids.push(entry.id);
         }
 
-        let cmd = MqCommand::publish(queue_id, &messages);
+        let cmd = MqCommand::publish(&mut buf, queue_id, &messages);
 
         let resp = self.batcher.submit(cmd).await?;
         self.m_send_count.increment(entry_ids.len() as u64);
 
-        match resp {
-            MqResponse::Published { base_offset, .. } => {
-                let successful = entry_ids
-                    .into_iter()
-                    .zip(md5s.into_iter())
-                    .enumerate()
-                    .map(|(i, (id, md5))| {
-                        let offset = base_offset + i as u64;
-                        SendMessageBatchResultEntry {
-                            id,
-                            message_id: offset.to_string(),
-                            md5_of_message_body: md5,
-                        }
-                    })
-                    .collect();
-
-                Ok(Json(SendMessageBatchResponse {
-                    successful,
-                    failed: Vec::new(),
-                }))
-            }
-            MqResponse::Error(e) => Err(SqsError::Internal(e.to_string())),
-            _ => Err(SqsError::Internal("unexpected response".into())),
+        if resp.tag() == ResponseEntry::TAG_PUBLISHED {
+            let base_offset = resp.base_offset();
+            let successful = entry_ids
+                .into_iter()
+                .zip(md5s.into_iter())
+                .enumerate()
+                .map(|(i, (id, md5))| {
+                    let offset = base_offset + i as u64;
+                    SendMessageBatchResultEntry {
+                        id,
+                        message_id: offset.to_string(),
+                        md5_of_message_body: md5,
+                    }
+                })
+                .collect();
+            Ok(Json(SendMessageBatchResponse {
+                successful,
+                failed: Vec::new(),
+            }))
+        } else if resp.tag() == ResponseEntry::TAG_ERROR {
+            Err(SqsError::Internal(resp.error_message().to_string()))
+        } else {
+            Err(SqsError::Internal("unexpected response".into()))
         }
     }
 
@@ -286,6 +298,7 @@ impl SqsState {
         &self,
         req: ReceiveMessageRequest,
     ) -> Result<Json<ReceiveMessageResponse>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let queue_name = self.parse_queue_name(&req.queue_url)?;
         let queue_id = name_hash(queue_name);
         let max_count = req.max_number_of_messages.unwrap_or(1).min(10);
@@ -294,7 +307,7 @@ impl SqsState {
         // Generate a consumer ID for this receive operation.
         let consumer_id = rand_consumer_id();
 
-        let cmd = MqCommand::group_deliver(queue_id, consumer_id, max_count);
+        let cmd = MqCommand::group_deliver(&mut buf, queue_id, consumer_id, max_count);
 
         // Long-poll: retry up to wait_time seconds
         let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_time as u64);
@@ -302,8 +315,9 @@ impl SqsState {
         loop {
             let resp = self.batcher.submit(cmd.clone()).await?;
 
-            match resp {
-                MqResponse::Messages { messages } if !messages.is_empty() => {
+            if resp.tag() == ResponseEntry::TAG_MESSAGES {
+                let messages: Vec<DeliveredMessage> = resp.messages().collect();
+                if !messages.is_empty() {
                     self.m_receive_count.increment(messages.len() as u64);
                     let sqs_messages = messages
                         .into_iter()
@@ -313,35 +327,38 @@ impl SqsState {
                         messages: sqs_messages,
                     }));
                 }
-                MqResponse::Messages { .. } => {
-                    // No messages — check if we should keep waiting
-                    if wait_time == 0 || tokio::time::Instant::now() >= deadline {
-                        return Ok(Json(ReceiveMessageResponse {
-                            messages: Vec::new(),
-                        }));
-                    }
-                    // Brief sleep before retrying
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    continue;
+                // No messages — check if we should keep waiting
+                if wait_time == 0 || tokio::time::Instant::now() >= deadline {
+                    return Ok(Json(ReceiveMessageResponse {
+                        messages: Vec::new(),
+                    }));
                 }
-                MqResponse::Error(e) => return Err(SqsError::Internal(e.to_string())),
-                _ => return Err(SqsError::Internal("unexpected response".into())),
+                // Brief sleep before retrying
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            } else if resp.tag() == ResponseEntry::TAG_ERROR {
+                return Err(SqsError::Internal(resp.error_message().to_string()));
+            } else {
+                return Err(SqsError::Internal("unexpected response".into()));
             }
         }
     }
 
     pub async fn delete_message(&self, req: DeleteMessageRequest) -> Result<Json<()>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let (queue_id, message_id) = Self::decode_receipt_handle(&req.receipt_handle)?;
 
-        let cmd = MqCommand::group_ack(queue_id, &[message_id], None);
+        let cmd = MqCommand::group_ack(&mut buf, queue_id, &[message_id], None);
 
         let resp = self.batcher.submit(cmd).await?;
         self.m_delete_count.increment(1);
 
-        match resp {
-            MqResponse::Ok => Ok(Json(())),
-            MqResponse::Error(e) => Err(SqsError::Internal(e.to_string())),
-            _ => Err(SqsError::Internal("unexpected response".into())),
+        if resp.is_ok() {
+            Ok(Json(()))
+        } else if resp.tag() == ResponseEntry::TAG_ERROR {
+            Err(SqsError::Internal(resp.error_message().to_string()))
+        } else {
+            Err(SqsError::Internal("unexpected response".into()))
         }
     }
 
@@ -349,6 +366,7 @@ impl SqsState {
         &self,
         req: DeleteMessageBatchRequest,
     ) -> Result<Json<DeleteMessageBatchResponse>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let mut successful = Vec::new();
         let mut failed = Vec::new();
 
@@ -378,15 +396,15 @@ impl SqsState {
         // Single Ack command per queue with all message_ids.
         for (queue_id, entries) in by_queue {
             let (ids, message_ids): (Vec<String>, Vec<u64>) = entries.into_iter().unzip();
-            let cmd = MqCommand::group_ack(queue_id, &message_ids, None);
+            let cmd = MqCommand::group_ack(&mut buf, queue_id, &message_ids, None);
             match self.batcher.submit(cmd).await {
-                Ok(MqResponse::Ok) => {
+                Ok(resp) if resp.is_ok() => {
                     for id in ids {
                         successful.push(DeleteMessageBatchResultEntry { id });
                     }
                 }
-                Ok(MqResponse::Error(e)) => {
-                    let msg: Cow<'static, str> = Cow::Owned(e.to_string());
+                Ok(resp) if resp.tag() == ResponseEntry::TAG_ERROR => {
+                    let msg: Cow<'static, str> = Cow::Owned(resp.error_message().to_string());
                     for id in ids {
                         failed.push(BatchResultErrorEntry {
                             id,
@@ -417,19 +435,23 @@ impl SqsState {
         &self,
         req: ChangeMessageVisibilityRequest,
     ) -> Result<Json<()>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let (queue_id, message_id) = Self::decode_receipt_handle(&req.receipt_handle)?;
 
         let cmd = MqCommand::group_extend_visibility(
+            &mut buf,
             queue_id,
             &[message_id],
             req.visibility_timeout as u64 * 1000,
         );
 
         let resp = self.batcher.submit(cmd).await?;
-        match resp {
-            MqResponse::Ok => Ok(Json(())),
-            MqResponse::Error(e) => Err(SqsError::Internal(e.to_string())),
-            _ => Err(SqsError::Internal("unexpected response".into())),
+        if resp.is_ok() {
+            Ok(Json(()))
+        } else if resp.tag() == ResponseEntry::TAG_ERROR {
+            Err(SqsError::Internal(resp.error_message().to_string()))
+        } else {
+            Err(SqsError::Internal("unexpected response".into()))
         }
     }
 
@@ -437,6 +459,7 @@ impl SqsState {
         &self,
         req: ChangeMessageVisibilityBatchRequest,
     ) -> Result<Json<ChangeMessageVisibilityBatchResponse>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let mut successful = Vec::new();
         let mut failed = Vec::new();
 
@@ -467,9 +490,10 @@ impl SqsState {
 
         for ((queue_id, extension_ms), entries) in by_key {
             let (ids, message_ids): (Vec<String>, Vec<u64>) = entries.into_iter().unzip();
-            let cmd = MqCommand::group_extend_visibility(queue_id, &message_ids, extension_ms);
+            let cmd =
+                MqCommand::group_extend_visibility(&mut buf, queue_id, &message_ids, extension_ms);
             match self.batcher.submit(cmd).await {
-                Ok(MqResponse::Ok) => {
+                Ok(resp) if resp.is_ok() => {
                     for id in ids {
                         successful.push(ChangeMessageVisibilityBatchResultEntry { id });
                     }
@@ -494,15 +518,18 @@ impl SqsState {
     }
 
     pub async fn purge_queue(&self, req: PurgeQueueRequest) -> Result<Json<()>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let queue_name = self.parse_queue_name(&req.queue_url)?;
         let queue_id = name_hash(queue_name);
 
-        let cmd = MqCommand::group_purge(queue_id);
+        let cmd = MqCommand::group_purge(&mut buf, queue_id);
         let resp = self.batcher.submit(cmd).await?;
-        match resp {
-            MqResponse::Ok => Ok(Json(())),
-            MqResponse::Error(e) => Err(SqsError::QueueNotFound(e.to_string())),
-            _ => Err(SqsError::Internal("unexpected response".into())),
+        if resp.is_ok() {
+            Ok(Json(()))
+        } else if resp.tag() == ResponseEntry::TAG_ERROR {
+            Err(SqsError::QueueNotFound(resp.error_message().to_string()))
+        } else {
+            Err(SqsError::Internal("unexpected response".into()))
         }
     }
 
@@ -510,42 +537,36 @@ impl SqsState {
         &self,
         req: GetQueueAttributesRequest,
     ) -> Result<Json<GetQueueAttributesResponse>, SqsError> {
+        let mut buf = bytes::BytesMut::new();
         let queue_name = self.parse_queue_name(&req.queue_url)?;
         let queue_id = name_hash(queue_name);
 
-        let cmd = MqCommand::group_get_attributes(queue_id);
+        let cmd = MqCommand::group_get_attributes(&mut buf, queue_id);
         let resp = self.batcher.submit(cmd).await?;
 
-        match resp {
-            MqResponse::Stats(EntityStats::ConsumerGroup {
-                group_id: _,
-                variant: _,
-                pending_count,
-                in_flight_count,
-                dlq_count,
-                active_actor_count: _,
-            }) => {
-                let mut attrs = serde_json::Map::with_capacity(4);
-                attrs.insert(
-                    "ApproximateNumberOfMessages".into(),
-                    serde_json::Value::String(pending_count.to_string()),
-                );
-                attrs.insert(
-                    "ApproximateNumberOfMessagesNotVisible".into(),
-                    serde_json::Value::String(in_flight_count.to_string()),
-                );
-                attrs.insert(
-                    "ApproximateNumberOfMessagesDelayed".into(),
-                    serde_json::Value::String("0".into()),
-                );
-                attrs.insert(
-                    "ApproximateNumberOfMessagesDead".into(),
-                    serde_json::Value::String(dlq_count.to_string()),
-                );
-                Ok(Json(GetQueueAttributesResponse { attributes: attrs }))
-            }
-            MqResponse::Error(e) => Err(SqsError::QueueNotFound(e.to_string())),
-            _ => Err(SqsError::Internal("unexpected response".into())),
+        if resp.tag() == ResponseEntry::TAG_STATS && resp.stats_kind() == 1 {
+            let mut attrs = serde_json::Map::with_capacity(4);
+            attrs.insert(
+                "ApproximateNumberOfMessages".into(),
+                serde_json::Value::String(resp.stats_pending_count().to_string()),
+            );
+            attrs.insert(
+                "ApproximateNumberOfMessagesNotVisible".into(),
+                serde_json::Value::String(resp.stats_in_flight_count().to_string()),
+            );
+            attrs.insert(
+                "ApproximateNumberOfMessagesDelayed".into(),
+                serde_json::Value::String("0".into()),
+            );
+            attrs.insert(
+                "ApproximateNumberOfMessagesDead".into(),
+                serde_json::Value::String(resp.stats_dlq_count().to_string()),
+            );
+            Ok(Json(GetQueueAttributesResponse { attributes: attrs }))
+        } else if resp.tag() == ResponseEntry::TAG_ERROR {
+            Err(SqsError::QueueNotFound(resp.error_message().to_string()))
+        } else {
+            Err(SqsError::Internal("unexpected response".into()))
         }
     }
 }

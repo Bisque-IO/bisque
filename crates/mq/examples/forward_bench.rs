@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
 
-use bisque_mq::async_apply::{ClientRegistry, ResponseCallback, ResponseEntry};
+use bisque_mq::async_apply::{ClientRegistry, ResponseCallback};
 use bisque_mq::forward::{ForwardAcceptor, ForwardClient, ForwardConfig};
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -41,8 +41,8 @@ impl BenchConfig {
         let mut partitions = vec![1, 2, 4, 8];
         let mut connections = vec![1, 2, 4, 8];
         let mut stats = false;
-        let mut inbound_cap = 4096usize;
-        let mut responder_cap = 256usize;
+        let mut inbound_cap = 65536usize;
+        let mut responder_cap = 65536usize;
         let args: Vec<String> = std::env::args().collect();
         let mut i = 1;
         while i < args.len() {
@@ -378,13 +378,17 @@ async fn bench_local_registry_dispatch(
     for _ in 0..messages {
         for &cid in &cids {
             let p = (cid as usize) % n;
-            ResponseEntry::encode_log_index_frame(&mut part_bufs[p], cid, 42);
+            // Frame: [len=20:4][client_id:4][request_seq:8][log_index:8]
+            part_bufs[p].put_u32_le(20u32);
+            part_bufs[p].put_u32_le(cid);
+            part_bufs[p].put_u64_le(0u64); // request_seq
+            part_bufs[p].put_u64_le(42u64); // log_index
         }
         let mut active = 0u64;
         for (p, buf) in part_bufs.iter_mut().enumerate() {
             if !buf.is_empty() {
-                // Each 12-byte record is one frame.
-                let nframes = buf.len() as u64 / 12;
+                // Each 24-byte record is one frame (4 len + 4 cid + 8 req_seq + 8 log_idx).
+                let nframes = buf.len() as u64 / 24;
                 frames_per_send.push(nframes);
                 active += 1;
                 registry
@@ -440,8 +444,13 @@ async fn bench_one_way_throughput(
 
     // ClientRegistry with 4 partitions, capacity 4096.
     let client_registry = ClientRegistry::new(4, 4096);
-    let mut client =
-        ForwardClient::start(config.clone(), 1, Some(addr), Arc::clone(&client_registry));
+    let mut client = ForwardClient::start(
+        config.clone(),
+        1,
+        0,
+        Some(addr),
+        Arc::clone(&client_registry),
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -452,7 +461,7 @@ async fn bench_one_way_throughput(
     let producer_client = client.clone_handle();
     let producer = tokio::spawn(async move {
         for _ in 0..messages {
-            producer_client.forward(1u32, &producer_payload).await;
+            producer_client.forward(1u32, 0u64, &producer_payload).await;
         }
     });
 
@@ -547,8 +556,13 @@ async fn bench_full_roundtrip(
     drop(done_tx);
     let local_cid = client_registry.register(callback);
 
-    let mut client =
-        ForwardClient::start(config.clone(), 1, Some(addr), Arc::clone(&client_registry));
+    let mut client = ForwardClient::start(
+        config.clone(),
+        1,
+        0,
+        Some(addr),
+        Arc::clone(&client_registry),
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -560,7 +574,9 @@ async fn bench_full_roundtrip(
     let producer = tokio::spawn(async move {
         let start = Instant::now();
         for _ in 0..messages {
-            producer_client.forward(local_cid, &producer_payload).await;
+            producer_client
+                .forward(local_cid, 0u64, &producer_payload)
+                .await;
         }
         start.elapsed()
     });
@@ -579,11 +595,12 @@ async fn bench_full_roundtrip(
         while consumed < messages {
             if let Some(batch) = batch_rx.recv().await {
                 let node_id = batch.node_id;
-                let mut resp = BytesMut::with_capacity(batch.len() * 16);
+                let mut resp = BytesMut::with_capacity(batch.len() * 24);
                 rx_batch_dist.push(batch.len() as u64);
-                for (client_id, _cmd) in batch.iter() {
-                    resp.put_u32_le(12u32);
+                for (client_id, _request_seq, _cmd) in batch.iter() {
+                    resp.put_u32_le(20u32);
                     resp.put_u32_le(client_id);
+                    resp.put_u64_le(0u64); // request_seq
                     resp.put_u64_le(consumed as u64);
                     consumed += 1;
                 }
@@ -595,9 +612,10 @@ async fn bench_full_roundtrip(
                     match batch_rx.try_recv() {
                         Ok(b) if b.node_id == node_id => {
                             rx_batch_dist.push(b.len() as u64);
-                            for (client_id, _cmd) in b.iter() {
-                                resp.put_u32_le(12u32);
+                            for (client_id, _request_seq, _cmd) in b.iter() {
+                                resp.put_u32_le(20u32);
                                 resp.put_u32_le(client_id);
+                                resp.put_u64_le(0u64);
                                 resp.put_u64_le(consumed as u64);
                                 consumed += 1;
                             }
@@ -606,9 +624,10 @@ async fn bench_full_roundtrip(
                         Ok(b) => {
                             // Different node — put stats but can't unrecv; just process it.
                             rx_batch_dist.push(b.len() as u64);
-                            for (client_id, _cmd) in b.iter() {
-                                resp.put_u32_le(12u32);
+                            for (client_id, _request_seq, _cmd) in b.iter() {
+                                resp.put_u32_le(20u32);
                                 resp.put_u32_le(client_id);
+                                resp.put_u64_le(0u64);
                                 resp.put_u64_le(consumed as u64);
                                 consumed += 1;
                             }
@@ -618,7 +637,7 @@ async fn bench_full_roundtrip(
                     }
                 }
                 drain_dist.push(extra);
-                resp_batch_dist.push(resp.len() as u64 / 16);
+                resp_batch_dist.push(resp.len() as u64 / 24);
                 acceptor.push_response_async(node_id, resp.freeze()).await;
             }
         }
@@ -726,6 +745,7 @@ async fn bench_full_roundtrip_n_conns(
         clients.push(ForwardClient::start(
             config.clone(),
             node_id,
+            0,
             Some(addr),
             Arc::clone(&client_registry),
         ));
@@ -751,7 +771,7 @@ async fn bench_full_roundtrip_n_conns(
         producer_handles.push(tokio::spawn(async move {
             barrier.wait().await;
             for _ in 0..messages_per_conn {
-                handle.forward(cid, &payload).await;
+                handle.forward(cid, 0u64, &payload).await;
             }
         }));
     }
@@ -772,10 +792,11 @@ async fn bench_full_roundtrip_n_conns(
                 // Accumulate the first batch.
                 rx_batch_dist.push(batch.len() as u64);
                 let first_node = batch.node_id;
-                let mut first_resp = BytesMut::with_capacity(batch.len() * 16);
-                for (client_id, _cmd) in batch.iter() {
-                    first_resp.put_u32_le(12u32);
+                let mut first_resp = BytesMut::with_capacity(batch.len() * 24);
+                for (client_id, _request_seq, _cmd) in batch.iter() {
+                    first_resp.put_u32_le(20u32);
                     first_resp.put_u32_le(client_id);
+                    first_resp.put_u64_le(0u64); // request_seq
                     first_resp.put_u64_le(consumed as u64);
                     consumed += 1;
                 }
@@ -792,12 +813,13 @@ async fn bench_full_roundtrip_n_conns(
                                 if let Some(e) = node_bufs.iter_mut().find(|(id, _)| *id == nid) {
                                     &mut e.1
                                 } else {
-                                    node_bufs.push((nid, BytesMut::with_capacity(b.len() * 16)));
+                                    node_bufs.push((nid, BytesMut::with_capacity(b.len() * 24)));
                                     &mut node_bufs.last_mut().unwrap().1
                                 };
-                            for (client_id, _cmd) in b.iter() {
-                                buf.put_u32_le(12u32);
+                            for (client_id, _request_seq, _cmd) in b.iter() {
+                                buf.put_u32_le(20u32);
                                 buf.put_u32_le(client_id);
+                                buf.put_u64_le(0u64); // request_seq
                                 buf.put_u64_le(consumed as u64);
                                 consumed += 1;
                             }
@@ -810,7 +832,7 @@ async fn bench_full_roundtrip_n_conns(
 
                 // Send one coalesced response per node.
                 for (nid, buf) in node_bufs.drain(..) {
-                    resp_batch_dist.push(buf.len() as u64 / 16);
+                    resp_batch_dist.push(buf.len() as u64 / 24);
                     acceptor.push_response_async(nid, buf.freeze()).await;
                 }
             }

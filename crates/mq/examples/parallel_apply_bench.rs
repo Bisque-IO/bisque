@@ -34,6 +34,20 @@ type Os = <Rt as AsyncRuntime>::Oneshot;
 // Helpers
 // =============================================================================
 
+use bisque_mq::async_apply::ResponseEntry;
+use bytes::BytesMut;
+
+fn apply_engine(
+    engine: &bisque_mq::engine::MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+) -> ResponseEntry {
+    let mut buf = BytesMut::new();
+    engine.apply_command(cmd, &mut buf, log_index, current_time, None);
+    ResponseEntry::split_from(&mut buf)
+}
+
 fn make_entry(index: u64, term: u64, cmd: MqCommand) -> openraft::impls::Entry<MqTypeConfig> {
     openraft::impls::Entry::<MqTypeConfig> {
         log_id: LogId {
@@ -88,6 +102,7 @@ async fn bench_async_apply(
     batch_size: usize,
 ) -> BenchResult {
     let tmp = TempDir::new().unwrap();
+    let mut buf = BytesMut::new();
     let raft_config = MmapStorageConfig::new(tmp.path()).with_segment_size(4 * 1024 * 1024); // 4MB — avoids double-rotation for ~2.5MB batches
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
         .await
@@ -100,7 +115,12 @@ async fn bench_async_apply(
         entries.push(make_entry(
             i as u64 + 1,
             1,
-            MqCommand::create_topic(&format!("bench-topic-{i}"), RetentionPolicy::default(), 0),
+            MqCommand::create_topic(
+                &mut buf,
+                &format!("bench-topic-{i}"),
+                RetentionPolicy::default(),
+                0,
+            ),
         ));
     }
     append_and_flush(&mut log, entries).await;
@@ -167,7 +187,7 @@ async fn bench_async_apply(
             entries.push(make_entry(
                 log_index,
                 1,
-                MqCommand::publish(tid, &msgs_payload),
+                MqCommand::publish(&mut buf, tid, &msgs_payload),
             ));
             log_index += 1;
         }
@@ -229,6 +249,7 @@ async fn bench_sequential(
     let engine = Arc::new(MqEngine::new(MqConfig::new(
         tmp.path().join("engine").to_str().unwrap(),
     )));
+    let mut buf = BytesMut::new();
 
     let flat_msg = make_flat_msg(msg_size);
     let msgs_payload: Vec<Bytes> = (0..batch_size).map(|_| flat_msg.clone()).collect();
@@ -237,12 +258,17 @@ async fn bench_sequential(
     // Create topics directly.
     let mut topic_ids = Vec::with_capacity(num_topics);
     for i in 0..num_topics {
-        let cmd =
-            MqCommand::create_topic(&format!("bench-topic-{i}"), RetentionPolicy::default(), 1);
-        let resp = engine.apply_command(&cmd, i as u64 + 1, 1000, None);
-        match resp {
-            MqResponse::EntityCreated { id } => topic_ids.push(id),
-            other => panic!("unexpected response creating topic {i}: {other:?}"),
+        let cmd = MqCommand::create_topic(
+            &mut buf,
+            &format!("bench-topic-{i}"),
+            RetentionPolicy::default(),
+            1,
+        );
+        let resp = apply_engine(&engine, &cmd, i as u64 + 1, 1000);
+        if resp.tag() == ResponseEntry::TAG_ENTITY_CREATED {
+            topic_ids.push(resp.entity_id());
+        } else {
+            panic!("unexpected response creating topic {i}: tag={}", resp.tag());
         }
     }
 
@@ -252,8 +278,8 @@ async fn bench_sequential(
     let start = Instant::now();
     for _round in 0..msgs_per_topic {
         for &tid in &topic_ids {
-            let cmd = MqCommand::publish(tid, &msgs_payload);
-            let _resp = engine.apply_command(&cmd, log_index, 1000, None);
+            let cmd = MqCommand::publish(&mut buf, tid, &msgs_payload);
+            let _resp = apply_engine(&engine, &cmd, log_index, 1000);
             log_index += 1;
         }
     }

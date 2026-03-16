@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bisque_mq::MqMetadata;
+use bisque_mq::ResponseEntry;
 use bisque_mq::consumer_group::GroupPhase;
-use bisque_mq::types::{MqCommand, MqError, MqResponse, RetentionPolicy, name_hash};
+use bisque_mq::types::{MqCommand, MqError, RetentionPolicy, name_hash};
 use bisque_mq::write_batcher::MqWriteBatcher;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use smallvec::smallvec;
 use tracing::{debug, warn};
@@ -21,7 +22,7 @@ use crate::types::*;
 /// Zero-allocation error type for produce path (avoids `format!()` on every error).
 enum ProduceError {
     Codec(CodecError),
-    Mq(MqError),
+    MqError(u8),
     Raft(bisque_mq::write_batcher::MqBatcherError),
     UnexpectedResponse,
 }
@@ -30,7 +31,7 @@ impl fmt::Display for ProduceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProduceError::Codec(e) => write!(f, "codec: {e}"),
-            ProduceError::Mq(e) => write!(f, "mq: {e}"),
+            ProduceError::MqError(kind) => write!(f, "mq error kind={kind}"),
             ProduceError::Raft(e) => write!(f, "raft: {e}"),
             ProduceError::UnexpectedResponse => f.write_str("unexpected response"),
         }
@@ -507,13 +508,19 @@ impl KafkaHandler {
 
     /// Resolve or auto-create a consumer group. Returns the group ID.
     async fn resolve_or_create_group(&self, group_name: &str) -> Result<u64, ()> {
+        let mut buf = BytesMut::new();
         if let Some(id) = self.resolve_group_id(group_name) {
             return Ok(id);
         }
-        let cmd = MqCommand::create_consumer_group(group_name, 1);
+        let cmd = MqCommand::create_consumer_group(&mut buf, group_name, 1);
         match self.batcher.submit(cmd).await {
-            Ok(MqResponse::EntityCreated { id, .. }) => Ok(id),
-            Ok(MqResponse::Error(MqError::AlreadyExists { id, .. })) => Ok(id),
+            Ok(response) => match response.tag() {
+                ResponseEntry::TAG_ENTITY_CREATED => Ok(response.entity_id()),
+                ResponseEntry::TAG_ERROR if response.is_already_exists() => {
+                    Ok(response.error_entity_id())
+                }
+                _ => Err(()),
+            },
             _ => Err(()),
         }
     }
@@ -745,6 +752,7 @@ impl KafkaHandler {
         topic_id: u64,
         record_set_bytes: Bytes,
     ) -> Result<i64, ProduceError> {
+        let mut buf = BytesMut::new();
         // Zero-copy decode — consumes Bytes directly, no clone needed
         let batch =
             codec::decode_record_batch_bytes(record_set_bytes).map_err(ProduceError::Codec)?;
@@ -754,16 +762,18 @@ impl KafkaHandler {
 
         self.m_produce_messages.increment(messages.len() as u64);
 
-        let cmd = MqCommand::publish(topic_id, &messages);
+        let cmd = MqCommand::publish(&mut buf, topic_id, &messages);
 
         match self.batcher.submit(cmd).await {
-            Ok(MqResponse::Published { base_offset, .. }) => {
-                // Wake up long-polling fetch requests for this specific topic
-                self.topic_notifier.notify_topic(topic_id);
-                Ok(base_offset as i64)
-            }
-            Ok(MqResponse::Error(e)) => Err(ProduceError::Mq(e)),
-            Ok(_) => Err(ProduceError::UnexpectedResponse),
+            Ok(response) => match response.tag() {
+                ResponseEntry::TAG_PUBLISHED => {
+                    // Wake up long-polling fetch requests for this specific topic
+                    self.topic_notifier.notify_topic(topic_id);
+                    Ok(response.base_offset() as i64)
+                }
+                ResponseEntry::TAG_ERROR => Err(ProduceError::MqError(response.error_kind())),
+                _ => Err(ProduceError::UnexpectedResponse),
+            },
             Err(e) => Err(ProduceError::Raft(e)),
         }
     }
@@ -982,6 +992,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     async fn handle_join_group(&self, req: JoinGroupRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         self.m_group_joins.increment(1);
 
         if req.group_id.is_empty() {
@@ -1023,6 +1034,7 @@ impl KafkaHandler {
             .collect();
 
         let cmd = MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             &req.member_id,
             req.protocols
@@ -1050,16 +1062,13 @@ impl KafkaHandler {
             }
         };
 
-        match resp {
-            MqResponse::GroupJoined {
-                generation,
-                leader,
-                member_id,
-                protocol_name,
-                is_leader,
-                members,
-                phase_complete,
-            } => {
+        match resp.tag() {
+            ResponseEntry::TAG_GROUP_JOINED => {
+                let generation = resp.group_joined_generation();
+                let is_leader = resp.group_joined_is_leader();
+                let phase_complete = resp.group_joined_phase_complete();
+                let (leader, member_id, protocol_name, members) = resp.group_joined_fields();
+
                 if phase_complete {
                     return KafkaResponse::JoinGroup(JoinGroupResponse {
                         error_code: ErrorCode::None.as_i16(),
@@ -1073,7 +1082,7 @@ impl KafkaHandler {
                                 .map(|(id, meta)| JoinGroupMember {
                                     member_id: WireString::from(id),
                                     group_instance_id: None,
-                                    metadata: Bytes::from(meta),
+                                    metadata: meta,
                                     ..Default::default()
                                 })
                                 .collect()
@@ -1093,8 +1102,8 @@ impl KafkaHandler {
 
                 self.build_join_response(group_id, &member_id)
             }
-            MqResponse::Error(e) => {
-                let error_code = mq_error_to_kafka_i16(&e);
+            ResponseEntry::TAG_ERROR => {
+                let error_code = response_entry_error_to_kafka_i16(&resp);
                 KafkaResponse::JoinGroup(JoinGroupResponse {
                     error_code,
                     generation_id: -1,
@@ -1104,8 +1113,8 @@ impl KafkaHandler {
                     members: Vec::new(),
                 })
             }
-            other => {
-                warn!("unexpected join group response: {other}");
+            _ => {
+                warn!("unexpected join group response: tag={}", resp.tag());
                 KafkaResponse::JoinGroup(JoinGroupResponse {
                     error_code: ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
                     generation_id: -1,
@@ -1170,6 +1179,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     async fn handle_sync_group(&self, req: SyncGroupRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         self.m_group_syncs.increment(1);
 
         let group_id = match self.resolve_group_id(&req.group_id) {
@@ -1195,6 +1205,7 @@ impl KafkaHandler {
             .collect();
 
         let cmd = MqCommand::sync_consumer_group(
+            &mut buf,
             group_id,
             req.generation_id,
             &req.member_id,
@@ -1212,15 +1223,13 @@ impl KafkaHandler {
             }
         };
 
-        match resp {
-            MqResponse::GroupSynced {
-                assignment,
-                phase_complete,
-            } => {
+        match resp.tag() {
+            ResponseEntry::TAG_GROUP_SYNCED => {
+                let phase_complete = resp.group_synced_phase_complete();
                 if phase_complete {
                     return KafkaResponse::SyncGroup(SyncGroupResponse {
                         error_code: ErrorCode::None.as_i16(),
-                        assignment: Bytes::from(assignment),
+                        assignment: Bytes::from(resp.group_synced_assignment().to_vec()),
                     });
                 }
 
@@ -1243,15 +1252,15 @@ impl KafkaHandler {
                     assignment,
                 })
             }
-            MqResponse::Error(e) => {
-                let error_code = mq_error_to_kafka_i16(&e);
+            ResponseEntry::TAG_ERROR => {
+                let error_code = response_entry_error_to_kafka_i16(&resp);
                 KafkaResponse::SyncGroup(SyncGroupResponse {
                     error_code,
                     assignment: Bytes::new(),
                 })
             }
-            other => {
-                warn!("unexpected sync group response: {other}");
+            _ => {
+                warn!("unexpected sync group response: tag={}", resp.tag());
                 KafkaResponse::SyncGroup(SyncGroupResponse {
                     error_code: ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
                     assignment: Bytes::new(),
@@ -1265,6 +1274,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     async fn handle_heartbeat(&self, req: HeartbeatRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         self.m_group_heartbeats.increment(1);
 
         let group_id = match self.resolve_group_id(&req.group_id) {
@@ -1276,16 +1286,26 @@ impl KafkaHandler {
             }
         };
 
-        let cmd = MqCommand::heartbeat_consumer_group(group_id, &req.member_id, req.generation_id);
+        let cmd = MqCommand::heartbeat_consumer_group(
+            &mut buf,
+            group_id,
+            &req.member_id,
+            req.generation_id,
+        );
 
         match self.batcher.submit(cmd).await {
-            Ok(MqResponse::Ok) => KafkaResponse::Heartbeat(HeartbeatResponse {
-                error_code: ErrorCode::None.as_i16(),
-            }),
-            Ok(MqResponse::Error(e)) => {
-                let error_code = mq_error_to_kafka_i16(&e);
-                KafkaResponse::Heartbeat(HeartbeatResponse { error_code })
-            }
+            Ok(response) => match response.tag() {
+                ResponseEntry::TAG_OK => KafkaResponse::Heartbeat(HeartbeatResponse {
+                    error_code: ErrorCode::None.as_i16(),
+                }),
+                ResponseEntry::TAG_ERROR => {
+                    let error_code = response_entry_error_to_kafka_i16(&response);
+                    KafkaResponse::Heartbeat(HeartbeatResponse { error_code })
+                }
+                _ => KafkaResponse::Heartbeat(HeartbeatResponse {
+                    error_code: ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
+                }),
+            },
             _ => KafkaResponse::Heartbeat(HeartbeatResponse {
                 error_code: ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
             }),
@@ -1297,6 +1317,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     async fn handle_leave_group(&self, req: LeaveGroupRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         self.m_group_leaves.increment(1);
 
         let group_id = match self.resolve_group_id(&req.group_id) {
@@ -1310,14 +1331,13 @@ impl KafkaHandler {
             }
         };
 
-        let cmd = MqCommand::leave_consumer_group(group_id, &req.member_id);
+        let cmd = MqCommand::leave_consumer_group(&mut buf, group_id, &req.member_id);
 
         match self.batcher.submit(cmd).await {
-            Ok(MqResponse::Ok) => {}
+            Ok(_) => {}
             Err(e) => {
                 warn!("leave consumer group batcher error: {e}");
             }
-            _ => {}
         }
 
         KafkaResponse::LeaveGroup(LeaveGroupResponse {
@@ -1336,6 +1356,7 @@ impl KafkaHandler {
         req: OffsetCommitRequest,
         _header: &RequestHeader,
     ) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         let group_id = match self.resolve_group_id(&req.group_id) {
             Some(id) => id,
             None => {
@@ -1380,6 +1401,7 @@ impl KafkaHandler {
                     }
                     Some(topic_id) => {
                         let cmd = MqCommand::commit_group_offset(
+                            &mut buf,
                             group_id,
                             req.generation_id,
                             topic_id,
@@ -1389,11 +1411,14 @@ impl KafkaHandler {
                             now,
                         );
                         let error_code = match self.batcher.submit(cmd).await {
-                            Ok(MqResponse::Ok) => ErrorCode::None.as_i16(),
-                            Ok(MqResponse::Error(e)) => {
-                                debug!("offset commit error: {e}");
-                                mq_error_to_kafka_i16(&e)
-                            }
+                            Ok(response) => match response.tag() {
+                                ResponseEntry::TAG_OK => ErrorCode::None.as_i16(),
+                                ResponseEntry::TAG_ERROR => {
+                                    debug!("offset commit error: kind={}", response.error_kind());
+                                    response_entry_error_to_kafka_i16(&response)
+                                }
+                                _ => ErrorCode::UnknownTopicOrPartition.as_i16(),
+                            },
                             _ => ErrorCode::UnknownTopicOrPartition.as_i16(),
                         };
                         part_responses.push(OffsetCommitPartitionResponse {
@@ -1417,6 +1442,7 @@ impl KafkaHandler {
 
     /// Legacy offset commit for consumers not using Raft-replicated groups.
     async fn handle_offset_commit_legacy(&self, req: OffsetCommitRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         let consumer_id = name_hash(&req.group_id);
 
         let resolved: Vec<(WireString, Vec<(i32, Option<u64>, i64)>)> = {
@@ -1449,13 +1475,21 @@ impl KafkaHandler {
                         });
                     }
                     Some(topic_id) => {
-                        let cmd = MqCommand::commit_offset(topic_id, consumer_id, offset as u64);
+                        let cmd = MqCommand::commit_offset(
+                            &mut buf,
+                            topic_id,
+                            consumer_id,
+                            offset as u64,
+                        );
                         let error_code = match self.batcher.submit(cmd).await {
-                            Ok(MqResponse::Ok) => ErrorCode::None.as_i16(),
-                            Ok(MqResponse::Error(e)) => {
-                                debug!("offset commit error: {e}");
-                                ErrorCode::UnknownTopicOrPartition.as_i16()
-                            }
+                            Ok(response) => match response.tag() {
+                                ResponseEntry::TAG_OK => ErrorCode::None.as_i16(),
+                                ResponseEntry::TAG_ERROR => {
+                                    debug!("offset commit error: kind={}", response.error_kind());
+                                    ErrorCode::UnknownTopicOrPartition.as_i16()
+                                }
+                                _ => ErrorCode::UnknownTopicOrPartition.as_i16(),
+                            },
                             _ => ErrorCode::UnknownTopicOrPartition.as_i16(),
                         };
                         part_responses.push(OffsetCommitPartitionResponse {
@@ -1548,6 +1582,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     async fn handle_create_topics(&self, req: CreateTopicsRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         let mut topic_responses = Vec::with_capacity(req.topics.len());
 
         for ct in req.topics {
@@ -1556,23 +1591,26 @@ impl KafkaHandler {
 
             for i in 0..num_partitions {
                 let mq_name = partition::partition_topic_name(&ct.name, i as i32);
-                let cmd = MqCommand::create_topic(&mq_name, RetentionPolicy::default(), 0);
+                let cmd =
+                    MqCommand::create_topic(&mut buf, &mq_name, RetentionPolicy::default(), 0);
                 match self.batcher.submit(cmd).await {
-                    Ok(MqResponse::EntityCreated { .. }) => {}
-                    Ok(MqResponse::Error(bisque_mq::types::MqError::AlreadyExists { .. })) => {
-                        error_code = ErrorCode::TopicAlreadyExists.as_i16();
-                    }
-                    Ok(MqResponse::Error(e)) => {
-                        warn!("create topic error: {e}");
-                        error_code = ErrorCode::InvalidTopicException.as_i16();
-                        break;
-                    }
+                    Ok(response) => match response.tag() {
+                        ResponseEntry::TAG_ENTITY_CREATED => {}
+                        ResponseEntry::TAG_ERROR if response.is_already_exists() => {
+                            error_code = ErrorCode::TopicAlreadyExists.as_i16();
+                        }
+                        ResponseEntry::TAG_ERROR => {
+                            warn!("create topic error: kind={}", response.error_kind());
+                            error_code = ErrorCode::InvalidTopicException.as_i16();
+                            break;
+                        }
+                        _ => {}
+                    },
                     Err(e) => {
                         warn!("create topic batcher error: {e}");
                         error_code = ErrorCode::InvalidTopicException.as_i16();
                         break;
                     }
-                    _ => {}
                 }
             }
 
@@ -1594,6 +1632,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     async fn handle_delete_topics(&self, req: DeleteTopicsRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         // Resolve all topic IDs upfront (lock-free), consuming req
         let resolved: Vec<(WireString, Option<Vec<u64>>)> = {
             let pmap = self.partition_map.load();
@@ -1620,7 +1659,7 @@ impl KafkaHandler {
                 Some(ids) => {
                     let mut error_code = ErrorCode::None.as_i16();
                     for topic_id in ids {
-                        let cmd = MqCommand::delete_topic(topic_id);
+                        let cmd = MqCommand::delete_topic(&mut buf, topic_id);
                         if let Err(e) = self.batcher.submit(cmd).await {
                             warn!("delete topic error: {e}");
                             error_code = ErrorCode::UnknownTopicOrPartition.as_i16();
@@ -1863,6 +1902,7 @@ impl KafkaHandler {
     }
 
     async fn handle_txn_offset_commit(&self, req: TxnOffsetCommitRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         if let Err(ec) = self.txn_coordinator.validate_txn_offset_commit(
             &req.transactional_id,
             req.producer_id,
@@ -1931,6 +1971,7 @@ impl KafkaHandler {
                     }
                     Some(topic_id) => {
                         let cmd = MqCommand::commit_group_offset(
+                            &mut buf,
                             group_id,
                             -1, // generation not checked for txn commits
                             topic_id,
@@ -1940,11 +1981,17 @@ impl KafkaHandler {
                             now,
                         );
                         let error_code = match self.batcher.submit(cmd).await {
-                            Ok(MqResponse::Ok) => ErrorCode::None.as_i16(),
-                            Ok(MqResponse::Error(e)) => {
-                                debug!("txn offset commit error: {e}");
-                                mq_error_to_kafka_i16(&e)
-                            }
+                            Ok(response) => match response.tag() {
+                                ResponseEntry::TAG_OK => ErrorCode::None.as_i16(),
+                                ResponseEntry::TAG_ERROR => {
+                                    debug!(
+                                        "txn offset commit error: kind={}",
+                                        response.error_kind()
+                                    );
+                                    response_entry_error_to_kafka_i16(&response)
+                                }
+                                _ => ErrorCode::UnknownTopicOrPartition.as_i16(),
+                            },
                             _ => ErrorCode::UnknownTopicOrPartition.as_i16(),
                         };
                         part_responses.push(TxnOffsetCommitPartitionResponse {
@@ -2111,6 +2158,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     async fn handle_create_partitions(&self, req: CreatePartitionsRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         let mut topic_responses = Vec::with_capacity(req.topics.len());
 
         for ct in req.topics {
@@ -2143,23 +2191,29 @@ impl KafkaHandler {
 
             for i in current_count..new_total {
                 let mq_name = partition::partition_topic_name(&ct.name, i as i32);
-                let cmd = MqCommand::create_topic(&mq_name, RetentionPolicy::default(), 0);
+                let cmd =
+                    MqCommand::create_topic(&mut buf, &mq_name, RetentionPolicy::default(), 0);
                 match self.batcher.submit(cmd).await {
-                    Ok(MqResponse::EntityCreated { .. }) => {}
-                    Ok(MqResponse::Error(MqError::AlreadyExists { .. })) => {}
-                    Ok(MqResponse::Error(e)) => {
-                        warn!("create partition error: {e}");
-                        error_code = ErrorCode::InvalidTopicException.as_i16();
-                        error_message = Some(WireString::from(format!("{e}")));
-                        break;
-                    }
+                    Ok(response) => match response.tag() {
+                        ResponseEntry::TAG_ENTITY_CREATED => {}
+                        ResponseEntry::TAG_ERROR if response.is_already_exists() => {}
+                        ResponseEntry::TAG_ERROR => {
+                            warn!("create partition error: kind={}", response.error_kind());
+                            error_code = ErrorCode::InvalidTopicException.as_i16();
+                            error_message = Some(WireString::from(format!(
+                                "error kind {}",
+                                response.error_kind()
+                            )));
+                            break;
+                        }
+                        _ => {}
+                    },
                     Err(e) => {
                         warn!("create partition batcher error: {e}");
                         error_code = ErrorCode::InvalidTopicException.as_i16();
                         error_message = Some(WireString::from(format!("{e}")));
                         break;
                     }
-                    _ => {}
                 }
             }
 
@@ -2181,6 +2235,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     async fn handle_delete_groups(&self, req: DeleteGroupsRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         let mut results = Vec::with_capacity(req.group_ids.len());
 
         for group_name in &req.group_ids {
@@ -2207,13 +2262,16 @@ impl KafkaHandler {
                 }
             }
 
-            let cmd = MqCommand::delete_consumer_group(group_id);
+            let cmd = MqCommand::delete_consumer_group(&mut buf, group_id);
             let error_code = match self.batcher.submit(cmd).await {
-                Ok(MqResponse::Ok) => ErrorCode::None.as_i16(),
-                Ok(MqResponse::Error(e)) => {
-                    debug!("delete group error: {e}");
-                    mq_error_to_kafka_i16(&e)
-                }
+                Ok(response) => match response.tag() {
+                    ResponseEntry::TAG_OK => ErrorCode::None.as_i16(),
+                    ResponseEntry::TAG_ERROR => {
+                        debug!("delete group error: kind={}", response.error_kind());
+                        response_entry_error_to_kafka_i16(&response)
+                    }
+                    _ => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
+                },
                 _ => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
             };
 
@@ -2231,6 +2289,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     async fn handle_offset_delete(&self, req: OffsetDeleteRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         let group_id = match self.resolve_group_id(&req.group_id) {
             Some(id) => id,
             None => {
@@ -2258,6 +2317,7 @@ impl KafkaHandler {
                     Some(topic_id) => {
                         // Delete the committed offset by committing offset -1
                         let cmd = MqCommand::commit_group_offset(
+                            &mut buf,
                             group_id,
                             -1,
                             topic_id,
@@ -2267,11 +2327,14 @@ impl KafkaHandler {
                             0,
                         );
                         let error_code = match self.batcher.submit(cmd).await {
-                            Ok(MqResponse::Ok) => ErrorCode::None.as_i16(),
-                            Ok(MqResponse::Error(e)) => {
-                                debug!("offset delete error: {e}");
-                                mq_error_to_kafka_i16(&e)
-                            }
+                            Ok(response) => match response.tag() {
+                                ResponseEntry::TAG_OK => ErrorCode::None.as_i16(),
+                                ResponseEntry::TAG_ERROR => {
+                                    debug!("offset delete error: kind={}", response.error_kind());
+                                    response_entry_error_to_kafka_i16(&response)
+                                }
+                                _ => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
+                            },
                             _ => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
                         };
                         part_responses.push(OffsetDeletePartitionResponse {
@@ -2458,6 +2521,7 @@ impl KafkaHandler {
     // -------------------------------------------------------------------------
 
     fn handle_describe_cluster(&self, req: DescribeClusterRequest) -> KafkaResponse {
+        let mut buf = BytesMut::new();
         KafkaResponse::DescribeCluster(DescribeClusterResponse {
             error_code: ErrorCode::None.as_i16(),
             cluster_id: WireString::from_static("bisque-mq"),
@@ -2482,11 +2546,12 @@ impl KafkaHandler {
     /// Clean up on connection disconnect. Submits LeaveGroup commands via Raft
     /// for each member registered on this connection.
     pub fn on_disconnect(&self, member_ids: &[WireString]) {
+        let mut buf = bytes::BytesMut::new();
         for mid in member_ids {
             let group_id = self.metadata.find_member_group(mid);
 
             if let Some(gid) = group_id {
-                let cmd = MqCommand::leave_consumer_group(gid, mid);
+                let cmd = MqCommand::leave_consumer_group(&mut buf, gid, mid);
                 let batcher = Arc::clone(&self.batcher);
                 tokio::spawn(async move {
                     if let Err(e) = batcher.submit(cmd).await {
@@ -2509,6 +2574,17 @@ fn mq_error_to_kafka_i16(e: &MqError) -> i16 {
         MqError::RebalanceInProgress => ErrorCode::RebalanceInProgress.as_i16(),
         MqError::NotFound { .. } => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
         MqError::AlreadyExists { .. } => ErrorCode::TopicAlreadyExists.as_i16(),
+        _ => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
+    }
+}
+
+fn response_entry_error_to_kafka_i16(response: &ResponseEntry) -> i16 {
+    match response.error_kind() {
+        ResponseEntry::ERR_ILLEGAL_GENERATION => ErrorCode::IllegalGeneration.as_i16(),
+        ResponseEntry::ERR_UNKNOWN_MEMBER_ID => ErrorCode::UnknownMemberId.as_i16(),
+        ResponseEntry::ERR_REBALANCE_IN_PROGRESS => ErrorCode::RebalanceInProgress.as_i16(),
+        ResponseEntry::ERR_NOT_FOUND => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
+        ResponseEntry::ERR_ALREADY_EXISTS => ErrorCode::TopicAlreadyExists.as_i16(),
         _ => ErrorCode::GroupCoordinatorNotAvailable.as_i16(),
     }
 }
@@ -2622,15 +2698,11 @@ mod tests {
     }
 
     /// Create a test handler backed by a real engine (no Raft).
-    fn make_test_handler() -> (
-        KafkaHandler,
-        Arc<parking_lot::Mutex<MqEngine>>,
-        Arc<MockLogReader>,
-    ) {
+    fn make_test_handler() -> (KafkaHandler, Arc<MqEngine>, Arc<MockLogReader>) {
         let config = MqConfig::new("/tmp/mq-kafka-test");
         let engine = MqEngine::new(config);
         let metadata = engine.shared_metadata();
-        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let engine = Arc::new(engine);
         let batcher = Arc::new(MqWriteBatcher::new_test(Arc::clone(&engine)));
         let log_reader = Arc::new(MockLogReader::new());
         let handler = KafkaHandler::new(

@@ -20,6 +20,30 @@ use bytes::Bytes;
 // Helpers
 // =============================================================================
 
+use bisque_mq::async_apply::ResponseEntry;
+use bytes::BytesMut;
+
+fn apply_engine(
+    engine: &bisque_mq::engine::MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+) -> ResponseEntry {
+    apply_engine_seg(engine, cmd, log_index, current_time, None)
+}
+
+fn apply_engine_seg(
+    engine: &bisque_mq::engine::MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+    segment_id: Option<u64>,
+) -> ResponseEntry {
+    let mut _buf = BytesMut::new();
+    engine.apply_command(cmd, &mut _buf, log_index, current_time, segment_id);
+    ResponseEntry::split_from(&mut _buf)
+}
+
 fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-retained-purge-test"))
 }
@@ -29,15 +53,19 @@ fn make_msg(value: &[u8]) -> Bytes {
 }
 
 fn create_exchange_in_engine(engine: &mut MqEngine, name: &str, log_index: u64) -> u64 {
-    match engine.apply_command(
-        &MqCommand::create_exchange(name, ExchangeType::Topic),
+    let mut buf = bytes::BytesMut::new();
+    let __e = apply_engine(
+        &engine,
+        &MqCommand::create_exchange(&mut buf, name, ExchangeType::Topic),
         log_index,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    __e.entity_id()
 }
 
 fn get_retained(
@@ -46,15 +74,19 @@ fn get_retained(
     filter: Option<&str>,
     log_index: u64,
 ) -> Vec<RetainedEntry> {
-    match engine.apply_command(
-        &MqCommand::get_retained(exchange_id, filter),
+    let mut buf = bytes::BytesMut::new();
+    let __e = apply_engine(
+        &engine,
+        &MqCommand::get_retained(&mut buf, exchange_id, filter),
         log_index,
         9999,
-        None,
-    ) {
-        MqResponse::RetainedMessages { messages } => messages,
-        other => panic!("expected RetainedMessages, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_RETAINED_MESSAGES,
+        "expected RetainedMessages"
+    );
+    __e.retained_messages().collect()
 }
 
 // =============================================================================
@@ -150,12 +182,14 @@ fn retained_value_detach_then_construct_new_mmap() {
 
 #[test]
 fn exchange_set_retained_with_segment_id_preserves_data() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange_in_engine(&mut engine, "mqtt/ex", 1);
 
     let msg = make_msg(b"sensor-data");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "sensors/temp", &msg),
+    apply_engine_seg(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "sensors/temp", &msg),
         2,
         1001,
         Some(42),
@@ -170,19 +204,22 @@ fn exchange_set_retained_with_segment_id_preserves_data() {
 #[test]
 fn exchange_retained_overwrite_on_different_segments() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange_in_engine(&mut engine, "mqtt/ex", 1);
 
     let msg1 = make_msg(b"first");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg1),
+    apply_engine_seg(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg1),
         2,
         1001,
         Some(10),
     );
 
     let msg2 = make_msg(b"second");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg2),
+    apply_engine_seg(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg2),
         3,
         1002,
         Some(20),
@@ -195,14 +232,16 @@ fn exchange_retained_overwrite_on_different_segments() {
 
 #[test]
 fn exchange_retained_multiple_keys_different_segments() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange_in_engine(&mut engine, "mqtt/ex", 1);
 
     for (i, seg) in [10u64, 20, 30].iter().enumerate() {
         let msg = make_msg(format!("msg-{}", i).as_bytes());
         let key = format!("key-{}", i);
-        engine.apply_command(
-            &MqCommand::set_retained(exchange_id, &key, &msg),
+        apply_engine_seg(
+            &engine,
+            &MqCommand::set_retained(&mut buf, exchange_id, &key, &msg),
             i as u64 + 2,
             1001 + i as u64,
             Some(*seg),
@@ -215,27 +254,30 @@ fn exchange_retained_multiple_keys_different_segments() {
 
 #[test]
 fn exchange_delete_then_reset_on_new_segment() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange_in_engine(&mut engine, "mqtt/ex", 1);
 
     let msg = make_msg(b"first");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg),
+    apply_engine_seg(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg),
         2,
         1001,
         Some(10),
     );
 
-    engine.apply_command(
-        &MqCommand::delete_retained(exchange_id, "key"),
+    apply_engine(
+        &engine,
+        &MqCommand::delete_retained(&mut buf, exchange_id, "key"),
         3,
         1002,
-        None,
     );
 
     let msg2 = make_msg(b"second");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg2),
+    apply_engine_seg(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg2),
         4,
         1003,
         Some(20),
@@ -252,12 +294,14 @@ fn exchange_delete_then_reset_on_new_segment() {
 #[test]
 fn snapshot_preserves_retained_messages_after_segment_provenance() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange_in_engine(&mut engine, "mqtt/ex", 1);
 
     // Set with mmap backing
     let msg = make_msg(b"will-survive-snapshot");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg),
+    apply_engine_seg(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg),
         2,
         1001,
         Some(42),
@@ -277,6 +321,7 @@ fn snapshot_preserves_retained_messages_after_segment_provenance() {
 
 #[test]
 fn snapshot_with_many_retained_across_segments() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange_in_engine(&mut engine, "mqtt/ex", 1);
 
@@ -284,8 +329,9 @@ fn snapshot_with_many_retained_across_segments() {
         let msg = make_msg(format!("msg-{}", i).as_bytes());
         let key = format!("sensor/{}", i);
         let seg = (i / 5) + 1; // segments 1, 2, 3, 4
-        engine.apply_command(
-            &MqCommand::set_retained(exchange_id, &key, &msg),
+        apply_engine_seg(
+            &engine,
+            &MqCommand::set_retained(&mut buf, exchange_id, &key, &msg),
             i + 2,
             1001 + i,
             Some(seg),

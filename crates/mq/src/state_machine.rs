@@ -14,14 +14,14 @@ use tracing::{info, warn};
 use bisque_raft::{SegmentPrefetcher, SegmentSyncClient};
 
 use crate::MqTypeConfig;
-use crate::async_apply::AsyncApplyManager;
+use crate::async_apply::{AsyncApplyManager, ResponseEntry};
 use crate::config::MqConfig;
 use crate::engine::MqEngine;
 use crate::manifest::{GroupMeta, MqManifestManager, StructuralWrite};
 use crate::metadata::MqMetadata;
 use crate::retention::RetentionEvaluator;
 use crate::segment_index::SegmentIndexMap;
-use crate::types::{MqCommand, MqResponse, MqSnapshotData};
+use crate::types::{MqApplyResponse, MqCommand, MqSnapshotData};
 
 /// Raft state machine that drives the MQ engine.
 ///
@@ -60,7 +60,7 @@ pub struct MqStateMachine {
     /// when segments are unpinned (Level 1). Drained after each apply batch.
     purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
     /// Pull-based async apply manager.
-    async_apply: Option<AsyncApplyManager>,
+    async_apply: Option<Arc<AsyncApplyManager>>,
     /// Level 2 retention evaluator — deletes segment files based on
     /// per-entity retention policies.
     retention_evaluator: Option<Arc<RetentionEvaluator>>,
@@ -106,7 +106,13 @@ impl MqStateMachine {
             initial_cursor,
             &config.catalog_name,
         );
-        self.async_apply = Some(manager);
+        self.async_apply = Some(Arc::new(manager));
+    }
+
+    /// Get a shared reference to the async apply manager.
+    /// Returns `None` if `init_async_apply()` has not been called yet.
+    pub fn async_apply(&self) -> Option<Arc<AsyncApplyManager>> {
+        self.async_apply.clone()
     }
 
     /// Initialize the Level 2 retention evaluator. Call after all builder
@@ -183,7 +189,7 @@ impl MqStateMachine {
         self.engine.shared_metadata()
     }
 
-    /// Build a snapshot of all engine state (delegates to `MqEngine::snapshot`).
+    /// Build a snapshot of all engine state.
     pub fn snapshot(&self) -> MqSnapshotData {
         self.engine.snapshot()
     }
@@ -191,73 +197,6 @@ impl MqStateMachine {
     /// Get a shared reference to the segment index map.
     pub fn shared_segment_indexes(&self) -> Arc<SegmentIndexMap> {
         Arc::clone(&self.segment_indexes)
-    }
-
-    /// Apply a batch command synchronously during the async apply path.
-    /// Called after a barrier ensures all prior entries are processed.
-    fn apply_batch_inline(
-        &self,
-        cmd: &MqCommand,
-        log_index: u64,
-        current_time: u64,
-        responder: Option<openraft::storage::ApplyResponder<MqTypeConfig>>,
-    ) {
-        if cmd.tag() == MqCommand::TAG_FORWARDED_BATCH {
-            self.apply_forwarded_batch_inline(cmd, log_index, current_time);
-            if let Some(r) = responder {
-                r.send(MqResponse::Ok);
-            }
-            return;
-        }
-
-        let loc = self.prefetcher.as_ref().and_then(|p| {
-            let l = p.log_location(log_index)?;
-            Some((l.segment_id as u32, l.offset as u32))
-        });
-        let segment_id = loc.map(|(seg, _)| seg as u64);
-
-        let response = self
-            .engine
-            .apply_command(cmd, log_index, current_time, segment_id);
-
-        // Structural writes for batch sub-commands.
-        let kind = classify_structural(cmd);
-        if let Some(ref manifest) = self.manifest {
-            if let Some(writes) = collect_structural_writes(self.engine.metadata(), &response, kind)
-            {
-                let next_id = self.engine.metadata().next_id.load(Ordering::Relaxed);
-                for w in writes {
-                    manifest.structural_update_fire_and_forget(
-                        self.group_id,
-                        log_index,
-                        next_id,
-                        w,
-                    );
-                }
-            }
-        }
-
-        // Segment index tracking.
-        if let Some(loc) = loc {
-            self.segment_indexes.track_command(cmd, loc);
-        }
-
-        if let Some(r) = responder {
-            r.send(response);
-        }
-    }
-
-    /// Apply each sub-command in a TAG_FORWARDED_BATCH.
-    ///
-    /// Response routing is handled asynchronously by [`PartitionWorker`]s after
-    /// reading the committed entry from the mmap log — not here.
-    fn apply_forwarded_batch_inline(&self, cmd: &MqCommand, log_index: u64, current_time: u64) {
-        let view = cmd.as_forwarded_batch();
-        for (_, sub_cmd_bytes) in view.iter() {
-            let sub_cmd = MqCommand::from_bytes(cmd.buf.slice_ref(sub_cmd_bytes));
-            self.engine
-                .apply_command(&sub_cmd, log_index, current_time, None);
-        }
     }
 
     fn update_purge_floor(&mut self) {
@@ -376,6 +315,7 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                         next_id: structural.next_id,
                         file_manifest: Vec::new(),
                         sync_addr: None,
+                        client_sessions: Default::default(),
                     };
                     self.engine.restore_structural(snap);
                     self.segment_indexes.clear();
@@ -429,236 +369,46 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
             > + Unpin
             + OptionalSend,
     {
-        // Hoist timestamp outside the loop — sub-millisecond drift is acceptable.
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let mut had_entries = false;
 
-        // =====================================================================
-        // Async apply path: drain → stash responders → advance HWM → return.
-        // Workers pull from mmap and deliver responses asynchronously.
-        // Batch entries are processed synchronously with a barrier.
-        // =====================================================================
-        if self.async_apply.is_some() {
-            let mut had_entries = false;
+        while let Some(entry_result) = entries.next().await {
+            let (entry, responder) = entry_result?;
+            self.last_applied = Some(entry.log_id);
+            had_entries = true;
 
-            while let Some(entry_result) = entries.next().await {
-                let (entry, responder) = entry_result?;
-                self.last_applied = Some(entry.log_id);
-                had_entries = true;
-
-                match entry.payload {
-                    EntryPayload::Blank => {
-                        if let Some(r) = responder {
-                            r.send(MqResponse::Ok);
-                        }
-                    }
-                    EntryPayload::Normal(cmd) => {
-                        let log_index = entry.log_id.index;
-
-                        if cmd.tag() == MqCommand::TAG_BATCH
-                            || cmd.tag() == MqCommand::TAG_FORWARDED_BATCH
-                        {
-                            // Barrier: wait for workers to process all entries
-                            // before this batch so ordering is preserved.
-                            let async_apply = self.async_apply.as_ref().unwrap();
-                            if log_index > 1 {
-                                async_apply.advance_and_wait(log_index - 1).await;
-                            }
-
-                            // Process batch synchronously.
-                            self.apply_batch_inline(&cmd, log_index, current_time, responder);
-                        } else {
-                            // Complete raft responder immediately with log index.
-                            // Actual result delivered via client channel.
-                            if let Some(r) = responder {
-                                r.send(MqResponse::Committed { log_index });
-                            }
-                        }
-                    }
-                    EntryPayload::Membership(membership) => {
-                        self.last_membership =
-                            StoredMembership::new(Some(entry.log_id), membership);
-                        if let Some(r) = responder {
-                            r.send(MqResponse::Ok);
-                        }
-                    }
+            match entry.payload {
+                EntryPayload::Membership(membership) => {
+                    self.last_membership = StoredMembership::new(Some(entry.log_id), membership);
                 }
+                _ => {}
             }
 
-            if !had_entries {
-                self.update_purge_floor();
-                self.update_pin_ceiling();
-                return Ok(());
+            if let Some(r) = responder {
+                r.send(MqApplyResponse {
+                    log_index: entry.log_id.index,
+                });
             }
+        }
 
-            // Drain purged segment IDs that workers have already swept.
-            // Workers peek the list and sweep before advancing their cursors,
-            // so by the time we enter the next apply() call all workers from
-            // the previous cycle have finished sweeping.
-            {
-                let async_apply = self.async_apply.as_ref().unwrap();
-                async_apply.drain_purged_segments();
-            }
+        if !had_entries {
+            self.update_purge_floor();
+            self.update_pin_ceiling();
+            return Ok(());
+        }
 
-            // Advance HWM — workers wake and pull from the log.
+        {
+            let async_apply = self
+                .async_apply
+                .as_ref()
+                .expect("async_apply must be initialized before apply()");
+            async_apply.drain_purged_segments();
             if let Some(ref la) = self.last_applied {
-                let async_apply = self.async_apply.as_ref().unwrap();
                 async_apply.advance_hwm(la.index);
             }
-
-            // Update purge floor (accounts for worker cursors).
-            self.update_purge_floor();
-            self.update_pin_ceiling();
-
-            // Post-apply housekeeping (retained sweep, segment sealing) runs
-            // regardless of which path was taken — see below.
-        } else {
-            // =================================================================
-            // Sequential apply fallback (no async apply workers).
-            // =================================================================
-
-            let mut had_entries = false;
-
-            while let Some(entry_result) = entries.next().await {
-                let (entry, responder) = entry_result?;
-                self.last_applied = Some(entry.log_id);
-                had_entries = true;
-
-                match entry.payload {
-                    EntryPayload::Blank => {
-                        if let Some(r) = responder {
-                            r.send(MqResponse::Ok);
-                        }
-                    }
-                    EntryPayload::Normal(cmd) => {
-                        let log_index = entry.log_id.index;
-                        let record_location = self.prefetcher.as_ref().and_then(|p| {
-                            let loc = p.log_location(log_index)?;
-                            Some((loc.segment_id as u32, loc.offset as u32))
-                        });
-                        let structural_kind = classify_structural(&cmd);
-                        let segment_id = record_location.map(|(seg, _)| seg as u64);
-
-                        let response =
-                            self.engine
-                                .apply_command(&cmd, log_index, current_time, segment_id);
-
-                        if let Some(ref manifest) = self.manifest {
-                            if let Some(writes) = collect_structural_writes(
-                                self.engine.metadata(),
-                                &response,
-                                structural_kind,
-                            ) {
-                                let meta = self.engine.metadata();
-                                let next_id = meta.next_id.load(Ordering::Relaxed);
-                                for w in writes {
-                                    manifest.structural_update_fire_and_forget(
-                                        self.group_id,
-                                        log_index,
-                                        next_id,
-                                        w,
-                                    );
-                                }
-                            }
-                        }
-
-                        if let Some(loc) = record_location {
-                            self.segment_indexes.track_command(&cmd, loc);
-                        }
-
-                        if let Some(r) = responder {
-                            r.send(response);
-                        }
-                    }
-                    EntryPayload::Membership(membership) => {
-                        self.last_membership =
-                            StoredMembership::new(Some(entry.log_id), membership);
-                        if let Some(r) = responder {
-                            r.send(MqResponse::Ok);
-                        }
-                    }
-                }
-            }
-
-            if !had_entries {
-                self.update_purge_floor();
-                self.update_pin_ceiling();
-                return Ok(());
-            }
-
-            self.update_purge_floor();
-            self.update_pin_ceiling();
         }
 
-        // Sweep retained messages referencing purged mmap segments.
-        // Detach (copy to heap) so the segment can be freed, then batch-persist
-        // the detached retained data to MDBX for fast recovery.
-        //
-        // With async apply, each partition worker sweeps its own exchanges
-        // after processing each range — no global sweep needed here.
-        if self.async_apply.is_none() {
-            if let Some(ref purged_segments) = self.purged_segments {
-                let purged_ids: Vec<u64> = {
-                    let mut guard = purged_segments.lock();
-                    if guard.is_empty() {
-                        Vec::new()
-                    } else {
-                        std::mem::take(&mut *guard)
-                    }
-                };
-
-                if !purged_ids.is_empty() {
-                    let meta = self.engine.metadata();
-
-                    // Sweep exchange retained messages.
-                    let exchanges_guard = meta.exchanges.pin();
-                    for (&exchange_id, exchange) in exchanges_guard.iter() {
-                        let mut retained = exchange.retained.write();
-                        let mut detached = false;
-                        for rv in retained.values_mut() {
-                            if let Some(seg_id) = rv.segment_id {
-                                if purged_ids.contains(&seg_id) {
-                                    rv.detach();
-                                    detached = true;
-                                }
-                            }
-                        }
-
-                        // Batch-persist all retained messages for this exchange
-                        if detached {
-                            if let Some(ref manifest) = self.manifest {
-                                let entries: Vec<(String, Vec<u8>)> = retained
-                                    .iter()
-                                    .map(|(k, v)| (k.clone(), v.message.to_vec()))
-                                    .collect();
-                                manifest.persist_retained_fire_and_forget(
-                                    self.group_id,
-                                    exchange_id,
-                                    entries,
-                                );
-                            }
-                        }
-                    }
-
-                    // Sweep topic retained messages.
-                    let topics_guard = meta.topics.pin();
-                    for (_, topic) in topics_guard.iter() {
-                        if topic.meta.retained {
-                            let mut retained = topic.retained_message.write();
-                            if let Some(ref mut rv) = *retained {
-                                if let Some(seg_id) = rv.segment_id {
-                                    if purged_ids.contains(&seg_id) {
-                                        rv.detach();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        self.update_purge_floor();
+        self.update_pin_ceiling();
 
         // Drain sealed segment indexes and write .sidx files on blocking pool.
         // The current segment_id is derived from the last applied entry's record location.
@@ -998,16 +748,17 @@ fn classify_structural_buf(buf: &[u8]) -> StructuralKind {
 /// For deletes, uses the ID captured before apply.
 pub(crate) fn collect_structural_writes(
     meta: &MqMetadata,
-    response: &MqResponse,
+    response: &ResponseEntry,
     kind: StructuralKind,
 ) -> Option<Vec<StructuralWrite>> {
     match kind {
         StructuralKind::None => None,
         StructuralKind::CreateTopic => {
-            if let MqResponse::EntityCreated { id } = response {
+            if response.tag() == ResponseEntry::TAG_ENTITY_CREATED {
+                let id = response.entity_id();
                 meta.topics
                     .pin()
-                    .get(id)
+                    .get(&id)
                     .map(|t| vec![StructuralWrite::CreateTopic(t.snapshot_meta())])
             } else {
                 None
@@ -1015,10 +766,11 @@ pub(crate) fn collect_structural_writes(
         }
         StructuralKind::DeleteTopic(id) => Some(vec![StructuralWrite::DeleteTopic(id)]),
         StructuralKind::CreateExchange => {
-            if let MqResponse::EntityCreated { id } = response {
+            if response.tag() == ResponseEntry::TAG_ENTITY_CREATED {
+                let id = response.entity_id();
                 meta.exchanges
                     .pin()
-                    .get(id)
+                    .get(&id)
                     .map(|e| vec![StructuralWrite::CreateExchange(e.meta.clone())])
             } else {
                 None
@@ -1026,10 +778,11 @@ pub(crate) fn collect_structural_writes(
         }
         StructuralKind::DeleteExchange(id) => Some(vec![StructuralWrite::DeleteExchange(id)]),
         StructuralKind::CreateConsumerGroup => {
-            if let MqResponse::EntityCreated { id } = response {
+            if response.tag() == ResponseEntry::TAG_ENTITY_CREATED {
+                let id = response.entity_id();
                 meta.consumer_groups
                     .pin()
-                    .get(id)
+                    .get(&id)
                     .map(|g| vec![StructuralWrite::CreateConsumerGroup(g.snapshot_meta())])
             } else {
                 None
@@ -1039,10 +792,11 @@ pub(crate) fn collect_structural_writes(
             Some(vec![StructuralWrite::DeleteConsumerGroup(id)])
         }
         StructuralKind::CreateSession => {
-            if let MqResponse::EntityCreated { id } = response {
+            if response.tag() == ResponseEntry::TAG_ENTITY_CREATED {
+                let id = response.entity_id();
                 meta.sessions
                     .pin()
-                    .get(id)
+                    .get(&id)
                     .map(|s| vec![StructuralWrite::CreateSession(s.snapshot_meta())])
             } else {
                 None
@@ -1053,7 +807,7 @@ pub(crate) fn collect_structural_writes(
             routing_key,
             message,
         } => {
-            if matches!(response, MqResponse::Ok) {
+            if response.tag() == ResponseEntry::TAG_OK {
                 Some(vec![StructuralWrite::SetRetained {
                     exchange_id,
                     routing_key,
@@ -1067,7 +821,7 @@ pub(crate) fn collect_structural_writes(
             exchange_id,
             routing_key,
         } => {
-            if matches!(response, MqResponse::Ok) {
+            if response.tag() == ResponseEntry::TAG_OK {
                 Some(vec![StructuralWrite::DeleteRetained {
                     exchange_id,
                     routing_key,
@@ -1077,14 +831,12 @@ pub(crate) fn collect_structural_writes(
             }
         }
         StructuralKind::Batch(kinds) => {
-            let responses = if let MqResponse::BatchResponse(resps) = response {
-                resps.as_slice()
-            } else {
+            if response.tag() != ResponseEntry::TAG_BATCH {
                 return None;
-            };
+            }
             let mut writes = Vec::new();
-            for (kind, resp) in kinds.into_iter().zip(responses.iter()) {
-                if let Some(w) = collect_structural_writes(meta, resp, kind) {
+            for (kind, resp) in kinds.into_iter().zip(response.batch_entries()) {
+                if let Some(w) = collect_structural_writes(meta, &resp, kind) {
                     writes.extend(w);
                 }
             }

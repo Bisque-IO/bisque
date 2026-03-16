@@ -153,6 +153,7 @@ fn bench_native_inbound(payload_size: usize, num_messages: u64) -> BenchResult {
     let topic = b"bench/topic/test";
     let exchange_id = 1u64;
 
+    let mut buf = BytesMut::new();
     let start = Instant::now();
     for _ in 0..num_messages {
         let flat = FlatMessageBuilder::new(&payload)
@@ -160,7 +161,8 @@ fn bench_native_inbound(payload_size: usize, num_messages: u64) -> BenchResult {
             .timestamp(1000)
             .publisher_id(42)
             .build();
-        let cmd = MqCommand::publish_to_exchange(exchange_id, &[flat]);
+        buf.clear();
+        let cmd = MqCommand::publish_to_exchange(&mut buf, exchange_id, &[flat]);
         black_box(&cmd);
     }
     let elapsed = start.elapsed();
@@ -213,6 +215,7 @@ fn bench_native_roundtrip(payload_size: usize, num_messages: u64) -> BenchResult
     let payload = vec![0xABu8; payload_size];
     let topic = b"bench/topic/test";
 
+    let mut buf = BytesMut::new();
     let start = Instant::now();
     for _ in 0..num_messages {
         // Inbound: build FlatMessage + MqCommand
@@ -221,7 +224,8 @@ fn bench_native_roundtrip(payload_size: usize, num_messages: u64) -> BenchResult
             .timestamp(1000)
             .publisher_id(42)
             .build();
-        let cmd = MqCommand::publish_to_exchange(1, &[flat_bytes.clone()]);
+        buf.clear();
+        let cmd = MqCommand::publish_to_exchange(&mut buf, 1, &[flat_bytes.clone()]);
         black_box(&cmd);
 
         // Outbound: read fields from the FlatMessage
@@ -407,7 +411,9 @@ fn bench_inbound_batched(
             .iter()
             .map(|&(start, len)| &msg_buf[start..start + len])
             .collect();
-        let cmd = MqCommand::publish_to_exchange_slices(exchange_id, &slices);
+        let mut scratch = BytesMut::new();
+        MqCommand::write_publish_to_exchange(&mut scratch, exchange_id, &slices);
+        let cmd = MqCommand::split_from(&mut scratch);
         black_box(&cmd);
     }
     let elapsed = start.elapsed();
@@ -434,34 +440,30 @@ fn bench_native_inbound_batched(
 
     let start = Instant::now();
     for _ in 0..num_batches {
-        // Write messages directly into the MqCommand buffer — zero intermediate copies.
-        let msg_estimate = 40 + 8 * 3 + topic.len() + payload.len(); // FlatMessage size
-        let mut writer = MqCommand::begin_publish_to_exchange(
-            MqCommand::TAG_PUBLISH_TO_EXCHANGE,
-            exchange_id,
-            batch_size,
-            msg_estimate * batch_size,
-        );
+        let mut msg_bufs: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
-            writer.push(|buf| {
-                write_flat_message_vec(
-                    buf,
-                    &payload,
-                    None,
-                    Some(topic),
-                    None,
-                    None,
-                    &[],
-                    1000,
-                    0,
-                    0,
-                    42,
-                    0,
-                    false,
-                );
-            });
+            let mut mbuf = Vec::new();
+            write_flat_message_vec(
+                &mut mbuf,
+                &payload,
+                None,
+                Some(topic),
+                None,
+                None,
+                &[],
+                1000,
+                0,
+                0,
+                42,
+                0,
+                false,
+            );
+            msg_bufs.push(mbuf);
         }
-        let cmd = writer.finish();
+        let slices: Vec<&[u8]> = msg_bufs.iter().map(|b| b.as_slice()).collect();
+        let mut scratch = BytesMut::new();
+        MqCommand::write_publish_to_exchange(&mut scratch, exchange_id, &slices);
+        let cmd = MqCommand::split_from(&mut scratch);
         black_box(&cmd);
     }
     let elapsed = start.elapsed();
@@ -484,13 +486,15 @@ fn bench_native_inbound_envelope(payload_size: usize, num_messages: u64) -> Benc
     let topic = b"bench/topic/test";
     let exchange_id = 1u64;
 
+    let mut buf = BytesMut::new();
     let start = Instant::now();
     for _ in 0..num_messages {
         let envelope = MqttEnvelopeBuilder::new(topic, &payload)
             .timestamp(1000)
             .publisher_id(42)
             .build();
-        let cmd = MqCommand::publish_to_exchange(exchange_id, &[envelope]);
+        buf.clear();
+        let cmd = MqCommand::publish_to_exchange(&mut buf, exchange_id, &[envelope]);
         black_box(&cmd);
     }
     let elapsed = start.elapsed();
@@ -513,6 +517,7 @@ fn bench_native_inbound_fast_flat(payload_size: usize, num_messages: u64) -> Ben
     let topic = b"bench/topic/test";
     let exchange_id = 1u64;
 
+    let mut buf = BytesMut::new();
     let start = Instant::now();
     for _ in 0..num_messages {
         let flat = FlatMessageBuilder::new(&payload)
@@ -520,7 +525,8 @@ fn bench_native_inbound_fast_flat(payload_size: usize, num_messages: u64) -> Ben
             .timestamp(1000)
             .publisher_id(42)
             .build();
-        let cmd = MqCommand::publish_to_exchange(exchange_id, &[flat]);
+        buf.clear();
+        let cmd = MqCommand::publish_to_exchange(&mut buf, exchange_id, &[flat]);
         black_box(&cmd);
     }
     let elapsed = start.elapsed();
@@ -543,13 +549,15 @@ fn bench_native_inbound_fast_env(payload_size: usize, num_messages: u64) -> Benc
     let topic = b"bench/topic/test";
     let exchange_id = 1u64;
 
+    let mut buf = BytesMut::new();
     let start = Instant::now();
     for _ in 0..num_messages {
         let env = MqttEnvelopeBuilder::new(topic, &payload)
             .timestamp(1000)
             .publisher_id(42)
             .build();
-        let cmd = MqCommand::publish_to_exchange(exchange_id, &[env]);
+        buf.clear();
+        let cmd = MqCommand::publish_to_exchange(&mut buf, exchange_id, &[env]);
         black_box(&cmd);
     }
     let elapsed = start.elapsed();

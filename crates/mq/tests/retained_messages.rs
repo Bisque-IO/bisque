@@ -26,11 +26,36 @@ use bytes::Bytes;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{LogId, SnapshotMeta, StoredMembership};
 
-type MqTypeConfig = bisque_raft::BisqueRaftTypeConfig<MqCommand, MqResponse>;
+type MqTypeConfig = bisque_raft::BisqueRaftTypeConfig<MqCommand, MqApplyResponse>;
 
 // =============================================================================
 // Helpers
 // =============================================================================
+
+use bisque_mq::MqApplyResponse;
+use bisque_mq::async_apply::ResponseEntry;
+use bytes::BytesMut;
+
+fn apply_engine(
+    engine: &bisque_mq::engine::MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+) -> ResponseEntry {
+    apply_engine_seg(engine, cmd, log_index, current_time, None)
+}
+
+fn apply_engine_seg(
+    engine: &bisque_mq::engine::MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+    segment_id: Option<u64>,
+) -> ResponseEntry {
+    let mut _buf = BytesMut::new();
+    engine.apply_command(cmd, &mut _buf, log_index, current_time, segment_id);
+    ResponseEntry::split_from(&mut _buf)
+}
 
 fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-retained-test"))
@@ -41,15 +66,19 @@ fn make_msg(value: &[u8]) -> Bytes {
 }
 
 fn create_exchange(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) -> u64 {
-    match engine.apply_command(
-        &MqCommand::create_exchange(name, ExchangeType::Topic),
+    let mut buf = bytes::BytesMut::new();
+    let __e = apply_engine(
+        &engine,
+        &MqCommand::create_exchange(&mut buf, name, ExchangeType::Topic),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    __e.entity_id()
 }
 
 fn create_exchange_typed(
@@ -59,28 +88,36 @@ fn create_exchange_typed(
     log_index: u64,
     time: u64,
 ) -> u64 {
-    match engine.apply_command(
-        &MqCommand::create_exchange(name, exchange_type),
+    let mut buf = bytes::BytesMut::new();
+    let __e = apply_engine(
+        &engine,
+        &MqCommand::create_exchange(&mut buf, name, exchange_type),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    __e.entity_id()
 }
 
 /// Get retained messages count via GET_RETAINED command.
 fn get_retained_count(engine: &mut MqEngine, exchange_id: u64, log_index: u64) -> usize {
-    match engine.apply_command(
-        &MqCommand::get_retained(exchange_id, None),
+    let mut buf = bytes::BytesMut::new();
+    let __e = apply_engine(
+        &engine,
+        &MqCommand::get_retained(&mut buf, exchange_id, None),
         log_index,
         9999,
-        None,
-    ) {
-        MqResponse::RetainedMessages { messages } => messages.len(),
-        other => panic!("expected RetainedMessages, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_RETAINED_MESSAGES,
+        "expected RetainedMessages"
+    );
+    __e.retained_messages().count()
 }
 
 /// Get retained messages via GET_RETAINED command.
@@ -90,15 +127,19 @@ fn get_retained(
     filter: Option<&str>,
     log_index: u64,
 ) -> Vec<RetainedEntry> {
-    match engine.apply_command(
-        &MqCommand::get_retained(exchange_id, filter),
+    let mut buf = bytes::BytesMut::new();
+    let __e = apply_engine(
+        &engine,
+        &MqCommand::get_retained(&mut buf, exchange_id, filter),
         log_index,
         9999,
-        None,
-    ) {
-        MqResponse::RetainedMessages { messages } => messages,
-        other => panic!("expected RetainedMessages, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_RETAINED_MESSAGES,
+        "expected RetainedMessages"
+    );
+    __e.retained_messages().collect()
 }
 
 fn leader_id() -> openraft::impls::leader_id_adv::LeaderId<MqTypeConfig> {
@@ -126,16 +167,17 @@ fn make_snapshot_meta(index: u64, id: &str) -> SnapshotMeta<MqTypeConfig> {
 #[test]
 fn test_set_retained_basic() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let msg = make_msg(b"temp=22.5");
 
-    let resp = engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "sensors/temp", &msg),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "sensors/temp", &msg),
         2,
         1001,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 
     // Verify stored via GET_RETAINED
     let entries = get_retained(&mut engine, exchange_id, Some("sensors/temp"), 3);
@@ -145,37 +187,40 @@ fn test_set_retained_basic() {
 
 #[test]
 fn test_set_retained_nonexistent_exchange() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let msg = make_msg(b"data");
 
-    let resp = engine.apply_command(
-        &MqCommand::set_retained(99999, "some/key", &msg),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, 99999, "some/key", &msg),
         1,
         1000,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Error(MqError::NotFound { .. })));
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ERROR, "expected Error");
+    assert_eq!(resp.error_kind(), ResponseEntry::ERR_NOT_FOUND);
 }
 
 #[test]
 fn test_set_retained_overwrite() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg1 = make_msg(b"first");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg1),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg1),
         2,
         1001,
-        None,
     );
 
     let msg2 = make_msg(b"second");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg2),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg2),
         3,
         1002,
-        None,
     );
 
     // Should have exactly one entry (overwritten, not appended)
@@ -185,16 +230,17 @@ fn test_set_retained_overwrite() {
 #[test]
 fn test_set_retained_multiple_keys() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     for i in 0..10 {
         let msg = make_msg(format!("val-{}", i).as_bytes());
         let key = format!("sensors/sensor{}", i);
-        engine.apply_command(
-            &MqCommand::set_retained(exchange_id, &key, &msg),
+        apply_engine(
+            &engine,
+            &MqCommand::set_retained(&mut buf, exchange_id, &key, &msg),
             i as u64 + 2,
             1001 + i as u64,
-            None,
         );
     }
 
@@ -203,17 +249,18 @@ fn test_set_retained_multiple_keys() {
 
 #[test]
 fn test_set_retained_empty_routing_key() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let msg = make_msg(b"data");
 
-    let resp = engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "", &msg),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "", &msg),
         2,
         1001,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 
     // Empty routing key should be retrievable
     assert_eq!(get_retained_count(&mut engine, exchange_id, 3), 1);
@@ -225,23 +272,24 @@ fn test_set_retained_empty_routing_key() {
 
 #[test]
 fn test_get_retained_all() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg1 = make_msg(b"temp=22.5");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "sensors/temp", &msg1),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "sensors/temp", &msg1),
         2,
         1001,
-        None,
     );
 
     let msg2 = make_msg(b"humidity=60");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "sensors/humidity", &msg2),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "sensors/humidity", &msg2),
         3,
         1002,
-        None,
     );
 
     // Get all retained (no filter)
@@ -252,21 +300,22 @@ fn test_get_retained_all() {
 #[test]
 fn test_get_retained_exact_match() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg1 = make_msg(b"temp=22.5");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "sensors/temp", &msg1),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "sensors/temp", &msg1),
         2,
         1001,
-        None,
     );
     let msg2 = make_msg(b"humidity=60");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "sensors/humidity", &msg2),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "sensors/humidity", &msg2),
         3,
         1002,
-        None,
     );
 
     let entries = get_retained(&mut engine, exchange_id, Some("sensors/temp"), 4);
@@ -276,6 +325,7 @@ fn test_get_retained_exact_match() {
 
 #[test]
 fn test_get_retained_wildcard_plus() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
@@ -284,11 +334,11 @@ fn test_get_retained_wildcard_plus() {
         .enumerate()
     {
         let msg = make_msg(format!("val-{}", i).as_bytes());
-        engine.apply_command(
-            &MqCommand::set_retained(exchange_id, key, &msg),
+        apply_engine(
+            &engine,
+            &MqCommand::set_retained(&mut buf, exchange_id, key, &msg),
             i as u64 + 2,
             1001 + i as u64,
-            None,
         );
     }
 
@@ -306,6 +356,7 @@ fn test_get_retained_wildcard_plus() {
 
 #[test]
 fn test_get_retained_wildcard_hash() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
@@ -319,11 +370,11 @@ fn test_get_retained_wildcard_hash() {
     .enumerate()
     {
         let msg = make_msg(format!("val-{}", i).as_bytes());
-        engine.apply_command(
-            &MqCommand::set_retained(exchange_id, key, &msg),
+        apply_engine(
+            &engine,
+            &MqCommand::set_retained(&mut buf, exchange_id, key, &msg),
             i as u64 + 2,
             1001 + i as u64,
-            None,
         );
     }
 
@@ -347,22 +398,30 @@ fn test_get_retained_empty_exchange() {
 
 #[test]
 fn test_get_retained_nonexistent_exchange() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
-    let resp = engine.apply_command(&MqCommand::get_retained(99999, None), 1, 1000, None);
-    assert!(matches!(resp, MqResponse::Error(MqError::NotFound { .. })));
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::get_retained(&mut buf, 99999, None),
+        1,
+        1000,
+    );
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ERROR, "expected Error");
+    assert_eq!(resp.error_kind(), ResponseEntry::ERR_NOT_FOUND);
 }
 
 #[test]
 fn test_get_retained_no_match() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg = make_msg(b"data");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "sensors/temp", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "sensors/temp", &msg),
         2,
         1001,
-        None,
     );
 
     let entries = get_retained(&mut engine, exchange_id, Some("actuators/+"), 3);
@@ -376,23 +435,24 @@ fn test_get_retained_no_match() {
 #[test]
 fn test_delete_retained_basic() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg = make_msg(b"data");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "sensors/temp", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "sensors/temp", &msg),
         2,
         1001,
-        None,
     );
 
-    let resp = engine.apply_command(
-        &MqCommand::delete_retained(exchange_id, "sensors/temp"),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::delete_retained(&mut buf, exchange_id, "sensors/temp"),
         3,
         1002,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 
     // Verify removed
     assert_eq!(get_retained_count(&mut engine, exchange_id, 4), 0);
@@ -400,53 +460,67 @@ fn test_delete_retained_basic() {
 
 #[test]
 fn test_delete_retained_nonexistent_key() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     // Deleting a key that doesn't exist should be Ok (idempotent)
-    let resp = engine.apply_command(
-        &MqCommand::delete_retained(exchange_id, "nonexistent"),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::delete_retained(&mut buf, exchange_id, "nonexistent"),
         2,
         1001,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 }
 
 #[test]
 fn test_delete_retained_nonexistent_exchange() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
-    let resp = engine.apply_command(&MqCommand::delete_retained(99999, "key"), 1, 1000, None);
-    assert!(matches!(resp, MqResponse::Error(MqError::NotFound { .. })));
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::delete_retained(&mut buf, 99999, "key"),
+        1,
+        1000,
+    );
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ERROR, "expected Error");
+    assert_eq!(resp.error_kind(), ResponseEntry::ERR_NOT_FOUND);
 }
 
 #[test]
 fn test_delete_retained_selective() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg = make_msg(b"data");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "a", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "a", &msg),
         2,
         1001,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "b", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "b", &msg),
         3,
         1002,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "c", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "c", &msg),
         4,
         1003,
-        None,
     );
 
     // Delete only "b"
-    engine.apply_command(&MqCommand::delete_retained(exchange_id, "b"), 5, 1004, None);
+    apply_engine(
+        &engine,
+        &MqCommand::delete_retained(&mut buf, exchange_id, "b"),
+        5,
+        1004,
+    );
 
     assert_eq!(get_retained_count(&mut engine, exchange_id, 6), 2);
     // Verify "a" and "c" remain, "b" is gone
@@ -470,16 +544,17 @@ fn test_delete_retained_selective() {
 
 #[test]
 fn test_retained_full_lifecycle() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     // 1. Set retained
     let msg = make_msg(b"initial");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "topic/a", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "topic/a", &msg),
         2,
         1001,
-        None,
     );
 
     // 2. Get retained - should find it
@@ -490,11 +565,11 @@ fn test_retained_full_lifecycle() {
 
     // 3. Overwrite
     let msg2 = make_msg(b"updated");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "topic/a", &msg2),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "topic/a", &msg2),
         4,
         1003,
-        None,
     );
 
     // 4. Get again - still one message
@@ -504,11 +579,11 @@ fn test_retained_full_lifecycle() {
     );
 
     // 5. Delete
-    engine.apply_command(
-        &MqCommand::delete_retained(exchange_id, "topic/a"),
+    apply_engine(
+        &engine,
+        &MqCommand::delete_retained(&mut buf, exchange_id, "topic/a"),
         6,
         1005,
-        None,
     );
 
     // 6. Get again - should be empty
@@ -583,30 +658,42 @@ fn test_retained_value_heap_constructor() {
 
 #[test]
 fn test_delete_exchange_clears_retained() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg = make_msg(b"retained-data");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key1", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key1", &msg),
         2,
         1001,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key2", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key2", &msg),
         3,
         1002,
-        None,
     );
 
     // Delete the exchange
-    let resp = engine.apply_command(&MqCommand::delete_exchange(exchange_id), 4, 1003, None);
-    assert!(matches!(resp, MqResponse::Ok));
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::delete_exchange(&mut buf, exchange_id),
+        4,
+        1003,
+    );
+    assert!(resp.is_ok(), "expected Ok");
 
     // GET_RETAINED on deleted exchange should fail
-    let resp = engine.apply_command(&MqCommand::get_retained(exchange_id, None), 5, 1004, None);
-    assert!(matches!(resp, MqResponse::Error(MqError::NotFound { .. })));
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::get_retained(&mut buf, exchange_id, None),
+        5,
+        1004,
+    );
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ERROR, "expected Error");
+    assert_eq!(resp.error_kind(), ResponseEntry::ERR_NOT_FOUND);
 }
 
 // =============================================================================
@@ -615,22 +702,23 @@ fn test_delete_exchange_clears_retained() {
 
 #[test]
 fn test_retained_multiple_exchanges() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let ex1 = create_exchange(&mut engine, "exchange1", 1, 1000);
     let ex2 = create_exchange(&mut engine, "exchange2", 2, 1001);
 
     let msg = make_msg(b"data");
-    engine.apply_command(
-        &MqCommand::set_retained(ex1, "shared/key", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, ex1, "shared/key", &msg),
         3,
         1002,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::set_retained(ex2, "shared/key", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, ex2, "shared/key", &msg),
         4,
         1003,
-        None,
     );
 
     // Each exchange should have its own copy
@@ -638,11 +726,11 @@ fn test_retained_multiple_exchanges() {
     assert_eq!(get_retained_count(&mut engine, ex2, 6), 1);
 
     // Delete from one doesn't affect the other
-    engine.apply_command(
-        &MqCommand::delete_retained(ex1, "shared/key"),
+    apply_engine(
+        &engine,
+        &MqCommand::delete_retained(&mut buf, ex1, "shared/key"),
         7,
         1004,
-        None,
     );
 
     assert_eq!(get_retained_count(&mut engine, ex1, 8), 0);
@@ -656,22 +744,23 @@ fn test_retained_multiple_exchanges() {
 #[test]
 fn test_snapshot_includes_retained_messages() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg1 = make_msg(b"retained-1");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "topic/a", &msg1),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "topic/a", &msg1),
         2,
         1001,
-        None,
     );
 
     let msg2 = make_msg(b"retained-2");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "topic/b", &msg2),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "topic/b", &msg2),
         3,
         1002,
-        None,
     );
 
     let snap = engine.snapshot();
@@ -690,15 +779,16 @@ fn test_snapshot_includes_retained_messages() {
 
 #[tokio::test]
 async fn test_snapshot_install_with_retained_messages() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg = make_msg(b"retained-via-snapshot");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg),
         2,
         1001,
-        None,
     );
 
     let snap_bytes =
@@ -725,6 +815,7 @@ async fn test_snapshot_install_with_retained_messages() {
 
 #[tokio::test]
 async fn test_manifest_recovery_with_retained_messages() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = tempfile::tempdir().unwrap();
     let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
     manifest.open_group(1).unwrap();
@@ -734,11 +825,11 @@ async fn test_manifest_recovery_with_retained_messages() {
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg = make_msg(b"persisted-retained");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "persist/key", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "persist/key", &msg),
         2,
         1001,
-        None,
     );
 
     let snap = engine.snapshot();
@@ -769,6 +860,7 @@ async fn test_manifest_recovery_with_retained_messages() {
 
 #[tokio::test]
 async fn test_manifest_recovery_multiple_retained() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = tempfile::tempdir().unwrap();
     let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
     manifest.open_group(1).unwrap();
@@ -780,19 +872,19 @@ async fn test_manifest_recovery_multiple_retained() {
 
     for i in 0..5 {
         let msg = make_msg(format!("msg-{}", i).as_bytes());
-        engine.apply_command(
-            &MqCommand::set_retained(ex1, &format!("key/{}", i), &msg),
+        apply_engine(
+            &engine,
+            &MqCommand::set_retained(&mut buf, ex1, &format!("key/{}", i), &msg),
             i as u64 + 3,
             1002 + i as u64,
-            None,
         );
     }
     let msg = make_msg(b"ex2-msg");
-    engine.apply_command(
-        &MqCommand::set_retained(ex2, "other/key", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, ex2, "other/key", &msg),
         8,
         1007,
-        None,
     );
 
     let snap = engine.snapshot();
@@ -827,8 +919,9 @@ async fn test_manifest_recovery_multiple_retained() {
 
 #[test]
 fn test_set_retained_codec() {
+    let mut buf = bytes::BytesMut::new();
     let msg = make_msg(b"codec-test");
-    let cmd = MqCommand::set_retained(42, "sensors/temp", &msg);
+    let cmd = MqCommand::set_retained(&mut buf, 42, "sensors/temp", &msg);
 
     assert_eq!(cmd.tag(), MqCommand::TAG_SET_RETAINED);
     let v = cmd.as_set_retained();
@@ -839,7 +932,8 @@ fn test_set_retained_codec() {
 
 #[test]
 fn test_get_retained_codec_with_filter() {
-    let cmd = MqCommand::get_retained(42, Some("sensors/+"));
+    let mut buf = bytes::BytesMut::new();
+    let cmd = MqCommand::get_retained(&mut buf, 42, Some("sensors/+"));
 
     assert_eq!(cmd.tag(), MqCommand::TAG_GET_RETAINED);
     let v = cmd.as_get_retained();
@@ -849,7 +943,9 @@ fn test_get_retained_codec_with_filter() {
 
 #[test]
 fn test_get_retained_codec_no_filter() {
-    let cmd = MqCommand::get_retained(42, None);
+    let mut buf = BytesMut::new();
+
+    let cmd = MqCommand::get_retained(&mut buf, 42, None);
 
     assert_eq!(cmd.tag(), MqCommand::TAG_GET_RETAINED);
     let v = cmd.as_get_retained();
@@ -859,7 +955,8 @@ fn test_get_retained_codec_no_filter() {
 
 #[test]
 fn test_delete_retained_codec() {
-    let cmd = MqCommand::delete_retained(42, "sensors/temp");
+    let mut buf = bytes::BytesMut::new();
+    let cmd = MqCommand::delete_retained(&mut buf, 42, "sensors/temp");
 
     assert_eq!(cmd.tag(), MqCommand::TAG_DELETE_RETAINED);
     let v = cmd.as_delete_retained();
@@ -873,8 +970,9 @@ fn test_delete_retained_codec() {
 
 #[test]
 fn test_set_retained_display() {
+    let mut buf = bytes::BytesMut::new();
     let msg = make_msg(b"data");
-    let cmd = MqCommand::set_retained(42, "sensors/temp", &msg);
+    let cmd = MqCommand::set_retained(&mut buf, 42, "sensors/temp", &msg);
     let s = format!("{}", cmd);
     assert!(s.contains("SetRetained"));
     assert!(s.contains("42"));
@@ -883,7 +981,9 @@ fn test_set_retained_display() {
 
 #[test]
 fn test_get_retained_display() {
-    let cmd = MqCommand::get_retained(42, Some("sensors/+"));
+    let mut buf = BytesMut::new();
+
+    let cmd = MqCommand::get_retained(&mut buf, 42, Some("sensors/+"));
     let s = format!("{}", cmd);
     assert!(s.contains("GetRetained"));
     assert!(s.contains("42"));
@@ -891,7 +991,8 @@ fn test_get_retained_display() {
 
 #[test]
 fn test_delete_retained_display() {
-    let cmd = MqCommand::delete_retained(42, "sensors/temp");
+    let mut buf = bytes::BytesMut::new();
+    let cmd = MqCommand::delete_retained(&mut buf, 42, "sensors/temp");
     let s = format!("{}", cmd);
     assert!(s.contains("DeleteRetained"));
     assert!(s.contains("42"));
@@ -905,9 +1006,10 @@ fn test_delete_retained_display() {
 #[test]
 fn test_set_retained_raft_encode_decode() {
     use bisque_raft::codec::{Decode, Encode};
+    let mut buf = bytes::BytesMut::new();
 
     let msg = make_msg(b"raft-test");
-    let cmd = MqCommand::set_retained(42, "key", &msg);
+    let cmd = MqCommand::set_retained(&mut buf, 42, "key", &msg);
 
     let mut buf = Vec::new();
     cmd.encode(&mut buf).unwrap();
@@ -921,9 +1023,11 @@ fn test_set_retained_raft_encode_decode() {
 
 #[test]
 fn test_get_retained_raft_encode_decode() {
+    let mut buf = BytesMut::new();
+
     use bisque_raft::codec::{Decode, Encode};
 
-    let cmd = MqCommand::get_retained(99, Some("pattern/#"));
+    let cmd = MqCommand::get_retained(&mut buf, 99, Some("pattern/#"));
 
     let mut buf = Vec::new();
     cmd.encode(&mut buf).unwrap();
@@ -938,8 +1042,9 @@ fn test_get_retained_raft_encode_decode() {
 #[test]
 fn test_delete_retained_raft_encode_decode() {
     use bisque_raft::codec::{Decode, Encode};
+    let mut buf = bytes::BytesMut::new();
 
-    let cmd = MqCommand::delete_retained(99, "del/key");
+    let cmd = MqCommand::delete_retained(&mut buf, 99, "del/key");
 
     let mut buf = Vec::new();
     cmd.encode(&mut buf).unwrap();
@@ -952,86 +1057,32 @@ fn test_delete_retained_raft_encode_decode() {
 }
 
 // =============================================================================
-// MqResponse::RetainedMessages codec round-trip
-// =============================================================================
-
-#[test]
-fn test_retained_messages_response_encode_decode() {
-    use bisque_raft::codec::{Decode, Encode};
-
-    let resp = MqResponse::RetainedMessages {
-        messages: vec![
-            RetainedEntry {
-                routing_key: Bytes::from_static(b"sensors/temp"),
-                message: Bytes::from_static(b"22.5"),
-            },
-            RetainedEntry {
-                routing_key: Bytes::from_static(b"sensors/humidity"),
-                message: Bytes::from_static(b"60"),
-            },
-        ],
-    };
-
-    let mut buf = Vec::new();
-    resp.encode(&mut buf).unwrap();
-
-    let decoded = MqResponse::decode(&mut &buf[..]).unwrap();
-    match decoded {
-        MqResponse::RetainedMessages { messages } => {
-            assert_eq!(messages.len(), 2);
-            assert_eq!(&messages[0].routing_key[..], b"sensors/temp");
-            assert_eq!(&messages[0].message[..], b"22.5");
-            assert_eq!(&messages[1].routing_key[..], b"sensors/humidity");
-            assert_eq!(&messages[1].message[..], b"60");
-        }
-        other => panic!("expected RetainedMessages, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_retained_messages_response_empty() {
-    use bisque_raft::codec::{Decode, Encode};
-
-    let resp = MqResponse::RetainedMessages { messages: vec![] };
-
-    let mut buf = Vec::new();
-    resp.encode(&mut buf).unwrap();
-
-    let decoded = MqResponse::decode(&mut &buf[..]).unwrap();
-    match decoded {
-        MqResponse::RetainedMessages { messages } => {
-            assert!(messages.is_empty());
-        }
-        other => panic!("expected RetainedMessages, got {:?}", other),
-    }
-}
-
-// =============================================================================
 // Batch commands with retained
 // =============================================================================
 
 #[test]
 fn test_batch_with_retained_commands() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg1 = make_msg(b"batch-1");
     let msg2 = make_msg(b"batch-2");
 
-    let batch = MqCommand::batch(&[
-        MqCommand::set_retained(exchange_id, "a", &msg1),
-        MqCommand::set_retained(exchange_id, "b", &msg2),
-    ]);
+    let inner1 = MqCommand::set_retained(&mut buf, exchange_id, "a", &msg1);
+    let inner2 = MqCommand::set_retained(&mut buf, exchange_id, "b", &msg2);
+    let batch = MqCommand::batch(&mut buf, &[inner1, inner2]);
 
-    let resp = engine.apply_command(&batch, 2, 1001, None);
-    match resp {
-        MqResponse::BatchResponse(resps) => {
-            assert_eq!(resps.len(), 2);
-            assert!(matches!(resps[0], MqResponse::Ok));
-            assert!(matches!(resps[1], MqResponse::Ok));
-        }
-        other => panic!("expected BatchResponse, got {:?}", other),
-    }
+    let resp = apply_engine(&engine, &batch, 2, 1001);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_BATCH,
+        "expected BatchResponse"
+    );
+    let __entries: Vec<_> = resp.batch_entries().collect();
+    assert_eq!(__entries.len(), 2);
+    assert!(__entries[0].is_ok());
+    assert!(__entries[1].is_ok());
 
     assert_eq!(get_retained_count(&mut engine, exchange_id, 3), 2);
 }
@@ -1039,33 +1090,34 @@ fn test_batch_with_retained_commands() {
 #[test]
 fn test_batch_set_and_delete_retained() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     // Pre-set a retained message
     let msg = make_msg(b"to-delete");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "old-key", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "old-key", &msg),
         2,
         1001,
-        None,
     );
 
     // Batch: set new + delete old
     let new_msg = make_msg(b"new");
-    let batch = MqCommand::batch(&[
-        MqCommand::set_retained(exchange_id, "new-key", &new_msg),
-        MqCommand::delete_retained(exchange_id, "old-key"),
-    ]);
+    let inner_set = MqCommand::set_retained(&mut buf, exchange_id, "new-key", &new_msg);
+    let inner_del = MqCommand::delete_retained(&mut buf, exchange_id, "old-key");
+    let batch = MqCommand::batch(&mut buf, &[inner_set, inner_del]);
 
-    let resp = engine.apply_command(&batch, 3, 1002, None);
-    match resp {
-        MqResponse::BatchResponse(resps) => {
-            assert_eq!(resps.len(), 2);
-            assert!(matches!(resps[0], MqResponse::Ok));
-            assert!(matches!(resps[1], MqResponse::Ok));
-        }
-        other => panic!("expected BatchResponse, got {:?}", other),
-    }
+    let resp = apply_engine(&engine, &batch, 3, 1002);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_BATCH,
+        "expected BatchResponse"
+    );
+    let __entries: Vec<_> = resp.batch_entries().collect();
+    assert_eq!(__entries.len(), 2);
+    assert!(__entries[0].is_ok());
+    assert!(__entries[1].is_ok());
 
     // Only new-key should remain
     let entries = get_retained(&mut engine, exchange_id, None, 4);
@@ -1079,19 +1131,20 @@ fn test_batch_set_and_delete_retained() {
 
 #[test]
 fn test_retained_large_message() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     // 1MB message
     let large_payload = vec![0xABu8; 1024 * 1024];
     let msg = make_msg(&large_payload);
-    let resp = engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "large", &msg),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "large", &msg),
         2,
         1001,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 
     // Retrieve it
     let entries = get_retained(&mut engine, exchange_id, Some("large"), 3);
@@ -1101,18 +1154,19 @@ fn test_retained_large_message() {
 
 #[test]
 fn test_retained_unicode_routing_key() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg = make_msg(b"unicode-data");
     let key = "传感器/温度/房间1";
-    let resp = engine.apply_command(
-        &MqCommand::set_retained(exchange_id, key, &msg),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, key, &msg),
         2,
         1001,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 
     let entries = get_retained(&mut engine, exchange_id, Some(key), 3);
     assert_eq!(entries.len(), 1);
@@ -1122,12 +1176,14 @@ fn test_retained_unicode_routing_key() {
 #[test]
 fn test_retained_segment_provenance_via_snapshot() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     // Set with segment_id to simulate mmap-backed
     let msg = make_msg(b"mmap-data");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg),
+    apply_engine_seg(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg),
         2,
         1001,
         Some(42),
@@ -1153,15 +1209,16 @@ fn test_retained_segment_provenance_via_snapshot() {
 
 #[tokio::test]
 async fn test_snapshot_builder_includes_retained() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg = make_msg(b"builder-retained");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key", &msg),
         2,
         1001,
-        None,
     );
 
     let snap_bytes =
@@ -1193,18 +1250,19 @@ async fn test_snapshot_builder_includes_retained() {
 
 #[test]
 fn test_retained_on_direct_exchange() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id =
         create_exchange_typed(&mut engine, "direct-ex", ExchangeType::Direct, 1, 1000);
 
     let msg = make_msg(b"direct-retained");
-    let resp = engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "exact-key", &msg),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "exact-key", &msg),
         2,
         1001,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 
     let entries = get_retained(&mut engine, exchange_id, Some("exact-key"), 3);
     assert_eq!(entries.len(), 1);
@@ -1212,18 +1270,19 @@ fn test_retained_on_direct_exchange() {
 
 #[test]
 fn test_retained_on_fanout_exchange() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id =
         create_exchange_typed(&mut engine, "fanout-ex", ExchangeType::Fanout, 1, 1000);
 
     let msg = make_msg(b"fanout-retained");
-    let resp = engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "any-key", &msg),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "any-key", &msg),
         2,
         1001,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 
     let entries = get_retained(&mut engine, exchange_id, None, 3);
     assert_eq!(entries.len(), 1);
@@ -1236,17 +1295,18 @@ fn test_retained_on_fanout_exchange() {
 #[test]
 fn test_retained_many_keys() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     // Set 100 retained messages
     for i in 0..100u64 {
         let msg = make_msg(format!("msg-{}", i).as_bytes());
         let key = format!("level1/level2/sensor{}", i);
-        engine.apply_command(
-            &MqCommand::set_retained(exchange_id, &key, &msg),
+        apply_engine(
+            &engine,
+            &MqCommand::set_retained(&mut buf, exchange_id, &key, &msg),
             i + 2,
             1001 + i,
-            None,
         );
     }
 
@@ -1260,11 +1320,11 @@ fn test_retained_many_keys() {
     // Delete half
     for i in 0..50u64 {
         let key = format!("level1/level2/sensor{}", i);
-        engine.apply_command(
-            &MqCommand::delete_retained(exchange_id, &key),
+        apply_engine(
+            &engine,
+            &MqCommand::delete_retained(&mut buf, exchange_id, &key),
             300 + i,
             2000 + i,
-            None,
         );
     }
 
@@ -1277,27 +1337,28 @@ fn test_retained_many_keys() {
 
 #[test]
 fn test_snapshot_after_delete_retained() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     let msg = make_msg(b"data");
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key1", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key1", &msg),
         2,
         1001,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "key2", &msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "key2", &msg),
         3,
         1002,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::delete_retained(exchange_id, "key1"),
+    apply_engine(
+        &engine,
+        &MqCommand::delete_retained(&mut buf, exchange_id, "key1"),
         4,
         1003,
-        None,
     );
 
     let snap = engine.snapshot();

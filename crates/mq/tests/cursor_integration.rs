@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use openraft::entry::EntryPayload;
 use openraft::storage::RaftLogStorage;
 use openraft::type_config::async_runtime::AsyncRuntime;
@@ -14,9 +14,10 @@ use openraft::type_config::async_runtime::oneshot::Oneshot;
 use openraft::{LogId, storage::IOFlushed};
 use tempfile::TempDir;
 
+use bisque_mq::MqApplyResponse;
 use bisque_mq::flat::FlatMessageBuilder;
 use bisque_mq::metadata::TopicMeta;
-use bisque_mq::types::{MqCommand, MqResponse};
+use bisque_mq::types::MqCommand;
 use bisque_mq::{
     MqMetadata, MqReader, MqSegmentCursor, MqSegmentScanner, read_command,
     read_latest_topic_message, read_message_at, read_messages_at_into,
@@ -27,7 +28,7 @@ use bisque_raft::{BisqueRaftTypeConfig, MmapPerGroupLogStorage, MmapStorageConfi
 // Type aliases
 // ---------------------------------------------------------------------------
 
-type C = BisqueRaftTypeConfig<MqCommand, MqResponse>;
+type C = BisqueRaftTypeConfig<MqCommand, MqApplyResponse>;
 type Rt = <C as openraft::RaftTypeConfig>::AsyncRuntime;
 type Os = <Rt as AsyncRuntime>::Oneshot;
 
@@ -108,10 +109,17 @@ fn scanner_single_segment() {
         let (storage, mut log) = setup_storage(&tmp, 1024 * 1024).await;
         let prefetcher = log.prefetcher();
 
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 10, &[make_flat_msg(b"hello")]);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[make_flat_msg(b"world")]);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 30, &[make_flat_msg(b"msg")]);
+        let cmd3 = MqCommand::split_from(&mut buf);
         let entries = vec![
-            make_entry(1, 1, MqCommand::publish(10, &[make_flat_msg(b"hello")])),
-            make_entry(2, 1, MqCommand::publish(20, &[make_flat_msg(b"world")])),
-            make_entry(3, 1, MqCommand::publish(30, &[make_flat_msg(b"msg")])),
+            make_entry(1, 1, cmd1),
+            make_entry(2, 1, cmd2),
+            make_entry(3, 1, cmd3),
         ];
         append_entries(&mut log, entries).await;
 
@@ -145,12 +153,15 @@ fn scanner_multi_segment() {
 
         // Write enough entries to span multiple segments.
         let mut entries = Vec::new();
+        let mut buf = BytesMut::new();
         for i in 1..=20 {
-            entries.push(make_entry(
-                i,
-                1,
-                MqCommand::publish(i % 5, &[make_flat_msg(format!("msg-{i}").as_bytes())]),
-            ));
+            MqCommand::write_publish_bytes(
+                &mut buf,
+                i % 5,
+                &[make_flat_msg(format!("msg-{i}").as_bytes())],
+            );
+            let cmd = MqCommand::split_from(&mut buf);
+            entries.push(make_entry(i, 1, cmd));
         }
         append_entries(&mut log, entries).await;
 
@@ -177,13 +188,12 @@ fn scanner_entity_filter_across_segments() {
         let prefetcher = log.prefetcher();
 
         let mut entries = Vec::new();
+        let mut buf = BytesMut::new();
         for i in 1..=20 {
             let topic_id = i % 3; // topics 0, 1, 2
-            entries.push(make_entry(
-                i,
-                1,
-                MqCommand::publish(topic_id, &[make_flat_msg(b"data")]),
-            ));
+            MqCommand::write_publish_bytes(&mut buf, topic_id, &[make_flat_msg(b"data")]);
+            let cmd = MqCommand::split_from(&mut buf);
+            entries.push(make_entry(i, 1, cmd));
         }
         append_entries(&mut log, entries).await;
 
@@ -209,21 +219,34 @@ fn scanner_batch_explosion_across_segments() {
         let prefetcher = log.prefetcher();
 
         // Mix standalone and batch commands.
-        let batch1 = MqCommand::batch(&[
-            MqCommand::publish(10, &[make_flat_msg(b"b1-a")]),
-            MqCommand::publish(20, &[make_flat_msg(b"b1-b")]),
-        ]);
-        let batch2 = MqCommand::batch(&[
-            MqCommand::publish(10, &[make_flat_msg(b"b2-a")]),
-            MqCommand::publish(30, &[make_flat_msg(b"b2-b")]),
-        ]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 10, &[make_flat_msg(b"b1-a")]);
+        let b1_a = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[make_flat_msg(b"b1-b")]);
+        let b1_b = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[b1_a, b1_b]);
+        let batch1 = MqCommand::split_from(&mut buf);
+
+        MqCommand::write_publish_bytes(&mut buf, 10, &[make_flat_msg(b"b2-a")]);
+        let b2_a = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 30, &[make_flat_msg(b"b2-b")]);
+        let b2_b = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[b2_a, b2_b]);
+        let batch2 = MqCommand::split_from(&mut buf);
+
+        MqCommand::write_publish_bytes(&mut buf, 10, &[make_flat_msg(b"solo1")]);
+        let solo1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[make_flat_msg(b"solo2")]);
+        let solo2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 10, &[make_flat_msg(b"solo3")]);
+        let solo3 = MqCommand::split_from(&mut buf);
 
         let entries = vec![
-            make_entry(1, 1, MqCommand::publish(10, &[make_flat_msg(b"solo1")])),
+            make_entry(1, 1, solo1),
             make_entry(2, 1, batch1),
-            make_entry(3, 1, MqCommand::publish(20, &[make_flat_msg(b"solo2")])),
+            make_entry(3, 1, solo2),
             make_entry(4, 1, batch2),
-            make_entry(5, 1, MqCommand::publish(10, &[make_flat_msg(b"solo3")])),
+            make_entry(5, 1, solo3),
         ];
         append_entries(&mut log, entries).await;
 
@@ -263,12 +286,11 @@ fn scanner_start_from_specific_segment() {
         let prefetcher = log.prefetcher();
 
         let mut entries = Vec::new();
+        let mut buf = BytesMut::new();
         for i in 1..=20 {
-            entries.push(make_entry(
-                i,
-                1,
-                MqCommand::publish(1, &[make_flat_msg(b"x")]),
-            ));
+            MqCommand::write_publish_bytes(&mut buf, 1, &[make_flat_msg(b"x")]);
+            let cmd = MqCommand::split_from(&mut buf);
+            entries.push(make_entry(i, 1, cmd));
         }
         append_entries(&mut log, entries).await;
 
@@ -321,7 +343,9 @@ fn read_command_returns_correct_command() {
         let (storage, mut log) = setup_storage(&tmp, 1024 * 1024).await;
         let prefetcher = log.prefetcher();
 
-        let cmd = MqCommand::publish(42, &[make_flat_msg(b"hello")]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 42, &[make_flat_msg(b"hello")]);
+        let cmd = MqCommand::split_from(&mut buf);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         let result = read_command(&prefetcher, 1).unwrap();
@@ -339,15 +363,10 @@ fn read_command_missing_index() {
         let (storage, mut log) = setup_storage(&tmp, 1024 * 1024).await;
         let prefetcher = log.prefetcher();
 
-        append_entries(
-            &mut log,
-            vec![make_entry(
-                1,
-                1,
-                MqCommand::publish(1, &[make_flat_msg(b"x")]),
-            )],
-        )
-        .await;
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[make_flat_msg(b"x")]);
+        let cmd = MqCommand::split_from(&mut buf);
+        append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         // Index 99 doesn't exist.
         assert!(read_command(&prefetcher, 99).is_none());
@@ -364,7 +383,9 @@ fn read_message_at_extracts_publish_payload() {
         let prefetcher = log.prefetcher();
 
         let msg = make_flat_msg(b"payload-data");
-        let cmd = MqCommand::publish(1, &[msg.clone()]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[msg.clone()]);
+        let cmd = MqCommand::split_from(&mut buf);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         let result = read_message_at(&prefetcher, 1).unwrap();
@@ -382,7 +403,9 @@ fn read_message_at_returns_none_for_non_publish() {
         let prefetcher = log.prefetcher();
 
         // A non-publish command — read_message_at should return None.
-        let cmd = MqCommand::commit_offset(1, 1, 0);
+        let mut buf = BytesMut::new();
+        MqCommand::write_commit_offset(&mut buf, 1, 1, 0);
+        let cmd = MqCommand::split_from(&mut buf);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         assert!(read_message_at(&prefetcher, 1).is_none());
@@ -416,7 +439,9 @@ fn read_messages_at_into_multi_message_publish() {
             make_flat_msg(b"msg-2"),
             make_flat_msg(b"msg-3"),
         ];
-        let cmd = MqCommand::publish(1, &msgs);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &msgs);
+        let cmd = MqCommand::split_from(&mut buf);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         let mut out = Vec::new();
@@ -437,7 +462,9 @@ fn read_messages_at_into_clears_output_vec() {
         let (storage, mut log) = setup_storage(&tmp, 1024 * 1024).await;
         let prefetcher = log.prefetcher();
 
-        let cmd = MqCommand::publish(1, &[make_flat_msg(b"msg")]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[make_flat_msg(b"msg")]);
+        let cmd = MqCommand::split_from(&mut buf);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         let mut out = vec![Bytes::from_static(b"garbage")];
@@ -465,7 +492,9 @@ fn read_latest_topic_message_with_position() {
             make_flat_msg(b"second"),
             make_flat_msg(b"third"),
         ];
-        let cmd = MqCommand::publish(42, &msgs);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 42, &msgs);
+        let cmd = MqCommand::split_from(&mut buf);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         // Read message at position 0 (first).
@@ -495,7 +524,9 @@ fn mq_reader_read_message_at() {
         let prefetcher = log.prefetcher();
 
         let msg = make_flat_msg(b"reader-test");
-        let cmd = MqCommand::publish(1, &[msg.clone()]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[msg.clone()]);
+        let cmd = MqCommand::split_from(&mut buf);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         let metadata = Arc::new(MqMetadata::default());
@@ -518,7 +549,9 @@ fn mq_reader_read_messages_at_into() {
         let prefetcher = log.prefetcher();
 
         let msgs = vec![make_flat_msg(b"a"), make_flat_msg(b"b")];
-        let cmd = MqCommand::publish(1, &msgs);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &msgs);
+        let cmd = MqCommand::split_from(&mut buf);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         let metadata = Arc::new(MqMetadata::default());
@@ -600,7 +633,9 @@ fn mq_reader_read_latest_topic_message() {
         let prefetcher = log.prefetcher();
 
         let msgs = vec![make_flat_msg(b"retained-msg")];
-        let cmd = MqCommand::publish(42, &msgs);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 42, &msgs);
+        let cmd = MqCommand::split_from(&mut buf);
         append_entries(&mut log, vec![make_entry(1, 1, cmd)]).await;
 
         let metadata = Arc::new(MqMetadata::default());
@@ -634,10 +669,12 @@ fn mq_reader_segment_cursor() {
         let (storage, mut log) = setup_storage(&tmp, 1024 * 1024).await;
         let prefetcher = log.prefetcher();
 
-        let entries = vec![
-            make_entry(1, 1, MqCommand::publish(1, &[make_flat_msg(b"a")])),
-            make_entry(2, 1, MqCommand::publish(2, &[make_flat_msg(b"b")])),
-        ];
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[make_flat_msg(b"a")]);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 2, &[make_flat_msg(b"b")]);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        let entries = vec![make_entry(1, 1, cmd1), make_entry(2, 1, cmd2)];
         append_entries(&mut log, entries).await;
 
         let metadata = Arc::new(MqMetadata::default());
@@ -670,10 +707,17 @@ fn cursor_from_real_segment_bytes() {
         let (storage, mut log) = setup_storage(&tmp, 1024 * 1024).await;
         let prefetcher = log.prefetcher();
 
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 10, &[make_flat_msg(b"hello")]);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[make_flat_msg(b"world")]);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 30, &[make_flat_msg(b"q")]);
+        let cmd3 = MqCommand::split_from(&mut buf);
         let entries = vec![
-            make_entry(1, 1, MqCommand::publish(10, &[make_flat_msg(b"hello")])),
-            make_entry(2, 1, MqCommand::publish(20, &[make_flat_msg(b"world")])),
-            make_entry(3, 1, MqCommand::publish(30, &[make_flat_msg(b"q")])),
+            make_entry(1, 1, cmd1),
+            make_entry(2, 1, cmd2),
+            make_entry(3, 1, cmd3),
         ];
         append_entries(&mut log, entries).await;
 
@@ -700,13 +744,12 @@ fn cursor_entity_filter_with_real_storage() {
         let prefetcher = log.prefetcher();
 
         let mut entries = Vec::new();
+        let mut buf = BytesMut::new();
         for i in 1..=10 {
             let topic_id = if i % 2 == 0 { 100 } else { 200 };
-            entries.push(make_entry(
-                i,
-                1,
-                MqCommand::publish(topic_id, &[make_flat_msg(b"data")]),
-            ));
+            MqCommand::write_publish_bytes(&mut buf, topic_id, &[make_flat_msg(b"data")]);
+            let cmd = MqCommand::split_from(&mut buf);
+            entries.push(make_entry(i, 1, cmd));
         }
         append_entries(&mut log, entries).await;
 
@@ -732,15 +775,18 @@ fn cursor_batch_with_real_storage() {
         let (storage, mut log) = setup_storage(&tmp, 1024 * 1024).await;
         let prefetcher = log.prefetcher();
 
-        let batch = MqCommand::batch(&[
-            MqCommand::publish(1, &[make_flat_msg(b"a")]),
-            MqCommand::publish(2, &[make_flat_msg(b"b")]),
-            MqCommand::publish(3, &[make_flat_msg(b"c")]),
-        ]);
-        let entries = vec![
-            make_entry(1, 1, MqCommand::publish(0, &[make_flat_msg(b"solo")])),
-            make_entry(2, 1, batch),
-        ];
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[make_flat_msg(b"a")]);
+        let bc1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 2, &[make_flat_msg(b"b")]);
+        let bc2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 3, &[make_flat_msg(b"c")]);
+        let bc3 = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[bc1, bc2, bc3]);
+        let batch = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 0, &[make_flat_msg(b"solo")]);
+        let solo = MqCommand::split_from(&mut buf);
+        let entries = vec![make_entry(1, 1, solo), make_entry(2, 1, batch)];
         append_entries(&mut log, entries).await;
 
         let active_id = prefetcher.active_segment_id();
@@ -775,13 +821,16 @@ fn end_to_end_scanner_and_reader() {
 
         // Write 30 entries across multiple segments.
         let mut entries = Vec::new();
+        let mut buf = BytesMut::new();
         for i in 1..=30 {
             let topic_id = i % 3;
-            entries.push(make_entry(
-                i,
-                1,
-                MqCommand::publish(topic_id, &[make_flat_msg(format!("msg-{i}").as_bytes())]),
-            ));
+            MqCommand::write_publish_bytes(
+                &mut buf,
+                topic_id,
+                &[make_flat_msg(format!("msg-{i}").as_bytes())],
+            );
+            let cmd = MqCommand::split_from(&mut buf);
+            entries.push(make_entry(i, 1, cmd));
         }
         append_entries(&mut log, entries).await;
 

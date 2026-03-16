@@ -6,8 +6,9 @@
 //! Since engine fields are `pub(crate)`, integration tests verify state via
 //! `engine.snapshot()` and `engine.apply_command(, None)` responses.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
+use bisque_mq::async_apply::ResponseEntry;
 use bisque_mq::config::MqConfig;
 use bisque_mq::engine::MqEngine;
 use bisque_mq::flat::FlatMessageBuilder;
@@ -28,6 +29,13 @@ fn make_flat_msg_with_key(key: &[u8], value: &[u8]) -> Bytes {
         .build()
 }
 
+// Test-only helper: call apply_command and return ResponseEntry
+fn apply(engine: &MqEngine, cmd: &MqCommand, log_index: u64, current_time: u64) -> ResponseEntry {
+    let mut _buf = BytesMut::new();
+    engine.apply_command(cmd, &mut _buf, log_index, current_time, None);
+    ResponseEntry::split_from(&mut _buf)
+}
+
 // =============================================================================
 // End-to-end topic workflow
 // =============================================================================
@@ -35,50 +43,44 @@ fn make_flat_msg_with_key(key: &[u8], value: &[u8]) -> Bytes {
 #[test]
 fn test_topic_publish_consume_commit_purge() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     // Create topic
-    let topic_id = match engine.apply_command(
-        &MqCommand::create_topic(
-            "orders",
-            RetentionPolicy {
-                max_age_secs: Some(3600),
-                ..Default::default()
-            },
-            0,
-        ),
-        1,
-        1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    MqCommand::write_create_topic(
+        &mut buf,
+        "orders",
+        &RetentionPolicy {
+            max_age_secs: Some(3600),
+            ..Default::default()
+        },
+        0,
+    );
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let topic_id = resp.entity_id();
 
     // Create session instead of register_consumer
-    engine.apply_command(
-        &MqCommand::create_session(100, "order-processor", 30000, 60000),
-        2,
-        1001,
-        None,
-    );
+    MqCommand::write_create_session(&mut buf, 100, "order-processor", 30000, 60000);
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
 
     // Publish batch
     let messages: Vec<Bytes> = (0..10)
         .map(|i| make_flat_msg_with_key(format!("order-{}", i).as_bytes(), b"order-data"))
         .collect();
-    let resp = engine.apply_command(&MqCommand::publish(topic_id, &messages), 3, 1002, None);
-    match resp {
-        MqResponse::Published { count, .. } => assert_eq!(count, 10),
-        other => panic!("expected Published, got {:?}", other),
-    }
+    MqCommand::write_publish_bytes(&mut buf, topic_id, &messages);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 3, 1002);
+    assert_eq!(resp.tag(), ResponseEntry::TAG_PUBLISHED);
+    assert_eq!(resp.published_count(), 10);
 
     // Commit offset
-    let resp = engine.apply_command(&MqCommand::commit_offset(topic_id, 100, 3), 4, 1003, None);
-    assert!(matches!(resp, MqResponse::Ok));
+    MqCommand::write_commit_offset(&mut buf, topic_id, 100, 3);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 4, 1003);
+    assert!(resp.is_ok());
 
     // Purge old messages
-    let resp = engine.apply_command(&MqCommand::purge_topic(topic_id, 3), 5, 1004, None);
-    assert!(matches!(resp, MqResponse::Ok));
+    MqCommand::write_purge_topic(&mut buf, topic_id, 3);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 5, 1004);
+    assert!(resp.is_ok());
 
     // Verify via snapshot
     let snap = engine.snapshot();
@@ -94,71 +96,52 @@ fn test_topic_publish_consume_commit_purge() {
 #[test]
 fn test_full_snapshot_restore_roundtrip() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     // Build diverse state
-    engine.apply_command(
-        &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-        1,
-        1000,
-        None,
-    );
-    engine.apply_command(
-        &MqCommand::publish(1, &[make_flat_msg(b"e1"), make_flat_msg(b"e2")]),
-        2,
-        1001,
-        None,
-    );
-    engine.apply_command(&MqCommand::commit_offset(1, 100, 2), 3, 1002, None);
+    MqCommand::write_create_topic(&mut buf, "events", &RetentionPolicy::default(), 0);
+    apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    MqCommand::write_publish_bytes(&mut buf, 1, &[make_flat_msg(b"e1"), make_flat_msg(b"e2")]);
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
+    MqCommand::write_commit_offset(&mut buf, 1, 100, 2);
+    apply(&engine, &MqCommand::split_from(&mut buf), 3, 1002);
 
-    engine.apply_command(
-        &MqCommand::create_queue(
-            "tasks",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            Some(&TopicDedupConfig {
-                window_secs: 60,
-                max_entries: 100_000,
-            }),
-            false,
-            None,
-            false,
-            None,
-        ),
-        4,
-        1003,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "tasks",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
+        Some(&TopicDedupConfig {
+            window_secs: 60,
+            max_entries: 100_000,
+        }),
+        false,
+        None,
+        false,
         None,
     );
+    apply(&engine, &MqCommand::split_from(&mut buf), 4, 1003);
 
-    engine.apply_command(
-        &MqCommand::create_actor_group(
-            "actors",
-            ActorVariantConfig::default(),
-            RetentionPolicy::default(),
-            false,
-            None,
-        ),
-        6,
-        1005,
+    MqCommand::write_create_actor_group(
+        &mut buf,
+        "actors",
+        ActorVariantConfig::default(),
+        RetentionPolicy::default(),
+        false,
         None,
     );
+    apply(&engine, &MqCommand::split_from(&mut buf), 6, 1005);
 
-    engine.apply_command(
-        &MqCommand::create_job_cron(
-            "cron-job",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-        ),
-        8,
-        1007,
-        None,
+    MqCommand::write_create_job_cron(
+        &mut buf,
+        "cron-job",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
     );
+    apply(&engine, &MqCommand::split_from(&mut buf), 8, 1007);
 
-    engine.apply_command(
-        &MqCommand::create_session(100, "workers", 30000, 60000),
-        9,
-        1008,
-        None,
-    );
+    MqCommand::write_create_session(&mut buf, 100, "workers", 30000, 60000);
+    apply(&engine, &MqCommand::split_from(&mut buf), 9, 1008);
 
     // Snapshot
     let snap = engine.snapshot();
@@ -194,13 +177,9 @@ fn test_full_snapshot_restore_roundtrip() {
     assert_eq!(snap2.next_id, snap.next_id);
 
     // Engine continues to work after restore
-    let resp = engine2.apply_command(
-        &MqCommand::publish(1, &[make_flat_msg(b"post-restore")]),
-        11,
-        2000,
-        None,
-    );
-    assert!(matches!(resp, MqResponse::Published { .. }));
+    MqCommand::write_publish_bytes(&mut buf, 1, &[make_flat_msg(b"post-restore")]);
+    let resp = apply(&engine2, &MqCommand::split_from(&mut buf), 11, 2000);
+    assert_eq!(resp.tag(), ResponseEntry::TAG_PUBLISHED);
 }
 
 // =============================================================================
@@ -210,18 +189,23 @@ fn test_full_snapshot_restore_roundtrip() {
 #[test]
 fn test_id_allocation_across_entity_types() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     let mut ids = Vec::new();
     for (i, name) in ["t1", "q1", "ns1", "j1"].iter().enumerate() {
         let resp = match i {
-            0 => engine.apply_command(
-                &MqCommand::create_topic(name, RetentionPolicy::default(), 0),
-                (i + 1) as u64,
-                1000,
-                None,
-            ),
-            1 => engine.apply_command(
-                &MqCommand::create_queue(
+            0 => {
+                MqCommand::write_create_topic(&mut buf, name, &RetentionPolicy::default(), 0);
+                apply(
+                    &engine,
+                    &MqCommand::split_from(&mut buf),
+                    (i + 1) as u64,
+                    1000,
+                )
+            }
+            1 => {
+                MqCommand::write_create_queue(
+                    &mut buf,
                     name,
                     AckVariantConfig::default(),
                     RetentionPolicy::default(),
@@ -230,39 +214,53 @@ fn test_id_allocation_across_entity_types() {
                     None,
                     false,
                     None,
-                ),
-                (i + 1) as u64,
-                1001,
-                None,
-            ),
-            2 => engine.apply_command(
-                &MqCommand::create_actor_group(
+                );
+                apply(
+                    &engine,
+                    &MqCommand::split_from(&mut buf),
+                    (i + 1) as u64,
+                    1001,
+                )
+            }
+            2 => {
+                MqCommand::write_create_actor_group(
+                    &mut buf,
                     name,
                     ActorVariantConfig::default(),
                     RetentionPolicy::default(),
                     false,
                     None,
-                ),
-                (i + 1) as u64,
-                1002,
-                None,
-            ),
-            3 => engine.apply_command(
-                &MqCommand::create_job_cron(
+                );
+                apply(
+                    &engine,
+                    &MqCommand::split_from(&mut buf),
+                    (i + 1) as u64,
+                    1002,
+                )
+            }
+            3 => {
+                MqCommand::write_create_job_cron(
+                    &mut buf,
                     name,
                     AckVariantConfig::default(),
                     RetentionPolicy::default(),
-                ),
-                (i + 1) as u64,
-                1003,
-                None,
-            ),
+                );
+                apply(
+                    &engine,
+                    &MqCommand::split_from(&mut buf),
+                    (i + 1) as u64,
+                    1003,
+                )
+            }
             _ => unreachable!(),
         };
-        match resp {
-            MqResponse::EntityCreated { id } => ids.push(id),
-            other => panic!("expected EntityCreated, got {:?}", other),
-        }
+        assert_eq!(
+            resp.tag(),
+            ResponseEntry::TAG_ENTITY_CREATED,
+            "expected EntityCreated, got tag={}",
+            resp.tag()
+        );
+        ids.push(resp.entity_id());
     }
 
     // All unique and monotonically increasing
@@ -282,19 +280,32 @@ fn test_id_allocation_across_entity_types() {
 #[test]
 fn test_operations_on_nonexistent_entities() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
+    MqCommand::write_delete_topic(&mut buf, 999);
+    let c0 = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    MqCommand::write_delete_consumer_group(&mut buf, 999);
+    let c1 = apply(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
+    MqCommand::write_publish_bytes(&mut buf, 999, &[]);
+    let c2 = apply(&engine, &MqCommand::split_from(&mut buf), 3, 1000);
     let cases = vec![
-        engine.apply_command(&MqCommand::delete_topic(999), 1, 1000, None),
-        engine.apply_command(&MqCommand::delete_consumer_group(999), 2, 1000, None),
-        engine.apply_command(&MqCommand::publish(999, &[]), 3, 1000, None),
-        engine.apply_command(&MqCommand::group_deliver(999, 1, 1), 4, 1000, None),
+        c0,
+        c1,
+        c2,
+        apply(
+            &engine,
+            &MqCommand::group_deliver(&mut buf, 999, 1, 1),
+            4,
+            1000,
+        ),
     ];
 
     for resp in cases {
-        assert!(
-            matches!(resp, MqResponse::Error(_)),
-            "expected Error, got {:?}",
-            resp
+        assert_eq!(
+            resp.tag(),
+            ResponseEntry::TAG_ERROR,
+            "expected Error, got tag={}",
+            resp.tag()
         );
     }
 }
@@ -302,52 +313,39 @@ fn test_operations_on_nonexistent_entities() {
 #[test]
 fn test_duplicate_entity_names() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    engine.apply_command(
-        &MqCommand::create_topic("dup", RetentionPolicy::default(), 0),
-        1,
-        1000,
-        None,
-    );
-    let resp = engine.apply_command(
-        &MqCommand::create_topic("dup", RetentionPolicy::default(), 0),
-        2,
-        1001,
-        None,
-    );
-    assert!(matches!(resp, MqResponse::Error(_)));
+    MqCommand::write_create_topic(&mut buf, "dup", &RetentionPolicy::default(), 0);
+    apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    MqCommand::write_create_topic(&mut buf, "dup", &RetentionPolicy::default(), 0);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ERROR);
 
-    engine.apply_command(
-        &MqCommand::create_queue(
-            "dup",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        3,
-        1002,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "dup",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
+        None,
+        false,
+        None,
+        false,
         None,
     );
-    let resp = engine.apply_command(
-        &MqCommand::create_queue(
-            "dup",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        4,
-        1003,
+    apply(&engine, &MqCommand::split_from(&mut buf), 3, 1002);
+    MqCommand::write_create_queue(
+        &mut buf,
+        "dup",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
+        None,
+        false,
+        None,
+        false,
         None,
     );
-    assert!(matches!(resp, MqResponse::Error(_)));
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 4, 1003);
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ERROR);
 }
 
 // =============================================================================
@@ -357,45 +355,34 @@ fn test_duplicate_entity_names() {
 #[test]
 fn test_delete_and_recreate_entity() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     // Create and delete topic
-    engine.apply_command(
-        &MqCommand::create_topic("ephemeral", RetentionPolicy::default(), 0),
-        1,
-        1000,
-        None,
-    );
-    engine.apply_command(&MqCommand::delete_topic(1), 2, 1001, None);
+    MqCommand::write_create_topic(&mut buf, "ephemeral", &RetentionPolicy::default(), 0);
+    apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    MqCommand::write_delete_topic(&mut buf, 1);
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
 
     // Recreate with same name
-    let resp = engine.apply_command(
-        &MqCommand::create_topic("ephemeral", RetentionPolicy::default(), 0),
-        3,
-        1002,
-        None,
+    MqCommand::write_create_topic(&mut buf, "ephemeral", &RetentionPolicy::default(), 0);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 3, 1002);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        resp.tag()
     );
-    match resp {
-        MqResponse::EntityCreated { id } => assert_eq!(id, 2), // new ID
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    assert_eq!(resp.entity_id(), 2); // new ID
 
     // New entity works
-    let resp = engine.apply_command(
-        &MqCommand::publish(2, &[make_flat_msg(b"new-msg")]),
-        4,
-        1003,
-        None,
-    );
-    assert!(matches!(resp, MqResponse::Published { .. }));
+    MqCommand::write_publish_bytes(&mut buf, 2, &[make_flat_msg(b"new-msg")]);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 4, 1003);
+    assert_eq!(resp.tag(), ResponseEntry::TAG_PUBLISHED);
 
     // Old ID doesn't work
-    let resp = engine.apply_command(
-        &MqCommand::publish(1, &[make_flat_msg(b"x")]),
-        5,
-        1004,
-        None,
-    );
-    assert!(matches!(resp, MqResponse::Error(_)));
+    MqCommand::write_publish_bytes(&mut buf, 1, &[make_flat_msg(b"x")]);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 5, 1004);
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ERROR);
 }
 
 // =============================================================================
@@ -405,34 +392,47 @@ fn test_delete_and_recreate_entity() {
 #[test]
 fn test_batch_mixed_creates_and_publishes() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let batch = MqCommand::batch(&[
-        MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
-        MqCommand::create_topic("t2", RetentionPolicy::default(), 0),
-        MqCommand::publish(1, &[make_flat_msg(b"hello")]),
-    ]);
+    MqCommand::write_create_topic(&mut buf, "t1", &RetentionPolicy::default(), 0);
+    let cmd1 = MqCommand::split_from(&mut buf);
+    MqCommand::write_create_topic(&mut buf, "t2", &RetentionPolicy::default(), 0);
+    let cmd2 = MqCommand::split_from(&mut buf);
+    MqCommand::write_publish_bytes(&mut buf, 1, &[make_flat_msg(b"hello")]);
+    let cmd3 = MqCommand::split_from(&mut buf);
+    MqCommand::write_batch(&mut buf, &[cmd1, cmd2, cmd3]);
+    let batch = MqCommand::split_from(&mut buf);
 
-    let resp = engine.apply_command(&batch, 1, 1000, None);
-    match resp {
-        MqResponse::BatchResponse(resps) => {
-            assert_eq!(resps.len(), 3);
-            assert!(
-                matches!(resps[0], MqResponse::EntityCreated { id: 1 }),
-                "First should be EntityCreated(1), got {:?}",
-                resps[0]
-            );
-            assert!(
-                matches!(resps[1], MqResponse::EntityCreated { id: 2 }),
-                "Second should be EntityCreated(2), got {:?}",
-                resps[1]
-            );
-            assert!(
-                matches!(resps[2], MqResponse::Published { .. }),
-                "Third should be Published, got {:?}",
-                resps[2]
-            );
-        }
-        other => panic!("expected BatchResponse, got {:?}", other),
+    let resp = apply(&engine, &batch, 1, 1000);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_BATCH,
+        "expected BatchResponse, got tag={}",
+        resp.tag()
+    );
+    {
+        let entries: Vec<_> = resp.batch_entries().collect();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0].tag(),
+            ResponseEntry::TAG_ENTITY_CREATED,
+            "First should be EntityCreated(1), got tag={}",
+            entries[0].tag()
+        );
+        assert_eq!(entries[0].entity_id(), 1, "First entity_id should be 1");
+        assert_eq!(
+            entries[1].tag(),
+            ResponseEntry::TAG_ENTITY_CREATED,
+            "Second should be EntityCreated(2), got tag={}",
+            entries[1].tag()
+        );
+        assert_eq!(entries[1].entity_id(), 2, "Second entity_id should be 2");
+        assert_eq!(
+            entries[2].tag(),
+            ResponseEntry::TAG_PUBLISHED,
+            "Third should be Published, got tag={}",
+            entries[2].tag()
+        );
     }
 
     // Verify both topics exist
@@ -443,29 +443,38 @@ fn test_batch_mixed_creates_and_publishes() {
 #[test]
 fn test_batch_partial_errors() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     // First command will fail (nonexistent topic), second should still succeed
-    let batch = MqCommand::batch(&[
-        MqCommand::publish(999, &[make_flat_msg(b"fail")]),
-        MqCommand::create_topic("ok", RetentionPolicy::default(), 0),
-    ]);
+    MqCommand::write_publish_bytes(&mut buf, 999, &[make_flat_msg(b"fail")]);
+    let cmd1 = MqCommand::split_from(&mut buf);
+    MqCommand::write_create_topic(&mut buf, "ok", &RetentionPolicy::default(), 0);
+    let cmd2 = MqCommand::split_from(&mut buf);
+    MqCommand::write_batch(&mut buf, &[cmd1, cmd2]);
+    let batch = MqCommand::split_from(&mut buf);
 
-    let resp = engine.apply_command(&batch, 1, 1000, None);
-    match resp {
-        MqResponse::BatchResponse(resps) => {
-            assert_eq!(resps.len(), 2);
-            assert!(
-                matches!(resps[0], MqResponse::Error(_)),
-                "First should be Error, got {:?}",
-                resps[0]
-            );
-            assert!(
-                matches!(resps[1], MqResponse::EntityCreated { .. }),
-                "Second should be EntityCreated, got {:?}",
-                resps[1]
-            );
-        }
-        other => panic!("expected BatchResponse, got {:?}", other),
+    let resp = apply(&engine, &batch, 1, 1000);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_BATCH,
+        "expected BatchResponse, got tag={}",
+        resp.tag()
+    );
+    {
+        let entries: Vec<_> = resp.batch_entries().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].tag(),
+            ResponseEntry::TAG_ERROR,
+            "First should be Error, got tag={}",
+            entries[0].tag()
+        );
+        assert_eq!(
+            entries[1].tag(),
+            ResponseEntry::TAG_ENTITY_CREATED,
+            "Second should be EntityCreated, got tag={}",
+            entries[1].tag()
+        );
     }
 
     // Topic was created despite earlier error (no rollback)
@@ -476,14 +485,17 @@ fn test_batch_partial_errors() {
 #[test]
 fn test_batch_empty() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let resp = engine.apply_command(&MqCommand::batch(&[]), 1, 1000, None);
-    match resp {
-        MqResponse::BatchResponse(resps) => {
-            assert_eq!(resps.len(), 0);
-        }
-        other => panic!("expected BatchResponse, got {:?}", other),
-    }
+    MqCommand::write_batch(&mut buf, &[]);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_BATCH,
+        "expected BatchResponse, got tag={}",
+        resp.tag()
+    );
+    assert_eq!(resp.batch_count(), 0);
 }
 
 // =============================================================================
@@ -493,62 +505,91 @@ fn test_batch_empty() {
 #[test]
 fn test_consumer_group_create_and_delete() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     // Create
-    let group_id = match engine.apply_command(
-        &MqCommand::create_consumer_group("my-group", 1),
+    let group_id = match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "my-group", 1),
         1,
         1000,
-        None,
     ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
     };
     assert!(group_id > 0);
 
     // Duplicate create returns AlreadyExists
-    match engine.apply_command(
-        &MqCommand::create_consumer_group("my-group", 1),
+    match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "my-group", 1),
         2,
         1001,
-        None,
     ) {
-        MqResponse::Error(MqError::AlreadyExists { .. }) => {}
-        other => panic!("expected AlreadyExists, got {other}"),
+        e => assert!(
+            e.is_already_exists(),
+            "expected AlreadyExists, got tag={}",
+            e.tag()
+        ),
     }
 
     // Delete
-    match engine.apply_command(&MqCommand::delete_consumer_group(group_id), 3, 1002, None) {
-        MqResponse::Ok => {}
-        other => panic!("expected Ok, got {other}"),
+    MqCommand::write_delete_consumer_group(&mut buf, group_id);
+    match apply(&engine, &MqCommand::split_from(&mut buf), 3, 1002) {
+        e => assert!(e.is_ok(), "expected Ok, got tag={}", e.tag()),
     }
 
     // Can recreate after delete
-    match engine.apply_command(
-        &MqCommand::create_consumer_group("my-group", 0),
+    match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "my-group", 0),
         4,
         1003,
-        None,
     ) {
-        MqResponse::EntityCreated { .. } => {}
-        other => panic!("expected EntityCreated, got {other}"),
+        e => assert_eq!(
+            e.tag(),
+            ResponseEntry::TAG_ENTITY_CREATED,
+            "expected EntityCreated, got tag={}",
+            e.tag()
+        ),
     }
 }
 
 #[test]
 fn test_consumer_group_single_member_join_sync() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
 
     // Create group
-    let group_id =
-        match engine.apply_command(&MqCommand::create_consumer_group("g1", 1), 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {other}"),
-        };
+    let group_id = match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "g1", 1),
+        1,
+        1000,
+    ) {
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
+    };
 
     // Join with empty member_id -> auto-assigned
-    let (member_id, generation) = match engine.apply_command(
+    let (member_id, generation) = match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "test-client",
@@ -559,27 +600,32 @@ fn test_consumer_group_single_member_join_sync() {
         ),
         2,
         1001,
-        None,
     ) {
-        MqResponse::GroupJoined {
-            member_id,
-            generation,
-            is_leader,
-            phase_complete,
-            ..
-        } => {
-            assert!(phase_complete, "single member should complete immediately");
-            assert!(is_leader, "sole member should be leader");
-            assert_eq!(generation, 1);
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
+            assert!(
+                e.group_joined_phase_complete(),
+                "single member should complete immediately"
+            );
+            assert!(e.group_joined_is_leader(), "sole member should be leader");
+            assert_eq!(e.group_joined_generation(), 1);
+            let member_id = e.group_joined_fields().1;
             assert!(!member_id.is_empty());
+            let generation = e.group_joined_generation();
             (member_id, generation)
         }
-        other => panic!("expected GroupJoined, got {other}"),
     };
 
     // Sync as leader with assignments
-    match engine.apply_command(
+    match apply(
+        &engine,
         &MqCommand::sync_consumer_group(
+            &mut buf,
             group_id,
             generation,
             &member_id,
@@ -587,43 +633,57 @@ fn test_consumer_group_single_member_join_sync() {
         ),
         3,
         1002,
-        None,
     ) {
-        MqResponse::GroupSynced {
-            assignment,
-            phase_complete,
-        } => {
-            assert!(phase_complete);
-            assert_eq!(assignment, b"assignment-data");
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_SYNCED,
+                "expected GroupSynced, got tag={}",
+                e.tag()
+            );
+            assert!(e.group_synced_phase_complete());
+            assert_eq!(e.group_synced_assignment(), b"assignment-data");
         }
-        other => panic!("expected GroupSynced, got {other}"),
     }
 
     // Heartbeat
-    match engine.apply_command(
-        &MqCommand::heartbeat_consumer_group(group_id, &member_id, generation),
+    match apply(
+        &engine,
+        &MqCommand::heartbeat_consumer_group(&mut buf, group_id, &member_id, generation),
         4,
         1003,
-        None,
     ) {
-        MqResponse::Ok => {}
-        other => panic!("expected Ok, got {other}"),
+        e => assert!(e.is_ok(), "expected Ok, got tag={}", e.tag()),
     }
 }
 
 #[test]
 fn test_consumer_group_two_members_join() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
 
-    let group_id =
-        match engine.apply_command(&MqCommand::create_consumer_group("g2", 1), 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {other}"),
-        };
+    let group_id = match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "g2", 1),
+        1,
+        1000,
+    ) {
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
+    };
 
     // First member joins -> phase NOT complete (waiting for more)
-    let m1_id = match engine.apply_command(
+    let m1_id = match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "client-1",
@@ -634,31 +694,33 @@ fn test_consumer_group_two_members_join() {
         ),
         2,
         1001,
-        None,
     ) {
-        MqResponse::GroupJoined {
-            member_id,
-            phase_complete,
-            ..
-        } => {
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
             // With only one member, phase completes immediately
-            assert!(phase_complete);
-            member_id
+            assert!(e.group_joined_phase_complete());
+            e.group_joined_fields().1
         }
-        other => panic!("expected GroupJoined, got {other}"),
     };
 
     // Complete sync for gen 1
-    engine.apply_command(
-        &MqCommand::sync_consumer_group(group_id, 1, &m1_id, &[(&m1_id, b"a1")]),
+    apply(
+        &engine,
+        &MqCommand::sync_consumer_group(&mut buf, group_id, 1, &m1_id, &[(&m1_id, b"a1")]),
         3,
         1002,
-        None,
     );
 
     // Second member joins -> triggers rebalance
-    let m2_id = match engine.apply_command(
+    let m2_id = match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "client-2",
@@ -669,23 +731,25 @@ fn test_consumer_group_two_members_join() {
         ),
         4,
         1003,
-        None,
     ) {
-        MqResponse::GroupJoined {
-            member_id,
-            phase_complete,
-            ..
-        } => {
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
             // Phase NOT complete -- waiting for m1 to re-join
-            assert!(!phase_complete);
-            member_id
+            assert!(!e.group_joined_phase_complete());
+            e.group_joined_fields().1
         }
-        other => panic!("expected GroupJoined, got {other}"),
     };
 
     // m1 re-joins -> now all members joined -> phase completes
-    match engine.apply_command(
+    match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             &m1_id,
             "client-1",
@@ -696,22 +760,24 @@ fn test_consumer_group_two_members_join() {
         ),
         5,
         1004,
-        None,
     ) {
-        MqResponse::GroupJoined {
-            generation,
-            phase_complete,
-            ..
-        } => {
-            assert!(phase_complete);
-            assert_eq!(generation, 2);
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
+            assert!(e.group_joined_phase_complete());
+            assert_eq!(e.group_joined_generation(), 2);
         }
-        other => panic!("expected GroupJoined, got {other}"),
     }
 
     // Both sync in gen 2
-    engine.apply_command(
+    apply(
+        &engine,
         &MqCommand::sync_consumer_group(
+            &mut buf,
             group_id,
             2,
             &m1_id,
@@ -719,38 +785,53 @@ fn test_consumer_group_two_members_join() {
         ),
         6,
         1005,
-        None,
     );
-    match engine.apply_command(
-        &MqCommand::sync_consumer_group(group_id, 2, &m2_id, &[]),
+    match apply(
+        &engine,
+        &MqCommand::sync_consumer_group(&mut buf, group_id, 2, &m2_id, &[]),
         7,
         1006,
-        None,
     ) {
-        MqResponse::GroupSynced {
-            assignment,
-            phase_complete,
-        } => {
-            assert!(phase_complete);
-            assert_eq!(assignment, b"a2-v2");
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_SYNCED,
+                "expected GroupSynced, got tag={}",
+                e.tag()
+            );
+            assert!(e.group_synced_phase_complete());
+            assert_eq!(e.group_synced_assignment(), b"a2-v2");
         }
-        other => panic!("expected GroupSynced, got {other}"),
     }
 }
 
 #[test]
 fn test_consumer_group_leave() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id =
-        match engine.apply_command(&MqCommand::create_consumer_group("g3", 1), 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {other}"),
-        };
+    let group_id = match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "g3", 1),
+        1,
+        1000,
+    ) {
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
+    };
 
     // Join
-    let member_id = match engine.apply_command(
+    let member_id = match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "client",
@@ -761,47 +842,65 @@ fn test_consumer_group_leave() {
         ),
         2,
         1001,
-        None,
     ) {
-        MqResponse::GroupJoined { member_id, .. } => member_id,
-        other => panic!("expected GroupJoined, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
+            e.group_joined_fields().1
+        }
     };
 
     // Leave
-    match engine.apply_command(
-        &MqCommand::leave_consumer_group(group_id, &member_id),
+    match apply(
+        &engine,
+        &MqCommand::leave_consumer_group(&mut buf, group_id, &member_id),
         3,
         1002,
-        None,
     ) {
-        MqResponse::Ok => {}
-        other => panic!("expected Ok, got {other}"),
+        e => assert!(e.is_ok(), "expected Ok, got tag={}", e.tag()),
     }
 
     // Leave again (idempotent)
-    match engine.apply_command(
-        &MqCommand::leave_consumer_group(group_id, &member_id),
+    match apply(
+        &engine,
+        &MqCommand::leave_consumer_group(&mut buf, group_id, &member_id),
         4,
         1003,
-        None,
     ) {
-        MqResponse::Ok => {}
-        other => panic!("expected Ok, got {other}"),
+        e => assert!(e.is_ok(), "expected Ok, got tag={}", e.tag()),
     }
 }
 
 #[test]
 fn test_consumer_group_heartbeat_fencing() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
 
-    let group_id =
-        match engine.apply_command(&MqCommand::create_consumer_group("g4", 1), 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {other}"),
-        };
+    let group_id = match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "g4", 1),
+        1,
+        1000,
+    ) {
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
+    };
 
-    let member_id = match engine.apply_command(
+    let member_id = match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "client",
@@ -812,85 +911,121 @@ fn test_consumer_group_heartbeat_fencing() {
         ),
         2,
         1001,
-        None,
     ) {
-        MqResponse::GroupJoined { member_id, .. } => member_id,
-        other => panic!("expected GroupJoined, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
+            e.group_joined_fields().1
+        }
     };
 
     // Correct generation
-    match engine.apply_command(
-        &MqCommand::heartbeat_consumer_group(group_id, &member_id, 1),
+    match apply(
+        &engine,
+        &MqCommand::heartbeat_consumer_group(&mut buf, group_id, &member_id, 1),
         3,
         1002,
-        None,
     ) {
-        MqResponse::Ok => {}
-        other => panic!("expected Ok, got {other}"),
+        e => assert!(e.is_ok(), "expected Ok, got tag={}", e.tag()),
     }
 
     // Wrong generation
-    match engine.apply_command(
-        &MqCommand::heartbeat_consumer_group(group_id, &member_id, 99),
+    match apply(
+        &engine,
+        &MqCommand::heartbeat_consumer_group(&mut buf, group_id, &member_id, 99),
         4,
         1003,
-        None,
     ) {
-        MqResponse::Error(MqError::IllegalGeneration) => {}
-        other => panic!("expected IllegalGeneration, got {other}"),
+        e => {
+            assert_eq!(e.tag(), ResponseEntry::TAG_ERROR);
+            assert_eq!(
+                e.error_kind(),
+                ResponseEntry::ERR_ILLEGAL_GENERATION,
+                "expected IllegalGeneration"
+            );
+        }
     }
 
     // Unknown member
-    match engine.apply_command(
-        &MqCommand::heartbeat_consumer_group(group_id, "unknown-member", 1),
+    match apply(
+        &engine,
+        &MqCommand::heartbeat_consumer_group(&mut buf, group_id, "unknown-member", 1),
         5,
         1004,
-        None,
     ) {
-        MqResponse::Error(MqError::UnknownMemberId) => {}
-        other => panic!("expected UnknownMemberId, got {other}"),
+        e => {
+            assert_eq!(e.tag(), ResponseEntry::TAG_ERROR);
+            assert_eq!(
+                e.error_kind(),
+                ResponseEntry::ERR_UNKNOWN_MEMBER_ID,
+                "expected UnknownMemberId"
+            );
+        }
     }
 
     // Nonexistent group
-    match engine.apply_command(
-        &MqCommand::heartbeat_consumer_group(99999, &member_id, 1),
+    match apply(
+        &engine,
+        &MqCommand::heartbeat_consumer_group(&mut buf, 99999, &member_id, 1),
         6,
         1005,
-        None,
     ) {
-        MqResponse::Error(MqError::NotFound { .. }) => {}
-        other => panic!("expected NotFound, got {other}"),
+        e => {
+            assert_eq!(e.tag(), ResponseEntry::TAG_ERROR);
+            assert_eq!(
+                e.error_kind(),
+                ResponseEntry::ERR_NOT_FOUND,
+                "expected NotFound"
+            );
+        }
     }
 }
 
 #[test]
 fn test_consumer_group_offset_commit_and_fetch() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     // Create topic + group
-    let topic_id = match engine.apply_command(
-        &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-        1,
-        1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {other}"),
+    MqCommand::write_create_topic(&mut buf, "events", &RetentionPolicy::default(), 0);
+    let topic_id = match apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000) {
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
     };
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_consumer_group("cg-offsets", 1),
+    let group_id = match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "cg-offsets", 1),
         2,
         1001,
-        None,
     ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
     };
 
     // Join + sync to get a generation
-    let member_id = match engine.apply_command(
+    let member_id = match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "client",
@@ -901,28 +1036,33 @@ fn test_consumer_group_offset_commit_and_fetch() {
         ),
         3,
         1002,
-        None,
     ) {
-        MqResponse::GroupJoined { member_id, .. } => member_id,
-        other => panic!("expected GroupJoined, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
+            e.group_joined_fields().1
+        }
     };
 
-    engine.apply_command(
-        &MqCommand::sync_consumer_group(group_id, 1, &member_id, &[(&member_id, b"a")]),
+    apply(
+        &engine,
+        &MqCommand::sync_consumer_group(&mut buf, group_id, 1, &member_id, &[(&member_id, b"a")]),
         4,
         1003,
-        None,
     );
 
     // Commit offset
-    match engine.apply_command(
-        &MqCommand::commit_group_offset(group_id, 1, topic_id, 0, 42, None, 2000),
+    match apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, group_id, 1, topic_id, 0, 42, None, 2000),
         5,
         2000,
-        None,
     ) {
-        MqResponse::Ok => {}
-        other => panic!("expected Ok, got {other}"),
+        e => assert!(e.is_ok(), "expected Ok, got tag={}", e.tag()),
     }
 
     // Read offset via metadata
@@ -933,11 +1073,11 @@ fn test_consumer_group_offset_commit_and_fetch() {
     assert_eq!(offset, Some(42));
 
     // Commit higher offset
-    engine.apply_command(
-        &MqCommand::commit_group_offset(group_id, 1, topic_id, 0, 100, None, 3000),
+    apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, group_id, 1, topic_id, 0, 100, None, 3000),
         6,
         3000,
-        None,
     );
     let offset = engine
         .metadata()
@@ -946,34 +1086,50 @@ fn test_consumer_group_offset_commit_and_fetch() {
     assert_eq!(offset, Some(100));
 
     // Wrong generation should fail
-    match engine.apply_command(
-        &MqCommand::commit_group_offset(group_id, 99, topic_id, 0, 200, None, 4000),
+    match apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, group_id, 99, topic_id, 0, 200, None, 4000),
         7,
         4000,
-        None,
     ) {
-        MqResponse::Error(MqError::IllegalGeneration) => {}
-        other => panic!("expected IllegalGeneration, got {other}"),
+        e => {
+            assert_eq!(e.tag(), ResponseEntry::TAG_ERROR);
+            assert_eq!(
+                e.error_kind(),
+                ResponseEntry::ERR_ILLEGAL_GENERATION,
+                "expected IllegalGeneration"
+            );
+        }
     }
 }
 
 #[test]
 fn test_consumer_group_session_expiry() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_consumer_group("g-expire", 1),
+    let group_id = match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "g-expire", 1),
         1,
         1000,
-        None,
     ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
     };
 
     // Join with 5s session timeout
-    let member_id = match engine.apply_command(
+    let member_id = match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "client",
@@ -984,15 +1140,26 @@ fn test_consumer_group_session_expiry() {
         ),
         2,
         1000,
-        None,
     ) {
-        MqResponse::GroupJoined { member_id, .. } => member_id,
-        other => panic!("expected GroupJoined, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
+            e.group_joined_fields().1
+        }
     };
 
     // Member heartbeat at t=1000, session_timeout=5000
     // Expire at t=5999 -> no expiry yet
-    engine.apply_command(&MqCommand::expire_group_sessions(5999), 3, 5999, None);
+    apply(
+        &engine,
+        &MqCommand::expire_group_sessions(&mut buf, 5999),
+        3,
+        5999,
+    );
     assert!(
         engine
             .metadata()
@@ -1002,7 +1169,12 @@ fn test_consumer_group_session_expiry() {
     );
 
     // Expire at t=6001 -> should expire
-    engine.apply_command(&MqCommand::expire_group_sessions(6001), 4, 6001, None);
+    apply(
+        &engine,
+        &MqCommand::expire_group_sessions(&mut buf, 6001),
+        4,
+        6001,
+    );
     assert!(
         !engine
             .metadata()
@@ -1014,22 +1186,32 @@ fn test_consumer_group_session_expiry() {
 
 #[test]
 fn test_consumer_group_snapshot_restore() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
 
     // Create group
-    let group_id = match engine.apply_command(
-        &MqCommand::create_consumer_group("snap-group", 1),
+    let group_id = match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "snap-group", 1),
         1,
         1000,
-        None,
     ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
     };
 
     // Join member
-    let member_id = match engine.apply_command(
+    let member_id = match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "client",
@@ -1040,26 +1222,32 @@ fn test_consumer_group_snapshot_restore() {
         ),
         2,
         1001,
-        None,
     ) {
-        MqResponse::GroupJoined { member_id, .. } => member_id,
-        other => panic!("expected GroupJoined, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
+            e.group_joined_fields().1
+        }
     };
 
     // Sync
-    engine.apply_command(
-        &MqCommand::sync_consumer_group(group_id, 1, &member_id, &[(&member_id, b"asn")]),
+    apply(
+        &engine,
+        &MqCommand::sync_consumer_group(&mut buf, group_id, 1, &member_id, &[(&member_id, b"asn")]),
         3,
         1002,
-        None,
     );
 
     // Commit offset
-    engine.apply_command(
-        &MqCommand::commit_group_offset(group_id, 1, 42, 0, 99, None, 1003),
+    apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, group_id, 1, 42, 0, 99, None, 1003),
         4,
         1003,
-        None,
     );
 
     // Snapshot
@@ -1098,55 +1286,70 @@ fn test_consumer_group_snapshot_restore() {
     assert_eq!(snap2.consumer_groups[0].meta.generation, 1);
 
     // Engine continues to work
-    match engine2.apply_command(
-        &MqCommand::heartbeat_consumer_group(group_id, &member_id, 1),
+    match apply(
+        &engine2,
+        &MqCommand::heartbeat_consumer_group(&mut buf, group_id, &member_id, 1),
         5,
         2000,
-        None,
     ) {
-        MqResponse::Ok => {}
-        other => panic!("expected Ok after restore, got {other}"),
+        e => assert!(e.is_ok(), "expected Ok after restore, got tag={}", e.tag()),
     }
 }
 
 #[test]
 fn test_consumer_group_offset_expiry() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_consumer_group("g-offset-exp", 1),
+    let group_id = match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "g-offset-exp", 1),
         1,
         1000,
-        None,
     ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
     };
 
     // Join + sync
-    let member_id = match engine.apply_command(
+    let member_id = match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "client",
-            5000, // 5s session timeout
+            5000,
             60000,
             "consumer",
             &[("range", b"")],
         ),
         2,
         1001,
-        None,
     ) {
-        MqResponse::GroupJoined { member_id, .. } => member_id,
-        other => panic!("expected GroupJoined, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_GROUP_JOINED,
+                "expected GroupJoined, got tag={}",
+                e.tag()
+            );
+            e.group_joined_fields().1
+        }
     };
 
-    engine.apply_command(
-        &MqCommand::sync_consumer_group(group_id, 1, &member_id, &[(&member_id, b"a")]),
+    apply(
+        &engine,
+        &MqCommand::sync_consumer_group(&mut buf, group_id, 1, &member_id, &[(&member_id, b"a")]),
         3,
         1002,
-        None,
     );
 
     // Group has member
@@ -1159,7 +1362,12 @@ fn test_consumer_group_offset_expiry() {
     );
 
     // Expire before session timeout -> member still present
-    engine.apply_command(&MqCommand::expire_group_sessions(5999), 4, 5999, None);
+    apply(
+        &engine,
+        &MqCommand::expire_group_sessions(&mut buf, 5999),
+        4,
+        5999,
+    );
     assert!(
         engine
             .metadata()
@@ -1169,7 +1377,12 @@ fn test_consumer_group_offset_expiry() {
     );
 
     // Expire after session timeout -> member removed, group becomes empty
-    engine.apply_command(&MqCommand::expire_group_sessions(6002), 5, 6002, None);
+    apply(
+        &engine,
+        &MqCommand::expire_group_sessions(&mut buf, 6002),
+        5,
+        6002,
+    );
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     assert!(!group.has_member(&member_id));
     assert_eq!(group.member_count(), 0);
@@ -1182,14 +1395,22 @@ fn test_consumer_group_offset_expiry() {
 
 /// Helper: create a group and return its id.
 fn create_group(engine: &mut MqEngine, name: &str, log_idx: u64, ts: u64) -> u64 {
-    match engine.apply_command(
-        &MqCommand::create_consumer_group(name, 1),
+    let mut buf = bytes::BytesMut::new();
+    match apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, name, 1),
         log_idx,
         ts,
-        None,
     ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {other}"),
+        e => {
+            assert_eq!(
+                e.tag(),
+                ResponseEntry::TAG_ENTITY_CREATED,
+                "expected EntityCreated, got tag={}",
+                e.tag()
+            );
+            e.entity_id()
+        }
     }
 }
 
@@ -1201,8 +1422,11 @@ fn join_group(
     log_idx: u64,
     ts: u64,
 ) -> (String, i32, bool) {
-    match engine.apply_command(
+    let mut buf = bytes::BytesMut::new();
+    let e = apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             group_id,
             member_id,
             "client",
@@ -1213,16 +1437,17 @@ fn join_group(
         ),
         log_idx,
         ts,
-        None,
-    ) {
-        MqResponse::GroupJoined {
-            member_id,
-            generation,
-            phase_complete,
-            ..
-        } => (member_id, generation, phase_complete),
-        other => panic!("expected GroupJoined, got {other}"),
-    }
+    );
+    assert_eq!(
+        e.tag(),
+        ResponseEntry::TAG_GROUP_JOINED,
+        "expected GroupJoined, got tag={}",
+        e.tag()
+    );
+    let member_id = e.group_joined_fields().1;
+    let generation = e.group_joined_generation();
+    let phase_complete = e.group_joined_phase_complete();
+    (member_id, generation, phase_complete)
 }
 
 /// Helper: sync a group as leader with assignments.
@@ -1235,22 +1460,30 @@ fn sync_group(
     log_idx: u64,
     ts: u64,
 ) {
-    match engine.apply_command(
-        &MqCommand::sync_consumer_group(group_id, generation, member_id, assignments),
+    let mut buf = bytes::BytesMut::new();
+    match apply(
+        &engine,
+        &MqCommand::sync_consumer_group(&mut buf, group_id, generation, member_id, assignments),
         log_idx,
         ts,
-        None,
     ) {
-        MqResponse::GroupSynced { .. } => {}
-        other => panic!("expected GroupSynced, got {other}"),
+        e => assert_eq!(
+            e.tag(),
+            ResponseEntry::TAG_GROUP_SYNCED,
+            "expected GroupSynced, got tag={}",
+            e.tag()
+        ),
     }
 }
 
 #[test]
 fn test_cg_join_nonexistent_group() {
     let mut engine = make_engine();
-    match engine.apply_command(
+    let mut buf = BytesMut::new();
+    match apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             99999,
             "",
             "c",
@@ -1261,49 +1494,56 @@ fn test_cg_join_nonexistent_group() {
         ),
         1,
         1000,
-        None,
     ) {
-        MqResponse::Error(MqError::NotFound {
-            entity: EntityKind::ConsumerGroup,
-            id: 99999,
-        }) => {}
-        other => panic!("expected NotFound, got {other}"),
+        e => {
+            assert_eq!(e.tag(), ResponseEntry::TAG_ERROR);
+            assert_eq!(e.error_kind(), ResponseEntry::ERR_NOT_FOUND);
+            assert_eq!(e.error_entity_id(), 99999, "expected NotFound(99999)");
+        }
     }
 }
 
 #[test]
 fn test_cg_sync_nonexistent_group() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
-    match engine.apply_command(
-        &MqCommand::sync_consumer_group(99999, 1, "m1", &[]),
+    match apply(
+        &engine,
+        &MqCommand::sync_consumer_group(&mut buf, 99999, 1, "m1", &[]),
         1,
         1000,
-        None,
     ) {
-        MqResponse::Error(MqError::NotFound {
-            entity: EntityKind::ConsumerGroup,
-            id: 99999,
-        }) => {}
-        other => panic!("expected NotFound, got {other}"),
+        e => {
+            assert_eq!(e.tag(), ResponseEntry::TAG_ERROR);
+            assert_eq!(e.error_kind(), ResponseEntry::ERR_NOT_FOUND);
+            assert_eq!(e.error_entity_id(), 99999, "expected NotFound(99999)");
+        }
     }
 }
 
 #[test]
 fn test_cg_sync_wrong_generation() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-sync-g", 1, 1000);
     let (mid, g, _) = join_group(&mut engine, gid, "", 2, 1001);
     assert_eq!(g, 1);
 
     // Sync with wrong generation
-    match engine.apply_command(
-        &MqCommand::sync_consumer_group(gid, 999, &mid, &[]),
+    match apply(
+        &engine,
+        &MqCommand::sync_consumer_group(&mut buf, gid, 999, &mid, &[]),
         3,
         1002,
-        None,
     ) {
-        MqResponse::Error(MqError::IllegalGeneration) => {}
-        other => panic!("expected IllegalGeneration, got {other}"),
+        e => {
+            assert_eq!(e.tag(), ResponseEntry::TAG_ERROR);
+            assert_eq!(
+                e.error_kind(),
+                ResponseEntry::ERR_ILLEGAL_GENERATION,
+                "expected IllegalGeneration"
+            );
+        }
     }
 }
 
@@ -1333,6 +1573,7 @@ fn test_cg_join_during_completing_rebalance() {
 
 #[test]
 fn test_cg_leave_triggers_rebalance_in_stable() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-leave-stable", 1, 1000);
 
@@ -1353,7 +1594,12 @@ fn test_cg_leave_triggers_rebalance_in_stable() {
     );
 
     // Leave member A -> should trigger PreparingRebalance
-    engine.apply_command(&MqCommand::leave_consumer_group(gid, &ma), 6, 1005, None);
+    apply(
+        &engine,
+        &MqCommand::leave_consumer_group(&mut buf, gid, &ma),
+        6,
+        1005,
+    );
     assert_eq!(
         engine.metadata().get_consumer_group(gid).unwrap().phase(),
         bisque_mq::consumer_group::GroupPhase::PreparingRebalance
@@ -1362,6 +1608,7 @@ fn test_cg_leave_triggers_rebalance_in_stable() {
 
 #[test]
 fn test_cg_leave_during_rebalance() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-leave-rebal", 1, 1000);
 
@@ -1389,7 +1636,12 @@ fn test_cg_leave_during_rebalance() {
     join_group(&mut engine, gid, "", 6, 1005);
 
     // B leaves during rebalance
-    engine.apply_command(&MqCommand::leave_consumer_group(gid, &mb), 7, 1006, None);
+    apply(
+        &engine,
+        &MqCommand::leave_consumer_group(&mut buf, gid, &mb),
+        7,
+        1006,
+    );
 
     // Should still have members, phase should be determined by remaining count
     let group = engine.metadata().get_consumer_group(gid).unwrap();
@@ -1399,11 +1651,17 @@ fn test_cg_leave_during_rebalance() {
 #[test]
 fn test_cg_leave_last_member() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let gid = create_group(&mut engine, "g-leave-last", 1, 1000);
     let (ma, g, _) = join_group(&mut engine, gid, "", 2, 1001);
     sync_group(&mut engine, gid, g, &ma, &[(&ma, b"a")], 3, 1002);
 
-    engine.apply_command(&MqCommand::leave_consumer_group(gid, &ma), 4, 1003, None);
+    apply(
+        &engine,
+        &MqCommand::leave_consumer_group(&mut buf, gid, &ma),
+        4,
+        1003,
+    );
 
     let group = engine.metadata().get_consumer_group(gid).unwrap();
     assert_eq!(group.phase(), bisque_mq::consumer_group::GroupPhase::Empty);
@@ -1413,6 +1671,7 @@ fn test_cg_leave_last_member() {
 
 #[test]
 fn test_cg_heartbeat_during_rebalance() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-hb-rebal", 1, 1000);
     let (ma, g, _) = join_group(&mut engine, gid, "", 2, 1001);
@@ -1426,14 +1685,20 @@ fn test_cg_heartbeat_during_rebalance() {
     );
 
     // Heartbeat during rebalance -> RebalanceInProgress
-    match engine.apply_command(
-        &MqCommand::heartbeat_consumer_group(gid, &ma, g),
+    match apply(
+        &engine,
+        &MqCommand::heartbeat_consumer_group(&mut buf, gid, &ma, g),
         5,
         1004,
-        None,
     ) {
-        MqResponse::Error(MqError::RebalanceInProgress) => {}
-        other => panic!("expected RebalanceInProgress, got {other}"),
+        e => {
+            assert_eq!(e.tag(), ResponseEntry::TAG_ERROR);
+            assert_eq!(
+                e.error_kind(),
+                ResponseEntry::ERR_REBALANCE_IN_PROGRESS,
+                "expected RebalanceInProgress"
+            );
+        }
     }
 }
 
@@ -1464,16 +1729,17 @@ fn test_cg_double_join_same_member() {
 #[test]
 fn test_cg_offset_overwrite() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let gid = create_group(&mut engine, "g-off-over", 1, 1000);
     let (ma, g, _) = join_group(&mut engine, gid, "", 2, 1001);
     sync_group(&mut engine, gid, g, &ma, &[(&ma, b"a")], 3, 1002);
 
     // Commit offset 10
-    engine.apply_command(
-        &MqCommand::commit_group_offset(gid, g, 42, 0, 10, None, 1003),
+    apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, gid, g, 42, 0, 10, None, 1003),
         4,
         1003,
-        None,
     );
     assert_eq!(
         engine
@@ -1485,11 +1751,11 @@ fn test_cg_offset_overwrite() {
     );
 
     // Overwrite with offset 20
-    engine.apply_command(
-        &MqCommand::commit_group_offset(gid, g, 42, 0, 20, None, 1004),
+    apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, gid, g, 42, 0, 20, None, 1004),
         5,
         1004,
-        None,
     );
     assert_eq!(
         engine
@@ -1503,29 +1769,30 @@ fn test_cg_offset_overwrite() {
 
 #[test]
 fn test_cg_offset_multiple_partitions() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-off-multi", 1, 1000);
     let (ma, g, _) = join_group(&mut engine, gid, "", 2, 1001);
     sync_group(&mut engine, gid, g, &ma, &[(&ma, b"a")], 3, 1002);
 
     // Commit to different topic/partition combos
-    engine.apply_command(
-        &MqCommand::commit_group_offset(gid, g, 10, 0, 100, None, 1003),
+    apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, gid, g, 10, 0, 100, None, 1003),
         4,
         1003,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::commit_group_offset(gid, g, 10, 1, 200, None, 1004),
+    apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, gid, g, 10, 1, 200, None, 1004),
         5,
         1004,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::commit_group_offset(gid, g, 20, 0, 300, None, 1005),
+    apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, gid, g, 20, 0, 300, None, 1005),
         6,
         1005,
-        None,
     );
 
     let group = engine.metadata().get_consumer_group(gid).unwrap();
@@ -1537,20 +1804,20 @@ fn test_cg_offset_multiple_partitions() {
 
 #[test]
 fn test_cg_offset_boundary_zero() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-off-zero", 1, 1000);
     let (ma, g, _) = join_group(&mut engine, gid, "", 2, 1001);
     sync_group(&mut engine, gid, g, &ma, &[(&ma, b"a")], 3, 1002);
 
     // Commit offset 0 -- valid boundary
-    match engine.apply_command(
-        &MqCommand::commit_group_offset(gid, g, 42, 0, 0, None, 1003),
+    match apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, gid, g, 42, 0, 0, None, 1003),
         4,
         1003,
-        None,
     ) {
-        MqResponse::Ok => {}
-        other => panic!("expected Ok, got {other}"),
+        e => assert!(e.is_ok(), "expected Ok, got tag={}", e.tag()),
     }
     assert_eq!(
         engine
@@ -1565,22 +1832,24 @@ fn test_cg_offset_boundary_zero() {
 #[test]
 fn test_cg_offset_commit_nonexistent_group() {
     let mut engine = make_engine();
-    match engine.apply_command(
-        &MqCommand::commit_group_offset(99999, 1, 42, 0, 10, None, 1000),
+    let mut buf = BytesMut::new();
+    match apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, 99999, 1, 42, 0, 10, None, 1000),
         1,
         1000,
-        None,
     ) {
-        MqResponse::Error(MqError::NotFound {
-            entity: EntityKind::ConsumerGroup,
-            ..
-        }) => {}
-        other => panic!("expected NotFound, got {other}"),
+        e => {
+            assert_eq!(e.tag(), ResponseEntry::TAG_ERROR);
+            assert_eq!(e.error_kind(), ResponseEntry::ERR_NOT_FOUND);
+            assert_eq!(e.error_entity_id(), 99999, "expected NotFound(99999)");
+        }
     }
 }
 
 #[test]
 fn test_cg_session_expiry_triggers_rebalance() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-exp-rebal", 1, 1000);
 
@@ -1599,16 +1868,21 @@ fn test_cg_session_expiry_triggers_rebalance() {
     );
 
     // Heartbeat only member A at t=5000
-    engine.apply_command(
-        &MqCommand::heartbeat_consumer_group(gid, &ma, g),
+    apply(
+        &engine,
+        &MqCommand::heartbeat_consumer_group(&mut buf, gid, &ma, g),
         6,
         5000,
-        None,
     );
 
     // Expire at t=31003 -> member B's last heartbeat was at join time 1002, timeout 30000
     // So B expires at 1002 + 30000 = 31002
-    engine.apply_command(&MqCommand::expire_group_sessions(31003), 7, 31003, None);
+    apply(
+        &engine,
+        &MqCommand::expire_group_sessions(&mut buf, 31003),
+        7,
+        31003,
+    );
 
     let group = engine.metadata().get_consumer_group(gid).unwrap();
     assert_eq!(group.member_count(), 1); // Only A remains
@@ -1623,12 +1897,15 @@ fn test_cg_session_expiry_triggers_rebalance() {
 
 #[test]
 fn test_cg_session_expiry_multiple_timeouts() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-exp-multi", 1, 1000);
 
     // Member A with 10s timeout
-    match engine.apply_command(
+    let ea = apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             gid,
             "",
             "c-a",
@@ -1639,70 +1916,81 @@ fn test_cg_session_expiry_multiple_timeouts() {
         ),
         2,
         1000,
-        None,
-    ) {
-        MqResponse::GroupJoined { member_id, .. } => {
-            // Member B with 60s timeout
-            match engine.apply_command(
-                &MqCommand::join_consumer_group(
-                    gid,
-                    "",
-                    "c-b",
-                    60000,
-                    60000,
-                    "consumer",
-                    &[("range", b"")],
-                ),
-                3,
-                1000,
-                None,
-            ) {
-                MqResponse::GroupJoined { member_id: mb, .. } => {
-                    // A rejoins (preserving 10s timeout) to complete
-                    engine.apply_command(
-                        &MqCommand::join_consumer_group(
-                            gid,
-                            &member_id,
-                            "c-a",
-                            10000,
-                            60000,
-                            "consumer",
-                            &[("range", b"")],
-                        ),
-                        4,
-                        1000,
-                        None,
-                    );
-                    let group = engine.metadata().get_consumer_group(gid).unwrap();
-                    let g = group.generation();
-                    drop(group);
-                    sync_group(
-                        &mut engine,
-                        gid,
-                        g,
-                        &member_id,
-                        &[(&member_id, b"a"), (&mb, b"b")],
-                        5,
-                        1001,
-                    );
+    );
+    assert_eq!(
+        ea.tag(),
+        ResponseEntry::TAG_GROUP_JOINED,
+        "expected GroupJoined for A"
+    );
+    let member_id = ea.group_joined_fields().1;
+    // Member B with 60s timeout
+    let eb = apply(
+        &engine,
+        &MqCommand::join_consumer_group(
+            &mut buf,
+            gid,
+            "",
+            "c-b",
+            60000,
+            60000,
+            "consumer",
+            &[("range", b"")],
+        ),
+        3,
+        1000,
+    );
+    assert_eq!(
+        eb.tag(),
+        ResponseEntry::TAG_GROUP_JOINED,
+        "expected GroupJoined for B"
+    );
+    let mb = eb.group_joined_fields().1;
+    // A rejoins (preserving 10s timeout) to complete
+    apply(
+        &engine,
+        &MqCommand::join_consumer_group(
+            &mut buf,
+            gid,
+            &member_id,
+            "c-a",
+            10000,
+            60000,
+            "consumer",
+            &[("range", b"")],
+        ),
+        4,
+        1000,
+    );
+    let group = engine.metadata().get_consumer_group(gid).unwrap();
+    let g = group.generation();
+    drop(group);
+    sync_group(
+        &mut engine,
+        gid,
+        g,
+        &member_id,
+        &[(&member_id, b"a"), (&mb, b"b")],
+        5,
+        1001,
+    );
 
-                    // Expire at t=11002 -> A (10s timeout, heartbeat at 1000) expired, B (60s) still alive
-                    engine.apply_command(&MqCommand::expire_group_sessions(11002), 6, 11002, None);
-                    let group = engine.metadata().get_consumer_group(gid).unwrap();
-                    assert_eq!(group.member_count(), 1);
-                    assert!(group.has_member(&mb));
-                    assert!(!group.has_member(&member_id));
-                }
-                other => panic!("expected GroupJoined, got {other}"),
-            }
-        }
-        other => panic!("expected GroupJoined, got {other}"),
-    }
+    // Expire at t=11002 -> A (10s timeout, heartbeat at 1000) expired, B (60s) still alive
+    apply(
+        &engine,
+        &MqCommand::expire_group_sessions(&mut buf, 11002),
+        6,
+        11002,
+    );
+    let group = engine.metadata().get_consumer_group(gid).unwrap();
+    assert_eq!(group.member_count(), 1);
+    assert!(group.has_member(&mb));
+    assert!(!group.has_member(&member_id));
 }
 
 #[test]
 fn test_cg_session_expiry_boundary() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let gid = create_group(&mut engine, "g-exp-bound", 1, 1000);
     // Join with 10s timeout, heartbeat at t=1000
     let (ma, g, _) = join_group(&mut engine, gid, "", 2, 1000);
@@ -1711,7 +1999,12 @@ fn test_cg_session_expiry_boundary() {
     // Expire at exact boundary: 1000 + 30000 = 31000 (default session timeout)
     // Member heartbeat was at 1000, timeout is 30000
     // At t=31000: last_heartbeat(1000) + timeout(30000) = 31000, not < 31000 -> NOT expired
-    engine.apply_command(&MqCommand::expire_group_sessions(31000), 4, 31000, None);
+    apply(
+        &engine,
+        &MqCommand::expire_group_sessions(&mut buf, 31000),
+        4,
+        31000,
+    );
     assert_eq!(
         engine
             .metadata()
@@ -1722,7 +2015,12 @@ fn test_cg_session_expiry_boundary() {
     );
 
     // At t=31001: 1000 + 30000 = 31000 < 31001 -> expired
-    engine.apply_command(&MqCommand::expire_group_sessions(31001), 5, 31001, None);
+    apply(
+        &engine,
+        &MqCommand::expire_group_sessions(&mut buf, 31001),
+        5,
+        31001,
+    );
     assert_eq!(
         engine
             .metadata()
@@ -1736,55 +2034,75 @@ fn test_cg_session_expiry_boundary() {
 #[test]
 fn test_cg_batch_with_consumer_group_commands() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let create_cmd = MqCommand::create_consumer_group("g-batch", 1);
-    let batch = MqCommand::batch(&[create_cmd]);
+    MqCommand::write_create_consumer_group(&mut buf, "g-batch", 1);
+    let create_cmd = MqCommand::split_from(&mut buf);
+    MqCommand::write_batch(&mut buf, &[create_cmd]);
+    let batch = MqCommand::split_from(&mut buf);
 
-    match engine.apply_command(&batch, 1, 1000, None) {
-        MqResponse::BatchResponse(responses) => {
-            assert_eq!(responses.len(), 1);
-            match &responses[0] {
-                MqResponse::EntityCreated { id } => {
-                    assert!(engine.metadata().get_consumer_group(*id).is_some());
-                }
-                other => panic!("expected EntityCreated, got {other}"),
-            }
-        }
-        other => panic!("expected BatchResponse, got {other}"),
-    }
+    let resp = apply(&engine, &batch, 1, 1000);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_BATCH,
+        "expected BatchResponse"
+    );
+    let entries: Vec<_> = resp.batch_entries().collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    assert!(
+        engine
+            .metadata()
+            .get_consumer_group(entries[0].entity_id())
+            .is_some()
+    );
 }
 
 #[test]
 fn test_cg_batch_mixed_types() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let topic_cmd = MqCommand::create_topic("t-batch", RetentionPolicy::default(), 0);
-    let group_cmd = MqCommand::create_consumer_group("g-batch-mix", 1);
-    let batch = MqCommand::batch(&[topic_cmd, group_cmd]);
+    MqCommand::write_create_topic(&mut buf, "t-batch", &RetentionPolicy::default(), 0);
+    let topic_cmd = MqCommand::split_from(&mut buf);
+    MqCommand::write_create_consumer_group(&mut buf, "g-batch-mix", 1);
+    let group_cmd = MqCommand::split_from(&mut buf);
+    MqCommand::write_batch(&mut buf, &[topic_cmd, group_cmd]);
+    let batch = MqCommand::split_from(&mut buf);
 
-    match engine.apply_command(&batch, 1, 1000, None) {
-        MqResponse::BatchResponse(responses) => {
-            assert_eq!(responses.len(), 2);
-            // Both should be EntityCreated
-            for resp in responses.iter() {
-                match resp {
-                    MqResponse::EntityCreated { .. } => {}
-                    other => panic!("expected EntityCreated, got {other}"),
-                }
-            }
-        }
-        other => panic!("expected BatchResponse, got {other}"),
+    let resp = apply(&engine, &batch, 1, 1000);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_BATCH,
+        "expected BatchResponse"
+    );
+    let entries: Vec<_> = resp.batch_entries().collect();
+    assert_eq!(entries.len(), 2);
+    // Both should be EntityCreated
+    for e in entries.iter() {
+        assert_eq!(
+            e.tag(),
+            ResponseEntry::TAG_ENTITY_CREATED,
+            "expected EntityCreated"
+        );
     }
 }
 
 #[test]
 fn test_cg_protocol_selection_tiebreak() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let gid = create_group(&mut engine, "g-proto-tie", 1, 1000);
 
     // Member A: ["range", "roundrobin"]
-    match engine.apply_command(
+    let ea = apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             gid,
             "",
             "c-a",
@@ -1795,52 +2113,58 @@ fn test_cg_protocol_selection_tiebreak() {
         ),
         2,
         1001,
-        None,
-    ) {
-        MqResponse::GroupJoined { member_id: ma, .. } => {
-            // Member B: ["roundrobin", "range"]
-            match engine.apply_command(
-                &MqCommand::join_consumer_group(
-                    gid,
-                    "",
-                    "c-b",
-                    30000,
-                    60000,
-                    "consumer",
-                    &[("roundrobin", b""), ("range", b"")],
-                ),
-                3,
-                1002,
-                None,
-            ) {
-                MqResponse::GroupJoined { .. } => {
-                    // A rejoins to complete phase
-                    match engine.apply_command(
-                        &MqCommand::join_consumer_group(
-                            gid,
-                            &ma,
-                            "c-a",
-                            30000,
-                            60000,
-                            "consumer",
-                            &[("range", b""), ("roundrobin", b"")],
-                        ),
-                        4,
-                        1003,
-                        None,
-                    ) {
-                        MqResponse::GroupJoined { protocol_name, .. } => {
-                            // Both protocols supported by 2 members -- tiebreak by position
-                            assert!(protocol_name == "range" || protocol_name == "roundrobin");
-                        }
-                        other => panic!("expected GroupJoined, got {other}"),
-                    }
-                }
-                other => panic!("expected GroupJoined, got {other}"),
-            }
-        }
-        other => panic!("expected GroupJoined, got {other}"),
-    }
+    );
+    assert_eq!(
+        ea.tag(),
+        ResponseEntry::TAG_GROUP_JOINED,
+        "expected GroupJoined for A"
+    );
+    let ma = ea.group_joined_fields().1;
+    // Member B: ["roundrobin", "range"]
+    let eb = apply(
+        &engine,
+        &MqCommand::join_consumer_group(
+            &mut buf,
+            gid,
+            "",
+            "c-b",
+            30000,
+            60000,
+            "consumer",
+            &[("roundrobin", b""), ("range", b"")],
+        ),
+        3,
+        1002,
+    );
+    assert_eq!(
+        eb.tag(),
+        ResponseEntry::TAG_GROUP_JOINED,
+        "expected GroupJoined for B"
+    );
+    // A rejoins to complete phase
+    let ec = apply(
+        &engine,
+        &MqCommand::join_consumer_group(
+            &mut buf,
+            gid,
+            &ma,
+            "c-a",
+            30000,
+            60000,
+            "consumer",
+            &[("range", b""), ("roundrobin", b"")],
+        ),
+        4,
+        1003,
+    );
+    assert_eq!(
+        ec.tag(),
+        ResponseEntry::TAG_GROUP_JOINED,
+        "expected GroupJoined for A rejoin"
+    );
+    let protocol_name = ec.group_joined_fields().2;
+    // Both protocols supported by 2 members -- tiebreak by position
+    assert!(protocol_name == "range" || protocol_name == "roundrobin");
 }
 
 #[test]
@@ -1891,6 +2215,7 @@ fn test_cg_three_member_rebalance() {
 
 #[test]
 fn test_cg_leader_leaves_new_leader_elected() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-leader-leave", 1, 1000);
 
@@ -1916,11 +2241,11 @@ fn test_cg_leader_leaves_new_leader_elected() {
         .unwrap();
 
     // Leader leaves
-    engine.apply_command(
-        &MqCommand::leave_consumer_group(gid, &leader1),
+    apply(
+        &engine,
+        &MqCommand::leave_consumer_group(&mut buf, gid, &leader1),
         6,
         1005,
-        None,
     );
 
     // Remaining member rejoins -> new leader elected
@@ -1941,6 +2266,7 @@ fn test_cg_leader_leaves_new_leader_elected() {
 #[test]
 fn test_cg_rejoin_with_different_protocols() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let gid = create_group(&mut engine, "g-proto-change", 1, 1000);
 
     // Join with "range"
@@ -1948,8 +2274,10 @@ fn test_cg_rejoin_with_different_protocols() {
     sync_group(&mut engine, gid, gen1, &ma, &[(&ma, b"a")], 3, 1002);
 
     // Rejoin with "roundrobin"
-    match engine.apply_command(
+    let e = apply(
+        &engine,
         &MqCommand::join_consumer_group(
+            &mut buf,
             gid,
             &ma,
             "client",
@@ -1960,18 +2288,14 @@ fn test_cg_rejoin_with_different_protocols() {
         ),
         4,
         1003,
-        None,
-    ) {
-        MqResponse::GroupJoined {
-            protocol_name,
-            generation,
-            ..
-        } => {
-            assert_eq!(generation, 2);
-            assert_eq!(protocol_name, "roundrobin");
-        }
-        other => panic!("expected GroupJoined, got {other}"),
-    }
+    );
+    assert_eq!(
+        e.tag(),
+        ResponseEntry::TAG_GROUP_JOINED,
+        "expected GroupJoined"
+    );
+    assert_eq!(e.group_joined_generation(), 2);
+    assert_eq!(e.group_joined_fields().2, "roundrobin");
 }
 
 #[test]
@@ -2014,19 +2338,25 @@ fn test_cg_snapshot_mid_rebalance() {
 
 #[test]
 fn test_cg_snapshot_empty_group_with_offsets() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let gid = create_group(&mut engine, "g-snap-empty", 1, 1000);
 
     // Join, commit offset, then leave (group becomes empty but offsets remain)
     let (ma, g, _) = join_group(&mut engine, gid, "", 2, 1001);
     sync_group(&mut engine, gid, g, &ma, &[(&ma, b"a")], 3, 1002);
-    engine.apply_command(
-        &MqCommand::commit_group_offset(gid, g, 42, 0, 100, Some("meta"), 1003),
+    apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, gid, g, 42, 0, 100, Some("meta"), 1003),
         4,
         1003,
-        None,
     );
-    engine.apply_command(&MqCommand::leave_consumer_group(gid, &ma), 5, 1004, None);
+    apply(
+        &engine,
+        &MqCommand::leave_consumer_group(&mut buf, gid, &ma),
+        5,
+        1004,
+    );
 
     // Verify: empty group with offsets
     {
@@ -2149,16 +2479,17 @@ fn test_cg_snapshot_preserves_generation() {
 #[test]
 fn test_cg_snapshot_operations_continue() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let gid = create_group(&mut engine, "g-snap-ops", 1, 1000);
     let (ma, g, _) = join_group(&mut engine, gid, "", 2, 1001);
     sync_group(&mut engine, gid, g, &ma, &[(&ma, b"a")], 3, 1002);
 
     // Commit an offset
-    engine.apply_command(
-        &MqCommand::commit_group_offset(gid, g, 42, 0, 50, None, 1003),
+    apply(
+        &engine,
+        &MqCommand::commit_group_offset(&mut buf, gid, g, 42, 0, 50, None, 1003),
         4,
         1003,
-        None,
     );
 
     // Snapshot + restore
@@ -2169,25 +2500,27 @@ fn test_cg_snapshot_operations_continue() {
     // All operations should continue working:
 
     // 1. Heartbeat
-    match engine2.apply_command(
-        &MqCommand::heartbeat_consumer_group(gid, &ma, g),
+    match apply(
+        &engine2,
+        &MqCommand::heartbeat_consumer_group(&mut buf, gid, &ma, g),
         10,
         2000,
-        None,
     ) {
-        MqResponse::Ok => {}
-        other => panic!("heartbeat after restore: {other}"),
+        e => assert!(e.is_ok(), "heartbeat after restore, got tag={}", e.tag()),
     }
 
     // 2. Offset commit
-    match engine2.apply_command(
-        &MqCommand::commit_group_offset(gid, g, 42, 1, 75, None, 2001),
+    match apply(
+        &engine2,
+        &MqCommand::commit_group_offset(&mut buf, gid, g, 42, 1, 75, None, 2001),
         11,
         2001,
-        None,
     ) {
-        MqResponse::Ok => {}
-        other => panic!("offset commit after restore: {other}"),
+        e => assert!(
+            e.is_ok(),
+            "offset commit after restore, got tag={}",
+            e.tag()
+        ),
     }
     assert_eq!(
         engine2
@@ -2230,26 +2563,28 @@ fn test_cg_snapshot_operations_continue() {
 #[test]
 fn test_ack_queue_create_publish_deliver_ack() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     // Create an ack-variant queue (auto-creates source topic)
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "test-queue",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "test-queue",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     // Find the source topic
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2261,8 +2596,10 @@ fn test_ack_queue_create_publish_deliver_ack() {
     let msgs: Vec<Bytes> = (0..3)
         .map(|i| make_flat_msg(format!("msg-{i}").as_bytes()))
         .collect();
-    let resp = engine.apply_command(&MqCommand::publish(source_topic_id, &msgs), 2, 1001, None);
-    assert!(matches!(resp, MqResponse::Published { count: 3, .. }));
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &msgs);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
+    assert_eq!(resp.tag(), ResponseEntry::TAG_PUBLISHED);
+    assert_eq!(resp.published_count(), 3);
 
     // Verify ack state has pending messages
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2271,22 +2608,25 @@ fn test_ack_queue_create_publish_deliver_ack() {
     drop(group);
 
     // Create session for consumer
-    engine.apply_command(
-        &MqCommand::create_session(100, "consumer-1", 30000, 60000),
-        3,
-        1002,
-        None,
-    );
+    MqCommand::write_create_session(&mut buf, 100, "consumer-1", 30000, 60000);
+    apply(&engine, &MqCommand::split_from(&mut buf), 3, 1002);
 
     // Deliver
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 10), 4, 1003, None);
-    let delivered_ids = match resp {
-        MqResponse::Messages { messages } => {
-            assert_eq!(messages.len(), 3);
-            messages.iter().map(|m| m.message_id).collect::<Vec<_>>()
-        }
-        other => panic!("expected Messages, got {:?}", other),
-    };
+    let resp = apply(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 10),
+        4,
+        1003,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_MESSAGES,
+        "expected Messages, got tag={}",
+        resp.tag()
+    );
+    let delivered_msgs: Vec<_> = resp.messages().collect();
+    assert_eq!(delivered_msgs.len(), 3);
+    let delivered_ids: Vec<_> = delivered_msgs.iter().map(|m| m.message_id).collect();
 
     // Verify in-flight
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2296,13 +2636,13 @@ fn test_ack_queue_create_publish_deliver_ack() {
     drop(group);
 
     // Ack all
-    let resp = engine.apply_command(
-        &MqCommand::group_ack(group_id, &delivered_ids, None),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_ack(&mut buf, group_id, &delivered_ids, None),
         5,
         1004,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok());
 
     // Verify empty
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2314,47 +2654,58 @@ fn test_ack_queue_create_publish_deliver_ack() {
 #[test]
 fn test_ack_nack_returns_to_pending() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "nack-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "nack-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
     drop(group);
 
     // Publish
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id, &[make_flat_msg(b"msg")]),
-        2,
-        1001,
-        None,
-    );
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[make_flat_msg(b"msg")]);
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
 
     // Deliver
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 1002, None);
-    let msg_id = match resp {
-        MqResponse::Messages { messages } => messages[0].message_id,
-        other => panic!("expected Messages, got {:?}", other),
-    };
+    let resp = apply(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 1),
+        3,
+        1002,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_MESSAGES,
+        "expected Messages, got tag={}",
+        resp.tag()
+    );
+    let msg_id = resp.messages().next().unwrap().message_id;
 
     // Nack
-    engine.apply_command(&MqCommand::group_nack(group_id, &[msg_id]), 4, 1003, None);
+    apply(
+        &engine,
+        &MqCommand::group_nack(&mut buf, group_id, &[msg_id]),
+        4,
+        1003,
+    );
 
     // Verify returned to pending
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2366,49 +2717,55 @@ fn test_ack_nack_returns_to_pending() {
 #[test]
 fn test_ack_release_returns_without_attempt_increment() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "release-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "release-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
     drop(group);
 
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id, &[make_flat_msg(b"msg")]),
-        2,
-        1001,
-        None,
-    );
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[make_flat_msg(b"msg")]);
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
 
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 1002, None);
-    let msg_id = match resp {
-        MqResponse::Messages { messages } => messages[0].message_id,
-        other => panic!("expected Messages, got {:?}", other),
-    };
+    let resp = apply(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 1),
+        3,
+        1002,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_MESSAGES,
+        "expected Messages, got tag={}",
+        resp.tag()
+    );
+    let msg_id = resp.messages().next().unwrap().message_id;
 
     // Release
-    engine.apply_command(
-        &MqCommand::group_release(group_id, &[msg_id]),
+    apply(
+        &engine,
+        &MqCommand::group_release(&mut buf, group_id, &[msg_id]),
         4,
         1003,
-        None,
     );
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2424,113 +2781,124 @@ fn test_ack_release_returns_without_attempt_increment() {
 #[test]
 fn test_ack_timeout_and_dead_letter() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     let mut config = AckVariantConfig::default();
     config.max_retries = 1;
     config.dead_letter_topic = Some("dlq-topic".to_string());
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "timeout-q",
-            config,
-            RetentionPolicy::default(),
-            None,
-            true,
-            Some("dlq-topic"),
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "timeout-q",
+        config,
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        true,
+        Some("dlq-topic"),
+        false,
+        None,
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
     drop(group);
 
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id, &[make_flat_msg(b"dlq-msg")]),
-        2,
-        1001,
-        None,
-    );
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[make_flat_msg(b"dlq-msg")]);
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
 
     // Deliver (attempts = 1 after deliver)
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 1002, None);
-    let msg_id = match resp {
-        MqResponse::Messages { messages } => messages[0].message_id,
-        other => panic!("expected Messages, got {:?}", other),
-    };
+    let resp = apply(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 1),
+        3,
+        1002,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_MESSAGES,
+        "expected Messages, got tag={}",
+        resp.tag()
+    );
+    let msg_id = resp.messages().next().unwrap().message_id;
 
     // Timeout with max_retries=1 → should dead letter
-    let resp = engine.apply_command(
-        &MqCommand::group_timeout_expired(group_id, &[msg_id]),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_timeout_expired(&mut buf, group_id, &[msg_id]),
         4,
         1003,
-        None,
     );
-    match resp {
-        MqResponse::DeadLettered {
-            dead_letter_ids, ..
-        } => {
-            assert_eq!(dead_letter_ids.len(), 1);
-        }
-        other => panic!("expected DeadLettered, got {:?}", other),
-    }
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_DEAD_LETTERED,
+        "expected DeadLettered, got tag={}",
+        resp.tag()
+    );
+    assert_eq!(resp.dead_letter_ids().count(), 1);
 }
 
 #[test]
 fn test_ack_extend_visibility_via_engine() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "vis-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "vis-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
     drop(group);
 
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id, &[make_flat_msg(b"msg")]),
-        2,
-        1001,
-        None,
-    );
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[make_flat_msg(b"msg")]);
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
 
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 1002, None);
-    let msg_id = match resp {
-        MqResponse::Messages { messages } => messages[0].message_id,
-        other => panic!("expected Messages, got {:?}", other),
-    };
+    let resp = apply(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 1),
+        3,
+        1002,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_MESSAGES,
+        "expected Messages, got tag={}",
+        resp.tag()
+    );
+    let msg_id = resp.messages().next().unwrap().message_id;
 
     // Extend visibility
-    let resp = engine.apply_command(
-        &MqCommand::group_extend_visibility(group_id, &[msg_id], 60_000),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_extend_visibility(&mut buf, group_id, &[msg_id], 60_000),
         4,
         1003,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok());
 
     // Verify deadline extended
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2544,32 +2912,35 @@ fn test_ack_extend_visibility_via_engine() {
 #[test]
 fn test_ack_purge_via_engine() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "purge-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "purge-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
     drop(group);
 
     let msgs: Vec<Bytes> = (0..5).map(|_| make_flat_msg(b"x")).collect();
-    engine.apply_command(&MqCommand::publish(source_topic_id, &msgs), 2, 1001, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &msgs);
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
 
     // Verify pending
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2577,8 +2948,13 @@ fn test_ack_purge_via_engine() {
     drop(group);
 
     // Purge
-    let resp = engine.apply_command(&MqCommand::group_purge(group_id), 3, 1002, None);
-    assert!(matches!(resp, MqResponse::Ok));
+    let resp = apply(
+        &engine,
+        &MqCommand::group_purge(&mut buf, group_id),
+        3,
+        1002,
+    );
+    assert!(resp.is_ok());
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     assert_eq!(group.ack_state().unwrap().pending_count(), 0);
@@ -2587,52 +2963,72 @@ fn test_ack_purge_via_engine() {
 #[test]
 fn test_ack_get_attributes() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "attrs-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "attrs-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
     drop(group);
 
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id, &[make_flat_msg(b"a"), make_flat_msg(b"b")]),
-        2,
-        1001,
-        None,
+    MqCommand::write_publish_bytes(
+        &mut buf,
+        source_topic_id,
+        &[make_flat_msg(b"a"), make_flat_msg(b"b")],
+    );
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
+
+    apply(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 1),
+        3,
+        1002,
     );
 
-    engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 1002, None);
-
-    let resp = engine.apply_command(&MqCommand::group_get_attributes(group_id), 4, 1003, None);
-    match resp {
-        MqResponse::Stats(EntityStats::ConsumerGroup {
-            pending_count,
-            in_flight_count,
-            variant,
-            ..
-        }) => {
-            assert_eq!(pending_count, 1);
-            assert_eq!(in_flight_count, 1);
-            assert_eq!(variant, GroupVariant::Ack);
-        }
-        other => panic!("expected Stats(ConsumerGroup), got {:?}", other),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_get_attributes(&mut buf, group_id),
+        4,
+        1003,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_STATS,
+        "expected Stats, got tag={}",
+        resp.tag()
+    );
+    {
+        // Stats binary layout: [tag:1][status:1][kind:1][pad:5][log_idx:8][group_id:8][variant:4][pad:4][pending:8][in_flight:8][dlq:8][active_actors:8]
+        let kind = resp.buf[2];
+        assert_eq!(kind, 1u8, "expected ConsumerGroup kind=1");
+        let variant_u32 = u32::from_le_bytes(resp.buf[24..28].try_into().unwrap());
+        let pending = u64::from_le_bytes(resp.buf[32..40].try_into().unwrap());
+        let in_flight = u64::from_le_bytes(resp.buf[40..48].try_into().unwrap());
+        assert_eq!(pending, 1, "expected pending_count=1");
+        assert_eq!(in_flight, 1, "expected in_flight_count=1");
+        assert_eq!(
+            variant_u32,
+            GroupVariant::Ack as u32,
+            "expected Ack variant"
+        );
     }
 }
 
@@ -2643,22 +3039,24 @@ fn test_ack_get_attributes() {
 #[test]
 fn test_actor_group_assign_deliver_ack() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_actor_group(
-            "test-actors",
-            ActorVariantConfig::default(),
-            RetentionPolicy::default(),
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_actor_group(
+        &mut buf,
+        "test-actors",
+        ActorVariantConfig::default(),
+        RetentionPolicy::default(),
+        false,
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     // Directly send a message to the actor (like engine test does)
     let actor_id = Bytes::from_static(b"actor-1");
@@ -2672,37 +3070,39 @@ fn test_actor_group_assign_deliver_ack() {
     }
 
     // Assign actor to consumer via engine command
-    let resp = engine.apply_command(
-        &MqCommand::group_assign_actors(group_id, 42, &[actor_id.clone()]),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_assign_actors(&mut buf, group_id, 42, &[actor_id.clone()]),
         2,
         1001,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok());
 
     // Deliver via engine command
-    let resp = engine.apply_command(
-        &MqCommand::group_deliver_actor(group_id, 42, &[actor_id.clone()]),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_deliver_actor(&mut buf, group_id, 42, &[actor_id.clone()]),
         3,
         1002,
-        None,
     );
-    match resp {
-        MqResponse::Messages { messages } => {
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0].message_id, 100);
-        }
-        other => panic!("expected Messages, got {:?}", other),
-    }
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_MESSAGES,
+        "expected Messages, got tag={}",
+        resp.tag()
+    );
+    let __msgs: Vec<_> = resp.messages().collect();
+    assert_eq!(__msgs.len(), 1);
+    assert_eq!(__msgs[0].message_id, 100);
 
     // Ack via engine command
-    let resp = engine.apply_command(
-        &MqCommand::group_ack_actor(group_id, b"actor-1", 100, None),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_ack_actor(&mut buf, group_id, b"actor-1", 100, None),
         4,
         1003,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok());
 
     // Verify actor state
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2716,22 +3116,24 @@ fn test_actor_group_assign_deliver_ack() {
 #[test]
 fn test_actor_nack_returns_to_mailbox() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_actor_group(
-            "nack-actors",
-            ActorVariantConfig::default(),
-            RetentionPolicy::default(),
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_actor_group(
+        &mut buf,
+        "nack-actors",
+        ActorVariantConfig::default(),
+        RetentionPolicy::default(),
+        false,
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let actor_id = Bytes::from_static(b"actor-1");
     {
@@ -2743,32 +3145,35 @@ fn test_actor_nack_returns_to_mailbox() {
             .unwrap();
     }
 
-    engine.apply_command(
-        &MqCommand::group_assign_actors(group_id, 42, &[actor_id.clone()]),
+    apply(
+        &engine,
+        &MqCommand::group_assign_actors(&mut buf, group_id, 42, &[actor_id.clone()]),
         2,
         1001,
-        None,
     );
 
-    let resp = engine.apply_command(
-        &MqCommand::group_deliver_actor(group_id, 42, &[actor_id.clone()]),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_deliver_actor(&mut buf, group_id, 42, &[actor_id.clone()]),
         3,
         1002,
-        None,
     );
-    let msg_id = match resp {
-        MqResponse::Messages { messages } => messages[0].message_id,
-        other => panic!("expected Messages, got {:?}", other),
-    };
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_MESSAGES,
+        "expected Messages, got tag={}",
+        resp.tag()
+    );
+    let msg_id = resp.messages().next().unwrap().message_id;
 
     // Nack
-    let resp = engine.apply_command(
-        &MqCommand::group_nack_actor(group_id, b"actor-1", msg_id),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_nack_actor(&mut buf, group_id, b"actor-1", msg_id),
         4,
         1003,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok());
 
     // Verify returned to mailbox
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -2782,22 +3187,24 @@ fn test_actor_nack_returns_to_mailbox() {
 #[test]
 fn test_actor_release_unassigns() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_actor_group(
-            "release-actors",
-            ActorVariantConfig::default(),
-            RetentionPolicy::default(),
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_actor_group(
+        &mut buf,
+        "release-actors",
+        ActorVariantConfig::default(),
+        RetentionPolicy::default(),
+        false,
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let actor_id = Bytes::from_static(b"actor-1");
     {
@@ -2809,28 +3216,28 @@ fn test_actor_release_unassigns() {
             .unwrap();
     }
 
-    engine.apply_command(
-        &MqCommand::group_assign_actors(group_id, 42, &[actor_id.clone()]),
+    apply(
+        &engine,
+        &MqCommand::group_assign_actors(&mut buf, group_id, 42, &[actor_id.clone()]),
         2,
         1001,
-        None,
     );
 
-    engine.apply_command(
-        &MqCommand::group_deliver_actor(group_id, 42, &[actor_id.clone()]),
+    apply(
+        &engine,
+        &MqCommand::group_deliver_actor(&mut buf, group_id, 42, &[actor_id.clone()]),
         3,
         1002,
-        None,
     );
 
     // Release consumer → actor should be unassigned, in-flight returned to pending
-    let resp = engine.apply_command(
-        &MqCommand::group_release_actors(group_id, 42),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_release_actors(&mut buf, group_id, 42),
         4,
         1003,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok());
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let actor_state = group.actor_state().unwrap();
@@ -2844,22 +3251,24 @@ fn test_actor_release_unassigns() {
 #[test]
 fn test_actor_evict_idle_via_engine() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_actor_group(
-            "evict-actors",
-            ActorVariantConfig::default(),
-            RetentionPolicy::default(),
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_actor_group(
+        &mut buf,
+        "evict-actors",
+        ActorVariantConfig::default(),
+        RetentionPolicy::default(),
+        false,
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let actor_id = Bytes::from_static(b"idle-actor");
     {
@@ -2876,8 +3285,13 @@ fn test_actor_evict_idle_via_engine() {
     }
 
     // Evict actors idle before timestamp 1000
-    let resp = engine.apply_command(&MqCommand::group_evict_idle(group_id, 1000), 2, 1001, None);
-    assert!(matches!(resp, MqResponse::Ok));
+    let resp = apply(
+        &engine,
+        &MqCommand::group_evict_idle(&mut buf, group_id, 1000),
+        2,
+        1001,
+    );
+    assert!(resp.is_ok());
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let actor_state = group.actor_state().unwrap();
@@ -2887,22 +3301,24 @@ fn test_actor_evict_idle_via_engine() {
 #[test]
 fn test_actor_get_attributes() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_actor_group(
-            "attr-actors",
-            ActorVariantConfig::default(),
-            RetentionPolicy::default(),
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_actor_group(
+        &mut buf,
+        "attr-actors",
+        ActorVariantConfig::default(),
+        RetentionPolicy::default(),
+        false,
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let actor_id = Bytes::from_static(b"actor-1");
     {
@@ -2914,17 +3330,30 @@ fn test_actor_get_attributes() {
             .unwrap();
     }
 
-    let resp = engine.apply_command(&MqCommand::group_get_attributes(group_id), 2, 1001, None);
-    match resp {
-        MqResponse::Stats(EntityStats::ConsumerGroup {
-            variant,
-            active_actor_count,
-            ..
-        }) => {
-            assert_eq!(variant, GroupVariant::Actor);
-            assert_eq!(active_actor_count, 1);
-        }
-        other => panic!("expected Stats(ConsumerGroup), got {:?}", other),
+    let resp = apply(
+        &engine,
+        &MqCommand::group_get_attributes(&mut buf, group_id),
+        2,
+        1001,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_STATS,
+        "expected Stats, got tag={}",
+        resp.tag()
+    );
+    {
+        // Stats binary layout: [tag:1][status:1][kind:1][pad:5][log_idx:8][group_id:8][variant:4][pad:4][pending:8][in_flight:8][dlq:8][active_actors:8]
+        let kind = resp.buf[2];
+        assert_eq!(kind, 1u8, "expected ConsumerGroup kind=1");
+        let variant_u32 = u32::from_le_bytes(resp.buf[24..28].try_into().unwrap());
+        let active_actors = u64::from_le_bytes(resp.buf[56..64].try_into().unwrap());
+        assert_eq!(
+            variant_u32,
+            GroupVariant::Actor as u32,
+            "expected Actor variant"
+        );
+        assert_eq!(active_actors, 1, "expected active_actor_count=1");
     }
 }
 
@@ -2935,25 +3364,27 @@ fn test_actor_get_attributes() {
 #[test]
 fn test_ack_snapshot_restore_via_engine() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "snap-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "snap-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
@@ -2961,8 +3392,14 @@ fn test_ack_snapshot_restore_via_engine() {
 
     // Publish and deliver some messages
     let msgs: Vec<Bytes> = (0..5).map(|_| make_flat_msg(b"snap-data")).collect();
-    engine.apply_command(&MqCommand::publish(source_topic_id, &msgs), 2, 1001, None);
-    engine.apply_command(&MqCommand::group_deliver(group_id, 100, 2), 3, 1002, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &msgs);
+    apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
+    apply(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 2),
+        3,
+        1002,
+    );
 
     // Take snapshot
     let snap = engine.snapshot();
@@ -2982,13 +3419,19 @@ fn test_ack_snapshot_restore_via_engine() {
     drop(group);
 
     // Continue delivering
-    let resp = engine2.apply_command(&MqCommand::group_deliver(group_id, 100, 10), 10, 2000, None);
-    match resp {
-        MqResponse::Messages { messages } => {
-            assert_eq!(messages.len(), 3);
-        }
-        other => panic!("expected Messages, got {:?}", other),
-    }
+    let resp = apply(
+        &engine2,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 10),
+        10,
+        2000,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_MESSAGES,
+        "expected Messages, got tag={}",
+        resp.tag()
+    );
+    assert_eq!(resp.messages().count(), 3);
 }
 
 // =============================================================================
@@ -2998,34 +3441,42 @@ fn test_ack_snapshot_restore_via_engine() {
 #[test]
 fn test_delete_consumer_group_cleans_up() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "del-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "del-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let __e = apply(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        __e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated, got tag={}",
+        __e.tag()
+    );
+    let group_id = __e.entity_id();
 
     // Delete
-    let resp = engine.apply_command(&MqCommand::delete_consumer_group(group_id), 2, 1001, None);
-    assert!(matches!(resp, MqResponse::Ok));
+    MqCommand::write_delete_consumer_group(&mut buf, group_id);
+    let resp = apply(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
+    assert!(resp.is_ok());
 
     // Verify deleted
     assert!(engine.metadata().get_consumer_group(group_id).is_none());
 
     // Operations on deleted group fail
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 1002, None);
-    assert!(matches!(resp, MqResponse::Error(_)));
+    let resp = apply(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 1),
+        3,
+        1002,
+    );
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ERROR);
 }

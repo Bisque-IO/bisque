@@ -200,9 +200,11 @@ impl MqState {
         }
 
         // Write batcher
+        // TODO: pass `Some(Arc<AsyncApplyManager>)` once async apply is wired up here.
         let mq_batcher = Arc::new(bisque_mq::MqWriteBatcher::new(
             bisque_mq::MqWriteBatcherConfig::default(),
             mq_raft,
+            None,
             group_id,
             &catalog_name,
         ));

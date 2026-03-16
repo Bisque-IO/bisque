@@ -16,11 +16,17 @@ use bisque_mq::config::MqConfig;
 use bisque_mq::engine::MqEngine;
 use bisque_mq::state_machine::MqStateMachine;
 use bisque_mq::types::*;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{LogId, SnapshotMeta, StoredMembership};
 
-type MqTypeConfig = bisque_raft::BisqueRaftTypeConfig<MqCommand, MqResponse>;
+use bisque_mq::MqApplyResponse;
+type MqTypeConfig = bisque_raft::BisqueRaftTypeConfig<MqCommand, MqApplyResponse>;
+
+fn apply(engine: &MqEngine, cmd: &MqCommand, log_index: u64, current_time: u64) {
+    let mut buf = BytesMut::new();
+    engine.apply_command(cmd, &mut buf, log_index, current_time, None);
+}
 
 fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-manifest-integration-test"))
@@ -55,26 +61,29 @@ fn make_snapshot_meta(index: u64, id: &str) -> SnapshotMeta<MqTypeConfig> {
 /// This simulates a node restart after snapshot install.
 #[tokio::test]
 async fn test_snapshot_recovery_via_applied_state() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = tempfile::tempdir().unwrap();
     let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
     manifest.open_group(1).unwrap();
 
     // --- First lifecycle: install a snapshot ---
     let mut engine = make_engine();
-    engine.apply_command(
-        &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
+    apply(
+        &engine,
+        &MqCommand::create_topic(&mut buf, "events", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::publish(1, &[make_msg(b"m1"), make_msg(b"m2")]),
+    apply(
+        &engine,
+        &MqCommand::publish(&mut buf, 1, &[make_msg(b"m1"), make_msg(b"m2")]),
         2,
         1001,
-        None,
     );
-    engine.apply_command(
+    apply(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             "tasks",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -86,7 +95,6 @@ async fn test_snapshot_recovery_via_applied_state() {
         ),
         3,
         1002,
-        None,
     );
 
     let snap = engine.snapshot();
@@ -125,20 +133,23 @@ async fn test_snapshot_recovery_via_applied_state() {
 /// (which is the primary recovery mechanism after snapshot install).
 #[tokio::test]
 async fn test_snapshot_install_then_recovery_via_applied_state() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = tempfile::tempdir().unwrap();
     let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
     manifest.open_group(1).unwrap();
 
     // Build an engine with a topic and queue
     let mut engine = make_engine();
-    engine.apply_command(
-        &MqCommand::create_topic("my-topic", RetentionPolicy::default(), 0),
+    apply(
+        &engine,
+        &MqCommand::create_topic(&mut buf, "my-topic", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
     );
-    engine.apply_command(
+    apply(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             "my-queue",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -150,7 +161,6 @@ async fn test_snapshot_install_then_recovery_via_applied_state() {
         ),
         2,
         1001,
-        None,
     );
 
     // Install snapshot via state machine (this writes to manifest)
@@ -207,17 +217,18 @@ async fn test_applied_state_empty_manifest() {
 /// any structural writes that happened in between.
 #[tokio::test]
 async fn test_snapshot_overwrites_structural_on_restart() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = tempfile::tempdir().unwrap();
     let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
     manifest.open_group(1).unwrap();
 
     // First: install snapshot with topic "t1"
     let mut engine1 = make_engine();
-    engine1.apply_command(
-        &MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
+    apply(
+        &engine1,
+        &MqCommand::create_topic(&mut buf, "t1", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
     );
     let snap1_bytes =
         bincode::serde::encode_to_vec(&engine1.snapshot(), bincode::config::standard()).unwrap();
@@ -230,8 +241,10 @@ async fn test_snapshot_overwrites_structural_on_restart() {
 
     // Second: install snapshot with queue "q1" (no topics)
     let mut engine2 = make_engine();
-    engine2.apply_command(
+    apply(
+        &engine2,
         &MqCommand::create_queue(
+            &mut buf,
             "q1",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -243,7 +256,6 @@ async fn test_snapshot_overwrites_structural_on_restart() {
         ),
         1,
         1000,
-        None,
     );
     let snap2_bytes =
         bincode::serde::encode_to_vec(&engine2.snapshot(), bincode::config::standard()).unwrap();
@@ -283,15 +295,18 @@ async fn test_get_current_snapshot_none_when_empty() {
 /// after `install_snapshot()` sets `last_applied`.
 #[tokio::test]
 async fn test_get_current_snapshot_after_install() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
-    engine.apply_command(
-        &MqCommand::create_topic("live-topic", RetentionPolicy::default(), 0),
+    apply(
+        &engine,
+        &MqCommand::create_topic(&mut buf, "live-topic", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
     );
-    engine.apply_command(
+    apply(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             "live-queue",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -303,7 +318,6 @@ async fn test_get_current_snapshot_after_install() {
         ),
         2,
         1001,
-        None,
     );
 
     let snap_bytes =
@@ -363,18 +377,24 @@ async fn test_install_snapshot_empty_bytes() {
 /// readable directly from the manifest.
 #[tokio::test]
 async fn test_install_snapshot_persists_to_manifest() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = tempfile::tempdir().unwrap();
     let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
     manifest.open_group(1).unwrap();
 
     let mut engine = make_engine();
-    engine.apply_command(
-        &MqCommand::create_topic("persisted", RetentionPolicy::default(), 0),
+    apply(
+        &engine,
+        &MqCommand::create_topic(&mut buf, "persisted", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
     );
-    engine.apply_command(&MqCommand::publish(1, &[make_msg(b"x")]), 2, 1001, None);
+    apply(
+        &engine,
+        &MqCommand::publish(&mut buf, 1, &[make_msg(b"x")]),
+        2,
+        1001,
+    );
 
     let snap_bytes =
         bincode::serde::encode_to_vec(&engine.snapshot(), bincode::config::standard()).unwrap();
@@ -404,22 +424,23 @@ async fn test_install_snapshot_persists_to_manifest() {
 /// state machine with manifest, and then recovered on restart.
 #[tokio::test]
 async fn test_snapshot_builder_to_install_to_recovery_roundtrip() {
+    let mut buf = bytes::BytesMut::new();
     let _leader_tmp = tempfile::tempdir().unwrap();
     let follower_tmp = tempfile::tempdir().unwrap();
 
     // --- Leader builds snapshot ---
     let mut leader_engine = make_engine();
-    leader_engine.apply_command(
-        &MqCommand::create_topic("rt-topic", RetentionPolicy::default(), 0),
+    apply(
+        &leader_engine,
+        &MqCommand::create_topic(&mut buf, "rt-topic", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
     );
-    leader_engine.apply_command(
-        &MqCommand::publish(1, &[make_msg(b"payload")]),
+    apply(
+        &leader_engine,
+        &MqCommand::publish(&mut buf, 1, &[make_msg(b"payload")]),
         2,
         1001,
-        None,
     );
 
     let mut leader_sm = MqStateMachine::new(leader_engine);

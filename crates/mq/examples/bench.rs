@@ -9,8 +9,9 @@
 
 use std::time::Instant;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
+use bisque_mq::async_apply::ResponseEntry;
 use bisque_mq::config::MqConfig;
 use bisque_mq::engine::MqEngine;
 use bisque_mq::flat::FlatMessageBuilder;
@@ -72,6 +73,12 @@ impl BenchConfig {
 
 fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/bisque-bench"))
+}
+
+fn apply(engine: &MqEngine, cmd: &MqCommand, log_index: u64, current_time: u64) -> ResponseEntry {
+    let mut buf = BytesMut::new();
+    engine.apply_command(cmd, &mut buf, log_index, current_time, None);
+    ResponseEntry::split_from(&mut buf)
 }
 
 fn make_payload(size: usize) -> Bytes {
@@ -141,18 +148,22 @@ impl BenchResult {
 
 fn bench_topic_publish(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let payload = make_payload(msg_size);
     let flat_msg = make_flat_msg(&payload);
 
-    let topic_id = match engine.apply_command(
-        &MqCommand::create_topic("bench-topic", RetentionPolicy::default(), 0),
+    let r = apply(
+        &engine,
+        &MqCommand::create_topic(&mut buf, "bench-topic", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let topic_id = r.entity_id();
 
     // Pre-build batches
     let batch: Vec<Bytes> = (0..config.batch_size).map(|_| flat_msg.clone()).collect();
@@ -162,11 +173,11 @@ fn bench_topic_publish(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let start = Instant::now();
     for i in 0..num_batches {
         let log_index = (i * config.batch_size + 2) as u64;
-        engine.apply_command(
-            &MqCommand::publish(topic_id, &batch),
+        apply(
+            &engine,
+            &MqCommand::publish(&mut buf, topic_id, &batch),
             log_index,
             1000 + i as u64,
-            None,
         );
     }
     let elapsed = start.elapsed();
@@ -183,32 +194,35 @@ fn bench_topic_publish(config: &BenchConfig, msg_size: usize) -> BenchResult {
 
 fn bench_topic_publish_single(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let payload = make_payload(msg_size);
     let flat_msg = make_flat_msg(&payload);
     let single = [flat_msg];
 
-    let topic_id = match engine.apply_command(
-        &MqCommand::create_topic("bench-topic-single", RetentionPolicy::default(), 0),
+    let r = apply(
+        &engine,
+        &MqCommand::create_topic(
+            &mut buf,
+            "bench-topic-single",
+            RetentionPolicy::default(),
+            0,
+        ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let topic_id = r.entity_id();
 
     let count = config.messages.min(100_000); // cap single-message bench
 
-    let cmd = &MqCommand::publish(topic_id, &single);
+    let cmd = &MqCommand::publish(&mut buf, topic_id, &single);
     let start = Instant::now();
     for i in 0..count {
-        engine.apply_command(
-            cmd,
-            // &MqCommand::publish(topic_id, &single),
-            (i + 2) as u64,
-            1000 + i as u64,
-            None,
-        );
+        apply(&engine, cmd, (i + 2) as u64, 1000 + i as u64);
     }
     let elapsed = start.elapsed();
 
@@ -224,39 +238,46 @@ fn bench_topic_publish_single(config: &BenchConfig, msg_size: usize) -> BenchRes
 
 fn bench_offset_commit(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let payload = make_payload(msg_size);
     let flat_msg = make_flat_msg(&payload);
 
     // Create topic + offset consumer group
-    let topic_id = match engine.apply_command(
-        &MqCommand::create_topic("offset-topic", RetentionPolicy::default(), 0),
+    let r = apply(
+        &engine,
+        &MqCommand::create_topic(&mut buf, "offset-topic", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let topic_id = r.entity_id();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_consumer_group("offset-group", 1),
+    let r = apply(
+        &engine,
+        &MqCommand::create_consumer_group(&mut buf, "offset-group", 1),
         2,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
 
     // Publish messages
     let batch: Vec<Bytes> = (0..config.batch_size).map(|_| flat_msg.clone()).collect();
     let num_batches = config.messages / config.batch_size;
     for i in 0..num_batches {
-        engine.apply_command(
-            &MqCommand::publish(topic_id, &batch),
+        apply(
+            &engine,
+            &MqCommand::publish(&mut buf, topic_id, &batch),
             (i * config.batch_size + 10) as u64,
             1000,
-            None,
         );
     }
 
@@ -264,19 +285,20 @@ fn bench_offset_commit(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let count = config.messages.min(100_000);
     let start = Instant::now();
     for i in 0..count {
-        engine.apply_command(
+        apply(
+            &engine,
             &MqCommand::commit_group_offset(
+                &mut buf,
                 group_id,
-                0, // generation
+                0,
                 topic_id,
-                0, // partition
+                0,
                 i as u64,
                 None,
                 2000 + i as u64,
             ),
             (config.messages + i + 100) as u64,
             2000 + i as u64,
-            None,
         );
     }
     let elapsed = start.elapsed();
@@ -293,11 +315,14 @@ fn bench_offset_commit(config: &BenchConfig, msg_size: usize) -> BenchResult {
 
 fn bench_ack_enqueue(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let payload = make_payload(msg_size);
     let flat_msg = make_flat_msg(&payload);
 
-    let group_id = match engine.apply_command(
+    let r = apply(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             "ack-queue",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -309,11 +334,13 @@ fn bench_ack_enqueue(config: &BenchConfig, msg_size: usize) -> BenchResult {
         ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
@@ -326,11 +353,11 @@ fn bench_ack_enqueue(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let start = Instant::now();
     for i in 0..num_batches {
         let log_index = (i * config.batch_size + 10) as u64;
-        engine.apply_command(
-            &MqCommand::publish(source_topic_id, &batch),
+        apply(
+            &engine,
+            &MqCommand::publish(&mut buf, source_topic_id, &batch),
             log_index,
             1000 + i as u64,
-            None,
         );
     }
     let elapsed = start.elapsed();
@@ -345,11 +372,14 @@ fn bench_ack_enqueue(config: &BenchConfig, msg_size: usize) -> BenchResult {
 
 fn bench_ack_deliver(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let payload = make_payload(msg_size);
     let flat_msg = make_flat_msg(&payload);
 
-    let group_id = match engine.apply_command(
+    let r = apply(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             "ack-deliver-q",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -361,11 +391,13 @@ fn bench_ack_deliver(config: &BenchConfig, msg_size: usize) -> BenchResult {
         ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
@@ -376,11 +408,11 @@ fn bench_ack_deliver(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let num_batches = config.messages / config.batch_size;
     let total = num_batches * config.batch_size;
     for i in 0..num_batches {
-        engine.apply_command(
-            &MqCommand::publish(source_topic_id, &batch),
+        apply(
+            &engine,
+            &MqCommand::publish(&mut buf, source_topic_id, &batch),
             (i * config.batch_size + 10) as u64,
             1000,
-            None,
         );
     }
 
@@ -389,20 +421,20 @@ fn bench_ack_deliver(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut delivered = 0usize;
     let start = Instant::now();
     loop {
-        let resp = engine.apply_command(
-            &MqCommand::group_deliver(group_id, consumer_id, config.batch_size as u32),
+        let resp = apply(
+            &engine,
+            &MqCommand::group_deliver(&mut buf, group_id, consumer_id, config.batch_size as u32),
             (total + delivered + 100) as u64,
             2000,
-            None,
         );
-        match resp {
-            MqResponse::Messages { messages } => {
-                if messages.is_empty() {
-                    break;
-                }
-                delivered += messages.len();
+        if resp.tag() == ResponseEntry::TAG_MESSAGES {
+            let count = resp.message_count() as usize;
+            if count == 0 {
+                break;
             }
-            _ => break,
+            delivered += count;
+        } else {
+            break;
         }
     }
     let elapsed = start.elapsed();
@@ -417,11 +449,14 @@ fn bench_ack_deliver(config: &BenchConfig, msg_size: usize) -> BenchResult {
 
 fn bench_ack_full_cycle(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let payload = make_payload(msg_size);
     let flat_msg = make_flat_msg(&payload);
 
-    let group_id = match engine.apply_command(
+    let r = apply(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             "ack-cycle-q",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -433,11 +468,13 @@ fn bench_ack_full_cycle(config: &BenchConfig, msg_size: usize) -> BenchResult {
         ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
 
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
     let source_topic_id = group.meta.source_topic_id;
@@ -453,31 +490,31 @@ fn bench_ack_full_cycle(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let start = Instant::now();
     for _ in 0..num_batches {
         // Enqueue batch
-        engine.apply_command(
-            &MqCommand::publish(source_topic_id, &batch),
+        apply(
+            &engine,
+            &MqCommand::publish(&mut buf, source_topic_id, &batch),
             log_idx,
             1000,
-            None,
         );
         log_idx += config.batch_size as u64;
 
         // Deliver batch
-        let resp = engine.apply_command(
-            &MqCommand::group_deliver(group_id, consumer_id, config.batch_size as u32),
+        let resp = apply(
+            &engine,
+            &MqCommand::group_deliver(&mut buf, group_id, consumer_id, config.batch_size as u32),
             log_idx,
             2000,
-            None,
         );
         log_idx += 1;
 
         // Ack all
-        if let MqResponse::Messages { messages } = resp {
-            let ids: Vec<u64> = messages.iter().map(|m| m.message_id).collect();
-            engine.apply_command(
-                &MqCommand::group_ack(group_id, &ids, None),
+        if resp.tag() == ResponseEntry::TAG_MESSAGES {
+            let ids: Vec<u64> = resp.messages().map(|m| m.message_id).collect();
+            apply(
+                &engine,
+                &MqCommand::group_ack(&mut buf, group_id, &ids, None),
                 log_idx,
                 2001,
-                None,
             );
             log_idx += 1;
         }
@@ -496,9 +533,12 @@ fn bench_ack_full_cycle(config: &BenchConfig, msg_size: usize) -> BenchResult {
 
 fn bench_actor_send(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
+    let r = apply(
+        &engine,
         &MqCommand::create_actor_group(
+            &mut buf,
             "actor-bench",
             ActorVariantConfig::default(),
             RetentionPolicy::default(),
@@ -507,11 +547,13 @@ fn bench_actor_send(config: &BenchConfig, msg_size: usize) -> BenchResult {
         ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
 
     // Send to N distinct actors, 1 message each (to test actor creation + send)
     let count = config.messages.min(200_000);
@@ -546,12 +588,15 @@ fn bench_actor_send(config: &BenchConfig, msg_size: usize) -> BenchResult {
 
 fn bench_actor_send_same(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     let mut actor_config = ActorVariantConfig::default();
     actor_config.max_mailbox_depth = u32::MAX;
 
-    let group_id = match engine.apply_command(
+    let r = apply(
+        &engine,
         &MqCommand::create_actor_group(
+            &mut buf,
             "actor-same-bench",
             actor_config,
             RetentionPolicy::default(),
@@ -560,11 +605,13 @@ fn bench_actor_send_same(config: &BenchConfig, msg_size: usize) -> BenchResult {
         ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
 
     let count = config.messages.min(200_000);
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -598,9 +645,12 @@ fn bench_actor_send_same(config: &BenchConfig, msg_size: usize) -> BenchResult {
 
 fn bench_actor_full_cycle(config: &BenchConfig, msg_size: usize) -> BenchResult {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
+    let r = apply(
+        &engine,
         &MqCommand::create_actor_group(
+            &mut buf,
             "actor-cycle-bench",
             ActorVariantConfig::default(),
             RetentionPolicy::default(),
@@ -609,11 +659,13 @@ fn bench_actor_full_cycle(config: &BenchConfig, msg_size: usize) -> BenchResult 
         ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
 
     let count = config.messages.min(200_000);
     let group = engine.metadata().get_consumer_group(group_id).unwrap();
@@ -665,10 +717,11 @@ fn bench_command_encoding(config: &BenchConfig, msg_size: usize) -> BenchResult 
     let batch: Vec<Bytes> = (0..config.batch_size).map(|_| flat_msg.clone()).collect();
 
     let count = config.messages.min(200_000);
+    let mut buf = BytesMut::new();
 
     let start = Instant::now();
     for i in 0..count {
-        let _cmd = MqCommand::publish(i as u64, &batch);
+        let _cmd = MqCommand::publish(&mut buf, i as u64, &batch);
         std::hint::black_box(&_cmd);
     }
     let elapsed = start.elapsed();
@@ -687,6 +740,7 @@ fn bench_command_encoding_scatter(config: &BenchConfig, msg_size: usize) -> Benc
     let batch: Vec<Bytes> = (0..config.batch_size).map(|_| flat_msg.clone()).collect();
 
     let count = config.messages.min(200_000);
+    let mut buf = BytesMut::new();
 
     let start = Instant::now();
     let mut owned = batch.clone();
@@ -695,7 +749,7 @@ fn bench_command_encoding_scatter(config: &BenchConfig, msg_size: usize) -> Benc
         // Bytes::clone is atomic refcount bump — same cost as the contiguous
         // benchmark's &[Bytes] borrow since both start from the same batch.
         // let owned = batch.clone();
-        let mut cmd = MqCommand::publish_scatter(i as u64, owned);
+        let mut cmd = MqCommand::publish_scatter(&mut buf, i as u64, owned);
         std::hint::black_box(&cmd);
         owned = cmd.take_publish_segments();
     }
@@ -721,11 +775,12 @@ fn bench_full_encode_pipeline(config: &BenchConfig, msg_size: usize) -> (BenchRe
     let batch: Vec<Bytes> = (0..config.batch_size).map(|_| flat_msg.clone()).collect();
     let count = config.messages.min(200_000);
     let mut encode_buf = Vec::with_capacity(256 * 1024);
+    let mut buf = BytesMut::new();
 
     // Contiguous: construct + encode
     let start = Instant::now();
     for i in 0..count {
-        let cmd = MqCommand::publish(i as u64, &batch);
+        let cmd = MqCommand::publish(&mut buf, i as u64, &batch);
         encode_buf.clear();
         cmd.encode(&mut encode_buf).unwrap();
         std::hint::black_box(&encode_buf);
@@ -735,7 +790,7 @@ fn bench_full_encode_pipeline(config: &BenchConfig, msg_size: usize) -> (BenchRe
     // Scatter: construct + encode
     let start = Instant::now();
     for i in 0..count {
-        let cmd = MqCommand::publish_scatter(i as u64, batch.clone());
+        let cmd = MqCommand::publish_scatter(&mut buf, i as u64, batch.clone());
         encode_buf.clear();
         cmd.encode(&mut encode_buf).unwrap();
         std::hint::black_box(&encode_buf);

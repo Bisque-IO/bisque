@@ -1,4 +1,4 @@
-//! Flat binary codec for MqCommand and MqResponse.
+//! Flat binary codec for MqCommand.
 //!
 //! Hand-rolled binary encoding replaces serde/bincode for zero-copy reads
 //! from mmap-backed raft log segments. Each type is encoded as:
@@ -16,7 +16,7 @@
 use std::io::{Read, Write};
 
 use bisque_raft::codec::{BorrowPayload, CodecError, Decode, Encode};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use smallvec::SmallVec;
 
 use crate::types::*;
@@ -24,29 +24,6 @@ use crate::types::*;
 // =============================================================================
 // MqCommand tag aliases (delegate to MqCommand::TAG_*)
 // =============================================================================
-
-// =============================================================================
-// MqResponse tag constants
-// =============================================================================
-
-const TAG_RESP_OK: u8 = 0;
-const TAG_RESP_ERROR: u8 = 1;
-const TAG_RESP_ENTITY_CREATED: u8 = 2;
-const TAG_RESP_MESSAGES: u8 = 3;
-const TAG_RESP_PUBLISHED: u8 = 4;
-const TAG_RESP_STATS: u8 = 5;
-const TAG_RESP_BATCH: u8 = 6;
-const TAG_RESP_DEAD_LETTERED: u8 = 7;
-const TAG_RESP_GROUP_JOINED: u8 = 8;
-const TAG_RESP_GROUP_SYNCED: u8 = 9;
-const TAG_RESP_RETAINED_MESSAGES: u8 = 10;
-const TAG_RESP_WILL_PENDING: u8 = 11;
-const TAG_RESP_SESSION_RESTORED: u8 = 12;
-const TAG_RESP_SESSION_NOT_FOUND: u8 = 13;
-const TAG_RESP_MULTI_MESSAGES: u8 = 14;
-const TAG_RESP_TOPIC_ALIASES: u8 = 15;
-const TAG_RESP_WILLS_FIRED: u8 = 16;
-const TAG_RESP_COMMITTED: u8 = 17;
 
 // =============================================================================
 // Bytes encoding helpers
@@ -148,641 +125,169 @@ pub fn decode_u64s_at(buf: &[u8], data_offset: usize, count: usize) -> DecodeU64
 }
 
 // =============================================================================
-// CommandBuilder — fixed/flex binary command construction
+// BytesMut write helpers — fixed/flex binary command construction
 // =============================================================================
 
-/// Builder for MqCommand with fixed/flex layout.
+/// Initialize a command's fixed region in `buf`. Returns `base` (start offset).
+/// Header layout: `[size:4][fixed_size:2][tag:1][flags:1]`
+/// Size is patched in [`write_cmd_finish`].
+#[inline]
+fn write_cmd_begin(buf: &mut BytesMut, tag: u8, flags: u8, fixed_size: u16) -> usize {
+    debug_assert!(fixed_size >= 8 && fixed_size % 8 == 0);
+    let base = buf.len();
+    buf.put_bytes(0, fixed_size as usize);
+    buf[base + 4..base + 6].copy_from_slice(&fixed_size.to_le_bytes());
+    buf[base + 6] = tag;
+    buf[base + 7] = flags;
+    base
+}
+
+/// Patch the size header (first 4 bytes of command at `base`) with total command length.
+#[inline]
+fn write_cmd_finish(buf: &mut BytesMut, base: usize) {
+    let total = (buf.len() - base) as u32;
+    buf[base..base + 4].copy_from_slice(&total.to_le_bytes());
+}
+
+/// Write a u64 at fixed slot `slot` (relative to `base`).
+#[inline]
+fn write_u64_field(buf: &mut BytesMut, base: usize, slot: usize, value: u64) {
+    buf[base + slot..base + slot + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Write a u32 at fixed slot `slot` (relative to `base`).
+#[inline]
+fn write_u32_field(buf: &mut BytesMut, base: usize, slot: usize, value: u32) {
+    buf[base + slot..base + slot + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Write an i32 at fixed slot `slot` (relative to `base`).
+#[inline]
+fn write_i32_field(buf: &mut BytesMut, base: usize, slot: usize, value: i32) {
+    buf[base + slot..base + slot + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Write a u8 at fixed slot `slot` (relative to `base`).
+#[inline]
+fn write_u8_field(buf: &mut BytesMut, base: usize, slot: usize, value: u8) {
+    buf[base + slot] = value;
+}
+
+/// Write a flex8 value at fixed slot `slot` (relative to `base`).
 ///
-/// The fixed region has compile-time-known field offsets (all 8-byte aligned).
-/// The flex region holds variable-length data (strings, byte arrays, vectors).
-///
-/// Usage:
-/// ```ignore
-/// let cmd = CommandBuilder::new(TAG, 0, 24)  // 24-byte fixed region
-///     .set_u64(8, topic_id)
-///     .set_vec_bytes(16, &messages)
-///     .finish();
-/// ```
-pub(crate) struct CommandBuilder {
-    buf: SmallVec<[u8; 128]>,
-}
-
-impl CommandBuilder {
-    /// Create a new builder with the given tag, flags, and fixed region size.
-    /// `fixed_size` must be a multiple of 8 and >= 8 (header size).
-    ///
-    /// For fixed-only commands (≤128 bytes total), the buffer stays entirely
-    /// on the stack via `SmallVec` — zero heap allocations until `finish()`.
-    #[inline]
-    pub fn new(tag: u8, flags: u8, fixed_size: usize) -> Self {
-        debug_assert!(fixed_size >= 8 && fixed_size % 8 == 0);
-        let mut buf = SmallVec::new();
-        buf.resize(fixed_size, 0);
-        // Header: [size:4][fixed:2][tag:1][flags:1]
-        // size is patched in finish()
-        buf[4..6].copy_from_slice(&(fixed_size as u16).to_le_bytes());
-        buf[6] = tag;
-        buf[7] = flags;
-        Self { buf }
-    }
-
-    /// Create a new builder pre-sized for `total_capacity` bytes.
-    ///
-    /// Use this when the total size (fixed + flex) is known or estimable
-    /// upfront.  Avoids reallocation when flex data is appended — one
-    /// heap allocation total instead of two.
-    #[inline]
-    pub fn with_capacity(tag: u8, flags: u8, fixed_size: usize, total_capacity: usize) -> Self {
-        debug_assert!(fixed_size >= 8 && fixed_size % 8 == 0);
-        let mut buf = SmallVec::with_capacity(total_capacity);
-        buf.resize(fixed_size, 0);
-        buf[4..6].copy_from_slice(&(fixed_size as u16).to_le_bytes());
-        buf[6] = tag;
-        buf[7] = flags;
-        Self { buf }
-    }
-
-    #[inline]
-    pub fn set_u64(mut self, offset: usize, value: u64) -> Self {
-        self.buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        self
-    }
-
-    #[inline]
-    pub fn set_u32(mut self, offset: usize, value: u32) -> Self {
-        self.buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        self
-    }
-
-    #[inline]
-    pub fn set_i32(mut self, offset: usize, value: i32) -> Self {
-        self.buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        self
-    }
-
-    #[inline]
-    pub fn set_u8(mut self, offset: usize, value: u8) -> Self {
-        self.buf[offset] = value;
-        self
-    }
-
-    /// Set a flex8 string slot. Small strings (≤7 bytes) are inlined.
-    pub fn set_str(mut self, offset: usize, s: &str) -> Self {
-        self.write_flex8(offset, s.as_bytes());
-        self
-    }
-
-    /// Set a flex8 bytes slot. Small values (≤7 bytes) are inlined.
-    pub fn set_bytes(mut self, offset: usize, b: &[u8]) -> Self {
-        self.write_flex8(offset, b);
-        self
-    }
-
-    /// Set a flex8 bytes slot from a Bytes value.
-    pub fn set_bytes_val(mut self, offset: usize, b: &Bytes) -> Self {
-        self.write_flex8(offset, b);
-        self
-    }
-
-    /// Set an optional flex8 string slot. None → all zeros (length 0).
-    pub fn set_opt_str(self, offset: usize, s: Option<&str>) -> Self {
-        match s {
-            None => self, // zeros already
-            Some(s) => self.set_str(offset, s),
-        }
-    }
-
-    /// Set an optional flex8 bytes slot.
-    pub fn set_opt_bytes(self, offset: usize, b: Option<&Bytes>) -> Self {
-        match b {
-            None => self,
-            Some(b) => self.set_bytes(offset, b),
-        }
-    }
-
-    /// Set a vec_u64 slot: `[count:4][offset:4]` in fixed, u64 data in flex.
-    /// Ensures the u64 data in flex is 8-byte aligned.
-    pub fn set_vec_u64(mut self, offset: usize, values: &[u64]) -> Self {
-        self.buf[offset..offset + 4].copy_from_slice(&(values.len() as u32).to_le_bytes());
-        if values.is_empty() {
-            return self;
-        }
-        // Pad to 8-byte alignment
-        let pad = (8 - (self.buf.len() % 8)) % 8;
-        // Reserve once for pad + all u64 data
-        self.buf.reserve(pad + values.len() * 8);
-        self.buf.extend_from_slice(&[0u8; 8][..pad]);
-        let data_offset = self.buf.len();
-        self.buf[offset + 4..offset + 8].copy_from_slice(&(data_offset as u32).to_le_bytes());
-        for &v in values {
-            self.buf.extend_from_slice(&v.to_le_bytes());
-        }
-        self
-    }
-
-    /// Set a vec_bytes slot with descriptor table for O(1) random access.
-    ///
-    /// Fixed: `[count:4][offset:4]`
-    /// Flex: `[size0:4][offset0:4][size1:4][offset1:4]...][data0][data1]...`
-    pub fn set_vec_bytes(mut self, offset: usize, values: &[Bytes]) -> Self {
-        self.buf[offset..offset + 4].copy_from_slice(&(values.len() as u32).to_le_bytes());
-        if values.is_empty() {
-            return self;
-        }
-        let table_offset = self.buf.len();
-        self.buf[offset + 4..offset + 8].copy_from_slice(&(table_offset as u32).to_le_bytes());
-        // Pre-calculate total size: descriptor table + all data
-        let table_size = values.len() * 8;
-        let data_size: usize = values.iter().map(|v| v.len()).sum();
-        self.buf.reserve(table_size + data_size);
-        self.buf.resize(self.buf.len() + table_size, 0);
-        // Write data and fill descriptors
-        for (i, v) in values.iter().enumerate() {
-            let data_offset = self.buf.len();
-            self.buf.extend_from_slice(v);
-            let desc_off = table_offset + i * 8;
-            self.buf[desc_off..desc_off + 4].copy_from_slice(&(v.len() as u32).to_le_bytes());
-            self.buf[desc_off + 4..desc_off + 8]
-                .copy_from_slice(&(data_offset as u32).to_le_bytes());
-        }
-        self
-    }
-
-    /// Set a vec_bytes slot from borrowed slices. Identical wire format to
-    /// `set_vec_bytes` but accepts `&[&[u8]]` — no `Bytes` allocation needed.
-    pub fn set_vec_slices(mut self, offset: usize, values: &[&[u8]]) -> Self {
-        self.buf[offset..offset + 4].copy_from_slice(&(values.len() as u32).to_le_bytes());
-        if values.is_empty() {
-            return self;
-        }
-        let table_offset = self.buf.len();
-        self.buf[offset + 4..offset + 8].copy_from_slice(&(table_offset as u32).to_le_bytes());
-        // Pre-calculate total size: descriptor table + all data
-        let table_size = values.len() * 8;
-        let data_size: usize = values.iter().map(|v| v.len()).sum();
-        self.buf.reserve(table_size + data_size);
-        self.buf.resize(self.buf.len() + table_size, 0);
-        // Write data and fill descriptors
-        for (i, v) in values.iter().enumerate() {
-            let data_offset = self.buf.len();
-            self.buf.extend_from_slice(v);
-            let desc_off = table_offset + i * 8;
-            self.buf[desc_off..desc_off + 4].copy_from_slice(&(v.len() as u32).to_le_bytes());
-            self.buf[desc_off + 4..desc_off + 8]
-                .copy_from_slice(&(data_offset as u32).to_le_bytes());
-        }
-        self
-    }
-
-    /// Set a blob slot by encoding a value using the Encode trait.
-    pub fn set_blob_encode<T: Encode>(mut self, offset: usize, value: &T) -> Self {
-        let data_offset = self.buf.len();
-        value.encode(&mut self.buf).unwrap();
-        let data_size = self.buf.len() - data_offset;
-        self.buf[offset..offset + 4].copy_from_slice(&(data_offset as u32).to_le_bytes());
-        self.buf[offset + 4..offset + 8].copy_from_slice(&(data_size as u32).to_le_bytes());
-        self
-    }
-
-    /// Set a vec_kv slot: key-value pairs with flex8 descriptors.
-    /// Each entry is 16 bytes of descriptors: `[key:flex8][val:flex8]`.
-    pub fn set_vec_kv(mut self, offset: usize, pairs: &[(&str, &[u8])]) -> Self {
-        self.buf[offset..offset + 4].copy_from_slice(&(pairs.len() as u32).to_le_bytes());
-        if pairs.is_empty() {
-            return self;
-        }
-        let table_offset = self.buf.len();
-        self.buf[offset + 4..offset + 8].copy_from_slice(&(table_offset as u32).to_le_bytes());
-        // Reserve descriptor table: 16 bytes per entry (2 × flex8)
-        let table_size = pairs.len() * 16;
-        self.buf.resize(self.buf.len() + table_size, 0);
-        // Write data and fill descriptors
-        for (i, (key, val)) in pairs.iter().enumerate() {
-            let key_desc = table_offset + i * 16;
-            let val_desc = key_desc + 8;
-            self.write_flex8(key_desc, key.as_bytes());
-            self.write_flex8(val_desc, val);
-        }
-        self
-    }
-
-    /// Internal: write a flex8 small/large value at the given fixed-region offset.
-    ///
-    /// Bit-0 tag encoding (all LE):
-    /// - Small (≤7): `[(len << 1):u8][data:7]`     — bit 0 = 0
-    /// - Large (>7): `[(offset << 1 | 1):u32_le][size:u32_le]` — bit 0 = 1, 31-bit offset
-    fn write_flex8(&mut self, offset: usize, data: &[u8]) {
-        if data.len() <= 7 {
-            // Small inline: bit 0 = 0, len in bits 1..7
-            self.buf[offset] = (data.len() as u8) << 1;
-            self.buf[offset + 1..offset + 1 + data.len()].copy_from_slice(data);
-        } else {
-            // Large: bit 0 = 1, 31-bit offset via shift
-            let data_offset = self.buf.len();
-            self.buf.extend_from_slice(data);
-            let encoded = ((data_offset as u32) << 1) | 1;
-            self.buf[offset..offset + 4].copy_from_slice(&encoded.to_le_bytes());
-            self.buf[offset + 4..offset + 8].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        }
-    }
-
-    /// Finalize the command: patch the size header and return MqCommand.
-    #[inline]
-    pub fn finish(mut self) -> MqCommand {
-        let total_size = self.buf.len();
-        self.buf[0..4].copy_from_slice(&(total_size as u32).to_le_bytes());
-        MqCommand {
-            buf: Bytes::from(self.buf.into_vec()),
-            extra: SmallVec::new(),
-        }
-    }
-
-    /// Begin building a `vec_bytes` field by writing the count and reserving
-    /// the descriptor table. Returns a [`VecBytesWriter`] that lets callers
-    /// write entries directly into the command buffer — zero intermediate copies.
-    #[inline]
-    pub fn begin_vec_bytes(mut self, offset: usize, count: usize) -> VecBytesWriter {
-        self.buf[offset..offset + 4].copy_from_slice(&(count as u32).to_le_bytes());
-        if count == 0 {
-            return VecBytesWriter {
-                builder: self,
-                table_start: 0,
-                count: 0,
-                index: 0,
-            };
-        }
-        let table_offset = self.buf.len();
-        self.buf[offset + 4..offset + 8].copy_from_slice(&(table_offset as u32).to_le_bytes());
-        let table_size = count * 8;
-        self.buf.resize(self.buf.len() + table_size, 0);
-        VecBytesWriter {
-            builder: self,
-            table_start: table_offset,
-            count,
-            index: 0,
-        }
+/// Small (≤7 bytes): inlined as `[(len << 1):u8][data:≤7]`.
+/// Large (>8 bytes): `[(rel_offset << 1 | 1):u32][size:u32]` pointing into flex region.
+/// `rel_offset` is the byte offset of the data from `base` (within the command).
+fn write_flex8_field(buf: &mut BytesMut, base: usize, slot: usize, data: &[u8]) {
+    if data.len() <= 7 {
+        buf[base + slot] = (data.len() as u8) << 1;
+        buf[base + slot + 1..base + slot + 1 + data.len()].copy_from_slice(data);
+    } else {
+        let rel_offset = (buf.len() - base) as u32;
+        buf.extend_from_slice(data);
+        let encoded = (rel_offset << 1) | 1;
+        buf[base + slot..base + slot + 4].copy_from_slice(&encoded.to_le_bytes());
+        buf[base + slot + 4..base + slot + 8].copy_from_slice(&(data.len() as u32).to_le_bytes());
     }
 }
 
-/// Zero-copy writer for building `vec_bytes` entries directly inside a
-/// [`CommandBuilder`]'s buffer. Each entry is written in-place — no
-/// intermediate `BytesMut` or `Vec<Bytes>` needed.
-///
-/// Usage:
-/// ```ignore
-/// let mut w = CommandBuilder::new(tag, 0, 24)
-///     .set_u64(8, exchange_id)
-///     .begin_vec_bytes(16, batch_size);
-/// for msg in &messages {
-///     let start = w.position();
-///     w.buf_mut().extend_from_slice(msg);
-///     w.commit(start);
-/// }
-/// let cmd = w.finish();
-/// ```
-pub struct VecBytesWriter {
-    builder: CommandBuilder,
-    table_start: usize,
-    count: usize,
-    index: usize,
+#[inline]
+fn write_flex8_str_field(buf: &mut BytesMut, base: usize, slot: usize, s: &str) {
+    write_flex8_field(buf, base, slot, s.as_bytes());
 }
 
-impl VecBytesWriter {
-    /// Append one entry's bytes directly via a closure that writes into
-    /// the command's internal `Vec<u8>`. The descriptor is filled automatically.
-    ///
-    /// For publish batches, use with [`write_flat_message_vec`] or
-    /// [`MqttEnvelopeWriter::write_vec`] to write messages with zero
-    /// intermediate copies.
-    #[inline]
-    pub fn push<F>(&mut self, f: F)
-    where
-        F: FnOnce(&mut Vec<u8>),
-    {
-        debug_assert!(self.index < self.count);
-        // For batch commands the SmallVec is always heap-spilled (>128 bytes),
-        // so into_vec()/from_vec() are O(1) pointer moves — no copy.
-        let mut vec = std::mem::take(&mut self.builder.buf).into_vec();
-        let data_offset = vec.len();
-        f(&mut vec);
-        let len = vec.len() - data_offset;
-        self.builder.buf = SmallVec::from_vec(vec);
-
-        let desc_off = self.table_start + self.index * 8;
-        self.builder.buf[desc_off..desc_off + 4].copy_from_slice(&(len as u32).to_le_bytes());
-        self.builder.buf[desc_off + 4..desc_off + 8]
-            .copy_from_slice(&(data_offset as u32).to_le_bytes());
-        self.index += 1;
+#[inline]
+fn write_opt_flex8_str_field(buf: &mut BytesMut, base: usize, slot: usize, s: Option<&str>) {
+    if let Some(s) = s {
+        write_flex8_field(buf, base, slot, s.as_bytes());
     }
+    // else: slot stays zeroed → length 0 → None
+}
 
-    /// Append a pre-built entry (convenience for `push(|v| v.extend_from_slice(data))`).
-    #[inline]
-    pub fn push_slice(&mut self, data: &[u8]) {
-        debug_assert!(self.index < self.count);
-        let data_offset = self.builder.buf.len();
-        self.builder.buf.extend_from_slice(data);
-        let len = data.len();
-        let desc_off = self.table_start + self.index * 8;
-        self.builder.buf[desc_off..desc_off + 4].copy_from_slice(&(len as u32).to_le_bytes());
-        self.builder.buf[desc_off + 4..desc_off + 8]
-            .copy_from_slice(&(data_offset as u32).to_le_bytes());
-        self.index += 1;
-    }
-
-    /// Finalize the command. Panics in debug mode if not all entries were written.
-    #[inline]
-    pub fn finish(self) -> MqCommand {
-        debug_assert_eq!(self.index, self.count);
-        self.builder.finish()
+#[inline]
+fn write_opt_flex8_bytes_field(buf: &mut BytesMut, base: usize, slot: usize, b: Option<&Bytes>) {
+    if let Some(b) = b {
+        write_flex8_field(buf, base, slot, b);
     }
 }
 
-// =============================================================================
-// CommandWriter — zero-copy command builder that writes directly into &mut Vec<u8>
-// =============================================================================
-
-/// Builds a command directly into an external `Vec<u8>`. Unlike `CommandBuilder`
-/// which uses an internal `SmallVec` then copies out, `CommandWriter` writes
-/// every byte exactly once into the target buffer.
-pub(crate) struct CommandWriter<'a> {
-    buf: &'a mut Vec<u8>,
-    /// Byte offset in `buf` where this command starts.
-    cmd_start: usize,
-}
-
-#[allow(dead_code)]
-impl<'a> CommandWriter<'a> {
-    /// Begin a new command. Reserves `fixed_size` zeroed bytes in `buf`.
-    #[inline]
-    fn new(buf: &'a mut Vec<u8>, tag: u8, flags: u8, fixed_size: usize) -> Self {
-        debug_assert!(fixed_size >= 8 && fixed_size % 8 == 0);
-        let cmd_start = buf.len();
-        buf.resize(cmd_start + fixed_size, 0);
-        // Header: [size:4][fixed:2][tag:1][flags:1]
-        buf[cmd_start + 4..cmd_start + 6].copy_from_slice(&(fixed_size as u16).to_le_bytes());
-        buf[cmd_start + 6] = tag;
-        buf[cmd_start + 7] = flags;
-        Self { buf, cmd_start }
+/// Write a vec_u64 field at `slot`.
+/// Fixed: `[count:4][data_offset:4]`. Data is 8-byte aligned in flex region.
+fn write_vec_u64_field(buf: &mut BytesMut, base: usize, slot: usize, values: &[u64]) {
+    buf[base + slot..base + slot + 4].copy_from_slice(&(values.len() as u32).to_le_bytes());
+    if values.is_empty() {
+        return;
     }
-
-    /// Begin a new command with pre-reserved capacity for the total size.
-    #[inline]
-    fn with_capacity(
-        buf: &'a mut Vec<u8>,
-        tag: u8,
-        flags: u8,
-        fixed_size: usize,
-        total_capacity: usize,
-    ) -> Self {
-        debug_assert!(fixed_size >= 8 && fixed_size % 8 == 0);
-        buf.reserve(total_capacity);
-        Self::new(buf, tag, flags, fixed_size)
+    let pad = (8 - (buf.len() % 8)) % 8;
+    if pad > 0 {
+        buf.put_bytes(0, pad);
     }
-
-    #[inline]
-    fn set_u64(&mut self, offset: usize, value: u64) {
-        let off = self.cmd_start + offset;
-        self.buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
-    }
-
-    #[inline]
-    fn set_u32(&mut self, offset: usize, value: u32) {
-        let off = self.cmd_start + offset;
-        self.buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
-    }
-
-    /// Write a flex8 field: small (≤7 bytes) inlined, large appended to flex region.
-    #[inline]
-    fn set_flex8(&mut self, offset: usize, data: &[u8]) {
-        let off = self.cmd_start + offset;
-        if data.len() <= 7 {
-            self.buf[off] = (data.len() as u8) << 1;
-            self.buf[off + 1..off + 1 + data.len()].copy_from_slice(data);
-        } else {
-            let data_offset = self.buf.len();
-            self.buf.extend_from_slice(data);
-            let encoded = ((data_offset as u32) << 1) | 1;
-            self.buf[off..off + 4].copy_from_slice(&encoded.to_le_bytes());
-            self.buf[off + 4..off + 8].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        }
-    }
-
-    #[inline]
-    fn set_str(&mut self, offset: usize, s: &str) {
-        self.set_flex8(offset, s.as_bytes());
-    }
-
-    /// Write a vec_u64 field: `[count:4][offset:4]` in fixed, u64 data in flex.
-    #[inline]
-    fn set_vec_u64(&mut self, offset: usize, values: &[u64]) {
-        let off = self.cmd_start + offset;
-        self.buf[off..off + 4].copy_from_slice(&(values.len() as u32).to_le_bytes());
-        if values.is_empty() {
-            return;
-        }
-        // Pad to 8-byte alignment
-        let pad = (8 - (self.buf.len() % 8)) % 8;
-        self.buf.extend_from_slice(&[0u8; 8][..pad]);
-        let data_offset = self.buf.len();
-        self.buf[off + 4..off + 8].copy_from_slice(&(data_offset as u32).to_le_bytes());
-        for &v in values {
-            self.buf.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-
-    /// Write an optional flex8 bytes field.
-    #[inline]
-    fn set_opt_bytes(&mut self, offset: usize, b: Option<&Bytes>) {
-        if let Some(b) = b {
-            self.set_flex8(offset, b);
-        }
-    }
-
-    /// Finalize: patch the size header. Returns `(start, len)`.
-    #[inline]
-    fn finish(self) -> (u32, u32) {
-        let total_size = self.buf.len() - self.cmd_start;
-        let start = self.cmd_start;
-        self.buf[start..start + 4].copy_from_slice(&(total_size as u32).to_le_bytes());
-        (start as u32, total_size as u32)
+    let rel_offset = (buf.len() - base) as u32;
+    buf[base + slot + 4..base + slot + 8].copy_from_slice(&rel_offset.to_le_bytes());
+    for &v in values {
+        buf.put_u64_le(v);
     }
 }
 
-// =============================================================================
-// MqCommandBuffer — reusable buffer for zero-alloc command building
-// =============================================================================
-
-/// A reusable buffer for building multiple `MqCommand`s without per-command
-/// heap allocation. Commands are serialized contiguously into a single `Vec<u8>`.
-/// The buffer tracks command boundaries so callers can drain them individually.
-///
-/// All `write_*` methods build commands directly into the buffer — every byte
-/// is written exactly once. No intermediate `SmallVec` or `CommandBuilder`.
-///
-/// The buffer persists across calls — `clear()` resets length but keeps the
-/// allocation, so subsequent writes reuse the same memory.
-pub struct MqCommandBuffer {
-    buf: Vec<u8>,
-    /// Command boundaries: (start, len) pairs.
-    ranges: SmallVec<[(u32, u32); 8]>,
+/// Write a vec_bytes field at `slot` using sequential length-prefixed format.
+/// Fixed: `[count:4][data_start:4]`.
+/// Flex: `[len0:4][data0][len1:4][data1]...` — stream-oriented, no descriptor table.
+fn write_vec_bytes_field(buf: &mut BytesMut, base: usize, slot: usize, values: &[&[u8]]) {
+    buf[base + slot..base + slot + 4].copy_from_slice(&(values.len() as u32).to_le_bytes());
+    if values.is_empty() {
+        return;
+    }
+    let data_start = (buf.len() - base) as u32;
+    buf[base + slot + 4..base + slot + 8].copy_from_slice(&data_start.to_le_bytes());
+    for v in values {
+        buf.put_u32_le(v.len() as u32);
+        buf.extend_from_slice(v);
+    }
 }
 
-impl MqCommandBuffer {
-    /// Create a new buffer with the given initial capacity.
-    #[inline]
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            buf: Vec::with_capacity(capacity),
-            ranges: SmallVec::new(),
-        }
+/// Same as [`write_vec_bytes_field`] but takes `&[Bytes]`.
+fn write_vec_bytes_owned_field(buf: &mut BytesMut, base: usize, slot: usize, values: &[Bytes]) {
+    buf[base + slot..base + slot + 4].copy_from_slice(&(values.len() as u32).to_le_bytes());
+    if values.is_empty() {
+        return;
     }
-
-    /// Reset the buffer for reuse. Keeps the underlying allocation.
-    #[inline]
-    pub fn clear(&mut self) {
-        self.buf.clear();
-        self.ranges.clear();
+    let data_start = (buf.len() - base) as u32;
+    buf[base + slot + 4..base + slot + 8].copy_from_slice(&data_start.to_le_bytes());
+    for v in values {
+        buf.put_u32_le(v.len() as u32);
+        buf.extend_from_slice(v);
     }
+}
 
-    /// Number of commands in the buffer.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.ranges.len()
+/// Write a blob field at `slot`: encode `value` using the [`Encode`] trait.
+/// Fixed: `[data_offset:4][data_size:4]`. Data appended to flex region.
+fn write_blob_field<T: Encode>(buf: &mut BytesMut, base: usize, slot: usize, value: &T) {
+    let data_start = (buf.len() - base) as u32;
+    let mut tmp = Vec::with_capacity(value.encoded_size());
+    value.encode(&mut tmp).unwrap();
+    let data_size = tmp.len() as u32;
+    buf.extend_from_slice(&tmp);
+    buf[base + slot..base + slot + 4].copy_from_slice(&data_start.to_le_bytes());
+    buf[base + slot + 4..base + slot + 8].copy_from_slice(&data_size.to_le_bytes());
+}
+
+/// Write a vec_kv field at `slot`: key-value pairs with flex8 descriptors.
+/// Fixed: `[count:4][table_offset:4]`. Table: 16 bytes per entry `[key:flex8][val:flex8]`.
+fn write_vec_kv_field(buf: &mut BytesMut, base: usize, slot: usize, pairs: &[(&str, &[u8])]) {
+    buf[base + slot..base + slot + 4].copy_from_slice(&(pairs.len() as u32).to_le_bytes());
+    if pairs.is_empty() {
+        return;
     }
-
-    /// Whether the buffer has no commands.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
-
-    /// Get the raw bytes for the command at `index`.
-    #[inline]
-    pub fn get(&self, index: usize) -> &[u8] {
-        let (start, len) = self.ranges[index];
-        &self.buf[start as usize..(start + len) as usize]
-    }
-
-    /// Create an `MqCommand` from the command at `index` (copies bytes).
-    #[inline]
-    pub fn to_command(&self, index: usize) -> MqCommand {
-        MqCommand::from_vec(self.get(index).to_vec())
-    }
-
-    /// Raw buffer access.
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buf
-    }
-
-    /// Mutable raw buffer access.
-    #[inline]
-    pub fn buf_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.buf
-    }
-
-    /// Push a pre-built command range (for callers that write directly into buf).
-    #[inline]
-    pub fn push_range(&mut self, start: u32, len: u32) {
-        self.ranges.push((start, len));
-    }
-
-    // -- Write methods: one per MqCommand constructor used by MQTT session --
-    // Each writes directly into self.buf via CommandWriter. Zero intermediate copies.
-
-    /// Write a `group_ack` command. @8 group_id:8, @16 message_ids:vec_u64, @24 response:opt_flex8
-    #[inline]
-    pub fn write_group_ack(
-        &mut self,
-        group_id: u64,
-        message_ids: &[u64],
-        response: Option<&Bytes>,
-    ) {
-        let resp_size = response.map_or(0, |b| if b.len() > 7 { b.len() } else { 0 });
-        let mut w = CommandWriter::with_capacity(
-            &mut self.buf,
-            MqCommand::TAG_GROUP_ACK,
-            0,
-            32,
-            32 + message_ids.len() * 8 + resp_size,
-        );
-        w.set_u64(8, group_id);
-        w.set_vec_u64(16, message_ids);
-        w.set_opt_bytes(24, response);
-        let range = w.finish();
-        self.ranges.push(range);
-    }
-
-    /// Write a `group_nack` command. @8 group_id:8, @16 message_ids:vec_u64
-    #[inline]
-    pub fn write_group_nack(&mut self, group_id: u64, message_ids: &[u64]) {
-        let mut w = CommandWriter::with_capacity(
-            &mut self.buf,
-            MqCommand::TAG_GROUP_NACK,
-            0,
-            24,
-            24 + message_ids.len() * 8,
-        );
-        w.set_u64(8, group_id);
-        w.set_vec_u64(16, message_ids);
-        let range = w.finish();
-        self.ranges.push(range);
-    }
-
-    /// Write a `heartbeat_session` command. @8 session_id:8
-    #[inline]
-    pub fn write_heartbeat_session(&mut self, session_id: u64) {
-        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_HEARTBEAT_SESSION, 0, 16);
-        w.set_u64(8, session_id);
-        let range = w.finish();
-        self.ranges.push(range);
-    }
-
-    /// Write a `create_session` command. @8 session_id:8, @16 keep_alive_ms:8,
-    /// @24 session_expiry_ms:8, @32 client_id:flex8
-    #[inline]
-    pub fn write_create_session(
-        &mut self,
-        session_id: u64,
-        client_id: &str,
-        keep_alive_ms: u64,
-        session_expiry_ms: u64,
-    ) {
-        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_CREATE_SESSION, 0, 40);
-        w.set_u64(8, session_id);
-        w.set_u64(16, keep_alive_ms);
-        w.set_u64(24, session_expiry_ms);
-        w.set_str(32, client_id);
-        let range = w.finish();
-        self.ranges.push(range);
-    }
-
-    /// Write a `disconnect_session` command. flags[0]=publish_will, @8 session_id:8
-    #[inline]
-    pub fn write_disconnect_session(&mut self, session_id: u64, publish_will: bool) {
-        let flags = if publish_will { 1u8 } else { 0u8 };
-        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_DISCONNECT_SESSION, flags, 16);
-        w.set_u64(8, session_id);
-        let range = w.finish();
-        self.ranges.push(range);
-    }
-
-    /// Write a `delete_binding` command. @8 binding_id:8
-    #[inline]
-    pub fn write_delete_binding(&mut self, binding_id: u64) {
-        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_DELETE_BINDING, 0, 16);
-        w.set_u64(8, binding_id);
-        let range = w.finish();
-        self.ranges.push(range);
-    }
-
-    /// Write a `delete_consumer_group` command. @8 group_id:8
-    #[inline]
-    pub fn write_delete_consumer_group(&mut self, group_id: u64) {
-        let mut w = CommandWriter::new(&mut self.buf, MqCommand::TAG_DELETE_CONSUMER_GROUP, 0, 16);
-        w.set_u64(8, group_id);
-        let range = w.finish();
-        self.ranges.push(range);
+    let table_rel = (buf.len() - base) as u32;
+    buf[base + slot + 4..base + slot + 8].copy_from_slice(&table_rel.to_le_bytes());
+    let table_size = pairs.len() * 16;
+    let table_abs = buf.len();
+    buf.put_bytes(0, table_size);
+    for (i, (key, val)) in pairs.iter().enumerate() {
+        let key_slot = table_abs + i * 16 - base;
+        let val_slot = key_slot + 8;
+        write_flex8_field(buf, base, key_slot, key.as_bytes());
+        write_flex8_field(buf, base, val_slot, val);
     }
 }
 
@@ -1319,15 +824,11 @@ impl Decode for MqCommand {
         reader.read_to_end(&mut buf)?;
         Ok(MqCommand {
             buf: Bytes::from(buf),
-            extra: SmallVec::new(),
         })
     }
 
     fn decode_from_bytes(data: Bytes) -> Result<Self, CodecError> {
-        Ok(MqCommand {
-            buf: data,
-            extra: SmallVec::new(),
-        })
+        Ok(MqCommand { buf: data })
     }
 }
 
@@ -1337,237 +838,248 @@ impl BorrowPayload for MqCommand {
     }
 
     fn extra_payload_segments(&self) -> &[bytes::Bytes] {
-        &self.extra
+        &[]
     }
 }
 
 // =============================================================================
-// MqCommand — Constructor methods
+// MqApplyResponse — Encode/Decode/BorrowPayload
+// =============================================================================
+
+impl Encode for crate::types::MqApplyResponse {
+    #[inline]
+    fn encode<W: Write>(&self, w: &mut W) -> Result<(), CodecError> {
+        w.write_all(&self.log_index.to_le_bytes())?;
+        Ok(())
+    }
+
+    #[inline]
+    fn encoded_size(&self) -> usize {
+        8
+    }
+}
+
+impl Decode for crate::types::MqApplyResponse {
+    fn decode<R: Read>(_reader: &mut R) -> Result<Self, CodecError> {
+        Err(CodecError::InvalidDiscriminant(0))
+    }
+
+    fn decode_from_bytes(bytes: Bytes) -> Result<Self, CodecError> {
+        if bytes.len() < 8 {
+            return Err(CodecError::InvalidDiscriminant(0));
+        }
+        let log_index = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        Ok(Self { log_index })
+    }
+}
+
+impl BorrowPayload for crate::types::MqApplyResponse {
+    fn payload_bytes(&self) -> &[u8] {
+        &[]
+    }
+
+    fn extra_payload_segments(&self) -> &[bytes::Bytes] {
+        &[]
+    }
+}
+
+// =============================================================================
+// MqCommand — write_* methods (write into caller-provided BytesMut slab)
 // =============================================================================
 
 impl MqCommand {
     // -- Topics (0-5) --
 
-    /// @8 name:flex8, @16 retention:blob, @24 partition_count:4
-    pub fn create_topic(name: &str, retention: RetentionPolicy, partition_count: u32) -> Self {
-        CommandBuilder::new(Self::TAG_CREATE_TOPIC, 0, 32)
-            .set_str(8, name)
-            .set_blob_encode(16, &retention)
-            .set_u32(24, partition_count)
-            .finish()
+    pub fn write_create_topic(
+        buf: &mut BytesMut,
+        name: &str,
+        retention: &RetentionPolicy,
+        partition_count: u32,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_CREATE_TOPIC, 0, 32);
+        write_flex8_str_field(buf, base, 8, name);
+        write_blob_field(buf, base, 16, retention);
+        write_u32_field(buf, base, 24, partition_count);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 topic_id:8
-    pub fn delete_topic(topic_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_DELETE_TOPIC, 0, 16)
-            .set_u64(8, topic_id)
-            .finish()
+    pub fn write_delete_topic(buf: &mut BytesMut, topic_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_DELETE_TOPIC, 0, 16);
+        write_u64_field(buf, base, 8, topic_id);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 topic_id:8, @16 messages:vec_bytes
-    pub fn publish(topic_id: u64, messages: &[Bytes]) -> Self {
-        let table_size = messages.len() * 8;
-        let data_size: usize = messages.iter().map(|m| m.len()).sum();
-        CommandBuilder::with_capacity(Self::TAG_PUBLISH, 0, 24, 24 + table_size + data_size)
-            .set_u64(8, topic_id)
-            .set_vec_bytes(16, messages)
-            .finish()
+    /// @8 topic_id:8, @16 messages:vec_bytes (sequential format)
+    pub fn write_publish(buf: &mut BytesMut, topic_id: u64, messages: &[&[u8]]) {
+        let base = write_cmd_begin(buf, Self::TAG_PUBLISH, 0, 24);
+        write_u64_field(buf, base, 8, topic_id);
+        write_vec_bytes_field(buf, base, 16, messages);
+        write_cmd_finish(buf, base);
     }
 
-    /// Publish with owned messages Vec. Produces identical wire format to `publish`.
-    pub fn publish_scatter(topic_id: u64, messages: Vec<Bytes>) -> Self {
-        CommandBuilder::new(Self::TAG_PUBLISH, 0, 24)
-            .set_u64(8, topic_id)
-            .set_vec_bytes(16, &messages)
-            .finish()
+    pub fn write_publish_bytes(buf: &mut BytesMut, topic_id: u64, messages: &[Bytes]) {
+        let base = write_cmd_begin(buf, Self::TAG_PUBLISH, 0, 24);
+        write_u64_field(buf, base, 8, topic_id);
+        write_vec_bytes_owned_field(buf, base, 16, messages);
+        write_cmd_finish(buf, base);
     }
 
-    /// Exchange publish with owned messages Vec.
-    pub fn publish_to_exchange_scatter(exchange_id: u64, messages: Vec<Bytes>) -> Self {
-        CommandBuilder::new(Self::TAG_PUBLISH_TO_EXCHANGE, 0, 24)
-            .set_u64(8, exchange_id)
-            .set_vec_bytes(16, &messages)
-            .finish()
+    pub fn write_commit_offset(buf: &mut BytesMut, topic_id: u64, consumer_id: u64, offset: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_COMMIT_OFFSET, 0, 32);
+        write_u64_field(buf, base, 8, topic_id);
+        write_u64_field(buf, base, 16, consumer_id);
+        write_u64_field(buf, base, 24, offset);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 topic_id:8, @16 consumer_id:8, @24 offset:8
-    pub fn commit_offset(topic_id: u64, consumer_id: u64, offset: u64) -> Self {
-        CommandBuilder::new(Self::TAG_COMMIT_OFFSET, 0, 32)
-            .set_u64(8, topic_id)
-            .set_u64(16, consumer_id)
-            .set_u64(24, offset)
-            .finish()
+    pub fn write_purge_topic(buf: &mut BytesMut, topic_id: u64, before_index: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_PURGE_TOPIC, 0, 24);
+        write_u64_field(buf, base, 8, topic_id);
+        write_u64_field(buf, base, 16, before_index);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 topic_id:8, @16 before_index:8
-    pub fn purge_topic(topic_id: u64, before_index: u64) -> Self {
-        CommandBuilder::new(Self::TAG_PURGE_TOPIC, 0, 24)
-            .set_u64(8, topic_id)
-            .set_u64(16, before_index)
-            .finish()
+    pub fn write_set_retained(
+        buf: &mut BytesMut,
+        exchange_id: u64,
+        routing_key: &str,
+        message: &[u8],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_SET_RETAINED, 0, 32);
+        write_u64_field(buf, base, 8, exchange_id);
+        write_flex8_str_field(buf, base, 16, routing_key);
+        write_flex8_field(buf, base, 24, message);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 exchange_id:8, @16 routing_key:flex8, @24 message:flex8
-    pub fn set_retained(exchange_id: u64, routing_key: &str, message: &Bytes) -> Self {
-        CommandBuilder::new(Self::TAG_SET_RETAINED, 0, 32)
-            .set_u64(8, exchange_id)
-            .set_str(16, routing_key)
-            .set_bytes_val(24, message)
-            .finish()
+    pub fn write_get_retained(
+        buf: &mut BytesMut,
+        exchange_id: u64,
+        routing_key_filter: Option<&str>,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GET_RETAINED, 0, 24);
+        write_u64_field(buf, base, 8, exchange_id);
+        write_opt_flex8_str_field(buf, base, 16, routing_key_filter);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 exchange_id:8, @16 filter:opt_flex8
-    pub fn get_retained(exchange_id: u64, routing_key_filter: Option<&str>) -> Self {
-        CommandBuilder::new(Self::TAG_GET_RETAINED, 0, 24)
-            .set_u64(8, exchange_id)
-            .set_opt_str(16, routing_key_filter)
-            .finish()
-    }
-
-    /// @8 exchange_id:8, @16 routing_key:flex8
-    pub fn delete_retained(exchange_id: u64, routing_key: &str) -> Self {
-        CommandBuilder::new(Self::TAG_DELETE_RETAINED, 0, 24)
-            .set_u64(8, exchange_id)
-            .set_str(16, routing_key)
-            .finish()
+    pub fn write_delete_retained(buf: &mut BytesMut, exchange_id: u64, routing_key: &str) {
+        let base = write_cmd_begin(buf, Self::TAG_DELETE_RETAINED, 0, 24);
+        write_u64_field(buf, base, 8, exchange_id);
+        write_flex8_str_field(buf, base, 16, routing_key);
+        write_cmd_finish(buf, base);
     }
 
     // -- Exchanges (6-10) --
 
-    /// flags=exchange_type, @8 name:flex8
-    pub fn create_exchange(name: &str, exchange_type: ExchangeType) -> Self {
+    pub fn write_create_exchange(buf: &mut BytesMut, name: &str, exchange_type: ExchangeType) {
         let et_byte = match exchange_type {
             ExchangeType::Direct => 0,
             ExchangeType::Fanout => 1,
             ExchangeType::Topic => 2,
         };
-        CommandBuilder::new(Self::TAG_CREATE_EXCHANGE, et_byte, 16)
-            .set_str(8, name)
-            .finish()
+        let base = write_cmd_begin(buf, Self::TAG_CREATE_EXCHANGE, et_byte, 16);
+        write_flex8_str_field(buf, base, 8, name);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 exchange_id:8
-    pub fn delete_exchange(exchange_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_DELETE_EXCHANGE, 0, 16)
-            .set_u64(8, exchange_id)
-            .finish()
+    pub fn write_delete_exchange(buf: &mut BytesMut, exchange_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_DELETE_EXCHANGE, 0, 16);
+        write_u64_field(buf, base, 8, exchange_id);
+        write_cmd_finish(buf, base);
     }
 
-    /// flags[0]=no_local, @8 exchange_id:8, @16 topic_id:8,
-    /// @24 routing_key:opt_flex8, @32 shared_group:opt_flex8,
-    /// @40 subscription_id:4, @44 has_sub_id:1
-    pub fn create_binding(exchange_id: u64, topic_id: u64, routing_key: Option<&str>) -> Self {
-        Self::create_binding_with_opts(exchange_id, topic_id, routing_key, false, None, None)
+    pub fn write_create_binding(
+        buf: &mut BytesMut,
+        exchange_id: u64,
+        topic_id: u64,
+        routing_key: Option<&str>,
+    ) {
+        Self::write_create_binding_with_opts(
+            buf,
+            exchange_id,
+            topic_id,
+            routing_key,
+            false,
+            None,
+            None,
+        );
     }
 
-    pub fn create_binding_with_opts(
+    pub fn write_create_binding_with_opts(
+        buf: &mut BytesMut,
         exchange_id: u64,
         topic_id: u64,
         routing_key: Option<&str>,
         no_local: bool,
         shared_group: Option<&str>,
         subscription_id: Option<u32>,
-    ) -> Self {
+    ) {
         let flags = if no_local { 1u8 } else { 0u8 };
-        let mut b = CommandBuilder::new(Self::TAG_CREATE_BINDING, flags, 48)
-            .set_u64(8, exchange_id)
-            .set_u64(16, topic_id)
-            .set_opt_str(24, routing_key)
-            .set_opt_str(32, shared_group);
+        let base = write_cmd_begin(buf, Self::TAG_CREATE_BINDING, flags, 48);
+        write_u64_field(buf, base, 8, exchange_id);
+        write_u64_field(buf, base, 16, topic_id);
+        write_opt_flex8_str_field(buf, base, 24, routing_key);
+        write_opt_flex8_str_field(buf, base, 32, shared_group);
         if let Some(sid) = subscription_id {
-            b = b.set_u32(40, sid).set_u8(44, 1);
+            write_u32_field(buf, base, 40, sid);
+            write_u8_field(buf, base, 44, 1);
         }
-        b.finish()
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 binding_id:8
-    pub fn delete_binding(binding_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_DELETE_BINDING, 0, 16)
-            .set_u64(8, binding_id)
-            .finish()
+    pub fn write_delete_binding(buf: &mut BytesMut, binding_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_DELETE_BINDING, 0, 16);
+        write_u64_field(buf, base, 8, binding_id);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 exchange_id:8, @16 messages:vec_bytes
-    pub fn publish_to_exchange(exchange_id: u64, messages: &[Bytes]) -> Self {
-        let table_size = messages.len() * 8;
-        let data_size: usize = messages.iter().map(|m| m.len()).sum();
-        CommandBuilder::with_capacity(
-            Self::TAG_PUBLISH_TO_EXCHANGE,
-            0,
-            24,
-            24 + table_size + data_size,
-        )
-        .set_u64(8, exchange_id)
-        .set_vec_bytes(16, messages)
-        .finish()
+    pub fn write_publish_to_exchange(buf: &mut BytesMut, exchange_id: u64, messages: &[&[u8]]) {
+        let base = write_cmd_begin(buf, Self::TAG_PUBLISH_TO_EXCHANGE, 0, 24);
+        write_u64_field(buf, base, 8, exchange_id);
+        write_vec_bytes_field(buf, base, 16, messages);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 exchange_id:8, @16 messages:vec_bytes (slice variant, same wire format)
-    pub fn publish_to_exchange_slices(exchange_id: u64, messages: &[&[u8]]) -> Self {
-        let table_size = messages.len() * 8;
-        let data_size: usize = messages.iter().map(|m| m.len()).sum();
-        CommandBuilder::with_capacity(
-            Self::TAG_PUBLISH_TO_EXCHANGE,
-            0,
-            24,
-            24 + table_size + data_size,
-        )
-        .set_u64(8, exchange_id)
-        .set_vec_slices(16, messages)
-        .finish()
-    }
-
-    /// Begin building a publish-to-exchange command where messages are written
-    /// directly into the command buffer — zero intermediate copies.
-    ///
-    /// `capacity_hint` is the estimated total size of all message bytes
-    /// (excluding the descriptor table). Pass `0` to let the buffer grow
-    /// dynamically.
-    ///
-    /// Returns a [`VecBytesWriter`]; call `.push()` for each message,
-    /// then `.finish()` to produce the `MqCommand`.
-    pub fn begin_publish_to_exchange(
-        tag: u8,
+    pub fn write_publish_to_exchange_bytes(
+        buf: &mut BytesMut,
         exchange_id: u64,
-        count: usize,
-        capacity_hint: usize,
-    ) -> VecBytesWriter {
-        let table_size = count * 8;
-        CommandBuilder::with_capacity(tag, 0, 24, 24 + table_size + capacity_hint)
-            .set_u64(8, exchange_id)
-            .begin_vec_bytes(16, count)
+        messages: &[Bytes],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_PUBLISH_TO_EXCHANGE, 0, 24);
+        write_u64_field(buf, base, 8, exchange_id);
+        write_vec_bytes_owned_field(buf, base, 16, messages);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 exchange_id:8, @16 messages:vec_bytes — MQTT exchange publish variant
-    pub fn publish_to_exchange_mqtt(exchange_id: u64, messages: &[&[u8]]) -> Self {
-        let table_size = messages.len() * 8;
-        let data_size: usize = messages.iter().map(|m| m.len()).sum();
-        CommandBuilder::with_capacity(
-            Self::TAG_PUBLISH_TO_EXCHANGE_MQTT,
-            0,
-            24,
-            24 + table_size + data_size,
-        )
-        .set_u64(8, exchange_id)
-        .set_vec_slices(16, messages)
-        .finish()
+    pub fn write_publish_to_exchange_mqtt(
+        buf: &mut BytesMut,
+        exchange_id: u64,
+        messages: &[&[u8]],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_PUBLISH_TO_EXCHANGE_MQTT, 0, 24);
+        write_u64_field(buf, base, 8, exchange_id);
+        write_vec_bytes_field(buf, base, 16, messages);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 exchange_id:8, @16 routing_key:flex8, @24 message:flex8 — MQTT retained variant
-    pub fn set_retained_mqtt(exchange_id: u64, routing_key: &str, message: &[u8]) -> Self {
-        CommandBuilder::new(Self::TAG_SET_RETAINED_MQTT, 0, 32)
-            .set_u64(8, exchange_id)
-            .set_str(16, routing_key)
-            .set_bytes(24, message)
-            .finish()
+    pub fn write_set_retained_mqtt(
+        buf: &mut BytesMut,
+        exchange_id: u64,
+        routing_key: &str,
+        message: &[u8],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_SET_RETAINED_MQTT, 0, 32);
+        write_u64_field(buf, base, 8, exchange_id);
+        write_flex8_str_field(buf, base, 16, routing_key);
+        write_flex8_field(buf, base, 24, message);
+        write_cmd_finish(buf, base);
     }
 
     // -- Consumer Groups (11-18) --
 
-    /// @8 name:flex8, @16 dlq_topic_name:opt_flex8, @24 response_topic_name:opt_flex8,
-    /// @32 variant_config:blob, @40 topic_retention:blob, @48 topic_dedup:blob,
-    /// @56 auto_offset_reset:1|auto_create_topic:1|topic_lifetime:1
-    pub fn create_consumer_group_full(
+    pub fn write_create_consumer_group_full(
+        buf: &mut BytesMut,
         name: &str,
         auto_offset_reset: u8,
         variant_config: &VariantConfig,
@@ -1577,29 +1089,29 @@ impl MqCommand {
         topic_lifetime: TopicLifetimePolicy,
         dlq_topic_name: Option<&str>,
         response_topic_name: Option<&str>,
-    ) -> Self {
+    ) {
         let lifetime_byte = match topic_lifetime {
             TopicLifetimePolicy::Permanent => 0u8,
             TopicLifetimePolicy::DeleteOnLastDetach => 1u8,
         };
-        let mut b = CommandBuilder::new(Self::TAG_CREATE_CONSUMER_GROUP, 0, 64)
-            .set_str(8, name)
-            .set_opt_str(16, dlq_topic_name)
-            .set_opt_str(24, response_topic_name)
-            .set_blob_encode(32, variant_config)
-            .set_blob_encode(40, topic_retention)
-            .set_u8(56, auto_offset_reset)
-            .set_u8(57, auto_create_topic as u8)
-            .set_u8(58, lifetime_byte);
+        let base = write_cmd_begin(buf, Self::TAG_CREATE_CONSUMER_GROUP, 0, 64);
+        write_flex8_str_field(buf, base, 8, name);
+        write_opt_flex8_str_field(buf, base, 16, dlq_topic_name);
+        write_opt_flex8_str_field(buf, base, 24, response_topic_name);
+        write_blob_field(buf, base, 32, variant_config);
+        write_blob_field(buf, base, 40, topic_retention);
         if let Some(dedup) = topic_dedup {
-            b = b.set_blob_encode(48, dedup);
+            write_blob_field(buf, base, 48, dedup);
         }
-        b.finish()
+        write_u8_field(buf, base, 56, auto_offset_reset);
+        write_u8_field(buf, base, 57, auto_create_topic as u8);
+        write_u8_field(buf, base, 58, lifetime_byte);
+        write_cmd_finish(buf, base);
     }
 
-    /// Simple create_consumer_group (Offset variant, no auto-create topic).
-    pub fn create_consumer_group(name: &str, auto_offset_reset: u8) -> Self {
-        Self::create_consumer_group_full(
+    pub fn write_create_consumer_group(buf: &mut BytesMut, name: &str, auto_offset_reset: u8) {
+        Self::write_create_consumer_group_full(
+            buf,
             name,
             auto_offset_reset,
             &VariantConfig::Offset,
@@ -1609,13 +1121,11 @@ impl MqCommand {
             TopicLifetimePolicy::Permanent,
             None,
             None,
-        )
+        );
     }
 
-    // -- Compound create convenience APIs --
-
-    /// Create an Ack-variant consumer group with an auto-created source topic.
-    pub fn create_queue(
+    pub fn write_create_queue(
+        buf: &mut BytesMut,
         name: &str,
         config: AckVariantConfig,
         retention: RetentionPolicy,
@@ -1624,26 +1134,19 @@ impl MqCommand {
         dlq_name: Option<&str>,
         enable_response: bool,
         response_name: Option<&str>,
-    ) -> Self {
-        let dlq = if enable_dlq {
-            Some(
-                dlq_name
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{}:dlq", name)),
-            )
-        } else {
-            None
-        };
-        let resp = if enable_response {
-            Some(
-                response_name
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{}:resp", name)),
-            )
-        } else {
-            None
-        };
-        Self::create_consumer_group_full(
+    ) {
+        let dlq = enable_dlq.then(|| {
+            dlq_name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}:dlq", name))
+        });
+        let resp = enable_response.then(|| {
+            response_name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}:resp", name))
+        });
+        Self::write_create_consumer_group_full(
+            buf,
             name,
             1,
             &VariantConfig::Ack(config),
@@ -1653,27 +1156,24 @@ impl MqCommand {
             TopicLifetimePolicy::Permanent,
             dlq.as_deref(),
             resp.as_deref(),
-        )
+        );
     }
 
-    /// Create an Actor-variant consumer group with an auto-created source topic.
-    pub fn create_actor_group(
+    pub fn write_create_actor_group(
+        buf: &mut BytesMut,
         name: &str,
         config: ActorVariantConfig,
         retention: RetentionPolicy,
         enable_response: bool,
         response_name: Option<&str>,
-    ) -> Self {
-        let resp = if enable_response {
-            Some(
-                response_name
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{}:resp", name)),
-            )
-        } else {
-            None
-        };
-        Self::create_consumer_group_full(
+    ) {
+        let resp = enable_response.then(|| {
+            response_name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}:resp", name))
+        });
+        Self::write_create_consumer_group_full(
+            buf,
             name,
             1,
             &VariantConfig::Actor(config),
@@ -1683,16 +1183,17 @@ impl MqCommand {
             TopicLifetimePolicy::Permanent,
             None,
             resp.as_deref(),
-        )
+        );
     }
 
-    /// Create an Ack-variant consumer group with cron auto-publish.
-    pub fn create_job_cron(
+    pub fn write_create_job_cron(
+        buf: &mut BytesMut,
         name: &str,
         ack_config: AckVariantConfig,
         retention: RetentionPolicy,
-    ) -> Self {
-        Self::create_consumer_group_full(
+    ) {
+        Self::write_create_consumer_group_full(
+            buf,
             name,
             1,
             &VariantConfig::Ack(ack_config),
@@ -1702,19 +1203,631 @@ impl MqCommand {
             TopicLifetimePolicy::Permanent,
             None,
             None,
-        )
+        );
     }
 
-    /// @8 group_id:8
-    pub fn delete_consumer_group(group_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_DELETE_CONSUMER_GROUP, 0, 16)
-            .set_u64(8, group_id)
-            .finish()
+    pub fn write_delete_consumer_group(buf: &mut BytesMut, group_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_DELETE_CONSUMER_GROUP, 0, 16);
+        write_u64_field(buf, base, 8, group_id);
+        write_cmd_finish(buf, base);
     }
 
-    /// @8 group_id:8, @16 topic_id:8, @24 offset:8, @32 timestamp:8,
-    /// @40 metadata:opt_flex8, @48 generation:i32|partition_index:u32
+    pub fn write_commit_group_offset(
+        buf: &mut BytesMut,
+        group_id: u64,
+        generation: i32,
+        topic_id: u64,
+        partition_index: u32,
+        offset: u64,
+        metadata: Option<&str>,
+        timestamp: u64,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_COMMIT_GROUP_OFFSET, 0, 56);
+        write_u64_field(buf, base, 8, group_id);
+        write_u64_field(buf, base, 16, topic_id);
+        write_u64_field(buf, base, 24, offset);
+        write_u64_field(buf, base, 32, timestamp);
+        write_opt_flex8_str_field(buf, base, 40, metadata);
+        write_i32_field(buf, base, 48, generation);
+        write_u32_field(buf, base, 52, partition_index);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_join_consumer_group(
+        buf: &mut BytesMut,
+        group_id: u64,
+        member_id: &str,
+        client_id: &str,
+        session_timeout_ms: i32,
+        rebalance_timeout_ms: i32,
+        protocol_type: &str,
+        protocols: &[(&str, &[u8])],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_JOIN_CONSUMER_GROUP, 0, 56);
+        write_u64_field(buf, base, 8, group_id);
+        write_flex8_str_field(buf, base, 16, member_id);
+        write_flex8_str_field(buf, base, 24, client_id);
+        write_flex8_str_field(buf, base, 32, protocol_type);
+        write_i32_field(buf, base, 40, session_timeout_ms);
+        write_i32_field(buf, base, 44, rebalance_timeout_ms);
+        write_vec_kv_field(buf, base, 48, protocols);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_sync_consumer_group(
+        buf: &mut BytesMut,
+        group_id: u64,
+        generation: i32,
+        member_id: &str,
+        assignments: &[(&str, &[u8])],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_SYNC_CONSUMER_GROUP, 0, 40);
+        write_u64_field(buf, base, 8, group_id);
+        write_flex8_str_field(buf, base, 16, member_id);
+        write_i32_field(buf, base, 24, generation);
+        write_vec_kv_field(buf, base, 32, assignments);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_leave_consumer_group(buf: &mut BytesMut, group_id: u64, member_id: &str) {
+        let base = write_cmd_begin(buf, Self::TAG_LEAVE_CONSUMER_GROUP, 0, 24);
+        write_u64_field(buf, base, 8, group_id);
+        write_flex8_str_field(buf, base, 16, member_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_heartbeat_consumer_group(
+        buf: &mut BytesMut,
+        group_id: u64,
+        member_id: &str,
+        generation: i32,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_HEARTBEAT_CONSUMER_GROUP, 0, 32);
+        write_u64_field(buf, base, 8, group_id);
+        write_flex8_str_field(buf, base, 16, member_id);
+        write_i32_field(buf, base, 24, generation);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_expire_group_sessions(buf: &mut BytesMut, now_ms: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_EXPIRE_GROUP_SESSIONS, 0, 16);
+        write_u64_field(buf, base, 8, now_ms);
+        write_cmd_finish(buf, base);
+    }
+
+    // -- Ack Variant (19-29) --
+
+    pub fn write_group_deliver(
+        buf: &mut BytesMut,
+        group_id: u64,
+        consumer_id: u64,
+        max_count: u32,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_DELIVER, 0, 48);
+        write_u64_field(buf, base, 8, group_id);
+        write_u64_field(buf, base, 16, consumer_id);
+        write_u32_field(buf, base, 24, max_count);
+        // @32 exclude_publisher_id, @40 current_time_ms — stay zeroed (disabled)
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_deliver_filtered(
+        buf: &mut BytesMut,
+        group_id: u64,
+        consumer_id: u64,
+        max_count: u32,
+        exclude_publisher_id: u64,
+        current_time_ms: u64,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_DELIVER, 0, 48);
+        write_u64_field(buf, base, 8, group_id);
+        write_u64_field(buf, base, 16, consumer_id);
+        write_u32_field(buf, base, 24, max_count);
+        write_u64_field(buf, base, 32, exclude_publisher_id);
+        write_u64_field(buf, base, 40, current_time_ms);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_ack(
+        buf: &mut BytesMut,
+        group_id: u64,
+        message_ids: &[u64],
+        response: Option<&Bytes>,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_ACK, 0, 32);
+        write_u64_field(buf, base, 8, group_id);
+        write_vec_u64_field(buf, base, 16, message_ids);
+        write_opt_flex8_bytes_field(buf, base, 24, response);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_nack(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_NACK, 0, 24);
+        write_u64_field(buf, base, 8, group_id);
+        write_vec_u64_field(buf, base, 16, message_ids);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_release(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_RELEASE, 0, 24);
+        write_u64_field(buf, base, 8, group_id);
+        write_vec_u64_field(buf, base, 16, message_ids);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_modify(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_MODIFY, 0, 24);
+        write_u64_field(buf, base, 8, group_id);
+        write_vec_u64_field(buf, base, 16, message_ids);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_extend_visibility(
+        buf: &mut BytesMut,
+        group_id: u64,
+        message_ids: &[u64],
+        extension_ms: u64,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_EXTEND_VISIBILITY, 0, 32);
+        write_u64_field(buf, base, 8, group_id);
+        write_vec_u64_field(buf, base, 16, message_ids);
+        write_u64_field(buf, base, 24, extension_ms);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_timeout_expired(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_TIMEOUT_EXPIRED, 0, 24);
+        write_u64_field(buf, base, 8, group_id);
+        write_vec_u64_field(buf, base, 16, message_ids);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_publish_to_dlq(
+        buf: &mut BytesMut,
+        source_group_id: u64,
+        dlq_topic_id: u64,
+        dead_letter_ids: &[u64],
+        messages: &[&[u8]],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_PUBLISH_TO_DLQ, 0, 40);
+        write_u64_field(buf, base, 8, source_group_id);
+        write_u64_field(buf, base, 16, dlq_topic_id);
+        write_vec_u64_field(buf, base, 24, dead_letter_ids);
+        write_vec_bytes_field(buf, base, 32, messages);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_expire_pending(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_EXPIRE_PENDING, 0, 24);
+        write_u64_field(buf, base, 8, group_id);
+        write_vec_u64_field(buf, base, 16, message_ids);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_purge(buf: &mut BytesMut, group_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_PURGE, 0, 16);
+        write_u64_field(buf, base, 8, group_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_get_attributes(buf: &mut BytesMut, group_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_GET_ATTRIBUTES, 0, 16);
+        write_u64_field(buf, base, 8, group_id);
+        write_cmd_finish(buf, base);
+    }
+
+    // -- Actor Variant (30-35) --
+
+    pub fn write_group_deliver_actor(
+        buf: &mut BytesMut,
+        group_id: u64,
+        consumer_id: u64,
+        actor_ids: &[&[u8]],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_DELIVER_ACTOR, 0, 32);
+        write_u64_field(buf, base, 8, group_id);
+        write_u64_field(buf, base, 16, consumer_id);
+        write_vec_bytes_field(buf, base, 24, actor_ids);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_ack_actor(
+        buf: &mut BytesMut,
+        group_id: u64,
+        actor_id: &[u8],
+        message_id: u64,
+        response: Option<&Bytes>,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_ACK_ACTOR, 0, 40);
+        write_u64_field(buf, base, 8, group_id);
+        write_u64_field(buf, base, 16, message_id);
+        write_flex8_field(buf, base, 24, actor_id);
+        write_opt_flex8_bytes_field(buf, base, 32, response);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_nack_actor(
+        buf: &mut BytesMut,
+        group_id: u64,
+        actor_id: &[u8],
+        message_id: u64,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_NACK_ACTOR, 0, 32);
+        write_u64_field(buf, base, 8, group_id);
+        write_u64_field(buf, base, 16, message_id);
+        write_flex8_field(buf, base, 24, actor_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_assign_actors(
+        buf: &mut BytesMut,
+        group_id: u64,
+        consumer_id: u64,
+        actor_ids: &[&[u8]],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_ASSIGN_ACTORS, 0, 32);
+        write_u64_field(buf, base, 8, group_id);
+        write_u64_field(buf, base, 16, consumer_id);
+        write_vec_bytes_field(buf, base, 24, actor_ids);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_release_actors(buf: &mut BytesMut, group_id: u64, consumer_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_RELEASE_ACTORS, 0, 24);
+        write_u64_field(buf, base, 8, group_id);
+        write_u64_field(buf, base, 16, consumer_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_group_evict_idle(buf: &mut BytesMut, group_id: u64, before_timestamp: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_GROUP_EVICT_IDLE, 0, 24);
+        write_u64_field(buf, base, 8, group_id);
+        write_u64_field(buf, base, 16, before_timestamp);
+        write_cmd_finish(buf, base);
+    }
+
+    // -- Cron (36-39) --
+
+    pub fn write_cron_enable(buf: &mut BytesMut, topic_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_CRON_ENABLE, 0, 16);
+        write_u64_field(buf, base, 8, topic_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_cron_disable(buf: &mut BytesMut, topic_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_CRON_DISABLE, 0, 16);
+        write_u64_field(buf, base, 8, topic_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_cron_trigger(buf: &mut BytesMut, topic_id: u64, triggered_at: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_CRON_TRIGGER, 0, 24);
+        write_u64_field(buf, base, 8, topic_id);
+        write_u64_field(buf, base, 16, triggered_at);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_cron_update(buf: &mut BytesMut, topic_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_CRON_UPDATE, 0, 16);
+        write_u64_field(buf, base, 8, topic_id);
+        write_cmd_finish(buf, base);
+    }
+
+    // -- Sessions (40-48) --
+
+    pub fn write_create_session(
+        buf: &mut BytesMut,
+        session_id: u64,
+        client_id: &str,
+        keep_alive_ms: u64,
+        session_expiry_ms: u64,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_CREATE_SESSION, 0, 40);
+        write_u64_field(buf, base, 8, session_id);
+        write_u64_field(buf, base, 16, keep_alive_ms);
+        write_u64_field(buf, base, 24, session_expiry_ms);
+        write_flex8_str_field(buf, base, 32, client_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_disconnect_session(buf: &mut BytesMut, session_id: u64, publish_will: bool) {
+        let flags = if publish_will { 1u8 } else { 0u8 };
+        let base = write_cmd_begin(buf, Self::TAG_DISCONNECT_SESSION, flags, 16);
+        write_u64_field(buf, base, 8, session_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_heartbeat_session(buf: &mut BytesMut, session_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_HEARTBEAT_SESSION, 0, 16);
+        write_u64_field(buf, base, 8, session_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_set_will(
+        buf: &mut BytesMut,
+        session_id: u64,
+        topic_id: u64,
+        delay_secs: u32,
+        qos: u8,
+        retain: bool,
+        routing_key: &str,
+        message: &[u8],
+    ) {
+        let flags = (qos & 0x03) | (if retain { 0x04 } else { 0 });
+        let base = write_cmd_begin(buf, Self::TAG_SET_WILL, flags, 48);
+        write_u64_field(buf, base, 8, session_id);
+        write_u64_field(buf, base, 16, topic_id);
+        write_flex8_str_field(buf, base, 24, routing_key);
+        write_flex8_field(buf, base, 32, message);
+        write_u32_field(buf, base, 40, delay_secs);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_clear_will(buf: &mut BytesMut, session_id: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_CLEAR_WILL, 0, 16);
+        write_u64_field(buf, base, 8, session_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_fire_pending_wills(buf: &mut BytesMut, now_ms: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_FIRE_PENDING_WILLS, 0, 16);
+        write_u64_field(buf, base, 8, now_ms);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_persist_session(
+        buf: &mut BytesMut,
+        session_id: u64,
+        client_id: &str,
+        session_expiry_secs: u32,
+        subscription_data: &[u8],
+        inbound_qos_inflight: u32,
+        outbound_qos1_count: u32,
+        remaining_quota: u64,
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_PERSIST_SESSION, 0, 56);
+        write_u64_field(buf, base, 8, session_id);
+        write_u64_field(buf, base, 16, remaining_quota);
+        write_flex8_str_field(buf, base, 24, client_id);
+        write_flex8_field(buf, base, 32, subscription_data);
+        write_u32_field(buf, base, 40, session_expiry_secs);
+        write_u32_field(buf, base, 44, inbound_qos_inflight);
+        write_u32_field(buf, base, 48, outbound_qos1_count);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_restore_session(buf: &mut BytesMut, client_id: &str) {
+        let base = write_cmd_begin(buf, Self::TAG_RESTORE_SESSION, 0, 16);
+        write_flex8_str_field(buf, base, 8, client_id);
+        write_cmd_finish(buf, base);
+    }
+
+    pub fn write_expire_sessions(buf: &mut BytesMut, now_ms: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_EXPIRE_SESSIONS, 0, 16);
+        write_u64_field(buf, base, 8, now_ms);
+        write_cmd_finish(buf, base);
+    }
+
+    // -- Batch (49) --
+
+    pub fn write_batch(buf: &mut BytesMut, commands: &[MqCommand]) {
+        Self::write_batch_with_id(buf, 0, commands);
+    }
+
+    pub fn write_batch_with_id(buf: &mut BytesMut, batch_id: u32, commands: &[MqCommand]) {
+        let base = write_cmd_begin(buf, Self::TAG_BATCH, 0, 16);
+        write_u32_field(buf, base, 8, commands.len() as u32);
+        write_u32_field(buf, base, 12, batch_id);
+        for cmd in commands {
+            buf.extend_from_slice(&cmd.buf);
+            let pad = (8 - (cmd.buf.len() % 8)) % 8;
+            if pad > 0 {
+                buf.put_bytes(0, pad);
+            }
+        }
+        write_cmd_finish(buf, base);
+    }
+
+    // -- Dedup (50) --
+
+    pub fn write_prune_dedup_window(buf: &mut BytesMut, topic_id: u64, before_timestamp: u64) {
+        let base = write_cmd_begin(buf, Self::TAG_PRUNE_DEDUP_WINDOW, 0, 24);
+        write_u64_field(buf, base, 8, topic_id);
+        write_u64_field(buf, base, 16, before_timestamp);
+        write_cmd_finish(buf, base);
+    }
+
+    // -- ForwardedBatch (55) --
+
+    /// Write TAG_FORWARDED_BATCH into `buf`.
+    /// Layout: `@8 node_id:u32, @12 count:u32, @16 [sub-frames...]`
+    pub fn write_forwarded_batch(buf: &mut BytesMut, node_id: u32, count: u32, frames: &[u8]) {
+        let base = write_cmd_begin(buf, Self::TAG_FORWARDED_BATCH, 0, 16);
+        write_u32_field(buf, base, 8, node_id);
+        write_u32_field(buf, base, 12, count);
+        buf.extend_from_slice(frames);
+        write_cmd_finish(buf, base);
+    }
+
+    /// Patch the TAG_FORWARDED_BATCH header into the first 16 bytes of `buf`.
+    /// `buf` must start with 16 zeroed bytes (via `buf.put_bytes(0, 16)`) followed by sub-frames.
+    pub fn write_forwarded_batch_header(buf: &mut bytes::BytesMut, node_id: u32, count: u32) {
+        let total = buf.len() as u32;
+        buf[0..4].copy_from_slice(&total.to_le_bytes());
+        buf[4..6].copy_from_slice(&16u16.to_le_bytes());
+        buf[6] = Self::TAG_FORWARDED_BATCH;
+        buf[7] = 0;
+        buf[8..12].copy_from_slice(&node_id.to_le_bytes());
+        buf[12..16].copy_from_slice(&count.to_le_bytes());
+    }
+
+    // -- Resume (56) --
+
+    /// Write TAG_RESUME into `buf`. Wire layout: `[TAG_RESUME:1][pad:3][session_client_id:4][last_acked_seq:8]`
+    pub fn write_resume(buf: &mut BytesMut, session_client_id: u32, last_acked_seq: u64) {
+        buf.put_u8(Self::TAG_RESUME);
+        buf.put_bytes(0, 3);
+        buf.put_u32_le(session_client_id);
+        buf.put_u64_le(last_acked_seq);
+    }
+}
+
+// MqCommand — Convenience constructors (caller supplies &mut BytesMut scratch buffer)
+// =============================================================================
+
+impl MqCommand {
+    pub fn create_topic(
+        buf: &mut BytesMut,
+        name: &str,
+        retention: RetentionPolicy,
+        partition_count: u32,
+    ) -> Self {
+        Self::write_create_topic(buf, name, &retention, partition_count);
+        Self::split_from(buf)
+    }
+    pub fn delete_topic(buf: &mut BytesMut, topic_id: u64) -> Self {
+        Self::write_delete_topic(buf, topic_id);
+        Self::split_from(buf)
+    }
+    pub fn publish(buf: &mut BytesMut, topic_id: u64, messages: &[Bytes]) -> Self {
+        Self::write_publish_bytes(buf, topic_id, messages);
+        Self::split_from(buf)
+    }
+    pub fn publish_scatter(buf: &mut BytesMut, topic_id: u64, messages: Vec<Bytes>) -> Self {
+        Self::write_publish_bytes(buf, topic_id, &messages);
+        Self::split_from(buf)
+    }
+    pub fn commit_offset(buf: &mut BytesMut, topic_id: u64, consumer_id: u64, offset: u64) -> Self {
+        Self::write_commit_offset(buf, topic_id, consumer_id, offset);
+        Self::split_from(buf)
+    }
+    pub fn purge_topic(buf: &mut BytesMut, topic_id: u64, before_index: u64) -> Self {
+        Self::write_purge_topic(buf, topic_id, before_index);
+        Self::split_from(buf)
+    }
+    pub fn set_retained(
+        buf: &mut BytesMut,
+        exchange_id: u64,
+        routing_key: &str,
+        message: &[u8],
+    ) -> Self {
+        Self::write_set_retained(buf, exchange_id, routing_key, message);
+        Self::split_from(buf)
+    }
+    pub fn get_retained(
+        buf: &mut BytesMut,
+        exchange_id: u64,
+        routing_key_filter: Option<&str>,
+    ) -> Self {
+        Self::write_get_retained(buf, exchange_id, routing_key_filter);
+        Self::split_from(buf)
+    }
+    pub fn delete_retained(buf: &mut BytesMut, exchange_id: u64, routing_key: &str) -> Self {
+        Self::write_delete_retained(buf, exchange_id, routing_key);
+        Self::split_from(buf)
+    }
+    pub fn create_exchange(buf: &mut BytesMut, name: &str, exchange_type: ExchangeType) -> Self {
+        Self::write_create_exchange(buf, name, exchange_type);
+        Self::split_from(buf)
+    }
+    pub fn delete_exchange(buf: &mut BytesMut, exchange_id: u64) -> Self {
+        Self::write_delete_exchange(buf, exchange_id);
+        Self::split_from(buf)
+    }
+    pub fn create_binding(
+        buf: &mut BytesMut,
+        exchange_id: u64,
+        topic_id: u64,
+        routing_key: Option<&str>,
+    ) -> Self {
+        Self::write_create_binding(buf, exchange_id, topic_id, routing_key);
+        Self::split_from(buf)
+    }
+    pub fn create_binding_with_opts(
+        buf: &mut BytesMut,
+        exchange_id: u64,
+        topic_id: u64,
+        routing_key: Option<&str>,
+        no_local: bool,
+        shared_group: Option<&str>,
+        subscription_id: Option<u32>,
+    ) -> Self {
+        Self::write_create_binding_with_opts(
+            buf,
+            exchange_id,
+            topic_id,
+            routing_key,
+            no_local,
+            shared_group,
+            subscription_id,
+        );
+        Self::split_from(buf)
+    }
+    pub fn publish_to_exchange(buf: &mut BytesMut, exchange_id: u64, messages: &[Bytes]) -> Self {
+        Self::write_publish_to_exchange_bytes(buf, exchange_id, messages);
+        Self::split_from(buf)
+    }
+    pub fn create_consumer_group(buf: &mut BytesMut, name: &str, auto_offset_reset: u8) -> Self {
+        Self::write_create_consumer_group(buf, name, auto_offset_reset);
+        Self::split_from(buf)
+    }
+    pub fn create_queue(
+        buf: &mut BytesMut,
+        name: &str,
+        config: AckVariantConfig,
+        retention: RetentionPolicy,
+        dedup: Option<&TopicDedupConfig>,
+        enable_dlq: bool,
+        dlq_name: Option<&str>,
+        enable_response: bool,
+        response_name: Option<&str>,
+    ) -> Self {
+        Self::write_create_queue(
+            buf,
+            name,
+            config,
+            retention,
+            dedup,
+            enable_dlq,
+            dlq_name,
+            enable_response,
+            response_name,
+        );
+        Self::split_from(buf)
+    }
+    pub fn create_actor_group(
+        buf: &mut BytesMut,
+        name: &str,
+        config: ActorVariantConfig,
+        retention: RetentionPolicy,
+        enable_response: bool,
+        response_name: Option<&str>,
+    ) -> Self {
+        Self::write_create_actor_group(
+            buf,
+            name,
+            config,
+            retention,
+            enable_response,
+            response_name,
+        );
+        Self::split_from(buf)
+    }
+    pub fn create_job_cron(
+        buf: &mut BytesMut,
+        name: &str,
+        ack_config: AckVariantConfig,
+        retention: RetentionPolicy,
+    ) -> Self {
+        Self::write_create_job_cron(buf, name, ack_config, retention);
+        Self::split_from(buf)
+    }
+    pub fn delete_consumer_group(buf: &mut BytesMut, group_id: u64) -> Self {
+        Self::write_delete_consumer_group(buf, group_id);
+        Self::split_from(buf)
+    }
     pub fn commit_group_offset(
+        buf: &mut BytesMut,
         group_id: u64,
         generation: i32,
         topic_id: u64,
@@ -1723,21 +1836,20 @@ impl MqCommand {
         metadata: Option<&str>,
         timestamp: u64,
     ) -> Self {
-        CommandBuilder::new(Self::TAG_COMMIT_GROUP_OFFSET, 0, 56)
-            .set_u64(8, group_id)
-            .set_u64(16, topic_id)
-            .set_u64(24, offset)
-            .set_u64(32, timestamp)
-            .set_opt_str(40, metadata)
-            .set_i32(48, generation)
-            .set_u32(52, partition_index)
-            .finish()
+        Self::write_commit_group_offset(
+            buf,
+            group_id,
+            generation,
+            topic_id,
+            partition_index,
+            offset,
+            metadata,
+            timestamp,
+        );
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 member_id:flex8, @24 client_id:flex8,
-    /// @32 protocol_type:flex8, @40 session_timeout_ms:i32|rebalance_timeout_ms:i32,
-    /// @48 protocols:vec_kv
     pub fn join_consumer_group(
+        buf: &mut BytesMut,
         group_id: u64,
         member_id: &str,
         client_id: &str,
@@ -1746,501 +1858,257 @@ impl MqCommand {
         protocol_type: &str,
         protocols: &[(&str, &[u8])],
     ) -> Self {
-        CommandBuilder::new(Self::TAG_JOIN_CONSUMER_GROUP, 0, 56)
-            .set_u64(8, group_id)
-            .set_str(16, member_id)
-            .set_str(24, client_id)
-            .set_str(32, protocol_type)
-            .set_i32(40, session_timeout_ms)
-            .set_i32(44, rebalance_timeout_ms)
-            .set_vec_kv(48, protocols)
-            .finish()
+        Self::write_join_consumer_group(
+            buf,
+            group_id,
+            member_id,
+            client_id,
+            session_timeout_ms,
+            rebalance_timeout_ms,
+            protocol_type,
+            protocols,
+        );
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 member_id:flex8, @24 generation:i32,
-    /// @32 assignments:vec_kv
     pub fn sync_consumer_group(
+        buf: &mut BytesMut,
         group_id: u64,
         generation: i32,
         member_id: &str,
         assignments: &[(&str, &[u8])],
     ) -> Self {
-        CommandBuilder::new(Self::TAG_SYNC_CONSUMER_GROUP, 0, 40)
-            .set_u64(8, group_id)
-            .set_str(16, member_id)
-            .set_i32(24, generation)
-            .set_vec_kv(32, assignments)
-            .finish()
+        Self::write_sync_consumer_group(buf, group_id, generation, member_id, assignments);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 member_id:flex8
-    pub fn leave_consumer_group(group_id: u64, member_id: &str) -> Self {
-        CommandBuilder::new(Self::TAG_LEAVE_CONSUMER_GROUP, 0, 24)
-            .set_u64(8, group_id)
-            .set_str(16, member_id)
-            .finish()
+    pub fn leave_consumer_group(buf: &mut BytesMut, group_id: u64, member_id: &str) -> Self {
+        Self::write_leave_consumer_group(buf, group_id, member_id);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 member_id:flex8, @24 generation:i32
-    pub fn heartbeat_consumer_group(group_id: u64, member_id: &str, generation: i32) -> Self {
-        CommandBuilder::new(Self::TAG_HEARTBEAT_CONSUMER_GROUP, 0, 32)
-            .set_u64(8, group_id)
-            .set_str(16, member_id)
-            .set_i32(24, generation)
-            .finish()
+    pub fn heartbeat_consumer_group(
+        buf: &mut BytesMut,
+        group_id: u64,
+        member_id: &str,
+        generation: i32,
+    ) -> Self {
+        Self::write_heartbeat_consumer_group(buf, group_id, member_id, generation);
+        Self::split_from(buf)
     }
-
-    /// @8 now_ms:8
-    pub fn expire_group_sessions(now_ms: u64) -> Self {
-        CommandBuilder::new(Self::TAG_EXPIRE_GROUP_SESSIONS, 0, 16)
-            .set_u64(8, now_ms)
-            .finish()
+    pub fn expire_group_sessions(buf: &mut BytesMut, now_ms: u64) -> Self {
+        Self::write_expire_group_sessions(buf, now_ms);
+        Self::split_from(buf)
     }
-
-    // -- Ack Variant (19-29) --
-
-    /// @8 group_id:8, @16 consumer_id:8, @24 max_count:4
-    /// @8 group_id:8, @16 consumer_id:8, @24 max_count:4, @32 exclude_publisher_id:8, @40 current_time_ms:8
-    ///
-    /// `exclude_publisher_id`: when non-zero, messages with this publisher_id are
-    /// auto-ACKed at engine level (MQTT no-local filtering).
-    /// `current_time_ms`: when non-zero, messages whose TTL has expired are
-    /// auto-ACKed at engine level (MQTT message expiry filtering).
-    pub fn group_deliver(group_id: u64, consumer_id: u64, max_count: u32) -> Self {
-        CommandBuilder::new(Self::TAG_GROUP_DELIVER, 0, 48)
-            .set_u64(8, group_id)
-            .set_u64(16, consumer_id)
-            .set_u32(24, max_count)
-            .set_u64(32, 0) // exclude_publisher_id (disabled)
-            .set_u64(40, 0) // current_time_ms (disabled)
-            .finish()
-    }
-
-    /// Extended group_deliver with no-local and expiry filtering support.
-    pub fn group_deliver_filtered(
+    pub fn group_deliver(
+        buf: &mut BytesMut,
         group_id: u64,
         consumer_id: u64,
         max_count: u32,
-        exclude_publisher_id: u64,
-        current_time_ms: u64,
     ) -> Self {
-        CommandBuilder::new(Self::TAG_GROUP_DELIVER, 0, 48)
-            .set_u64(8, group_id)
-            .set_u64(16, consumer_id)
-            .set_u32(24, max_count)
-            .set_u64(32, exclude_publisher_id)
-            .set_u64(40, current_time_ms)
-            .finish()
+        Self::write_group_deliver(buf, group_id, consumer_id, max_count);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 message_ids:vec_u64, @24 response:opt_flex8
-    pub fn group_ack(group_id: u64, message_ids: &[u64], response: Option<&Bytes>) -> Self {
-        let resp_size = response.map_or(0, |b| if b.len() > 7 { b.len() } else { 0 });
-        CommandBuilder::with_capacity(
-            Self::TAG_GROUP_ACK,
-            0,
-            32,
-            32 + message_ids.len() * 8 + resp_size,
-        )
-        .set_u64(8, group_id)
-        .set_vec_u64(16, message_ids)
-        .set_opt_bytes(24, response)
-        .finish()
+    pub fn group_ack(
+        buf: &mut BytesMut,
+        group_id: u64,
+        message_ids: &[u64],
+        response: Option<&Bytes>,
+    ) -> Self {
+        Self::write_group_ack(buf, group_id, message_ids, response);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 message_ids:vec_u64
-    pub fn group_nack(group_id: u64, message_ids: &[u64]) -> Self {
-        CommandBuilder::with_capacity(Self::TAG_GROUP_NACK, 0, 24, 24 + message_ids.len() * 8)
-            .set_u64(8, group_id)
-            .set_vec_u64(16, message_ids)
-            .finish()
+    pub fn group_nack(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) -> Self {
+        Self::write_group_nack(buf, group_id, message_ids);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 message_ids:vec_u64
-    pub fn group_release(group_id: u64, message_ids: &[u64]) -> Self {
-        CommandBuilder::with_capacity(Self::TAG_GROUP_RELEASE, 0, 24, 24 + message_ids.len() * 8)
-            .set_u64(8, group_id)
-            .set_vec_u64(16, message_ids)
-            .finish()
+    pub fn group_release(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) -> Self {
+        Self::write_group_release(buf, group_id, message_ids);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 message_ids:vec_u64
-    pub fn group_modify(group_id: u64, message_ids: &[u64]) -> Self {
-        CommandBuilder::with_capacity(Self::TAG_GROUP_MODIFY, 0, 24, 24 + message_ids.len() * 8)
-            .set_u64(8, group_id)
-            .set_vec_u64(16, message_ids)
-            .finish()
+    pub fn group_modify(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) -> Self {
+        Self::write_group_modify(buf, group_id, message_ids);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 message_ids:vec_u64, @24 extension_ms:8
-    pub fn group_extend_visibility(group_id: u64, message_ids: &[u64], extension_ms: u64) -> Self {
-        CommandBuilder::with_capacity(
-            Self::TAG_GROUP_EXTEND_VISIBILITY,
-            0,
-            32,
-            32 + message_ids.len() * 8,
-        )
-        .set_u64(8, group_id)
-        .set_vec_u64(16, message_ids)
-        .set_u64(24, extension_ms)
-        .finish()
+    pub fn group_extend_visibility(
+        buf: &mut BytesMut,
+        group_id: u64,
+        message_ids: &[u64],
+        extension_ms: u64,
+    ) -> Self {
+        Self::write_group_extend_visibility(buf, group_id, message_ids, extension_ms);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 message_ids:vec_u64
-    pub fn group_timeout_expired(group_id: u64, message_ids: &[u64]) -> Self {
-        CommandBuilder::with_capacity(
-            Self::TAG_GROUP_TIMEOUT_EXPIRED,
-            0,
-            24,
-            24 + message_ids.len() * 8,
-        )
-        .set_u64(8, group_id)
-        .set_vec_u64(16, message_ids)
-        .finish()
+    pub fn group_timeout_expired(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) -> Self {
+        Self::write_group_timeout_expired(buf, group_id, message_ids);
+        Self::split_from(buf)
     }
-
-    /// @8 source_group_id:8, @16 dlq_topic_id:8,
-    /// @24 dead_letter_ids:vec_u64, @32 messages:vec_bytes
+    pub fn group_expire_pending(buf: &mut BytesMut, group_id: u64, message_ids: &[u64]) -> Self {
+        Self::write_group_expire_pending(buf, group_id, message_ids);
+        Self::split_from(buf)
+    }
     pub fn group_publish_to_dlq(
+        buf: &mut BytesMut,
         source_group_id: u64,
         dlq_topic_id: u64,
         dead_letter_ids: &[u64],
         messages: &[Bytes],
     ) -> Self {
-        let u64_size = dead_letter_ids.len() * 8;
-        let table_size = messages.len() * 8;
-        let data_size: usize = messages.iter().map(|m| m.len()).sum();
-        CommandBuilder::with_capacity(
-            Self::TAG_GROUP_PUBLISH_TO_DLQ,
-            0,
-            40,
-            40 + u64_size + table_size + data_size,
-        )
-        .set_u64(8, source_group_id)
-        .set_u64(16, dlq_topic_id)
-        .set_vec_u64(24, dead_letter_ids)
-        .set_vec_bytes(32, messages)
-        .finish()
+        let msgs: Vec<&[u8]> = messages.iter().map(|b| b.as_ref()).collect();
+        Self::write_group_publish_to_dlq(
+            buf,
+            source_group_id,
+            dlq_topic_id,
+            dead_letter_ids,
+            &msgs,
+        );
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 message_ids:vec_u64
-    pub fn group_expire_pending(group_id: u64, message_ids: &[u64]) -> Self {
-        CommandBuilder::with_capacity(
-            Self::TAG_GROUP_EXPIRE_PENDING,
-            0,
-            24,
-            24 + message_ids.len() * 8,
-        )
-        .set_u64(8, group_id)
-        .set_vec_u64(16, message_ids)
-        .finish()
+    pub fn group_purge(buf: &mut BytesMut, group_id: u64) -> Self {
+        Self::write_group_purge(buf, group_id);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8
-    pub fn group_purge(group_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_GROUP_PURGE, 0, 16)
-            .set_u64(8, group_id)
-            .finish()
+    pub fn group_get_attributes(buf: &mut BytesMut, group_id: u64) -> Self {
+        Self::write_group_get_attributes(buf, group_id);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8
-    pub fn group_get_attributes(group_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_GROUP_GET_ATTRIBUTES, 0, 16)
-            .set_u64(8, group_id)
-            .finish()
+    pub fn group_deliver_actor(
+        buf: &mut BytesMut,
+        group_id: u64,
+        consumer_id: u64,
+        actor_ids: &[Bytes],
+    ) -> Self {
+        let ids: Vec<&[u8]> = actor_ids.iter().map(|b| b.as_ref()).collect();
+        Self::write_group_deliver_actor(buf, group_id, consumer_id, &ids);
+        Self::split_from(buf)
     }
-
-    // -- Actor Variant (30-35) --
-
-    /// @8 group_id:8, @16 consumer_id:8, @24 actor_ids:vec_bytes
-    pub fn group_deliver_actor(group_id: u64, consumer_id: u64, actor_ids: &[Bytes]) -> Self {
-        let table_size = actor_ids.len() * 8;
-        let data_size: usize = actor_ids.iter().map(|a| a.len()).sum();
-        CommandBuilder::with_capacity(
-            Self::TAG_GROUP_DELIVER_ACTOR,
-            0,
-            32,
-            32 + table_size + data_size,
-        )
-        .set_u64(8, group_id)
-        .set_u64(16, consumer_id)
-        .set_vec_bytes(24, actor_ids)
-        .finish()
-    }
-
-    /// @8 group_id:8, @16 message_id:8, @24 actor_id:flex8, @32 response:opt_flex8
     pub fn group_ack_actor(
+        buf: &mut BytesMut,
         group_id: u64,
         actor_id: &[u8],
         message_id: u64,
         response: Option<&Bytes>,
     ) -> Self {
-        CommandBuilder::new(Self::TAG_GROUP_ACK_ACTOR, 0, 40)
-            .set_u64(8, group_id)
-            .set_u64(16, message_id)
-            .set_bytes(24, actor_id)
-            .set_opt_bytes(32, response)
-            .finish()
+        Self::write_group_ack_actor(buf, group_id, actor_id, message_id, response);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 message_id:8, @24 actor_id:flex8
-    pub fn group_nack_actor(group_id: u64, actor_id: &[u8], message_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_GROUP_NACK_ACTOR, 0, 32)
-            .set_u64(8, group_id)
-            .set_u64(16, message_id)
-            .set_bytes(24, actor_id)
-            .finish()
+    pub fn group_nack_actor(
+        buf: &mut BytesMut,
+        group_id: u64,
+        actor_id: &[u8],
+        message_id: u64,
+    ) -> Self {
+        Self::write_group_nack_actor(buf, group_id, actor_id, message_id);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 consumer_id:8, @24 actor_ids:vec_bytes
-    pub fn group_assign_actors(group_id: u64, consumer_id: u64, actor_ids: &[Bytes]) -> Self {
-        let table_size = actor_ids.len() * 8;
-        let data_size: usize = actor_ids.iter().map(|a| a.len()).sum();
-        CommandBuilder::with_capacity(
-            Self::TAG_GROUP_ASSIGN_ACTORS,
-            0,
-            32,
-            32 + table_size + data_size,
-        )
-        .set_u64(8, group_id)
-        .set_u64(16, consumer_id)
-        .set_vec_bytes(24, actor_ids)
-        .finish()
+    pub fn group_assign_actors(
+        buf: &mut BytesMut,
+        group_id: u64,
+        consumer_id: u64,
+        actor_ids: &[Bytes],
+    ) -> Self {
+        let ids: Vec<&[u8]> = actor_ids.iter().map(|b| b.as_ref()).collect();
+        Self::write_group_assign_actors(buf, group_id, consumer_id, &ids);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 consumer_id:8
-    pub fn group_release_actors(group_id: u64, consumer_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_GROUP_RELEASE_ACTORS, 0, 24)
-            .set_u64(8, group_id)
-            .set_u64(16, consumer_id)
-            .finish()
+    pub fn group_release_actors(buf: &mut BytesMut, group_id: u64, consumer_id: u64) -> Self {
+        Self::write_group_release_actors(buf, group_id, consumer_id);
+        Self::split_from(buf)
     }
-
-    /// @8 group_id:8, @16 before_timestamp:8
-    pub fn group_evict_idle(group_id: u64, before_timestamp: u64) -> Self {
-        CommandBuilder::new(Self::TAG_GROUP_EVICT_IDLE, 0, 24)
-            .set_u64(8, group_id)
-            .set_u64(16, before_timestamp)
-            .finish()
+    pub fn group_evict_idle(buf: &mut BytesMut, group_id: u64, before_timestamp: u64) -> Self {
+        Self::write_group_evict_idle(buf, group_id, before_timestamp);
+        Self::split_from(buf)
     }
-
-    // -- Cron (36-39) --
-
-    /// @8 topic_id:8
-    pub fn cron_enable(topic_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_CRON_ENABLE, 0, 16)
-            .set_u64(8, topic_id)
-            .finish()
+    pub fn cron_enable(buf: &mut BytesMut, topic_id: u64) -> Self {
+        Self::write_cron_enable(buf, topic_id);
+        Self::split_from(buf)
     }
-
-    /// @8 topic_id:8
-    pub fn cron_disable(topic_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_CRON_DISABLE, 0, 16)
-            .set_u64(8, topic_id)
-            .finish()
+    pub fn cron_disable(buf: &mut BytesMut, topic_id: u64) -> Self {
+        Self::write_cron_disable(buf, topic_id);
+        Self::split_from(buf)
     }
-
-    /// @8 topic_id:8, @16 triggered_at:8
-    pub fn cron_trigger(topic_id: u64, triggered_at: u64) -> Self {
-        CommandBuilder::new(Self::TAG_CRON_TRIGGER, 0, 24)
-            .set_u64(8, topic_id)
-            .set_u64(16, triggered_at)
-            .finish()
+    pub fn cron_trigger(buf: &mut BytesMut, topic_id: u64, triggered_at: u64) -> Self {
+        Self::write_cron_trigger(buf, topic_id, triggered_at);
+        Self::split_from(buf)
     }
-
-    /// @8 topic_id:8
-    pub fn cron_update(topic_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_CRON_UPDATE, 0, 16)
-            .set_u64(8, topic_id)
-            .finish()
-    }
-
-    // -- Sessions (40-48) --
-
-    /// @8 session_id:8, @16 keep_alive_ms:8, @24 session_expiry_ms:8, @32 client_id:flex8
     pub fn create_session(
+        buf: &mut BytesMut,
         session_id: u64,
         client_id: &str,
         keep_alive_ms: u64,
         session_expiry_ms: u64,
     ) -> Self {
-        CommandBuilder::new(Self::TAG_CREATE_SESSION, 0, 40)
-            .set_u64(8, session_id)
-            .set_u64(16, keep_alive_ms)
-            .set_u64(24, session_expiry_ms)
-            .set_str(32, client_id)
-            .finish()
+        Self::write_create_session(buf, session_id, client_id, keep_alive_ms, session_expiry_ms);
+        Self::split_from(buf)
     }
-
-    /// flags[0]=publish_will, @8 session_id:8
-    pub fn disconnect_session(session_id: u64, publish_will: bool) -> Self {
-        let flags = if publish_will { 1u8 } else { 0u8 };
-        CommandBuilder::new(Self::TAG_DISCONNECT_SESSION, flags, 16)
-            .set_u64(8, session_id)
-            .finish()
+    pub fn disconnect_session(buf: &mut BytesMut, session_id: u64, publish_will: bool) -> Self {
+        Self::write_disconnect_session(buf, session_id, publish_will);
+        Self::split_from(buf)
     }
-
-    /// @8 session_id:8
-    pub fn heartbeat_session(session_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_HEARTBEAT_SESSION, 0, 16)
-            .set_u64(8, session_id)
-            .finish()
+    pub fn heartbeat_session(buf: &mut BytesMut, session_id: u64) -> Self {
+        Self::write_heartbeat_session(buf, session_id);
+        Self::split_from(buf)
     }
-
-    /// flags=qos(2bits)|retain(1bit), @8 session_id:8, @16 topic_id:8,
-    /// @24 routing_key:flex8, @32 message:flex8, @40 delay_secs:4
     pub fn set_will(
+        buf: &mut BytesMut,
         session_id: u64,
         topic_id: u64,
         delay_secs: u32,
         qos: u8,
         retain: bool,
         routing_key: &str,
-        message: &Bytes,
+        message: &[u8],
     ) -> Self {
-        let flags = (qos & 0x03) | (if retain { 0x04 } else { 0 });
-        CommandBuilder::new(Self::TAG_SET_WILL, flags, 48)
-            .set_u64(8, session_id)
-            .set_u64(16, topic_id)
-            .set_str(24, routing_key)
-            .set_bytes_val(32, message)
-            .set_u32(40, delay_secs)
-            .finish()
+        Self::write_set_will(
+            buf,
+            session_id,
+            topic_id,
+            delay_secs,
+            qos,
+            retain,
+            routing_key,
+            message,
+        );
+        Self::split_from(buf)
     }
-
-    /// @8 session_id:8
-    pub fn clear_will(session_id: u64) -> Self {
-        CommandBuilder::new(Self::TAG_CLEAR_WILL, 0, 16)
-            .set_u64(8, session_id)
-            .finish()
+    pub fn clear_will(buf: &mut BytesMut, session_id: u64) -> Self {
+        Self::write_clear_will(buf, session_id);
+        Self::split_from(buf)
     }
-
-    /// @8 now_ms:8
-    pub fn fire_pending_wills(now_ms: u64) -> Self {
-        CommandBuilder::new(Self::TAG_FIRE_PENDING_WILLS, 0, 16)
-            .set_u64(8, now_ms)
-            .finish()
+    pub fn fire_pending_wills(buf: &mut BytesMut, now_ms: u64) -> Self {
+        Self::write_fire_pending_wills(buf, now_ms);
+        Self::split_from(buf)
     }
-
-    /// @8 session_id:8, @16 remaining_quota:8, @24 client_id:flex8,
-    /// @32 subscription_data:flex8, @40 session_expiry_secs:4|inbound_qos_inflight:4,
-    /// @48 outbound_qos1_count:4
     pub fn persist_session(
+        buf: &mut BytesMut,
         session_id: u64,
         client_id: &str,
         session_expiry_secs: u32,
-        subscription_data: &Bytes,
+        subscription_data: &[u8],
         inbound_qos_inflight: u32,
         outbound_qos1_count: u32,
         remaining_quota: u64,
     ) -> Self {
-        CommandBuilder::new(Self::TAG_PERSIST_SESSION, 0, 56)
-            .set_u64(8, session_id)
-            .set_u64(16, remaining_quota)
-            .set_str(24, client_id)
-            .set_bytes_val(32, subscription_data)
-            .set_u32(40, session_expiry_secs)
-            .set_u32(44, inbound_qos_inflight)
-            .set_u32(48, outbound_qos1_count)
-            .finish()
+        Self::write_persist_session(
+            buf,
+            session_id,
+            client_id,
+            session_expiry_secs,
+            subscription_data,
+            inbound_qos_inflight,
+            outbound_qos1_count,
+            remaining_quota,
+        );
+        Self::split_from(buf)
     }
-
-    /// @8 client_id:flex8
-    pub fn restore_session(client_id: &str) -> Self {
-        CommandBuilder::new(Self::TAG_RESTORE_SESSION, 0, 16)
-            .set_str(8, client_id)
-            .finish()
+    pub fn restore_session(buf: &mut BytesMut, client_id: &str) -> Self {
+        Self::write_restore_session(buf, client_id);
+        Self::split_from(buf)
     }
-
-    /// @8 now_ms:8
-    pub fn expire_sessions(now_ms: u64) -> Self {
-        CommandBuilder::new(Self::TAG_EXPIRE_SESSIONS, 0, 16)
-            .set_u64(8, now_ms)
-            .finish()
+    pub fn expire_sessions(buf: &mut BytesMut, now_ms: u64) -> Self {
+        Self::write_expire_sessions(buf, now_ms);
+        Self::split_from(buf)
     }
-
-    // -- Batch (49) --
-
-    /// @8 count:4, flex: sub-commands (self-sized, padded to 8-byte boundaries)
-    pub fn batch(commands: &[MqCommand]) -> Self {
-        // Pre-calculate total size for single allocation.
-        let data_size: usize = commands
-            .iter()
-            .map(|cmd| {
-                let len = cmd.total_encoded_size();
-                len + (8 - (len % 8)) % 8
-            })
-            .sum();
-        let mut b = CommandBuilder::with_capacity(Self::TAG_BATCH, 0, 16, 16 + data_size)
-            .set_u32(8, commands.len() as u32);
-        // Sub-commands go in flex region; each is self-sized via its header.
-        // Pad each to 8-byte boundary for alignment.
-        for cmd in commands {
-            b.buf.extend_from_slice(&cmd.buf);
-            let len = cmd.buf.len();
-            let pad = (8 - (len % 8)) % 8;
-            if pad > 0 {
-                b.buf.extend_from_slice(&[0u8; 8][..pad]);
-            }
-        }
-        b.finish()
-    }
-
-    // -- Dedup (50) --
-
-    /// @8 topic_id:8, @16 before_timestamp:8
-    pub fn prune_dedup_window(topic_id: u64, before_timestamp: u64) -> Self {
-        CommandBuilder::new(Self::TAG_PRUNE_DEDUP_WINDOW, 0, 24)
-            .set_u64(8, topic_id)
-            .set_u64(16, before_timestamp)
-            .finish()
-    }
-
-    // -- ForwardedBatch (55) --
-
-    /// Build a TAG_FORWARDED_BATCH command from pre-encoded sub-frames.
-    ///
-    /// `frames` must already be in wire format: concatenated
-    /// `[len:4][client_id:4][cmd_bytes]` sub-frames (no padding).
-    ///
-    /// Fixed region layout:
-    /// ```text
-    /// @8  node_id: u32
-    /// @12 count:   u32
-    /// @16 [sub-frames...]
-    /// ```
-    pub fn forwarded_batch(node_id: u32, count: u32, frames: &[u8]) -> Self {
-        let total = 16 + frames.len(); // header(8) + fixed(8) + frames
-        let mut buf = Vec::with_capacity(total);
-        // header placeholder (patched below)
-        buf.extend_from_slice(&[0u8; 8]);
-        buf.extend_from_slice(&node_id.to_le_bytes());
-        buf.extend_from_slice(&count.to_le_bytes());
-        buf.extend_from_slice(frames);
-        // Patch size and fixed fields in header.
-        buf[0..4].copy_from_slice(&(total as u32).to_le_bytes());
-        buf[4..6].copy_from_slice(&16u16.to_le_bytes()); // fixed region = 16
-        buf[6] = Self::TAG_FORWARDED_BATCH;
-        buf[7] = 0; // flags
-        MqCommand {
-            buf: Bytes::from(buf),
-            extra: SmallVec::new(),
-        }
-    }
-
-    /// Write the TAG_FORWARDED_BATCH header into the first 16 bytes of `buf`.
-    ///
-    /// `buf` must have been pre-allocated with at least 16 bytes of zeroed
-    /// space at the front (via `buf.put_bytes(0, 16)`), followed by sub-frames.
-    /// Call this after all sub-frames have been written.
-    pub fn write_forwarded_batch_header(buf: &mut bytes::BytesMut, node_id: u32, count: u32) {
-        let total = buf.len() as u32;
-        buf[0..4].copy_from_slice(&total.to_le_bytes());
-        buf[4..6].copy_from_slice(&16u16.to_le_bytes()); // fixed region = 16
-        buf[6] = Self::TAG_FORWARDED_BATCH;
-        buf[7] = 0; // flags
-        buf[8..12].copy_from_slice(&node_id.to_le_bytes());
-        buf[12..16].copy_from_slice(&count.to_le_bytes());
+    pub fn batch(buf: &mut BytesMut, commands: &[MqCommand]) -> Self {
+        Self::write_batch(buf, commands);
+        Self::split_from(buf)
     }
 }
 
@@ -2257,17 +2125,12 @@ impl MqCommand {
         CmdPublish { buf: &self.buf }
     }
 
-    /// Collect publish/exchange-publish messages from the descriptor table.
     pub fn collect_publish_messages(&self) -> Vec<Bytes> {
-        let v = self.as_publish();
-        v.messages().collect()
+        self.as_publish().messages().collect()
     }
 
-    /// Collect publish messages from the descriptor table.
-    /// Used by the write batcher for merge operations.
     pub fn take_publish_segments(&mut self) -> Vec<Bytes> {
-        let v = CmdPublish { buf: &self.buf };
-        v.messages().collect()
+        CmdPublish { buf: &self.buf }.messages().collect()
     }
 
     pub fn as_create_exchange(&self) -> CmdCreateExchange<'_> {
@@ -2288,6 +2151,10 @@ impl MqCommand {
 
     pub fn as_forwarded_batch(&self) -> CmdForwardedBatch<'_> {
         CmdForwardedBatch { buf: &self.buf }
+    }
+
+    pub fn as_resume(&self) -> CmdResume<'_> {
+        CmdResume { buf: &self.buf }
     }
 
     pub fn as_create_consumer_group(&self) -> CmdCreateConsumerGroup<'_> {
@@ -2355,14 +2222,10 @@ impl MqCommand {
         {
             return None;
         }
-        // vec_bytes slot at @16: [count:4][offset:4]
         let count = self.field_vec_bytes_count(16);
         Some(VecBytesIter::new(&self.buf, 16, count))
     }
 
-    /// For `Publish`, `PublishToExchange`, or `PublishToExchangeMqtt`: iterate
-    /// messages as borrowed slices — avoids `Bytes::slice()` overhead.
-    /// Returns `None` for other command types.
     #[inline]
     pub fn publish_messages_slice_iter(&self) -> Option<VecSliceIter<'_>> {
         let tag = self.tag();
@@ -2375,15 +2238,12 @@ impl MqCommand {
         Some(VecSliceIter::new(&self.buf, 16))
     }
 
-    /// If this is a `Publish` for the given `topic_id`, return a zero-copy
-    /// message iterator. Returns `None` otherwise.
     #[inline]
     pub fn publish_messages_for_topic(&self, topic_id: u64) -> Option<VecBytesIter<'_>> {
         if self.tag() != Self::TAG_PUBLISH {
             return None;
         }
-        let tid = self.field_u64(8);
-        if tid != topic_id {
+        if self.field_u64(8) != topic_id {
             return None;
         }
         let count = self.field_vec_bytes_count(16);
@@ -2485,11 +2345,9 @@ impl<'a> CmdPublish<'a> {
     }
 
     pub fn messages(&self) -> VecBytesIter<'a> {
-        let count = self.message_count();
-        VecBytesIter::new(self.buf, 16, count)
+        VecBytesIter::new(self.buf, 16, self.message_count())
     }
 
-    /// Borrowed-slice iterator over the messages.
     pub fn messages_slice_iter(&self) -> VecSliceIter<'a> {
         VecSliceIter::new(self.buf, 16)
     }
@@ -2593,7 +2451,6 @@ impl<'a> CmdPublishToExchange<'a> {
         VecBytesIter::new(self.buf, 16, count)
     }
 
-    /// Borrowed-slice iterator over the messages — avoids `Bytes::slice()` overhead.
     pub fn messages_slice_iter(&self) -> VecSliceIter<'a> {
         VecSliceIter::new(self.buf, 16)
     }
@@ -2654,6 +2511,12 @@ impl<'a> CmdBatch<'a> {
 
     pub fn count(&self) -> u32 {
         u32::from_le_bytes(self.buf[8..12].try_into().unwrap())
+    }
+
+    /// Batch ID registered in `AsyncApplyManager::batch_registry`.
+    /// 0 = no registry entry (legacy or no response needed).
+    pub fn batch_id(&self) -> u32 {
+        u32::from_le_bytes(self.buf[12..16].try_into().unwrap())
     }
 
     pub fn commands(&self) -> BatchIter<'a> {
@@ -3163,17 +3026,17 @@ impl ExactSizeIterator for BatchIter<'_> {}
 ///
 /// Fixed region:
 /// ```text
-/// @8  node_id: u32  — originating follower node ID
-/// @12 count:   u32  — number of sub-frames
+/// @8  node_id:   u32  — originating follower node ID (0 = local/leader)
+/// @12 count:     u32  — number of sub-frames
 /// @16 [sub-frames...]
 /// ```
 ///
 /// Each sub-frame:
 /// ```text
-/// [len:4][client_id:4][cmd_bytes + pad8]
+/// [payload_len:4][client_id:4][request_seq:8][cmd_bytes + opt_pad]
 /// ```
-/// `len` = `4 + cmd_bytes.len()` (includes client_id, excludes the len field itself).
-/// Total sub-frame size: `4 + align8(len)` bytes.
+/// `payload_len` = `12 + cmd_bytes.len()` (client_id:4 + request_seq:8 + cmd, excludes len field).
+/// Total sub-frame size: `4 + payload_len` bytes (may be padded to 8-byte boundary by write_batcher).
 pub struct CmdForwardedBatch<'a> {
     buf: &'a [u8],
 }
@@ -3191,7 +3054,7 @@ impl<'a> CmdForwardedBatch<'a> {
         u32::from_le_bytes(self.buf[12..16].try_into().unwrap())
     }
 
-    /// Iterate over `(client_id, cmd_bytes)` sub-frames.
+    /// Iterate over `(client_id, request_seq, cmd_bytes)` sub-frames.
     #[inline]
     pub fn iter(&self) -> CmdForwardedBatchIter<'a> {
         CmdForwardedBatchIter {
@@ -3204,30 +3067,42 @@ impl<'a> CmdForwardedBatch<'a> {
 /// Zero-copy iterator over sub-frames in a [`CmdForwardedBatch`].
 ///
 /// Each call to [`next`](Iterator::next) parses one sub-frame header and returns
-/// `(client_id: u32, cmd_bytes: &[u8])` with no allocation.
+/// `(client_id: u32, request_seq: u64, cmd_bytes: &[u8])` with no allocation.
+///
+/// Sub-frame layout:
+/// ```text
+/// [payload_len:4][client_id:4][request_seq:8][cmd_bytes...]
+/// payload_len = 12 + cmd_bytes.len()
+/// advance     = 4 + payload_len = 16 + cmd_bytes.len()
+/// ```
 pub struct CmdForwardedBatchIter<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Iterator for CmdForwardedBatchIter<'a> {
-    type Item = (u32, &'a [u8]);
+    type Item = (u32, u64, &'a [u8]);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos + 4 > self.buf.len() {
             return None;
         }
-        // len = client_id (4) + cmd_bytes — excludes the 4-byte len field itself.
-        let len = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
-        if len < 4 || self.pos + 4 + len > self.buf.len() {
+        // payload_len = client_id(4) + request_seq(8) + cmd_bytes.len()
+        // Excludes the 4-byte payload_len field itself.
+        let payload_len =
+            u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+        // Minimum payload: client_id(4) + request_seq(8) = 12 bytes.
+        if payload_len < 12 || self.pos + 4 + payload_len > self.buf.len() {
             return None;
         }
         let client_id =
             u32::from_le_bytes(self.buf[self.pos + 4..self.pos + 8].try_into().unwrap());
-        let cmd_bytes = &self.buf[self.pos + 8..self.pos + 4 + len];
-        self.pos += 4 + len;
-        Some((client_id, cmd_bytes))
+        let request_seq =
+            u64::from_le_bytes(self.buf[self.pos + 8..self.pos + 16].try_into().unwrap());
+        let cmd_bytes = &self.buf[self.pos + 16..self.pos + 4 + payload_len];
+        self.pos += 4 + payload_len;
+        Some((client_id, request_seq, cmd_bytes))
     }
 
     #[inline]
@@ -3236,28 +3111,62 @@ impl<'a> Iterator for CmdForwardedBatchIter<'a> {
     }
 }
 
-/// Zero-copy iterator over vec_bytes descriptor table.
-/// Uses O(1) random access per element via [size:4][offset:4] descriptors.
+// =============================================================================
+// CmdResume — TAG_RESUME (56)
+// =============================================================================
+
+/// Zero-copy view over a TAG_RESUME command.
+///
+/// Wire layout (16 bytes total):
+/// ```text
+/// [TAG_RESUME:1][pad:3][session_client_id:4][last_acked_seq:8]
+/// ```
+///
+/// Sent by a client as the first sub-frame after reconnecting. The state machine
+/// responds with its `last_applied_seq` for the session so the client can
+/// discard already-applied commands and safely retry the rest.
+pub struct CmdResume<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> CmdResume<'a> {
+    /// The `client_id` from the previous session to look up.
+    #[inline]
+    pub fn session_client_id(&self) -> u32 {
+        u32::from_le_bytes(self.buf[4..8].try_into().unwrap())
+    }
+
+    /// The highest `request_seq` the client received a response for.
+    #[inline]
+    pub fn last_acked_seq(&self) -> u64 {
+        u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
+    }
+}
+
+/// Zero-copy iterator over a vec_bytes field in sequential format.
+///
+/// Fixed slot: `[count:4][data_start:4]` where `data_start` is the byte offset
+/// (relative to command start) of the sequential data region.
+/// Data region: `[len0:4][data0][len1:4][data1]...` — stream-oriented, no descriptor table.
 pub struct VecBytesIter<'a> {
     buf: &'a [u8],
-    table_offset: usize,
-    index: usize,
+    pos: usize,
     count: usize,
+    index: usize,
 }
 
 impl<'a> VecBytesIter<'a> {
-    /// Create from a raw buffer and slot offset. `count` is the element count.
     pub fn new(buf: &'a [u8], slot_offset: usize, count: u32) -> Self {
-        let table_offset = if count == 0 {
+        let pos = if count == 0 {
             0
         } else {
             u32::from_le_bytes(buf[slot_offset + 4..slot_offset + 8].try_into().unwrap()) as usize
         };
         Self {
             buf,
-            table_offset,
-            index: 0,
+            pos,
             count: count as usize,
+            index: 0,
         }
     }
 
@@ -3275,14 +3184,12 @@ impl<'a> Iterator for VecBytesIter<'a> {
         if self.index >= self.count {
             return None;
         }
-        let desc = self.table_offset + self.index * 8;
-        let size = u32::from_le_bytes(self.buf[desc..desc + 4].try_into().unwrap()) as usize;
-        let data_offset =
-            u32::from_le_bytes(self.buf[desc + 4..desc + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+        self.pos += 4;
+        let data = Bytes::copy_from_slice(&self.buf[self.pos..self.pos + len]);
+        self.pos += len;
         self.index += 1;
-        Some(Bytes::copy_from_slice(
-            &self.buf[data_offset..data_offset + size],
-        ))
+        Some(data)
     }
 
     #[inline]
@@ -3294,29 +3201,27 @@ impl<'a> Iterator for VecBytesIter<'a> {
 
 impl ExactSizeIterator for VecBytesIter<'_> {}
 
-/// Iterator over vec_bytes descriptor table that yields `&[u8]` slices
-/// instead of `Bytes`.
+/// Iterator over a vec_bytes field yielding `&[u8]` slices instead of `Bytes`.
 pub struct VecSliceIter<'a> {
     buf: &'a [u8],
+    pos: usize,
     count: usize,
-    table_offset: usize,
     index: usize,
 }
 
 impl<'a> VecSliceIter<'a> {
-    /// Create from a raw buffer and the slot offset where `[count:4][table_offset:4]` lives.
     pub fn new(buf: &'a [u8], slot_offset: usize) -> Self {
         let count =
             u32::from_le_bytes(buf[slot_offset..slot_offset + 4].try_into().unwrap()) as usize;
-        let table_offset = if count == 0 {
+        let pos = if count == 0 {
             0
         } else {
             u32::from_le_bytes(buf[slot_offset + 4..slot_offset + 8].try_into().unwrap()) as usize
         };
         Self {
             buf,
+            pos,
             count,
-            table_offset,
             index: 0,
         }
     }
@@ -3330,11 +3235,12 @@ impl<'a> Iterator for VecSliceIter<'a> {
         if self.index >= self.count {
             return None;
         }
-        let desc = self.table_offset + self.index * 8;
-        let len = u32::from_le_bytes(self.buf[desc..desc + 4].try_into().unwrap()) as usize;
-        let offset = u32::from_le_bytes(self.buf[desc + 4..desc + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+        self.pos += 4;
+        let data = &self.buf[self.pos..self.pos + len];
+        self.pos += len;
         self.index += 1;
-        Some(&self.buf[offset..offset + len])
+        Some(data)
     }
 
     #[inline]
@@ -3731,355 +3637,23 @@ pub fn fmt_mq_command(cmd: &MqCommand, f: &mut std::fmt::Formatter<'_>) -> std::
 }
 
 // =============================================================================
-// MqResponse — Encode / Decode
-// =============================================================================
-
-impl Encode for MqResponse {
-    fn encode<W: Write>(&self, w: &mut W) -> Result<(), CodecError> {
-        match self {
-            MqResponse::Ok => TAG_RESP_OK.encode(w),
-            MqResponse::Error(err) => {
-                TAG_RESP_ERROR.encode(w)?;
-                err.encode(w)
-            }
-            MqResponse::EntityCreated { id } => {
-                TAG_RESP_ENTITY_CREATED.encode(w)?;
-                id.encode(w)
-            }
-            MqResponse::Messages { messages } => {
-                TAG_RESP_MESSAGES.encode(w)?;
-                (messages.len() as u32).encode(w)?;
-                for msg in messages.iter() {
-                    msg.encode(w)?;
-                }
-                Ok(())
-            }
-            MqResponse::Published { base_offset, count } => {
-                TAG_RESP_PUBLISHED.encode(w)?;
-                base_offset.encode(w)?;
-                count.encode(w)
-            }
-            MqResponse::Stats(stats) => {
-                TAG_RESP_STATS.encode(w)?;
-                stats.encode(w)
-            }
-            MqResponse::BatchResponse(resps) => {
-                TAG_RESP_BATCH.encode(w)?;
-                (resps.len() as u32).encode(w)?;
-                for resp in (*resps).iter() {
-                    resp.encode(w)?;
-                }
-                Ok(())
-            }
-            MqResponse::GroupJoined {
-                generation,
-                leader,
-                member_id,
-                protocol_name,
-                is_leader,
-                members,
-                phase_complete,
-            } => {
-                TAG_RESP_GROUP_JOINED.encode(w)?;
-                generation.encode(w)?;
-                leader.encode(w)?;
-                member_id.encode(w)?;
-                protocol_name.encode(w)?;
-                (*is_leader as u8).encode(w)?;
-                (members.len() as u32).encode(w)?;
-                for (mid, meta) in members {
-                    mid.encode(w)?;
-                    encode_bytes(w, meta)?;
-                }
-                (*phase_complete as u8).encode(w)
-            }
-            MqResponse::GroupSynced {
-                assignment,
-                phase_complete,
-            } => {
-                TAG_RESP_GROUP_SYNCED.encode(w)?;
-                encode_bytes(w, assignment)?;
-                (*phase_complete as u8).encode(w)
-            }
-            MqResponse::DeadLettered {
-                dead_letter_ids,
-                dlq_topic_id,
-            } => {
-                TAG_RESP_DEAD_LETTERED.encode(w)?;
-                encode_vec_u64(w, dead_letter_ids)?;
-                dlq_topic_id.encode(w)
-            }
-            MqResponse::RetainedMessages { messages } => {
-                TAG_RESP_RETAINED_MESSAGES.encode(w)?;
-                (messages.len() as u32).encode(w)?;
-                for entry in messages {
-                    encode_bytes(w, &entry.routing_key)?;
-                    encode_bytes(w, &entry.message)?;
-                }
-                Ok(())
-            }
-            MqResponse::WillPending {
-                session_id,
-                delay_ms,
-            } => {
-                TAG_RESP_WILL_PENDING.encode(w)?;
-                session_id.encode(w)?;
-                delay_ms.encode(w)
-            }
-            MqResponse::SessionRestored {
-                session_id,
-                session_expiry_ms,
-                subscription_data,
-            } => {
-                TAG_RESP_SESSION_RESTORED.encode(w)?;
-                session_id.encode(w)?;
-                session_expiry_ms.encode(w)?;
-                encode_bytes(w, subscription_data)
-            }
-            MqResponse::SessionNotFound => TAG_RESP_SESSION_NOT_FOUND.encode(w),
-            MqResponse::MultiMessages { groups } => {
-                TAG_RESP_MULTI_MESSAGES.encode(w)?;
-                (groups.len() as u32).encode(w)?;
-                for (group_id, messages) in groups {
-                    group_id.encode(w)?;
-                    (messages.len() as u32).encode(w)?;
-                    for msg in messages.iter() {
-                        msg.encode(w)?;
-                    }
-                }
-                Ok(())
-            }
-            MqResponse::TopicAliases { aliases } => {
-                TAG_RESP_TOPIC_ALIASES.encode(w)?;
-                (aliases.len() as u32).encode(w)?;
-                for a in aliases {
-                    a.alias.encode(w)?;
-                    a.topic_name.encode(w)?;
-                }
-                Ok(())
-            }
-            MqResponse::WillsFired { count } => {
-                TAG_RESP_WILLS_FIRED.encode(w)?;
-                count.encode(w)
-            }
-            MqResponse::Committed { log_index } => {
-                TAG_RESP_COMMITTED.encode(w)?;
-                log_index.encode(w)
-            }
-        }
-    }
-
-    fn encoded_size(&self) -> usize {
-        1 + match self {
-            MqResponse::Ok => 0,
-            MqResponse::Error(err) => err.encoded_size(),
-            MqResponse::EntityCreated { .. } => 8,
-            MqResponse::Messages { messages } => {
-                4 + messages.iter().map(|m| m.encoded_size()).sum::<usize>()
-            }
-            MqResponse::Published { .. } => 8 + 8,
-            MqResponse::Stats(stats) => stats.encoded_size(),
-            MqResponse::BatchResponse(resps) => {
-                4 + resps.iter().map(|r| r.encoded_size()).sum::<usize>()
-            }
-            MqResponse::GroupJoined {
-                generation: _,
-                leader,
-                member_id,
-                protocol_name,
-                members,
-                ..
-            } => {
-                4 + leader.encoded_size()
-                    + member_id.encoded_size()
-                    + protocol_name.encoded_size()
-                    + 1 // is_leader
-                    + 4 // members count
-                    + members.iter().map(|(mid, meta)| mid.encoded_size() + 4 + meta.len()).sum::<usize>()
-                    + 1 // phase_complete
-            }
-            MqResponse::GroupSynced { assignment, .. } => 4 + assignment.len() + 1,
-            MqResponse::DeadLettered {
-                dead_letter_ids, ..
-            } => 4 + dead_letter_ids.len() * 8 + 8,
-            MqResponse::RetainedMessages { messages } => {
-                4 + messages
-                    .iter()
-                    .map(|e| 4 + e.routing_key.len() + 4 + e.message.len())
-                    .sum::<usize>()
-            }
-            MqResponse::WillPending { .. } => 8 + 8,
-            MqResponse::SessionRestored {
-                subscription_data, ..
-            } => 8 + 8 + 4 + subscription_data.len(),
-            MqResponse::SessionNotFound => 0,
-            MqResponse::MultiMessages { groups } => {
-                4 + groups
-                    .iter()
-                    .map(|(_, msgs)| 8 + 4 + msgs.iter().map(|m| m.encoded_size()).sum::<usize>())
-                    .sum::<usize>()
-            }
-            MqResponse::TopicAliases { aliases } => {
-                4 + aliases
-                    .iter()
-                    .map(|a| 2 + a.topic_name.encoded_size())
-                    .sum::<usize>()
-            }
-            MqResponse::WillsFired { .. } => 4,
-            MqResponse::Committed { .. } => 8,
-        }
-    }
-}
-
-impl Decode for MqResponse {
-    fn decode<R: Read>(r: &mut R) -> Result<Self, CodecError> {
-        match u8::decode(r)? {
-            TAG_RESP_OK => Ok(MqResponse::Ok),
-            TAG_RESP_ERROR => Ok(MqResponse::Error(MqError::decode(r)?)),
-            TAG_RESP_ENTITY_CREATED => Ok(MqResponse::EntityCreated {
-                id: u64::decode(r)?,
-            }),
-            TAG_RESP_MESSAGES => {
-                let count = u32::decode(r)? as usize;
-                let mut messages = SmallVec::with_capacity(count.min(256));
-                for _ in 0..count {
-                    messages.push(DeliveredMessage::decode(r)?);
-                }
-                Ok(MqResponse::Messages { messages })
-            }
-            TAG_RESP_PUBLISHED => Ok(MqResponse::Published {
-                base_offset: u64::decode(r)?,
-                count: u64::decode(r)?,
-            }),
-            TAG_RESP_STATS => Ok(MqResponse::Stats(EntityStats::decode(r)?)),
-            TAG_RESP_BATCH => {
-                let count = u32::decode(r)? as usize;
-                let mut resps = SmallVec::with_capacity(count.min(256));
-                for _ in 0..count {
-                    resps.push(MqResponse::decode(r)?);
-                }
-                Ok(MqResponse::BatchResponse(Box::new(resps)))
-            }
-            TAG_RESP_GROUP_JOINED => {
-                let generation = i32::decode(r)?;
-                let leader = String::decode(r)?;
-                let member_id = String::decode(r)?;
-                let protocol_name = String::decode(r)?;
-                let is_leader = u8::decode(r)? != 0;
-                let count = u32::decode(r)? as usize;
-                let mut members = Vec::with_capacity(count.min(256));
-                for _ in 0..count {
-                    let mid = String::decode(r)?;
-                    let meta = decode_bytes_owned(r)?;
-                    members.push((mid, meta));
-                }
-                let phase_complete = u8::decode(r)? != 0;
-                Ok(MqResponse::GroupJoined {
-                    generation,
-                    leader,
-                    member_id,
-                    protocol_name,
-                    is_leader,
-                    members,
-                    phase_complete,
-                })
-            }
-            TAG_RESP_GROUP_SYNCED => {
-                let assignment = decode_bytes(r)?;
-                let phase_complete = u8::decode(r)? != 0;
-                Ok(MqResponse::GroupSynced {
-                    assignment,
-                    phase_complete,
-                })
-            }
-            TAG_RESP_DEAD_LETTERED => Ok(MqResponse::DeadLettered {
-                dead_letter_ids: decode_vec_u64(r)?,
-                dlq_topic_id: u64::decode(r)?,
-            }),
-            TAG_RESP_RETAINED_MESSAGES => {
-                let count = u32::decode(r)? as usize;
-                let mut messages = Vec::with_capacity(count.min(1024));
-                for _ in 0..count {
-                    let routing_key = decode_bytes_owned(r)?;
-                    let message = decode_bytes_owned(r)?;
-                    messages.push(RetainedEntry {
-                        routing_key,
-                        message,
-                    });
-                }
-                Ok(MqResponse::RetainedMessages { messages })
-            }
-            TAG_RESP_WILL_PENDING => Ok(MqResponse::WillPending {
-                session_id: u64::decode(r)?,
-                delay_ms: u64::decode(r)?,
-            }),
-            TAG_RESP_SESSION_RESTORED => Ok(MqResponse::SessionRestored {
-                session_id: u64::decode(r)?,
-                session_expiry_ms: u64::decode(r)?,
-                subscription_data: decode_bytes_owned(r)?,
-            }),
-            TAG_RESP_SESSION_NOT_FOUND => Ok(MqResponse::SessionNotFound),
-            TAG_RESP_MULTI_MESSAGES => {
-                let count = u32::decode(r)? as usize;
-                let mut groups = Vec::with_capacity(count.min(256));
-                for _ in 0..count {
-                    let group_id = u64::decode(r)?;
-                    let msg_count = u32::decode(r)? as usize;
-                    let mut messages = SmallVec::with_capacity(msg_count.min(256));
-                    for _ in 0..msg_count {
-                        messages.push(DeliveredMessage::decode(r)?);
-                    }
-                    groups.push((group_id, messages));
-                }
-                Ok(MqResponse::MultiMessages { groups })
-            }
-            TAG_RESP_TOPIC_ALIASES => {
-                let count = u32::decode(r)? as usize;
-                let mut aliases = Vec::with_capacity(count.min(256));
-                for _ in 0..count {
-                    aliases.push(TopicAliasEntry {
-                        alias: u16::decode(r)?,
-                        topic_name: String::decode(r)?,
-                    });
-                }
-                Ok(MqResponse::TopicAliases { aliases })
-            }
-            TAG_RESP_WILLS_FIRED => Ok(MqResponse::WillsFired {
-                count: u32::decode(r)?,
-            }),
-            TAG_RESP_COMMITTED => Ok(MqResponse::Committed {
-                log_index: u64::decode(r)?,
-            }),
-            t => Err(CodecError::InvalidDiscriminant(t)),
-        }
-    }
-}
-
-impl BorrowPayload for MqResponse {
-    fn payload_bytes(&self) -> &[u8] {
-        &[]
-    }
-}
-
-// =============================================================================
 // Tests
 // =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn roundtrip_resp(resp: &MqResponse) -> MqResponse {
-        let encoded = resp.encode_to_vec().unwrap();
-        MqResponse::decode_from_slice(&encoded).unwrap()
-    }
+    use bytes::BytesMut;
 
     #[test]
     fn publish_roundtrip() {
-        let cmd = MqCommand::publish(
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(
+            &mut buf,
             42,
             &[Bytes::from_static(b"hello"), Bytes::from_static(b"world")],
         );
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_publish();
         assert_eq!(v.topic_id(), 42);
         let msgs: Vec<Bytes> = v.messages().collect();
@@ -4090,15 +3664,18 @@ mod tests {
 
     #[test]
     fn create_topic_roundtrip() {
-        let cmd = MqCommand::create_topic(
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(
+            &mut buf,
             "my-topic",
-            RetentionPolicy {
+            &RetentionPolicy {
                 max_age_secs: Some(3600),
                 max_bytes: None,
                 max_messages: Some(1_000_000),
             },
             8,
         );
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_topic();
         assert_eq!(v.name(), "my-topic");
         let ret = v.retention();
@@ -4110,12 +3687,16 @@ mod tests {
 
     #[test]
     fn batch_roundtrip() {
-        let cmds = vec![
-            MqCommand::delete_topic(1),
-            MqCommand::publish(2, &[Bytes::from_static(b"msg")]),
-            MqCommand::heartbeat_session(99),
-        ];
-        let cmd = MqCommand::batch(&cmds);
+        let mut buf = BytesMut::new();
+        MqCommand::write_delete_topic(&mut buf, 1);
+        let c1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 2, &[Bytes::from_static(b"msg")]);
+        let c2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_heartbeat_session(&mut buf, 99);
+        let c3 = MqCommand::split_from(&mut buf);
+        let cmds = vec![c1, c2, c3];
+        MqCommand::write_batch(&mut buf, &cmds);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_batch();
         assert_eq!(v.count(), 3);
         let sub_cmds: Vec<&[u8]> = v.commands().collect();
@@ -4132,37 +3713,14 @@ mod tests {
     }
 
     #[test]
-    fn response_roundtrips() {
-        let cases: Vec<MqResponse> = vec![
-            MqResponse::Ok,
-            MqResponse::Error(MqError::NotFound {
-                entity: EntityKind::Topic,
-                id: 42,
-            }),
-            MqResponse::EntityCreated { id: 7 },
-            MqResponse::Published {
-                base_offset: 1,
-                count: 3,
-            },
-            MqResponse::DeadLettered {
-                dead_letter_ids: smallvec::smallvec![10, 20],
-                dlq_topic_id: 99,
-            },
-        ];
-        for resp in &cases {
-            let decoded = roundtrip_resp(resp);
-            let enc1 = resp.encode_to_vec().unwrap();
-            let enc2 = decoded.encode_to_vec().unwrap();
-            assert_eq!(enc1, enc2, "roundtrip mismatch for {:?}", resp);
-        }
-    }
-
-    #[test]
     fn publish_messages_zero_copy() {
-        let cmd = MqCommand::publish(
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(
+            &mut buf,
             42,
             &[Bytes::from_static(b"aaa"), Bytes::from_static(b"bbbbb")],
         );
+        let cmd = MqCommand::split_from(&mut buf);
 
         assert_eq!(cmd.tag(), MqCommand::TAG_PUBLISH);
         assert_eq!(cmd.as_publish().topic_id(), 42);
@@ -4175,21 +3733,27 @@ mod tests {
 
     #[test]
     fn publish_messages_for_topic_filter() {
-        let cmd = MqCommand::publish(7, &[Bytes::from_static(b"x")]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 7, &[Bytes::from_static(b"x")]);
+        let cmd = MqCommand::split_from(&mut buf);
         assert!(cmd.publish_messages_for_topic(7).is_some());
         assert!(cmd.publish_messages_for_topic(8).is_none());
     }
 
     #[test]
     fn non_publish_returns_none() {
-        let cmd = MqCommand::delete_topic(1);
+        let mut buf = BytesMut::new();
+        MqCommand::write_delete_topic(&mut buf, 1);
+        let cmd = MqCommand::split_from(&mut buf);
         assert!(cmd.publish_messages().is_none());
         assert!(cmd.publish_messages_for_topic(1).is_none());
     }
 
     #[test]
     fn create_exchange_view() {
-        let cmd = MqCommand::create_exchange("my-exchange", ExchangeType::Topic);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_exchange(&mut buf, "my-exchange", ExchangeType::Topic);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_exchange();
         assert_eq!(v.name(), "my-exchange");
         assert_eq!(v.exchange_type(), ExchangeType::Topic);
@@ -4197,7 +3761,9 @@ mod tests {
 
     #[test]
     fn create_binding_view() {
-        let cmd = MqCommand::create_binding(1, 2, Some("routing.key"));
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_binding(&mut buf, 1, 2, Some("routing.key"));
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_binding();
         assert_eq!(v.exchange_id(), 1);
         assert_eq!(v.topic_id(), 2);
@@ -4206,20 +3772,29 @@ mod tests {
 
     #[test]
     fn display_format() {
+        let mut buf = BytesMut::new();
+
+        MqCommand::write_create_topic(&mut buf, "events", &RetentionPolicy::default(), 0);
+        let cmd_create = MqCommand::split_from(&mut buf);
+
+        MqCommand::write_delete_topic(&mut buf, 42);
+        let cmd_delete = MqCommand::split_from(&mut buf);
+
+        MqCommand::write_publish_bytes(
+            &mut buf,
+            1,
+            &[crate::flat::FlatMessageBuilder::new(b"x").build()],
+        );
+        let cmd_publish = MqCommand::split_from(&mut buf);
+
+        MqCommand::write_heartbeat_session(&mut buf, 99);
+        let cmd_heartbeat = MqCommand::split_from(&mut buf);
+
         let cases: Vec<(MqCommand, &str)> = vec![
-            (
-                MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-                "CreateTopic(events)",
-            ),
-            (MqCommand::delete_topic(42), "DeleteTopic(42)"),
-            (
-                MqCommand::publish(1, &[crate::flat::FlatMessageBuilder::new(b"x").build()]),
-                "Publish(topic=1, count=1)",
-            ),
-            (
-                MqCommand::heartbeat_session(99),
-                "HeartbeatSession(session=99)",
-            ),
+            (cmd_create, "CreateTopic(events)"),
+            (cmd_delete, "DeleteTopic(42)"),
+            (cmd_publish, "Publish(topic=1, count=1)"),
+            (cmd_heartbeat, "HeartbeatSession(session=99)"),
         ];
 
         for (cmd, expected) in cases {
@@ -4229,15 +3804,20 @@ mod tests {
 
     #[test]
     fn consumer_group_command_roundtrips() {
-        let cmd = MqCommand::create_consumer_group("my-group", 1);
+        let mut buf = BytesMut::new();
+
+        MqCommand::write_create_consumer_group(&mut buf, "my-group", 1);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_consumer_group();
         assert_eq!(v.name(), "my-group");
         assert_eq!(v.auto_offset_reset(), 1);
 
-        let cmd = MqCommand::delete_consumer_group(42);
+        MqCommand::write_delete_consumer_group(&mut buf, 42);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.field_u64(8), 42);
 
-        let cmd = MqCommand::commit_group_offset(10, 3, 20, 0, 100, Some("md"), 5000);
+        MqCommand::write_commit_group_offset(&mut buf, 10, 3, 20, 0, 100, Some("md"), 5000);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_commit_group_offset();
         assert_eq!(v.group_id(), 10);
         assert_eq!(v.generation(), 3);
@@ -4247,12 +3827,14 @@ mod tests {
         assert_eq!(v.metadata(), Some("md"));
         assert_eq!(v.timestamp(), 5000);
 
-        let cmd = MqCommand::commit_group_offset(10, 3, 20, 0, 100, None, 5000);
+        MqCommand::write_commit_group_offset(&mut buf, 10, 3, 20, 0, 100, None, 5000);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_commit_group_offset();
         assert_eq!(v.metadata(), None);
         assert_eq!(v.timestamp(), 5000);
 
-        let cmd = MqCommand::join_consumer_group(
+        MqCommand::write_join_consumer_group(
+            &mut buf,
             10,
             "member-1",
             "client-1",
@@ -4261,6 +3843,7 @@ mod tests {
             "consumer",
             &[("range", b"\x01\x02"), ("roundrobin", b"\x03")],
         );
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_join_consumer_group();
         assert_eq!(v.group_id(), 10);
         assert_eq!(v.member_id(), "member-1");
@@ -4272,12 +3855,14 @@ mod tests {
         assert_eq!(protocols[0].0, "range");
         assert_eq!(protocols[1].0, "roundrobin");
 
-        let cmd = MqCommand::sync_consumer_group(
+        MqCommand::write_sync_consumer_group(
+            &mut buf,
             10,
             5,
             "member-1",
             &[("member-1", b"assign-1"), ("member-2", b"assign-2")],
         );
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_sync_consumer_group();
         assert_eq!(v.group_id(), 10);
         assert_eq!(v.generation(), 5);
@@ -4285,12 +3870,14 @@ mod tests {
         let assignments = v.assignments();
         assert_eq!(assignments.len(), 2);
 
-        let cmd = MqCommand::leave_consumer_group(10, "member-1");
+        MqCommand::write_leave_consumer_group(&mut buf, 10, "member-1");
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_leave_consumer_group();
         assert_eq!(v.group_id(), 10);
         assert_eq!(v.member_id(), "member-1");
 
-        let cmd = MqCommand::heartbeat_consumer_group(10, "member-1", 7);
+        MqCommand::write_heartbeat_consumer_group(&mut buf, 10, "member-1", 7);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_heartbeat_consumer_group();
         assert_eq!(v.group_id(), 10);
         assert_eq!(v.member_id(), "member-1");
@@ -4298,82 +3885,33 @@ mod tests {
     }
 
     #[test]
-    fn consumer_group_response_roundtrips() {
-        let resp = MqResponse::GroupJoined {
-            generation: 3,
-            leader: "m-1".to_string(),
-            member_id: "m-2".to_string(),
-            protocol_name: "range".to_string(),
-            is_leader: false,
-            members: vec![("m-1".to_string(), Bytes::from_static(&[1, 2, 3]))],
-            phase_complete: true,
-        };
-        let decoded = roundtrip_resp(&resp);
-        match decoded {
-            MqResponse::GroupJoined {
-                generation,
-                leader,
-                member_id,
-                protocol_name,
-                is_leader,
-                members,
-                phase_complete,
-            } => {
-                assert_eq!(generation, 3);
-                assert_eq!(leader, "m-1");
-                assert_eq!(member_id, "m-2");
-                assert_eq!(protocol_name, "range");
-                assert!(!is_leader);
-                assert_eq!(members.len(), 1);
-                assert!(phase_complete);
-            }
-            _ => panic!("wrong variant"),
-        }
-
-        let resp = MqResponse::GroupSynced {
-            assignment: vec![4, 5, 6],
-            phase_complete: false,
-        };
-        let decoded = roundtrip_resp(&resp);
-        match decoded {
-            MqResponse::GroupSynced {
-                assignment,
-                phase_complete,
-            } => {
-                assert_eq!(assignment, vec![4, 5, 6]);
-                assert!(!phase_complete);
-            }
-            _ => panic!("wrong variant"),
-        }
-
-        let resp = MqResponse::Error(MqError::IllegalGeneration);
-        match roundtrip_resp(&resp) {
-            MqResponse::Error(MqError::IllegalGeneration) => {}
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn group_ack_variant_roundtrips() {
-        let cmd = MqCommand::group_deliver(5, 10, 100);
+        let mut buf = BytesMut::new();
+
+        MqCommand::write_group_deliver(&mut buf, 5, 10, 100);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_GROUP_DELIVER);
         assert_eq!(cmd.field_u64(8), 5);
         assert_eq!(cmd.field_u64(16), 10);
         assert_eq!(cmd.field_u32(24), 100);
 
-        let cmd = MqCommand::group_ack(5, &[1, 2, 3], None);
+        MqCommand::write_group_ack(&mut buf, 5, &[1, 2, 3], None);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_GROUP_ACK);
         assert_eq!(cmd.field_u64(8), 5);
         let ids = cmd.field_vec_u64(16);
         assert_eq!(&*ids, &[1, 2, 3]);
 
-        let cmd = MqCommand::group_nack(7, &[10, 20]);
+        MqCommand::write_group_nack(&mut buf, 7, &[10, 20]);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_GROUP_NACK);
 
-        let cmd = MqCommand::group_extend_visibility(3, &[1], 5000);
+        MqCommand::write_group_extend_visibility(&mut buf, 3, &[1], 5000);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_GROUP_EXTEND_VISIBILITY);
 
-        let cmd = MqCommand::group_publish_to_dlq(1, 2, &[10], &[Bytes::from_static(b"dead")]);
+        MqCommand::write_group_publish_to_dlq(&mut buf, 1, 2, &[10], &[b"dead".as_ref()]);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_GROUP_PUBLISH_TO_DLQ);
         let v = cmd.as_publish_to_dlq();
         assert_eq!(v.source_group_id(), 1);
@@ -4382,29 +3920,39 @@ mod tests {
 
     #[test]
     fn session_command_roundtrips() {
-        let cmd = MqCommand::create_session(1, "client-1", 30000, 3600000);
+        let mut buf = BytesMut::new();
+
+        MqCommand::write_create_session(&mut buf, 1, "client-1", 30000, 3600000);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_CREATE_SESSION);
         assert_eq!(cmd.field_u64(8), 1);
 
-        let cmd = MqCommand::disconnect_session(1, true);
+        MqCommand::write_disconnect_session(&mut buf, 1, true);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_DISCONNECT_SESSION);
         assert_eq!(cmd.field_u64(8), 1);
 
-        let cmd = MqCommand::heartbeat_session(1);
+        MqCommand::write_heartbeat_session(&mut buf, 1);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_HEARTBEAT_SESSION);
         assert_eq!(cmd.field_u64(8), 1);
     }
 
     #[test]
     fn cron_command_roundtrips() {
-        let cmd = MqCommand::cron_enable(5);
+        let mut buf = BytesMut::new();
+
+        MqCommand::write_cron_enable(&mut buf, 5);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_CRON_ENABLE);
         assert_eq!(cmd.field_u64(8), 5);
 
-        let cmd = MqCommand::cron_disable(5);
+        MqCommand::write_cron_disable(&mut buf, 5);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_CRON_DISABLE);
 
-        let cmd = MqCommand::cron_trigger(5, 12345);
+        MqCommand::write_cron_trigger(&mut buf, 5, 12345);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_CRON_TRIGGER);
         assert_eq!(cmd.field_u64(8), 5);
         assert_eq!(cmd.field_u64(16), 12345);
@@ -4416,7 +3964,9 @@ mod tests {
 
     #[test]
     fn v2_header_layout() {
-        let cmd = MqCommand::delete_topic(42);
+        let mut buf = BytesMut::new();
+        MqCommand::write_delete_topic(&mut buf, 42);
+        let cmd = MqCommand::split_from(&mut buf);
         let buf = cmd.as_bytes();
         // [size:4][fixed:2][tag:1][flags:1]
         let size = u32::from_le_bytes(buf[0..4].try_into().unwrap());
@@ -4430,16 +3980,21 @@ mod tests {
 
     #[test]
     fn v2_header_flags() {
-        let cmd = MqCommand::disconnect_session(1, true);
+        let mut buf = BytesMut::new();
+        MqCommand::write_disconnect_session(&mut buf, 1, true);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.flags(), 1);
-        let cmd = MqCommand::disconnect_session(1, false);
+        MqCommand::write_disconnect_session(&mut buf, 1, false);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.flags(), 0);
     }
 
     #[test]
     fn v2_flex8_inline_small() {
         // Strings ≤ 7 bytes are stored inline
-        let cmd = MqCommand::create_topic("abc", RetentionPolicy::default(), 1);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "abc", &RetentionPolicy::default(), 1);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_topic();
         assert_eq!(v.name(), "abc");
         // Verify it's inline: bit 0 = 0, len = byte >> 1
@@ -4452,7 +4007,9 @@ mod tests {
         // Strings > 7 bytes go to flex region
         let long_name = "this-is-a-very-long-topic-name";
         assert!(long_name.len() > 7);
-        let cmd = MqCommand::create_topic(long_name, RetentionPolicy::default(), 1);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, long_name, &RetentionPolicy::default(), 1);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_topic();
         assert_eq!(v.name(), long_name);
         // Verify it's in flex: bit 0 = 1
@@ -4462,7 +4019,9 @@ mod tests {
     #[test]
     fn v2_flex8_exactly_7_bytes() {
         let name = "1234567"; // exactly 7 bytes
-        let cmd = MqCommand::create_topic(name, RetentionPolicy::default(), 1);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, name, &RetentionPolicy::default(), 1);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_topic();
         assert_eq!(v.name(), name);
         // Should be inline: bit 0 = 0, len = 7
@@ -4473,7 +4032,9 @@ mod tests {
     #[test]
     fn v2_flex8_8_bytes_goes_to_flex() {
         let name = "12345678"; // 8 bytes — too large for inline
-        let cmd = MqCommand::create_topic(name, RetentionPolicy::default(), 1);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, name, &RetentionPolicy::default(), 1);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_topic();
         assert_eq!(v.name(), name);
         // Should be in flex region: bit 0 = 1
@@ -4482,14 +4043,18 @@ mod tests {
 
     #[test]
     fn v2_flex8_empty() {
-        let cmd = MqCommand::create_topic("", RetentionPolicy::default(), 1);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "", &RetentionPolicy::default(), 1);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_topic();
         assert_eq!(v.name(), "");
     }
 
     #[test]
     fn v2_vec_bytes_empty() {
-        let cmd = MqCommand::publish(1, &[]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[]);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_publish();
         assert_eq!(v.topic_id(), 1);
         assert_eq!(v.message_count(), 0);
@@ -4499,7 +4064,9 @@ mod tests {
 
     #[test]
     fn v2_vec_bytes_single() {
-        let cmd = MqCommand::publish(1, &[Bytes::from_static(b"single")]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"single")]);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_publish();
         assert_eq!(v.message_count(), 1);
         let msgs: Vec<Bytes> = v.messages().collect();
@@ -4512,7 +4079,9 @@ mod tests {
         let messages: Vec<Bytes> = (0..100)
             .map(|i| Bytes::from(format!("message-{i}")))
             .collect();
-        let cmd = MqCommand::publish(42, &messages);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 42, &messages);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_publish();
         assert_eq!(v.topic_id(), 42);
         assert_eq!(v.message_count(), 100);
@@ -4530,7 +4099,9 @@ mod tests {
             Bytes::from_static(b"one"),
             Bytes::from_static(b"two"),
         ];
-        let cmd = MqCommand::publish(1, &messages);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &messages);
+        let cmd = MqCommand::split_from(&mut buf);
         // Random access via field_vec_bytes_get
         assert_eq!(cmd.field_vec_bytes_get(16, 0), b"zero");
         assert_eq!(cmd.field_vec_bytes_get(16, 1), b"one");
@@ -4544,7 +4115,9 @@ mod tests {
             Bytes::from_static(b"b"),
             Bytes::from_static(b"c"),
         ];
-        let cmd = MqCommand::publish(1, &messages);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &messages);
+        let cmd = MqCommand::split_from(&mut buf);
         let mut iter = cmd.as_publish().messages();
         assert_eq!(iter.remaining(), 3);
         iter.next();
@@ -4559,14 +4132,18 @@ mod tests {
     #[test]
     fn v2_vec_u64_roundtrip() {
         let ids = vec![1u64, 2, 3, 100, u64::MAX];
-        let cmd = MqCommand::group_ack(42, &ids, None);
+        let mut buf = BytesMut::new();
+        MqCommand::write_group_ack(&mut buf, 42, &ids, None);
+        let cmd = MqCommand::split_from(&mut buf);
         let decoded = cmd.field_vec_u64(16);
         assert_eq!(&*decoded, &ids);
     }
 
     #[test]
     fn v2_vec_u64_empty() {
-        let cmd = MqCommand::group_ack(42, &[], None);
+        let mut buf = BytesMut::new();
+        MqCommand::write_group_ack(&mut buf, 42, &[], None);
+        let cmd = MqCommand::split_from(&mut buf);
         let decoded = cmd.field_vec_u64(16);
         assert!(decoded.is_empty());
     }
@@ -4578,7 +4155,9 @@ mod tests {
             max_bytes: Some(1_000_000),
             max_messages: Some(100_000),
         };
-        let cmd = MqCommand::create_topic("t", retention.clone(), 4);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "t", &retention, 4);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_topic();
         let decoded_ret = v.retention();
         assert_eq!(decoded_ret.max_age_secs, retention.max_age_secs);
@@ -4588,7 +4167,9 @@ mod tests {
 
     #[test]
     fn v2_blob_default() {
-        let cmd = MqCommand::create_topic("t", RetentionPolicy::default(), 1);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "t", &RetentionPolicy::default(), 1);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_topic();
         let ret = v.retention();
         assert_eq!(ret.max_age_secs, None);
@@ -4599,8 +4180,14 @@ mod tests {
     #[test]
     fn v2_batch_self_sized() {
         // Verify batch sub-commands are self-sized (size in first 4 bytes)
-        let cmds = vec![MqCommand::delete_topic(1), MqCommand::delete_topic(2)];
-        let batch = MqCommand::batch(&cmds);
+        let mut buf = BytesMut::new();
+        MqCommand::write_delete_topic(&mut buf, 1);
+        let c1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_delete_topic(&mut buf, 2);
+        let c2 = MqCommand::split_from(&mut buf);
+        let cmds = vec![c1, c2];
+        MqCommand::write_batch(&mut buf, &cmds);
+        let batch = MqCommand::split_from(&mut buf);
         let buf = batch.as_bytes();
         // batch header: [size:4][fixed:2][tag:1][flags:1][count:4][pad:4]
         let count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
@@ -4615,12 +4202,16 @@ mod tests {
     #[test]
     fn v2_batch_alignment() {
         // Sub-commands in batch should be padded to 8-byte boundaries
-        let cmds = vec![
-            MqCommand::delete_topic(1),
-            MqCommand::heartbeat_session(2),
-            MqCommand::delete_topic(3),
-        ];
-        let batch = MqCommand::batch(&cmds);
+        let mut buf = BytesMut::new();
+        MqCommand::write_delete_topic(&mut buf, 1);
+        let c1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_heartbeat_session(&mut buf, 2);
+        let c2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_delete_topic(&mut buf, 3);
+        let c3 = MqCommand::split_from(&mut buf);
+        let cmds = vec![c1, c2, c3];
+        MqCommand::write_batch(&mut buf, &cmds);
+        let batch = MqCommand::split_from(&mut buf);
         let v = batch.as_batch();
         let sub_cmds: Vec<&[u8]> = v.commands().collect();
         assert_eq!(sub_cmds.len(), 3);
@@ -4631,12 +4222,16 @@ mod tests {
 
     #[test]
     fn v2_batch_with_variable_size_subcmds() {
-        let cmds = vec![
-            MqCommand::create_topic("short", RetentionPolicy::default(), 1),
-            MqCommand::publish(1, &[Bytes::from_static(b"hello world data")]),
-            MqCommand::delete_topic(99),
-        ];
-        let batch = MqCommand::batch(&cmds);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "short", &RetentionPolicy::default(), 1);
+        let c1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"hello world data")]);
+        let c2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_delete_topic(&mut buf, 99);
+        let c3 = MqCommand::split_from(&mut buf);
+        let cmds = vec![c1, c2, c3];
+        MqCommand::write_batch(&mut buf, &cmds);
+        let batch = MqCommand::split_from(&mut buf);
         let sub_cmds: Vec<&[u8]> = batch.as_batch().commands().collect();
         assert_eq!(sub_cmds.len(), 3);
         assert_eq!(
@@ -4657,19 +4252,23 @@ mod tests {
 
     #[test]
     fn v2_command_builder_size_field() {
-        // The size field at offset 0 should equal total buffer length
-        let cmd = MqCommand::publish(1, &[Bytes::from_static(b"test")]);
-        let buf = cmd.as_bytes();
-        let size = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        assert_eq!(size as usize, buf.len());
+        // The size field at offset 0 should equal total encoded size (buf + extra).
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"test")]);
+        let cmd = MqCommand::split_from(&mut buf);
+        let bytes = cmd.as_bytes();
+        let size = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(size as usize, cmd.total_encoded_size());
     }
 
     #[test]
     fn v2_command_builder_fixed_field() {
         // The fixed field at offset 4 should be a multiple of 8
-        let cmd = MqCommand::create_topic("x", RetentionPolicy::default(), 1);
-        let buf = cmd.as_bytes();
-        let fixed = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "x", &RetentionPolicy::default(), 1);
+        let cmd = MqCommand::split_from(&mut buf);
+        let bytes = cmd.as_bytes();
+        let fixed = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         assert_eq!(fixed as usize % 8, 0);
         assert!(fixed >= 8);
     }
@@ -4677,31 +4276,42 @@ mod tests {
     #[test]
     fn v2_all_simple_entity_commands() {
         // Test all commands that just have @8 entity_id:u64
-        let test_cases: Vec<(fn(u64) -> MqCommand, u8)> = vec![
-            (MqCommand::delete_topic, MqCommand::TAG_DELETE_TOPIC),
-            (MqCommand::delete_exchange, MqCommand::TAG_DELETE_EXCHANGE),
-            (MqCommand::delete_binding, MqCommand::TAG_DELETE_BINDING),
+        let mut buf = BytesMut::new();
+
+        let cases: &[(fn(&mut BytesMut, u64), u8)] = &[
+            (MqCommand::write_delete_topic, MqCommand::TAG_DELETE_TOPIC),
             (
-                MqCommand::delete_consumer_group,
+                MqCommand::write_delete_exchange,
+                MqCommand::TAG_DELETE_EXCHANGE,
+            ),
+            (
+                MqCommand::write_delete_binding,
+                MqCommand::TAG_DELETE_BINDING,
+            ),
+            (
+                MqCommand::write_delete_consumer_group,
                 MqCommand::TAG_DELETE_CONSUMER_GROUP,
             ),
             (
-                MqCommand::heartbeat_session,
+                MqCommand::write_heartbeat_session,
                 MqCommand::TAG_HEARTBEAT_SESSION,
             ),
-            (MqCommand::cron_enable, MqCommand::TAG_CRON_ENABLE),
-            (MqCommand::cron_disable, MqCommand::TAG_CRON_DISABLE),
+            (MqCommand::write_cron_enable, MqCommand::TAG_CRON_ENABLE),
+            (MqCommand::write_cron_disable, MqCommand::TAG_CRON_DISABLE),
         ];
-        for (ctor, expected_tag) in test_cases {
-            let cmd = ctor(12345);
-            assert_eq!(cmd.tag(), expected_tag);
+        for (write_fn, expected_tag) in cases {
+            write_fn(&mut buf, 12345);
+            let cmd = MqCommand::split_from(&mut buf);
+            assert_eq!(cmd.tag(), *expected_tag);
             assert_eq!(cmd.field_u64(8), 12345);
         }
     }
 
     #[test]
     fn v2_create_session_full() {
-        let cmd = MqCommand::create_session(99, "my-client-id", 30_000, 3_600_000);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_session(&mut buf, 99, "my-client-id", 30_000, 3_600_000);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_CREATE_SESSION);
         assert_eq!(cmd.field_u64(8), 99);
         assert_eq!(cmd.field_u64(16), 30_000);
@@ -4711,12 +4321,14 @@ mod tests {
 
     #[test]
     fn v2_exchange_roundtrip() {
+        let mut buf = BytesMut::new();
         for (name, etype) in [
             ("direct-ex", ExchangeType::Direct),
             ("fanout-ex", ExchangeType::Fanout),
             ("topic-ex", ExchangeType::Topic),
         ] {
-            let cmd = MqCommand::create_exchange(name, etype);
+            MqCommand::write_create_exchange(&mut buf, name, etype);
+            let cmd = MqCommand::split_from(&mut buf);
             let v = cmd.as_create_exchange();
             assert_eq!(v.name(), name);
             assert_eq!(v.exchange_type(), etype);
@@ -4725,7 +4337,9 @@ mod tests {
 
     #[test]
     fn v2_binding_with_all_opts() {
-        let cmd = MqCommand::create_binding_with_opts(
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_binding_with_opts(
+            &mut buf,
             10,
             20,
             Some("my.routing.key.pattern"),
@@ -4733,6 +4347,7 @@ mod tests {
             Some("shared-group-name"),
             Some(42),
         );
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_binding();
         assert_eq!(v.exchange_id(), 10);
         assert_eq!(v.topic_id(), 20);
@@ -4744,7 +4359,9 @@ mod tests {
 
     #[test]
     fn v2_binding_minimal() {
-        let cmd = MqCommand::create_binding(1, 2, None);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_binding(&mut buf, 1, 2, None);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_create_binding();
         assert_eq!(v.exchange_id(), 1);
         assert_eq!(v.topic_id(), 2);
@@ -4757,7 +4374,9 @@ mod tests {
     #[test]
     fn v2_publish_to_exchange_roundtrip() {
         let msgs = vec![Bytes::from_static(b"msg-a"), Bytes::from_static(b"msg-b")];
-        let cmd = MqCommand::publish_to_exchange(55, &msgs);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_to_exchange_bytes(&mut buf, 55, &msgs);
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_publish_to_exchange();
         assert_eq!(v.exchange_id(), 55);
         let decoded: Vec<Bytes> = v.messages().collect();
@@ -4768,7 +4387,9 @@ mod tests {
 
     #[test]
     fn v2_group_deliver_roundtrip() {
-        let cmd = MqCommand::group_deliver(100, 200, 50);
+        let mut buf = BytesMut::new();
+        MqCommand::write_group_deliver(&mut buf, 100, 200, 50);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.field_u64(8), 100);
         assert_eq!(cmd.field_u64(16), 200);
         assert_eq!(cmd.field_u32(24), 50);
@@ -4776,7 +4397,9 @@ mod tests {
 
     #[test]
     fn v2_group_extend_visibility_roundtrip() {
-        let cmd = MqCommand::group_extend_visibility(7, &[10, 20, 30], 60000);
+        let mut buf = BytesMut::new();
+        MqCommand::write_group_extend_visibility(&mut buf, 7, &[10, 20, 30], 60000);
+        let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_GROUP_EXTEND_VISIBILITY);
         assert_eq!(cmd.field_u64(8), 7);
         let ids = cmd.field_vec_u64(16);
@@ -4786,12 +4409,15 @@ mod tests {
 
     #[test]
     fn v2_publish_to_dlq_roundtrip() {
-        let cmd = MqCommand::group_publish_to_dlq(
+        let mut buf = BytesMut::new();
+        MqCommand::write_group_publish_to_dlq(
+            &mut buf,
             10,
             20,
             &[100, 200],
-            &[Bytes::from_static(b"dead-1"), Bytes::from_static(b"dead-2")],
+            &[b"dead-1".as_ref(), b"dead-2".as_ref()],
         );
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_publish_to_dlq();
         assert_eq!(v.source_group_id(), 10);
         assert_eq!(v.dlq_topic_id(), 20);
@@ -4806,7 +4432,9 @@ mod tests {
     #[test]
     fn v2_serde_roundtrip() {
         // MqCommand implements Serialize/Deserialize for Raft AppData
-        let cmd = MqCommand::publish(42, &[Bytes::from_static(b"serde-test")]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 42, &[Bytes::from_static(b"serde-test")]);
+        let cmd = MqCommand::split_from(&mut buf);
         let serialized = serde_json::to_vec(&cmd).unwrap();
         let deserialized: MqCommand = serde_json::from_slice(&serialized).unwrap();
         assert_eq!(deserialized.tag(), MqCommand::TAG_PUBLISH);
@@ -4818,7 +4446,9 @@ mod tests {
     #[test]
     fn v2_encode_decode_roundtrip() {
         // Test Encode/Decode traits (for Raft)
-        let cmd = MqCommand::create_topic("raft-test", RetentionPolicy::default(), 4);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "raft-test", &RetentionPolicy::default(), 4);
+        let cmd = MqCommand::split_from(&mut buf);
         let encoded = cmd.encode_to_vec().unwrap();
         let decoded = MqCommand::decode_from_slice(&encoded).unwrap();
         assert_eq!(decoded.tag(), MqCommand::TAG_CREATE_TOPIC);
@@ -4828,7 +4458,9 @@ mod tests {
 
     #[test]
     fn v2_vec_kv_join_consumer_group() {
-        let cmd = MqCommand::join_consumer_group(
+        let mut buf = BytesMut::new();
+        MqCommand::write_join_consumer_group(
+            &mut buf,
             1,
             "m1",
             "c1",
@@ -4837,6 +4469,7 @@ mod tests {
             "consumer",
             &[("range", b"\x01"), ("sticky", b"\x02\x03")],
         );
+        let cmd = MqCommand::split_from(&mut buf);
         let v = cmd.as_join_consumer_group();
         assert_eq!(v.group_id(), 1);
         assert_eq!(v.member_id(), "m1");
@@ -4855,8 +4488,15 @@ mod tests {
     #[test]
     fn v2_large_batch() {
         // Test batch with many sub-commands
-        let cmds: Vec<MqCommand> = (0..50).map(|i| MqCommand::delete_topic(i)).collect();
-        let batch = MqCommand::batch(&cmds);
+        let mut buf = BytesMut::new();
+        let cmds: Vec<MqCommand> = (0..50)
+            .map(|i| {
+                MqCommand::write_delete_topic(&mut buf, i);
+                MqCommand::split_from(&mut buf)
+            })
+            .collect();
+        MqCommand::write_batch(&mut buf, &cmds);
+        let batch = MqCommand::split_from(&mut buf);
         let v = batch.as_batch();
         assert_eq!(v.count(), 50);
         let sub_cmds: Vec<&[u8]> = v.commands().collect();
@@ -4875,19 +4515,22 @@ mod tests {
             Bytes::from_static(b"foo bar baz"),
         ];
 
-        let contiguous = MqCommand::publish(42, &msgs);
-        let scatter = MqCommand::publish_scatter(42, msgs.clone());
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 42, &msgs);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 42, &msgs);
+        let cmd2 = MqCommand::split_from(&mut buf);
 
         // Encoded sizes must match
-        assert_eq!(contiguous.encoded_size(), scatter.encoded_size());
+        assert_eq!(cmd1.encoded_size(), cmd2.encoded_size());
 
         // Encoded bytes must be identical
-        let c_bytes = contiguous.encode_to_vec().unwrap();
-        let s_bytes = scatter.encode_to_vec().unwrap();
-        assert_eq!(c_bytes, s_bytes);
+        let b1 = cmd1.encode_to_vec().unwrap();
+        let b2 = cmd2.encode_to_vec().unwrap();
+        assert_eq!(b1, b2);
 
         // Decode the encoded bytes and verify field access works
-        let decoded = MqCommand::decode_from_bytes(Bytes::from(s_bytes)).unwrap();
+        let decoded = MqCommand::decode_from_bytes(Bytes::from(b2)).unwrap();
         let v = decoded.as_publish();
         assert_eq!(v.topic_id(), 42);
         let decoded_msgs: Vec<Bytes> = v.messages().collect();
@@ -4899,24 +4542,28 @@ mod tests {
 
     #[test]
     fn publish_scatter_empty() {
-        let contiguous = MqCommand::publish(99, &[]);
-        let scatter = MqCommand::publish_scatter(99, vec![]);
-        assert_eq!(
-            contiguous.encode_to_vec().unwrap(),
-            scatter.encode_to_vec().unwrap()
-        );
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 99, &[]);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 99, &[]);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        assert_eq!(cmd1.encode_to_vec().unwrap(), cmd2.encode_to_vec().unwrap());
     }
 
     #[test]
     fn batch_with_scatter_subcommands() {
         let msgs: Vec<Bytes> = vec![Bytes::from_static(b"aaa"), Bytes::from_static(b"bbb")];
 
-        // Batch containing publish_scatter and contiguous commands
-        let scatter_pub = MqCommand::publish_scatter(1, msgs.clone());
-        let contiguous_pub = MqCommand::publish(2, &msgs);
-        let delete = MqCommand::delete_topic(3);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &msgs);
+        let pub1_cmd = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 2, &msgs);
+        let pub2_cmd = MqCommand::split_from(&mut buf);
+        MqCommand::write_delete_topic(&mut buf, 3);
+        let delete = MqCommand::split_from(&mut buf);
 
-        let batch = MqCommand::batch(&[scatter_pub, contiguous_pub, delete]);
+        MqCommand::write_batch(&mut buf, &[pub1_cmd, pub2_cmd, delete]);
+        let batch = MqCommand::split_from(&mut buf);
         let v = batch.as_batch();
         assert_eq!(v.count(), 3);
 
@@ -4941,12 +4588,15 @@ mod tests {
     #[test]
     fn collect_publish_messages_equivalence() {
         let msgs: Vec<Bytes> = vec![Bytes::from_static(b"x"), Bytes::from_static(b"yy")];
-        let scatter = MqCommand::publish_scatter(1, msgs.clone());
-        let collected = scatter.collect_publish_messages();
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &msgs);
+        let cmd = MqCommand::split_from(&mut buf);
+        let collected = cmd.collect_publish_messages();
         assert_eq!(collected, msgs);
 
-        let contiguous = MqCommand::publish(1, &msgs);
-        let collected = contiguous.collect_publish_messages();
+        MqCommand::write_publish_bytes(&mut buf, 1, &msgs);
+        let cmd = MqCommand::split_from(&mut buf);
+        let collected = cmd.collect_publish_messages();
         assert_eq!(collected, msgs);
     }
 }

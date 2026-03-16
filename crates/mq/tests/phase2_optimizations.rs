@@ -15,6 +15,30 @@ use bisque_mq::types::*;
 // Helpers
 // =============================================================================
 
+use bisque_mq::async_apply::ResponseEntry;
+use bytes::BytesMut;
+
+fn apply_engine(
+    engine: &bisque_mq::engine::MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+) -> ResponseEntry {
+    apply_engine_seg(engine, cmd, log_index, current_time, None)
+}
+
+fn apply_engine_seg(
+    engine: &bisque_mq::engine::MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+    segment_id: Option<u64>,
+) -> ResponseEntry {
+    let mut _buf = BytesMut::new();
+    engine.apply_command(cmd, &mut _buf, log_index, current_time, segment_id);
+    ResponseEntry::split_from(&mut _buf)
+}
+
 fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-phase2-opt-test"))
 }
@@ -31,20 +55,27 @@ fn make_flat_msg_with_routing_key(value: &[u8], routing_key: &str) -> bytes::Byt
 }
 
 fn create_exchange(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) -> u64 {
-    match engine.apply_command(
-        &MqCommand::create_exchange(name, ExchangeType::Topic),
+    let mut buf = bytes::BytesMut::new();
+    let e = apply_engine(
+        &engine,
+        &MqCommand::create_exchange(&mut buf, name, ExchangeType::Topic),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    e.entity_id()
 }
 
 fn create_queue(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) -> u64 {
-    match engine.apply_command(
+    let mut buf = bytes::BytesMut::new();
+    let e = apply_engine(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             name,
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -56,11 +87,13 @@ fn create_queue(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) ->
         ),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    e.entity_id()
 }
 
 fn create_binding(
@@ -71,15 +104,19 @@ fn create_binding(
     log_index: u64,
     time: u64,
 ) -> u64 {
-    match engine.apply_command(
-        &MqCommand::create_binding(exchange_id, queue_id, Some(routing_key)),
+    let mut buf = bytes::BytesMut::new();
+    let e = apply_engine(
+        &engine,
+        &MqCommand::create_binding(&mut buf, exchange_id, queue_id, Some(routing_key)),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    e.entity_id()
 }
 
 fn create_session(
@@ -89,11 +126,12 @@ fn create_session(
     log_index: u64,
     time: u64,
 ) {
-    engine.apply_command(
-        &MqCommand::create_session(session_id, client_id, 30000, 0),
+    let mut buf = bytes::BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::create_session(&mut buf, session_id, client_id, 30000, 0),
         log_index,
         time,
-        None,
     );
 }
 
@@ -107,8 +145,11 @@ fn set_will(
     log_index: u64,
     time: u64,
 ) {
-    engine.apply_command(
+    let mut buf = bytes::BytesMut::new();
+    apply_engine(
+        &engine,
         &MqCommand::set_will(
+            &mut buf,
             session_id,
             exchange_id,
             delay_secs,
@@ -119,7 +160,6 @@ fn set_will(
         ),
         log_index,
         time,
-        None,
     );
 }
 
@@ -130,13 +170,14 @@ fn source_topic_id(group_id: u64) -> u64 {
 }
 
 fn enqueue_messages(engine: &mut MqEngine, topic_id: u64, count: usize, log_index: u64, time: u64) {
+    let mut buf = bytes::BytesMut::new();
     for i in 0..count {
         let msg = make_flat_msg(format!("msg-{}", i).as_bytes());
-        engine.apply_command(
-            &MqCommand::publish(topic_id, &[msg]),
+        apply_engine(
+            &engine,
+            &MqCommand::publish(&mut buf, topic_id, &[msg]),
             log_index + i as u64,
             time,
-            None,
         );
     }
 }
@@ -149,15 +190,15 @@ fn deliver_messages(
     log_index: u64,
     time: u64,
 ) -> Vec<DeliveredMessage> {
-    match engine.apply_command(
-        &MqCommand::group_deliver(group_id, consumer_id, max_count),
+    let mut buf = bytes::BytesMut::new();
+    let e = apply_engine(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, consumer_id, max_count),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::Messages { messages } => messages.to_vec(),
-        other => panic!("expected Messages, got {:?}", other),
-    }
+    );
+    assert_eq!(e.tag(), ResponseEntry::TAG_MESSAGES, "expected Messages");
+    e.messages().collect()
 }
 
 // =============================================================================
@@ -166,6 +207,7 @@ fn deliver_messages(
 
 #[tokio::test]
 async fn test_opt1_notifier_triggered_on_enqueue() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let queue_id = create_queue(&mut engine, "notify-q", 1, 1000);
 
@@ -178,11 +220,11 @@ async fn test_opt1_notifier_triggered_on_enqueue() {
     tokio::task::yield_now().await;
 
     let msg = make_flat_msg(b"hello");
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id(queue_id), &[msg]),
+    apply_engine(
+        &engine,
+        &MqCommand::publish(&mut buf, source_topic_id(queue_id), &[msg]),
         2,
         1001,
-        None,
     );
 
     tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
@@ -193,6 +235,7 @@ async fn test_opt1_notifier_triggered_on_enqueue() {
 
 #[tokio::test]
 async fn test_opt1_notifier_triggered_on_exchange_publish() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/ex", 1, 1000);
     let queue_id = create_queue(&mut engine, "sub-q", 2, 1001);
@@ -213,11 +256,11 @@ async fn test_opt1_notifier_triggered_on_exchange_publish() {
     tokio::task::yield_now().await;
 
     let msg = make_flat_msg_with_routing_key(b"temp=22", "sensors/temp");
-    engine.apply_command(
-        &MqCommand::publish_to_exchange(exchange_id, &[msg]),
+    apply_engine(
+        &engine,
+        &MqCommand::publish_to_exchange(&mut buf, exchange_id, &[msg]),
         4,
         1003,
-        None,
     );
 
     tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
@@ -228,6 +271,7 @@ async fn test_opt1_notifier_triggered_on_exchange_publish() {
 
 #[tokio::test]
 async fn test_opt1_notifier_triggered_on_nack() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let queue_id = create_queue(&mut engine, "nack-q", 1, 1000);
     create_session(&mut engine, 100, "consumer-1", 2, 1001);
@@ -244,7 +288,12 @@ async fn test_opt1_notifier_triggered_on_nack() {
     tokio::task::yield_now().await;
 
     let msg_ids: Vec<u64> = msgs.iter().map(|m| m.message_id).collect();
-    engine.apply_command(&MqCommand::group_nack(queue_id, &msg_ids), 5, 1004, None);
+    apply_engine(
+        &engine,
+        &MqCommand::group_nack(&mut buf, queue_id, &msg_ids),
+        5,
+        1004,
+    );
 
     tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
         .await
@@ -254,6 +303,7 @@ async fn test_opt1_notifier_triggered_on_nack() {
 
 #[tokio::test]
 async fn test_opt1_notifier_multiple_watchers() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let queue_id = create_queue(&mut engine, "multi-watch-q", 1, 1000);
 
@@ -269,11 +319,11 @@ async fn test_opt1_notifier_multiple_watchers() {
     tokio::task::yield_now().await;
 
     let msg = make_flat_msg(b"hello");
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id(queue_id), &[msg]),
+    apply_engine(
+        &engine,
+        &MqCommand::publish(&mut buf, source_topic_id(queue_id), &[msg]),
         2,
         1001,
-        None,
     );
 
     tokio::time::timeout(std::time::Duration::from_millis(100), w1)
@@ -288,6 +338,7 @@ async fn test_opt1_notifier_multiple_watchers() {
 
 #[tokio::test]
 async fn test_opt1_notifier_no_spurious_for_other_queues() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let q1 = create_queue(&mut engine, "q1", 1, 1000);
     let q2 = create_queue(&mut engine, "q2", 2, 1001);
@@ -304,11 +355,11 @@ async fn test_opt1_notifier_no_spurious_for_other_queues() {
     tokio::task::yield_now().await;
 
     let msg = make_flat_msg(b"only-q1");
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id(q1), &[msg]),
+    apply_engine(
+        &engine,
+        &MqCommand::publish(&mut buf, source_topic_id(q1), &[msg]),
         3,
         1002,
-        None,
     );
 
     tokio::time::timeout(std::time::Duration::from_millis(100), w1)
@@ -331,6 +382,7 @@ async fn test_opt1_notifier_no_spurious_for_other_queues() {
 #[test]
 fn test_opt4_will_delay_stores_pending() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
     // Register session
@@ -350,17 +402,23 @@ fn test_opt4_will_delay_stores_pending() {
     );
 
     // Disconnect — will should be stored as pending
-    let resp = engine.apply_command(&MqCommand::disconnect_session(100, true), 4, 1003, None);
-    match &resp {
-        MqResponse::WillPending { delay_ms, .. } => {
-            assert_eq!(*delay_ms, 30_000);
-        }
-        other => panic!("expected WillPending, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        4,
+        1003,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_WILL_PENDING,
+        "expected WillPending"
+    );
+    assert_eq!(resp.will_pending_delay_ms(), 30_000);
 }
 
 #[test]
 fn test_opt4_will_no_delay_fires_immediately() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let queue_id = create_queue(&mut engine, "will-target-q", 2, 1001);
@@ -390,11 +448,16 @@ fn test_opt4_will_no_delay_fires_immediately() {
     );
 
     // Disconnect — will should fire immediately (returns Ok)
-    let resp = engine.apply_command(&MqCommand::disconnect_session(100, true), 6, 1005, None);
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        6,
+        1005,
+    );
     assert!(
-        matches!(resp, MqResponse::Ok),
-        "immediate will disconnect should return Ok, got {:?}",
-        resp
+        resp.is_ok(),
+        "immediate will disconnect should return Ok, got tag={}",
+        resp.tag()
     );
 
     // The will message should be in the target queue
@@ -408,6 +471,7 @@ fn test_opt4_will_no_delay_fires_immediately() {
 
 #[test]
 fn test_opt4_cancel_pending_will_on_reconnect() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
 
@@ -426,24 +490,39 @@ fn test_opt4_cancel_pending_will_on_reconnect() {
     );
 
     // Disconnect — will becomes pending
-    engine.apply_command(&MqCommand::disconnect_session(100, true), 4, 1003, None);
+    apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        4,
+        1003,
+    );
 
     // Reconnect with same client_id — should cancel pending will
     create_session(&mut engine, 200, "client-reconnect", 5, 1004);
 
     // Try to fire pending wills — nothing should fire (cancelled)
-    let resp = engine.apply_command(&MqCommand::fire_pending_wills(1003 + 61_000), 6, 1005, None);
-    match &resp {
-        MqResponse::WillsFired { count } => {
-            assert_eq!(*count, 0, "cancelled will should not fire");
-        }
-        other => panic!("expected WillsFired, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::fire_pending_wills(&mut buf, 1003 + 61_000),
+        6,
+        1005,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_WILLS_FIRED,
+        "expected WillsFired"
+    );
+    assert_eq!(
+        resp.wills_fired_count(),
+        0,
+        "cancelled will should not fire"
+    );
 }
 
 #[test]
 fn test_opt4_fire_pending_wills_timing() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let queue_id = create_queue(&mut engine, "will-q", 2, 1001);
     create_binding(&mut engine, exchange_id, queue_id, "clients/#", 3, 1002);
@@ -462,29 +541,53 @@ fn test_opt4_fire_pending_wills_timing() {
         1004,
     );
 
-    engine.apply_command(&MqCommand::disconnect_session(100, true), 6, 1005, None);
+    apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        6,
+        1005,
+    );
 
     // Fire at 5 seconds after disconnect (before 10s delay)
-    let resp = engine.apply_command(&MqCommand::fire_pending_wills(1005 + 5_000), 7, 1006, None);
-    match &resp {
-        MqResponse::WillsFired { count } => {
-            assert_eq!(*count, 0, "will should not fire before delay expires");
-        }
-        other => panic!("expected WillsFired, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::fire_pending_wills(&mut buf, 1005 + 5_000),
+        7,
+        1006,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_WILLS_FIRED,
+        "expected WillsFired"
+    );
+    assert_eq!(
+        resp.wills_fired_count(),
+        0,
+        "will should not fire before delay expires"
+    );
 
     // Fire at 11 seconds after disconnect (after 10s delay)
-    let resp = engine.apply_command(&MqCommand::fire_pending_wills(1005 + 11_000), 8, 1007, None);
-    match &resp {
-        MqResponse::WillsFired { count } => {
-            assert_eq!(*count, 1, "will should fire after delay expires");
-        }
-        other => panic!("expected WillsFired, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::fire_pending_wills(&mut buf, 1005 + 11_000),
+        8,
+        1007,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_WILLS_FIRED,
+        "expected WillsFired"
+    );
+    assert_eq!(
+        resp.wills_fired_count(),
+        1,
+        "will should fire after delay expires"
+    );
 }
 
 #[test]
 fn test_opt4_pending_wills_survive_snapshot() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     // Create queue + binding before snapshot so the will can route after restore
@@ -506,7 +609,12 @@ fn test_opt4_pending_wills_survive_snapshot() {
         1004,
     );
 
-    engine.apply_command(&MqCommand::disconnect_session(100, true), 6, 1005, None);
+    apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        6,
+        1005,
+    );
 
     // Snapshot and restore
     let snap = engine.snapshot();
@@ -520,13 +628,22 @@ fn test_opt4_pending_wills_survive_snapshot() {
     engine2.restore(snap);
 
     // Fire pending wills — the restored will should fire via the restored exchange + binding
-    let resp = engine2.apply_command(&MqCommand::fire_pending_wills(1005 + 61_000), 7, 1006, None);
-    match &resp {
-        MqResponse::WillsFired { count } => {
-            assert_eq!(*count, 1, "pending will should survive snapshot/restore");
-        }
-        other => panic!("expected WillsFired, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine2,
+        &MqCommand::fire_pending_wills(&mut buf, 1005 + 61_000),
+        7,
+        1006,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_WILLS_FIRED,
+        "expected WillsFired"
+    );
+    assert_eq!(
+        resp.wills_fired_count(),
+        1,
+        "pending will should survive snapshot/restore"
+    );
 }
 
 // =============================================================================
@@ -535,86 +652,95 @@ fn test_opt4_pending_wills_survive_snapshot() {
 
 #[test]
 fn test_opt6_reject_no_local_on_shared_binding() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let queue_id = create_queue(&mut engine, "shared-q", 2, 1001);
 
     // Create binding with no_local=true AND shared_group=Some("group1")
     // Should be rejected per MQTT 5.0 SS 3.8.3.1
-    let resp = engine.apply_command(
+    let resp = apply_engine(
+        &engine,
         &MqCommand::create_binding_with_opts(
+            &mut buf,
             exchange_id,
             queue_id,
             Some("sensors/#"),
-            true,           // no_local
-            Some("group1"), // shared_group
-            None,           // subscription_id
+            true,
+            Some("group1"),
+            None,
         ),
         3,
         1002,
-        None,
     );
-    match &resp {
-        MqResponse::Error(MqError::Custom(message)) => {
-            assert!(
-                message.contains("no_local") || message.contains("shared"),
-                "error should mention no_local or shared: {}",
-                message
-            );
-        }
-        other => panic!("expected Custom error, got {:?}", other),
-    }
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_ERROR,
+        "expected Custom error"
+    );
+    let message = resp.error_message();
+    assert!(
+        message.contains("no_local") || message.contains("shared"),
+        "error should mention no_local or shared: {}",
+        message
+    );
 }
 
 #[test]
 fn test_opt6_allow_no_local_on_non_shared_binding() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let queue_id = create_queue(&mut engine, "non-shared-q", 2, 1001);
 
-    let resp = engine.apply_command(
+    let resp = apply_engine(
+        &engine,
         &MqCommand::create_binding_with_opts(
+            &mut buf,
             exchange_id,
             queue_id,
             Some("sensors/#"),
-            true, // no_local
-            None, // no shared_group
-            None, // subscription_id
+            true,
+            None,
+            None,
         ),
         3,
         1002,
-        None,
     );
-    assert!(
-        matches!(resp, MqResponse::EntityCreated { .. }),
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
         "no_local without shared should succeed, got {:?}",
-        resp
+        resp.tag()
     );
 }
 
 #[test]
 fn test_opt6_allow_shared_without_no_local() {
+    let mut buf = bytes::BytesMut::new();
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let queue_id = create_queue(&mut engine, "shared-ok-q", 2, 1001);
 
-    let resp = engine.apply_command(
+    let resp = apply_engine(
+        &engine,
         &MqCommand::create_binding_with_opts(
+            &mut buf,
             exchange_id,
             queue_id,
             Some("sensors/#"),
-            false,          // no_local = false
-            Some("group1"), // shared_group
-            None,           // subscription_id
+            false,
+            Some("group1"),
+            None,
         ),
         3,
         1002,
-        None,
     );
-    assert!(
-        matches!(resp, MqResponse::EntityCreated { .. }),
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
         "shared without no_local should succeed, got {:?}",
-        resp
+        resp.tag()
     );
 }
 
@@ -644,6 +770,8 @@ fn test_opt7_deliver_includes_group_id() {
 
 #[test]
 fn test_opt7_group_id_codec_roundtrip() {
+    let mut buf = BytesMut::new();
+
     use bisque_raft::codec::{Decode, Encode};
     use std::io::Cursor;
 
@@ -672,7 +800,8 @@ fn test_opt7_group_id_codec_roundtrip() {
 
 #[test]
 fn test_codec_fire_pending_wills() {
-    let cmd = MqCommand::fire_pending_wills(1234567890);
+    let mut buf = bytes::BytesMut::new();
+    let cmd = MqCommand::fire_pending_wills(&mut buf, 1234567890);
     assert_eq!(cmd.tag(), MqCommand::TAG_FIRE_PENDING_WILLS);
 }
 
@@ -682,7 +811,9 @@ fn test_codec_fire_pending_wills() {
 
 #[test]
 fn test_create_binding_with_opts_codec() {
+    let mut buf = bytes::BytesMut::new();
     let cmd = MqCommand::create_binding_with_opts(
+        &mut buf,
         10,
         20,
         Some("sensors/+/temp"),
@@ -703,7 +834,9 @@ fn test_create_binding_with_opts_codec() {
 
 #[test]
 fn test_create_binding_backward_compat() {
-    let cmd = MqCommand::create_binding(10, 20, Some("topic/#"));
+    let mut buf = BytesMut::new();
+
+    let cmd = MqCommand::create_binding(&mut buf, 10, 20, Some("topic/#"));
     let view = cmd.as_create_binding();
     assert!(
         !view.no_local(),
@@ -713,60 +846,4 @@ fn test_create_binding_backward_compat() {
         view.shared_group().is_none(),
         "backward compat: shared_group should be None"
     );
-}
-
-// =============================================================================
-// MqResponse codec for new variants
-// =============================================================================
-
-#[test]
-fn test_response_wills_fired_codec() {
-    use bisque_raft::codec::{Decode, Encode};
-    use std::io::Cursor;
-
-    let resp = MqResponse::WillsFired { count: 5 };
-    let mut buf = Vec::new();
-    resp.encode(&mut buf).unwrap();
-
-    let mut cursor = Cursor::new(&buf[..]);
-    let decoded = MqResponse::decode(&mut cursor).unwrap();
-    match decoded {
-        MqResponse::WillsFired { count } => assert_eq!(count, 5),
-        other => panic!("expected WillsFired, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_response_topic_aliases_codec() {
-    use bisque_raft::codec::{Decode, Encode};
-    use std::io::Cursor;
-
-    let aliases = vec![
-        TopicAliasEntry {
-            alias: 1,
-            topic_name: "sensors/temp".to_string(),
-        },
-        TopicAliasEntry {
-            alias: 2,
-            topic_name: "sensors/humidity".to_string(),
-        },
-    ];
-    let resp = MqResponse::TopicAliases { aliases };
-    let mut buf = Vec::new();
-    resp.encode(&mut buf).unwrap();
-
-    let mut cursor = Cursor::new(&buf[..]);
-    let decoded = MqResponse::decode(&mut cursor).unwrap();
-    match decoded {
-        MqResponse::TopicAliases {
-            aliases: decoded_aliases,
-        } => {
-            assert_eq!(decoded_aliases.len(), 2);
-            assert_eq!(decoded_aliases[0].alias, 1);
-            assert_eq!(decoded_aliases[0].topic_name, "sensors/temp");
-            assert_eq!(decoded_aliases[1].alias, 2);
-            assert_eq!(decoded_aliases[1].topic_name, "sensors/humidity");
-        }
-        other => panic!("expected TopicAliases, got {:?}", other),
-    }
 }

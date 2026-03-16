@@ -10,10 +10,11 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
 use tracing::{debug, info, warn};
 
+use crate::async_apply::ResponseEntry;
 use crate::config::MqConfig;
 use crate::consumer_group::*;
 use crate::exchange::*;
@@ -62,7 +63,7 @@ impl MqEngine {
         &self.metadata
     }
 
-    /// Apply a single command. Returns the response.
+    /// Apply a single command, writing the response into `buf`.
     ///
     /// `log_index` is the raft log index of the entry containing this command.
     /// `current_time` is a millisecond timestamp (from the leader's wall clock,
@@ -70,10 +71,11 @@ impl MqEngine {
     pub fn apply_command(
         &self,
         cmd: &MqCommand,
+        buf: &mut BytesMut,
         log_index: u64,
         current_time: u64,
         segment_id: Option<u64>,
-    ) -> MqResponse {
+    ) {
         self.m_apply_count.increment(1);
         let md = &self.metadata;
 
@@ -86,10 +88,15 @@ impl MqEngine {
                 let name_str = v.name();
                 let name_h = name_hash(name_str);
                 if let Some(r) = md.topic_names.pin().get(&name_h) {
-                    return MqResponse::Error(MqError::AlreadyExists {
-                        entity: EntityKind::Topic,
-                        id: *r,
-                    });
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::AlreadyExists {
+                            entity: EntityKind::Topic,
+                            id: *r,
+                        },
+                    );
+                    return;
                 }
                 let topic_id = md.alloc_id();
                 let name = name_str.to_owned();
@@ -105,7 +112,7 @@ impl MqEngine {
                 md.topics.pin().insert(topic_id, Arc::new(state));
                 md.topic_names.pin().insert(name_h, topic_id);
                 info!(topic_id, "topic created");
-                MqResponse::EntityCreated { id: topic_id }
+                ResponseEntry::write_entity_created(buf, log_index, topic_id)
             }
 
             MqCommand::TAG_DELETE_TOPIC => {
@@ -117,12 +124,16 @@ impl MqEngine {
                     if state.message_count() > 0 {
                         self.mark_purge_floor_dirty();
                     }
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Topic,
-                        id: topic_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Topic,
+                            id: topic_id,
+                        },
+                    )
                 }
             }
 
@@ -135,7 +146,7 @@ impl MqEngine {
                         // Fast path: no attached groups, skip collect + enqueue
                         let base_offset = topic.apply_publish(log_index, v.messages(), segment_id);
                         self.on_message_added(log_index);
-                        MqResponse::Published { base_offset, count }
+                        ResponseEntry::write_published(buf, log_index, base_offset, count)
                     } else {
                         let messages: SmallVec<[Bytes; 16]> = v.messages().collect();
                         let base_offset =
@@ -154,13 +165,17 @@ impl MqEngine {
                             current_time,
                         );
                         self.on_message_added(log_index);
-                        MqResponse::Published { base_offset, count }
+                        ResponseEntry::write_published(buf, log_index, base_offset, count)
                     }
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Topic,
-                        id: topic_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Topic,
+                            id: topic_id,
+                        },
+                    )
                 }
             }
 
@@ -172,12 +187,16 @@ impl MqEngine {
                 if let Some(topic) = md.topics.pin().get(&topic_id) {
                     topic.apply_commit_offset(consumer_id, offset);
                     md.purge_floor_dirty.store(true, Ordering::Relaxed);
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Topic,
-                        id: topic_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Topic,
+                            id: topic_id,
+                        },
+                    )
                 }
             }
 
@@ -188,12 +207,16 @@ impl MqEngine {
                 if let Some(topic) = md.topics.pin().get(&topic_id) {
                     topic.apply_purge(before_index);
                     self.mark_purge_floor_dirty();
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Topic,
-                        id: topic_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Topic,
+                            id: topic_id,
+                        },
+                    )
                 }
             }
 
@@ -208,12 +231,16 @@ impl MqEngine {
                         None => RetainedValue::heap(message),
                     };
                     exchange.retained.write().insert(routing_key, retained);
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Exchange,
-                        id: exchange_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Exchange,
+                            id: exchange_id,
+                        },
+                    )
                 }
             }
 
@@ -234,12 +261,16 @@ impl MqEngine {
                             message: rv.message.clone(),
                         })
                         .collect();
-                    MqResponse::RetainedMessages { messages }
+                    ResponseEntry::write_retained_messages(buf, log_index, &messages)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Exchange,
-                        id: exchange_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Exchange,
+                            id: exchange_id,
+                        },
+                    )
                 }
             }
 
@@ -249,12 +280,16 @@ impl MqEngine {
                 if let Some(exchange) = md.exchanges.pin().get(&exchange_id) {
                     let routing_key = v.routing_key();
                     exchange.retained.write().remove(routing_key);
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Exchange,
-                        id: exchange_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Exchange,
+                            id: exchange_id,
+                        },
+                    )
                 }
             }
 
@@ -267,10 +302,15 @@ impl MqEngine {
                 let exchange_type = v.exchange_type();
                 let name_h = name_hash(name_str);
                 if let Some(r) = md.exchange_names.pin().get(&name_h) {
-                    return MqResponse::Error(MqError::AlreadyExists {
-                        entity: EntityKind::Exchange,
-                        id: *r,
-                    });
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::AlreadyExists {
+                            entity: EntityKind::Exchange,
+                            id: *r,
+                        },
+                    );
+                    return;
                 }
                 let id = md.alloc_id();
                 let name = name_str.to_owned();
@@ -280,7 +320,7 @@ impl MqEngine {
                     .insert(id, Arc::new(ExchangeState::new(meta)));
                 md.exchange_names.pin().insert(name_h, id);
                 info!(exchange_id = id, "exchange created");
-                MqResponse::EntityCreated { id }
+                ResponseEntry::write_entity_created(buf, log_index, id)
             }
 
             MqCommand::TAG_DELETE_EXCHANGE => {
@@ -294,12 +334,16 @@ impl MqEngine {
                     for binding_id in state.bindings.read().keys() {
                         binding_guard.remove(binding_id);
                     }
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Exchange,
-                        id: exchange_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Exchange,
+                            id: exchange_id,
+                        },
+                    )
                 }
             }
 
@@ -314,16 +358,26 @@ impl MqEngine {
 
                 // MQTT 5.0 §3.8.3.1: no_local on shared subscriptions is a protocol error
                 if no_local && shared_group.is_some() {
-                    return MqResponse::Error(MqError::Custom(
-                        "no_local not allowed on shared subscriptions".to_string(),
-                    ));
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::Custom(
+                            "no_local not allowed on shared subscriptions".to_string(),
+                        ),
+                    );
+                    return;
                 }
 
                 if !md.exchanges.pin().contains_key(&exchange_id) {
-                    return MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Exchange,
-                        id: exchange_id,
-                    });
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Exchange,
+                            id: exchange_id,
+                        },
+                    );
+                    return;
                 }
 
                 let binding_id = md.alloc_id();
@@ -340,7 +394,7 @@ impl MqEngine {
                     exchange.add_binding(binding);
                 }
                 md.binding_index.pin().insert(binding_id, exchange_id);
-                MqResponse::EntityCreated { id: binding_id }
+                ResponseEntry::write_entity_created(buf, log_index, binding_id)
             }
 
             MqCommand::TAG_DELETE_BINDING => {
@@ -351,12 +405,16 @@ impl MqEngine {
                     if let Some(exchange) = md.exchanges.pin().get(&exchange_id) {
                         exchange.remove_binding(binding_id);
                     }
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Binding,
-                        id: binding_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Binding,
+                            id: binding_id,
+                        },
+                    )
                 }
             }
 
@@ -368,10 +426,15 @@ impl MqEngine {
                 let exchange = match exchange_guard.get(&exchange_id) {
                     Some(e) => e,
                     None => {
-                        return MqResponse::Error(MqError::NotFound {
-                            entity: EntityKind::Exchange,
-                            id: exchange_id,
-                        });
+                        ResponseEntry::write_mq_error(
+                            buf,
+                            log_index,
+                            &MqError::NotFound {
+                                entity: EntityKind::Exchange,
+                                id: exchange_id,
+                            },
+                        );
+                        return;
                     }
                 };
 
@@ -443,10 +506,7 @@ impl MqEngine {
                 if total_count > 0 {
                     self.on_message_added(log_index);
                 }
-                MqResponse::Published {
-                    base_offset: 0,
-                    count: total_count,
-                }
+                ResponseEntry::write_published(buf, log_index, 0, total_count)
             }
 
             // =================================================================
@@ -459,10 +519,15 @@ impl MqEngine {
 
                 // Check for name collision with existing groups
                 if md.consumer_group_names.pin().contains_key(&name_h) {
-                    return MqResponse::Error(MqError::AlreadyExists {
-                        entity: EntityKind::ConsumerGroup,
-                        id: 0,
-                    });
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::AlreadyExists {
+                            entity: EntityKind::ConsumerGroup,
+                            id: 0,
+                        },
+                    );
+                    return;
                 }
                 let name = name_str.to_owned();
 
@@ -566,7 +631,7 @@ impl MqEngine {
                     source_topic_id,
                     "consumer group created"
                 );
-                MqResponse::EntityCreated { id: group_id }
+                ResponseEntry::write_entity_created(buf, log_index, group_id)
             }
 
             MqCommand::TAG_DELETE_CONSUMER_GROUP => {
@@ -601,12 +666,16 @@ impl MqEngine {
                         }
                         _ => {}
                     }
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ConsumerGroup,
-                        id: group_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::ConsumerGroup,
+                            id: group_id,
+                        },
+                    )
                 }
             }
 
@@ -620,10 +689,15 @@ impl MqEngine {
                 let group = match cg_guard.get(&group_id) {
                     Some(g) => g,
                     None => {
-                        return MqResponse::Error(MqError::NotFound {
-                            entity: EntityKind::ConsumerGroup,
-                            id: group_id,
-                        });
+                        ResponseEntry::write_mq_error(
+                            buf,
+                            log_index,
+                            &MqError::NotFound {
+                                entity: EntityKind::ConsumerGroup,
+                                id: group_id,
+                            },
+                        );
+                        return;
                     }
                 };
 
@@ -671,20 +745,24 @@ impl MqEngine {
                 let leader_arc = group.leader();
                 let leader_str = leader_arc.as_deref().map(|s| s.as_str()).unwrap_or("");
                 let is_leader = leader_str == actual_member_id;
+                let members = if is_leader {
+                    group.member_protocols()
+                } else {
+                    vec![]
+                };
+                let protocol_name = (*group.protocol_name()).clone();
 
-                MqResponse::GroupJoined {
-                    generation: group.generation(),
-                    leader: leader_str.to_string(),
-                    member_id: actual_member_id,
-                    protocol_name: (*group.protocol_name()).clone(),
+                ResponseEntry::write_group_joined(
+                    buf,
+                    log_index,
+                    group.generation(),
+                    leader_str,
+                    &actual_member_id,
+                    &protocol_name,
                     is_leader,
-                    members: if is_leader {
-                        group.member_protocols()
-                    } else {
-                        vec![]
-                    },
-                    phase_complete: all_joined,
-                }
+                    all_joined,
+                    &members,
+                )
             }
 
             MqCommand::TAG_SYNC_CONSUMER_GROUP => {
@@ -697,15 +775,21 @@ impl MqEngine {
                 let group = match cg_guard.get(&group_id) {
                     Some(g) => g,
                     None => {
-                        return MqResponse::Error(MqError::NotFound {
-                            entity: EntityKind::ConsumerGroup,
-                            id: group_id,
-                        });
+                        ResponseEntry::write_mq_error(
+                            buf,
+                            log_index,
+                            &MqError::NotFound {
+                                entity: EntityKind::ConsumerGroup,
+                                id: group_id,
+                            },
+                        );
+                        return;
                     }
                 };
 
                 if group.generation() != generation {
-                    return MqResponse::Error(MqError::IllegalGeneration);
+                    ResponseEntry::write_mq_error(buf, log_index, &MqError::IllegalGeneration);
+                    return;
                 }
 
                 // If this is the leader with assignments, store them
@@ -732,10 +816,12 @@ impl MqEngine {
                     .unwrap_or_default()
                     .to_vec();
 
-                MqResponse::GroupSynced {
-                    assignment,
-                    phase_complete: group.phase() == GroupPhase::Stable,
-                }
+                ResponseEntry::write_group_synced(
+                    buf,
+                    log_index,
+                    &assignment,
+                    group.phase() == GroupPhase::Stable,
+                )
             }
 
             MqCommand::TAG_LEAVE_CONSUMER_GROUP => {
@@ -746,7 +832,10 @@ impl MqEngine {
                 let cg_guard = md.consumer_groups.pin();
                 let group = match cg_guard.get(&group_id) {
                     Some(g) => g,
-                    None => return MqResponse::Ok, // Idempotent
+                    None => {
+                        ResponseEntry::write_ok(buf, log_index);
+                        return;
+                    } // Idempotent
                 };
 
                 group.remove_member(member_id);
@@ -759,7 +848,7 @@ impl MqEngine {
                 }
 
                 group.phase_notify.notify_waiters();
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_HEARTBEAT_CONSUMER_GROUP => {
@@ -772,28 +861,35 @@ impl MqEngine {
                 let group = match cg_guard.get(&group_id) {
                     Some(g) => g,
                     None => {
-                        return MqResponse::Error(MqError::NotFound {
-                            entity: EntityKind::ConsumerGroup,
-                            id: group_id,
-                        });
+                        ResponseEntry::write_mq_error(
+                            buf,
+                            log_index,
+                            &MqError::NotFound {
+                                entity: EntityKind::ConsumerGroup,
+                                id: group_id,
+                            },
+                        );
+                        return;
                     }
                 };
 
                 if group.generation() != generation {
-                    return MqResponse::Error(MqError::IllegalGeneration);
+                    ResponseEntry::write_mq_error(buf, log_index, &MqError::IllegalGeneration);
+                    return;
                 }
 
                 if !group.has_member(member_id) {
-                    return MqResponse::Error(MqError::UnknownMemberId);
+                    ResponseEntry::write_mq_error(buf, log_index, &MqError::UnknownMemberId);
+                    return;
                 }
 
                 group.update_member_heartbeat(member_id, current_time);
                 group.touch_activity(current_time);
 
                 if group.phase() == GroupPhase::PreparingRebalance {
-                    MqResponse::Error(MqError::RebalanceInProgress)
+                    ResponseEntry::write_mq_error(buf, log_index, &MqError::RebalanceInProgress)
                 } else {
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 }
             }
 
@@ -806,15 +902,21 @@ impl MqEngine {
                 let group = match cg_guard.get(&group_id) {
                     Some(g) => g,
                     None => {
-                        return MqResponse::Error(MqError::NotFound {
-                            entity: EntityKind::ConsumerGroup,
-                            id: group_id,
-                        });
+                        ResponseEntry::write_mq_error(
+                            buf,
+                            log_index,
+                            &MqError::NotFound {
+                                entity: EntityKind::ConsumerGroup,
+                                id: group_id,
+                            },
+                        );
+                        return;
                     }
                 };
 
                 if group.generation() != generation {
-                    return MqResponse::Error(MqError::IllegalGeneration);
+                    ResponseEntry::write_mq_error(buf, log_index, &MqError::IllegalGeneration);
+                    return;
                 }
 
                 group.offsets.pin().insert(
@@ -830,7 +932,7 @@ impl MqEngine {
 
                 group.touch_activity(current_time);
                 group.record_offset_commit();
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_EXPIRE_GROUP_SESSIONS => {
@@ -858,7 +960,7 @@ impl MqEngine {
                     }
                 }
 
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             // =================================================================
@@ -929,13 +1031,18 @@ impl MqEngine {
                             ack.apply_ack(&filtered_ids);
                         }
                         md.group_notifier.notify(group_id);
-                        return MqResponse::Messages { messages: msgs };
+                        ResponseEntry::write_messages(buf, log_index, &msgs);
+                        return;
                     }
                 }
-                MqResponse::Error(MqError::NotFound {
-                    entity: EntityKind::ConsumerGroup,
-                    id: group_id,
-                })
+                ResponseEntry::write_mq_error(
+                    buf,
+                    log_index,
+                    &MqError::NotFound {
+                        entity: EntityKind::ConsumerGroup,
+                        id: group_id,
+                    },
+                )
             }
 
             MqCommand::TAG_GROUP_ACK => {
@@ -978,10 +1085,11 @@ impl MqEngine {
                             }
                         }
 
-                        return MqResponse::Ok;
+                        ResponseEntry::write_ok(buf, log_index);
+                        return;
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_NACK => {
@@ -995,7 +1103,7 @@ impl MqEngine {
                         md.group_notifier.notify(group_id);
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_RELEASE => {
@@ -1009,7 +1117,7 @@ impl MqEngine {
                         md.group_notifier.notify(group_id);
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_MODIFY => {
@@ -1024,7 +1132,7 @@ impl MqEngine {
                         md.group_notifier.notify(group_id);
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_EXTEND_VISIBILITY => {
@@ -1038,7 +1146,7 @@ impl MqEngine {
                         ack.apply_extend_visibility(&message_ids, extension_ms);
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_TIMEOUT_EXPIRED => {
@@ -1053,14 +1161,17 @@ impl MqEngine {
                         if !dead_lettered.is_empty() {
                             // Resolve DLQ topic
                             let dlq_topic_id = self.resolve_dlq_topic(group);
-                            return MqResponse::DeadLettered {
-                                dead_letter_ids: dead_lettered,
+                            ResponseEntry::write_dead_lettered(
+                                buf,
+                                log_index,
                                 dlq_topic_id,
-                            };
+                                &dead_lettered,
+                            );
+                            return;
                         }
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_PUBLISH_TO_DLQ => {
@@ -1083,7 +1194,7 @@ impl MqEngine {
                         self.mark_purge_floor_dirty();
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_EXPIRE_PENDING => {
@@ -1097,7 +1208,7 @@ impl MqEngine {
                         self.mark_purge_floor_dirty();
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_PURGE => {
@@ -1110,7 +1221,7 @@ impl MqEngine {
                         }
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_GET_ATTRIBUTES => {
@@ -1128,19 +1239,27 @@ impl MqEngine {
                         VariantState::Actor(actor) => (0, 0, 0, actor.active_count()),
                         VariantState::Offset => (0, 0, 0, 0),
                     };
-                    MqResponse::Stats(EntityStats::ConsumerGroup {
-                        group_id,
-                        variant,
-                        pending_count: pending,
-                        in_flight_count: in_flight,
-                        dlq_count: dlq,
-                        active_actor_count: actors,
-                    })
+                    ResponseEntry::write_stats(
+                        buf,
+                        log_index,
+                        &EntityStats::ConsumerGroup {
+                            group_id,
+                            variant,
+                            pending_count: pending,
+                            in_flight_count: in_flight,
+                            dlq_count: dlq,
+                            active_actor_count: actors,
+                        },
+                    )
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::ConsumerGroup,
-                        id: group_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::ConsumerGroup,
+                            id: group_id,
+                        },
+                    )
                 }
             }
 
@@ -1159,7 +1278,7 @@ impl MqEngine {
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
                     if let Some(actor_state) = group.actor_state() {
-                        let mut msgs = SmallVec::new();
+                        let mut msgs: SmallVec<[DeliveredMessage; 8]> = SmallVec::new();
                         for actor_id in &actor_ids {
                             if let Some(msg_idx) =
                                 actor_state.apply_deliver(actor_id, consumer_id, 0)
@@ -1175,13 +1294,18 @@ impl MqEngine {
                         if !msgs.is_empty() {
                             md.track_session_group(consumer_id, group_id);
                         }
-                        return MqResponse::Messages { messages: msgs };
+                        ResponseEntry::write_messages(buf, log_index, &msgs);
+                        return;
                     }
                 }
-                MqResponse::Error(MqError::NotFound {
-                    entity: EntityKind::ConsumerGroup,
-                    id: group_id,
-                })
+                ResponseEntry::write_mq_error(
+                    buf,
+                    log_index,
+                    &MqError::NotFound {
+                        entity: EntityKind::ConsumerGroup,
+                        id: group_id,
+                    },
+                )
             }
 
             MqCommand::TAG_GROUP_ACK_ACTOR => {
@@ -1212,7 +1336,7 @@ impl MqEngine {
                         }
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_NACK_ACTOR => {
@@ -1227,7 +1351,7 @@ impl MqEngine {
                         actor_state.apply_nack(&actor_id, message_id, 0);
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_ASSIGN_ACTORS => {
@@ -1246,7 +1370,7 @@ impl MqEngine {
                         md.track_session_group(consumer_id, group_id);
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_RELEASE_ACTORS => {
@@ -1259,7 +1383,7 @@ impl MqEngine {
                         actor_state.apply_release(consumer_id);
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_GROUP_EVICT_IDLE => {
@@ -1273,7 +1397,7 @@ impl MqEngine {
                         debug!(group_id, count, "evicted idle actors");
                     }
                 }
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             // =================================================================
@@ -1284,12 +1408,16 @@ impl MqEngine {
                 let topic_id = cmd.field_u64(8);
                 if let Some(topic) = md.topics.pin().get(&topic_id) {
                     topic.cron_enabled.store(true, Ordering::Relaxed);
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Topic,
-                        id: topic_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Topic,
+                            id: topic_id,
+                        },
+                    )
                 }
             }
 
@@ -1298,12 +1426,16 @@ impl MqEngine {
                 let topic_id = cmd.field_u64(8);
                 if let Some(topic) = md.topics.pin().get(&topic_id) {
                     topic.cron_enabled.store(false, Ordering::Relaxed);
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Topic,
-                        id: topic_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Topic,
+                            id: topic_id,
+                        },
+                    )
                 }
             }
 
@@ -1322,12 +1454,16 @@ impl MqEngine {
                     topic.apply_publish(log_index, std::iter::once(payload), None);
                     topic.apply_cron_trigger(triggered_at);
                     self.on_message_added(log_index);
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Topic,
-                        id: topic_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Topic,
+                            id: topic_id,
+                        },
+                    )
                 }
             }
 
@@ -1336,12 +1472,16 @@ impl MqEngine {
                 // For now, just acknowledge — full cron config update requires codec extension
                 let topic_id = cmd.field_u64(8);
                 if md.topics.pin().contains_key(&topic_id) {
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Topic,
-                        id: topic_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Topic,
+                            id: topic_id,
+                        },
+                    )
                 }
             }
 
@@ -1366,7 +1506,14 @@ impl MqEngine {
                     .copied()
                     .filter(|&old_id| old_id != session_id);
                 if let Some(old_id) = takeover_id {
-                    self.disconnect_session_internal(old_id, false, log_index, current_time);
+                    let mut _discard = BytesMut::new();
+                    self.disconnect_session_internal(
+                        old_id,
+                        false,
+                        log_index,
+                        current_time,
+                        &mut _discard,
+                    );
                 }
 
                 let meta = SessionMeta::new(
@@ -1387,14 +1534,20 @@ impl MqEngine {
                     .insert(client_id_hash, session_id);
                 // Cancel any pending will for this client
                 self.metadata.pending_wills.pin().remove(&client_id_hash);
-                MqResponse::EntityCreated { id: session_id }
+                ResponseEntry::write_entity_created(buf, log_index, session_id)
             }
 
             MqCommand::TAG_DISCONNECT_SESSION => {
                 // Wire v2: flags=publish_will, @8 session_id:u64
                 let session_id = cmd.field_u64(8);
                 let publish_will = cmd.flags() != 0;
-                self.disconnect_session_internal(session_id, publish_will, log_index, current_time)
+                self.disconnect_session_internal(
+                    session_id,
+                    publish_will,
+                    log_index,
+                    current_time,
+                    buf,
+                )
             }
 
             MqCommand::TAG_HEARTBEAT_SESSION => {
@@ -1402,12 +1555,16 @@ impl MqEngine {
                 let session_id = cmd.field_u64(8);
                 if let Some(session) = md.sessions.pin().get(&session_id) {
                     session.heartbeat(current_time);
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Session,
-                        id: session_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Session,
+                            id: session_id,
+                        },
+                    )
                 }
             }
 
@@ -1423,12 +1580,16 @@ impl MqEngine {
                         retained: v.retain(),
                     };
                     session.set_will(will);
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Session,
-                        id: session_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Session,
+                            id: session_id,
+                        },
+                    )
                 }
             }
 
@@ -1437,12 +1598,16 @@ impl MqEngine {
                 let session_id = cmd.field_u64(8);
                 if let Some(session) = md.sessions.pin().get(&session_id) {
                     session.clear_will();
-                    MqResponse::Ok
+                    ResponseEntry::write_ok(buf, log_index)
                 } else {
-                    MqResponse::Error(MqError::NotFound {
-                        entity: EntityKind::Session,
-                        id: session_id,
-                    })
+                    ResponseEntry::write_mq_error(
+                        buf,
+                        log_index,
+                        &MqError::NotFound {
+                            entity: EntityKind::Session,
+                            id: session_id,
+                        },
+                    )
                 }
             }
 
@@ -1466,7 +1631,7 @@ impl MqEngine {
                     }
                 }
 
-                MqResponse::WillsFired { count }
+                ResponseEntry::write_wills_fired(buf, log_index, count)
             }
 
             MqCommand::TAG_PERSIST_SESSION => {
@@ -1508,7 +1673,7 @@ impl MqEngine {
                 md.session_client_index
                     .pin()
                     .insert(client_id_hash, session_id);
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             MqCommand::TAG_RESTORE_SESSION => {
@@ -1535,16 +1700,18 @@ impl MqEngine {
                             // Session expired
                             md.sessions.pin().remove(&session_id);
                             md.session_client_index.pin().remove(&client_id_hash);
-                            MqResponse::SessionNotFound
+                            ResponseEntry::write_session_not_found(buf, log_index)
                         } else {
-                            MqResponse::SessionRestored {
+                            ResponseEntry::write_session_restored(
+                                buf,
+                                log_index,
                                 session_id,
-                                session_expiry_ms: expiry_ms,
-                                subscription_data: snap.subscription_data.clone(),
-                            }
+                                expiry_ms,
+                                &snap.subscription_data,
+                            )
                         }
                     }
-                    None => MqResponse::SessionNotFound,
+                    None => ResponseEntry::write_session_not_found(buf, log_index),
                 }
             }
 
@@ -1560,16 +1727,23 @@ impl MqEngine {
 
                 for session_id in expired_ids {
                     // Disconnect with will publication
-                    self.disconnect_session_internal(session_id, true, log_index, current_time);
+                    let mut _discard = BytesMut::new();
+                    self.disconnect_session_internal(
+                        session_id,
+                        true,
+                        log_index,
+                        current_time,
+                        &mut _discard,
+                    );
                 }
 
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             // =================================================================
             // Batch (49)
             // =================================================================
-            MqCommand::TAG_BATCH => self.apply_batch(cmd, log_index, current_time, segment_id),
+            MqCommand::TAG_BATCH => self.apply_batch(cmd, buf, log_index, current_time, segment_id),
 
             // =================================================================
             // Dedup (50)
@@ -1577,16 +1751,17 @@ impl MqEngine {
             MqCommand::TAG_PRUNE_DEDUP_WINDOW => {
                 // Legacy — dedup GC is now local (not Raft-replicated).
                 // Kept as no-op for rolling-upgrade wire compatibility.
-                MqResponse::Ok
+                ResponseEntry::write_ok(buf, log_index)
             }
 
             _ => {
                 self.m_unknown_tag.increment(1);
                 warn!(tag = cmd.tag(), "unknown MqCommand tag");
-                MqResponse::Error(MqError::Custom(format!(
-                    "unknown command tag: {}",
-                    cmd.tag()
-                )))
+                ResponseEntry::write_mq_error(
+                    buf,
+                    log_index,
+                    &MqError::Custom(format!("unknown command tag: {}", cmd.tag())),
+                )
             }
         }
     }
@@ -1600,14 +1775,16 @@ impl MqEngine {
     fn apply_batch(
         &self,
         cmd: &MqCommand,
+        buf: &mut BytesMut,
         log_index: u64,
         current_time: u64,
         segment_id: Option<u64>,
-    ) -> MqResponse {
+    ) {
         let batch = cmd.as_batch();
         let count = batch.count() as usize;
         let cmds: SmallVec<[&[u8]; 16]> = batch.commands().collect();
-        let mut responses: SmallVec<[MqResponse; 8]> = SmallVec::with_capacity(count);
+        let mut responses: Vec<ResponseEntry> = Vec::with_capacity(count);
+        let mut sub_buf = BytesMut::new();
 
         let mut i = 0;
         while i < cmds.len() {
@@ -1628,6 +1805,7 @@ impl MqEngine {
                         log_index,
                         current_time,
                         segment_id,
+                        &mut sub_buf,
                         &mut responses,
                     );
                     i = run_end;
@@ -1647,7 +1825,14 @@ impl MqEngine {
                 let run_end = self.find_run_end(&cmds, i, tag, group_id);
 
                 if run_end - i > 1 {
-                    self.apply_ack_variant_run(tag, &cmds[i..run_end], group_id, &mut responses);
+                    self.apply_ack_variant_run(
+                        tag,
+                        &cmds[i..run_end],
+                        group_id,
+                        log_index,
+                        &mut sub_buf,
+                        &mut responses,
+                    );
                     i = run_end;
                     continue;
                 }
@@ -1655,11 +1840,12 @@ impl MqEngine {
 
             // Default: process single sub-command via temporary MqCommand wrapper
             let sub_cmd = MqCommand::from_vec(cmds[i].to_vec());
-            responses.push(self.apply_command(&sub_cmd, log_index, current_time, segment_id));
+            self.apply_command(&sub_cmd, &mut sub_buf, log_index, current_time, segment_id);
+            responses.push(ResponseEntry::split_from(&mut sub_buf));
             i += 1;
         }
 
-        MqResponse::BatchResponse(Box::new(responses))
+        ResponseEntry::write_batch_response(buf, log_index, &responses)
     }
 
     /// Find the end of a consecutive run of commands with the same tag and entity_id.
@@ -1685,7 +1871,8 @@ impl MqEngine {
         log_index: u64,
         current_time: u64,
         segment_id: Option<u64>,
-        responses: &mut SmallVec<[MqResponse; 8]>,
+        sub_buf: &mut BytesMut,
+        responses: &mut Vec<ResponseEntry>,
     ) {
         use crate::codec::CmdPublish;
         let md = &self.metadata;
@@ -1700,10 +1887,8 @@ impl MqEngine {
                     let msg_count = msgs.len() as u64;
                     let base_offset =
                         topic.apply_publish(log_index, msgs.iter().cloned(), segment_id);
-                    responses.push(MqResponse::Published {
-                        base_offset,
-                        count: msg_count,
-                    });
+                    ResponseEntry::write_published(sub_buf, log_index, base_offset, msg_count);
+                    responses.push(ResponseEntry::split_from(sub_buf));
                     all_messages.push(msgs);
                 }
                 let group_ids: SmallVec<[u64; 4]> = topic
@@ -1726,19 +1911,22 @@ impl MqEngine {
                     let v = CmdPublish::from_buf(sub);
                     let msg_count = v.message_count() as u64;
                     let base_offset = topic.apply_publish(log_index, v.messages(), segment_id);
-                    responses.push(MqResponse::Published {
-                        base_offset,
-                        count: msg_count,
-                    });
+                    ResponseEntry::write_published(sub_buf, log_index, base_offset, msg_count);
+                    responses.push(ResponseEntry::split_from(sub_buf));
                 }
             }
             self.on_message_added(log_index);
         } else {
             for _ in cmds {
-                responses.push(MqResponse::Error(MqError::NotFound {
-                    entity: EntityKind::Topic,
-                    id: topic_id,
-                }));
+                ResponseEntry::write_mq_error(
+                    sub_buf,
+                    log_index,
+                    &MqError::NotFound {
+                        entity: EntityKind::Topic,
+                        id: topic_id,
+                    },
+                );
+                responses.push(ResponseEntry::split_from(sub_buf));
             }
         }
     }
@@ -1750,7 +1938,9 @@ impl MqEngine {
         tag: u8,
         cmds: &[&[u8]],
         group_id: u64,
-        responses: &mut SmallVec<[MqResponse; 8]>,
+        log_index: u64,
+        sub_buf: &mut BytesMut,
+        responses: &mut Vec<ResponseEntry>,
     ) {
         let md = &self.metadata;
         if let Some(group) = md.consumer_groups.pin().get(&group_id) {
@@ -1772,19 +1962,22 @@ impl MqEngine {
                         }
                         _ => unreachable!(),
                     }
-                    responses.push(MqResponse::Ok);
+                    ResponseEntry::write_ok(sub_buf, log_index);
+                    responses.push(ResponseEntry::split_from(sub_buf));
                 }
                 if tag == MqCommand::TAG_GROUP_NACK || tag == MqCommand::TAG_GROUP_RELEASE {
                     md.group_notifier.notify(group_id);
                 }
             } else {
                 for _ in cmds {
-                    responses.push(MqResponse::Ok);
+                    ResponseEntry::write_ok(sub_buf, log_index);
+                    responses.push(ResponseEntry::split_from(sub_buf));
                 }
             }
         } else {
             for _ in cmds {
-                responses.push(MqResponse::Ok);
+                ResponseEntry::write_ok(sub_buf, log_index);
+                responses.push(ResponseEntry::split_from(sub_buf));
             }
         }
     }
@@ -1876,11 +2069,13 @@ impl MqEngine {
         publish_will: bool,
         log_index: u64,
         current_time: u64,
-    ) -> MqResponse {
+        buf: &mut BytesMut,
+    ) {
         let md = &self.metadata;
 
         if md.sessions.pin().get(&session_id).is_none() {
-            return MqResponse::Ok; // idempotent
+            ResponseEntry::write_ok(buf, log_index);
+            return; // idempotent
         }
 
         // Release all in-flight from consumer groups
@@ -1907,7 +2102,10 @@ impl MqEngine {
         // Re-acquire session reference
         let session = match md.sessions.pin().get(&session_id).cloned() {
             Some(s) => s,
-            None => return MqResponse::Ok,
+            None => {
+                ResponseEntry::write_ok(buf, log_index);
+                return;
+            }
         };
 
         // Handle will
@@ -1930,10 +2128,8 @@ impl MqEngine {
                         md.sessions.pin().remove(&session_id);
                         md.session_client_index.pin().remove(&hash);
                     }
-                    return MqResponse::WillPending {
-                        session_id,
-                        delay_ms,
-                    };
+                    ResponseEntry::write_will_pending(buf, log_index, session_id, delay_ms);
+                    return;
                 } else {
                     // Publish will immediately
                     self.publish_will_payload(will.topic_id, will.payload, log_index);
@@ -1948,7 +2144,7 @@ impl MqEngine {
             md.session_client_index.pin().remove(&hash);
         }
 
-        MqResponse::Ok
+        ResponseEntry::write_ok(buf, log_index)
     }
 
     /// Resolve the DLQ topic ID for an ack-variant consumer group.
@@ -2043,6 +2239,7 @@ impl MqEngine {
             next_id: md.next_id.load(Ordering::Relaxed),
             file_manifest: Vec::new(),
             sync_addr: None,
+            client_sessions: std::collections::HashMap::new(),
         }
     }
 
@@ -2300,6 +2497,7 @@ impl MqEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_apply::ResponseEntry;
     use crate::flat::FlatMessageBuilder;
 
     fn make_config() -> MqConfig {
@@ -2314,41 +2512,54 @@ mod tests {
         FlatMessageBuilder::new(value).timestamp(1000).build()
     }
 
+    /// Helper: apply a command and return a `ResponseEntry` for inspection.
+    fn apply(
+        engine: &MqEngine,
+        cmd: &MqCommand,
+        log_index: u64,
+        current_time: u64,
+    ) -> ResponseEntry {
+        let mut buf = BytesMut::new();
+        engine.apply_command(cmd, &mut buf, log_index, current_time, None);
+        ResponseEntry::split_from(&mut buf)
+    }
+
     // =========================================================================
     // 1. test_create_delete_topic
     // =========================================================================
 
     #[test]
     fn test_create_delete_topic() {
-        let mut engine = make_engine();
+        let engine = make_engine();
+        let mut buf = BytesMut::new();
 
-        let cmd = MqCommand::create_topic("events", RetentionPolicy::default(), 0);
-        let resp = engine.apply_command(&cmd, 1, 1000, None);
-        let topic_id = match resp {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {:?}", other),
-        };
+        MqCommand::write_create_topic(&mut buf, "events", &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        let resp = apply(&engine, &cmd, 1, 1000);
+        assert_eq!(
+            resp.tag(),
+            ResponseEntry::TAG_ENTITY_CREATED,
+            "expected EntityCreated"
+        );
+        let topic_id = resp.entity_id();
         assert!(topic_id > 0);
 
         // Duplicate name should fail
-        let cmd2 = MqCommand::create_topic("events", RetentionPolicy::default(), 0);
-        match engine.apply_command(&cmd2, 2, 1001, None) {
-            MqResponse::Error(MqError::AlreadyExists { .. }) => {}
-            other => panic!("expected AlreadyExists, got {:?}", other),
-        }
+        MqCommand::write_create_topic(&mut buf, "events", &RetentionPolicy::default(), 0);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        let resp2 = apply(&engine, &cmd2, 2, 1001);
+        assert!(resp2.is_already_exists(), "expected AlreadyExists");
 
         // Delete
-        let del_cmd = MqCommand::delete_topic(topic_id);
-        assert!(matches!(
-            engine.apply_command(&del_cmd, 3, 1002, None),
-            MqResponse::Ok
-        ));
+        MqCommand::write_delete_topic(&mut buf, topic_id);
+        let del_cmd = MqCommand::split_from(&mut buf);
+        let resp3 = apply(&engine, &del_cmd, 3, 1002);
+        assert_eq!(resp3.tag(), ResponseEntry::TAG_OK);
 
         // Delete non-existent
-        match engine.apply_command(&del_cmd, 4, 1003, None) {
-            MqResponse::Error(MqError::NotFound { .. }) => {}
-            other => panic!("expected NotFound, got {:?}", other),
-        }
+        let resp4 = apply(&engine, &del_cmd, 4, 1003);
+        assert_eq!(resp4.tag(), ResponseEntry::TAG_ERROR);
+        assert_eq!(resp4.error_kind(), ResponseEntry::ERR_NOT_FOUND);
     }
 
     // =========================================================================
@@ -2357,35 +2568,32 @@ mod tests {
 
     #[test]
     fn test_publish_and_offset() {
-        let mut engine = make_engine();
+        let engine = make_engine();
+        let mut buf = BytesMut::new();
 
-        let cmd = MqCommand::create_topic("logs", RetentionPolicy::default(), 0);
-        let topic_id = match engine.apply_command(&cmd, 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {:?}", other),
-        };
+        MqCommand::write_create_topic(&mut buf, "logs", &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        let resp = apply(&engine, &cmd, 1, 1000);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+        let topic_id = resp.entity_id();
 
         let msg = make_msg(b"hello");
-        let pub_cmd = MqCommand::publish(topic_id, &[msg]);
-        match engine.apply_command(&pub_cmd, 2, 1001, None) {
-            MqResponse::Published { base_offset, count } => {
-                assert_eq!(base_offset, 0);
-                assert_eq!(count, 1);
-            }
-            other => panic!("expected Published, got {:?}", other),
-        }
+        MqCommand::write_publish_bytes(&mut buf, topic_id, &[msg]);
+        let pub_cmd = MqCommand::split_from(&mut buf);
+        let resp2 = apply(&engine, &pub_cmd, 2, 1001);
+        assert_eq!(resp2.tag(), ResponseEntry::TAG_PUBLISHED);
+        assert_eq!(resp2.base_offset(), 0);
+        assert_eq!(resp2.published_count(), 1);
 
         // Publish more messages
         let msg2 = make_msg(b"world");
         let msg3 = make_msg(b"!");
-        let pub_cmd2 = MqCommand::publish(topic_id, &[msg2, msg3]);
-        match engine.apply_command(&pub_cmd2, 3, 1002, None) {
-            MqResponse::Published { base_offset, count } => {
-                assert_eq!(base_offset, 1);
-                assert_eq!(count, 2);
-            }
-            other => panic!("expected Published, got {:?}", other),
-        }
+        MqCommand::write_publish_bytes(&mut buf, topic_id, &[msg2, msg3]);
+        let pub_cmd2 = MqCommand::split_from(&mut buf);
+        let resp3 = apply(&engine, &pub_cmd2, 3, 1002);
+        assert_eq!(resp3.tag(), ResponseEntry::TAG_PUBLISHED);
+        assert_eq!(resp3.base_offset(), 1);
+        assert_eq!(resp3.published_count(), 2);
 
         // Verify topic state
         let topic = engine
@@ -2405,14 +2613,19 @@ mod tests {
 
     #[test]
     fn test_create_consumer_group() {
-        let mut engine = make_engine();
+        let engine = make_engine();
+        let mut buf = BytesMut::new();
 
         // Create a basic consumer group (Offset variant via old codec)
-        let cmd = MqCommand::create_consumer_group("my-group", 1); // 1 = Latest
-        let group_id = match engine.apply_command(&cmd, 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {:?}", other),
-        };
+        MqCommand::write_create_consumer_group(&mut buf, "my-group", 1); // 1 = Latest
+        let cmd = MqCommand::split_from(&mut buf);
+        let resp = apply(&engine, &cmd, 1, 1000);
+        assert_eq!(
+            resp.tag(),
+            ResponseEntry::TAG_ENTITY_CREATED,
+            "expected EntityCreated"
+        );
+        let group_id = resp.entity_id();
         assert!(group_id > 0);
 
         // Verify it exists
@@ -2431,7 +2644,7 @@ mod tests {
 
     #[test]
     fn test_ack_variant_lifecycle() {
-        let mut engine = make_engine();
+        let engine = make_engine();
 
         // Manually create a consumer group with Ack variant
         let md = engine.shared_metadata();
@@ -2508,7 +2721,7 @@ mod tests {
 
     #[test]
     fn test_actor_variant_lifecycle() {
-        let mut engine = make_engine();
+        let engine = make_engine();
         let md = engine.shared_metadata();
         let group_id = md.alloc_id();
 
@@ -2567,7 +2780,7 @@ mod tests {
 
     #[test]
     fn test_session_lifecycle() {
-        let mut engine = make_engine();
+        let engine = make_engine();
         let md = engine.shared_metadata();
 
         // Create session directly
@@ -2592,15 +2805,16 @@ mod tests {
 
     #[test]
     fn test_will_on_disconnect() {
-        let mut engine = make_engine();
+        let engine = make_engine();
         let md = engine.shared_metadata();
 
         // Create a topic for will publication
-        let cmd = MqCommand::create_topic("will-topic", RetentionPolicy::default(), 0);
-        let will_topic_id = match engine.apply_command(&cmd, 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {:?}", other),
-        };
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "will-topic", &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        let resp = apply(&engine, &cmd, 1, 1000);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+        let will_topic_id = resp.entity_id();
 
         // Create session with will
         let session_id = md.alloc_id();
@@ -2618,8 +2832,10 @@ mod tests {
             .insert(name_hash("will-client"), session_id);
 
         // Disconnect with will
-        let resp = engine.disconnect_session_internal(session_id, true, 10, 2000);
-        assert!(matches!(resp, MqResponse::Ok));
+        let mut resp_buf = BytesMut::new();
+        engine.disconnect_session_internal(session_id, true, 10, 2000, &mut resp_buf);
+        let resp = ResponseEntry::split_from(&mut resp_buf);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_OK);
 
         // Will should have been published to the topic
         let topic = md.topics.pin().get(&will_topic_id).unwrap().clone();
@@ -2632,50 +2848,47 @@ mod tests {
 
     #[test]
     fn test_exchange_routing() {
-        let mut engine = make_engine();
+        let engine = make_engine();
+        let mut buf = BytesMut::new();
 
         // Create exchange
-        let ex_cmd = MqCommand::create_exchange("fanout-ex", ExchangeType::Fanout);
-        let exchange_id = match engine.apply_command(&ex_cmd, 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {:?}", other),
-        };
+        MqCommand::write_create_exchange(&mut buf, "fanout-ex", ExchangeType::Fanout);
+        let ex_cmd = MqCommand::split_from(&mut buf);
+        let resp = apply(&engine, &ex_cmd, 1, 1000);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+        let exchange_id = resp.entity_id();
 
         // Create target topics
-        let t1_cmd = MqCommand::create_topic("target-1", RetentionPolicy::default(), 0);
-        let t1_id = match engine.apply_command(&t1_cmd, 2, 1001, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {:?}", other),
-        };
+        MqCommand::write_create_topic(&mut buf, "target-1", &RetentionPolicy::default(), 0);
+        let t1_cmd = MqCommand::split_from(&mut buf);
+        let t1_id = apply(&engine, &t1_cmd, 2, 1001).entity_id();
 
-        let t2_cmd = MqCommand::create_topic("target-2", RetentionPolicy::default(), 0);
-        let t2_id = match engine.apply_command(&t2_cmd, 3, 1002, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {:?}", other),
-        };
+        MqCommand::write_create_topic(&mut buf, "target-2", &RetentionPolicy::default(), 0);
+        let t2_cmd = MqCommand::split_from(&mut buf);
+        let t2_id = apply(&engine, &t2_cmd, 3, 1002).entity_id();
 
         // Create bindings
-        let b1_cmd = MqCommand::create_binding(exchange_id, t1_id, None);
-        assert!(matches!(
-            engine.apply_command(&b1_cmd, 4, 1003, None),
-            MqResponse::EntityCreated { .. }
-        ));
+        MqCommand::write_create_binding(&mut buf, exchange_id, t1_id, None);
+        let b1_cmd = MqCommand::split_from(&mut buf);
+        assert_eq!(
+            apply(&engine, &b1_cmd, 4, 1003).tag(),
+            ResponseEntry::TAG_ENTITY_CREATED
+        );
 
-        let b2_cmd = MqCommand::create_binding(exchange_id, t2_id, None);
-        assert!(matches!(
-            engine.apply_command(&b2_cmd, 5, 1004, None),
-            MqResponse::EntityCreated { .. }
-        ));
+        MqCommand::write_create_binding(&mut buf, exchange_id, t2_id, None);
+        let b2_cmd = MqCommand::split_from(&mut buf);
+        assert_eq!(
+            apply(&engine, &b2_cmd, 5, 1004).tag(),
+            ResponseEntry::TAG_ENTITY_CREATED
+        );
 
         // Publish to exchange
         let msg = make_msg(b"fanout-msg");
-        let pub_cmd = MqCommand::publish_to_exchange(exchange_id, &[msg]);
-        match engine.apply_command(&pub_cmd, 6, 1005, None) {
-            MqResponse::Published { count, .. } => {
-                assert!(count > 0);
-            }
-            other => panic!("expected Published, got {:?}", other),
-        }
+        MqCommand::write_publish_to_exchange_bytes(&mut buf, exchange_id, &[msg]);
+        let pub_cmd = MqCommand::split_from(&mut buf);
+        let pub_resp = apply(&engine, &pub_cmd, 6, 1005);
+        assert_eq!(pub_resp.tag(), ResponseEntry::TAG_PUBLISHED);
+        assert!(pub_resp.published_count() > 0);
 
         // Both topics should have received messages
         let t1 = engine.metadata().topics.pin().get(&t1_id).unwrap().clone();
@@ -2690,18 +2903,20 @@ mod tests {
 
     #[test]
     fn test_snapshot_restore() {
-        let mut engine = make_engine();
+        let engine = make_engine();
+        let mut buf = BytesMut::new();
 
         // Create some state
-        let cmd = MqCommand::create_topic("snap-topic", RetentionPolicy::default(), 0);
-        let topic_id = match engine.apply_command(&cmd, 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            _ => panic!("expected EntityCreated"),
-        };
+        MqCommand::write_create_topic(&mut buf, "snap-topic", &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        let resp = apply(&engine, &cmd, 1, 1000);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+        let topic_id = resp.entity_id();
 
         let msg = make_msg(b"snap-msg");
-        let pub_cmd = MqCommand::publish(topic_id, &[msg]);
-        engine.apply_command(&pub_cmd, 2, 1001, None);
+        MqCommand::write_publish_bytes(&mut buf, topic_id, &[msg]);
+        let pub_cmd = MqCommand::split_from(&mut buf);
+        apply(&engine, &pub_cmd, 2, 1001);
 
         // Snapshot
         let snap = engine.snapshot();
@@ -2709,7 +2924,7 @@ mod tests {
         assert_eq!(snap.topics[0].meta.topic_id, topic_id);
 
         // Restore into a new engine
-        let mut engine2 = make_engine();
+        let engine2 = make_engine();
         engine2.restore(snap);
 
         // Verify state was restored
@@ -2730,16 +2945,16 @@ mod tests {
 
     #[test]
     fn test_consumer_group_join_sync() {
-        let mut engine = make_engine();
+        let engine = make_engine();
+        let mut buf = BytesMut::new();
 
-        let cmd = MqCommand::create_consumer_group("join-test", 1);
-        let group_id = match engine.apply_command(&cmd, 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            other => panic!("expected EntityCreated, got {:?}", other),
-        };
+        MqCommand::write_create_consumer_group(&mut buf, "join-test", 1);
+        let cmd = MqCommand::split_from(&mut buf);
+        let group_id = apply(&engine, &cmd, 1, 1000).entity_id();
 
         // Join
-        let join_cmd = MqCommand::join_consumer_group(
+        MqCommand::write_join_consumer_group(
+            &mut buf,
             group_id,
             "",
             "client-1",
@@ -2748,37 +2963,28 @@ mod tests {
             "consumer",
             &[("range", b"meta" as &[u8])],
         );
-        let resp = engine.apply_command(&join_cmd, 2, 1001, None);
-        let member_id = match resp {
-            MqResponse::GroupJoined {
-                member_id,
-                phase_complete,
-                ..
-            } => {
-                assert!(phase_complete); // single member, so all joined immediately
-                member_id
-            }
-            other => panic!("expected GroupJoined, got {:?}", other),
-        };
+        let join_cmd = MqCommand::split_from(&mut buf);
+        let join_resp = apply(&engine, &join_cmd, 2, 1001);
+        assert_eq!(join_resp.tag(), ResponseEntry::TAG_GROUP_JOINED);
+        assert!(
+            join_resp.group_joined_phase_complete(),
+            "single member, so all joined immediately"
+        );
+        let (_leader, member_id, _protocol, _members) = join_resp.group_joined_fields();
 
         // Sync
-        let sync_cmd = MqCommand::sync_consumer_group(
+        MqCommand::write_sync_consumer_group(
+            &mut buf,
             group_id,
             1, // generation
             &member_id,
             &[(&member_id as &str, &[1u8, 2, 3] as &[u8])],
         );
-        let resp = engine.apply_command(&sync_cmd, 3, 1002, None);
-        match resp {
-            MqResponse::GroupSynced {
-                assignment,
-                phase_complete,
-            } => {
-                assert!(phase_complete);
-                assert_eq!(assignment, vec![1, 2, 3]);
-            }
-            other => panic!("expected GroupSynced, got {:?}", other),
-        }
+        let sync_cmd = MqCommand::split_from(&mut buf);
+        let sync_resp = apply(&engine, &sync_cmd, 3, 1002);
+        assert_eq!(sync_resp.tag(), ResponseEntry::TAG_GROUP_SYNCED);
+        assert!(sync_resp.group_synced_phase_complete());
+        assert_eq!(sync_resp.group_synced_assignment(), &[1u8, 2, 3]);
     }
 
     // =========================================================================
@@ -2787,15 +2993,14 @@ mod tests {
 
     #[test]
     fn test_dlq_routing() {
-        let mut engine = make_engine();
+        let engine = make_engine();
         let md = engine.shared_metadata();
 
         // Create DLQ topic
-        let cmd = MqCommand::create_topic("dlq-topic", RetentionPolicy::default(), 0);
-        let dlq_id = match engine.apply_command(&cmd, 1, 1000, None) {
-            MqResponse::EntityCreated { id } => id,
-            _ => panic!("expected EntityCreated"),
-        };
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, "dlq-topic", &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        let dlq_id = apply(&engine, &cmd, 1, 1000).entity_id();
 
         // Create ack group
         let group_id = md.alloc_id();
@@ -2852,7 +3057,7 @@ mod tests {
 
     #[test]
     fn test_auto_delete_on_last_detach() {
-        let mut engine = make_engine();
+        let engine = make_engine();
         let md = engine.shared_metadata();
 
         // Create a topic with DeleteOnLastDetach
@@ -2906,8 +3111,10 @@ mod tests {
         assert!(md.topics.pin().contains_key(&topic_id));
 
         // Delete the consumer group — should auto-delete the topic
-        let del_cmd = MqCommand::delete_consumer_group(group_id);
-        engine.apply_command(&del_cmd, 10, 2000, None);
+        let mut buf = BytesMut::new();
+        MqCommand::write_delete_consumer_group(&mut buf, group_id);
+        let del_cmd = MqCommand::split_from(&mut buf);
+        apply(&engine, &del_cmd, 10, 2000);
 
         // Topic should be gone
         assert!(!md.topics.pin().contains_key(&topic_id));
@@ -2919,20 +3126,22 @@ mod tests {
 
     #[test]
     fn test_batch_command() {
-        let mut engine = make_engine();
+        let engine = make_engine();
+        let mut buf = BytesMut::new();
 
-        let cmd1 = MqCommand::create_topic("batch-t1", RetentionPolicy::default(), 0);
-        let cmd2 = MqCommand::create_topic("batch-t2", RetentionPolicy::default(), 0);
-        let batch = MqCommand::batch(&[cmd1, cmd2]);
+        MqCommand::write_create_topic(&mut buf, "batch-t1", &RetentionPolicy::default(), 0);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_create_topic(&mut buf, "batch-t2", &RetentionPolicy::default(), 0);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[cmd1, cmd2]);
+        let batch = MqCommand::split_from(&mut buf);
 
-        match engine.apply_command(&batch, 1, 1000, None) {
-            MqResponse::BatchResponse(responses) => {
-                assert_eq!(responses.len(), 2);
-                assert!(matches!(responses[0], MqResponse::EntityCreated { .. }));
-                assert!(matches!(responses[1], MqResponse::EntityCreated { .. }));
-            }
-            other => panic!("expected BatchResponse, got {:?}", other),
-        }
+        let resp = apply(&engine, &batch, 1, 1000);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_BATCH);
+        let entries: Vec<ResponseEntry> = resp.batch_entries().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].tag(), ResponseEntry::TAG_ENTITY_CREATED);
+        assert_eq!(entries[1].tag(), ResponseEntry::TAG_ENTITY_CREATED);
 
         assert_eq!(engine.metadata().topics.len(), 2); // papaya len() works without pin
     }

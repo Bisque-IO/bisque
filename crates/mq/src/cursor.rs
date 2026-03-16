@@ -625,6 +625,7 @@ impl MqReader {
 mod tests {
     use super::*;
     use bisque_raft::record_format::{RecordType, append_record_into};
+    use bytes::BytesMut;
 
     /// Build a fake segment with Normal raft entries containing MqCommand data.
     fn build_test_segment(commands: &[MqCommand]) -> Bytes {
@@ -686,11 +687,14 @@ mod tests {
 
     #[test]
     fn cursor_scan_all_records() {
-        let cmds = vec![
-            MqCommand::publish(10, &[Bytes::from_static(b"hello")]),
-            MqCommand::publish(20, &[Bytes::from_static(b"world")]),
-            MqCommand::publish(30, &[Bytes::from_static(b"msg")]),
-        ];
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"hello")]);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[Bytes::from_static(b"world")]);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 30, &[Bytes::from_static(b"msg")]);
+        let cmd3 = MqCommand::split_from(&mut buf);
+        let cmds = vec![cmd1, cmd2, cmd3];
         let data = build_test_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -715,11 +719,14 @@ mod tests {
 
     #[test]
     fn cursor_skips_non_entry_records() {
-        let cmds = vec![
-            MqCommand::publish(1, &[Bytes::from_static(b"a")]),
-            MqCommand::publish(2, &[Bytes::from_static(b"b")]),
-            MqCommand::publish(3, &[Bytes::from_static(b"c")]),
-        ];
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"a")]);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 2, &[Bytes::from_static(b"b")]);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 3, &[Bytes::from_static(b"c")]);
+        let cmd3 = MqCommand::split_from(&mut buf);
+        let cmds = vec![cmd1, cmd2, cmd3];
         let data = build_mixed_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -732,13 +739,18 @@ mod tests {
 
     #[test]
     fn cursor_filter_by_entity() {
-        let cmds = vec![
-            MqCommand::publish(10, &[Bytes::from_static(b"a")]),
-            MqCommand::publish(20, &[Bytes::from_static(b"b")]),
-            MqCommand::publish(10, &[Bytes::from_static(b"c")]),
-            MqCommand::publish(30, &[Bytes::from_static(b"d")]),
-            MqCommand::publish(10, &[Bytes::from_static(b"e")]),
-        ];
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"a")]);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[Bytes::from_static(b"b")]);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"c")]);
+        let cmd3 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 30, &[Bytes::from_static(b"d")]);
+        let cmd4 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"e")]);
+        let cmd5 = MqCommand::split_from(&mut buf);
+        let cmds = vec![cmd1, cmd2, cmd3, cmd4, cmd5];
         let data = build_test_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -758,7 +770,9 @@ mod tests {
 
     #[test]
     fn cursor_rewind() {
-        let cmds = vec![MqCommand::publish(1, &[Bytes::from_static(b"x")])];
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"x")]);
+        let cmds = vec![MqCommand::split_from(&mut buf)];
         let data = build_test_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -772,10 +786,13 @@ mod tests {
 
     #[test]
     fn cursor_zero_copy_messages() {
-        let cmds = vec![MqCommand::publish(
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(
+            &mut buf,
             42,
             &[Bytes::from_static(b"hello"), Bytes::from_static(b"world")],
-        )];
+        );
+        let cmds = vec![MqCommand::split_from(&mut buf)];
         let data = build_test_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -803,7 +820,9 @@ mod tests {
         append_record_into(&mut buf, RecordType::Entry, 0, &payload);
 
         // Then a Normal entry.
-        let cmd = MqCommand::publish(1, &[Bytes::from_static(b"ok")]);
+        let mut cmd_buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut cmd_buf, 1, &[Bytes::from_static(b"ok")]);
+        let cmd = MqCommand::split_from(&mut cmd_buf);
         let mut payload2 = Vec::new();
         payload2.extend_from_slice(&1u64.to_le_bytes());
         payload2.extend_from_slice(&1u64.to_le_bytes());
@@ -825,8 +844,16 @@ mod tests {
     #[test]
     fn cursor_large_segment() {
         // 1000 records to verify sequential scanning at scale.
+        let mut buf = BytesMut::new();
         let cmds: Vec<MqCommand> = (0..1000)
-            .map(|i| MqCommand::publish(i % 10, &[Bytes::from(format!("msg-{i}"))]))
+            .map(|i| {
+                MqCommand::write_publish_bytes(
+                    &mut buf,
+                    i % 10,
+                    &[Bytes::from(format!("msg-{i}"))],
+                );
+                MqCommand::split_from(&mut buf)
+            })
             .collect();
         let data = build_test_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
@@ -847,16 +874,21 @@ mod tests {
     #[test]
     fn cursor_explodes_batch() {
         // A batch containing 3 sub-commands should yield 3 individual records.
-        let sub1 = MqCommand::publish(10, &[Bytes::from_static(b"a")]);
-        let sub2 = MqCommand::publish(20, &[Bytes::from_static(b"b")]);
-        let sub3 = MqCommand::publish(30, &[Bytes::from_static(b"c")]);
-        let batch = MqCommand::batch(&[sub1, sub2, sub3]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"a")]);
+        let sub1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[Bytes::from_static(b"b")]);
+        let sub2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 30, &[Bytes::from_static(b"c")]);
+        let sub3 = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[sub1, sub2, sub3]);
+        let batch = MqCommand::split_from(&mut buf);
 
-        let cmds = vec![
-            MqCommand::publish(1, &[Bytes::from_static(b"before")]),
-            batch,
-            MqCommand::publish(2, &[Bytes::from_static(b"after")]),
-        ];
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"before")]);
+        let before = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 2, &[Bytes::from_static(b"after")]);
+        let after = MqCommand::split_from(&mut buf);
+        let cmds = vec![before, batch, after];
         let data = build_test_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -894,15 +926,19 @@ mod tests {
     #[test]
     fn cursor_entity_filter_inside_batch() {
         // Entity filtering should find sub-commands inside batches.
-        let sub1 = MqCommand::publish(10, &[Bytes::from_static(b"x")]);
-        let sub2 = MqCommand::publish(20, &[Bytes::from_static(b"y")]);
-        let sub3 = MqCommand::publish(10, &[Bytes::from_static(b"z")]);
-        let batch = MqCommand::batch(&[sub1, sub2, sub3]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"x")]);
+        let sub1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[Bytes::from_static(b"y")]);
+        let sub2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"z")]);
+        let sub3 = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[sub1, sub2, sub3]);
+        let batch = MqCommand::split_from(&mut buf);
 
-        let cmds = vec![
-            MqCommand::publish(10, &[Bytes::from_static(b"solo")]),
-            batch,
-        ];
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"solo")]);
+        let solo = MqCommand::split_from(&mut buf);
+        let cmds = vec![solo, batch];
         let data = build_test_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -917,11 +953,19 @@ mod tests {
     #[test]
     fn cursor_consecutive_batches() {
         // Two batches back-to-back: ensure state resets between them.
-        let batch1 = MqCommand::batch(&[
-            MqCommand::publish(1, &[Bytes::from_static(b"a")]),
-            MqCommand::publish(2, &[Bytes::from_static(b"b")]),
-        ]);
-        let batch2 = MqCommand::batch(&[MqCommand::publish(3, &[Bytes::from_static(b"c")])]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"a")]);
+        let b1s1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 2, &[Bytes::from_static(b"b")]);
+        let b1s2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[b1s1, b1s2]);
+        let batch1 = MqCommand::split_from(&mut buf);
+
+        MqCommand::write_publish_bytes(&mut buf, 3, &[Bytes::from_static(b"c")]);
+        let b2s1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[b2s1]);
+        let batch2 = MqCommand::split_from(&mut buf);
+
         let data = build_test_segment(&[batch1, batch2]);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -937,11 +981,12 @@ mod tests {
 
     #[test]
     fn cursor_empty_batch_skipped() {
-        let empty_batch = MqCommand::batch(&[]);
-        let cmds = vec![
-            empty_batch,
-            MqCommand::publish(1, &[Bytes::from_static(b"after")]),
-        ];
+        let mut buf = BytesMut::new();
+        MqCommand::write_batch(&mut buf, &[]);
+        let empty_batch = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"after")]);
+        let after = MqCommand::split_from(&mut buf);
+        let cmds = vec![empty_batch, after];
         let data = build_test_segment(&cmds);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -954,10 +999,12 @@ mod tests {
     #[test]
     fn cursor_truncated_segment() {
         // Build a valid segment then truncate it mid-record.
-        let cmds = vec![
-            MqCommand::publish(1, &[Bytes::from_static(b"ok")]),
-            MqCommand::publish(2, &[Bytes::from_static(b"truncated")]),
-        ];
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"ok")]);
+        let cmd1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 2, &[Bytes::from_static(b"truncated")]);
+        let cmd2 = MqCommand::split_from(&mut buf);
+        let cmds = vec![cmd1, cmd2];
         let full = build_test_segment(&cmds);
         // Truncate well into the second record's content (past any alignment padding).
         let truncated = full.slice(..full.len() - 16);
@@ -973,11 +1020,15 @@ mod tests {
     #[test]
     fn cursor_rewind_mid_batch() {
         // Rewind while in the middle of exploding a batch.
-        let batch = MqCommand::batch(&[
-            MqCommand::publish(1, &[Bytes::from_static(b"a")]),
-            MqCommand::publish(2, &[Bytes::from_static(b"b")]),
-            MqCommand::publish(3, &[Bytes::from_static(b"c")]),
-        ]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"a")]);
+        let s1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 2, &[Bytes::from_static(b"b")]);
+        let s2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 3, &[Bytes::from_static(b"c")]);
+        let s3 = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[s1, s2, s3]);
+        let batch = MqCommand::split_from(&mut buf);
         let data = build_test_segment(&[batch]);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 
@@ -997,12 +1048,17 @@ mod tests {
     #[test]
     fn cursor_batch_with_mixed_topics() {
         // Batch containing publishes to different topics; entity filter picks the right ones.
-        let batch = MqCommand::batch(&[
-            MqCommand::publish(10, &[Bytes::from_static(b"p1")]),
-            MqCommand::publish(20, &[Bytes::from_static(b"p2")]),
-            MqCommand::publish(10, &[Bytes::from_static(b"p3")]),
-            MqCommand::publish(20, &[Bytes::from_static(b"p4")]),
-        ]);
+        let mut buf = BytesMut::new();
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"p1")]);
+        let s1 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[Bytes::from_static(b"p2")]);
+        let s2 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 10, &[Bytes::from_static(b"p3")]);
+        let s3 = MqCommand::split_from(&mut buf);
+        MqCommand::write_publish_bytes(&mut buf, 20, &[Bytes::from_static(b"p4")]);
+        let s4 = MqCommand::split_from(&mut buf);
+        MqCommand::write_batch(&mut buf, &[s1, s2, s3, s4]);
+        let batch = MqCommand::split_from(&mut buf);
         let data = build_test_segment(&[batch]);
         let mut cursor = MqSegmentCursor::new(SegmentView::from_bytes(1, data));
 

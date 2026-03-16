@@ -23,6 +23,30 @@ use bisque_mq::types::*;
 // Helpers
 // =============================================================================
 
+use bisque_mq::async_apply::ResponseEntry;
+use bytes::BytesMut;
+
+fn apply_engine(
+    engine: &bisque_mq::engine::MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+) -> ResponseEntry {
+    apply_engine_seg(engine, cmd, log_index, current_time, None)
+}
+
+fn apply_engine_seg(
+    engine: &bisque_mq::engine::MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+    segment_id: Option<u64>,
+) -> ResponseEntry {
+    let mut _buf = BytesMut::new();
+    engine.apply_command(cmd, &mut _buf, log_index, current_time, segment_id);
+    ResponseEntry::split_from(&mut _buf)
+}
+
 fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-mqtt-opt-test"))
 }
@@ -39,20 +63,27 @@ fn make_flat_msg_with_routing_key(value: &[u8], routing_key: &str) -> bytes::Byt
 }
 
 fn create_exchange(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) -> u64 {
-    match engine.apply_command(
-        &MqCommand::create_exchange(name, ExchangeType::Topic),
+    let mut buf = BytesMut::new();
+    let e = apply_engine(
+        &engine,
+        &MqCommand::create_exchange(&mut buf, name, ExchangeType::Topic),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    e.entity_id()
 }
 
 fn create_queue(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) -> u64 {
-    match engine.apply_command(
+    let mut buf = BytesMut::new();
+    let e = apply_engine(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             name,
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -64,11 +95,13 @@ fn create_queue(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) ->
         ),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    e.entity_id()
 }
 
 fn create_queue_with_config(
@@ -78,8 +111,11 @@ fn create_queue_with_config(
     log_index: u64,
     time: u64,
 ) -> u64 {
-    match engine.apply_command(
+    let mut buf = BytesMut::new();
+    let e = apply_engine(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             name,
             config,
             RetentionPolicy::default(),
@@ -91,32 +127,36 @@ fn create_queue_with_config(
         ),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        e.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    e.entity_id()
 }
 
 fn create_session(engine: &mut MqEngine, session_id: u64, log_index: u64, time: u64) {
-    engine.apply_command(
-        &MqCommand::create_session(session_id, "mqtt-consumer", 60000, 0),
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::create_session(&mut buf, session_id, "mqtt-consumer", 60000, 0),
         log_index,
         time,
-        None,
     );
 }
 
 fn enqueue_messages(engine: &mut MqEngine, topic_id: u64, count: usize, log_index: u64, time: u64) {
     // Publish each message individually with a unique log_index so each gets
     // a unique message_id (the engine uses log_index as the message_id key).
+    let mut buf = BytesMut::new();
     for i in 0..count {
         let msg = make_flat_msg(format!("msg-{}", i).as_bytes());
-        engine.apply_command(
-            &MqCommand::publish(topic_id, &[msg]),
+        apply_engine(
+            &engine,
+            &MqCommand::publish(&mut buf, topic_id, &[msg]),
             log_index + i as u64,
             time,
-            None,
         );
     }
 }
@@ -129,15 +169,15 @@ fn deliver_messages(
     log_index: u64,
     time: u64,
 ) -> Vec<DeliveredMessage> {
-    match engine.apply_command(
-        &MqCommand::group_deliver(group_id, consumer_id, max_count),
+    let mut buf = BytesMut::new();
+    let e = apply_engine(
+        &engine,
+        &MqCommand::group_deliver(&mut buf, group_id, consumer_id, max_count),
         log_index,
         time,
-        None,
-    ) {
-        MqResponse::Messages { messages } => messages.to_vec(),
-        other => panic!("expected Messages, got {:?}", other),
-    }
+    );
+    assert_eq!(e.tag(), ResponseEntry::TAG_MESSAGES, "expected Messages");
+    e.messages().collect()
 }
 
 // =============================================================================
@@ -363,13 +403,14 @@ fn test_opt2_set_retained_basic() {
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let msg = make_flat_msg_with_routing_key(b"temp=22.5", "sensors/temp");
 
-    let resp = engine.apply_command(
-        &MqCommand::set_retained(exchange_id, "sensors/temp", &msg),
+    let mut buf = BytesMut::new();
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_retained(&mut buf, exchange_id, "sensors/temp", &msg),
         2,
         1001,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 }
 
 // =============================================================================
@@ -383,14 +424,24 @@ fn test_opt3_set_will_basic() {
 
     create_session(&mut engine, 100, 2, 1001);
 
+    let mut buf = BytesMut::new();
     let will_msg = make_flat_msg_with_routing_key(b"client offline", "status/client1");
-    let resp = engine.apply_command(
-        &MqCommand::set_will(100, _exchange_id, 0, 0, false, "status/client1", &will_msg),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_will(
+            &mut buf,
+            100,
+            _exchange_id,
+            0,
+            0,
+            false,
+            "status/client1",
+            &will_msg,
+        ),
         3,
         1002,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 }
 
 #[test]
@@ -399,16 +450,17 @@ fn test_opt3_clear_will_basic() {
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     create_session(&mut engine, 100, 2, 1001);
 
+    let mut buf = BytesMut::new();
     let will_msg = make_flat_msg(b"offline");
-    engine.apply_command(
-        &MqCommand::set_will(100, exchange_id, 0, 0, false, "status", &will_msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_will(&mut buf, 100, exchange_id, 0, 0, false, "status", &will_msg),
         3,
         1002,
-        None,
     );
 
-    let resp = engine.apply_command(&MqCommand::clear_will(100), 4, 1003, None);
-    assert!(matches!(resp, MqResponse::Ok));
+    let resp = apply_engine(&engine, &MqCommand::clear_will(&mut buf, 100), 4, 1003);
+    assert!(resp.is_ok(), "expected Ok");
 }
 
 #[test]
@@ -418,27 +470,42 @@ fn test_opt3_will_on_disconnect_immediate() {
 
     // Create a queue bound to the exchange to receive the will message
     let queue_id = create_queue(&mut engine, "will-receiver", 2, 1001);
-    engine.apply_command(
-        &MqCommand::create_binding(exchange_id, queue_id, Some("status/client1")),
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::create_binding(&mut buf, exchange_id, queue_id, Some("status/client1")),
         3,
         1002,
-        None,
     );
 
     create_session(&mut engine, 100, 4, 1003);
 
     let will_msg = make_flat_msg_with_routing_key(b"client offline", "status/client1");
-    engine.apply_command(
-        &MqCommand::set_will(100, exchange_id, 0, 0, false, "status/client1", &will_msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_will(
+            &mut buf,
+            100,
+            exchange_id,
+            0,
+            0,
+            false,
+            "status/client1",
+            &will_msg,
+        ),
         5,
         1004,
-        None,
     );
 
     // Disconnect session -- will should be published
-    let resp = engine.apply_command(&MqCommand::disconnect_session(100, true), 6, 1005, None);
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        6,
+        1005,
+    );
     // Immediate will (delay=0) should publish inline
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 
     // Verify will message arrived in the bound queue
     let delivered = deliver_messages(&mut engine, queue_id, 200, 1, 7, 1006);
@@ -454,28 +521,43 @@ fn test_opt3_clean_disconnect_no_will() {
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let queue_id = create_queue(&mut engine, "will-receiver", 2, 1001);
-    engine.apply_command(
-        &MqCommand::create_binding(exchange_id, queue_id, Some("status/#")),
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::create_binding(&mut buf, exchange_id, queue_id, Some("status/#")),
         3,
         1002,
-        None,
     );
 
     create_session(&mut engine, 100, 4, 1003);
 
     let will_msg = make_flat_msg(b"offline");
-    engine.apply_command(
-        &MqCommand::set_will(100, exchange_id, 0, 0, false, "status/c1", &will_msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_will(
+            &mut buf,
+            100,
+            exchange_id,
+            0,
+            0,
+            false,
+            "status/c1",
+            &will_msg,
+        ),
         5,
         1004,
-        None,
     );
 
     // Clear will before disconnect (clean disconnect)
-    engine.apply_command(&MqCommand::clear_will(100), 6, 1005, None);
+    apply_engine(&engine, &MqCommand::clear_will(&mut buf, 100), 6, 1005);
 
     // Disconnect -- no will should be published
-    engine.apply_command(&MqCommand::disconnect_session(100, false), 7, 1006, None);
+    apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, false),
+        7,
+        1006,
+    );
 
     // Queue should be empty
     let delivered = deliver_messages(&mut engine, queue_id, 200, 1, 8, 1007);
@@ -485,15 +567,17 @@ fn test_opt3_clean_disconnect_no_will() {
 #[test]
 fn test_opt3_will_nonexistent_session() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
     let will_msg = make_flat_msg(b"offline");
 
-    let resp = engine.apply_command(
-        &MqCommand::set_will(999, 1, 0, 0, false, "status", &will_msg),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::set_will(&mut buf, 999, 1, 0, 0, false, "status", &will_msg),
         1,
         1000,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Error(MqError::NotFound { .. })));
+    assert_eq!(resp.tag(), ResponseEntry::TAG_ERROR, "expected Error");
+    assert_eq!(resp.error_kind(), ResponseEntry::ERR_NOT_FOUND);
 }
 
 #[test]
@@ -502,22 +586,37 @@ fn test_opt3_will_with_delay() {
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     create_session(&mut engine, 100, 2, 1001);
 
+    let mut buf = BytesMut::new();
     let will_msg = make_flat_msg(b"delayed-offline");
-    engine.apply_command(
-        &MqCommand::set_will(100, exchange_id, 5, 1, false, "status/c1", &will_msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_will(
+            &mut buf,
+            100,
+            exchange_id,
+            5,
+            1,
+            false,
+            "status/c1",
+            &will_msg,
+        ),
         3,
         1002,
-        None,
     );
 
     // Disconnect -- should return WillPending
-    let resp = engine.apply_command(&MqCommand::disconnect_session(100, true), 4, 1003, None);
-    match resp {
-        MqResponse::WillPending { delay_ms, .. } => {
-            assert!(delay_ms > 0);
-        }
-        other => panic!("expected WillPending for delayed will, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        4,
+        1003,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_WILL_PENDING,
+        "expected WillPending for delayed will"
+    );
+    assert!(resp.will_pending_delay_ms() > 0);
 }
 
 #[test]
@@ -525,11 +624,12 @@ fn test_opt3_will_update_replaces() {
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let queue_id = create_queue(&mut engine, "will-q", 2, 1001);
-    engine.apply_command(
-        &MqCommand::create_binding(exchange_id, queue_id, Some("status/c1")),
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::create_binding(&mut buf, exchange_id, queue_id, Some("status/c1")),
         3,
         1002,
-        None,
     );
 
     create_session(&mut engine, 100, 4, 1003);
@@ -537,21 +637,44 @@ fn test_opt3_will_update_replaces() {
     let will_msg1 = make_flat_msg_with_routing_key(b"msg1", "status/c1");
     let will_msg2 = make_flat_msg_with_routing_key(b"msg2-updated", "status/c1");
 
-    engine.apply_command(
-        &MqCommand::set_will(100, exchange_id, 0, 0, false, "status/c1", &will_msg1),
+    apply_engine(
+        &engine,
+        &MqCommand::set_will(
+            &mut buf,
+            100,
+            exchange_id,
+            0,
+            0,
+            false,
+            "status/c1",
+            &will_msg1,
+        ),
         5,
         1004,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::set_will(100, exchange_id, 0, 0, false, "status/c1", &will_msg2),
+    apply_engine(
+        &engine,
+        &MqCommand::set_will(
+            &mut buf,
+            100,
+            exchange_id,
+            0,
+            0,
+            false,
+            "status/c1",
+            &will_msg2,
+        ),
         6,
         1005,
-        None,
     );
 
     // Disconnect -- should publish msg2, not msg1
-    engine.apply_command(&MqCommand::disconnect_session(100, true), 7, 1006, None);
+    apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        7,
+        1006,
+    );
 
     let delivered = deliver_messages(&mut engine, queue_id, 200, 10, 8, 1007);
     assert_eq!(
@@ -567,12 +690,13 @@ fn test_opt3_will_survives_snapshot() {
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     create_session(&mut engine, 100, 2, 1001);
 
+    let mut buf = BytesMut::new();
     let will_msg = make_flat_msg_with_routing_key(b"crash-will", "status");
-    engine.apply_command(
-        &MqCommand::set_will(100, exchange_id, 0, 0, false, "status", &will_msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_will(&mut buf, 100, exchange_id, 0, 0, false, "status", &will_msg),
         3,
         1002,
-        None,
     );
 
     // Snapshot and restore
@@ -583,13 +707,18 @@ fn test_opt3_will_survives_snapshot() {
     // Verify will is preserved -- consumer should have will set
     // We verify by checking that disconnect publishes the will
     let queue_id = create_queue(&mut engine2, "will-q", 4, 1003);
-    engine2.apply_command(
-        &MqCommand::create_binding(exchange_id, queue_id, Some("status")),
+    apply_engine(
+        &engine2,
+        &MqCommand::create_binding(&mut buf, exchange_id, queue_id, Some("status")),
         5,
         1004,
-        None,
     );
-    engine2.apply_command(&MqCommand::disconnect_session(100, true), 6, 1005, None);
+    apply_engine(
+        &engine2,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        6,
+        1005,
+    );
 
     let delivered = deliver_messages(&mut engine2, queue_id, 200, 1, 7, 1006);
     assert_eq!(delivered.len(), 1, "will should survive snapshot");
@@ -604,13 +733,14 @@ fn test_opt6_persist_session_basic() {
     let mut engine = make_engine();
     let sub_data = Bytes::from_static(b"serialized-subscription-data");
 
-    let resp = engine.apply_command(
-        &MqCommand::persist_session(100, "mqtt-client-1", 3600, &sub_data, 0, 0, 0),
+    let mut buf = BytesMut::new();
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 100, "mqtt-client-1", 3600, &sub_data, 0, 0, 0),
         1,
         1000,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Ok));
+    assert!(resp.is_ok(), "expected Ok");
 }
 
 #[test]
@@ -618,26 +748,31 @@ fn test_opt6_restore_session_basic() {
     let mut engine = make_engine();
     let sub_data = Bytes::from(b"sub-filter:sensors/#,qos:1".to_vec());
 
-    engine.apply_command(
-        &MqCommand::persist_session(100, "mqtt-client-1", 3600, &sub_data, 0, 0, 0),
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 100, "mqtt-client-1", 3600, &sub_data, 0, 0, 0),
         1,
         1000,
-        None,
     );
 
-    let resp = engine.apply_command(&MqCommand::restore_session("mqtt-client-1"), 2, 1001, None);
-    match resp {
-        MqResponse::SessionRestored {
-            session_id,
-            session_expiry_ms,
-            subscription_data,
-        } => {
-            assert_eq!(session_id, 100);
-            assert!(session_expiry_ms > 0);
-            assert_eq!(&subscription_data[..], b"sub-filter:sensors/#,qos:1");
-        }
-        other => panic!("expected SessionRestored, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "mqtt-client-1"),
+        2,
+        1001,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored"
+    );
+    assert_eq!(resp.session_restored_id(), 100);
+    assert!(resp.session_restored_expiry_ms() > 0);
+    assert_eq!(
+        &resp.session_restored_subscription_data()[..],
+        b"sub-filter:sensors/#,qos:1"
+    );
 }
 
 #[test]
@@ -645,17 +780,27 @@ fn test_opt6_restore_session_expired() {
     let mut engine = make_engine();
     let sub_data = Bytes::from_static(b"data");
 
+    let mut buf = BytesMut::new();
     // Persist with 1-second expiry
-    engine.apply_command(
-        &MqCommand::persist_session(100, "client1", 1, &sub_data, 0, 0, 0),
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 100, "client1", 1, &sub_data, 0, 0, 0),
         1,
         1000,
-        None,
     );
 
     // Restore 3 seconds later (well past 1-second expiry)
-    let resp = engine.apply_command(&MqCommand::restore_session("client1"), 2, 4000, None);
-    assert!(matches!(resp, MqResponse::SessionNotFound));
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "client1"),
+        2,
+        4000,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_NOT_FOUND,
+        "expected SessionNotFound"
+    );
 }
 
 #[test]
@@ -663,35 +808,46 @@ fn test_opt6_restore_session_never_expire() {
     let mut engine = make_engine();
     let sub_data = Bytes::from_static(b"data");
 
+    let mut buf = BytesMut::new();
     // Persist with 0xFFFFFFFF = never expire
-    engine.apply_command(
-        &MqCommand::persist_session(100, "client1", 0xFFFFFFFF, &sub_data, 0, 0, 0),
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 100, "client1", 0xFFFFFFFF, &sub_data, 0, 0, 0),
         1,
         1000,
-        None,
     );
 
     // Restore much later
-    let resp = engine.apply_command(
-        &MqCommand::restore_session("client1"),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "client1"),
         2,
         1_000_000_000,
-        None,
     );
-    match resp {
-        MqResponse::SessionRestored { session_id, .. } => {
-            assert_eq!(session_id, 100);
-        }
-        other => panic!("expected SessionRestored, got {:?}", other),
-    }
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored"
+    );
+    assert_eq!(resp.session_restored_id(), 100);
 }
 
 #[test]
 fn test_opt6_restore_session_nonexistent() {
     let mut engine = make_engine();
 
-    let resp = engine.apply_command(&MqCommand::restore_session("unknown-client"), 1, 1000, None);
-    assert!(matches!(resp, MqResponse::SessionNotFound));
+    let mut buf = BytesMut::new();
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "unknown-client"),
+        1,
+        1000,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_NOT_FOUND,
+        "expected SessionNotFound"
+    );
 }
 
 #[test]
@@ -699,50 +855,83 @@ fn test_opt6_expire_sessions_cleanup() {
     let mut engine = make_engine();
     let sub_data = Bytes::from_static(b"data");
 
+    let mut buf = BytesMut::new();
     // Session 1: expires in 1 second
-    engine.apply_command(
-        &MqCommand::persist_session(100, "client-short", 1, &sub_data, 0, 0, 0),
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 100, "client-short", 1, &sub_data, 0, 0, 0),
         1,
         1000,
-        None,
     );
     // Session 2: expires in 10 seconds
-    engine.apply_command(
-        &MqCommand::persist_session(101, "client-medium", 10, &sub_data, 0, 0, 0),
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 101, "client-medium", 10, &sub_data, 0, 0, 0),
         2,
         1000,
-        None,
     );
     // Session 3: never expires
-    engine.apply_command(
-        &MqCommand::persist_session(102, "client-forever", 0xFFFFFFFF, &sub_data, 0, 0, 0),
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(
+            &mut buf,
+            102,
+            "client-forever",
+            0xFFFFFFFF,
+            &sub_data,
+            0,
+            0,
+            0,
+        ),
         3,
         1000,
-        None,
     );
 
     // Expire at now=5000ms (5 seconds later)
-    engine.apply_command(&MqCommand::expire_sessions(5000), 4, 5000, None);
+    apply_engine(
+        &engine,
+        &MqCommand::expire_sessions(&mut buf, 5000),
+        4,
+        5000,
+    );
 
     // client-short should be expired (1s expiry, 4s elapsed)
-    let resp = engine.apply_command(&MqCommand::restore_session("client-short"), 5, 5001, None);
-    assert!(
-        matches!(resp, MqResponse::SessionNotFound),
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "client-short"),
+        5,
+        5001,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_NOT_FOUND,
         "short-lived session should be expired"
     );
 
     // client-medium should still exist (10s expiry, 4s elapsed)
-    let resp = engine.apply_command(&MqCommand::restore_session("client-medium"), 6, 5002, None);
-    assert!(
-        matches!(resp, MqResponse::SessionRestored { .. }),
-        "medium session should still exist"
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "client-medium"),
+        6,
+        5002,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored: medium session should still exist"
     );
 
     // client-forever should still exist
-    let resp = engine.apply_command(&MqCommand::restore_session("client-forever"), 7, 5003, None);
-    assert!(
-        matches!(resp, MqResponse::SessionRestored { .. }),
-        "forever session should still exist"
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "client-forever"),
+        7,
+        5003,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored: forever session should still exist"
     );
 }
 
@@ -750,8 +939,11 @@ fn test_opt6_expire_sessions_cleanup() {
 fn test_opt6_persist_session_overwrite() {
     let mut engine = make_engine();
 
-    engine.apply_command(
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
         &MqCommand::persist_session(
+            &mut buf,
             100,
             "client1",
             3600,
@@ -762,10 +954,11 @@ fn test_opt6_persist_session_overwrite() {
         ),
         1,
         1000,
-        None,
     );
-    engine.apply_command(
+    apply_engine(
+        &engine,
         &MqCommand::persist_session(
+            &mut buf,
             200,
             "client1",
             7200,
@@ -776,22 +969,22 @@ fn test_opt6_persist_session_overwrite() {
         ),
         2,
         2000,
-        None,
     );
 
-    let resp = engine.apply_command(&MqCommand::restore_session("client1"), 3, 2001, None);
-    match resp {
-        MqResponse::SessionRestored {
-            session_id,
-            session_expiry_ms,
-            subscription_data,
-        } => {
-            assert_eq!(session_id, 200);
-            assert!(session_expiry_ms > 0);
-            assert_eq!(&subscription_data[..], b"new-data");
-        }
-        other => panic!("expected SessionRestored, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "client1"),
+        3,
+        2001,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored"
+    );
+    assert_eq!(resp.session_restored_id(), 200);
+    assert!(resp.session_restored_expiry_ms() > 0);
+    assert_eq!(&resp.session_restored_subscription_data()[..], b"new-data");
 }
 
 #[test]
@@ -799,11 +992,12 @@ fn test_opt6_session_survives_snapshot() {
     let mut engine = make_engine();
     let sub_data = Bytes::from(b"snapshot-test-data".to_vec());
 
-    engine.apply_command(
-        &MqCommand::persist_session(100, "client1", 3600, &sub_data, 0, 0, 0),
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 100, "client1", 3600, &sub_data, 0, 0, 0),
         1,
         1000,
-        None,
     );
 
     // Snapshot and restore
@@ -811,15 +1005,21 @@ fn test_opt6_session_survives_snapshot() {
     let mut engine2 = make_engine();
     engine2.restore(snap);
 
-    let resp = engine2.apply_command(&MqCommand::restore_session("client1"), 2, 1001, None);
-    match resp {
-        MqResponse::SessionRestored {
-            subscription_data, ..
-        } => {
-            assert_eq!(&subscription_data[..], b"snapshot-test-data");
-        }
-        other => panic!("expected SessionRestored, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine2,
+        &MqCommand::restore_session(&mut buf, "client1"),
+        2,
+        1001,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored"
+    );
+    assert_eq!(
+        &resp.session_restored_subscription_data()[..],
+        b"snapshot-test-data"
+    );
 }
 
 #[test]
@@ -828,25 +1028,30 @@ fn test_opt6_subscription_data_opaque() {
     // Arbitrary binary data (not valid UTF-8)
     let sub_data = Bytes::from(vec![0x00, 0xFF, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]);
 
-    engine.apply_command(
-        &MqCommand::persist_session(100, "client1", 3600, &sub_data, 0, 0, 0),
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 100, "client1", 3600, &sub_data, 0, 0, 0),
         1,
         1000,
-        None,
     );
 
-    let resp = engine.apply_command(&MqCommand::restore_session("client1"), 2, 1001, None);
-    match resp {
-        MqResponse::SessionRestored {
-            subscription_data, ..
-        } => {
-            assert_eq!(
-                subscription_data, sub_data,
-                "binary data should be preserved exactly"
-            );
-        }
-        other => panic!("expected SessionRestored, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "client1"),
+        2,
+        1001,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored"
+    );
+    assert_eq!(
+        resp.session_restored_subscription_data(),
+        sub_data,
+        "binary data should be preserved exactly"
+    );
 }
 
 // =============================================================================
@@ -858,25 +1063,40 @@ fn test_integration_will_via_engine_connect_disconnect() {
     let mut engine = make_engine();
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let queue_id = create_queue(&mut engine, "will-q", 2, 1001);
-    engine.apply_command(
-        &MqCommand::create_binding(exchange_id, queue_id, Some("status/#")),
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::create_binding(&mut buf, exchange_id, queue_id, Some("status/#")),
         3,
         1002,
-        None,
     );
 
     // "Connect" -- create session with will
     create_session(&mut engine, 100, 4, 1003);
     let will_msg = make_flat_msg_with_routing_key(b"offline", "status/client1");
-    engine.apply_command(
-        &MqCommand::set_will(100, exchange_id, 0, 1, false, "status/client1", &will_msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_will(
+            &mut buf,
+            100,
+            exchange_id,
+            0,
+            1,
+            false,
+            "status/client1",
+            &will_msg,
+        ),
         5,
         1004,
-        None,
     );
 
     // "Unclean disconnect"
-    engine.apply_command(&MqCommand::disconnect_session(100, true), 6, 1005, None);
+    apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        6,
+        1005,
+    );
 
     // Will should have been published to the queue
     let delivered = deliver_messages(&mut engine, queue_id, 200, 1, 7, 1006);
@@ -891,31 +1111,38 @@ fn test_integration_session_restore_full_flow() {
     create_session(&mut engine, 100, 1, 1000);
     let sub_data = Bytes::from(b"filter:sensors/#,qos:1,no_local:false".to_vec());
 
+    let mut buf = BytesMut::new();
     // Disconnect with session persistence
-    engine.apply_command(
-        &MqCommand::persist_session(100, "my-mqtt-client", 3600, &sub_data, 0, 0, 0),
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 100, "my-mqtt-client", 3600, &sub_data, 0, 0, 0),
         2,
         1001,
-        None,
     );
-    engine.apply_command(&MqCommand::disconnect_session(100, false), 3, 1002, None);
+    apply_engine(
+        &engine,
+        &MqCommand::disconnect_session(&mut buf, 100, false),
+        3,
+        1002,
+    );
 
     // Reconnect -- restore session
-    let resp = engine.apply_command(&MqCommand::restore_session("my-mqtt-client"), 4, 1003, None);
-    match resp {
-        MqResponse::SessionRestored {
-            session_id,
-            subscription_data,
-            ..
-        } => {
-            assert_eq!(session_id, 100);
-            assert_eq!(
-                &subscription_data[..],
-                b"filter:sensors/#,qos:1,no_local:false"
-            );
-        }
-        other => panic!("expected SessionRestored, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine,
+        &MqCommand::restore_session(&mut buf, "my-mqtt-client"),
+        4,
+        1003,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored"
+    );
+    assert_eq!(resp.session_restored_id(), 100);
+    assert_eq!(
+        &resp.session_restored_subscription_data()[..],
+        b"filter:sensors/#,qos:1,no_local:false"
+    );
 }
 
 // =============================================================================
@@ -927,11 +1154,12 @@ fn test_crash_recovery_session() {
     let mut engine = make_engine();
     let sub_data = Bytes::from(b"crash-recovery-subs".to_vec());
 
-    engine.apply_command(
-        &MqCommand::persist_session(100, "crash-client", 3600, &sub_data, 0, 0, 0),
+    let mut buf = BytesMut::new();
+    apply_engine(
+        &engine,
+        &MqCommand::persist_session(&mut buf, 100, "crash-client", 3600, &sub_data, 0, 0, 0),
         1,
         1000,
-        None,
     );
 
     // "Crash"
@@ -939,15 +1167,21 @@ fn test_crash_recovery_session() {
     let mut engine2 = make_engine();
     engine2.restore(snap);
 
-    let resp = engine2.apply_command(&MqCommand::restore_session("crash-client"), 2, 1001, None);
-    match resp {
-        MqResponse::SessionRestored {
-            subscription_data, ..
-        } => {
-            assert_eq!(&subscription_data[..], b"crash-recovery-subs");
-        }
-        other => panic!("expected SessionRestored, got {:?}", other),
-    }
+    let resp = apply_engine(
+        &engine2,
+        &MqCommand::restore_session(&mut buf, "crash-client"),
+        2,
+        1001,
+    );
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored"
+    );
+    assert_eq!(
+        &resp.session_restored_subscription_data()[..],
+        b"crash-recovery-subs"
+    );
 }
 
 #[test]
@@ -956,12 +1190,22 @@ fn test_crash_recovery_will() {
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     create_session(&mut engine, 100, 2, 1001);
 
+    let mut buf = BytesMut::new();
     let will_msg = make_flat_msg_with_routing_key(b"crash-will", "status/c1");
-    engine.apply_command(
-        &MqCommand::set_will(100, exchange_id, 0, 0, false, "status/c1", &will_msg),
+    apply_engine(
+        &engine,
+        &MqCommand::set_will(
+            &mut buf,
+            100,
+            exchange_id,
+            0,
+            0,
+            false,
+            "status/c1",
+            &will_msg,
+        ),
         3,
         1002,
-        None,
     );
 
     // "Crash" before disconnect
@@ -971,15 +1215,20 @@ fn test_crash_recovery_will() {
 
     // Create queue to receive will in restored engine
     let queue_id = create_queue(&mut engine2, "will-q", 4, 1003);
-    engine2.apply_command(
-        &MqCommand::create_binding(exchange_id, queue_id, Some("status/c1")),
+    apply_engine(
+        &engine2,
+        &MqCommand::create_binding(&mut buf, exchange_id, queue_id, Some("status/c1")),
         5,
         1004,
-        None,
     );
 
     // Now disconnect -- will should still be set after recovery
-    engine2.apply_command(&MqCommand::disconnect_session(100, true), 6, 1005, None);
+    apply_engine(
+        &engine2,
+        &MqCommand::disconnect_session(&mut buf, 100, true),
+        6,
+        1005,
+    );
 
     let delivered = deliver_messages(&mut engine2, queue_id, 200, 1, 7, 1006);
     assert_eq!(

@@ -505,6 +505,7 @@ impl GroupMdbxEnv {
             next_id,
             file_manifest: Vec::new(),
             sync_addr: None,
+            client_sessions: std::collections::HashMap::new(),
         }))
     }
 
@@ -1436,6 +1437,7 @@ mod tests {
     use crate::engine::MqEngine;
     use crate::flat::FlatMessageBuilder;
     use crate::types::{MqCommand, RetentionPolicy};
+    use bytes::BytesMut;
     use std::sync::atomic::Ordering;
 
     fn make_msg(value: &[u8]) -> bytes::Bytes {
@@ -1465,12 +1467,10 @@ mod tests {
         };
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine.apply_command(
-            &MqCommand::create_topic(&"t1".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
-        );
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, &"t1".to_string(), &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
         let snap = engine.snapshot();
         env.install_snapshot(&meta, &snap).unwrap();
 
@@ -1499,12 +1499,16 @@ mod tests {
             membership_bytes: Vec::new(),
         };
         let mut engine1 = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine1.apply_command(
-            &MqCommand::create_topic(&"old_topic".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"old_topic".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine1.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
         env.install_snapshot(&meta1, &engine1.snapshot()).unwrap();
 
         let meta2 = GroupMeta {
@@ -1515,18 +1519,18 @@ mod tests {
             membership_bytes: Vec::new(),
         };
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine2.apply_command(
-            &MqCommand::create_topic(&"new_topic".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"new_topic".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
-        engine2.apply_command(
-            &MqCommand::create_topic(&"t2".to_string(), RetentionPolicy::default(), 0),
-            2,
-            1001,
-            None,
-        );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine2.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
+        MqCommand::write_create_topic(&mut buf, &"t2".to_string(), &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine2.apply_command(&cmd, &mut buf, 2, 1001, None);
         env.install_snapshot(&meta2, &engine2.snapshot()).unwrap();
 
         let read_meta = env.read_group_meta().unwrap().unwrap();
@@ -1593,18 +1597,19 @@ mod tests {
         mgr.open_group(1).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine.apply_command(
-            &MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"events".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
-        engine.apply_command(
-            &MqCommand::publish(1, &vec![make_msg(b"hello")]),
-            2,
-            1001,
-            None,
-        );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[make_msg(b"hello")]);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 2, 1001, None);
 
         let snap = engine.snapshot();
 
@@ -1672,20 +1677,21 @@ mod tests {
         let env = GroupMdbxEnv::open(tmp.path()).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
+        let mut buf = BytesMut::new();
 
         // Topic
-        engine.apply_command(
-            &MqCommand::create_topic(&"events".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"events".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
-        engine.apply_command(
-            &MqCommand::publish(1, &vec![make_msg(b"m1"), make_msg(b"m2")]),
-            2,
-            1001,
-            None,
-        );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[make_msg(b"m1"), make_msg(b"m2")]);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 2, 1001, None);
 
         let snap = engine.snapshot();
         assert_eq!(snap.topics.len(), 1);
@@ -1710,18 +1716,14 @@ mod tests {
         let env = GroupMdbxEnv::open(tmp.path()).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine.apply_command(
-            &MqCommand::create_topic(&"t1".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
-        );
-        engine.apply_command(
-            &MqCommand::create_topic(&"t2".to_string(), RetentionPolicy::default(), 0),
-            2,
-            1001,
-            None,
-        );
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, &"t1".to_string(), &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
+        MqCommand::write_create_topic(&mut buf, &"t2".to_string(), &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 2, 1001, None);
 
         let snap = engine.snapshot();
         assert_eq!(snap.topics.len(), 2);
@@ -1740,16 +1742,16 @@ mod tests {
 
         // Write structural data first
         let mut tmp_engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        tmp_engine.apply_command(
-            &MqCommand::create_topic(
-                &"structural-topic".to_string(),
-                RetentionPolicy::default(),
-                0,
-            ),
-            1,
-            1000,
-            None,
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"structural-topic".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
+        let cmd = MqCommand::split_from(&mut buf);
+        tmp_engine.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
         let topic_meta = tmp_engine
             .metadata()
             .topics
@@ -1766,12 +1768,14 @@ mod tests {
 
         // Install snapshot — should clear the entities table
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine.apply_command(
-            &MqCommand::create_topic(&"snap-topic".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"snap-topic".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
         env.install_snapshot(&make_meta(5), &engine.snapshot())
             .unwrap();
 
@@ -1795,23 +1799,29 @@ mod tests {
         let env = GroupMdbxEnv::open(tmp.path()).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine.apply_command(
-            &MqCommand::create_topic(&"snap-topic".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"snap-topic".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
         env.install_snapshot(&make_meta(1), &engine.snapshot())
             .unwrap();
 
         // Now apply structural writes (simulates post-snapshot operation)
         let mut tmp_engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
-        tmp_engine2.apply_command(
-            &MqCommand::create_topic(&"new-topic".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"new-topic".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
+        let cmd = MqCommand::split_from(&mut buf);
+        tmp_engine2.apply_command(&cmd, &mut buf, 1, 1000, None);
         let topic_meta = tmp_engine2
             .metadata()
             .topics
@@ -1852,14 +1862,18 @@ mod tests {
         let env = GroupMdbxEnv::open(tmp.path()).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
+        let mut buf = BytesMut::new();
         // Create 5 entities to advance next_id
         for i in 0..5 {
-            engine.apply_command(
-                &MqCommand::create_topic(&format!("t{}", i), RetentionPolicy::default(), 0),
-                i + 1,
-                1000,
-                None,
+            MqCommand::write_create_topic(
+                &mut buf,
+                &format!("t{}", i),
+                &RetentionPolicy::default(),
+                0,
             );
+            let cmd = MqCommand::split_from(&mut buf);
+            engine.apply_command(&cmd, &mut buf, i + 1, 1000, None);
+            buf.clear();
         }
         let snap = engine.snapshot();
         let expected_next_id = snap.next_id;
@@ -1882,24 +1896,30 @@ mod tests {
         mgr.open_group(1).unwrap();
         mgr.open_group(2).unwrap();
 
+        let mut buf = BytesMut::new();
         let mut engine1 = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine1.apply_command(
-            &MqCommand::create_topic(&"group1-topic".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"group1-topic".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine1.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
         mgr.install_snapshot(1, make_meta(1), engine1.snapshot())
             .await
             .unwrap();
 
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine2.apply_command(
-            &MqCommand::create_topic(&"group2-topic".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"group2-topic".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine2.apply_command(&cmd, &mut buf, 1, 1000, None);
         mgr.install_snapshot(2, make_meta(1), engine2.snapshot())
             .await
             .unwrap();
@@ -1923,13 +1943,17 @@ mod tests {
         let env = GroupMdbxEnv::open(tmp.path()).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
+        let mut buf = BytesMut::new();
         for i in 0..50 {
-            engine.apply_command(
-                &MqCommand::create_topic(&format!("topic-{}", i), RetentionPolicy::default(), 0),
-                i + 1,
-                1000,
-                None,
+            MqCommand::write_create_topic(
+                &mut buf,
+                &format!("topic-{}", i),
+                &RetentionPolicy::default(),
+                0,
             );
+            let cmd = MqCommand::split_from(&mut buf);
+            engine.apply_command(&cmd, &mut buf, i + 1, 1000, None);
+            buf.clear();
         }
         let snap = engine.snapshot();
         env.install_snapshot(&make_meta(50), &snap).unwrap();
@@ -1946,13 +1970,17 @@ mod tests {
 
         // First snapshot: 3 topics
         let mut engine1 = MqEngine::new(MqConfig::new("/tmp/test"));
+        let mut buf = BytesMut::new();
         for i in 0..3 {
-            engine1.apply_command(
-                &MqCommand::create_topic(&format!("old-{}", i), RetentionPolicy::default(), 0),
-                i + 1,
-                1000,
-                None,
+            MqCommand::write_create_topic(
+                &mut buf,
+                &format!("old-{}", i),
+                &RetentionPolicy::default(),
+                0,
             );
+            let cmd = MqCommand::split_from(&mut buf);
+            engine1.apply_command(&cmd, &mut buf, i + 1, 1000, None);
+            buf.clear();
         }
         env.install_snapshot(&make_meta(3), &engine1.snapshot())
             .unwrap();
@@ -1961,12 +1989,14 @@ mod tests {
 
         // Second snapshot: 1 topic (different name)
         let mut engine2 = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine2.apply_command(
-            &MqCommand::create_topic(&"replacement-t".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
+        MqCommand::write_create_topic(
+            &mut buf,
+            &"replacement-t".to_string(),
+            &RetentionPolicy::default(),
+            0,
         );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine2.apply_command(&cmd, &mut buf, 1, 1000, None);
         env.install_snapshot(&make_meta(10), &engine2.snapshot())
             .unwrap();
 
@@ -1982,20 +2012,23 @@ mod tests {
         let env = GroupMdbxEnv::open(tmp.path()).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine.apply_command(
-            &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, &"t".to_string(), &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
+        MqCommand::write_publish_bytes(
+            &mut buf,
             1,
-            1000,
-            None,
+            &[make_msg(b"a"), make_msg(b"b"), make_msg(b"c")],
         );
-        engine.apply_command(
-            &MqCommand::publish(1, &vec![make_msg(b"a"), make_msg(b"b"), make_msg(b"c")]),
-            2,
-            1001,
-            None,
-        );
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 2, 1001, None);
+        buf.clear();
         // Commit an offset for consumer 42
-        engine.apply_command(&MqCommand::commit_offset(1, 42, 2), 3, 1002, None);
+        MqCommand::write_commit_offset(&mut buf, 1, 42, 2);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 3, 1002, None);
 
         let snap = engine.snapshot();
         assert!(!snap.topics[0].consumer_offsets.is_empty());
@@ -2015,13 +2048,14 @@ mod tests {
         let env = GroupMdbxEnv::open(tmp.path()).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine.apply_command(
-            &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
-        );
-        engine.apply_command(&MqCommand::publish(1, &vec![make_msg(b"a")]), 2, 1001, None);
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, &"t".to_string(), &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
+        buf.clear();
+        MqCommand::write_publish_bytes(&mut buf, 1, &[make_msg(b"a")]);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 2, 1001, None);
 
         let original_snap = engine.snapshot();
         env.install_snapshot(&make_meta(2), &original_snap).unwrap();
@@ -2053,12 +2087,10 @@ mod tests {
         let env = GroupMdbxEnv::open(tmp.path()).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine.apply_command(
-            &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
-        );
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, &"t".to_string(), &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
         let mut snap = engine.snapshot();
         snap.file_manifest = vec![bisque_raft::SnapshotFileEntry {
             relative_path: "seg_000001.log".to_string(),
@@ -2091,18 +2123,18 @@ mod tests {
         }
 
         // Install snapshots on all groups
+        let mut buf = BytesMut::new();
         for gid in 1..=5u64 {
             let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-            engine.apply_command(
-                &MqCommand::create_topic(
-                    &format!("group-{}-topic", gid),
-                    RetentionPolicy::default(),
-                    0,
-                ),
-                1,
-                1000,
-                None,
+            MqCommand::write_create_topic(
+                &mut buf,
+                &format!("group-{}-topic", gid),
+                &RetentionPolicy::default(),
+                0,
             );
+            let cmd = MqCommand::split_from(&mut buf);
+            engine.apply_command(&cmd, &mut buf, 1, 1000, None);
+            buf.clear();
             // Must install synchronously since manifest requires &self
             mgr.install_snapshot(gid, make_meta(1), engine.snapshot())
                 .await
@@ -2128,12 +2160,10 @@ mod tests {
         mgr.open_group(1).unwrap();
 
         let mut engine = MqEngine::new(MqConfig::new("/tmp/test"));
-        engine.apply_command(
-            &MqCommand::create_topic(&"t".to_string(), RetentionPolicy::default(), 0),
-            1,
-            1000,
-            None,
-        );
+        let mut buf = BytesMut::new();
+        MqCommand::write_create_topic(&mut buf, &"t".to_string(), &RetentionPolicy::default(), 0);
+        let cmd = MqCommand::split_from(&mut buf);
+        engine.apply_command(&cmd, &mut buf, 1, 1000, None);
 
         let mut meta = make_meta(100);
         meta.last_applied_term = 3;

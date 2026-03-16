@@ -13,7 +13,6 @@ use bytes::{BufMut, BytesMut};
 use bisque_mq::async_apply::{
     ClientRegistry, HighWaterMark, PendingRequest, PendingRequests, ResponseCallback, ResponseEntry,
 };
-use bisque_mq::types::MqResponse;
 
 // =============================================================================
 // HighWaterMark integration tests
@@ -91,19 +90,13 @@ async fn hwm_concurrent_producers() {
 #[test]
 fn response_entry_roundtrip_all_variants() {
     // Ok
-    let entry = ResponseEntry::from_response(1, &MqResponse::Ok);
+    let entry = ResponseEntry::ok(1);
     assert_eq!(entry.tag(), ResponseEntry::TAG_OK);
     assert!(entry.is_ok());
     assert_eq!(entry.log_index(), 1);
 
     // Published
-    let entry = ResponseEntry::from_response(
-        2,
-        &MqResponse::Published {
-            base_offset: 100,
-            count: 50,
-        },
-    );
+    let entry = ResponseEntry::published(2, 100, 50);
     assert_eq!(entry.tag(), ResponseEntry::TAG_PUBLISHED);
     assert_eq!(entry.log_index(), 2);
     let base_offset = u64::from_le_bytes(entry.buf[16..24].try_into().unwrap());
@@ -112,7 +105,7 @@ fn response_entry_roundtrip_all_variants() {
     assert_eq!(count, 50);
 
     // EntityCreated
-    let entry = ResponseEntry::from_response(3, &MqResponse::EntityCreated { id: 42 });
+    let entry = ResponseEntry::entity_created(3, 42);
     assert_eq!(entry.tag(), ResponseEntry::TAG_ENTITY_CREATED);
     let entity_id = u64::from_le_bytes(entry.buf[16..24].try_into().unwrap());
     assert_eq!(entity_id, 42);
@@ -175,7 +168,7 @@ async fn client_registry_concurrent_register_unregister() {
     for &id in &ids {
         let p = (id as usize) % registry.num_partitions();
         let mut frame = BytesMut::with_capacity(24);
-        ResponseEntry::encode_frame_into(&mut frame, id, id as u64, &MqResponse::Ok);
+        ResponseEntry::encode_frame_into(&mut frame, id, &ResponseEntry::ok(id as u64));
         registry.send_to_partition(p, frame.freeze());
     }
     all_done.notified().await;
@@ -205,7 +198,7 @@ async fn client_registry_high_throughput() {
     let p = (id as usize) % registry.num_partitions();
     for i in 0..1000u64 {
         let mut frame = BytesMut::with_capacity(24);
-        ResponseEntry::encode_frame_into(&mut frame, id, i, &MqResponse::Ok);
+        ResponseEntry::encode_frame_into(&mut frame, id, &ResponseEntry::ok(i));
         registry.send_to_partition(p, frame.freeze());
     }
     done.notified().await;

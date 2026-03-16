@@ -10,6 +10,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use bytes::BytesMut;
+
 use crate::MqTypeConfig;
 use crate::config::MqConfig;
 use crate::manifest::MqManifestManager;
@@ -190,8 +192,9 @@ impl MqRaftNode {
                 move |raft, _node_id| {
                     Box::pin(async move {
                         let now = unix_ms();
-                        let cmd = MqCommand::expire_group_sessions(now);
-                        let _ = raft.client_write(cmd).await;
+                        let mut scratch = BytesMut::new();
+                        MqCommand::write_expire_group_sessions(&mut scratch, now);
+                        let _ = raft.client_write(MqCommand::split_from(&mut scratch)).await;
                     })
                 },
             ));
@@ -252,7 +255,7 @@ impl MqRaftNode {
     }
 
     /// Write a command through raft consensus.
-    pub async fn write(&self, cmd: MqCommand) -> Result<crate::types::MqResponse, String> {
+    pub async fn write(&self, cmd: MqCommand) -> Result<crate::types::MqApplyResponse, String> {
         match self.raft.client_write(cmd).await {
             Ok(resp) => Ok(resp.data),
             Err(e) => Err(format!("raft write error: {}", e)),
@@ -285,7 +288,9 @@ impl MqRaftNode {
                 count = commands.len(),
                 "proposing visibility timeout / expiry commands"
             );
-            let _ = raft.client_write(MqCommand::batch(&commands)).await;
+            let mut scratch = BytesMut::new();
+            MqCommand::write_batch(&mut scratch, &commands);
+            let _ = raft.client_write(MqCommand::split_from(&mut scratch)).await;
         }
     }
 
@@ -297,7 +302,9 @@ impl MqRaftNode {
         let commands = collect_due_cron_triggers(meta, unix_ms(), counter);
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing cron trigger commands");
-            let _ = raft.client_write(MqCommand::batch(&commands)).await;
+            let mut scratch = BytesMut::new();
+            MqCommand::write_batch(&mut scratch, &commands);
+            let _ = raft.client_write(MqCommand::split_from(&mut scratch)).await;
         }
     }
 
@@ -309,7 +316,9 @@ impl MqRaftNode {
         let commands = collect_dead_sessions(meta, unix_ms(), timeout.as_millis() as u64);
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing dead session commands");
-            let _ = raft.client_write(MqCommand::batch(&commands)).await;
+            let mut scratch = BytesMut::new();
+            MqCommand::write_batch(&mut scratch, &commands);
+            let _ = raft.client_write(MqCommand::split_from(&mut scratch)).await;
         }
     }
 
@@ -319,7 +328,9 @@ impl MqRaftNode {
         let commands = collect_idle_actor_evictions(meta, unix_ms());
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing actor eviction commands");
-            let _ = raft.client_write(MqCommand::batch(&commands)).await;
+            let mut scratch = BytesMut::new();
+            MqCommand::write_batch(&mut scratch, &commands);
+            let _ = raft.client_write(MqCommand::split_from(&mut scratch)).await;
         }
     }
 
@@ -327,7 +338,9 @@ impl MqRaftNode {
         let commands = collect_actor_rebalance(meta);
         if !commands.is_empty() {
             debug!(count = commands.len(), "proposing actor rebalance commands");
-            let _ = raft.client_write(MqCommand::batch(&commands)).await;
+            let mut scratch = BytesMut::new();
+            MqCommand::write_batch(&mut scratch, &commands);
+            let _ = raft.client_write(MqCommand::split_from(&mut scratch)).await;
         }
     }
 }
@@ -354,6 +367,7 @@ fn unix_ms() -> u64 {
 /// expired in-flight messages (visibility timeout exceeded).
 pub(crate) fn collect_visibility_timeouts(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
+    let mut scratch = BytesMut::new();
     let guard = meta.consumer_groups.pin();
     for (&group_id, group) in guard.iter() {
         if let Some(ack) = group.ack_state() {
@@ -364,7 +378,8 @@ pub(crate) fn collect_visibility_timeouts(meta: &MqMetadata, now_ms: u64) -> Vec
                 .collect();
             drop(deadlines);
             if !expired.is_empty() {
-                commands.push(MqCommand::group_timeout_expired(group_id, &expired));
+                MqCommand::write_group_timeout_expired(&mut scratch, group_id, &expired);
+                commands.push(MqCommand::split_from(&mut scratch));
             }
         }
     }
@@ -375,6 +390,7 @@ pub(crate) fn collect_visibility_timeouts(meta: &MqMetadata, now_ms: u64) -> Vec
 /// pending messages past their TTL.
 pub(crate) fn collect_expired_pending_messages(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     let mut commands = Vec::new();
+    let mut scratch = BytesMut::new();
     let guard = meta.consumer_groups.pin();
     for (&group_id, group) in guard.iter() {
         if let Some(ack) = group.ack_state() {
@@ -385,7 +401,8 @@ pub(crate) fn collect_expired_pending_messages(meta: &MqMetadata, now_ms: u64) -
                 .collect();
             drop(deadlines);
             if !expired.is_empty() {
-                commands.push(MqCommand::group_expire_pending(group_id, &expired));
+                MqCommand::write_group_expire_pending(&mut scratch, group_id, &expired);
+                commands.push(MqCommand::split_from(&mut scratch));
             }
         }
     }
@@ -399,10 +416,12 @@ pub(crate) fn collect_due_cron_triggers(
     _counter: &AtomicU64,
 ) -> Vec<MqCommand> {
     let mut commands = Vec::new();
+    let mut scratch = BytesMut::new();
     let guard = meta.topics.pin();
     for (&topic_id, topic) in guard.iter() {
         if topic.should_cron_trigger(now_ms) {
-            commands.push(MqCommand::cron_trigger(topic_id, now_ms));
+            MqCommand::write_cron_trigger(&mut scratch, topic_id, now_ms);
+            commands.push(MqCommand::split_from(&mut scratch));
         }
     }
     commands
@@ -416,6 +435,7 @@ pub(crate) fn collect_dead_sessions(
     timeout_ms: u64,
 ) -> Vec<MqCommand> {
     let mut commands = Vec::new();
+    let mut scratch = BytesMut::new();
     let sessions_guard = meta.sessions.pin();
     for (&session_id, session) in sessions_guard.iter() {
         if !session.is_expired(now_ms) {
@@ -433,22 +453,26 @@ pub(crate) fn collect_dead_sessions(
             if let Some(ack) = group.ack_state() {
                 let in_flight = ack.consumer_in_flight_ids(session_id);
                 if !in_flight.is_empty() {
-                    commands.push(MqCommand::group_timeout_expired(
+                    MqCommand::write_group_timeout_expired(
+                        &mut scratch,
                         group_id,
                         &in_flight.into_vec(),
-                    ));
+                    );
+                    commands.push(MqCommand::split_from(&mut scratch));
                 }
             }
             // Release actors assigned to this session
             if let Some(actor) = group.actor_state() {
                 if actor.consumer_assignments.pin().contains_key(&session_id) {
-                    commands.push(MqCommand::group_release_actors(group_id, session_id));
+                    MqCommand::write_group_release_actors(&mut scratch, group_id, session_id);
+                    commands.push(MqCommand::split_from(&mut scratch));
                 }
             }
         }
 
         // Disconnect the session
-        commands.push(MqCommand::disconnect_session(session_id, true));
+        MqCommand::write_disconnect_session(&mut scratch, session_id, true);
+        commands.push(MqCommand::split_from(&mut scratch));
     }
     commands
 }
@@ -524,6 +548,7 @@ pub fn prune_dedup_local(meta: &MqMetadata) {
 pub(crate) fn collect_idle_actor_evictions(meta: &MqMetadata, now_ms: u64) -> Vec<MqCommand> {
     use crate::types::VariantConfig;
     let mut commands = Vec::new();
+    let mut scratch = BytesMut::new();
     let guard = meta.consumer_groups.pin();
     for (&group_id, group) in guard.iter() {
         if group.actor_state().is_some() {
@@ -531,7 +556,8 @@ pub(crate) fn collect_idle_actor_evictions(meta: &MqMetadata, now_ms: u64) -> Ve
                 let eviction_secs = actor_config.idle_eviction_secs;
                 if eviction_secs > 0 {
                     let before_timestamp = now_ms.saturating_sub(eviction_secs * 1000);
-                    commands.push(MqCommand::group_evict_idle(group_id, before_timestamp));
+                    MqCommand::write_group_evict_idle(&mut scratch, group_id, before_timestamp);
+                    commands.push(MqCommand::split_from(&mut scratch));
                 }
             }
         }
@@ -543,6 +569,7 @@ pub(crate) fn collect_idle_actor_evictions(meta: &MqMetadata, now_ms: u64) -> Ve
 /// sessions that are members of actor-variant consumer groups.
 pub(crate) fn collect_actor_rebalance(meta: &MqMetadata) -> Vec<MqCommand> {
     let mut commands = Vec::new();
+    let mut scratch = BytesMut::new();
     let cg_guard = meta.consumer_groups.pin();
     for (&group_id, group) in cg_guard.iter() {
         if let Some(actor) = group.actor_state() {
@@ -575,9 +602,9 @@ pub(crate) fn collect_actor_rebalance(meta: &MqMetadata) -> Vec<MqCommand> {
             }
 
             for (session_id, actor_ids) in per_session {
-                commands.push(MqCommand::group_assign_actors(
-                    group_id, session_id, &actor_ids,
-                ));
+                let ids: Vec<&[u8]> = actor_ids.iter().map(|b| b.as_ref()).collect();
+                MqCommand::write_group_assign_actors(&mut scratch, group_id, session_id, &ids);
+                commands.push(MqCommand::split_from(&mut scratch));
             }
         }
     }

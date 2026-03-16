@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use bisque_mq::flat::{FlatMessage, MqttEnvelope, is_mqtt_envelope};
 use bisque_mq::notifier::GroupNotifier;
-use bisque_mq::types::{ExchangeType, MqError, RetentionPolicy};
-use bisque_mq::{MqCommand, MqReader, MqResponse, MqWriteBatcher};
+use bisque_mq::types::{ExchangeType, RetentionPolicy};
+use bisque_mq::{MqCommand, MqReader, MqWriteBatcher, ResponseEntry};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -150,6 +150,7 @@ pub struct MqttServerStats {
 
 impl MqttServerStats {
     fn new() -> Self {
+        let mut buf = BytesMut::new();
         Self {
             active_connections: std::sync::atomic::AtomicU64::new(0),
             total_connections: std::sync::atomic::AtomicU64::new(0),
@@ -424,11 +425,13 @@ enum ConnectionError {
 
 /// Resolve an entity ID from a Create command response, handling AlreadyExists.
 /// Returns the entity ID on success.
-fn extract_entity_id(resp: &MqResponse) -> Option<u64> {
-    match resp {
-        MqResponse::EntityCreated { id } => Some(*id),
-        MqResponse::Error(MqError::AlreadyExists { id, .. }) => Some(*id),
-        _ => None,
+fn extract_entity_id(resp: &ResponseEntry) -> Option<u64> {
+    if resp.tag() == ResponseEntry::TAG_ENTITY_CREATED {
+        Some(resp.entity_id())
+    } else if resp.is_already_exists() {
+        Some(resp.error_entity_id())
+    } else {
+        None
     }
 }
 
@@ -440,6 +443,7 @@ async fn ensure_exchange(
     exchange_name: impl AsRef<str> + Into<String>,
     cached_id: Option<u64>,
 ) -> Result<u64, ConnectionError> {
+    let mut buf = bytes::BytesMut::new();
     if let Some(id) = cached_id {
         return Ok(id);
     }
@@ -449,6 +453,7 @@ async fn ensure_exchange(
 
     let resp = batcher
         .submit(MqCommand::create_exchange(
+            &mut buf,
             exchange_name.as_ref(),
             ExchangeType::Topic,
         ))
@@ -474,6 +479,7 @@ async fn ensure_topic(
     cached_id: Option<u64>,
     retention: RetentionPolicy,
 ) -> Result<u64, ConnectionError> {
+    let mut buf = bytes::BytesMut::new();
     if let Some(id) = cached_id {
         return Ok(id);
     }
@@ -482,7 +488,12 @@ async fn ensure_topic(
     }
 
     let resp = batcher
-        .submit(MqCommand::create_topic(topic_name.as_ref(), retention, 0))
+        .submit(MqCommand::create_topic(
+            &mut buf,
+            topic_name.as_ref(),
+            retention,
+            0,
+        ))
         .await?;
 
     if let Some(id) = extract_entity_id(&resp) {
@@ -509,6 +520,7 @@ async fn orchestrate_publish(
     batcher: &MqWriteBatcher,
     plan: PublishPlan,
 ) -> Result<(), ConnectionError> {
+    let mut buf = bytes::BytesMut::new();
     if !plan.has_message() {
         return Ok(()); // Invalid publish (e.g., unknown topic alias)
     }
@@ -530,13 +542,17 @@ async fn orchestrate_publish(
 
     // 2. Publish through the exchange (routes to all matching subscription queues).
     let resp = batcher
-        .submit(MqCommand::publish_to_exchange(exchange_id, &[msg]))
+        .submit(MqCommand::publish_to_exchange(
+            &mut buf,
+            exchange_id,
+            &[msg],
+        ))
         .await?;
 
-    match &resp {
-        MqResponse::Ok | MqResponse::Published { .. } => {}
-        MqResponse::Error(e) => {
-            warn!(%e, "exchange publish failed");
+    match resp.tag() {
+        ResponseEntry::TAG_OK | ResponseEntry::TAG_PUBLISHED => {}
+        ResponseEntry::TAG_ERROR => {
+            warn!(error_kind = resp.error_kind(), "exchange publish failed");
         }
         _ => {}
     }
@@ -571,7 +587,11 @@ async fn flush_publish_batch(
             .iter()
             .map(|&(start, len)| &msg_buf[start..start + len])
             .collect();
-        MqCommand::publish_to_exchange_slices(exchange_id, &slices)
+        {
+            let mut scratch = BytesMut::new();
+            MqCommand::write_publish_to_exchange(&mut scratch, exchange_id, &slices);
+            MqCommand::split_from(&mut scratch)
+        }
     };
 
     publish_ranges.clear();
@@ -580,10 +600,13 @@ async fn flush_publish_batch(
     // Submit all messages in a single publish_to_exchange_slices command.
     let resp = batcher.submit(cmd).await?;
 
-    match &resp {
-        MqResponse::Ok | MqResponse::Published { .. } => {}
-        MqResponse::Error(e) => {
-            warn!(%e, "batch exchange publish failed");
+    match resp.tag() {
+        ResponseEntry::TAG_OK | ResponseEntry::TAG_PUBLISHED => {}
+        ResponseEntry::TAG_ERROR => {
+            warn!(
+                error_kind = resp.error_kind(),
+                "batch exchange publish failed"
+            );
         }
         _ => {}
     }
@@ -602,6 +625,7 @@ async fn orchestrate_retained(
     batcher: &MqWriteBatcher,
     plan: RetainedPlan,
 ) -> Result<(), ConnectionError> {
+    let mut buf = bytes::BytesMut::new();
     // Destructure to move topic_name into ensure_topic (zero-alloc cache insert).
     let RetainedPlan {
         topic_name,
@@ -623,12 +647,14 @@ async fn orchestrate_retained(
     match flat_message {
         Some(msg) => {
             // Store the retained message.
-            let _ = batcher.submit(MqCommand::publish(topic_id, &[msg])).await?;
+            let _ = batcher
+                .submit(MqCommand::publish(&mut buf, topic_id, &[msg]))
+                .await?;
         }
         None => {
             // Clear retained: purge the topic.
             let _ = batcher
-                .submit(MqCommand::purge_topic(topic_id, u64::MAX))
+                .submit(MqCommand::purge_topic(&mut buf, topic_id, u64::MAX))
                 .await?;
         }
     }
@@ -652,6 +678,7 @@ async fn orchestrate_subscribe(
     filters: SmallVec<[SubscribeFilterPlan; 4]>,
     filter_names: &[RetainedFilterInfo],
 ) -> Result<(), ConnectionError> {
+    let mut buf = bytes::BytesMut::new();
     // 1. Ensure the global MQTT exchange.
     let exchange_id = ensure_exchange(session, batcher, exchange_name, cached_exchange_id).await?;
 
@@ -669,7 +696,11 @@ async fn orchestrate_subscribe(
         } else {
             uncached_queue_indices.push(resolved_queue_ids.len());
             resolved_queue_ids.push(0); // placeholder
-            queue_cmds.push(MqCommand::create_consumer_group(&fp.queue_name, 0));
+            queue_cmds.push(MqCommand::create_consumer_group(
+                &mut buf,
+                &fp.queue_name,
+                0,
+            ));
         }
     }
 
@@ -678,13 +709,19 @@ async fn orchestrate_subscribe(
         let resp = if queue_cmds.len() == 1 {
             batcher.submit(queue_cmds.pop().unwrap()).await?
         } else {
-            batcher.submit(MqCommand::batch(&queue_cmds)).await?
+            batcher
+                .submit(MqCommand::batch(&mut buf, &queue_cmds))
+                .await?
         };
 
         // Parse responses and fill in resolved IDs.
-        let responses: SmallVec<[&MqResponse; 4]> = match &resp {
-            MqResponse::BatchResponse(batch) => batch.iter().collect(),
-            other => SmallVec::from_elem(other, 1),
+        let batch_entries_q: Vec<ResponseEntry>;
+        let responses: Vec<&ResponseEntry> = if resp.tag() == ResponseEntry::TAG_BATCH {
+            batch_entries_q = resp.batch_entries().collect();
+            batch_entries_q.iter().collect()
+        } else {
+            batch_entries_q = vec![resp.clone()];
+            batch_entries_q.iter().collect()
         };
         for (resp_idx, &filter_idx) in uncached_queue_indices.iter().enumerate() {
             if let Some(id) = responses.get(resp_idx).and_then(|r| extract_entity_id(r)) {
@@ -714,6 +751,7 @@ async fn orchestrate_subscribe(
             resolved_binding_ids.push(0); // placeholder
             let queue_id = resolved_queue_ids[i];
             binding_cmds.push(MqCommand::create_binding_with_opts(
+                &mut buf,
                 exchange_id,
                 queue_id,
                 Some(fp.routing_key.as_str()),
@@ -729,12 +767,18 @@ async fn orchestrate_subscribe(
         let resp = if binding_cmds.len() == 1 {
             batcher.submit(binding_cmds.pop().unwrap()).await?
         } else {
-            batcher.submit(MqCommand::batch(&binding_cmds)).await?
+            batcher
+                .submit(MqCommand::batch(&mut buf, &binding_cmds))
+                .await?
         };
 
-        let responses: SmallVec<[&MqResponse; 4]> = match &resp {
-            MqResponse::BatchResponse(batch) => batch.iter().collect(),
-            other => SmallVec::from_elem(other, 1),
+        let batch_entries_b: Vec<ResponseEntry>;
+        let responses: Vec<&ResponseEntry> = if resp.tag() == ResponseEntry::TAG_BATCH {
+            batch_entries_b = resp.batch_entries().collect();
+            batch_entries_b.iter().collect()
+        } else {
+            batch_entries_b = vec![resp.clone()];
+            batch_entries_b.iter().collect()
         };
         for (resp_idx, &filter_idx) in uncached_binding_indices.iter().enumerate() {
             if let Some(id) = responses.get(resp_idx).and_then(|r| extract_entity_id(r)) {
@@ -784,6 +828,7 @@ async fn deliver_outbound(
     sub_buf: &mut Vec<SubDeliveryInfo>,
     flat_messages_buf: &mut Vec<Bytes>,
 ) -> Result<(), ConnectionError> {
+    let mut buf = bytes::BytesMut::new();
     if session.is_inflight_full() {
         return Ok(());
     }
@@ -825,17 +870,22 @@ async fn deliver_outbound(
         // and current time for message expiry — both handled at Raft apply.
         let exclude_pub = if no_local { my_session_id } else { 0 };
         let resp = batcher
-            .submit(MqCommand::group_deliver_filtered(
-                queue_id,
-                session.session_id,
-                remaining,
-                exclude_pub,
-                now_ms,
-            ))
+            .submit({
+                let mut scratch = BytesMut::new();
+                MqCommand::write_group_deliver_filtered(
+                    &mut scratch,
+                    queue_id,
+                    session.session_id,
+                    remaining,
+                    exclude_pub,
+                    now_ms,
+                );
+                MqCommand::split_from(&mut scratch)
+            })
             .await?;
 
-        if let MqResponse::Messages { messages } = resp {
-            for delivered in &messages {
+        if resp.tag() == ResponseEntry::TAG_MESSAGES {
+            for delivered in resp.messages() {
                 // Read flat message bytes from the raft log via log reader.
                 flat_messages_buf.clear();
                 log_reader.read_messages_at_into(delivered.message_id, flat_messages_buf);
@@ -843,7 +893,11 @@ async fn deliver_outbound(
                 if flat_messages_buf.is_empty() {
                     // Message has been purged — NACK it so the queue can move on.
                     let _ = batcher
-                        .submit(MqCommand::group_nack(queue_id, &[delivered.message_id]))
+                        .submit(MqCommand::group_nack(
+                            &mut buf,
+                            queue_id,
+                            &[delivered.message_id],
+                        ))
                         .await;
                     continue;
                 }
@@ -971,6 +1025,7 @@ async fn deliver_outbound(
                         );
                         let _ = batcher
                             .submit(MqCommand::group_ack(
+                                &mut buf,
                                 queue_id,
                                 &[delivered.message_id],
                                 None,
@@ -1021,6 +1076,7 @@ async fn handle_connection(
     dynamic_redirect: &Arc<ArcSwapOption<ServerRedirect>>,
     group_notifier: Option<&GroupNotifier>,
 ) -> Result<(), ConnectionError> {
+    let mut buf = bytes::BytesMut::new();
     let mut read_buf = BytesMut::with_capacity(config.read_buffer_size);
     // Reusable write buffer — cleared between uses, never re-allocated.
     let mut write_buf = BytesMut::with_capacity(config.read_buffer_size);
@@ -1123,7 +1179,7 @@ async fn handle_connection(
 
     // Submit registration commands.
     for i in 0..session.cmd_buf.len() {
-        let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+        let _ = batcher.submit(session.cmd_buf[i].clone()).await;
     }
 
     // Re-create queues and bindings for restored subscriptions.
@@ -1262,7 +1318,8 @@ async fn handle_connection(
                         // so we submit the flat_message directly if exchange is known.
                         if let Some(ref msg) = plan.flat_message {
                             if let Some(eid) = plan.cached_exchange_id {
-                                let cmd = MqCommand::publish_to_exchange(eid, &[msg.clone()]);
+                                let cmd =
+                                    MqCommand::publish_to_exchange(&mut buf, eid, &[msg.clone()]);
                                 let _ = batcher.submit(cmd).await;
                             }
                         }
@@ -1278,7 +1335,7 @@ async fn handle_connection(
 
             // Submit cleanup commands from cmd_buf.
             for i in 0..session.cmd_buf.len() {
-                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+                let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
         }
     }
@@ -1636,7 +1693,7 @@ async fn dispatch_inbound_packet(
             let packet_id = codec::read_ack_packet_id(packet_bytes, header_size)?;
             session.handle_puback(packet_id);
             for i in 0..session.cmd_buf.len() {
-                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+                let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
         }
 
@@ -1669,7 +1726,7 @@ async fn dispatch_inbound_packet(
             let packet_id = codec::read_ack_packet_id(packet_bytes, header_size)?;
             session.handle_pubcomp(packet_id);
             for i in 0..session.cmd_buf.len() {
-                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+                let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
         }
 
@@ -1750,7 +1807,7 @@ async fn dispatch_inbound_packet(
                 .collect();
             session.handle_unsubscribe(unsubscribe.packet_id, &string_filters);
             for i in 0..session.cmd_buf.len() {
-                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+                let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
             if !session.out_buf.is_empty() {
                 stream.write_all(&session.out_buf).await?;
@@ -1764,7 +1821,7 @@ async fn dispatch_inbound_packet(
         12 => {
             session.handle_pingreq();
             for i in 0..session.cmd_buf.len() {
-                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+                let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
             if !session.out_buf.is_empty() {
                 stream.write_all(&session.out_buf).await?;
@@ -1786,7 +1843,7 @@ async fn dispatch_inbound_packet(
             };
             let will_plan = session.handle_disconnect(Some(&disconnect));
             for i in 0..session.cmd_buf.len() {
-                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+                let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
             if let Some(plan) = will_plan {
                 if let Err(e) = orchestrate_publish(session, batcher, plan).await {
@@ -1802,7 +1859,7 @@ async fn dispatch_inbound_packet(
                     .map_err(|e| ConnectionError::Codec(e))?;
             session.handle_auth(&auth);
             for i in 0..session.cmd_buf.len() {
-                let _ = batcher.submit(session.cmd_buf.to_command(i)).await;
+                let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
             if !session.out_buf.is_empty() {
                 stream.write_all(&session.out_buf).await?;
@@ -2064,18 +2121,27 @@ mod tests {
 
     #[test]
     fn test_extract_entity_id() {
+        use bisque_mq::types::{EntityKind, MqError};
         assert_eq!(
-            extract_entity_id(&MqResponse::EntityCreated { id: 42 }),
+            extract_entity_id(&ResponseEntry::entity_created(0, 42)),
             Some(42)
         );
         assert_eq!(
-            extract_entity_id(&MqResponse::Error(MqError::AlreadyExists {
-                entity: bisque_mq::types::EntityKind::Exchange,
-                id: 99
-            })),
+            {
+                let mut b = BytesMut::new();
+                ResponseEntry::write_mq_error(
+                    &mut b,
+                    0,
+                    &MqError::AlreadyExists {
+                        entity: EntityKind::Exchange,
+                        id: 99,
+                    },
+                );
+                extract_entity_id(&ResponseEntry::split_from(&mut b))
+            },
             Some(99)
         );
-        assert_eq!(extract_entity_id(&MqResponse::Ok), None);
+        assert_eq!(extract_entity_id(&ResponseEntry::ok(0)), None);
     }
 
     #[test]
@@ -2249,12 +2315,21 @@ mod tests {
 
     #[test]
     fn test_extract_entity_id_other_responses() {
-        assert_eq!(extract_entity_id(&MqResponse::Ok), None);
+        use bisque_mq::types::{EntityKind, MqError};
+        assert_eq!(extract_entity_id(&ResponseEntry::ok(0)), None);
         assert_eq!(
-            extract_entity_id(&MqResponse::Error(MqError::NotFound {
-                entity: bisque_mq::types::EntityKind::ConsumerGroup,
-                id: 1,
-            })),
+            {
+                let mut b = BytesMut::new();
+                ResponseEntry::write_mq_error(
+                    &mut b,
+                    0,
+                    &MqError::NotFound {
+                        entity: EntityKind::ConsumerGroup,
+                        id: 1,
+                    },
+                );
+                extract_entity_id(&ResponseEntry::split_from(&mut b))
+            },
             None
         );
     }

@@ -76,6 +76,7 @@ async fn append_and_flush(
 
 #[tokio::test]
 async fn async_apply_workers_process_entries_from_raft_log() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -84,7 +85,7 @@ async fn async_apply_workers_process_entries_from_raft_log() {
     let mut log = storage.get_log_storage(0).await.unwrap();
 
     // Create a topic first (structural command at index 1).
-    let create_cmd = MqCommand::create_topic("test-topic", RetentionPolicy::default(), 0);
+    let create_cmd = MqCommand::create_topic(&mut buf, "test-topic", RetentionPolicy::default(), 0);
     append_and_flush(&mut log, vec![make_entry(1, 1, create_cmd)]).await;
 
     let prefetcher = log.prefetcher();
@@ -123,7 +124,7 @@ async fn async_apply_workers_process_entries_from_raft_log() {
     let msg = bisque_mq::flat::FlatMessageBuilder::new(b"hello")
         .timestamp(1000)
         .build();
-    let publish_cmd = MqCommand::publish(topic_id, &[msg]);
+    let publish_cmd = MqCommand::publish(&mut buf, topic_id, &[msg]);
     append_and_flush(&mut log, vec![make_entry(2, 1, publish_cmd)]).await;
 
     // Advance and wait.
@@ -147,6 +148,7 @@ async fn async_apply_workers_process_entries_from_raft_log() {
 
 #[tokio::test]
 async fn async_apply_multiple_topics_and_publishes() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -160,7 +162,12 @@ async fn async_apply_multiple_topics_and_publishes() {
         entries.push(make_entry(
             i,
             1,
-            MqCommand::create_topic(&format!("topic-{}", i), RetentionPolicy::default(), 0),
+            MqCommand::create_topic(
+                &mut buf,
+                &format!("topic-{}", i),
+                RetentionPolicy::default(),
+                0,
+            ),
         ));
     }
     append_and_flush(&mut log, entries).await;
@@ -198,7 +205,11 @@ async fn async_apply_multiple_topics_and_publishes() {
         let msg = bisque_mq::flat::FlatMessageBuilder::new(format!("msg-{}", i).as_bytes())
             .timestamp(2000)
             .build();
-        entries.push(make_entry(5 + i as u64, 1, MqCommand::publish(tid, &[msg])));
+        entries.push(make_entry(
+            5 + i as u64,
+            1,
+            MqCommand::publish(&mut buf, tid, &[msg]),
+        ));
     }
     append_and_flush(&mut log, entries).await;
 
@@ -221,6 +232,7 @@ async fn async_apply_multiple_topics_and_publishes() {
 
 #[tokio::test]
 async fn async_apply_skips_blank_entries() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -234,7 +246,7 @@ async fn async_apply_skips_blank_entries() {
         make_entry(
             2,
             1,
-            MqCommand::create_topic("after-blank", RetentionPolicy::default(), 0),
+            MqCommand::create_topic(&mut buf, "after-blank", RetentionPolicy::default(), 0),
         ),
         make_blank_entry(3, 1),
     ];
@@ -274,6 +286,7 @@ async fn async_apply_skips_blank_entries() {
 
 #[tokio::test]
 async fn async_apply_batch_entries_skipped_by_workers() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -287,7 +300,7 @@ async fn async_apply_batch_entries_skipped_by_workers() {
         vec![make_entry(
             1,
             1,
-            MqCommand::create_topic("batch-test", RetentionPolicy::default(), 0),
+            MqCommand::create_topic(&mut buf, "batch-test", RetentionPolicy::default(), 0),
         )],
     )
     .await;
@@ -322,8 +335,9 @@ async fn async_apply_batch_entries_skipped_by_workers() {
         .timestamp(1000)
         .build();
 
-    let batch = MqCommand::batch(&[MqCommand::publish(topic_id, &[msg1])]);
-    let normal = MqCommand::publish(topic_id, &[msg2]);
+    let inner_publish = MqCommand::publish(&mut buf, topic_id, &[msg1]);
+    let batch = MqCommand::batch(&mut buf, &[inner_publish]);
+    let normal = MqCommand::publish(&mut buf, topic_id, &[msg2]);
 
     append_and_flush(
         &mut log,
@@ -331,7 +345,7 @@ async fn async_apply_batch_entries_skipped_by_workers() {
     )
     .await;
 
-    // Workers should skip the batch entry (index 2) and apply the normal (index 3).
+    // Workers now apply both the batch entry (index 2) and the normal (index 3).
     manager.advance_and_wait(3).await;
 
     let snap = engine.snapshot();
@@ -340,12 +354,11 @@ async fn async_apply_batch_entries_skipped_by_workers() {
         .iter()
         .find(|t| t.meta.topic_id == topic_id)
         .unwrap();
-    // Only the normal publish at index 3 should have been applied.
-    // The batch at index 2 is skipped by workers (it would be handled
-    // by apply() synchronously in production).
+    // Both publishes should be applied: one from the batch at index 2,
+    // one from the normal publish at index 3.
     assert_eq!(
-        topic.meta.message_count, 1,
-        "only normal publish should be applied"
+        topic.meta.message_count, 2,
+        "both batch and normal publish should be applied by workers"
     );
 
     manager.shutdown().await;
@@ -354,6 +367,7 @@ async fn async_apply_batch_entries_skipped_by_workers() {
 
 #[tokio::test]
 async fn async_apply_cursor_tracks_worker_progress() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -367,7 +381,12 @@ async fn async_apply_cursor_tracks_worker_progress() {
         entries.push(make_entry(
             i,
             1,
-            MqCommand::create_topic(&format!("cursor-{}", i), RetentionPolicy::default(), 0),
+            MqCommand::create_topic(
+                &mut buf,
+                &format!("cursor-{}", i),
+                RetentionPolicy::default(),
+                0,
+            ),
         ));
     }
     append_and_flush(&mut log, entries).await;
@@ -414,6 +433,7 @@ async fn async_apply_cursor_tracks_worker_progress() {
 
 #[tokio::test]
 async fn async_apply_high_throughput() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -427,7 +447,7 @@ async fn async_apply_high_throughput() {
         vec![make_entry(
             1,
             1,
-            MqCommand::create_topic("throughput", RetentionPolicy::default(), 0),
+            MqCommand::create_topic(&mut buf, "throughput", RetentionPolicy::default(), 0),
         )],
     )
     .await;
@@ -462,7 +482,11 @@ async fn async_apply_high_throughput() {
             let msg = bisque_mq::flat::FlatMessageBuilder::new(format!("msg-{}", idx).as_bytes())
                 .timestamp(3000)
                 .build();
-            entries.push(make_entry(idx, 1, MqCommand::publish(topic_id, &[msg])));
+            entries.push(make_entry(
+                idx,
+                1,
+                MqCommand::publish(&mut buf, topic_id, &[msg]),
+            ));
         }
         append_and_flush(&mut log, entries).await;
     }
@@ -487,6 +511,7 @@ async fn async_apply_high_throughput() {
 
 #[tokio::test]
 async fn async_apply_segment_index_tracking() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -495,7 +520,7 @@ async fn async_apply_segment_index_tracking() {
     let mut log = storage.get_log_storage(0).await.unwrap();
 
     // Create a topic and publish.
-    let create_cmd = MqCommand::create_topic("idx-test", RetentionPolicy::default(), 0);
+    let create_cmd = MqCommand::create_topic(&mut buf, "idx-test", RetentionPolicy::default(), 0);
     append_and_flush(&mut log, vec![make_entry(1, 1, create_cmd)]).await;
 
     let prefetcher = log.prefetcher();
@@ -526,7 +551,11 @@ async fn async_apply_segment_index_tracking() {
         let msg = bisque_mq::flat::FlatMessageBuilder::new(format!("idx-{}", i).as_bytes())
             .timestamp(4000)
             .build();
-        entries.push(make_entry(2 + i, 1, MqCommand::publish(topic_id, &[msg])));
+        entries.push(make_entry(
+            2 + i,
+            1,
+            MqCommand::publish(&mut buf, topic_id, &[msg]),
+        ));
     }
     append_and_flush(&mut log, entries).await;
 
@@ -584,6 +613,7 @@ async fn async_apply_shutdown_sentinel() {
 
 #[tokio::test]
 async fn async_apply_purge_floor_accounts_for_workers() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -597,7 +627,12 @@ async fn async_apply_purge_floor_accounts_for_workers() {
         entries.push(make_entry(
             i,
             1,
-            MqCommand::create_topic(&format!("purge-{}", i), RetentionPolicy::default(), 0),
+            MqCommand::create_topic(
+                &mut buf,
+                &format!("purge-{}", i),
+                RetentionPolicy::default(),
+                0,
+            ),
         ));
     }
     append_and_flush(&mut log, entries).await;
@@ -646,6 +681,7 @@ async fn async_apply_purge_floor_accounts_for_workers() {
 /// advance_and_wait again. Tests persistent scanner across range boundaries.
 #[tokio::test]
 async fn async_apply_benchmark_flow_8_topics_4_partitions() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -664,7 +700,12 @@ async fn async_apply_benchmark_flow_8_topics_4_partitions() {
         entries.push(make_entry(
             i as u64 + 1,
             1,
-            MqCommand::create_topic(&format!("bench-topic-{i}"), RetentionPolicy::default(), 0),
+            MqCommand::create_topic(
+                &mut buf,
+                &format!("bench-topic-{i}"),
+                RetentionPolicy::default(),
+                0,
+            ),
         ));
     }
     append_and_flush(&mut log, entries).await;
@@ -720,7 +761,7 @@ async fn async_apply_benchmark_flow_8_topics_4_partitions() {
             entries.push(make_entry(
                 log_index,
                 1,
-                MqCommand::publish(tid, &msgs_payload),
+                MqCommand::publish(&mut buf, tid, &msgs_payload),
             ));
             log_index += 1;
         }
@@ -757,6 +798,7 @@ async fn async_apply_benchmark_flow_8_topics_4_partitions() {
 /// Tests that persistent scanner correctly resumes across multiple advance cycles.
 #[tokio::test]
 async fn async_apply_three_phase_persistent_scanner() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -773,7 +815,12 @@ async fn async_apply_three_phase_persistent_scanner() {
         entries.push(make_entry(
             i as u64 + 1,
             1,
-            MqCommand::create_topic(&format!("3phase-{i}"), RetentionPolicy::default(), 0),
+            MqCommand::create_topic(
+                &mut buf,
+                &format!("3phase-{i}"),
+                RetentionPolicy::default(),
+                0,
+            ),
         ));
     }
     append_and_flush(&mut log, entries).await;
@@ -818,7 +865,11 @@ async fn async_apply_three_phase_persistent_scanner() {
     let mut entries = Vec::new();
     for _round in 0..msgs_per_topic_p2 {
         for &tid in &topic_ids {
-            entries.push(make_entry(log_index, 1, MqCommand::publish(tid, &msgs)));
+            entries.push(make_entry(
+                log_index,
+                1,
+                MqCommand::publish(&mut buf, tid, &msgs),
+            ));
             log_index += 1;
         }
     }
@@ -837,7 +888,11 @@ async fn async_apply_three_phase_persistent_scanner() {
     let mut entries = Vec::new();
     for _round in 0..msgs_per_topic_p3 {
         for &tid in &topic_ids {
-            entries.push(make_entry(log_index, 1, MqCommand::publish(tid, &msgs)));
+            entries.push(make_entry(
+                log_index,
+                1,
+                MqCommand::publish(&mut buf, tid, &msgs),
+            ));
             log_index += 1;
         }
     }
@@ -868,6 +923,7 @@ async fn async_apply_three_phase_persistent_scanner() {
 /// Stress test: many partitions, many topics, high message count.
 #[tokio::test]
 async fn async_apply_stress_16_partitions_16_topics() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -886,7 +942,12 @@ async fn async_apply_stress_16_partitions_16_topics() {
         entries.push(make_entry(
             i as u64 + 1,
             1,
-            MqCommand::create_topic(&format!("stress-{i}"), RetentionPolicy::default(), 0),
+            MqCommand::create_topic(
+                &mut buf,
+                &format!("stress-{i}"),
+                RetentionPolicy::default(),
+                0,
+            ),
         ));
     }
     append_and_flush(&mut log, entries).await;
@@ -940,7 +1001,7 @@ async fn async_apply_stress_16_partitions_16_topics() {
             entries.push(make_entry(
                 log_index,
                 1,
-                MqCommand::publish(tid, &msgs_payload),
+                MqCommand::publish(&mut buf, tid, &msgs_payload),
             ));
             log_index += 1;
         }
@@ -974,6 +1035,7 @@ async fn async_apply_stress_16_partitions_16_topics() {
 /// This is the scenario that hangs in the benchmark.
 #[tokio::test]
 async fn async_apply_benchmark_exact_mirror() {
+    let mut buf = bytes::BytesMut::new();
     let tmp = TempDir::new().unwrap();
     let raft_config = MmapStorageConfig::new(tmp.path());
     let storage = MmapPerGroupLogStorage::<MqTypeConfig>::new(raft_config)
@@ -992,7 +1054,12 @@ async fn async_apply_benchmark_exact_mirror() {
         entries.push(make_entry(
             i as u64 + 1,
             1,
-            MqCommand::create_topic(&format!("bench-topic-{i}"), RetentionPolicy::default(), 0),
+            MqCommand::create_topic(
+                &mut buf,
+                &format!("bench-topic-{i}"),
+                RetentionPolicy::default(),
+                0,
+            ),
         ));
     }
     append_and_flush(&mut log, entries).await;
@@ -1047,7 +1114,7 @@ async fn async_apply_benchmark_exact_mirror() {
             entries.push(make_entry(
                 log_index,
                 1,
-                MqCommand::publish(tid, &msgs_payload),
+                MqCommand::publish(&mut buf, tid, &msgs_payload),
             ));
             log_index += 1;
         }

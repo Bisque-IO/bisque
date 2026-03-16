@@ -64,7 +64,7 @@ arrow-cast = { version = "57", default-features = false, features = ["prettyprin
 arrow-flight = { version = "57", default-features = false, features = ["flight-sql-experimental"] }
 arrow-ipc = { version = "57", default-features = false }
 arrow-schema = { version = "57", default-features = false }
-arc-swap = "1.7"
+arc-swap = "1.8"
 lru = "0.14"
 async-entry = "0.3"
 auto-const-array = "0.2"
@@ -93,7 +93,7 @@ crossbeam-utils = "0.8"
 crossfire = "3.1"
 dashmap = "6.1"
 papaya = "0.2"
-scc = "3.6.9"
+scc = "3.6"
 derive_more = { version = "2", features = [
     "std",
     "from",

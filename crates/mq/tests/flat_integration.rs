@@ -3,8 +3,9 @@
 //! These tests exercise the full encode → command → apply → decode path,
 //! verifying that flat-encoded messages flow correctly through the engine.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
+use bisque_mq::async_apply::ResponseEntry;
 use bisque_mq::config::MqConfig;
 use bisque_mq::engine::MqEngine;
 use bisque_mq::flat::{FlatMessage, FlatMessageBuilder, FlatMessageMeta};
@@ -12,6 +13,23 @@ use bisque_mq::types::*;
 
 fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-flat-integration-test"))
+}
+
+fn apply(engine: &MqEngine, cmd: &MqCommand) -> ResponseEntry {
+    let mut buf = BytesMut::new();
+    engine.apply_command(cmd, &mut buf, 1, 0, None);
+    ResponseEntry::split_from(&mut buf)
+}
+
+fn apply_at(
+    engine: &MqEngine,
+    cmd: &MqCommand,
+    log_index: u64,
+    current_time: u64,
+) -> ResponseEntry {
+    let mut buf = BytesMut::new();
+    engine.apply_command(cmd, &mut buf, log_index, current_time, None);
+    ResponseEntry::split_from(&mut buf)
 }
 
 // =============================================================================
@@ -125,26 +143,27 @@ fn test_meta_value_len_too_short() {
 #[test]
 fn test_queue_publish_ttl_from_flat_header() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     // create_queue returns group_id; source topic is auto-created (group_id+1)
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "ttl-queue",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "ttl-queue",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     // Publish message with 30s TTL to the source topic
@@ -153,7 +172,8 @@ fn test_queue_publish_ttl_from_flat_header() {
         .ttl_ms(30_000)
         .build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 5000, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 5000);
 
     let snap = engine.snapshot();
     // Topic should have 1 message
@@ -164,38 +184,34 @@ fn test_queue_publish_ttl_from_flat_header() {
         .unwrap();
     assert_eq!(topic.meta.message_count, 1);
 
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 6000, None);
-    match resp {
-        MqResponse::Messages { messages } => {
-            // Messages may or may not be delivered depending on ack state population
-            let _ = messages;
-        }
-        _ => {}
-    }
+    MqCommand::write_group_deliver(&mut buf, group_id, 100, 1);
+    let _resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 3, 6000);
+    // Messages may or may not be delivered depending on ack state population
 }
 
 #[test]
 fn test_queue_publish_delay_from_flat_header() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "delay-queue",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "delay-queue",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let msg = FlatMessageBuilder::new(b"delayed")
@@ -203,7 +219,8 @@ fn test_queue_publish_delay_from_flat_header() {
         .delay_ms(10_000)
         .build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 5000, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 5000);
 
     let snap = engine.snapshot();
     let topic = snap
@@ -217,30 +234,32 @@ fn test_queue_publish_delay_from_flat_header() {
 #[test]
 fn test_queue_publish_no_ttl_no_delay() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "plain-queue",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "plain-queue",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let msg = FlatMessageBuilder::new(b"plain").timestamp(1000).build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 5000, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 5000);
 
     let snap = engine.snapshot();
     let topic = snap
@@ -254,25 +273,26 @@ fn test_queue_publish_no_ttl_no_delay() {
 #[test]
 fn test_queue_publish_delay_clamped_by_ttl() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "clamped-queue",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "clamped-queue",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let msg = FlatMessageBuilder::new(b"clamped")
@@ -281,7 +301,8 @@ fn test_queue_publish_delay_clamped_by_ttl() {
         .delay_ms(60_000)
         .build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 5000, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 5000);
 
     let snap = engine.snapshot();
     let topic = snap
@@ -299,16 +320,16 @@ fn test_queue_publish_delay_clamped_by_ttl() {
 #[test]
 fn test_topic_publish_flat_messages() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let topic_id = match engine.apply_command(
-        &MqCommand::create_topic("events", RetentionPolicy::default(), 0),
-        1,
-        1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    MqCommand::write_create_topic(&mut buf, "events", &RetentionPolicy::default(), 0);
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let topic_id = r.entity_id();
 
     let messages: Vec<Bytes> = vec![
         FlatMessageBuilder::new(b"event-1")
@@ -327,11 +348,14 @@ fn test_topic_publish_flat_messages() {
             .build(),
     ];
 
-    let resp = engine.apply_command(&MqCommand::publish(topic_id, &messages), 2, 1000, None);
-    match resp {
-        MqResponse::Published { count, .. } => assert_eq!(count, 3),
-        other => panic!("expected Published, got {:?}", other),
-    }
+    MqCommand::write_publish_bytes(&mut buf, topic_id, &messages);
+    let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_PUBLISHED,
+        "expected Published"
+    );
+    assert_eq!(resp.published_count(), 3);
 
     let snap = engine.snapshot();
     assert_eq!(snap.topics[0].meta.message_count, 3);
@@ -344,70 +368,66 @@ fn test_topic_publish_flat_messages() {
 #[test]
 fn test_exchange_fanout_with_flat_messages() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let ex_id = match engine.apply_command(
-        &MqCommand::create_exchange("fanout-ex", ExchangeType::Fanout),
+    let r = apply_at(
+        &engine,
+        &MqCommand::create_exchange(&mut buf, "fanout-ex", ExchangeType::Fanout),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let ex_id = r.entity_id();
 
     // create_queue auto-creates source topic with same name
-    let q1_group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "q1",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        2,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "q1",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let q1_group_id = r.entity_id();
     let q1_topic_id = q1_group_id + 1;
 
-    let q2_group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "q2",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        3,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "q2",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 3, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let q2_group_id = r.entity_id();
     let q2_topic_id = q2_group_id + 1;
 
     // Bind exchange to source topics
-    engine.apply_command(
-        &MqCommand::create_binding(ex_id, q1_topic_id, None),
+    apply_at(
+        &engine,
+        &MqCommand::create_binding(&mut buf, ex_id, q1_topic_id, None),
         4,
         1000,
-        None,
     );
-    engine.apply_command(
-        &MqCommand::create_binding(ex_id, q2_topic_id, None),
+    apply_at(
+        &engine,
+        &MqCommand::create_binding(&mut buf, ex_id, q2_topic_id, None),
         5,
         1000,
-        None,
     );
 
     let msg = FlatMessageBuilder::new(b"fanout-data")
@@ -415,13 +435,17 @@ fn test_exchange_fanout_with_flat_messages() {
         .key(b"some-key")
         .build();
 
-    let resp = engine.apply_command(
-        &MqCommand::publish_to_exchange(ex_id, &[msg]),
+    let resp = apply_at(
+        &engine,
+        &MqCommand::publish_to_exchange(&mut buf, ex_id, &[msg]),
         6,
         2000,
-        None,
     );
-    assert!(matches!(resp, MqResponse::Published { .. }));
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_PUBLISHED,
+        "expected Published"
+    );
 
     let snap = engine.snapshot();
     // Each source topic should have 1 message
@@ -434,68 +458,64 @@ fn test_exchange_fanout_with_flat_messages() {
 #[test]
 fn test_exchange_direct_routing_with_flat_routing_key() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let ex_id = match engine.apply_command(
-        &MqCommand::create_exchange("direct-ex", ExchangeType::Direct),
+    let r = apply_at(
+        &engine,
+        &MqCommand::create_exchange(&mut buf, "direct-ex", ExchangeType::Direct),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let ex_id = r.entity_id();
 
-    let q_us_group = match engine.apply_command(
-        &MqCommand::create_queue(
-            "orders-us",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        2,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "orders-us",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
-    let q_us_topic = q_us_group + 1;
-
-    let q_eu_group = match engine.apply_command(
-        &MqCommand::create_queue(
-            "orders-eu",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        3,
-        1000,
+        false,
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
-    let q_eu_topic = q_eu_group + 1;
-
-    engine.apply_command(
-        &MqCommand::create_binding(ex_id, q_us_topic, Some("us")),
-        4,
-        1000,
+        false,
         None,
     );
-    engine.apply_command(
-        &MqCommand::create_binding(ex_id, q_eu_topic, Some("eu")),
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let q_us_group = r.entity_id();
+    let q_us_topic = q_us_group + 1;
+
+    MqCommand::write_create_queue(
+        &mut buf,
+        "orders-eu",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
+        None,
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 3, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let q_eu_group = r.entity_id();
+    let q_eu_topic = q_eu_group + 1;
+
+    apply_at(
+        &engine,
+        &MqCommand::create_binding(&mut buf, ex_id, q_us_topic, Some("us")),
+        4,
+        1000,
+    );
+    apply_at(
+        &engine,
+        &MqCommand::create_binding(&mut buf, ex_id, q_eu_topic, Some("eu")),
         5,
         1000,
-        None,
     );
 
     let msg_us = FlatMessageBuilder::new(b"order-data-us")
@@ -503,11 +523,11 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
         .routing_key(b"us")
         .build();
 
-    engine.apply_command(
-        &MqCommand::publish_to_exchange(ex_id, &[msg_us]),
+    apply_at(
+        &engine,
+        &MqCommand::publish_to_exchange(&mut buf, ex_id, &[msg_us]),
         6,
         2000,
-        None,
     );
 
     let snap = engine.snapshot();
@@ -529,11 +549,11 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
         .routing_key(b"eu")
         .build();
 
-    engine.apply_command(
-        &MqCommand::publish_to_exchange(ex_id, &[msg_eu]),
+    apply_at(
+        &engine,
+        &MqCommand::publish_to_exchange(&mut buf, ex_id, &[msg_eu]),
         7,
         2001,
-        None,
     );
 
     let snap = engine.snapshot();
@@ -554,51 +574,47 @@ fn test_exchange_direct_routing_with_flat_routing_key() {
 #[test]
 fn test_exchange_no_routing_key_in_flat_message() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let ex_id = match engine.apply_command(
-        &MqCommand::create_exchange("direct-ex-2", ExchangeType::Direct),
+    let r = apply_at(
+        &engine,
+        &MqCommand::create_exchange(&mut buf, "direct-ex-2", ExchangeType::Direct),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+    );
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let ex_id = r.entity_id();
 
-    let q_group = match engine.apply_command(
-        &MqCommand::create_queue(
-            "bound-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        2,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "bound-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let q_group = r.entity_id();
     let q_topic = q_group + 1;
 
-    engine.apply_command(
-        &MqCommand::create_binding(ex_id, q_topic, Some("specific")),
+    apply_at(
+        &engine,
+        &MqCommand::create_binding(&mut buf, ex_id, q_topic, Some("specific")),
         3,
         1000,
-        None,
     );
 
     let msg = FlatMessageBuilder::new(b"no-route").timestamp(2000).build();
 
-    engine.apply_command(
-        &MqCommand::publish_to_exchange(ex_id, &[msg]),
+    apply_at(
+        &engine,
+        &MqCommand::publish_to_exchange(&mut buf, ex_id, &[msg]),
         4,
         2000,
-        None,
     );
 
     let snap = engine.snapshot();
@@ -620,10 +636,13 @@ fn test_exchange_no_routing_key_in_flat_message() {
 #[test]
 fn test_actor_send_flat_message() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
     // Create actor group — returns group_id; source topic is auto-created
-    let group_id = match engine.apply_command(
+    let r = apply_at(
+        &engine,
         &MqCommand::create_actor_group(
+            &mut buf,
             "workers",
             ActorVariantConfig::default(),
             RetentionPolicy::default(),
@@ -632,11 +651,13 @@ fn test_actor_send_flat_message() {
         ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    );
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let msg = FlatMessageBuilder::new(b"task-payload")
@@ -648,7 +669,8 @@ fn test_actor_send_flat_message() {
         .build();
 
     // Publish to the actor group's source topic
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 5000, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 5000);
 
     let snap = engine.snapshot();
     let topic = snap
@@ -666,25 +688,26 @@ fn test_actor_send_flat_message() {
 #[test]
 fn test_batch_publish_mixed_flat_messages() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "mixed-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "mixed-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let messages: Vec<Bytes> = vec![
@@ -711,12 +734,8 @@ fn test_batch_publish_mixed_flat_messages() {
         FlatMessageBuilder::new(b"").timestamp(1004).build(),
     ];
 
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id, &messages),
-        2,
-        1000,
-        None,
-    );
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &messages);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
 
     let snap = engine.snapshot();
     let topic = snap
@@ -821,13 +840,11 @@ fn test_flat_message_binary_value() {
 #[test]
 fn test_snapshot_restore_with_flat_messages() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    engine.apply_command(
-        &MqCommand::create_topic("t1", RetentionPolicy::default(), 0),
-        1,
-        1000,
-        None,
-    );
+    MqCommand::write_create_topic(&mut buf, "t1", &RetentionPolicy::default(), 0);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+
     let messages: Vec<Bytes> = vec![
         FlatMessageBuilder::new(b"evt-1")
             .key(b"k1")
@@ -838,38 +855,31 @@ fn test_snapshot_restore_with_flat_messages() {
             .ttl_ms(5000)
             .build(),
     ];
-    engine.apply_command(&MqCommand::publish(1, &messages), 2, 1001, None);
+    MqCommand::write_publish_bytes(&mut buf, 1, &messages);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1001);
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "q1",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        3,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "q1",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 3, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let enqueue_msg = FlatMessageBuilder::new(b"task-1")
         .timestamp(2000)
         .delay_ms(1000)
         .build();
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id, &[enqueue_msg]),
-        4,
-        2000,
-        None,
-    );
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[enqueue_msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 4, 2000);
 
     let snap = engine.snapshot();
     let snap_bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
@@ -889,8 +899,13 @@ fn test_snapshot_restore_with_flat_messages() {
     let post_restore_msg = FlatMessageBuilder::new(b"post-restore")
         .timestamp(3000)
         .build();
-    let resp = engine2.apply_command(&MqCommand::publish(1, &[post_restore_msg]), 5, 3000, None);
-    assert!(matches!(resp, MqResponse::Published { .. }));
+    MqCommand::write_publish_bytes(&mut buf, 1, &[post_restore_msg]);
+    let resp = apply_at(&engine2, &MqCommand::split_from(&mut buf), 5, 3000);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_PUBLISHED,
+        "expected Published"
+    );
 }
 
 // =============================================================================
@@ -1000,35 +1015,35 @@ fn test_flat_message_as_bytes_roundtrip() {
 #[test]
 fn test_queue_ack_with_response_publishes_to_reply_topic() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let reply_topic_id = match engine.apply_command(
-        &MqCommand::create_topic("responses", RetentionPolicy::default(), 0),
-        1,
-        1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+    MqCommand::write_create_topic(&mut buf, "responses", &RetentionPolicy::default(), 0);
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let reply_topic_id = r.entity_id();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "requests",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        2,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "requests",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
+    assert_eq!(
+        r.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let request_msg = FlatMessageBuilder::new(b"compute-something")
@@ -1037,70 +1052,56 @@ fn test_queue_ack_with_response_publishes_to_reply_topic() {
         .correlation_id(b"req-001")
         .build();
 
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id, &[request_msg]),
-        3,
-        2000,
-        None,
-    );
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[request_msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 3, 2000);
 
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 4, 3000, None);
-    match resp {
-        MqResponse::Messages { messages } => {
-            if !messages.is_empty() {
-                let msg_id = messages[0].message_id;
+    MqCommand::write_group_deliver(&mut buf, group_id, 100, 1);
+    let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 4, 3000);
+    if resp.tag() == ResponseEntry::TAG_MESSAGES && resp.message_count() > 0 {
+        let messages: Vec<_> = resp.messages().collect();
+        let msg_id = messages[0].message_id;
 
-                let response_msg = FlatMessageBuilder::new(b"result: 42")
-                    .timestamp(4000)
-                    .correlation_id(b"req-001")
-                    .build();
+        let response_msg = FlatMessageBuilder::new(b"result: 42")
+            .timestamp(4000)
+            .correlation_id(b"req-001")
+            .build();
 
-                let resp = engine.apply_command(
-                    &MqCommand::group_ack(group_id, &[msg_id], Some(&response_msg)),
-                    5,
-                    4000,
-                    None,
-                );
-                assert!(matches!(resp, MqResponse::Ok));
+        MqCommand::write_group_ack(&mut buf, group_id, &[msg_id], Some(&response_msg));
+        let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 5, 4000);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_OK);
 
-                let snap = engine.snapshot();
-                let reply_topic = snap
-                    .topics
-                    .iter()
-                    .find(|t| t.meta.topic_id == reply_topic_id)
-                    .unwrap();
-                assert_eq!(
-                    reply_topic.meta.message_count, 1,
-                    "response should be published to reply topic"
-                );
-            }
-        }
-        _ => {}
+        let snap = engine.snapshot();
+        let reply_topic = snap
+            .topics
+            .iter()
+            .find(|t| t.meta.topic_id == reply_topic_id)
+            .unwrap();
+        assert_eq!(
+            reply_topic.meta.message_count, 1,
+            "response should be published to reply topic"
+        );
     }
 }
 
 #[test]
 fn test_queue_ack_without_response_is_normal_ack() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "normal-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "normal-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let msg = FlatMessageBuilder::new(b"data")
@@ -1108,98 +1109,80 @@ fn test_queue_ack_without_response_is_normal_ack() {
         .reply_to(b"some-topic")
         .build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 1000, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
 
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 2000, None);
-    match resp {
-        MqResponse::Messages { messages } => {
-            if !messages.is_empty() {
-                let msg_id = messages[0].message_id;
-                let resp = engine.apply_command(
-                    &MqCommand::group_ack(group_id, &[msg_id], None),
-                    4,
-                    3000,
-                    None,
-                );
-                assert!(matches!(resp, MqResponse::Ok));
-            }
-        }
-        _ => {}
+    MqCommand::write_group_deliver(&mut buf, group_id, 100, 1);
+    let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 3, 2000);
+    if resp.tag() == ResponseEntry::TAG_MESSAGES && resp.message_count() > 0 {
+        let messages: Vec<_> = resp.messages().collect();
+        let msg_id = messages[0].message_id;
+        MqCommand::write_group_ack(&mut buf, group_id, &[msg_id], None);
+        let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 4, 3000);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_OK);
     }
 }
 
 #[test]
 fn test_queue_ack_response_without_reply_to_drops_silently() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "no-reply-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "no-reply-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let msg = FlatMessageBuilder::new(b"no-reply").timestamp(1000).build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 1000, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
 
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 2000, None);
-    match resp {
-        MqResponse::Messages { messages } => {
-            if !messages.is_empty() {
-                let msg_id = messages[0].message_id;
-                let response = FlatMessageBuilder::new(b"orphan-response")
-                    .timestamp(3000)
-                    .build();
+    MqCommand::write_group_deliver(&mut buf, group_id, 100, 1);
+    let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 3, 2000);
+    if resp.tag() == ResponseEntry::TAG_MESSAGES && resp.message_count() > 0 {
+        let messages: Vec<_> = resp.messages().collect();
+        let msg_id = messages[0].message_id;
+        let response = FlatMessageBuilder::new(b"orphan-response")
+            .timestamp(3000)
+            .build();
 
-                let resp = engine.apply_command(
-                    &MqCommand::group_ack(group_id, &[msg_id], Some(&response)),
-                    4,
-                    3000,
-                    None,
-                );
-                assert!(matches!(resp, MqResponse::Ok));
-            }
-        }
-        _ => {}
+        MqCommand::write_group_ack(&mut buf, group_id, &[msg_id], Some(&response));
+        let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 4, 3000);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_OK);
     }
 }
 
 #[test]
 fn test_queue_ack_response_reply_topic_missing_drops_silently() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "q-missing-topic",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        1,
-        1000,
+    MqCommand::write_create_queue(
+        &mut buf,
+        "q-missing-topic",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+        false,
+        None,
+        false,
+        None,
+    );
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let msg = FlatMessageBuilder::new(b"request")
@@ -1207,57 +1190,44 @@ fn test_queue_ack_response_reply_topic_missing_drops_silently() {
         .reply_to(b"nonexistent-topic")
         .build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 1000, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
 
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 3, 2000, None);
-    match resp {
-        MqResponse::Messages { messages } => {
-            if !messages.is_empty() {
-                let msg_id = messages[0].message_id;
-                let response = FlatMessageBuilder::new(b"response").timestamp(3000).build();
+    MqCommand::write_group_deliver(&mut buf, group_id, 100, 1);
+    let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 3, 2000);
+    if resp.tag() == ResponseEntry::TAG_MESSAGES && resp.message_count() > 0 {
+        let messages: Vec<_> = resp.messages().collect();
+        let msg_id = messages[0].message_id;
+        let response = FlatMessageBuilder::new(b"response").timestamp(3000).build();
 
-                let resp = engine.apply_command(
-                    &MqCommand::group_ack(group_id, &[msg_id], Some(&response)),
-                    4,
-                    3000,
-                    None,
-                );
-                assert!(matches!(resp, MqResponse::Ok));
-            }
-        }
-        _ => {}
+        MqCommand::write_group_ack(&mut buf, group_id, &[msg_id], Some(&response));
+        let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 4, 3000);
+        assert_eq!(resp.tag(), ResponseEntry::TAG_OK);
     }
 }
 
 #[test]
 fn test_queue_ack_multiple_messages_first_has_reply_to() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    engine.apply_command(
-        &MqCommand::create_topic("multi-replies", RetentionPolicy::default(), 0),
-        1,
-        1000,
+    MqCommand::write_create_topic(&mut buf, "multi-replies", &RetentionPolicy::default(), 0);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 1, 1000);
+
+    MqCommand::write_create_queue(
+        &mut buf,
+        "multi-q",
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
+        None,
+        false,
+        None,
+        false,
         None,
     );
-
-    let group_id = match engine.apply_command(
-        &MqCommand::create_queue(
-            "multi-q",
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        2,
-        1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+    let r = apply_at(&engine, &MqCommand::split_from(&mut buf), 2, 1000);
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let msg1 = FlatMessageBuilder::new(b"req-1")
@@ -1265,30 +1235,24 @@ fn test_queue_ack_multiple_messages_first_has_reply_to() {
         .reply_to(b"multi-replies")
         .correlation_id(b"corr-1")
         .build();
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg1]), 3, 1000, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg1]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 3, 1000);
 
     let msg2 = FlatMessageBuilder::new(b"req-2").timestamp(1001).build();
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg2]), 4, 1001, None);
+    MqCommand::write_publish_bytes(&mut buf, source_topic_id, &[msg2]);
+    apply_at(&engine, &MqCommand::split_from(&mut buf), 4, 1001);
 
-    let resp = engine.apply_command(&MqCommand::group_deliver(group_id, 100, 2), 5, 2000, None);
-    match resp {
-        MqResponse::Messages { messages } => {
-            if !messages.is_empty() {
-                let msg_ids: Vec<u64> = messages.iter().map(|m| m.message_id).collect();
+    MqCommand::write_group_deliver(&mut buf, group_id, 100, 2);
+    let resp = apply_at(&engine, &MqCommand::split_from(&mut buf), 5, 2000);
+    if resp.tag() == ResponseEntry::TAG_MESSAGES && resp.message_count() > 0 {
+        let msg_ids: Vec<u64> = resp.messages().map(|m| m.message_id).collect();
 
-                let response = FlatMessageBuilder::new(b"batch-result")
-                    .timestamp(3000)
-                    .build();
+        let response = FlatMessageBuilder::new(b"batch-result")
+            .timestamp(3000)
+            .build();
 
-                engine.apply_command(
-                    &MqCommand::group_ack(group_id, &msg_ids, Some(&response)),
-                    6,
-                    3000,
-                    None,
-                );
-            }
-        }
-        _ => {}
+        MqCommand::write_group_ack(&mut buf, group_id, &msg_ids, Some(&response));
+        apply_at(&engine, &MqCommand::split_from(&mut buf), 6, 3000);
     }
 }
 
@@ -1299,19 +1263,21 @@ fn test_queue_ack_multiple_messages_first_has_reply_to() {
 #[test]
 fn test_actor_ack_with_response_publishes_to_reply_topic() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let reply_topic_id = match engine.apply_command(
-        &MqCommand::create_topic("actor-responses", RetentionPolicy::default(), 0),
+    let r = apply_at(
+        &engine,
+        &MqCommand::create_topic(&mut buf, "actor-responses", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+    );
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let reply_topic_id = r.entity_id();
 
-    let group_id = match engine.apply_command(
+    let r = apply_at(
+        &engine,
         &MqCommand::create_actor_group(
+            &mut buf,
             "rpc-actors",
             ActorVariantConfig::default(),
             RetentionPolicy::default(),
@@ -1320,11 +1286,9 @@ fn test_actor_ack_with_response_publishes_to_reply_topic() {
         ),
         2,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+    );
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let group_id = r.entity_id();
 
     let actor_id = Bytes::from_static(b"calculator");
 
@@ -1335,66 +1299,64 @@ fn test_actor_ack_with_response_publishes_to_reply_topic() {
         .build();
 
     let source_topic_id = group_id + 1;
-    engine.apply_command(
-        &MqCommand::publish(source_topic_id, &[request]),
+    apply_at(
+        &engine,
+        &MqCommand::publish(&mut buf, source_topic_id, &[request]),
         3,
         2000,
-        None,
     );
-
-    engine.apply_command(
-        &MqCommand::group_assign_actors(group_id, 100, &[actor_id.clone()]),
+    apply_at(
+        &engine,
+        &MqCommand::group_assign_actors(&mut buf, group_id, 100, &[actor_id.clone()]),
         4,
         2001,
-        None,
     );
 
-    let resp = engine.apply_command(
-        &MqCommand::group_deliver_actor(group_id, 100, &[actor_id.clone()]),
+    let resp = apply_at(
+        &engine,
+        &MqCommand::group_deliver_actor(&mut buf, group_id, 100, &[actor_id.clone()]),
         5,
         2002,
-        None,
     );
-    match resp {
-        MqResponse::Messages { messages } => {
-            if !messages.is_empty() {
-                let msg_id = messages[0].message_id;
+    if resp.tag() == ResponseEntry::TAG_MESSAGES && resp.message_count() > 0 {
+        let messages: Vec<_> = resp.messages().collect();
+        let msg_id = messages[0].message_id;
 
-                let response = FlatMessageBuilder::new(b"4")
-                    .timestamp(3000)
-                    .correlation_id(b"calc-001")
-                    .build();
+        let response = FlatMessageBuilder::new(b"4")
+            .timestamp(3000)
+            .correlation_id(b"calc-001")
+            .build();
 
-                let resp = engine.apply_command(
-                    &MqCommand::group_ack_actor(group_id, &actor_id, msg_id, Some(&response)),
-                    6,
-                    3000,
-                    None,
-                );
-                assert!(matches!(resp, MqResponse::Ok));
+        let resp = apply_at(
+            &engine,
+            &MqCommand::group_ack_actor(&mut buf, group_id, &actor_id, msg_id, Some(&response)),
+            6,
+            3000,
+        );
+        assert_eq!(resp.tag(), ResponseEntry::TAG_OK);
 
-                let snap = engine.snapshot();
-                let reply_topic = snap
-                    .topics
-                    .iter()
-                    .find(|t| t.meta.topic_id == reply_topic_id)
-                    .unwrap();
-                assert_eq!(
-                    reply_topic.meta.message_count, 1,
-                    "actor response should be published to reply topic"
-                );
-            }
-        }
-        _ => {}
+        let snap = engine.snapshot();
+        let reply_topic = snap
+            .topics
+            .iter()
+            .find(|t| t.meta.topic_id == reply_topic_id)
+            .unwrap();
+        assert_eq!(
+            reply_topic.meta.message_count, 1,
+            "actor response should be published to reply topic"
+        );
     }
 }
 
 #[test]
 fn test_actor_ack_without_response_normal() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
+    let r = apply_at(
+        &engine,
         &MqCommand::create_actor_group(
+            &mut buf,
             "normal-actors",
             ActorVariantConfig::default(),
             RetentionPolicy::default(),
@@ -1403,11 +1365,9 @@ fn test_actor_ack_without_response_normal() {
         ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+    );
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let actor_id = Bytes::from_static(b"worker-1");
@@ -1416,44 +1376,47 @@ fn test_actor_ack_without_response_normal() {
         .timestamp(2000)
         .build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 2000, None);
-
-    engine.apply_command(
-        &MqCommand::group_assign_actors(group_id, 100, &[actor_id.clone()]),
+    apply_at(
+        &engine,
+        &MqCommand::publish(&mut buf, source_topic_id, &[msg]),
+        2,
+        2000,
+    );
+    apply_at(
+        &engine,
+        &MqCommand::group_assign_actors(&mut buf, group_id, 100, &[actor_id.clone()]),
         3,
         2001,
-        None,
     );
 
-    let resp = engine.apply_command(
-        &MqCommand::group_deliver_actor(group_id, 100, &[actor_id.clone()]),
+    let resp = apply_at(
+        &engine,
+        &MqCommand::group_deliver_actor(&mut buf, group_id, 100, &[actor_id.clone()]),
         4,
         2002,
-        None,
     );
-    match resp {
-        MqResponse::Messages { messages } => {
-            if !messages.is_empty() {
-                let msg_id = messages[0].message_id;
-                let resp = engine.apply_command(
-                    &MqCommand::group_ack_actor(group_id, &actor_id, msg_id, None),
-                    5,
-                    3000,
-                    None,
-                );
-                assert!(matches!(resp, MqResponse::Ok));
-            }
-        }
-        _ => {}
+    if resp.tag() == ResponseEntry::TAG_MESSAGES && resp.message_count() > 0 {
+        let messages: Vec<_> = resp.messages().collect();
+        let msg_id = messages[0].message_id;
+        let resp = apply_at(
+            &engine,
+            &MqCommand::group_ack_actor(&mut buf, group_id, &actor_id, msg_id, None),
+            5,
+            3000,
+        );
+        assert_eq!(resp.tag(), ResponseEntry::TAG_OK);
     }
 }
 
 #[test]
 fn test_actor_ack_response_no_reply_to_drops_silently() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    let group_id = match engine.apply_command(
+    let r = apply_at(
+        &engine,
         &MqCommand::create_actor_group(
+            &mut buf,
             "no-reply-actors",
             ActorVariantConfig::default(),
             RetentionPolicy::default(),
@@ -1462,48 +1425,46 @@ fn test_actor_ack_response_no_reply_to_drops_silently() {
         ),
         1,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+    );
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let actor_id = Bytes::from_static(b"actor-1");
 
     let msg = FlatMessageBuilder::new(b"task").timestamp(2000).build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 2, 2000, None);
-
-    engine.apply_command(
-        &MqCommand::group_assign_actors(group_id, 100, &[actor_id.clone()]),
+    apply_at(
+        &engine,
+        &MqCommand::publish(&mut buf, source_topic_id, &[msg]),
+        2,
+        2000,
+    );
+    apply_at(
+        &engine,
+        &MqCommand::group_assign_actors(&mut buf, group_id, 100, &[actor_id.clone()]),
         3,
         2001,
-        None,
     );
 
-    let resp = engine.apply_command(
-        &MqCommand::group_deliver_actor(group_id, 100, &[actor_id.clone()]),
+    let resp = apply_at(
+        &engine,
+        &MqCommand::group_deliver_actor(&mut buf, group_id, 100, &[actor_id.clone()]),
         4,
         2002,
-        None,
     );
-    match resp {
-        MqResponse::Messages { messages } => {
-            if !messages.is_empty() {
-                let msg_id = messages[0].message_id;
-                let response = FlatMessageBuilder::new(b"result").timestamp(3000).build();
+    if resp.tag() == ResponseEntry::TAG_MESSAGES && resp.message_count() > 0 {
+        let messages: Vec<_> = resp.messages().collect();
+        let msg_id = messages[0].message_id;
+        let response = FlatMessageBuilder::new(b"result").timestamp(3000).build();
 
-                let resp = engine.apply_command(
-                    &MqCommand::group_ack_actor(group_id, &actor_id, msg_id, Some(&response)),
-                    5,
-                    3000,
-                    None,
-                );
-                assert!(matches!(resp, MqResponse::Ok));
-            }
-        }
-        _ => {}
+        let resp = apply_at(
+            &engine,
+            &MqCommand::group_ack_actor(&mut buf, group_id, &actor_id, msg_id, Some(&response)),
+            5,
+            3000,
+        );
+        assert_eq!(resp.tag(), ResponseEntry::TAG_OK);
     }
 }
 
@@ -1513,22 +1474,24 @@ fn test_actor_ack_response_no_reply_to_drops_silently() {
 
 #[test]
 fn test_ack_display_with_response() {
-    let ack_no_resp = MqCommand::group_ack(1, &[10, 11], None);
+    let mut buf = BytesMut::new();
+    let ack_no_resp = MqCommand::group_ack(&mut buf, 1, &[10, 11], None);
     assert_eq!(format!("{}", ack_no_resp), "GroupAck(group=1)");
 
     let resp_bytes = FlatMessageBuilder::new(b"resp").build();
-    let ack_with_resp = MqCommand::group_ack(1, &[10], Some(&resp_bytes));
+    let ack_with_resp = MqCommand::group_ack(&mut buf, 1, &[10], Some(&resp_bytes));
     assert_eq!(format!("{}", ack_with_resp), "GroupAck(group=1)");
 }
 
 #[test]
 fn test_ack_actor_display_with_response() {
+    let mut buf = BytesMut::new();
     let actor_id = Bytes::from_static(b"a1");
-    let ack_no_resp = MqCommand::group_ack_actor(1, &actor_id, 10, None);
+    let ack_no_resp = MqCommand::group_ack_actor(&mut buf, 1, &actor_id, 10, None);
     assert_eq!(format!("{}", ack_no_resp), "GroupAckActor(group=1)");
 
     let resp_bytes = FlatMessageBuilder::new(b"resp").build();
-    let ack_with_resp = MqCommand::group_ack_actor(1, &actor_id, 10, Some(&resp_bytes));
+    let ack_with_resp = MqCommand::group_ack_actor(&mut buf, 1, &actor_id, 10, Some(&resp_bytes));
     assert_eq!(format!("{}", ack_with_resp), "GroupAckActor(group=1)");
 }
 
@@ -1539,15 +1502,18 @@ fn test_ack_actor_display_with_response() {
 #[test]
 fn test_snapshot_restore_preserves_reply_to() {
     let mut engine = make_engine();
+    let mut buf = BytesMut::new();
 
-    engine.apply_command(
-        &MqCommand::create_topic("replies", RetentionPolicy::default(), 0),
+    apply_at(
+        &engine,
+        &MqCommand::create_topic(&mut buf, "replies", RetentionPolicy::default(), 0),
         1,
         1000,
-        None,
     );
-    let group_id = match engine.apply_command(
+    let r = apply_at(
+        &engine,
         &MqCommand::create_queue(
+            &mut buf,
             "rpc-queue",
             AckVariantConfig::default(),
             RetentionPolicy::default(),
@@ -1559,11 +1525,9 @@ fn test_snapshot_restore_preserves_reply_to() {
         ),
         2,
         1000,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        _ => panic!(),
-    };
+    );
+    assert_eq!(r.tag(), ResponseEntry::TAG_ENTITY_CREATED);
+    let group_id = r.entity_id();
     let source_topic_id = group_id + 1;
 
     let msg = FlatMessageBuilder::new(b"request")
@@ -1572,7 +1536,12 @@ fn test_snapshot_restore_preserves_reply_to() {
         .correlation_id(b"corr-snap")
         .build();
 
-    engine.apply_command(&MqCommand::publish(source_topic_id, &[msg]), 3, 2000, None);
+    apply_at(
+        &engine,
+        &MqCommand::publish(&mut buf, source_topic_id, &[msg]),
+        3,
+        2000,
+    );
 
     let snap = engine.snapshot();
     let snap_bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
@@ -1582,35 +1551,36 @@ fn test_snapshot_restore_preserves_reply_to() {
     let mut engine2 = make_engine();
     engine2.restore(snap_restored);
 
-    let resp = engine2.apply_command(&MqCommand::group_deliver(group_id, 100, 1), 4, 3000, None);
-    match resp {
-        MqResponse::Messages { messages } => {
-            if !messages.is_empty() {
-                let msg_id = messages[0].message_id;
+    let resp = apply_at(
+        &engine2,
+        &MqCommand::group_deliver(&mut buf, group_id, 100, 1),
+        4,
+        3000,
+    );
+    if resp.tag() == ResponseEntry::TAG_MESSAGES && resp.message_count() > 0 {
+        let messages: Vec<_> = resp.messages().collect();
+        let msg_id = messages[0].message_id;
 
-                let response = FlatMessageBuilder::new(b"reply-data")
-                    .timestamp(4000)
-                    .build();
+        let response = FlatMessageBuilder::new(b"reply-data")
+            .timestamp(4000)
+            .build();
 
-                engine2.apply_command(
-                    &MqCommand::group_ack(group_id, &[msg_id], Some(&response)),
-                    5,
-                    4000,
-                    None,
-                );
+        apply_at(
+            &engine2,
+            &MqCommand::group_ack(&mut buf, group_id, &[msg_id], Some(&response)),
+            5,
+            4000,
+        );
 
-                let snap2 = engine2.snapshot();
-                let reply_topic = snap2
-                    .topics
-                    .iter()
-                    .find(|t| t.meta.name == "replies")
-                    .unwrap();
-                assert_eq!(
-                    reply_topic.meta.message_count, 1,
-                    "response should be routed to reply topic after restore"
-                );
-            }
-        }
-        _ => {}
+        let snap2 = engine2.snapshot();
+        let reply_topic = snap2
+            .topics
+            .iter()
+            .find(|t| t.meta.name == "replies")
+            .unwrap();
+        assert_eq!(
+            reply_topic.meta.message_count, 1,
+            "response should be routed to reply topic after restore"
+        );
     }
 }

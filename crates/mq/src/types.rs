@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 use bytes::Bytes;
@@ -15,6 +16,18 @@ pub fn name_hash(name: &str) -> u64 {
 #[inline]
 pub fn name_hash_bytes(b: &[u8]) -> u64 {
     crc_fast::crc64_nvme(b)
+}
+
+// =============================================================================
+// MqApplyResponse
+// =============================================================================
+
+/// Minimal raft apply acknowledgement. The log index is all callers need
+/// to correlate with their pending request. Actual engine results are
+/// delivered via the worker → ClientRegistry pipeline.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MqApplyResponse {
+    pub log_index: u64,
 }
 
 // =============================================================================
@@ -479,25 +492,16 @@ pub enum EntityStats {
 
 /// Command type for the MQ engine.
 ///
-/// Wraps a flat-encoded binary buffer (`Bytes`). On the write path, constructor
-/// methods encode fields into the buffer. On the read path (state machine apply),
+/// Wraps a flat-encoded binary buffer (`Bytes`). On the write path, `write_*`
+/// functions write fields directly into a caller-provided `BytesMut`, and
+/// `MqCommand::split_from` splits the result out zero-copy. On the read path,
 /// the buffer is decoded from the raft log zero-copy.
 ///
-/// Per-variant accessor structs (in `codec`) provide typed APIs
-/// over the raw buffer.
-///
-/// For multi-partition `TAG_FORWARDED_BATCH` commands, the payload may be
-/// split across multiple `Bytes` segments (`buf` + `extra`) to avoid a
-/// concatenation copy. The raft encoder writes all segments via
-/// `append_record_into_scattered_many` with a single CRC pass. Once decoded
-/// from the raft log, the command is always a single contiguous `Bytes`.
+/// Commands are always a single contiguous `Bytes` — no scatter/gather.
+/// Per-variant accessor structs (in `codec`) provide typed APIs over the raw buffer.
 #[derive(Clone)]
 pub struct MqCommand {
     pub(crate) buf: Bytes,
-    /// Extra payload segments for vectored TAG_FORWARDED_BATCH (multi-partition batcher).
-    /// Empty for all other commands and for single-partition batches.
-    /// Inline capacity 1 covers the 2-partition case without a heap allocation.
-    pub(crate) extra: SmallVec<[Bytes; 1]>,
 }
 
 // Tag constants for MqCommand discriminants — unified allocation.
@@ -587,13 +591,24 @@ impl MqCommand {
     /// @0  [size:4][fixed:2][tag:1][flags:1]   MqCommand header
     /// @8  node_id: u32                        originating follower node
     /// @12 count:   u32                        number of sub-frames
-    /// @16 Frame 0: [len:4][client_id:4][cmd_bytes + pad8]
-    /// @.. Frame 1: [len:4][client_id:4][cmd_bytes + pad8]
+    /// @24 Frame 0: [payload_len:4][client_id:4][request_seq:8][cmd_bytes + opt_pad]
+    /// @.. Frame 1: [payload_len:4][client_id:4][request_seq:8][cmd_bytes + opt_pad]
     /// ```
     ///
-    /// Sub-frame `len` = `4 + cmd_bytes.len()` (client_id + cmd, excludes len field).
-    /// Each sub-frame is padded to 8-byte alignment.
+    /// Sub-frame `payload_len` = `12 + cmd_bytes.len()` (client_id:4 + request_seq:8 + cmd,
+    /// excludes payload_len field itself). Each sub-frame may be padded to 8-byte alignment
+    /// when built by the write_batcher (not by the TCP forwarding path).
     pub const TAG_FORWARDED_BATCH: u8 = 55;
+
+    // -- Resume (56) --
+
+    /// Client session resume command, sent as the first forwarded sub-frame after reconnect.
+    ///
+    /// Wire layout (16 bytes):
+    /// ```text
+    /// [TAG_RESUME:1][pad:3][session_client_id:4][last_acked_seq:8]
+    /// ```
+    pub const TAG_RESUME: u8 = 56;
 }
 
 /// Command header offsets.
@@ -793,42 +808,29 @@ impl MqCommand {
         u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap())
     }
 
-    /// Get the i-th element from a vec_bytes descriptor table.
+    /// Walk to the i-th element in a sequential vec_bytes stream.
+    /// Slot format: `[count:4][data_start:4]`; stream: `[len:4][data]...`
     #[inline]
     pub(crate) fn field_vec_bytes_get(&self, slot_offset: usize, index: usize) -> &[u8] {
-        let table_offset = u32::from_le_bytes(
+        let data_start = u32::from_le_bytes(
             self.buf[slot_offset + 4..slot_offset + 8]
                 .try_into()
                 .unwrap(),
         ) as usize;
-        let desc_offset = table_offset + index * 8;
-        let size =
-            u32::from_le_bytes(self.buf[desc_offset..desc_offset + 4].try_into().unwrap()) as usize;
-        let data_offset = u32::from_le_bytes(
-            self.buf[desc_offset + 4..desc_offset + 8]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        &self.buf[data_offset..data_offset + size]
+        let mut pos = data_start;
+        for _ in 0..index {
+            let len = u32::from_le_bytes(self.buf[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4 + len;
+        }
+        let len = u32::from_le_bytes(self.buf[pos..pos + 4].try_into().unwrap()) as usize;
+        &self.buf[pos + 4..pos + 4 + len]
     }
 
-    /// Get the i-th element from a vec_bytes descriptor table as Bytes.
+    /// Same as `field_vec_bytes_get` but returns a zero-copy `Bytes` slice.
     #[inline]
     pub(crate) fn field_vec_bytes_get_bytes(&self, slot_offset: usize, index: usize) -> Bytes {
-        let table_offset = u32::from_le_bytes(
-            self.buf[slot_offset + 4..slot_offset + 8]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let desc_offset = table_offset + index * 8;
-        let size =
-            u32::from_le_bytes(self.buf[desc_offset..desc_offset + 4].try_into().unwrap()) as usize;
-        let data_offset = u32::from_le_bytes(
-            self.buf[desc_offset + 4..desc_offset + 8]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        Bytes::copy_from_slice(&self.buf[data_offset..data_offset + size])
+        let data = self.field_vec_bytes_get(slot_offset, index);
+        self.buf.slice_ref(data)
     }
 
     /// Raw buffer access.
@@ -840,10 +842,7 @@ impl MqCommand {
     /// Wrap raw bytes as an MqCommand (zero-copy).
     #[inline]
     pub fn from_bytes(buf: Bytes) -> Self {
-        Self {
-            buf,
-            extra: SmallVec::new(),
-        }
+        Self { buf }
     }
 
     /// Wrap a Vec<u8> as an MqCommand.
@@ -851,11 +850,19 @@ impl MqCommand {
     pub fn from_vec(buf: Vec<u8>) -> Self {
         Self {
             buf: Bytes::from(buf),
-            extra: SmallVec::new(),
         }
     }
 
-    /// Total encoded size.
+    /// Split the current content of `buf` into an `MqCommand` (zero-copy slab).
+    /// The `BytesMut` is left empty but retains its backing capacity.
+    #[inline]
+    pub fn split_from(buf: &mut bytes::BytesMut) -> Self {
+        Self {
+            buf: buf.split().freeze(),
+        }
+    }
+
+    /// Total encoded size in bytes.
     #[inline]
     pub fn total_encoded_size(&self) -> usize {
         self.buf.len()
@@ -870,12 +877,7 @@ impl fmt::Display for MqCommand {
 
 impl fmt::Debug for MqCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "MqCommand(tag={}, {} bytes)",
-            self.tag(),
-            self.total_encoded_size(),
-        )
+        write!(f, "MqCommand(tag={}, {} bytes)", self.tag(), self.buf.len())
     }
 }
 
@@ -893,7 +895,6 @@ impl<'de> Deserialize<'de> for MqCommand {
         let bytes = <Vec<u8>>::deserialize(deserializer)?;
         Ok(Self {
             buf: Bytes::from(bytes),
-            extra: SmallVec::new(),
         })
     }
 }
@@ -967,7 +968,7 @@ impl fmt::Display for MqError {
 }
 
 // =============================================================================
-// MqResponse
+// Retained Message Entry
 // =============================================================================
 
 /// A retained message entry stored per topic.
@@ -977,147 +978,6 @@ pub struct RetainedEntry {
     pub routing_key: Bytes,
     /// The flat-encoded message bytes.
     pub message: Bytes,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MqResponse {
-    Ok,
-    Error(MqError),
-    EntityCreated {
-        id: u64,
-    },
-    Messages {
-        messages: SmallVec<[DeliveredMessage; 8]>,
-    },
-    Published {
-        /// First dense offset assigned.
-        base_offset: u64,
-        /// Number of messages published.
-        count: u64,
-    },
-    Stats(EntityStats),
-    BatchResponse(Box<SmallVec<[MqResponse; 8]>>),
-    /// Consumer group join completed (or partially — check `phase_complete`).
-    GroupJoined {
-        generation: i32,
-        leader: String,
-        member_id: String,
-        protocol_name: String,
-        is_leader: bool,
-        /// `(member_id, protocol_metadata)` — only populated for the leader.
-        members: Vec<(String, Bytes)>,
-        /// `true` if all members joined and generation was bumped.
-        phase_complete: bool,
-    },
-    /// Consumer group sync completed.
-    GroupSynced {
-        assignment: Vec<u8>,
-        /// `true` if group transitioned to `Stable`.
-        phase_complete: bool,
-    },
-    /// Messages were dead-lettered. The caller (background timer) should read
-    /// the original message bytes from the raft log and issue `GroupPublishToDlq`.
-    DeadLettered {
-        /// Raft log indexes of the dead-lettered messages.
-        dead_letter_ids: SmallVec<[u64; 8]>,
-        /// The configured DLQ topic to publish them to.
-        dlq_topic_id: u64,
-    },
-    /// Retained messages matching a topic filter.
-    RetainedMessages {
-        messages: Vec<RetainedEntry>,
-    },
-    /// Will message is pending (has a delay).
-    WillPending {
-        session_id: u64,
-        delay_ms: u64,
-    },
-    /// Session restored successfully.
-    SessionRestored {
-        session_id: u64,
-        session_expiry_ms: u64,
-        subscription_data: Bytes,
-    },
-    /// Session not found or expired.
-    SessionNotFound,
-    /// Multi-group deliver result.
-    MultiMessages {
-        groups: Vec<(u64, SmallVec<[DeliveredMessage; 8]>)>,
-    },
-    /// Topic aliases for a session.
-    TopicAliases {
-        aliases: Vec<TopicAliasEntry>,
-    },
-    /// Pending wills that were fired.
-    WillsFired {
-        count: u32,
-    },
-    /// Raft entry committed — actual result delivered via client channel.
-    Committed {
-        log_index: u64,
-    },
-}
-
-impl fmt::Display for MqResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ok => write!(f, "Ok"),
-            Self::Error(e) => write!(f, "Error({})", e),
-            Self::EntityCreated { id } => write!(f, "EntityCreated({})", id),
-            Self::Messages { messages } => write!(f, "Messages(count={})", messages.len()),
-            Self::Published { base_offset, count } => {
-                write!(f, "Published(base={base_offset}, count={count})")
-            }
-            Self::Stats(_) => write!(f, "Stats"),
-            Self::GroupJoined {
-                generation,
-                member_id,
-                is_leader,
-                phase_complete,
-                ..
-            } => {
-                write!(
-                    f,
-                    "GroupJoined(gen={generation}, member={member_id}, leader={is_leader}, complete={phase_complete})"
-                )
-            }
-            Self::GroupSynced { phase_complete, .. } => {
-                write!(f, "GroupSynced(complete={phase_complete})")
-            }
-            Self::BatchResponse(resps) => write!(f, "BatchResponse(count={})", resps.len()),
-            Self::DeadLettered {
-                dead_letter_ids,
-                dlq_topic_id,
-            } => {
-                write!(
-                    f,
-                    "DeadLettered(count={}, dlq_topic={})",
-                    dead_letter_ids.len(),
-                    dlq_topic_id
-                )
-            }
-            Self::RetainedMessages { messages } => {
-                write!(f, "RetainedMessages(count={})", messages.len())
-            }
-            Self::WillPending {
-                session_id,
-                delay_ms,
-            } => write!(f, "WillPending(session={session_id}, delay={delay_ms}ms)"),
-            Self::SessionRestored { session_id, .. } => {
-                write!(f, "SessionRestored(session={session_id})")
-            }
-            Self::SessionNotFound => write!(f, "SessionNotFound"),
-            Self::MultiMessages { groups } => {
-                let total: usize = groups.iter().map(|(_, msgs)| msgs.len()).sum();
-                write!(f, "MultiMessages(groups={}, msgs={})", groups.len(), total)
-            }
-            Self::TopicAliases { aliases } => {
-                write!(f, "TopicAliases(count={})", aliases.len())
-            }
-            Self::WillsFired { count } => write!(f, "WillsFired(count={count})"),
-            Self::Committed { log_index } => write!(f, "Committed(log_index={log_index})"),
-        }
-    }
 }
 
 // =============================================================================
@@ -1141,6 +1001,10 @@ pub struct MqSnapshotData {
     /// Address of the leader's segment sync server (e.g. "host:port").
     #[serde(default)]
     pub sync_addr: Option<String>,
+    /// Per-client highest applied request_seq — for idempotent apply after reconnect.
+    /// Key: client_id, Value: last applied request_seq.
+    #[serde(default)]
+    pub client_sessions: HashMap<u32, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,43 +1033,6 @@ mod tests {
     // =========================================================================
     // Display impls
     // =========================================================================
-
-    #[test]
-    fn test_mq_response_display() {
-        assert_eq!(format!("{}", MqResponse::Ok), "Ok");
-        assert_eq!(
-            format!("{}", MqResponse::Error(MqError::Custom("fail".to_string()))),
-            "Error(fail)"
-        );
-        assert_eq!(
-            format!("{}", MqResponse::EntityCreated { id: 42 }),
-            "EntityCreated(42)"
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                MqResponse::Messages {
-                    messages: smallvec::smallvec![DeliveredMessage {
-                        message_id: 1,
-                        attempt: 1,
-                        original_timestamp: 0,
-                        group_id: 0,
-                    }]
-                }
-            ),
-            "Messages(count=1)"
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                MqResponse::Published {
-                    base_offset: 1,
-                    count: 3,
-                }
-            ),
-            "Published(base=1, count=3)"
-        );
-    }
 
     // =========================================================================
     // Serde roundtrips

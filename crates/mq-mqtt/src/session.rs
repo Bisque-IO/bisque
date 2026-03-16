@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bisque_mq::MqCommandBuffer;
+use bisque_mq::MqCommand;
 use bisque_mq::flat::{self, FlatMessageBuilder};
 use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
@@ -443,10 +443,11 @@ pub struct MqttSession {
     remaining_quota: u64,
 
     // -- Command output buffer --
-    /// Shared output buffer for MqCommands. Methods write commands directly
-    /// here via `MqCommandBuffer::write_*`. Callers drain commands after
-    /// each method call — zero per-command heap allocation.
-    pub cmd_buf: MqCommandBuffer,
+    /// Commands produced by session handler methods. Callers drain after each
+    /// method call and submit to the write batcher.
+    pub cmd_buf: SmallVec<[MqCommand; 8]>,
+    /// Scratch buffer for building MqCommands.
+    scratch: BytesMut,
 
     // -- MQTT packet output buffer --
     /// Reusable output buffer for MQTT response packets. Session methods
@@ -561,7 +562,8 @@ impl MqttSession {
             rate_window_count: 0,
             rate_window_start_ms: 0,
             remaining_quota: 0,
-            cmd_buf: MqCommandBuffer::new(256),
+            cmd_buf: SmallVec::new(),
+            scratch: BytesMut::new(),
             out_buf: BytesMut::with_capacity(128),
         }
     }
@@ -804,7 +806,7 @@ impl MqttSession {
 
     /// Handle an incoming CONNECT packet.
     ///
-    /// Commands written to `cmd_buf`. Returns the CONNACK response packet.
+    /// Commands pushed to `cmd_buf`. Returns the CONNACK response packet.
     pub fn handle_connect(&mut self, connect: &Connect) {
         self.cmd_buf.clear();
         self.out_buf.clear();
@@ -977,12 +979,14 @@ impl MqttSession {
         let consumer_name = format!("mqtt/{}", self.client_id);
 
         // Register this session with bisque-mq (unified consumer+producer).
-        self.cmd_buf.write_create_session(
+        MqCommand::write_create_session(
+            &mut self.scratch,
             self.session_id,
             &consumer_name,
             (self.keep_alive as u64) * 1000,
             (self.session_expiry_interval as u64) * 1000,
         );
+        self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
 
         // If clean session, clear any old subscription state.
         if self.clean_session {
@@ -1082,7 +1086,7 @@ impl MqttSession {
 
     /// Handle an incoming AUTH packet during an enhanced authentication flow.
     ///
-    /// Commands written to `cmd_buf`. Response packets encoded to `out_buf`.
+    /// Commands pushed to `cmd_buf`. Response packets encoded to `out_buf`.
     pub fn handle_auth(&mut self, auth: &Auth) {
         self.cmd_buf.clear();
         self.out_buf.clear();
@@ -1176,12 +1180,14 @@ impl MqttSession {
 
                 // Registration commands written to cmd_buf (same as handle_connect completion).
                 let consumer_name = format!("mqtt/{}", self.client_id);
-                self.cmd_buf.write_create_session(
+                MqCommand::write_create_session(
+                    &mut self.scratch,
                     self.session_id,
                     &consumer_name,
                     (self.keep_alive as u64) * 1000,
                     (self.session_expiry_interval as u64) * 1000,
                 );
+                self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
 
                 debug!(
                     client_id = %self.client_id,
@@ -1766,7 +1772,8 @@ impl MqttSession {
                 if let (Some(queue_id), Some(message_id)) =
                     (inflight.mq_queue_id, inflight.mq_message_id)
                 {
-                    self.cmd_buf.write_group_ack(queue_id, &[message_id], None);
+                    MqCommand::write_group_ack(&mut self.scratch, queue_id, &[message_id], None);
+                    self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
                 }
             }
         } else {
@@ -1879,8 +1886,13 @@ impl MqttSession {
                 } => {
                     // QoS 2 delivery complete. ACK in bisque-mq.
                     debug!(packet_id, "QoS 2 outbound delivery complete");
-                    self.cmd_buf
-                        .write_group_ack(mq_queue_id, &[mq_message_id], None);
+                    MqCommand::write_group_ack(
+                        &mut self.scratch,
+                        mq_queue_id,
+                        &[mq_message_id],
+                        None,
+                    );
+                    self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
                 }
                 QoS2OutboundState::PublishSent { .. } => {
                     warn!(
@@ -2059,7 +2071,7 @@ impl MqttSession {
     /// Handle an UNSUBSCRIBE packet.
     ///
     /// Returns MqCommands to tear down bindings and an UNSUBACK response.
-    /// Commands written to `cmd_buf`. Returns UNSUBACK response.
+    /// Commands pushed to `cmd_buf`. Returns UNSUBACK response.
     pub fn handle_unsubscribe(&mut self, packet_id: u16, filters: &[String]) {
         self.cmd_buf.clear();
         self.out_buf.clear();
@@ -2069,12 +2081,14 @@ impl MqttSession {
             if let Some(mapping) = self.subscriptions.remove(filter) {
                 // Delete the exchange binding.
                 if let Some(binding_id) = mapping.binding_id {
-                    self.cmd_buf.write_delete_binding(binding_id);
+                    MqCommand::write_delete_binding(&mut self.scratch, binding_id);
+                    self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
                 }
                 // Delete subscription queue if clean session and not shared.
                 if self.clean_session && mapping.shared_group.is_none() {
                     if let Some(queue_id) = mapping.queue_id {
-                        self.cmd_buf.write_delete_consumer_group(queue_id);
+                        MqCommand::write_delete_consumer_group(&mut self.scratch, queue_id);
+                        self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
                     }
                 }
                 // Remove from queue_to_sub_id reverse index.
@@ -2112,11 +2126,12 @@ impl MqttSession {
     // PINGREQ handling
     // =========================================================================
 
-    /// Handle a PINGREQ packet. Command written to `cmd_buf`, PingResp to `out_buf`.
+    /// Handle a PINGREQ packet. Command pushed to `cmd_buf`, PingResp to `out_buf`.
     pub fn handle_pingreq(&mut self) {
         self.cmd_buf.clear();
         self.out_buf.clear();
-        self.cmd_buf.write_heartbeat_session(self.session_id);
+        MqCommand::write_heartbeat_session(&mut self.scratch, self.session_id);
+        self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
         encode_ping_resp(&mut self.out_buf);
     }
 
@@ -2255,18 +2270,20 @@ impl MqttSession {
 
         self.connected = false;
 
-        self.cmd_buf
-            .write_disconnect_session(self.session_id, publish_will);
+        MqCommand::write_disconnect_session(&mut self.scratch, self.session_id, publish_will);
+        self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
 
         // If clean session, remove all subscription bindings and queues.
         if self.clean_session {
             for mapping in self.subscriptions.values() {
                 if let Some(binding_id) = mapping.binding_id {
-                    self.cmd_buf.write_delete_binding(binding_id);
+                    MqCommand::write_delete_binding(&mut self.scratch, binding_id);
+                    self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
                 }
                 if mapping.shared_group.is_none() {
                     if let Some(queue_id) = mapping.queue_id {
-                        self.cmd_buf.write_delete_consumer_group(queue_id);
+                        MqCommand::write_delete_consumer_group(&mut self.scratch, queue_id);
+                        self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
                     }
                 }
             }
@@ -2329,7 +2346,8 @@ impl MqttSession {
         self.connected = false;
 
         // Disconnect session. For unclean disconnect, publish will message.
-        self.cmd_buf.write_disconnect_session(self.session_id, true);
+        MqCommand::write_disconnect_session(&mut self.scratch, self.session_id, true);
+        self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
 
         // Collect all outbound NACK message IDs, grouped by queue_id.
         // Uses SmallVec to avoid HashMap allocation for the common case.
@@ -2367,7 +2385,8 @@ impl MqttSession {
                 }
                 let mids: SmallVec<[u64; 8]> =
                     nack_pairs[start..i].iter().map(|(_, mid)| *mid).collect();
-                self.cmd_buf.write_group_nack(cur_qid, &mids);
+                MqCommand::write_group_nack(&mut self.scratch, cur_qid, &mids);
+                self.cmd_buf.push(MqCommand::split_from(&mut self.scratch));
             }
         }
 
@@ -2775,7 +2794,7 @@ mod tests {
 
         assert_eq!(session.cmd_buf.len(), 1);
         assert_eq!(
-            session.cmd_buf.to_command(0).tag(),
+            session.cmd_buf[0].clone().tag(),
             MqCommand::TAG_CREATE_SESSION
         );
 
@@ -3098,7 +3117,7 @@ mod tests {
 
         session.handle_pingreq();
         assert_eq!(
-            session.cmd_buf.to_command(0).tag(),
+            session.cmd_buf[0].clone().tag(),
             MqCommand::TAG_HEARTBEAT_SESSION
         );
         assert!(!session.out_buf.is_empty());
@@ -3126,7 +3145,7 @@ mod tests {
         assert!(will_plan.is_none());
         assert!(session.cmd_buf.len() >= 1);
         assert_eq!(
-            session.cmd_buf.to_command(0).tag(),
+            session.cmd_buf[0].clone().tag(),
             MqCommand::TAG_DISCONNECT_SESSION
         );
         assert_eq!(session.subscription_count(), 0);
@@ -3178,7 +3197,7 @@ mod tests {
         // Should have DisconnectSession.
         assert!(session.cmd_buf.len() >= 1);
         assert_eq!(
-            session.cmd_buf.to_command(0).tag(),
+            session.cmd_buf[0].clone().tag(),
             MqCommand::TAG_DISCONNECT_SESSION
         );
     }
@@ -3273,10 +3292,7 @@ mod tests {
 
         // Should ACK in bisque-mq.
         assert!(!session.cmd_buf.is_empty(), "should return ACK command");
-        assert_eq!(
-            session.cmd_buf.to_command(0).tag(),
-            MqCommand::TAG_GROUP_ACK
-        );
+        assert_eq!(session.cmd_buf[0].clone().tag(), MqCommand::TAG_GROUP_ACK);
         assert!(session.qos2_outbound.is_empty());
     }
 
@@ -3296,10 +3312,7 @@ mod tests {
         // PUBACK from client should ACK in bisque-mq.
         session.handle_puback(1);
         assert!(!session.cmd_buf.is_empty(), "should return ACK command");
-        assert_eq!(
-            session.cmd_buf.to_command(0).tag(),
-            MqCommand::TAG_GROUP_ACK
-        );
+        assert_eq!(session.cmd_buf[0].clone().tag(), MqCommand::TAG_GROUP_ACK);
     }
 
     // ---- Entity cache tests ----
@@ -3449,7 +3462,7 @@ mod tests {
         session.handle_pingreq();
         assert_eq!(session.cmd_buf.len(), 1);
         assert_eq!(
-            session.cmd_buf.to_command(0).tag(),
+            session.cmd_buf[0].clone().tag(),
             MqCommand::TAG_HEARTBEAT_SESSION
         );
         assert!(!session.out_buf.is_empty());
@@ -4636,7 +4649,7 @@ mod tests {
         assert!(will_plan.is_none());
         // With clean_session=false, no delete_binding or delete_queue commands.
         let has_delete = (0..session.cmd_buf.len()).any(|i| {
-            let cmd = session.cmd_buf.to_command(i);
+            let cmd = session.cmd_buf[i].clone();
             cmd.tag() == bisque_mq::types::MqCommand::TAG_DELETE_BINDING
                 || cmd.tag() == bisque_mq::types::MqCommand::TAG_DELETE_CONSUMER_GROUP
         });
@@ -4785,7 +4798,7 @@ mod tests {
         // Should have disconnect_consumer, disconnect_producer, and NACK commands.
         let nack_count = (0..session.cmd_buf.len())
             .filter(|&i| {
-                session.cmd_buf.to_command(i).tag() == bisque_mq::types::MqCommand::TAG_GROUP_NACK
+                session.cmd_buf[i].clone().tag() == bisque_mq::types::MqCommand::TAG_GROUP_NACK
             })
             .count();
         assert!(nack_count >= 1, "should have at least one NACK command");
@@ -4939,7 +4952,7 @@ mod tests {
         // Should have disconnect_session command.
         assert!(session.cmd_buf.len() >= 1);
         assert_eq!(
-            session.cmd_buf.to_command(0).tag(),
+            session.cmd_buf[0].clone().tag(),
             MqCommand::TAG_DISCONNECT_SESSION
         );
         assert!(!session.connected);

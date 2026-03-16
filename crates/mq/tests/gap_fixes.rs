@@ -7,8 +7,9 @@
 //!   Gap 6: Shared subscription is_shared in SubDeliveryInfo (adapter-level)
 //!   Gap 7: Server redirection (adapter-level)
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
+use bisque_mq::async_apply::ResponseEntry;
 use bisque_mq::config::MqConfig;
 use bisque_mq::engine::MqEngine;
 use bisque_mq::types::*;
@@ -21,37 +22,42 @@ fn make_engine() -> MqEngine {
     MqEngine::new(MqConfig::new("/tmp/mq-gap-fixes-test"))
 }
 
-fn create_exchange(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) -> u64 {
-    match engine.apply_command(
-        &MqCommand::create_exchange(name, ExchangeType::Topic),
-        log_index,
-        time,
-        None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+fn create_exchange(engine: &MqEngine, name: &str, log_index: u64, time: u64) -> u64 {
+    let mut buf = BytesMut::new();
+    MqCommand::write_create_exchange(&mut buf, name, ExchangeType::Topic);
+    let cmd = MqCommand::split_from(&mut buf);
+    engine.apply_command(&cmd, &mut buf, log_index, time, None);
+    let resp = ResponseEntry::split_from(&mut buf);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    resp.entity_id()
 }
 
-fn create_queue(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) -> u64 {
-    match engine.apply_command(
-        &MqCommand::create_queue(
-            name,
-            AckVariantConfig::default(),
-            RetentionPolicy::default(),
-            None,
-            false,
-            None,
-            false,
-            None,
-        ),
-        log_index,
-        time,
+fn create_queue(engine: &MqEngine, name: &str, log_index: u64, time: u64) -> u64 {
+    let mut buf = BytesMut::new();
+    MqCommand::write_create_queue(
+        &mut buf,
+        name,
+        AckVariantConfig::default(),
+        RetentionPolicy::default(),
         None,
-    ) {
-        MqResponse::EntityCreated { id } => id,
-        other => panic!("expected EntityCreated, got {:?}", other),
-    }
+        false,
+        None,
+        false,
+        None,
+    );
+    let cmd = MqCommand::split_from(&mut buf);
+    engine.apply_command(&cmd, &mut buf, log_index, time, None);
+    let resp = ResponseEntry::split_from(&mut buf);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_ENTITY_CREATED,
+        "expected EntityCreated"
+    );
+    resp.entity_id()
 }
 
 // =============================================================================
@@ -60,7 +66,17 @@ fn create_queue(engine: &mut MqEngine, name: &str, log_index: u64, time: u64) ->
 
 #[test]
 fn test_binding_subscription_id_codec() {
-    let cmd = MqCommand::create_binding_with_opts(10, 20, Some("sensors/#"), false, None, Some(42));
+    let mut buf = BytesMut::new();
+    MqCommand::write_create_binding_with_opts(
+        &mut buf,
+        10,
+        20,
+        Some("sensors/#"),
+        false,
+        None,
+        Some(42),
+    );
+    let cmd = MqCommand::split_from(&mut buf);
     let view = cmd.as_create_binding();
     assert_eq!(view.exchange_id(), 10);
     assert_eq!(view.topic_id(), 20);
@@ -72,8 +88,17 @@ fn test_binding_subscription_id_codec() {
 
 #[test]
 fn test_binding_subscription_id_none_codec() {
-    let cmd =
-        MqCommand::create_binding_with_opts(10, 20, Some("topic/+"), true, Some("group1"), None);
+    let mut buf = BytesMut::new();
+    MqCommand::write_create_binding_with_opts(
+        &mut buf,
+        10,
+        20,
+        Some("topic/+"),
+        true,
+        Some("group1"),
+        None,
+    );
+    let cmd = MqCommand::split_from(&mut buf);
     let view = cmd.as_create_binding();
     assert!(view.no_local());
     assert_eq!(view.shared_group(), Some("group1".to_string()));
@@ -86,30 +111,32 @@ fn test_binding_subscription_id_stored_in_engine() {
     let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
     let queue_id = create_queue(&mut engine, "sub-q", 2, 1001);
 
-    let resp = engine.apply_command(
-        &MqCommand::create_binding_with_opts(
-            exchange_id,
-            queue_id,
-            Some("test/#"),
-            false,
-            None,
-            Some(99),
-        ),
-        3,
-        1002,
+    let mut buf = BytesMut::new();
+    MqCommand::write_create_binding_with_opts(
+        &mut buf,
+        exchange_id,
+        queue_id,
+        Some("test/#"),
+        false,
         None,
+        Some(99),
     );
+    let cmd = MqCommand::split_from(&mut buf);
+    engine.apply_command(&cmd, &mut buf, 3, 1002, None);
+    let resp = ResponseEntry::split_from(&mut buf);
     assert!(
-        matches!(resp, MqResponse::EntityCreated { .. }),
-        "binding with subscription_id should succeed: {:?}",
-        resp
+        resp.tag() == ResponseEntry::TAG_ENTITY_CREATED,
+        "binding with subscription_id should succeed: tag={:?}",
+        resp.tag()
     );
 }
 
 #[test]
 fn test_binding_backward_compat_subscription_id_none() {
     // Basic create_binding should decode subscription_id as None
-    let cmd = MqCommand::create_binding(10, 20, Some("topic/#"));
+    let mut buf = BytesMut::new();
+    MqCommand::write_create_binding(&mut buf, 10, 20, Some("topic/#"));
+    let cmd = MqCommand::split_from(&mut buf);
     let view = cmd.as_create_binding();
     assert_eq!(view.subscription_id(), None);
 }
@@ -123,35 +150,34 @@ fn test_persist_session_with_flow_control() {
     let mut engine = make_engine();
     let sub_data = Bytes::from_static(b"sub-data");
 
-    let resp = engine.apply_command(
-        &MqCommand::persist_session(100, "client-fc", 3600, &sub_data, 5, 3, 1000),
-        1,
-        1000,
-        None,
-    );
-    assert!(matches!(resp, MqResponse::Ok));
+    let mut buf = BytesMut::new();
+    MqCommand::write_persist_session(&mut buf, 100, "client-fc", 3600, &sub_data, 5, 3, 1000);
+    let cmd = MqCommand::split_from(&mut buf);
+    engine.apply_command(&cmd, &mut buf, 1, 1000, None);
+    let resp = ResponseEntry::split_from(&mut buf);
+    assert_eq!(resp.tag(), ResponseEntry::TAG_OK);
 
     // Restore and verify counters
-    let resp = engine.apply_command(&MqCommand::restore_session("client-fc"), 2, 1001, None);
-    match resp {
-        MqResponse::SessionRestored {
-            session_id,
-            subscription_data,
-            session_expiry_ms,
-            ..
-        } => {
-            assert_eq!(session_id, 100);
-            let _ = session_expiry_ms;
-            // subscription_data restoration is not yet implemented (TODO in engine)
-            let _ = subscription_data;
-        }
-        other => panic!("expected SessionRestored, got {:?}", other),
+    MqCommand::write_restore_session(&mut buf, "client-fc");
+    let cmd = MqCommand::split_from(&mut buf);
+    engine.apply_command(&cmd, &mut buf, 2, 1001, None);
+    let resp = ResponseEntry::split_from(&mut buf);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored"
+    );
+    {
+        let session_id = resp.session_restored_id();
+        assert_eq!(session_id, 100);
     }
 }
 
 #[test]
 fn test_persist_session_flow_control_codec_roundtrip() {
-    let cmd = MqCommand::persist_session(
+    let mut buf = BytesMut::new();
+    MqCommand::write_persist_session(
+        &mut buf,
         42,
         "test-client",
         7200,
@@ -160,6 +186,7 @@ fn test_persist_session_flow_control_codec_roundtrip() {
         5,
         9999,
     );
+    let cmd = MqCommand::split_from(&mut buf);
     let view = cmd.as_persist_session();
     assert_eq!(view.consumer_id(), 42);
     assert_eq!(view.client_id(), "test-client");
@@ -172,8 +199,18 @@ fn test_persist_session_flow_control_codec_roundtrip() {
 #[test]
 fn test_persist_session_backward_compat_zeros() {
     // Old-style persist (with 0s) should work fine
-    let cmd =
-        MqCommand::persist_session(100, "old-client", 3600, &Bytes::from_static(b"x"), 0, 0, 0);
+    let mut buf = BytesMut::new();
+    MqCommand::write_persist_session(
+        &mut buf,
+        100,
+        "old-client",
+        3600,
+        &Bytes::from_static(b"x"),
+        0,
+        0,
+        0,
+    );
+    let cmd = MqCommand::split_from(&mut buf);
     let view = cmd.as_persist_session();
     assert_eq!(view.inbound_qos_inflight(), 0);
     assert_eq!(view.outbound_qos1_count(), 0);
@@ -190,12 +227,11 @@ fn test_snapshot_with_sessions() {
     let sub_data = Bytes::from_static(b"sub");
 
     // Persist session with flow control
-    engine.apply_command(
-        &MqCommand::persist_session(100, "snap-client", 3600, &sub_data, 3, 2, 500),
-        3,
-        1002,
-        None,
-    );
+    let mut buf = BytesMut::new();
+    MqCommand::write_persist_session(&mut buf, 100, "snap-client", 3600, &sub_data, 3, 2, 500);
+    let cmd = MqCommand::split_from(&mut buf);
+    engine.apply_command(&cmd, &mut buf, 3, 1002, None);
+    buf.clear();
 
     let snapshot = engine.snapshot();
     assert!(!snapshot.sessions.is_empty());
@@ -205,6 +241,13 @@ fn test_snapshot_with_sessions() {
     engine2.restore(snapshot);
 
     // Session survived
-    let resp = engine2.apply_command(&MqCommand::restore_session("snap-client"), 5, 1004, None);
-    assert!(matches!(resp, MqResponse::SessionRestored { .. }));
+    MqCommand::write_restore_session(&mut buf, "snap-client");
+    let cmd = MqCommand::split_from(&mut buf);
+    engine2.apply_command(&cmd, &mut buf, 5, 1004, None);
+    let resp = ResponseEntry::split_from(&mut buf);
+    assert_eq!(
+        resp.tag(),
+        ResponseEntry::TAG_SESSION_RESTORED,
+        "expected SessionRestored"
+    );
 }

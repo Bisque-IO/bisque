@@ -22,9 +22,8 @@ pub mod write_batcher;
 
 pub use async_apply::{
     AsyncApplyManager, ClientRegistry, HighWaterMark, PendingRequest, PendingRequests,
-    ResponseCallback, ResponseEntry, SharedResponderTxs,
+    ResponseCallback, ResponseEntry,
 };
-pub use codec::MqCommandBuffer;
 pub use config::MqConfig;
 pub use cursor::{
     MqReader, MqSegmentCursor, MqSegmentScanner, SegmentRecord, read_command,
@@ -39,10 +38,11 @@ pub use manifest::MqManifestManager;
 pub use metadata::{MqMetadata, TopicMeta};
 pub use raft::MqRaftNode;
 pub use state_machine::MqStateMachine;
-pub use types::{MqCommand, MqResponse};
+pub use types::{MqApplyResponse, MqCommand};
 pub use write_batcher::{
-    LocalBatcher, MqBatcherError, MqWriteBatcher, MqWriteBatcherConfig, SubmitWriter,
+    LocalBatcher, LocalFrameBatch, LocalWriter, MqBatcherError, MqWriteBatcher,
+    MqWriteBatcherConfig,
 };
 
 /// Raft type configuration for bisque-mq.
-pub type MqTypeConfig = bisque_raft::BisqueRaftTypeConfig<MqCommand, MqResponse>;
+pub type MqTypeConfig = bisque_raft::BisqueRaftTypeConfig<MqCommand, MqApplyResponse>;

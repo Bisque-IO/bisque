@@ -1,12 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bisque_mq::types::{MqCommand, MqResponse, PartitionInfo};
+use bisque_mq::ResponseEntry;
+use bisque_mq::types::{MqCommand, PartitionInfo};
 use bisque_mq::write_batcher::MqWriteBatcher;
 use bisque_mq_protocol::tag::ServerTag;
 use bisque_mq_protocol::types::{ClientFrame, ServerFrame};
 use bisque_raft::SegmentPrefetcher;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -691,6 +692,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         sub_id: u32,
         message_ids: Vec<u64>,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let (group_id, entity_type, entity_id) = match self.get_sub_routing(sub_id) {
             Some(info) => info,
             None => return Ok(()),
@@ -703,7 +705,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
             ENTITY_TYPE_QUEUE => {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
                     let _ = batcher
-                        .submit(MqCommand::group_ack(group_id, &message_ids, None))
+                        .submit(MqCommand::group_ack(&mut buf, group_id, &message_ids, None))
                         .await;
                 }
             }
@@ -712,6 +714,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
                     for &msg_id in &message_ids {
                         let _ = batcher
                             .submit(MqCommand::group_ack_actor(
+                                &mut buf,
                                 group_id,
                                 &[], // TODO: track actor_id per in-flight message
                                 msg_id,
@@ -740,6 +743,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         sub_id: u32,
         message_ids: Vec<u64>,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let (group_id, entity_type, entity_id) = match self.get_sub_routing(sub_id) {
             Some(info) => info,
             None => return Ok(()),
@@ -752,7 +756,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
             ENTITY_TYPE_QUEUE => {
                 if let Some(batcher) = self.router.get_batcher(group_id) {
                     let _ = batcher
-                        .submit(MqCommand::group_nack(group_id, &message_ids))
+                        .submit(MqCommand::group_nack(&mut buf, group_id, &message_ids))
                         .await;
                 }
             }
@@ -761,6 +765,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
                     for &msg_id in &message_ids {
                         let _ = batcher
                             .submit(MqCommand::group_nack_actor(
+                                &mut buf,
                                 group_id,
                                 &[], // TODO: track actor_id per in-flight message
                                 msg_id,
@@ -785,6 +790,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         sub_id: u32,
         offset: u64,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let (group_id, entity_type, entity_id) = match self.get_sub_routing(sub_id) {
             Some(info) => info,
             None => return Ok(()),
@@ -798,7 +804,12 @@ impl<R: MqRouter> ConsumerHandler<R> {
 
         if let Some(batcher) = self.router.get_batcher(group_id) {
             let _ = batcher
-                .submit(MqCommand::commit_offset(entity_id, consumer_id, offset))
+                .submit(MqCommand::commit_offset(
+                    &mut buf,
+                    entity_id,
+                    consumer_id,
+                    offset,
+                ))
                 .await;
         }
 
@@ -815,6 +826,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         name: &[u8],
         auto_offset_reset: u8,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let batcher = match self.router.get_batcher(group_id) {
             Some(b) => b,
             None => {
@@ -826,24 +838,22 @@ impl<R: MqRouter> ConsumerHandler<R> {
         let name_str = std::str::from_utf8(name).unwrap_or("");
         let response = batcher
             .submit(MqCommand::create_consumer_group(
+                &mut buf,
                 name_str,
                 auto_offset_reset,
             ))
             .await?;
 
-        match response {
-            MqResponse::EntityCreated { id } => {
-                self.send_frame(ServerFrame::GroupCreated {
-                    consumer_group_id: id,
-                })
+        if response.tag() == ResponseEntry::TAG_ENTITY_CREATED {
+            self.send_frame(ServerFrame::GroupCreated {
+                consumer_group_id: response.entity_id(),
+            })
+            .await?;
+        } else if response.tag() == ResponseEntry::TAG_ERROR {
+            self.send_group_error(2, &format!("error kind {}", response.error_kind()))
                 .await?;
-            }
-            MqResponse::Error(e) => {
-                self.send_group_error(2, &e.to_string()).await?;
-            }
-            _ => {
-                self.send_group_error(3, "unexpected response").await?;
-            }
+        } else {
+            self.send_group_error(3, "unexpected response").await?;
         }
         Ok(())
     }
@@ -853,6 +863,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         group_id: u64,
         name_hash: u64,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let consumer_group_id = match self.router.resolve_consumer_group(group_id, name_hash) {
             Some(id) => id,
             None => {
@@ -868,19 +879,17 @@ impl<R: MqRouter> ConsumerHandler<R> {
         };
 
         let response = batcher
-            .submit(MqCommand::delete_consumer_group(consumer_group_id))
+            .submit(MqCommand::delete_consumer_group(
+                &mut buf,
+                consumer_group_id,
+            ))
             .await?;
 
-        match response {
-            MqResponse::Ok => {
-                self.send_frame(ServerFrame::GroupDeleted).await?;
-            }
-            MqResponse::Error(e) => {
-                self.send_group_error(2, &e.to_string()).await?;
-            }
-            _ => {
-                self.send_frame(ServerFrame::GroupDeleted).await?;
-            }
+        if response.tag() == ResponseEntry::TAG_ERROR {
+            self.send_group_error(2, &format!("error kind {}", response.error_kind()))
+                .await?;
+        } else {
+            self.send_frame(ServerFrame::GroupDeleted).await?;
         }
         Ok(())
     }
@@ -897,6 +906,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         protocol_type: &[u8],
         protocols: Vec<(Bytes, Bytes)>,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let consumer_group_id = match self.router.resolve_consumer_group(group_id, name_hash) {
             Some(id) => id,
             None => {
@@ -930,6 +940,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
 
         let response = batcher
             .submit(MqCommand::join_consumer_group(
+                &mut buf,
                 consumer_group_id,
                 member_id_str,
                 client_id_str,
@@ -940,82 +951,75 @@ impl<R: MqRouter> ConsumerHandler<R> {
             ))
             .await?;
 
-        match response {
-            MqResponse::GroupJoined {
-                generation,
-                leader,
-                member_id: assigned_member_id,
-                protocol_name,
-                is_leader,
-                members,
-                phase_complete,
-            } => {
-                // Track membership for cleanup on disconnect
-                self.track_group_membership(
-                    group_id,
-                    consumer_group_id,
-                    assigned_member_id.clone(),
-                    rebalance_timeout_ms,
-                );
+        if response.tag() == ResponseEntry::TAG_GROUP_JOINED {
+            let generation = response.group_joined_generation();
+            let is_leader = response.group_joined_is_leader();
+            let phase_complete = response.group_joined_phase_complete();
+            let (leader, assigned_member_id, protocol_name, members) =
+                response.group_joined_fields();
 
-                if phase_complete {
-                    send_group_joined_response(
-                        &self.frame_tx,
-                        generation,
-                        &leader,
+            // Track membership for cleanup on disconnect
+            self.track_group_membership(
+                group_id,
+                consumer_group_id,
+                assigned_member_id.clone(),
+                rebalance_timeout_ms,
+            );
+
+            if phase_complete {
+                send_group_joined_response(
+                    &self.frame_tx,
+                    generation,
+                    &leader,
+                    &assigned_member_id,
+                    &protocol_name,
+                    is_leader,
+                    &members,
+                )
+                .await?;
+            } else {
+                // Spawn background task to wait for phase completion,
+                // so the main loop stays responsive for heartbeats etc.
+                let router = self.router.clone();
+                let frame_tx = self.frame_tx.clone();
+                let timeout = Duration::from_millis(rebalance_timeout_ms as u64);
+                let task = tokio::spawn(async move {
+                    if let Some(notify) = phase_notify {
+                        let _ = tokio::time::timeout(timeout, notify.notified()).await;
+                    }
+
+                    // Read final state from metadata
+                    if let Some((g, ldr, mid, proto, is_ldr, mems)) = router.read_group_join_result(
+                        group_id,
+                        consumer_group_id,
                         &assigned_member_id,
-                        &protocol_name,
-                        is_leader,
-                        &members,
-                    )
-                    .await?;
-                } else {
-                    // Spawn background task to wait for phase completion,
-                    // so the main loop stays responsive for heartbeats etc.
-                    let router = self.router.clone();
-                    let frame_tx = self.frame_tx.clone();
-                    let timeout = Duration::from_millis(rebalance_timeout_ms as u64);
-                    let task = tokio::spawn(async move {
-                        if let Some(notify) = phase_notify {
-                            let _ = tokio::time::timeout(timeout, notify.notified()).await;
-                        }
-
-                        // Read final state from metadata
-                        if let Some((g, ldr, mid, proto, is_ldr, mems)) = router
-                            .read_group_join_result(
-                                group_id,
-                                consumer_group_id,
-                                &assigned_member_id,
-                            )
-                        {
-                            let _ = send_group_joined_response(
-                                &frame_tx, g, &ldr, &mid, &proto, is_ldr, &mems,
-                            )
-                            .await;
-                        } else {
-                            // Fallback: use initial response data
-                            let _ = send_group_joined_response(
-                                &frame_tx,
-                                generation,
-                                &leader,
-                                &assigned_member_id,
-                                &protocol_name,
-                                is_leader,
-                                &members,
-                            )
-                            .await;
-                        }
-                    });
-                    self.prune_background_tasks();
-                    self.background_tasks.push(task);
-                }
+                    ) {
+                        let _ = send_group_joined_response(
+                            &frame_tx, g, &ldr, &mid, &proto, is_ldr, &mems,
+                        )
+                        .await;
+                    } else {
+                        // Fallback: use initial response data
+                        let _ = send_group_joined_response(
+                            &frame_tx,
+                            generation,
+                            &leader,
+                            &assigned_member_id,
+                            &protocol_name,
+                            is_leader,
+                            &members,
+                        )
+                        .await;
+                    }
+                });
+                self.prune_background_tasks();
+                self.background_tasks.push(task);
             }
-            MqResponse::Error(e) => {
-                self.send_group_error(2, &e.to_string()).await?;
-            }
-            _ => {
-                self.send_group_error(3, "unexpected response").await?;
-            }
+        } else if response.tag() == ResponseEntry::TAG_ERROR {
+            self.send_group_error(2, &format!("error kind {}", response.error_kind()))
+                .await?;
+        } else {
+            self.send_group_error(3, "unexpected response").await?;
         }
         Ok(())
     }
@@ -1028,6 +1032,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         member_id: &[u8],
         assignments: Vec<(Bytes, Bytes)>,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let consumer_group_id = match self.router.resolve_consumer_group(group_id, name_hash) {
             Some(id) => id,
             None => {
@@ -1058,6 +1063,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
 
         let response = batcher
             .submit(MqCommand::sync_consumer_group(
+                &mut buf,
                 consumer_group_id,
                 generation,
                 &member_id_str,
@@ -1065,51 +1071,42 @@ impl<R: MqRouter> ConsumerHandler<R> {
             ))
             .await?;
 
-        match response {
-            MqResponse::GroupSynced {
-                assignment,
-                phase_complete,
-            } => {
-                if phase_complete {
-                    self.send_frame(ServerFrame::GroupSynced {
-                        assignment: Bytes::from(assignment),
-                    })
+        if response.tag() == ResponseEntry::TAG_GROUP_SYNCED {
+            let phase_complete = response.group_synced_phase_complete();
+            let assignment = Bytes::from(response.group_synced_assignment().to_vec());
+            if phase_complete {
+                self.send_frame(ServerFrame::GroupSynced { assignment })
                     .await?;
-                } else {
-                    // Use rebalance timeout from JoinGroup (stored per membership)
-                    let timeout = self.get_rebalance_timeout(group_id, consumer_group_id);
-                    // Spawn background task so main loop stays responsive
-                    let router = self.router.clone();
-                    let frame_tx = self.frame_tx.clone();
-                    let task = tokio::spawn(async move {
-                        if let Some(notify) = phase_notify {
-                            let _ = tokio::time::timeout(timeout, notify.notified()).await;
-                        }
+                return Ok(());
+            } else {
+                // Use rebalance timeout from JoinGroup (stored per membership)
+                let timeout = self.get_rebalance_timeout(group_id, consumer_group_id);
+                // Spawn background task so main loop stays responsive
+                let router = self.router.clone();
+                let frame_tx = self.frame_tx.clone();
+                let task = tokio::spawn(async move {
+                    if let Some(notify) = phase_notify {
+                        let _ = tokio::time::timeout(timeout, notify.notified()).await;
+                    }
 
-                        let final_assignment = router
-                            .read_group_member_assignment(
-                                group_id,
-                                consumer_group_id,
-                                &member_id_str,
-                            )
-                            .unwrap_or(assignment);
+                    let final_assignment = router
+                        .read_group_member_assignment(group_id, consumer_group_id, &member_id_str)
+                        .unwrap_or_else(|| assignment.to_vec());
 
-                        let _ = frame_tx
-                            .send(ServerFrame::GroupSynced {
-                                assignment: Bytes::from(final_assignment),
-                            })
-                            .await;
-                    });
-                    self.prune_background_tasks();
-                    self.background_tasks.push(task);
-                }
+                    let _ = frame_tx
+                        .send(ServerFrame::GroupSynced {
+                            assignment: Bytes::from(final_assignment),
+                        })
+                        .await;
+                });
+                self.prune_background_tasks();
+                self.background_tasks.push(task);
             }
-            MqResponse::Error(e) => {
-                self.send_group_error(2, &e.to_string()).await?;
-            }
-            _ => {
-                self.send_group_error(3, "unexpected response").await?;
-            }
+        } else if response.tag() == ResponseEntry::TAG_ERROR {
+            self.send_group_error(2, &format!("error kind {}", response.error_kind()))
+                .await?;
+        } else {
+            self.send_group_error(3, "unexpected response").await?;
         }
         Ok(())
     }
@@ -1120,6 +1117,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         name_hash: u64,
         member_id: &[u8],
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let consumer_group_id = match self.router.resolve_consumer_group(group_id, name_hash) {
             Some(id) => id,
             None => {
@@ -1137,23 +1135,18 @@ impl<R: MqRouter> ConsumerHandler<R> {
         let member_id_str = std::str::from_utf8(member_id).unwrap_or("");
         let response = batcher
             .submit(MqCommand::leave_consumer_group(
+                &mut buf,
                 consumer_group_id,
                 member_id_str,
             ))
             .await?;
 
-        match response {
-            MqResponse::Ok => {
-                self.remove_group_membership(group_id, consumer_group_id, member_id_str);
-                self.send_frame(ServerFrame::GroupLeft).await?;
-            }
-            MqResponse::Error(e) => {
-                self.send_group_error(2, &e.to_string()).await?;
-            }
-            _ => {
-                self.remove_group_membership(group_id, consumer_group_id, member_id_str);
-                self.send_frame(ServerFrame::GroupLeft).await?;
-            }
+        if response.tag() == ResponseEntry::TAG_ERROR {
+            self.send_group_error(2, &format!("error kind {}", response.error_kind()))
+                .await?;
+        } else {
+            self.remove_group_membership(group_id, consumer_group_id, member_id_str);
+            self.send_frame(ServerFrame::GroupLeft).await?;
         }
         Ok(())
     }
@@ -1165,6 +1158,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         member_id: &[u8],
         generation: i32,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let consumer_group_id = match self.router.resolve_consumer_group(group_id, name_hash) {
             Some(id) => id,
             None => {
@@ -1182,22 +1176,18 @@ impl<R: MqRouter> ConsumerHandler<R> {
         let member_id_str = std::str::from_utf8(member_id).unwrap_or("");
         let response = batcher
             .submit(MqCommand::heartbeat_consumer_group(
+                &mut buf,
                 consumer_group_id,
                 member_id_str,
                 generation,
             ))
             .await?;
 
-        match response {
-            MqResponse::Ok => {
-                self.send_frame(ServerFrame::GroupHeartbeatOk).await?;
-            }
-            MqResponse::Error(e) => {
-                self.send_group_error(2, &e.to_string()).await?;
-            }
-            _ => {
-                self.send_frame(ServerFrame::GroupHeartbeatOk).await?;
-            }
+        if response.tag() == ResponseEntry::TAG_ERROR {
+            self.send_group_error(2, &format!("error kind {}", response.error_kind()))
+                .await?;
+        } else {
+            self.send_frame(ServerFrame::GroupHeartbeatOk).await?;
         }
         Ok(())
     }
@@ -1209,6 +1199,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         generation: i32,
         offsets: Vec<(u64, u32, u64, Bytes)>,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let consumer_group_id = match self.router.resolve_consumer_group(group_id, name_hash) {
             Some(id) => id,
             None => {
@@ -1239,6 +1230,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
             };
             batcher
                 .submit(MqCommand::commit_group_offset(
+                    &mut buf,
                     consumer_group_id,
                     generation,
                     *topic_id,
@@ -1260,6 +1252,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
                         Some(metadata_str)
                     };
                     MqCommand::commit_group_offset(
+                        &mut buf,
                         consumer_group_id,
                         generation,
                         *topic_id,
@@ -1270,7 +1263,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
                     )
                 })
                 .collect();
-            batcher.submit(MqCommand::batch(&commands)).await
+            batcher.submit(MqCommand::batch(&mut buf, &commands)).await
         };
 
         match result {
@@ -1461,6 +1454,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         topic_name_hash: u64,
         messages: Vec<Bytes>,
     ) -> Result<(), ConsumerError> {
+        let mut buf = BytesMut::new();
         let topic_id =
             match self
                 .router
@@ -1479,7 +1473,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         };
 
         let _ = batcher
-            .submit(MqCommand::publish(topic_id, &messages))
+            .submit(MqCommand::publish(&mut buf, topic_id, &messages))
             .await;
 
         Ok(())
@@ -1564,32 +1558,41 @@ impl<R: MqRouter> ConsumerHandler<R> {
         consumer_id: u64,
         max_count: u32,
     ) -> Result<bool, ConsumerError> {
+        let mut buf = BytesMut::new();
         let batcher = match self.router.get_batcher(group_id) {
             Some(b) => b,
             None => return Ok(false),
         };
 
         let response = batcher
-            .submit(MqCommand::group_deliver(group_id, consumer_id, max_count))
+            .submit(MqCommand::group_deliver(
+                &mut buf,
+                group_id,
+                consumer_id,
+                max_count,
+            ))
             .await?;
 
-        match response {
-            MqResponse::Messages { messages } => {
-                let delivered = !messages.is_empty();
-                if delivered {
-                    self.send_message_batch(group_id, sub_id, &messages).await?;
-                }
-                Ok(delivered)
+        if response.tag() == ResponseEntry::TAG_MESSAGES {
+            let messages: Vec<bisque_mq::types::DeliveredMessage> = response.messages().collect();
+            let delivered = !messages.is_empty();
+            if delivered {
+                self.send_message_batch(group_id, sub_id, &messages).await?;
             }
-            MqResponse::Error(e) => {
-                debug!(queue_id, error = %e, "queue deliver error");
-                if let Some(session) = &mut self.session {
-                    session.remove_subscription(sub_id);
-                }
-                self.cancel_topic_watcher(sub_id);
-                Ok(false)
+            Ok(delivered)
+        } else if response.tag() == ResponseEntry::TAG_ERROR {
+            debug!(
+                queue_id,
+                error_kind = response.error_kind(),
+                "queue deliver error"
+            );
+            if let Some(session) = &mut self.session {
+                session.remove_subscription(sub_id);
             }
-            _ => Ok(false),
+            self.cancel_topic_watcher(sub_id);
+            Ok(false)
+        } else {
+            Ok(false)
         }
     }
 
@@ -1601,6 +1604,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         namespace_id: u64,
         consumer_id: u64,
     ) -> Result<bool, ConsumerError> {
+        let mut buf = BytesMut::new();
         let batcher = match self.router.get_batcher(group_id) {
             Some(b) => b,
             None => return Ok(false),
@@ -1608,13 +1612,15 @@ impl<R: MqRouter> ConsumerHandler<R> {
 
         let response = batcher
             .submit(MqCommand::group_deliver_actor(
+                &mut buf,
                 group_id,
                 consumer_id,
                 &[], // TODO: track assigned actors
             ))
             .await?;
 
-        if let MqResponse::Messages { messages } = response {
+        if response.tag() == ResponseEntry::TAG_MESSAGES {
+            let messages: Vec<bisque_mq::types::DeliveredMessage> = response.messages().collect();
             let delivered = !messages.is_empty();
             if delivered {
                 self.send_message_batch(group_id, sub_id, &messages).await?;
@@ -1700,6 +1706,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
     // -----------------------------------------------------------------------
 
     async fn cleanup(&mut self) {
+        let mut buf = BytesMut::new();
         // Abort all topic watcher tasks
         for (_, handle) in self.topic_watcher_handles.drain(..) {
             handle.abort();
@@ -1715,6 +1722,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
             if let Some(batcher) = self.router.get_batcher(membership.group_id) {
                 let _ = batcher
                     .submit(MqCommand::leave_consumer_group(
+                        &mut buf,
                         membership.consumer_group_id,
                         &membership.member_id,
                     ))
@@ -1732,7 +1740,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         for group_id in session.group_ids() {
             if let Some(batcher) = self.router.get_batcher(group_id) {
                 let _ = batcher
-                    .submit(MqCommand::disconnect_session(consumer_id, false))
+                    .submit(MqCommand::disconnect_session(&mut buf, consumer_id, false))
                     .await;
             }
         }
@@ -1990,7 +1998,7 @@ mod tests {
     struct BatcherRouter {
         batcher: Arc<MqWriteBatcher>,
         consumer_groups: HashMap<(u64, u64), u64>,
-        _engine: std::sync::Arc<parking_lot::Mutex<bisque_mq::engine::MqEngine>>,
+        _engine: std::sync::Arc<bisque_mq::engine::MqEngine>,
     }
 
     impl BatcherRouter {
@@ -1998,9 +2006,7 @@ mod tests {
             let config = bisque_mq::config::MqConfig::new(
                 std::env::temp_dir().join(format!("bisque-test-{}", std::process::id())),
             );
-            let engine = std::sync::Arc::new(parking_lot::Mutex::new(
-                bisque_mq::engine::MqEngine::new(config),
-            ));
+            let engine = std::sync::Arc::new(bisque_mq::engine::MqEngine::new(config));
             let batcher = Arc::new(MqWriteBatcher::new_test(engine.clone()));
             Self {
                 batcher,

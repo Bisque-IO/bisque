@@ -24,29 +24,36 @@
 //!
 //! ## Wire format
 //!
-//! **Command** (follower → leader): length-prefixed frames
-//! ```text
-//! [len:4 LE][client_id:u32 LE][command bytes...]
-//! ```
-//!
 //! **Handshake** (first frame, follower → leader):
 //! ```text
 //! [len=4][node_id:u32 LE]
 //! ```
 //!
-//! **Response** (leader → follower): tight-packed fixed-width records, no length prefix:
+//! **Batch frame** (follower → leader, wraps one drain event):
 //! ```text
-//! [client_id:u32 LE][log_index:u64 LE]  (12 bytes per record)
+//! [raft_group_id:4 LE][batch_payload_len:4 LE][sub-frames...]
+//! ```
+//! Each sub-frame:
+//! ```text
+//! [payload_len:4 LE][client_id:4 LE][request_seq:8 LE][cmd_bytes...]
+//! payload_len = 12 + cmd_bytes.len()
+//! ```
+//!
+//! **Response** (leader → follower): length-prefixed frames:
+//! ```text
+//! [len:4 LE][client_id:4 LE][request_seq:8 LE][log_index:8 LE][response_bytes]
+//! len = 20 + response_bytes.len()
 //! ```
 
 use std::io;
+use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use bytes::{BufMut, Bytes, BytesMut};
+use smallvec::SmallVec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -56,9 +63,7 @@ use tracing::{debug, info, warn};
 use openraft::Raft;
 
 use crate::MqTypeConfig;
-use crate::async_apply::{
-    ClientRegistry, ResponderBroadcast, ResponderTxVec, ResponseEntry, SharedResponderTxs,
-};
+use crate::async_apply::{ClientRegistry, ResponderBroadcast, ResponderUpdateMsg};
 use crate::types::MqCommand;
 
 // =============================================================================
@@ -77,221 +82,185 @@ type BoxedWriter = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 const FRAME_PREFIX_LEN: usize = 4;
 
 // ---------------------------------------------------------------------------
-// Outbound partition buffer — lock-free, partitioned write path
+// Channel-based outbound buffer — two-level drainer architecture
 // ---------------------------------------------------------------------------
 
-/// Capacity of each outbound segment. 1 MiB fits ~131K 8-byte frames.
-const OUTBOUND_SEG_CAPACITY: u32 = 1 << 20; // 1 MiB
+/// Drain-batch header size on the wire: [raft_group_id:4][batch_payload_len:4].
+const BATCH_HEADER_LEN: usize = 8;
 
-/// Bit 31 of `write_pos` is set by the drainer to seal the segment.
-const OUTBOUND_SEALED_BIT: u32 = 1 << 31;
-
-// Sub-frame format (no alignment padding, directly usable as TCP wire frames):
-//   [payload_len: 4 LE][client_id: 4 LE][cmd_bytes...]
-//   payload_len = 4 + cmd.len()
-//   total frame  = 8 + cmd.len() bytes
-
-/// One fixed-capacity buffer for a single outbound partition.
+/// A batch of outbound sub-frames for a single raft group, ready for TCP writing.
 ///
-/// # Concurrency
-/// - `write_pos` is claimed by producers via CAS; bit 31 is the seal flag.
-/// - `committed` is incremented by producers (Release) after each write.
-/// - Drainer spins (Acquire) until `committed == final_write_pos` before reading.
-struct OutboundSeg {
-    data: std::cell::UnsafeCell<BytesMut>,
-    write_pos: AtomicU32, // bit 31 = OUTBOUND_SEALED_BIT
-    committed: AtomicU32,
-    capacity: u32,
+/// Built by the per-group drainer task and consumed by the TCP connection drainer.
+/// Contains the batch header and a SmallVec of sub-frame `Bytes` for vectored I/O.
+struct OutboundBatch {
+    /// Wire header: `[raft_group_id:4 LE][payload_len:4 LE]`.
+    header: [u8; BATCH_HEADER_LEN],
+    /// Sub-frame `Bytes` — each is `[payload_len:4][client_id:4][request_seq:8][cmd...]`.
+    frames: SmallVec<[Bytes; 16]>,
 }
 
-// Safety: producers write to non-overlapping ranges claimed via CAS; the drainer
-// reads only after all producers have committed (spin-wait on `committed`).
-unsafe impl Send for OutboundSeg {}
-unsafe impl Sync for OutboundSeg {}
-
-impl OutboundSeg {
-    fn new(capacity: u32) -> Box<Self> {
-        Box::new(Self {
-            data: std::cell::UnsafeCell::new(BytesMut::with_capacity(capacity as usize)),
-            write_pos: AtomicU32::new(0),
-            committed: AtomicU32::new(0),
-            capacity,
-        })
-    }
-}
-
-/// Per-partition state: an atomically-swappable active segment.
-struct OutboundPartition {
-    active: AtomicPtr<OutboundSeg>,
-}
-
-unsafe impl Send for OutboundPartition {}
-unsafe impl Sync for OutboundPartition {}
-
-impl Drop for OutboundPartition {
-    fn drop(&mut self) {
-        let p = self.active.load(Ordering::Relaxed);
-        if !p.is_null() {
-            unsafe { drop(Box::from_raw(p)) };
-        }
-    }
-}
-
-/// Shared waker state for the drainer. Coalesces rapid writes into one wakeup.
-struct OutboundWaker {
-    pending: AtomicBool,
-    notify: tokio::sync::Notify,
-    shutdown: AtomicBool,
-}
-
-impl OutboundWaker {
-    #[inline]
-    fn wake(&self) {
-        if !self.pending.swap(true, Ordering::Release) {
-            self.notify.notify_waiters();
-        }
-    }
-}
-
-/// Shared outbound buffer — held by both the `ForwardClient`/`ForwardHandle` writers
-/// and the background connection task that drains it.
+/// Channel-based outbound buffer for sending sub-frames to a raft group.
 ///
-/// Writers call [`try_write`](OutboundBuf::try_write) or
-/// [`write`](OutboundBuf::write) to append sub-frames lock-free.
-/// The background loop calls [`drain_to_tcp`](OutboundBuf::drain_to_tcp)
-/// after [`wait_for_data`](OutboundBuf::wait_for_data) wakes it.
+/// Producers call [`try_write`](Self::try_write) or [`write`](Self::write) to
+/// encode and send sub-frames into the crossfire MPSC channel. A per-group
+/// drainer task collects frames into [`OutboundBatch`]es and feeds them to the
+/// TCP connection drainer for vectored I/O.
+#[derive(Clone)]
 pub struct OutboundBuf {
-    partitions: Vec<Arc<OutboundPartition>>,
-    waker: OutboundWaker,
-    mask: u32,
+    tx: crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>,
 }
 
 impl OutboundBuf {
-    fn new(num_partitions: usize) -> Self {
-        let n = num_partitions.next_power_of_two().max(1);
-        let partitions = (0..n)
-            .map(|_| {
-                Arc::new(OutboundPartition {
-                    active: AtomicPtr::new(Box::into_raw(OutboundSeg::new(OUTBOUND_SEG_CAPACITY))),
-                })
-            })
-            .collect();
-        Self {
-            partitions,
-            waker: OutboundWaker {
-                pending: AtomicBool::new(false),
-                notify: tokio::sync::Notify::new(),
-                shutdown: AtomicBool::new(false),
-            },
-            mask: (n - 1) as u32,
-        }
+    /// Encode a sub-frame: `[payload_len:4 LE][client_id:4 LE][request_seq:8 LE][cmd_bytes...]`.
+    #[inline]
+    fn encode_sub_frame(client_id: u32, request_seq: u64, cmd: &[u8]) -> Bytes {
+        let payload_len = (12 + cmd.len()) as u32;
+        let mut buf = BytesMut::with_capacity(16 + cmd.len());
+        buf.put_u32_le(payload_len);
+        buf.put_u32_le(client_id);
+        buf.put_u64_le(request_seq);
+        buf.put_slice(cmd);
+        buf.freeze()
     }
 
-    /// Try to write one sub-frame to the partition for `client_id`.
+    /// Try to send one sub-frame without blocking.
     ///
-    /// Returns `false` if the segment is sealed or full (backpressure).
-    /// The caller is responsible for retrying via [`write`](Self::write).
+    /// Returns `false` if the channel is full (backpressure).
     #[inline]
-    pub fn try_write(&self, client_id: u32, cmd: &[u8]) -> bool {
-        let entry_size = (8 + cmd.len()) as u32; // no alignment padding
-        let payload_len = (4 + cmd.len()) as u32;
-        let idx = (client_id & self.mask) as usize;
-        let partition = &self.partitions[idx];
-
-        loop {
-            let seg_ptr = partition.active.load(Ordering::Acquire);
-            let seg = unsafe { &*seg_ptr };
-
-            let pos = seg.write_pos.load(Ordering::Relaxed);
-            if pos & OUTBOUND_SEALED_BIT != 0 || pos + entry_size > seg.capacity {
-                return false;
-            }
-            if seg
-                .write_pos
-                .compare_exchange(pos, pos + entry_size, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-            {
-                continue; // lost slot race, retry
-            }
-
-            unsafe {
-                let dst = (*seg.data.get()).as_ptr().add(pos as usize) as *mut u8;
-                (dst as *mut u32).write_unaligned(payload_len.to_le());
-                (dst.add(4) as *mut u32).write_unaligned(client_id.to_le());
-                std::ptr::copy_nonoverlapping(cmd.as_ptr(), dst.add(8), cmd.len());
-            }
-
-            seg.committed.fetch_add(entry_size, Ordering::Release);
-            self.waker.wake();
-            return true;
-        }
+    pub fn try_write(&self, client_id: u32, request_seq: u64, cmd: &[u8]) -> bool {
+        let frame = Self::encode_sub_frame(client_id, request_seq, cmd);
+        self.tx.try_send(frame).is_ok()
     }
 
-    /// Async write — yields to runtime on backpressure until the frame is accepted.
+    /// Send one sub-frame, awaiting if the channel is full.
     #[inline]
-    pub async fn write(&self, client_id: u32, cmd: &[u8]) {
-        while !self.try_write(client_id, cmd) {
-            tokio::task::yield_now().await;
-        }
+    pub async fn write(&self, client_id: u32, request_seq: u64, cmd: &[u8]) {
+        let frame = Self::encode_sub_frame(client_id, request_seq, cmd);
+        let _ = self.tx.send(frame).await;
+    }
+}
+
+/// Write all data from an `IoSlice` array, handling partial writes.
+///
+/// Attempts a single `write_vectored` call first (writev syscall). If partial,
+/// falls back to `write_all` for each remaining slice.
+async fn write_all_vectored(writer: &mut BoxedWriter, slices: &[IoSlice<'_>]) -> io::Result<()> {
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    if total == 0 {
+        return Ok(());
     }
 
-    /// Wait for data to be available (HighWaterMark pattern).
-    async fn wait_for_data(&self) {
-        let notified = self.waker.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !self.waker.pending.swap(false, Ordering::AcqRel) {
-            notified.await;
-            self.waker.pending.store(false, Ordering::Relaxed);
-        }
+    let n = writer.write_vectored(slices).await?;
+    if n == total {
+        return Ok(());
+    }
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "write_vectored returned 0",
+        ));
     }
 
-    /// Seal all partitions, spin-wait for in-flight writes, then write drained
-    /// bytes to `writer`. Returns the number of bytes written (0 = nothing drained).
-    async fn drain_to_tcp(&self, writer: &mut BoxedWriter) -> io::Result<usize> {
-        let mut total = 0usize;
-        for partition in self.partitions.iter() {
-            let old_ptr = partition.active.load(Ordering::Acquire);
-            let old_seg = unsafe { &*old_ptr };
-
-            let sealed = old_seg
-                .write_pos
-                .fetch_or(OUTBOUND_SEALED_BIT, Ordering::AcqRel);
-            let final_pos = sealed & !OUTBOUND_SEALED_BIT;
-
-            if final_pos == 0 {
-                // Empty segment — unseal and reuse.
-                old_seg
-                    .write_pos
-                    .fetch_and(!OUTBOUND_SEALED_BIT, Ordering::Relaxed);
-                continue;
-            }
-
-            // Install a fresh segment so writers can proceed immediately.
-            let new_seg = Box::into_raw(OutboundSeg::new(OUTBOUND_SEG_CAPACITY));
-            partition.active.store(new_seg, Ordering::Release);
-
-            // Spin-wait for all in-flight producers to finish committing.
-            while old_seg.committed.load(Ordering::Acquire) < final_pos {
-                std::hint::spin_loop();
-            }
-
-            // Extract the committed bytes (zero-copy split).
-            let data = unsafe {
-                let bm = &mut *old_seg.data.get();
-                bm.set_len(final_pos as usize);
-                bm.split()
-            };
-            // Drop the old segment now that we own `data`.
-            unsafe { drop(Box::from_raw(old_ptr)) };
-
-            total += data.len();
-            writer.write_all(&data).await?;
+    // Partial write — fall back to write_all for remaining data.
+    let mut skip = n;
+    for slice in slices {
+        if skip >= slice.len() {
+            skip -= slice.len();
+            continue;
         }
-        if total > 0 {
-            writer.flush().await?;
+        writer.write_all(&slice[skip..]).await?;
+        skip = 0;
+    }
+    Ok(())
+}
+
+/// Per-raft-group drainer task (level 1).
+///
+/// Receives sub-frame `Bytes` from producers via the group channel, collects
+/// them into an [`OutboundBatch`] (SmallVec), and sends the batch to the TCP
+/// connection drainer channel.
+///
+/// Returns the group rx on exit for reuse across reconnections.
+async fn run_group_drainer(
+    rx: crossfire::AsyncRx<crossfire::mpsc::Array<Bytes>>,
+    raft_group_id: u32,
+    batch_tx: crossfire::MAsyncTx<crossfire::mpmc::Array<OutboundBatch>>,
+    stop: CancellationToken,
+) -> crossfire::AsyncRx<crossfire::mpsc::Array<Bytes>> {
+    loop {
+        let first = tokio::select! {
+            biased;
+            _ = stop.cancelled() => break,
+            result = rx.recv() => match result {
+                Ok(frame) => frame,
+                Err(_) => break,
+            },
+        };
+
+        // Yield so producers can accumulate more frames.
+        tokio::task::yield_now().await;
+
+        let mut frames = SmallVec::<[Bytes; 16]>::new();
+        frames.push(first);
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
         }
-        Ok(total)
+
+        let payload_len: usize = frames.iter().map(|f| f.len()).sum();
+        let mut header = [0u8; BATCH_HEADER_LEN];
+        header[..4].copy_from_slice(&raft_group_id.to_le_bytes());
+        header[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
+
+        if batch_tx
+            .send(OutboundBatch { header, frames })
+            .await
+            .is_err()
+        {
+            break; // TCP drainer gone
+        }
+    }
+    rx
+}
+
+/// TCP connection drainer task (level 2).
+///
+/// Receives [`OutboundBatch`]es from per-group drainer tasks via the MPMC
+/// channel, builds a flat `IoSlice` array across all batches, and writes them
+/// to TCP with vectored I/O. Multiple TCP drainer tasks can consume from the
+/// same MPMC channel for connection pooling.
+async fn run_tcp_drainer(
+    batch_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<OutboundBatch>>,
+    writer: &mut BoxedWriter,
+    stop: &CancellationToken,
+) -> io::Result<()> {
+    loop {
+        let first = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Ok(()),
+            result = batch_rx.recv() => match result {
+                Ok(batch) => batch,
+                Err(_) => return Ok(()),
+            },
+        };
+
+        // Drain all immediately available batches for one coalesced write.
+        let mut batches = SmallVec::<[OutboundBatch; 8]>::new();
+        batches.push(first);
+        while let Ok(batch) = batch_rx.try_recv() {
+            batches.push(batch);
+        }
+
+        // Build IoSlice array: [header][frame0][frame1]...[header][frame0]...
+        let mut io_slices = SmallVec::<[IoSlice<'_>; 64]>::new();
+        for batch in &batches {
+            io_slices.push(IoSlice::new(&batch.header));
+            for frame in &batch.frames {
+                io_slices.push(IoSlice::new(frame));
+            }
+        }
+
+        write_all_vectored(writer, &io_slices).await?;
+        writer.flush().await?;
     }
 }
 
@@ -379,9 +348,19 @@ pub struct ForwardConfig {
     /// channel (in `Bytes` chunks).  Higher values allow more in-flight chunks
     /// before backpressure kicks in.  Default: 256.
     pub responder_channel_capacity: usize,
-    /// Number of lock-free outbound partitions for the follower write buffer.
-    /// Must be a power of two; defaults to 4.
-    pub num_outbound_partitions: usize,
+    /// Capacity of the per-raft-group outbound crossfire MPSC channel (in
+    /// sub-frame `Bytes` items).  Higher values buffer more commands during
+    /// reconnections.  Default: 4096.
+    pub outbound_channel_capacity: usize,
+    /// Number of concurrent TCP connections to the leader for outbound
+    /// command batches.  All connections consume from a shared MPMC batch
+    /// queue, providing connection-level parallelism.  Default: 1.
+    pub num_outbound_connections: usize,
+    /// Time-to-live for each outbound TCP connection.  When a connection's
+    /// TTL expires it spawns a replacement before closing, ensuring seamless
+    /// rotation via the shared MPMC batch queue.  `None` disables TTL
+    /// rotation.  Default: `None`.
+    pub connection_ttl: Option<Duration>,
     /// Inbound command buffer capacity (leader side). Default: 4096.
     pub inbound_buffer_capacity: usize,
     /// TCP connect timeout. Default: 10s.
@@ -407,7 +386,9 @@ impl Default for ForwardConfig {
     fn default() -> Self {
         Self {
             responder_channel_capacity: 256,
-            num_outbound_partitions: 4,
+            outbound_channel_capacity: 4096,
+            num_outbound_connections: 1,
+            connection_ttl: None,
             inbound_buffer_capacity: 4096,
             connect_timeout: Duration::from_secs(10),
             reconnect_base: Duration::from_millis(100),
@@ -505,12 +486,10 @@ async fn run_follower_responder(
                     Err(_) => return,
                 };
                 slabs.push(slab);
-                // Drain all immediately available chunks for one vectored write.
+                // Drain all immediately available chunks for one coalesced write.
                 while let Ok(more) = rx.try_recv() {
                     slabs.push(more);
                 }
-                // Write each slab sequentially (tokio doesn't expose true scatter I/O
-                // via AsyncWriteExt, so we loop write_all which is equivalent for TCP).
                 for slab in &slabs {
                     if let Err(e) = writer.write_all(slab).await {
                         debug!(error = %e, "follower responder write failed");
@@ -532,47 +511,36 @@ async fn run_follower_responder(
 // =============================================================================
 
 fn responder_txs_insert(
-    txs: &ArcSwap<ResponderTxVec>,
+    update_tx: &tokio::sync::mpsc::UnboundedSender<ResponderUpdateMsg>,
     broadcast: &ResponderBroadcast,
     node_id: u32,
     tx: crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>,
 ) {
     broadcast.insert(node_id, tx.clone());
-    txs.rcu(|old| {
-        let mut new_arr: Box<[_; 64]> = Box::new(std::array::from_fn(|i| old[i].clone()));
-        new_arr[node_id as usize] = Some(tx.clone());
-        new_arr
-    });
-}
-
-fn responder_txs_remove(
-    txs: &ArcSwap<ResponderTxVec>,
-    broadcast: &ResponderBroadcast,
-    node_id: u32,
-) {
-    broadcast.remove(node_id);
-    txs.rcu(|old| {
-        let mut new_arr: Box<[_; 64]> = Box::new(std::array::from_fn(|i| old[i].clone()));
-        new_arr[node_id as usize] = None;
-        new_arr
-    });
+    let _ = update_tx.send((node_id, Some(tx)));
 }
 
 // =============================================================================
 // ForwardedBatch
 // =============================================================================
 
-/// A batch of commands forwarded from a single follower TCP read.
+/// A batch of commands forwarded from a single follower TCP batch frame.
 ///
-/// Holds one reference-counted `Bytes` buffer for the entire read. Individual
-/// commands are parsed on-the-fly from the wire format via [`iter()`](Self::iter),
-/// yielding `(client_id, &[u8])` pairs with zero per-command allocation.
+/// Holds one reference-counted `Bytes` buffer containing sub-frames parsed
+/// from the wire format. Individual commands are parsed on-the-fly via
+/// [`iter()`](Self::iter), yielding `(client_id, request_seq, cmd_bytes)`
+/// triples with zero per-command allocation.
+///
+/// Sub-frame wire format: `[payload_len:4][client_id:4][request_seq:8][cmd_bytes...]`
+/// where `payload_len = 12 + cmd_bytes.len()`.
 pub struct ForwardedBatch {
     /// The originating node ID.
     pub node_id: u32,
-    /// Raw wire data: `[len:4][client_id:4][cmd]...` concatenated frames.
+    /// The raft group this batch belongs to.
+    pub raft_group_id: u32,
+    /// Raw sub-frame bytes (without the 8-byte batch header).
     buf: Bytes,
-    /// Number of complete frames in this batch.
+    /// Number of complete sub-frames in this batch.
     count: u32,
 }
 
@@ -602,33 +570,35 @@ impl ForwardedBatch {
 }
 
 /// Iterator over commands in a [`ForwardedBatch`].
+///
+/// Yields `(client_id, request_seq, cmd_bytes)` triples parsed from
+/// sub-frames: `[payload_len:4][client_id:4][request_seq:8][cmd_bytes...]`.
 pub struct ForwardedBatchIter<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Iterator for ForwardedBatchIter<'a> {
-    type Item = (u32, &'a [u8]);
+    /// `(client_id, request_seq, cmd_bytes)`
+    type Item = (u32, u64, &'a [u8]);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos + 4 > self.buf.len() {
             return None;
         }
-        let frame_len =
+        // payload_len = 12 + cmd_bytes.len()  (client_id:4 + request_seq:8 + cmd)
+        let payload_len =
             u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
-        if frame_len < 4 || self.pos + 4 + frame_len > self.buf.len() {
+        if payload_len < 12 || self.pos + 4 + payload_len > self.buf.len() {
             return None;
         }
-        let payload_start = self.pos + 4;
-        let client_id = u32::from_le_bytes(
-            self.buf[payload_start..payload_start + 4]
-                .try_into()
-                .unwrap(),
-        );
-        let cmd = &self.buf[payload_start + 4..payload_start + frame_len];
-        self.pos = payload_start + frame_len;
-        Some((client_id, cmd))
+        let base = self.pos + 4;
+        let client_id = u32::from_le_bytes(self.buf[base..base + 4].try_into().unwrap());
+        let request_seq = u64::from_le_bytes(self.buf[base + 4..base + 12].try_into().unwrap());
+        let cmd = &self.buf[base + 12..base + payload_len];
+        self.pos += 4 + payload_len;
+        Some((client_id, request_seq, cmd))
     }
 
     #[inline]
@@ -643,12 +613,12 @@ impl<'a> Iterator for ForwardedBatchIter<'a> {
 
 /// Follower-side forwarding client.
 ///
-/// Maintains a duplex TCP connection to the leader. Commands are written into
-/// a partitioned lock-free [`OutboundBuf`] and survive reconnections —
-/// data accumulated during disconnect is drained on reconnect.
+/// Maintains a duplex TCP connection to the leader. Commands are sent into
+/// a crossfire MPSC channel and survive reconnections — data accumulated
+/// during disconnect is drained on reconnect.
 pub struct ForwardClient {
-    /// Shared lock-free outbound buffer.
-    outbound: Arc<OutboundBuf>,
+    /// Channel-based outbound buffer.
+    outbound: OutboundBuf,
     /// Watch channel for target leader address.
     target_tx: tokio::sync::watch::Sender<Option<SocketAddr>>,
     /// Cancellation token for shutdown.
@@ -662,21 +632,21 @@ pub struct ForwardClient {
 /// Cheap, cloneable handle for sending commands through a [`ForwardClient`].
 #[derive(Clone)]
 pub struct ForwardHandle {
-    outbound: Arc<OutboundBuf>,
+    outbound: OutboundBuf,
 }
 
 impl ForwardHandle {
     /// Try to forward a command to the leader without blocking.
     ///
-    /// Returns `false` if the active segment is sealed or full (backpressure).
+    /// Returns `false` if the channel is full (backpressure).
     #[inline]
-    pub fn try_forward(&self, client_id: u32, cmd: &[u8]) -> bool {
-        self.outbound.try_write(client_id, cmd)
+    pub fn try_forward(&self, client_id: u32, request_seq: u64, cmd: &[u8]) -> bool {
+        self.outbound.try_write(client_id, request_seq, cmd)
     }
 
     /// Forward a command, yielding to the runtime on backpressure.
-    pub async fn forward(&self, client_id: u32, cmd: &[u8]) {
-        self.outbound.write(client_id, cmd).await;
+    pub async fn forward(&self, client_id: u32, request_seq: u64, cmd: &[u8]) {
+        self.outbound.write(client_id, request_seq, cmd).await;
     }
 }
 
@@ -685,15 +655,18 @@ impl ForwardClient {
     ///
     /// - `config`: transport configuration.
     /// - `node_id`: this node's ID (sent in handshake).
+    /// - `raft_group_id`: raft group ID for multiplexed TCP connections.
     /// - `initial_target`: leader address (or `None` if unknown).
     /// - `client_registry`: local client registry for response dispatch.
     pub fn start(
         config: ForwardConfig,
         node_id: u32,
+        raft_group_id: u32,
         initial_target: Option<SocketAddr>,
         client_registry: Arc<ClientRegistry>,
     ) -> Self {
-        let outbound = Arc::new(OutboundBuf::new(config.num_outbound_partitions));
+        let (tx, rx) = crossfire::mpsc::bounded_async::<Bytes>(config.outbound_channel_capacity);
+        let outbound = OutboundBuf { tx };
         let (target_tx, target_rx) = tokio::sync::watch::channel(initial_target);
         let cancel = CancellationToken::new();
         let generation = Arc::new(AtomicU64::new(0));
@@ -701,7 +674,8 @@ impl ForwardClient {
         let handle = tokio::spawn(forward_client_loop(
             config,
             node_id,
-            Arc::clone(&outbound),
+            raft_group_id,
+            rx,
             target_rx,
             cancel.clone(),
             generation.clone(),
@@ -720,21 +694,21 @@ impl ForwardClient {
     /// Get a cheap, cloneable handle for sending commands.
     pub fn clone_handle(&self) -> ForwardHandle {
         ForwardHandle {
-            outbound: Arc::clone(&self.outbound),
+            outbound: self.outbound.clone(),
         }
     }
 
     /// Try to forward a command to the leader without blocking.
     ///
-    /// Returns `false` if the active segment is sealed or full (backpressure).
+    /// Returns `false` if the channel is full (backpressure).
     #[inline]
-    pub fn try_forward(&self, client_id: u32, cmd: &[u8]) -> bool {
-        self.outbound.try_write(client_id, cmd)
+    pub fn try_forward(&self, client_id: u32, request_seq: u64, cmd: &[u8]) -> bool {
+        self.outbound.try_write(client_id, request_seq, cmd)
     }
 
     /// Forward a command, yielding to the runtime on backpressure.
-    pub async fn forward(&self, client_id: u32, cmd: &[u8]) {
-        self.outbound.write(client_id, cmd).await;
+    pub async fn forward(&self, client_id: u32, request_seq: u64, cmd: &[u8]) {
+        self.outbound.write(client_id, request_seq, cmd).await;
     }
 
     /// Update the leader address. The client will reconnect to the new target.
@@ -756,17 +730,45 @@ impl ForwardClient {
     }
 }
 
-/// Main connection loop for the forward client.
+/// Why a connection exited — used by the connection pool to decide whether to
+/// respawn, back off, or shut down.
+enum ConnectionExit {
+    /// The connection's TTL expired — spawn a replacement immediately.
+    TtlExpired,
+    /// IO or protocol error.
+    Error(io::Error),
+    /// Global shutdown requested.
+    Shutdown,
+}
+
+/// Main connection-pool loop for the forward client.
+///
+/// Creates the MPMC batch channel and group drainer once, then manages a
+/// [`JoinSet`](tokio::task::JoinSet) of TCP connections. Each connection
+/// consumes from the shared MPMC batch queue, so TTL rotation and error
+/// recovery are seamless — batches simply flow to whichever connection is
+/// ready.
 async fn forward_client_loop(
     config: ForwardConfig,
     node_id: u32,
-    outbound: Arc<OutboundBuf>,
+    raft_group_id: u32,
+    group_rx: crossfire::AsyncRx<crossfire::mpsc::Array<Bytes>>,
     mut target_rx: tokio::sync::watch::Receiver<Option<SocketAddr>>,
     cancel: CancellationToken,
     generation: Arc<AtomicU64>,
     client_registry: Arc<ClientRegistry>,
 ) {
-    let mut backoff = config.reconnect_base;
+    // Create the MPMC batch channel (shared across all TCP connections).
+    let (batch_tx, batch_rx) = crossfire::mpmc::bounded_async::<OutboundBatch>(256);
+
+    // Spawn the group drainer — lives for the entire ForwardClient lifetime.
+    let drainer_stop = cancel.child_token();
+    let _group_handle = tokio::spawn(run_group_drainer(
+        group_rx,
+        raft_group_id,
+        batch_tx,
+        drainer_stop.clone(),
+    ));
 
     loop {
         if cancel.is_cancelled() {
@@ -779,211 +781,257 @@ async fn forward_client_loop(
             if let Some(addr) = current {
                 break addr;
             }
-            // No target yet — wait for update or shutdown.
             tokio::select! {
                 _ = target_rx.changed() => continue,
                 _ = cancel.cancelled() => return,
             }
         };
 
-        // Connect (with cancellation).
-        let conn = tokio::select! {
-            c = connect_tcp(addr, &config) => c,
-            _ = cancel.cancelled() => return,
-        };
-        let (reader, writer) = match conn {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(target = %addr, error = %e, "forward connect failed");
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {},
-                    _ = cancel.cancelled() => return,
+        // Spawn the initial connection pool.
+        let conn_cancel = cancel.child_token();
+        let mut conn_set = tokio::task::JoinSet::new();
+        for _ in 0..config.num_outbound_connections {
+            conn_set.spawn(run_single_connection(
+                batch_rx.clone(),
+                addr,
+                node_id,
+                config.clone(),
+                conn_cancel.clone(),
+                Arc::clone(&client_registry),
+                generation.clone(),
+            ));
+        }
+
+        // Monitor the connection pool: respawn on TTL/error, stop on
+        // leader change or shutdown.
+        let pool_exit = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break ConnectionExit::Shutdown,
+                _ = target_rx.changed() => break ConnectionExit::TtlExpired,
+                join_result = conn_set.join_next() => {
+                    match join_result {
+                        // All connections gone (shouldn't happen — we respawn).
+                        None => break ConnectionExit::Error(
+                            io::Error::new(io::ErrorKind::Other, "all connections exited"),
+                        ),
+                        Some(Ok(ConnectionExit::TtlExpired)) => {
+                            // Seamless rotation — spawn replacement immediately.
+                            conn_set.spawn(run_single_connection(
+                                batch_rx.clone(),
+                                addr,
+                                node_id,
+                                config.clone(),
+                                conn_cancel.clone(),
+                                Arc::clone(&client_registry),
+                                generation.clone(),
+                            ));
+                        }
+                        Some(Ok(ConnectionExit::Error(e))) => {
+                            debug!(error = %e, "outbound connection error, respawning");
+                            // Small delay before respawn to avoid spin on persistent errors.
+                            let batch_rx = batch_rx.clone();
+                            let config = config.clone();
+                            let conn_cancel = conn_cancel.clone();
+                            let client_registry = Arc::clone(&client_registry);
+                            let generation = generation.clone();
+                            conn_set.spawn(async move {
+                                tokio::time::sleep(config.reconnect_base).await;
+                                run_single_connection(
+                                    batch_rx,
+                                    addr,
+                                    node_id,
+                                    config,
+                                    conn_cancel,
+                                    client_registry,
+                                    generation,
+                                )
+                                .await
+                            });
+                        }
+                        Some(Ok(ConnectionExit::Shutdown)) | Some(Err(_)) => {
+                            // Shutdown or panic — don't respawn.
+                        }
+                    }
                 }
-                backoff = (backoff * 2).min(config.reconnect_max);
-                continue;
             }
         };
 
-        // Reset backoff on successful connect.
-        backoff = config.reconnect_base;
-        generation.fetch_add(1, Ordering::Release);
-        debug!(target = %addr, "forward client connected");
+        // Cancel all remaining connections and drain the JoinSet.
+        conn_cancel.cancel();
+        while conn_set.join_next().await.is_some() {}
 
-        // Handshake: send our node_id.
-        let (mut reader, mut writer) = (reader, writer);
-        if let Err(e) = write_frame(&mut writer, &node_id.to_le_bytes()).await {
-            warn!(error = %e, "forward handshake write failed");
-            continue;
-        }
-        if let Err(e) = writer.flush().await {
-            warn!(error = %e, "forward handshake flush failed");
-            continue;
-        }
-
-        // Run duplex: outbound and inbound tasks run concurrently.
-        let result = run_forward_client_connection(
-            Arc::clone(&outbound),
-            reader,
-            writer,
-            &mut target_rx,
-            &cancel,
-            &client_registry,
-        )
-        .await;
-
-        match result {
-            Ok(Reconnect::LeaderChanged) => {
+        match pool_exit {
+            ConnectionExit::Shutdown => return,
+            ConnectionExit::TtlExpired => {
+                // Leader changed — reconnect to new target.
                 debug!("leader changed, reconnecting");
-                backoff = config.reconnect_base;
             }
-            Ok(Reconnect::Shutdown) => return,
-            Err(e) => {
-                debug!(error = %e, "forward connection lost");
+            ConnectionExit::Error(e) => {
+                debug!(error = %e, "connection pool error");
             }
         }
     }
 }
 
-enum Reconnect {
-    LeaderChanged,
-    Shutdown,
-}
+/// Run a single TCP connection to the leader: connect, handshake, then run
+/// the outbound TCP drainer (from MPMC batch queue) and inbound response
+/// reader concurrently. Exits on TTL expiry, error, or cancellation.
+async fn run_single_connection(
+    batch_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<OutboundBatch>>,
+    addr: SocketAddr,
+    node_id: u32,
+    config: ForwardConfig,
+    cancel: CancellationToken,
+    client_registry: Arc<ClientRegistry>,
+    generation: Arc<AtomicU64>,
+) -> ConnectionExit {
+    // Connect.
+    let conn = tokio::select! {
+        c = connect_tcp(addr, &config) => c,
+        _ = cancel.cancelled() => return ConnectionExit::Shutdown,
+    };
+    let (reader, writer) = match conn {
+        Ok(c) => c,
+        Err(e) => return ConnectionExit::Error(e),
+    };
 
-/// Outbound task: drains the [`OutboundBuf`] to TCP until cancelled.
-///
-/// The cancellation check happens only in the `select!` at `wait_for_data`,
-/// never during `drain_to_tcp`, so a drain in progress always runs to
-/// completion — no partial TCP writes.
-///
-/// On IO error, cancels `failed` so the inbound loop can detect the failure.
-async fn run_outbound_loop(
-    outbound: Arc<OutboundBuf>,
-    mut writer: BoxedWriter,
-    stop: CancellationToken,
-    failed: CancellationToken,
-) -> io::Result<()> {
-    loop {
-        tokio::select! {
-            biased;
-            _ = stop.cancelled() => return Ok(()),
-            _ = outbound.wait_for_data() => {}
-        }
-        // Yield once so concurrent producers can accumulate more writes into
-        // the active segment before we seal and drain it.
-        tokio::task::yield_now().await;
-        if let Err(e) = outbound.drain_to_tcp(&mut writer).await {
-            failed.cancel();
-            return Err(e);
-        }
+    // Handshake: send our node_id.
+    let (reader, mut writer) = (reader, writer);
+    if let Err(e) = write_frame(&mut writer, &node_id.to_le_bytes()).await {
+        return ConnectionExit::Error(e);
     }
-}
+    if let Err(e) = writer.flush().await {
+        return ConnectionExit::Error(e);
+    }
 
-/// Run a single connection session. Returns when the connection fails,
-/// the leader changes, or shutdown is requested.
-///
-/// Outbound and inbound run as independent concurrent tasks so that:
-/// - TCP writes and reads proceed in parallel (no head-of-line blocking).
-/// - `drain_to_tcp` is never cancelled mid-write (cancel is only checked
-///   between drains in [`run_outbound_loop`]).
-async fn run_forward_client_connection(
-    outbound: Arc<OutboundBuf>,
-    reader: BoxedReader,
-    writer: BoxedWriter,
-    target_rx: &mut tokio::sync::watch::Receiver<Option<SocketAddr>>,
-    cancel: &CancellationToken,
-    client_registry: &ClientRegistry,
-) -> Result<Reconnect, io::Error> {
-    // stop_outbound fires on global shutdown or when we want to stop the connection.
-    let stop_outbound = cancel.child_token();
-    // outbound_failed is cancelled by the outbound task itself on IO error.
+    generation.fetch_add(1, Ordering::Release);
+    debug!(target = %addr, "forward connection established");
+
+    // Spawn the outbound TCP drainer.
+    let stop = cancel.child_token();
     let outbound_failed = CancellationToken::new();
 
-    let outbound_handle = tokio::spawn(run_outbound_loop(
-        outbound,
-        writer,
-        stop_outbound.clone(),
-        outbound_failed.clone(),
-    ));
+    let outbound_stop = stop.clone();
+    let outbound_failed_clone = outbound_failed.clone();
+    let outbound_handle = tokio::spawn(async move {
+        let result = run_tcp_drainer(batch_rx, &mut writer, &outbound_stop).await;
+        if result.is_err() {
+            outbound_failed_clone.cancel();
+        }
+        result
+    });
 
-    let result =
-        run_inbound_loop(reader, target_rx, cancel, &outbound_failed, client_registry).await;
+    // Run inbound + TTL concurrently.
+    let exit =
+        run_connection_inbound(reader, &client_registry, &cancel, &outbound_failed, &config).await;
 
-    // Signal the outbound task to stop, then wait for any in-progress drain
-    // to finish before we return (and the connection is dropped).
-    stop_outbound.cancel();
+    // Stop the outbound drainer and wait for it to finish its current write.
+    stop.cancel();
     let _ = outbound_handle.await;
 
-    result
+    exit
 }
 
-/// Inbound loop: bulk-reads fixed-width `[client_id:4 LE][log_index:8 LE]` response
-/// records (12 bytes each) from the leader and dispatches them to the owning
-/// [`ClientPartition`]s via [`ClientRegistry::send_to_partition_async`].
+/// Inbound response reader for a single connection.
 ///
-/// Records are batched per partition before sending — one channel send per partition
-/// per read, instead of one per record. Provides backpressure — no silent drops.
-async fn run_inbound_loop(
+/// Bulk-reads `[len:4 LE][payload...]` response frames from the leader and
+/// dispatches them to [`ClientPartition`]s via [`ClientRegistry`]. Also
+/// monitors TTL expiry, cancellation, and outbound failures.
+async fn run_connection_inbound(
     mut reader: BoxedReader,
-    target_rx: &mut tokio::sync::watch::Receiver<Option<SocketAddr>>,
+    client_registry: &ClientRegistry,
     cancel: &CancellationToken,
     outbound_failed: &CancellationToken,
-    client_registry: &ClientRegistry,
-) -> Result<Reconnect, io::Error> {
-    // Wire format: [len=12:4 LE][client_id:4 LE][log_index:8 LE] = 16 bytes per record.
-    // The leader pre-frames records so the inbound loop can broadcast the raw slab directly
-    // to all partition workers without any per-record decode, re-encode, or copy.
-    const RECORD_SIZE: usize = 16; // [len:4][client_id:4][log_index:8]
+    config: &ForwardConfig,
+) -> ConnectionExit {
     let mut read_buf = BytesMut::with_capacity(1024 * 1024);
     let n = client_registry.num_partitions();
+    let ttl_sleep = async {
+        match config.connection_ttl {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(ttl_sleep);
 
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Ok(Reconnect::Shutdown),
-            _ = target_rx.changed() => return Ok(Reconnect::LeaderChanged),
+            _ = cancel.cancelled() => return ConnectionExit::Shutdown,
+            _ = &mut ttl_sleep => return ConnectionExit::TtlExpired,
             _ = outbound_failed.cancelled() => {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "outbound task failed"));
+                return ConnectionExit::Error(
+                    io::Error::new(io::ErrorKind::BrokenPipe, "outbound task failed"),
+                );
             }
             bytes_read = reader.read_buf(&mut read_buf) => {
-                let bytes_read = bytes_read?;
+                let bytes_read = match bytes_read {
+                    Ok(n) => n,
+                    Err(e) => return ConnectionExit::Error(e),
+                };
                 if bytes_read == 0 {
-                    return Err(io::Error::new(io::ErrorKind::ConnectionReset, "EOF"));
+                    return ConnectionExit::Error(
+                        io::Error::new(io::ErrorKind::ConnectionReset, "EOF"),
+                    );
                 }
 
-                // Freeze all complete 16-byte records as a single zero-copy slab, then
-                // broadcast to every partition worker.  Each worker's dispatch filters by
-                // client_id % n == partition_id, skipping records it doesn't own.
-                // The slab stays hot in L1/L2 cache from the TCP read, so scanning
-                // past non-owned records is cheap — and we eliminate all copying.
-                let complete = (read_buf.len() / RECORD_SIZE) * RECORD_SIZE;
+                // Single-pass scan: find complete frame boundaries.
+                let buf = read_buf.as_ref();
+                let mut complete = 0;
+                let mut sent_mask = 0u64;
+                let mut sent_count = 0usize;
+                let mut scan = 0;
+                while scan + 8 <= buf.len() {
+                    let frame_len =
+                        u32::from_le_bytes(buf[scan..scan + 4].try_into().unwrap()) as usize;
+                    let next = scan + 4 + frame_len;
+                    if frame_len < 4 || next > buf.len() {
+                        break;
+                    }
+                    scan = next;
+                    complete = next;
+                }
+                while scan + 4 <= buf.len() {
+                    let frame_len =
+                        u32::from_le_bytes(buf[scan..scan + 4].try_into().unwrap()) as usize;
+                    let next = scan + 4 + frame_len;
+                    if next > buf.len() {
+                        break;
+                    }
+                    scan = next;
+                    complete = next;
+                }
+
                 if complete > 0 {
                     let slab = read_buf.split_to(complete).freeze();
+
                     if n == 1 {
                         client_registry.send_to_partition_async(0, slab).await;
                     } else {
-                        // Scan once: on the first record for partition p, send
-                        // slab.slice(pos..complete) — starts at that record, skipping
-                        // all preceding records.  dispatch() filters the remaining
-                        // records by client_id % n == p.  Zero copies; each partition
-                        // receives exactly one send, beginning no earlier than needed.
-                        let mut sent_mask = 0u64;
                         let mut pos = 0;
-                        while pos + RECORD_SIZE <= complete {
+                        while pos + 8 <= complete && sent_count < n {
+                            let frame_len = u32::from_le_bytes(
+                                slab[pos..pos + 4].try_into().unwrap(),
+                            ) as usize;
+                            if frame_len < 4 || pos + 4 + frame_len > complete {
+                                break;
+                            }
                             let client_id = u32::from_le_bytes(
                                 slab[pos + 4..pos + 8].try_into().unwrap(),
                             );
                             let p = (client_id as usize) % n;
                             if (sent_mask >> p) & 1 == 0 {
                                 sent_mask |= 1 << p;
+                                sent_count += 1;
                                 client_registry
                                     .send_to_partition_async(p, slab.slice(pos..complete))
                                     .await;
                             }
-                            pos += RECORD_SIZE;
+                            pos += 4 + frame_len;
                         }
                     }
                 }
-                // Any partial record (< 16 bytes) stays in read_buf for next read.
             }
         }
     }
@@ -999,8 +1047,10 @@ async fn run_inbound_loop(
 /// and surfaces forwarded commands by proposing `TAG_FORWARDED_BATCH` entries
 /// to raft (or sending them to a channel in test/bench mode).
 pub struct ForwardAcceptor {
-    /// Live responder channel table — updated as followers connect/disconnect.
-    responder_txs: SharedResponderTxs,
+    /// Live responder channel table — directly owned, drained from `update_rx`.
+    responder_txs: Box<[Option<crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>>; 64]>,
+    /// Receives (node_id, Option<tx>) updates from accept loop as followers connect/disconnect.
+    update_rx: tokio::sync::mpsc::UnboundedReceiver<ResponderUpdateMsg>,
     /// Cancellation token for shutdown.
     cancel: CancellationToken,
     /// Accept loop handle.
@@ -1023,23 +1073,20 @@ impl ForwardAcceptor {
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let cancel = CancellationToken::new();
-
-        let responder_txs: SharedResponderTxs =
-            Arc::new(ArcSwap::from_pointee(Box::new(std::array::from_fn(|_| {
-                None
-            }))));
+        let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let handle = tokio::spawn(accept_loop(
             config,
             listener,
             raft,
-            Arc::clone(&responder_txs),
+            update_tx,
             responder_broadcast,
             cancel.clone(),
         ));
 
         Ok(Self {
-            responder_txs,
+            responder_txs: Box::new(std::array::from_fn(|_| None)),
+            update_rx,
             cancel,
             handle: Some(handle),
             local_addr,
@@ -1051,13 +1098,21 @@ impl ForwardAcceptor {
         self.local_addr
     }
 
+    /// Drain pending connect/disconnect updates into the local responder table.
+    fn drain_updates(&mut self) {
+        while let Ok((node_id, tx)) = self.update_rx.try_recv() {
+            self.responder_txs[node_id as usize] = tx;
+        }
+    }
+
     /// Push pre-encoded response bytes to a connected follower's responder channel.
     ///
     /// `bytes` must contain tight-packed `[client_id:4 LE][log_index:8 LE]` records.
     /// Non-blocking — returns `false` if the follower is not connected or the channel
     /// is full.
-    pub fn push_response(&self, node_id: u32, bytes: Bytes) -> bool {
-        if let Some(tx) = &self.responder_txs.load()[node_id as usize] {
+    pub fn push_response(&mut self, node_id: u32, bytes: Bytes) -> bool {
+        self.drain_updates();
+        if let Some(tx) = &self.responder_txs[node_id as usize] {
             tx.try_send(bytes).is_ok()
         } else {
             false
@@ -1065,25 +1120,17 @@ impl ForwardAcceptor {
     }
 
     /// Async variant of [`push_response`] — awaits if the channel is full (backpressure).
-    pub async fn push_response_async(&self, node_id: u32, bytes: Bytes) {
-        let tx = self.responder_txs.load()[node_id as usize].clone();
-        if let Some(tx) = tx {
+    pub async fn push_response_async(&mut self, node_id: u32, bytes: Bytes) {
+        self.drain_updates();
+        if let Some(tx) = &self.responder_txs[node_id as usize] {
             let _ = tx.send(bytes).await;
         }
     }
 
-    /// Return a clone of the shared responder channel table handle.
-    pub fn responder_txs_handle(&self) -> SharedResponderTxs {
-        Arc::clone(&self.responder_txs)
-    }
-
     /// Number of connected follower nodes.
-    pub fn connected_nodes(&self) -> usize {
-        self.responder_txs
-            .load()
-            .iter()
-            .filter(|x| x.is_some())
-            .count()
+    pub fn connected_nodes(&mut self) -> usize {
+        self.drain_updates();
+        self.responder_txs.iter().filter(|x| x.is_some()).count()
     }
 
     /// Shut down the acceptor and all connections.
@@ -1104,25 +1151,23 @@ impl ForwardAcceptor {
         let (tx, rx) = tokio::sync::mpsc::channel(config.inbound_buffer_capacity);
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
-        let responder_txs: SharedResponderTxs =
-            Arc::new(ArcSwap::from_pointee(Box::new(std::array::from_fn(|_| {
-                None
-            }))));
         let responder_broadcast = ResponderBroadcast::new_empty();
         let cancel = CancellationToken::new();
+        let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let handle = tokio::spawn(accept_loop_with_channel(
             config,
             listener,
             tx,
-            Arc::clone(&responder_txs),
+            update_tx,
             responder_broadcast,
             cancel.clone(),
         ));
 
         Ok((
             Self {
-                responder_txs,
+                responder_txs: Box::new(std::array::from_fn(|_| None)),
+                update_rx,
                 cancel,
                 handle: Some(handle),
                 local_addr,
@@ -1137,7 +1182,7 @@ async fn accept_loop_with_channel(
     config: ForwardConfig,
     listener: TcpListener,
     tx: tokio::sync::mpsc::Sender<ForwardedBatch>,
-    responder_txs: SharedResponderTxs,
+    update_tx: tokio::sync::mpsc::UnboundedSender<ResponderUpdateMsg>,
     responder_broadcast: ResponderBroadcast,
     cancel: CancellationToken,
 ) {
@@ -1158,7 +1203,7 @@ async fn accept_loop_with_channel(
         }
         let config = config.clone();
         let tx = tx.clone();
-        let responder_txs = Arc::clone(&responder_txs);
+        let update_tx = update_tx.clone();
         let responder_broadcast = responder_broadcast.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
@@ -1167,7 +1212,7 @@ async fn accept_loop_with_channel(
                 stream,
                 peer_addr,
                 tx,
-                responder_txs,
+                update_tx,
                 responder_broadcast,
                 cancel,
             )
@@ -1186,7 +1231,7 @@ async fn handle_follower_connection_with_channel(
     stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
     tx: tokio::sync::mpsc::Sender<ForwardedBatch>,
-    responder_txs: SharedResponderTxs,
+    update_tx: tokio::sync::mpsc::UnboundedSender<ResponderUpdateMsg>,
     responder_broadcast: ResponderBroadcast,
     cancel: CancellationToken,
 ) -> io::Result<()> {
@@ -1204,13 +1249,14 @@ async fn handle_follower_connection_with_channel(
 
     let (resp_tx, resp_rx) =
         crossfire::mpsc::bounded_async::<Bytes>(config.responder_channel_capacity);
-    responder_txs_insert(&responder_txs, &responder_broadcast, node_id, resp_tx);
+    responder_txs_insert(&update_tx, &responder_broadcast, node_id, resp_tx);
 
     let writer_cancel = cancel.clone();
     let writer_handle = tokio::spawn(async move {
         run_follower_responder(resp_rx, writer, writer_cancel).await;
     });
 
+    // Parse batch wire format: [raft_group_id:4][batch_payload_len:4][sub-frames...]
     let mut read_buf = BytesMut::with_capacity(128 * 1024);
     let result = loop {
         let n = tokio::select! {
@@ -1220,30 +1266,49 @@ async fn handle_follower_connection_with_channel(
         if n == 0 {
             break Ok(());
         }
-        let mut pos = 0;
-        let mut count = 0u32;
-        while pos + 4 <= read_buf.len() {
-            let frame_len = u32::from_le_bytes(read_buf[pos..pos + 4].try_into().unwrap()) as usize;
-            if frame_len < 4 || pos + 4 + frame_len > read_buf.len() {
+        // Process all complete batches.
+        while read_buf.len() >= BATCH_HEADER_LEN {
+            let raft_group_id = u32::from_le_bytes(read_buf[..4].try_into().unwrap());
+            let batch_payload_len = u32::from_le_bytes(read_buf[4..8].try_into().unwrap()) as usize;
+            let needed = BATCH_HEADER_LEN + batch_payload_len;
+            if read_buf.len() < needed {
                 break;
             }
-            pos += 4 + frame_len;
-            count += 1;
-        }
-        if count > 0 {
-            let frames_bytes = read_buf.split_to(pos).freeze();
-            let batch = ForwardedBatch {
-                node_id,
-                buf: frames_bytes,
-                count,
-            };
-            if tx.send(batch).await.is_err() {
-                break Ok(()); // receiver dropped (shutdown)
+            let _ = read_buf.split_to(BATCH_HEADER_LEN);
+            let payload = read_buf.split_to(batch_payload_len).freeze();
+
+            // Count sub-frames.
+            let mut sub_pos = 0;
+            let mut count = 0u32;
+            while sub_pos + 4 <= payload.len() {
+                let plen =
+                    u32::from_le_bytes(payload[sub_pos..sub_pos + 4].try_into().unwrap()) as usize;
+                if plen < 12 || sub_pos + 4 + plen > payload.len() {
+                    break;
+                }
+                sub_pos += 4 + plen;
+                count += 1;
+            }
+
+            if count > 0 {
+                let batch = ForwardedBatch {
+                    node_id,
+                    raft_group_id,
+                    buf: payload,
+                    count,
+                };
+                if tx.send(batch).await.is_err() {
+                    break; // receiver dropped (shutdown)
+                }
             }
         }
     };
 
-    responder_txs_remove(&responder_txs, &responder_broadcast, node_id);
+    // We do NOT remove the responder entry for this node_id.  When multiple
+    // connections from the same follower overlap (e.g. TTL rotation), the
+    // newer connection has already overwritten the responder.  Removing it
+    // here would delete the *new* connection's responder.  Stale entries are
+    // harmless — sends to a closed channel simply fail.
     writer_handle.abort();
     result
 }
@@ -1253,7 +1318,7 @@ async fn accept_loop(
     config: ForwardConfig,
     listener: TcpListener,
     raft: Raft<MqTypeConfig>,
-    responder_txs: SharedResponderTxs,
+    update_tx: tokio::sync::mpsc::UnboundedSender<ResponderUpdateMsg>,
     responder_broadcast: ResponderBroadcast,
     cancel: CancellationToken,
 ) {
@@ -1277,7 +1342,7 @@ async fn accept_loop(
 
         let config = config.clone();
         let raft = raft.clone();
-        let responder_txs = Arc::clone(&responder_txs);
+        let update_tx = update_tx.clone();
         let responder_broadcast = responder_broadcast.clone();
         let cancel = cancel.clone();
 
@@ -1287,7 +1352,7 @@ async fn accept_loop(
                 stream,
                 peer_addr,
                 raft,
-                responder_txs,
+                update_tx,
                 responder_broadcast,
                 cancel,
             )
@@ -1305,7 +1370,7 @@ async fn handle_follower_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     raft: Raft<MqTypeConfig>,
-    responder_txs: SharedResponderTxs,
+    update_tx: tokio::sync::mpsc::UnboundedSender<ResponderUpdateMsg>,
     responder_broadcast: ResponderBroadcast,
     cancel: CancellationToken,
 ) -> io::Result<()> {
@@ -1326,7 +1391,7 @@ async fn handle_follower_connection(
     // Create responder channel and register in the shared table.
     let (resp_tx, resp_rx) =
         crossfire::mpsc::bounded_async::<Bytes>(config.responder_channel_capacity);
-    responder_txs_insert(&responder_txs, &responder_broadcast, node_id, resp_tx);
+    responder_txs_insert(&update_tx, &responder_broadcast, node_id, resp_tx);
 
     // Spawn the FollowerResponder task: drains encoded bytes to TCP.
     let writer_cancel = cancel.clone();
@@ -1334,7 +1399,9 @@ async fn handle_follower_connection(
         run_follower_responder(resp_rx, writer, writer_cancel).await;
     });
 
-    // TCP reader: bulk-read from follower, parse frame boundaries, send batches.
+    // TCP reader: bulk-read from follower, parse batch frame headers and sub-frames.
+    // Wire format from follower: [raft_group_id:4][batch_payload_len:4][sub-frames...]
+    // Sub-frame: [payload_len:4][client_id:4][request_seq:8][cmd_bytes...]
     let mut read_buf = BytesMut::with_capacity(128 * 1024);
     let result = loop {
         // Bulk-read whatever TCP gives us, appending after any partial frame.
@@ -1346,37 +1413,52 @@ async fn handle_follower_connection(
             break Ok(()); // EOF
         }
 
-        // Find the last complete frame boundary.
-        let mut pos = 0;
-        let mut count = 0u32;
-        while pos + 4 <= read_buf.len() {
-            let frame_len = u32::from_le_bytes(read_buf[pos..pos + 4].try_into().unwrap()) as usize;
-            if frame_len < 4 || pos + 4 + frame_len > read_buf.len() {
-                break; // short or partial frame
+        // Process all complete batches in the buffer.
+        // A complete batch is: BATCH_HEADER_LEN(8) + batch_payload_len bytes.
+        while read_buf.len() >= BATCH_HEADER_LEN {
+            let _raft_group_id = u32::from_le_bytes(read_buf[..4].try_into().unwrap());
+            let batch_payload_len = u32::from_le_bytes(read_buf[4..8].try_into().unwrap()) as usize;
+            let needed = BATCH_HEADER_LEN + batch_payload_len;
+            if read_buf.len() < needed {
+                break; // incomplete batch — wait for more data
             }
-            pos += 4 + frame_len;
-            count += 1;
-        }
 
-        if count > 0 {
-            // Freeze the complete portion once — single refcount for the batch.
-            let frames_bytes = read_buf.split_to(pos).freeze();
-            // Wrap into TAG_FORWARDED_BATCH and propose to raft directly.
-            // Fire-and-forget: proposal happens in a spawned task so the TCP
-            // reader is never blocked by raft commit latency.
-            let cmd = MqCommand::forwarded_batch(node_id, count, &frames_bytes);
-            let raft2 = raft.clone();
-            tokio::spawn(async move {
-                if let Err(e) = raft2.client_write(cmd).await {
-                    debug!(error = %e, "forwarded batch proposal failed");
+            // Consume the 8-byte header and extract the sub-frames payload.
+            let _ = read_buf.split_to(BATCH_HEADER_LEN);
+            let payload = read_buf.split_to(batch_payload_len).freeze();
+
+            // Count sub-frames: [payload_len:4][client_id:4][request_seq:8][cmd...]
+            let mut sub_pos = 0;
+            let mut count = 0u32;
+            while sub_pos + 4 <= payload.len() {
+                let plen =
+                    u32::from_le_bytes(payload[sub_pos..sub_pos + 4].try_into().unwrap()) as usize;
+                if plen < 12 || sub_pos + 4 + plen > payload.len() {
+                    break;
                 }
-            });
+                sub_pos += 4 + plen;
+                count += 1;
+            }
+
+            if count > 0 {
+                // Wrap into TAG_FORWARDED_BATCH and propose to raft.
+                // Fire-and-forget: spawned task so TCP reader is never blocked.
+                let mut scratch = BytesMut::new();
+                MqCommand::write_forwarded_batch(&mut scratch, node_id, count, &payload);
+                let cmd = MqCommand::split_from(&mut scratch);
+                let raft2 = raft.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = raft2.client_write(cmd).await {
+                        debug!(error = %e, "forwarded batch proposal failed");
+                    }
+                });
+            }
         }
-        // Partial frame data remains in read_buf for next read.
+        // Any partial batch remains in read_buf for the next read.
     };
 
-    // Cleanup: remove responder channel, abort writer task.
-    responder_txs_remove(&responder_txs, &responder_broadcast, node_id);
+    // We do NOT remove the responder — see comment in
+    // handle_follower_connection_with_channel for rationale.
     writer_handle.abort();
 
     info!(node_id, peer = %peer_addr, "follower disconnected");
@@ -1511,23 +1593,28 @@ mod tests {
         let done_cb = std::sync::Arc::clone(&done);
         let cb: crate::async_apply::ResponseCallback =
             std::sync::Arc::new(move |_slab, _offset, msg, is_done| {
-                if !is_done && msg.len() >= 8 {
-                    // NodeRoute frame payload: [log_index:8 LE]
-                    let li = u64::from_le_bytes(msg[0..8].try_into().unwrap());
+                if !is_done && msg.len() >= 16 {
+                    // Frame payload after client_id: [request_seq:8][log_index:8]
+                    let li = u64::from_le_bytes(msg[8..16].try_into().unwrap());
                     log_idx_cb.store(li, std::sync::atomic::Ordering::Relaxed);
                     done_cb.notify_one();
                 }
             });
         let local_cid = client_registry.register(cb);
 
-        let mut client =
-            ForwardClient::start(config.clone(), 1, Some(addr), Arc::clone(&client_registry));
+        let mut client = ForwardClient::start(
+            config.clone(),
+            1,
+            0,
+            Some(addr),
+            Arc::clone(&client_registry),
+        );
 
         // Give connection time to establish.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Forward a command.
-        client.forward(local_cid, b"test cmd").await;
+        // Forward a command (request_seq=0 means no session tracking).
+        client.forward(local_cid, 0, b"test cmd").await;
 
         // Acceptor should receive it.
         let batch = tokio::time::timeout(Duration::from_secs(1), batch_rx.recv())
@@ -1535,15 +1622,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(batch.node_id, 1);
-        let (cid, cmd_bytes) = batch.iter().next().unwrap();
+        let (cid, _req_seq, cmd_bytes) = batch.iter().next().unwrap();
         assert_eq!(cid, local_cid);
         assert_eq!(cmd_bytes, b"test cmd");
 
-        // Send response back via push_response_async (pre-framed: [12u32][cid][log_index]).
-        let mut resp = BytesMut::with_capacity(16);
-        resp.put_u32_le(12u32);
+        // Send response back via push_response_async.
+        // New format: [len=20:4][cid:4][request_seq:8][log_index:8]
+        let mut resp = BytesMut::with_capacity(24);
+        resp.put_u32_le(20u32);
         resp.put_u32_le(local_cid);
-        resp.put_u64_le(42u64);
+        resp.put_u64_le(0u64); // request_seq
+        resp.put_u64_le(42u64); // log_index
         acceptor.push_response_async(1, resp.freeze()).await;
 
         // Client should dispatch response to the callback.
@@ -1572,8 +1661,13 @@ mod tests {
         let addr = acceptor.local_addr();
 
         let client_registry = ClientRegistry::new(4, 256);
-        let mut client =
-            ForwardClient::start(config.clone(), 2, Some(addr), Arc::clone(&client_registry));
+        let mut client = ForwardClient::start(
+            config.clone(),
+            2,
+            0,
+            Some(addr),
+            Arc::clone(&client_registry),
+        );
 
         // Wait for initial connection.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1595,13 +1689,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Forward should work after reconnect.
-        client.forward(1, b"after reconnect").await;
+        client.forward(1, 0, b"after reconnect").await;
 
         let batch = tokio::time::timeout(Duration::from_secs(1), batch_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        let (_, cmd_bytes) = batch.iter().next().unwrap();
+        let (_, _req_seq, cmd_bytes) = batch.iter().next().unwrap();
         assert_eq!(cmd_bytes, b"after reconnect");
 
         // Generation should have increased.
@@ -1626,12 +1720,17 @@ mod tests {
         drop(listener);
 
         let client_registry = ClientRegistry::new(4, 256);
-        let mut client =
-            ForwardClient::start(config.clone(), 3, Some(addr), Arc::clone(&client_registry));
+        let mut client = ForwardClient::start(
+            config.clone(),
+            3,
+            0,
+            Some(addr),
+            Arc::clone(&client_registry),
+        );
 
         // No acceptor yet — buffer commands (client_id is u32 now).
         for i in 0u32..5 {
-            client.try_forward(i, &i.to_le_bytes());
+            client.try_forward(i, 0, &i.to_le_bytes());
         }
 
         // Start acceptor on the same port.
@@ -1671,18 +1770,23 @@ mod tests {
         let addr1 = acceptor1.local_addr();
 
         let client_registry = ClientRegistry::new(4, 256);
-        let mut client =
-            ForwardClient::start(config.clone(), 4, Some(addr1), Arc::clone(&client_registry));
+        let mut client = ForwardClient::start(
+            config.clone(),
+            4,
+            0,
+            Some(addr1),
+            Arc::clone(&client_registry),
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Forward to first leader.
-        client.forward(1, b"to leader 1").await;
+        client.forward(1, 0, b"to leader 1").await;
         let batch = tokio::time::timeout(Duration::from_secs(1), batch_rx1.recv())
             .await
             .unwrap()
             .unwrap();
-        let (_, cmd_bytes) = batch.iter().next().unwrap();
+        let (_, _req_seq, cmd_bytes) = batch.iter().next().unwrap();
         assert_eq!(cmd_bytes, b"to leader 1");
 
         let (mut acceptor2, mut batch_rx2) =
@@ -1696,13 +1800,27 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Forward to second leader.
-        client.forward(1, b"to leader 2").await;
-        let batch = tokio::time::timeout(Duration::from_secs(1), batch_rx2.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (_, cmd_bytes) = batch.iter().next().unwrap();
-        assert_eq!(cmd_bytes, b"to leader 2");
+        client.forward(1, 0, b"to leader 2").await;
+
+        // Retransmitted unACKed batches from leader 1 may arrive first;
+        // scan until we find "to leader 2".
+        let mut found_cmd = false;
+        for _ in 0..5 {
+            let Ok(Some(batch)) =
+                tokio::time::timeout(Duration::from_secs(1), batch_rx2.recv()).await
+            else {
+                break;
+            };
+            for (_, _, cmd_bytes) in batch.iter() {
+                if cmd_bytes == b"to leader 2" {
+                    found_cmd = true;
+                }
+            }
+            if found_cmd {
+                break;
+            }
+        }
+        assert!(found_cmd, "expected 'to leader 2' to arrive on leader 2");
 
         client.shutdown().await;
         acceptor1.shutdown().await;
@@ -1723,7 +1841,7 @@ mod tests {
         let mut clients = Vec::new();
         for i in 0..num_followers {
             let reg = ClientRegistry::new(4, 256);
-            let client = ForwardClient::start(config.clone(), 10 + i, Some(addr), reg);
+            let client = ForwardClient::start(config.clone(), 10 + i, 0, Some(addr), reg);
             clients.push(client);
         }
 
@@ -1732,7 +1850,7 @@ mod tests {
         // Each follower sends a command.
         for (i, client) in clients.iter().enumerate() {
             let msg = format!("from node {}", 10 + i as u32);
-            client.forward(1, msg.as_bytes()).await;
+            client.forward(1, 0, msg.as_bytes()).await;
         }
 
         // Collect all commands (may arrive as multiple batches).
@@ -1782,10 +1900,10 @@ mod tests {
         let (done1c, log1c) = (std::sync::Arc::clone(&done1), std::sync::Arc::clone(&log1));
         let cb1: crate::async_apply::ResponseCallback =
             std::sync::Arc::new(move |_slab, _offset, msg, is_done| {
-                if !is_done && msg.len() >= 8 {
-                    // NodeRoute frame payload: [log_index:8 LE]
+                if !is_done && msg.len() >= 16 {
+                    // Frame payload after client_id: [request_seq:8][log_index:8]
                     log1c.store(
-                        u64::from_le_bytes(msg[0..8].try_into().unwrap()),
+                        u64::from_le_bytes(msg[8..16].try_into().unwrap()),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     done1c.notify_one();
@@ -1794,9 +1912,10 @@ mod tests {
         let (done2c, log2c) = (std::sync::Arc::clone(&done2), std::sync::Arc::clone(&log2));
         let cb2: crate::async_apply::ResponseCallback =
             std::sync::Arc::new(move |_slab, _offset, msg, is_done| {
-                if !is_done && msg.len() >= 8 {
+                if !is_done && msg.len() >= 16 {
+                    // Frame payload after client_id: [request_seq:8][log_index:8]
                     log2c.store(
-                        u64::from_le_bytes(msg[0..8].try_into().unwrap()),
+                        u64::from_le_bytes(msg[8..16].try_into().unwrap()),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     done2c.notify_one();
@@ -1805,23 +1924,31 @@ mod tests {
         let cid1 = client_registry.register(cb1);
         let cid2 = client_registry.register(cb2);
 
-        let mut client =
-            ForwardClient::start(config.clone(), 5, Some(addr), Arc::clone(&client_registry));
+        let mut client = ForwardClient::start(
+            config.clone(),
+            5,
+            0,
+            Some(addr),
+            Arc::clone(&client_registry),
+        );
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Forward a command to establish the route.
-        client.forward(cid1, b"cmd1").await;
+        client.forward(cid1, 0, b"cmd1").await;
         let _ = tokio::time::timeout(Duration::from_millis(200), batch_rx.recv()).await;
 
-        // Send responses via push_response_async (pre-framed: [12u32][cid][log_index]).
-        let mut resp = BytesMut::with_capacity(32);
-        resp.put_u32_le(12u32);
+        // Send responses via push_response_async.
+        // New format: [len=20:4][cid:4][request_seq:8][log_index:8]
+        let mut resp = BytesMut::with_capacity(48);
+        resp.put_u32_le(20u32);
         resp.put_u32_le(cid1);
-        resp.put_u64_le(100u64);
-        resp.put_u32_le(12u32);
+        resp.put_u64_le(0u64); // request_seq
+        resp.put_u64_le(100u64); // log_index
+        resp.put_u32_le(20u32);
         resp.put_u32_le(cid2);
-        resp.put_u64_le(200u64);
+        resp.put_u64_le(0u64); // request_seq
+        resp.put_u64_le(200u64); // log_index
         acceptor.push_response_async(5, resp.freeze()).await;
 
         // Both callbacks should fire.
@@ -1846,6 +1973,7 @@ mod tests {
     fn default_config() {
         let cfg = ForwardConfig::default();
         assert_eq!(cfg.responder_channel_capacity, 256);
+        assert_eq!(cfg.outbound_channel_capacity, 4096);
         assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
         assert!(cfg.tcp_nodelay);
     }
@@ -1908,5 +2036,136 @@ mod tests {
             assert_eq!(cid, *expected_cid);
             assert_eq!(data, expected_payload.as_ref());
         }
+    }
+
+    // ---- Batch framing tests ----
+
+    /// Helper: build a raw batch frame (follower→leader wire format) manually.
+    /// `[raft_group_id:4][batch_payload_len:4][sub-frames...]`
+    /// Each sub-frame: `[payload_len:4][client_id:4][request_seq:8][cmd_bytes...]`
+    fn build_batch_frame(commands: &[(u32, u64, &[u8])]) -> Bytes {
+        build_batch_frame_with_group(0, commands)
+    }
+
+    fn build_batch_frame_with_group(raft_group_id: u32, commands: &[(u32, u64, &[u8])]) -> Bytes {
+        let mut buf = BytesMut::new();
+
+        // Compute total payload size first.
+        let payload_len: usize = commands.iter().map(|(_, _, cmd)| 4 + 12 + cmd.len()).sum();
+
+        buf.extend_from_slice(&raft_group_id.to_le_bytes()); // raft_group_id:4
+        buf.extend_from_slice(&(payload_len as u32).to_le_bytes()); // batch_payload_len:4
+        for (client_id, request_seq, cmd) in commands {
+            let sub_payload_len = (12 + cmd.len()) as u32;
+            buf.extend_from_slice(&sub_payload_len.to_le_bytes()); // payload_len:4
+            buf.extend_from_slice(&client_id.to_le_bytes()); // client_id:4
+            buf.extend_from_slice(&request_seq.to_le_bytes()); // request_seq:8
+            buf.extend_from_slice(cmd); // cmd_bytes
+        }
+        buf.freeze()
+    }
+
+    #[test]
+    fn batch_frame_wire_format_roundtrip() {
+        // Build a batch frame with two commands and verify ForwardedBatchIter decodes it.
+        let raw = build_batch_frame(&[(1, 100, b"hello"), (2, 200, b"world")]);
+
+        // Skip batch header (4 bytes) to get sub-frames.
+        let sub_frames = raw.slice(BATCH_HEADER_LEN..);
+        let batch = ForwardedBatch {
+            node_id: 7,
+            raft_group_id: 0,
+            buf: sub_frames,
+            count: 2,
+        };
+
+        let items: Vec<_> = batch.iter().collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], (1, 100, b"hello".as_ref()));
+        assert_eq!(items[1], (2, 200, b"world".as_ref()));
+        assert_eq!(batch.node_id, 7);
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[test]
+    fn forwarded_batch_iter_single_cmd() {
+        let raw = build_batch_frame(&[(99, 42, b"payload")]);
+        let batch = ForwardedBatch {
+            node_id: 1,
+            raft_group_id: 0,
+            buf: raw.slice(BATCH_HEADER_LEN..),
+            count: 1,
+        };
+        let mut it = batch.iter();
+        let (cid, rseq, cmd) = it.next().unwrap();
+        assert_eq!(cid, 99);
+        assert_eq!(rseq, 42);
+        assert_eq!(cmd, b"payload");
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn forwarded_batch_iter_empty_cmd() {
+        let raw = build_batch_frame(&[(5, 0, b"")]);
+        let batch = ForwardedBatch {
+            node_id: 1,
+            raft_group_id: 0,
+            buf: raw.slice(BATCH_HEADER_LEN..),
+            count: 1,
+        };
+        let items: Vec<_> = batch.iter().collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0], (5u32, 0u64, b"".as_ref()));
+    }
+
+    #[test]
+    fn sub_frame_encoding() {
+        let frame = OutboundBuf::encode_sub_frame(42, 100, b"hello");
+        assert_eq!(frame.len(), 16 + 5); // 4+4+8+5
+        let payload_len = u32::from_le_bytes(frame[0..4].try_into().unwrap());
+        assert_eq!(payload_len, 17); // 12 + 5
+        let client_id = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+        assert_eq!(client_id, 42);
+        let request_seq = u64::from_le_bytes(frame[8..16].try_into().unwrap());
+        assert_eq!(request_seq, 100);
+        assert_eq!(&frame[16..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn outbound_channel_try_write() {
+        let (tx, rx) = crossfire::mpsc::bounded_async::<Bytes>(16);
+        let outbound = OutboundBuf { tx };
+
+        assert!(outbound.try_write(1, 10, b"cmd_a"));
+        assert!(outbound.try_write(2, 11, b"cmd_b"));
+
+        let frame1 = rx.try_recv().unwrap();
+        let frame2 = rx.try_recv().unwrap();
+
+        // Verify sub-frame wire format.
+        let cid1 = u32::from_le_bytes(frame1[4..8].try_into().unwrap());
+        let cid2 = u32::from_le_bytes(frame2[4..8].try_into().unwrap());
+        assert_eq!(cid1, 1);
+        assert_eq!(cid2, 2);
+    }
+
+    #[test]
+    fn forwarded_batch_iter_request_seq_roundtrip() {
+        // Verify request_seq is correctly encoded and decoded.
+        let raw = build_batch_frame(&[
+            (10, 0, b"zero_seq"),       // request_seq = 0 (write_batcher path)
+            (20, u64::MAX, b"max_seq"), // request_seq = u64::MAX
+            (30, 12345678, b"mid"),
+        ]);
+        let batch = ForwardedBatch {
+            node_id: 1,
+            raft_group_id: 0,
+            buf: raw.slice(BATCH_HEADER_LEN..),
+            count: 3,
+        };
+        let items: Vec<_> = batch.iter().collect();
+        assert_eq!(items[0], (10, 0, b"zero_seq".as_ref()));
+        assert_eq!(items[1], (20, u64::MAX, b"max_seq".as_ref()));
+        assert_eq!(items[2], (30, 12345678, b"mid".as_ref()));
     }
 }
