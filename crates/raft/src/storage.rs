@@ -11,6 +11,7 @@ use openraft::RaftTypeConfig;
 use openraft::storage::RaftLogStorage;
 use parking_lot::Mutex;
 use std::future::Future;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -36,7 +37,10 @@ where
     ///
     /// The first call for a new group_id may perform recovery operations
     /// using async I/O.
-    fn get_log_storage(&self, group_id: u64) -> impl Future<Output = Self::GroupLogStorage> + Send;
+    fn get_log_storage(
+        &self,
+        group_id: u64,
+    ) -> impl Future<Output = io::Result<Self::GroupLogStorage>> + Send;
 
     /// Remove a group from this storage.
     ///

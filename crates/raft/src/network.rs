@@ -103,7 +103,10 @@ where
     type Network = MultiRaftNetwork<C, T>;
 
     async fn new_client(&mut self, _target: C::NodeId, _node: &C::Node) -> Self::Network {
-        panic!("MultiRaftNetworkFactory cannot be used directly. Use GroupNetworkFactory.");
+        // This trait impl exists only to satisfy OpenRaft's type requirements.
+        // All actual networking goes through GroupNetworkFactory, which wraps
+        // this factory with a group_id. Reaching this code is a programming error.
+        unreachable!("MultiRaftNetworkFactory cannot be used directly. Use GroupNetworkFactory.");
     }
 }
 

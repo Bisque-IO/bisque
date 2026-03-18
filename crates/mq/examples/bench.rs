@@ -751,7 +751,7 @@ fn bench_command_encoding_scatter(config: &BenchConfig, msg_size: usize) -> Benc
         // let owned = batch.clone();
         let mut cmd = MqCommand::publish_scatter(&mut buf, i as u64, owned);
         std::hint::black_box(&cmd);
-        owned = cmd.take_publish_segments();
+        owned = cmd.take_publish_segments().unwrap();
     }
     let elapsed = start.elapsed();
 

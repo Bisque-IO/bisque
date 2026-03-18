@@ -11,6 +11,26 @@ use std::marker::Unpin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Error returned when adding a Raft group fails.
+#[derive(Debug)]
+pub enum AddGroupError<C: RaftTypeConfig> {
+    /// Failed to create or recover the group's log storage.
+    Storage(std::io::Error),
+    /// The Raft instance failed to initialize.
+    Raft(openraft::error::Fatal<C>),
+}
+
+impl<C: RaftTypeConfig> std::fmt::Display for AddGroupError<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(e) => write!(f, "log storage error: {e}"),
+            Self::Raft(e) => write!(f, "raft initialization error: {e}"),
+        }
+    }
+}
+
+impl<C: RaftTypeConfig> std::error::Error for AddGroupError<C> {}
+
 /// Manager for multiple Raft groups.
 ///
 /// The manager handles:
@@ -58,14 +78,18 @@ where
         node_id: C::NodeId,
         raft_config: Arc<Config>,
         state_machine: SM,
-    ) -> Result<Raft<C>, openraft::error::Fatal<C>>
+    ) -> Result<Raft<C>, AddGroupError<C>>
     where
         C::SnapshotData: AsyncRead + AsyncWrite + Unpin,
         C::Entry: Clone,
         SM: RaftStateMachine<C>,
     {
         let group_factory = GroupNetworkFactory::new(self.network_factory.clone(), group_id);
-        let log_store = self.storage.get_log_storage(group_id).await;
+        let log_store = self
+            .storage
+            .get_log_storage(group_id)
+            .await
+            .map_err(AddGroupError::Storage)?;
 
         let raft = Raft::new(
             node_id,
@@ -74,7 +98,8 @@ where
             log_store,
             state_machine,
         )
-        .await?;
+        .await
+        .map_err(AddGroupError::Raft)?;
 
         self.groups.insert(group_id, raft.clone());
         Ok(raft)
@@ -322,11 +347,12 @@ mod tests {
     impl MultiRaftLogStorage<TestConfig> for InMemoryMultiStorage {
         type GroupLogStorage = InMemoryLogStorage;
 
-        async fn get_log_storage(&self, group_id: u64) -> Self::GroupLogStorage {
-            self.storages
+        async fn get_log_storage(&self, group_id: u64) -> std::io::Result<Self::GroupLogStorage> {
+            Ok(self
+                .storages
                 .entry(group_id)
                 .or_insert_with(InMemoryLogStorage::new)
-                .clone()
+                .clone())
         }
 
         fn remove_group(&self, group_id: u64) {

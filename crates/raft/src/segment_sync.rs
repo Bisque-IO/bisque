@@ -558,6 +558,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestTempDir;
 
     #[test]
     fn test_validate_relative_path() {
@@ -595,7 +596,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_empty_manifest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestTempDir::new();
         let client = SegmentSyncClient::new(SegmentSyncClientConfig {
             data_dir: dir.path().to_path_buf(),
             #[cfg(feature = "tls")]
@@ -613,8 +614,8 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
 
         // Create a temporary leader data dir with a segment file
-        let leader_dir = tempfile::tempdir().unwrap();
-        let follower_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
+        let follower_dir = TestTempDir::new();
 
         let seg_data = vec![42u8; 4096];
         std::fs::write(leader_dir.path().join("seg_000001.log"), &seg_data).unwrap();
@@ -687,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_list_segment_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestTempDir::new();
         std::fs::write(dir.path().join("seg_000001.log"), &[0u8; 100]).unwrap();
         std::fs::write(dir.path().join("seg_000003.log"), &[0u8; 200]).unwrap();
         std::fs::write(dir.path().join("not_a_segment.txt"), &[0u8; 50]).unwrap();
@@ -702,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_list_segment_files_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestTempDir::new();
         let entries = list_segment_files(dir.path()).unwrap();
         assert!(entries.is_empty());
     }
@@ -753,8 +754,8 @@ mod tests {
     #[tokio::test]
     async fn test_sync_large_file_multi_chunk() {
         // File larger than STREAM_CHUNK_SIZE (256 KB) to exercise chunked transfer
-        let leader_dir = tempfile::tempdir().unwrap();
-        let follower_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
+        let follower_dir = TestTempDir::new();
 
         let large_data: Vec<u8> = (0..=255u8).cycle().take(512 * 1024).collect();
         std::fs::write(leader_dir.path().join("seg_000001.log"), &large_data).unwrap();
@@ -787,8 +788,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_verification_failure_size_mismatch() {
-        let leader_dir = tempfile::tempdir().unwrap();
-        let follower_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
+        let follower_dir = TestTempDir::new();
 
         // Write a file that's 100 bytes
         std::fs::write(leader_dir.path().join("seg_000001.log"), &[7u8; 100]).unwrap();
@@ -818,8 +819,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_all_files_missing() {
-        let leader_dir = tempfile::tempdir().unwrap();
-        let follower_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
+        let follower_dir = TestTempDir::new();
 
         // No files on leader
         let manifest = vec![
@@ -853,8 +854,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_subdirectory_paths() {
-        let leader_dir = tempfile::tempdir().unwrap();
-        let follower_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
+        let follower_dir = TestTempDir::new();
 
         // Create files in a subdirectory
         std::fs::create_dir_all(leader_dir.path().join("group_1")).unwrap();
@@ -886,8 +887,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_content_integrity_multiple_files() {
-        let leader_dir = tempfile::tempdir().unwrap();
-        let follower_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
+        let follower_dir = TestTempDir::new();
 
         // Create files with distinct content patterns
         let file1: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
@@ -948,7 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_rejects_invalid_magic() {
-        let leader_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
         let (addr, tx, handle) = start_server(leader_dir.path().to_path_buf()).await;
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -976,7 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_rejects_invalid_version() {
-        let leader_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
         let (addr, tx, handle) = start_server(leader_dir.path().to_path_buf()).await;
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1003,8 +1004,8 @@ mod tests {
     #[tokio::test]
     async fn test_sync_single_file_exact_chunk_boundary() {
         // File exactly equal to STREAM_CHUNK_SIZE
-        let leader_dir = tempfile::tempdir().unwrap();
-        let follower_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
+        let follower_dir = TestTempDir::new();
 
         let data = vec![0xABu8; STREAM_CHUNK_SIZE];
         std::fs::write(leader_dir.path().join("seg_000001.log"), &data).unwrap();
@@ -1036,8 +1037,8 @@ mod tests {
     #[tokio::test]
     async fn test_sync_empty_file() {
         // Zero-byte file on leader — should transfer successfully
-        let leader_dir = tempfile::tempdir().unwrap();
-        let follower_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
+        let follower_dir = TestTempDir::new();
 
         std::fs::write(leader_dir.path().join("seg_000001.log"), &[]).unwrap();
 
@@ -1065,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_connect_refused() {
-        let follower_dir = tempfile::tempdir().unwrap();
+        let follower_dir = TestTempDir::new();
         let client = make_client(follower_dir.path().to_path_buf());
 
         let manifest = vec![SnapshotFileEntry {
@@ -1081,8 +1082,8 @@ mod tests {
     #[tokio::test]
     async fn test_sync_manifest_serde_roundtrip_via_protocol() {
         // Verify the full manifest survives encode→send→receive→decode
-        let leader_dir = tempfile::tempdir().unwrap();
-        let follower_dir = tempfile::tempdir().unwrap();
+        let leader_dir = TestTempDir::new();
+        let follower_dir = TestTempDir::new();
 
         // Create many files with various name patterns
         let mut manifest = Vec::new();

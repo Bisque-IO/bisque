@@ -207,6 +207,7 @@ impl MqState {
             None,
             group_id,
             &catalog_name,
+            None,
         ));
 
         // Router

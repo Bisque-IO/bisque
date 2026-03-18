@@ -17,6 +17,7 @@ use crate::MqTypeConfig;
 use crate::async_apply::{AsyncApplyManager, ResponseEntry};
 use crate::config::MqConfig;
 use crate::engine::MqEngine;
+use crate::forward::RaftBacklog;
 use crate::manifest::{GroupMeta, MqManifestManager, StructuralWrite};
 use crate::metadata::MqMetadata;
 use crate::retention::RetentionEvaluator;
@@ -64,6 +65,9 @@ pub struct MqStateMachine {
     /// Level 2 retention evaluator — deletes segment files based on
     /// per-entity retention policies.
     retention_evaluator: Option<Arc<RetentionEvaluator>>,
+    /// Shared raft backlog budget. Released here in `apply()` after each
+    /// TAG_BATCH / TAG_FORWARDED_BATCH entry is committed.
+    raft_backlog: Option<Arc<RaftBacklog>>,
 }
 
 impl MqStateMachine {
@@ -85,16 +89,17 @@ impl MqStateMachine {
             purged_segments: None,
             async_apply: None,
             retention_evaluator: None,
+            raft_backlog: None,
         }
     }
 
     /// Initialize the pull-based async apply system. Call after all builder
     /// methods are invoked, before the state machine is used.
-    pub fn init_async_apply(&mut self, config: &MqConfig) {
+    pub fn init_async_apply(&mut self, config: &MqConfig) -> Result<(), String> {
         let prefetcher = self
             .prefetcher
             .clone()
-            .expect("init_async_apply requires a prefetcher");
+            .ok_or_else(|| "init_async_apply requires a prefetcher".to_string())?;
         let initial_cursor = self.last_applied.map(|la| la.index).unwrap_or(0);
         let manager = AsyncApplyManager::new(
             &config.parallel_apply,
@@ -107,6 +112,7 @@ impl MqStateMachine {
             &config.catalog_name,
         );
         self.async_apply = Some(Arc::new(manager));
+        Ok(())
     }
 
     /// Get a shared reference to the async apply manager.
@@ -181,6 +187,11 @@ impl MqStateMachine {
 
     pub fn with_group_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.group_dir = Some(dir);
+        self
+    }
+
+    pub fn with_raft_backlog(mut self, backlog: Arc<RaftBacklog>) -> Self {
+        self.raft_backlog = Some(backlog);
         self
     }
 
@@ -376,9 +387,20 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
             self.last_applied = Some(entry.log_id);
             had_entries = true;
 
-            match entry.payload {
+            match &entry.payload {
                 EntryPayload::Membership(membership) => {
-                    self.last_membership = StoredMembership::new(Some(entry.log_id), membership);
+                    self.last_membership =
+                        StoredMembership::new(Some(entry.log_id), membership.clone());
+                }
+                EntryPayload::Normal(cmd) => {
+                    // Release raft backlog budget for commands that were charged
+                    // on submission (TAG_FORWARDED_BATCH, TAG_BATCH).
+                    if let Some(ref backlog) = self.raft_backlog {
+                        let tag = cmd.tag();
+                        if tag == MqCommand::TAG_FORWARDED_BATCH || tag == MqCommand::TAG_BATCH {
+                            backlog.release(cmd.total_encoded_size());
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -396,11 +418,7 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
             return Ok(());
         }
 
-        {
-            let async_apply = self
-                .async_apply
-                .as_ref()
-                .expect("async_apply must be initialized before apply()");
+        if let Some(ref async_apply) = self.async_apply {
             async_apply.drain_purged_segments();
             if let Some(ref la) = self.last_applied {
                 async_apply.advance_hwm(la.index);
@@ -699,33 +717,50 @@ fn classify_structural_buf(buf: &[u8]) -> StructuralKind {
     use crate::codec::{CmdBatch, CmdDeleteRetained, CmdSetRetained};
     use crate::types::{buf_field_u64, buf_tag};
 
+    if buf.len() < 8 {
+        return StructuralKind::None;
+    }
+
     match buf_tag(buf) {
         MqCommand::TAG_CREATE_TOPIC => StructuralKind::CreateTopic,
-        MqCommand::TAG_DELETE_TOPIC => StructuralKind::DeleteTopic(buf_field_u64(buf, 8)),
+        MqCommand::TAG_DELETE_TOPIC if buf.len() >= 16 => {
+            StructuralKind::DeleteTopic(buf_field_u64(buf, 8))
+        }
         MqCommand::TAG_CREATE_EXCHANGE => StructuralKind::CreateExchange,
-        MqCommand::TAG_DELETE_EXCHANGE => StructuralKind::DeleteExchange(buf_field_u64(buf, 8)),
+        MqCommand::TAG_DELETE_EXCHANGE if buf.len() >= 16 => {
+            StructuralKind::DeleteExchange(buf_field_u64(buf, 8))
+        }
         MqCommand::TAG_CREATE_CONSUMER_GROUP => StructuralKind::CreateConsumerGroup,
-        MqCommand::TAG_DELETE_CONSUMER_GROUP => {
+        MqCommand::TAG_DELETE_CONSUMER_GROUP if buf.len() >= 16 => {
             StructuralKind::DeleteConsumerGroup(buf_field_u64(buf, 8))
         }
         MqCommand::TAG_CREATE_SESSION => StructuralKind::CreateSession,
         MqCommand::TAG_SET_RETAINED | MqCommand::TAG_SET_RETAINED_MQTT => {
-            let v = CmdSetRetained::from_buf(buf);
+            let v = match CmdSetRetained::from_buf(buf) {
+                Ok(v) => v,
+                Err(_) => return StructuralKind::None,
+            };
             StructuralKind::SetRetained {
                 exchange_id: v.exchange_id(),
-                routing_key: v.routing_key().to_owned(),
-                message: v.message().to_vec(),
+                routing_key: v.routing_key().unwrap_or("").to_owned(),
+                message: v.message().unwrap_or_default().to_vec(),
             }
         }
         MqCommand::TAG_DELETE_RETAINED => {
-            let v = CmdDeleteRetained::from_buf(buf);
+            let v = match CmdDeleteRetained::from_buf(buf) {
+                Ok(v) => v,
+                Err(_) => return StructuralKind::None,
+            };
             StructuralKind::DeleteRetained {
                 exchange_id: v.exchange_id(),
-                routing_key: v.routing_key().to_owned(),
+                routing_key: v.routing_key().unwrap_or("").to_owned(),
             }
         }
         MqCommand::TAG_BATCH => {
-            let batch = CmdBatch::from_buf(buf);
+            let batch = match CmdBatch::from_buf(buf) {
+                Ok(b) => b,
+                Err(_) => return StructuralKind::None,
+            };
             let kinds: Vec<StructuralKind> = batch
                 .commands()
                 .map(|c| classify_structural_buf(c))

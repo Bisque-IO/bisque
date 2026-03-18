@@ -428,13 +428,15 @@ impl<C> Encode for openraft::impls::leader_id_adv::LeaderId<C>
 where
     C: RaftTypeConfig<NodeId = u64, Term = u64>,
 {
+    /// Wire format: `[term:8][node_id:4][pad:4]` = 16 bytes, 8-byte aligned.
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         self.term.encode(writer)?;
-        self.node_id.encode(writer)?;
+        (self.node_id as u32).encode(writer)?;
+        writer.write_all(&[0u8; 4])?; // padding for 8-byte alignment
         Ok(())
     }
     fn encoded_size(&self) -> usize {
-        16 // 8 + 8
+        16 // 8 + 4 + 4pad
     }
 }
 
@@ -443,10 +445,11 @@ where
     C: RaftTypeConfig<NodeId = u64, Term = u64>,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
-        Ok(Self {
-            term: u64::decode(reader)?,
-            node_id: u64::decode(reader)?,
-        })
+        let term = u64::decode(reader)?;
+        let node_id = u32::decode(reader)? as u64;
+        let mut _pad = [0u8; 4];
+        reader.read_exact(&mut _pad)?;
+        Ok(Self { term, node_id })
     }
 }
 
@@ -460,14 +463,14 @@ where
             LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
         >,
 {
+    /// Wire format: `[leader_id:16][index:8]` = 24 bytes, 8-byte aligned.
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
-        self.leader_id.term.encode(writer)?;
-        self.leader_id.node_id.encode(writer)?;
+        self.leader_id.encode(writer)?;
         self.index.encode(writer)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
-        24 // 8 + 8 + 8
+        24 // 16 + 8
     }
 }
 
@@ -480,13 +483,9 @@ where
         >,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
-        let term = u64::decode(reader)?;
-        let node_id = u64::decode(reader)?;
+        let leader_id = openraft::impls::leader_id_adv::LeaderId::<C>::decode(reader)?;
         let index = u64::decode(reader)?;
-        Ok(Self {
-            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
-            index,
-        })
+        Ok(Self { leader_id, index })
     }
 }
 
@@ -500,13 +499,18 @@ where
             LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
         >,
 {
+    /// Wire format: `[term:8][node_id:4][committed:1][pad:3]` = 16 bytes, 8-byte aligned.
+    /// Packs committed into LeaderId's trailing padding to avoid wasting a full
+    /// 8-byte slot on a single boolean.
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
-        self.leader_id.encode(writer)?;
+        self.leader_id.term.encode(writer)?;
+        (self.leader_id.node_id as u32).encode(writer)?;
         self.committed.encode(writer)?;
+        writer.write_all(&[0u8; 3])?; // padding for 8-byte alignment
         Ok(())
     }
     fn encoded_size(&self) -> usize {
-        17 // 16 + 1
+        16 // 8 + 4 + 1 + 3pad
     }
 }
 
@@ -519,9 +523,14 @@ where
         >,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
+        let term = u64::decode(reader)?;
+        let node_id = u32::decode(reader)? as u64;
+        let committed = bool::decode(reader)?;
+        let mut _pad = [0u8; 3];
+        reader.read_exact(&mut _pad)?;
         Ok(Self {
-            leader_id: openraft::impls::leader_id_adv::LeaderId::<C>::decode(reader)?,
-            committed: bool::decode(reader)?,
+            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
+            committed,
         })
     }
 }
@@ -618,25 +627,27 @@ where
     C: RaftTypeConfig<NodeId = u64, Node = openraft::impls::BasicNode>,
     C::D: Encode,
 {
+    /// Encode the payload data **without** the tag byte.
+    ///
+    /// The tag is packed into the Entry header's padding region, so
+    /// `EntryPayload::encode` only writes the data portion.  Standalone
+    /// callers that need the tag must write it themselves.
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         match self {
-            openraft::EntryPayload::Blank => {
-                (EntryPayloadType::Blank as u8).encode(writer)?;
-            }
+            openraft::EntryPayload::Blank => {}
             openraft::EntryPayload::Normal(data) => {
-                (EntryPayloadType::Normal as u8).encode(writer)?;
                 data.encode(writer)?;
             }
             openraft::EntryPayload::Membership(membership) => {
-                (EntryPayloadType::Membership as u8).encode(writer)?;
                 membership.encode(writer)?;
             }
         }
         Ok(())
     }
 
+    /// Size of the payload data **without** the tag byte.
     fn encoded_size(&self) -> usize {
-        1 + match self {
+        match self {
             openraft::EntryPayload::Blank => 0,
             openraft::EntryPayload::Normal(data) => data.encoded_size(),
             openraft::EntryPayload::Membership(membership) => membership.encoded_size(),
@@ -649,37 +660,20 @@ where
     C: RaftTypeConfig<NodeId = u64, Node = openraft::impls::BasicNode>,
     C::D: Decode,
 {
-    fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
-        let tag = EntryPayloadType::try_from(u8::decode(reader)?)?;
-        match tag {
-            EntryPayloadType::Blank => Ok(openraft::EntryPayload::Blank),
-            EntryPayloadType::Normal => Ok(openraft::EntryPayload::Normal(C::D::decode(reader)?)),
-            EntryPayloadType::Membership => Ok(openraft::EntryPayload::Membership(
-                openraft::Membership::<C>::decode(reader)?,
-            )),
-        }
+    /// Decode payload data **without** reading a tag byte.
+    ///
+    /// The caller (Entry::decode) is responsible for reading the tag from the
+    /// entry header and dispatching to the right variant.  This method is
+    /// therefore unused — Entry::decode calls the per-variant decoders directly.
+    fn decode<R: Read>(_reader: &mut R) -> Result<Self, CodecError> {
+        Err(CodecError::DataCorruption)
     }
 
-    fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, CodecError> {
-        if data.is_empty() {
-            return Err(CodecError::BufferTooSmall { needed: 1, have: 0 });
-        }
-        let tag = EntryPayloadType::try_from(data[0])?;
-        match tag {
-            EntryPayloadType::Blank => Ok(openraft::EntryPayload::Blank),
-            EntryPayloadType::Normal => {
-                let payload_bytes = data.slice(1..);
-                Ok(openraft::EntryPayload::Normal(C::D::decode_from_bytes(
-                    payload_bytes,
-                )?))
-            }
-            EntryPayloadType::Membership => {
-                let payload_bytes = data.slice(1..);
-                Ok(openraft::EntryPayload::Membership(
-                    openraft::Membership::<C>::decode_from_slice(&payload_bytes)?,
-                ))
-            }
-        }
+    /// Decode payload data from bytes **without** a leading tag byte.
+    ///
+    /// Same caveat as `decode` — Entry::decode_from_bytes handles the tag.
+    fn decode_from_bytes(_data: bytes::Bytes) -> Result<Self, CodecError> {
+        Err(CodecError::DataCorruption)
     }
 }
 
@@ -695,14 +689,37 @@ where
         >,
     C::D: Encode,
 {
+    /// Wire format: `[term:8][node_id:4][tag:1][pad:3][index:8][payload_data...]`
+    ///
+    /// The payload tag is packed into the 4-byte padding after node_id (within
+    /// the LeaderId region), saving 8 bytes of alignment waste per entry
+    /// compared to the old `[term:8][node_id:8][index:8][tag:1]` layout.
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
-        self.log_id.encode(writer)?;
-        self.payload.encode(writer)?;
+        self.log_id.leader_id.term.encode(writer)?;
+        (self.log_id.leader_id.node_id as u32).encode(writer)?;
+        // Pack tag + 3 pad bytes into the 4 bytes after node_id
+        let tag = match &self.payload {
+            openraft::EntryPayload::Blank => EntryPayloadType::Blank as u8,
+            openraft::EntryPayload::Normal(_) => EntryPayloadType::Normal as u8,
+            openraft::EntryPayload::Membership(_) => EntryPayloadType::Membership as u8,
+        };
+        writer.write_all(&[tag, 0, 0, 0])?; // tag + 3 pad
+        self.log_id.index.encode(writer)?;
+        // Write payload data (without tag — it's already in the header)
+        match &self.payload {
+            openraft::EntryPayload::Blank => {}
+            openraft::EntryPayload::Normal(data) => data.encode(writer)?,
+            openraft::EntryPayload::Membership(membership) => membership.encode(writer)?,
+        }
         Ok(())
     }
 
     fn encoded_size(&self) -> usize {
-        self.log_id.encoded_size() + self.payload.encoded_size()
+        24 + match &self.payload {
+            openraft::EntryPayload::Blank => 0,
+            openraft::EntryPayload::Normal(data) => data.encoded_size(),
+            openraft::EntryPayload::Membership(membership) => membership.encoded_size(),
+        }
     }
 }
 
@@ -717,22 +734,42 @@ where
     C::D: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
-        Ok(Self {
-            log_id: openraft::LogId::<C>::decode(reader)?,
-            payload: openraft::EntryPayload::<C>::decode(reader)?,
-        })
+        let term = u64::decode(reader)?;
+        let node_id = u32::decode(reader)? as u64;
+        let tag = u8::decode(reader)?;
+        let mut _pad = [0u8; 3];
+        reader.read_exact(&mut _pad)?;
+        let index = u64::decode(reader)?;
+
+        let log_id = openraft::LogId::<C> {
+            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
+            index,
+        };
+
+        let payload_tag = EntryPayloadType::try_from(tag)?;
+        let payload = match payload_tag {
+            EntryPayloadType::Blank => openraft::EntryPayload::Blank,
+            EntryPayloadType::Normal => openraft::EntryPayload::Normal(C::D::decode(reader)?),
+            EntryPayloadType::Membership => {
+                openraft::EntryPayload::Membership(openraft::Membership::<C>::decode(reader)?)
+            }
+        };
+
+        Ok(Self { log_id, payload })
     }
 
     fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, CodecError> {
-        // Entry layout: [term:8][node_id:8][index:8][payload_tag:1][payload...]
-        if data.len() < 25 {
+        // Entry layout: [term:8][node_id:4][tag:1][pad:3][index:8][payload_data...]
+        if data.len() < 24 {
             return Err(CodecError::BufferTooSmall {
-                needed: 25,
+                needed: 24,
                 have: data.len(),
             });
         }
         let term = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let node_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let node_id = u32::from_le_bytes(data[8..12].try_into().unwrap()) as u64;
+        let tag = data[12];
+        // data[13..16] = padding
         let index = u64::from_le_bytes(data[16..24].try_into().unwrap());
 
         let log_id = openraft::LogId::<C> {
@@ -740,8 +777,20 @@ where
             index,
         };
 
-        let payload_bytes = data.slice(24..);
-        let payload = openraft::EntryPayload::<C>::decode_from_bytes(payload_bytes)?;
+        let payload_tag = EntryPayloadType::try_from(tag)?;
+        let payload = match payload_tag {
+            EntryPayloadType::Blank => openraft::EntryPayload::Blank,
+            EntryPayloadType::Normal => {
+                let payload_bytes = data.slice(24..);
+                openraft::EntryPayload::Normal(C::D::decode_from_bytes(payload_bytes)?)
+            }
+            EntryPayloadType::Membership => {
+                let payload_bytes = data.slice(24..);
+                openraft::EntryPayload::Membership(openraft::Membership::<C>::decode_from_slice(
+                    &payload_bytes,
+                )?)
+            }
+        };
 
         Ok(Self { log_id, payload })
     }
@@ -1554,7 +1603,7 @@ mod tests {
     fn test_vote_roundtrip() {
         let val = make_vote(5, 10, true);
         let encoded = val.encode_to_vec().unwrap();
-        assert_eq!(encoded.len(), 17);
+        assert_eq!(encoded.len(), 16);
         let decoded = openraft::impls::Vote::<C>::decode_from_slice(&encoded).unwrap();
         assert_eq!(val, decoded);
     }
@@ -1810,10 +1859,10 @@ mod tests {
     fn test_corrupted_vote() {
         let vote = make_vote(5, 10, true);
         let encoded = vote.encode_to_vec().unwrap();
-        assert_eq!(encoded.len(), 17);
+        assert_eq!(encoded.len(), 16);
 
         // Vote doesn't include CRC validation; the only reliable failure mode is truncation.
-        let invalid_too_short = vec![0xFFu8; 16];
+        let invalid_too_short = vec![0xFFu8; 15];
         assert!(openraft::impls::Vote::<C>::decode_from_slice(&invalid_too_short).is_err());
     }
 

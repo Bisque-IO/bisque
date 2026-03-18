@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
 use crate::MqTypeConfig;
-use crate::types::MqSnapshotData;
+use crate::types::{MqSnapshotData, read_u64_le};
 
 // MDBX table names
 const META_TABLE: &str = "mq_meta";
@@ -427,6 +427,7 @@ impl GroupMdbxEnv {
         // Read next_id from meta table
         let next_id = match txn.get::<std::borrow::Cow<[u8]>>(&meta_tbl, NEXT_ID_KEY) {
             Ok(Some(bytes)) if bytes.len() == 8 => {
+                // SAFETY: guarded by bytes.len() == 8 check above
                 u64::from_le_bytes(bytes[..8].try_into().unwrap())
             }
             _ => 1,
@@ -522,6 +523,7 @@ impl GroupMdbxEnv {
         // Read structural purge floor
         let floor = match txn.get::<std::borrow::Cow<[u8]>>(&meta_tbl, STRUCTURAL_FLOOR_KEY) {
             Ok(Some(bytes)) if bytes.len() == 8 => {
+                // SAFETY: guarded by bytes.len() == 8 check above
                 u64::from_le_bytes(bytes[..8].try_into().unwrap())
             }
             Ok(_) => return Ok(None),
@@ -531,6 +533,7 @@ impl GroupMdbxEnv {
         // Read next_id
         let next_id = match txn.get::<std::borrow::Cow<[u8]>>(&meta_tbl, NEXT_ID_KEY) {
             Ok(Some(bytes)) if bytes.len() == 8 => {
+                // SAFETY: guarded by bytes.len() == 8 check above
                 u64::from_le_bytes(bytes[..8].try_into().unwrap())
             }
             Ok(_) => 1,
@@ -594,6 +597,7 @@ impl GroupMdbxEnv {
                     sessions.push(meta);
                 }
                 b'R' => {
+                    // SAFETY: guarded by key.len() == 9 check above
                     let exchange_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
                     let (entries, _): (Vec<(String, Vec<u8>)>, _) =
                         bincode::serde::decode_from_slice(&value, bincode::config::standard())
@@ -989,6 +993,7 @@ impl GroupMdbxEnv {
 
             if let Some(val) = found {
                 if val.len() == SEGMENT_RANGE_VALUE_SIZE {
+                    // SAFETY: guarded by val.len() == SEGMENT_RANGE_VALUE_SIZE (24) check above
                     let found_seg_id = u64::from_le_bytes(val[..8].try_into().unwrap());
                     if found_seg_id == segment_id {
                         let _ = cursor.del(WriteFlags::empty());
@@ -1062,6 +1067,7 @@ impl GroupMdbxEnv {
                         decode_segment_range_value(&val);
                     if found_seg_id == segment_id {
                         let entity_type = key[0];
+                        // SAFETY: guarded by key.len() == 9 check above
                         let entity_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
                         results.push((entity_type, entity_id, record_count, total_bytes));
                     }
@@ -1094,9 +1100,12 @@ fn segment_range_value(segment_id: u64, record_count: u64, total_bytes: u64) -> 
 
 /// Decode a segment_ranges value into `(segment_id, record_count, total_bytes)`.
 fn decode_segment_range_value(val: &[u8]) -> (u64, u64, u64) {
-    let segment_id = u64::from_le_bytes(val[0..8].try_into().unwrap());
-    let record_count = u64::from_le_bytes(val[8..16].try_into().unwrap());
-    let total_bytes = u64::from_le_bytes(val[16..24].try_into().unwrap());
+    if val.len() < 24 {
+        return (0, 0, 0);
+    }
+    let segment_id = read_u64_le(val, 0).unwrap_or(0);
+    let record_count = read_u64_le(val, 8).unwrap_or(0);
+    let total_bytes = read_u64_le(val, 16).unwrap_or(0);
     (segment_id, record_count, total_bytes)
 }
 

@@ -128,11 +128,11 @@ fn scanner_single_segment() {
         let rec = scanner.next_record().unwrap();
         assert_eq!(rec.log_index, 1);
         assert_eq!(rec.command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(rec.command.as_publish().topic_id(), 10);
+        assert_eq!(rec.command.as_publish().unwrap().topic_id(), 10);
 
         let rec = scanner.next_record().unwrap();
         assert_eq!(rec.log_index, 2);
-        assert_eq!(rec.command.as_publish().topic_id(), 20);
+        assert_eq!(rec.command.as_publish().unwrap().topic_id(), 20);
 
         let rec = scanner.next_record().unwrap();
         assert_eq!(rec.log_index, 3);
@@ -201,7 +201,7 @@ fn scanner_entity_filter_across_segments() {
 
         let mut topic1_count = 0;
         while let Some(rec) = scanner.next_record_for_entity(MqCommand::TAG_PUBLISH, 1) {
-            assert_eq!(rec.command.as_publish().topic_id(), 1);
+            assert_eq!(rec.command.as_publish().unwrap().topic_id(), 1);
             topic1_count += 1;
         }
         // indices 1,4,7,10,13,16,19 → i%3==1 → 7 entries
@@ -350,7 +350,7 @@ fn read_command_returns_correct_command() {
 
         let result = read_command(&prefetcher, 1).unwrap();
         assert_eq!(result.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(result.as_publish().topic_id(), 42);
+        assert_eq!(result.as_publish().unwrap().topic_id(), 42);
 
         storage.stop();
     });
@@ -728,8 +728,8 @@ fn cursor_from_real_segment_bytes() {
         let all = cursor.collect_all();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(all[0].command.as_publish().topic_id(), 10);
-        assert_eq!(all[1].command.as_publish().topic_id(), 20);
+        assert_eq!(all[0].command.as_publish().unwrap().topic_id(), 10);
+        assert_eq!(all[1].command.as_publish().unwrap().topic_id(), 20);
         assert_eq!(all[2].command.tag(), MqCommand::TAG_PUBLISH);
 
         storage.stop();
@@ -800,8 +800,8 @@ fn cursor_batch_with_real_storage() {
         assert_eq!(all[1].log_index, 2);
         assert_eq!(all[2].log_index, 2);
         assert_eq!(all[3].log_index, 2);
-        assert_eq!(all[1].command.as_publish().topic_id(), 1);
-        assert_eq!(all[2].command.as_publish().topic_id(), 2);
+        assert_eq!(all[1].command.as_publish().unwrap().topic_id(), 1);
+        assert_eq!(all[2].command.as_publish().unwrap().topic_id(), 2);
         assert_eq!(all[3].command.tag(), MqCommand::TAG_PUBLISH);
 
         storage.stop();

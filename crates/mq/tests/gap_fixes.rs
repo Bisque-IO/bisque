@@ -77,12 +77,12 @@ fn test_binding_subscription_id_codec() {
         Some(42),
     );
     let cmd = MqCommand::split_from(&mut buf);
-    let view = cmd.as_create_binding();
+    let view = cmd.as_create_binding().unwrap();
     assert_eq!(view.exchange_id(), 10);
     assert_eq!(view.topic_id(), 20);
-    assert_eq!(view.routing_key(), Some("sensors/#".to_string()));
+    assert_eq!(view.routing_key().unwrap(), Some("sensors/#".to_string()));
     assert!(!view.no_local());
-    assert_eq!(view.shared_group(), None);
+    assert_eq!(view.shared_group().unwrap(), None);
     assert_eq!(view.subscription_id(), Some(42));
 }
 
@@ -99,9 +99,9 @@ fn test_binding_subscription_id_none_codec() {
         None,
     );
     let cmd = MqCommand::split_from(&mut buf);
-    let view = cmd.as_create_binding();
+    let view = cmd.as_create_binding().unwrap();
     assert!(view.no_local());
-    assert_eq!(view.shared_group(), Some("group1".to_string()));
+    assert_eq!(view.shared_group().unwrap(), Some("group1".to_string()));
     assert_eq!(view.subscription_id(), None);
 }
 
@@ -137,7 +137,7 @@ fn test_binding_backward_compat_subscription_id_none() {
     let mut buf = BytesMut::new();
     MqCommand::write_create_binding(&mut buf, 10, 20, Some("topic/#"));
     let cmd = MqCommand::split_from(&mut buf);
-    let view = cmd.as_create_binding();
+    let view = cmd.as_create_binding().unwrap();
     assert_eq!(view.subscription_id(), None);
 }
 
@@ -187,9 +187,9 @@ fn test_persist_session_flow_control_codec_roundtrip() {
         9999,
     );
     let cmd = MqCommand::split_from(&mut buf);
-    let view = cmd.as_persist_session();
+    let view = cmd.as_persist_session().unwrap();
     assert_eq!(view.consumer_id(), 42);
-    assert_eq!(view.client_id(), "test-client");
+    assert_eq!(view.client_id().unwrap(), "test-client");
     assert_eq!(view.session_expiry_secs(), 7200);
     assert_eq!(view.inbound_qos_inflight(), 10);
     assert_eq!(view.outbound_qos1_count(), 5);
@@ -211,7 +211,7 @@ fn test_persist_session_backward_compat_zeros() {
         0,
     );
     let cmd = MqCommand::split_from(&mut buf);
-    let view = cmd.as_persist_session();
+    let view = cmd.as_persist_session().unwrap();
     assert_eq!(view.inbound_qos_inflight(), 0);
     assert_eq!(view.outbound_qos1_count(), 0);
     assert_eq!(view.remaining_quota(), 0);

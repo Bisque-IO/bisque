@@ -122,6 +122,11 @@ impl MqSegmentCursor {
         if let Some(data) = &self.batch_data {
             if self.batch_remaining > 0 {
                 let off = self.batch_offset;
+                if off + 4 > data.len() {
+                    self.batch_data = None;
+                    return None;
+                }
+                // SAFETY: guarded by off + 4 <= data.len() check above
                 let size = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
                 let cmd = MqCommand::from_bytes(data.slice(off..off + size));
                 let padded = (size + 7) & !7;
@@ -142,6 +147,7 @@ impl MqSegmentCursor {
                 return None;
             }
 
+            // SAFETY: read_slice returns exactly LENGTH_SIZE (4) bytes
             let record_len = u32::from_le_bytes(
                 self.view
                     .read_slice(self.offset, LENGTH_SIZE)
@@ -186,6 +192,7 @@ impl MqSegmentCursor {
 
             // Extract log_index from the entry header.
             let index_offset = record_start + HEADER_SIZE + 16; // after term(8) + node_id(8)
+            // SAFETY: read_slice returns exactly 8 bytes
             let log_index =
                 u64::from_le_bytes(self.view.read_slice(index_offset, 8).try_into().unwrap());
 
@@ -201,6 +208,7 @@ impl MqSegmentCursor {
             // Explode TAG_BATCH: store the bytes and re-enter to yield first sub-command.
             // Layout: [TAG_BATCH:1][count:4][len1:4][cmd1][len2:4][cmd2]...
             if cmd_bytes[6] == MqCommand::TAG_BATCH && cmd_bytes.len() >= 16 {
+                // SAFETY: guarded by cmd_bytes.len() >= 16 check above
                 let count = u32::from_le_bytes(cmd_bytes[8..12].try_into().unwrap());
                 if count > 0 {
                     self.batch_data = Some(cmd_bytes);
@@ -239,6 +247,7 @@ impl MqSegmentCursor {
             let rec = self.next_record()?;
             let cmd = &rec.command;
             if cmd.tag() == match_tag && cmd.buf.len() >= 16 {
+                // SAFETY: guarded by cmd.buf.len() >= 16 check above
                 let id = u64::from_le_bytes(cmd.buf[8..16].try_into().unwrap());
                 if id == entity_id {
                     return Some(rec);
@@ -279,6 +288,7 @@ impl MqSegmentCursor {
                 return None;
             }
 
+            // SAFETY: read_slice returns exactly LENGTH_SIZE (4) bytes
             let record_len = u32::from_le_bytes(
                 self.view
                     .read_slice(self.offset, LENGTH_SIZE)
@@ -313,6 +323,7 @@ impl MqSegmentCursor {
             }
 
             let index_offset = record_start + HEADER_SIZE + 16;
+            // SAFETY: read_slice returns exactly 8 bytes
             let log_index =
                 u64::from_le_bytes(self.view.read_slice(index_offset, 8).try_into().unwrap());
 
@@ -453,6 +464,7 @@ impl MqSegmentScanner {
     ) -> Option<SegmentRecord> {
         if let Some(rec) = self.peeked.take() {
             if rec.command.tag() == match_tag && rec.command.buf.len() >= 16 {
+                // SAFETY: guarded by rec.command.buf.len() >= 16 check above
                 let id = u64::from_le_bytes(rec.command.buf[8..16].try_into().unwrap());
                 if id == entity_id {
                     return Some(rec);
@@ -701,17 +713,17 @@ mod tests {
         let rec1 = cursor.next_record().expect("should get record 1");
         assert_eq!(rec1.log_index, 1);
         assert_eq!(rec1.command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(rec1.command.as_publish().topic_id(), 10);
+        assert_eq!(rec1.command.as_publish().unwrap().topic_id(), 10);
 
         let rec2 = cursor.next_record().expect("should get record 2");
         assert_eq!(rec2.log_index, 2);
         assert_eq!(rec2.command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(rec2.command.as_publish().topic_id(), 20);
+        assert_eq!(rec2.command.as_publish().unwrap().topic_id(), 20);
 
         let rec3 = cursor.next_record().expect("should get record 3");
         assert_eq!(rec3.log_index, 3);
         assert_eq!(rec3.command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(rec3.command.as_publish().topic_id(), 30);
+        assert_eq!(rec3.command.as_publish().unwrap().topic_id(), 30);
 
         assert!(cursor.next_record().is_none());
         assert!(cursor.is_exhausted());
@@ -732,9 +744,9 @@ mod tests {
 
         let records = cursor.collect_all();
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].command.as_publish().topic_id(), 1);
-        assert_eq!(records[1].command.as_publish().topic_id(), 2);
-        assert_eq!(records[2].command.as_publish().topic_id(), 3);
+        assert_eq!(records[0].command.as_publish().unwrap().topic_id(), 1);
+        assert_eq!(records[1].command.as_publish().unwrap().topic_id(), 2);
+        assert_eq!(records[2].command.as_publish().unwrap().topic_id(), 3);
     }
 
     #[test]
@@ -862,7 +874,10 @@ mod tests {
         assert_eq!(all.len(), 1000);
         for (i, rec) in all.iter().enumerate() {
             assert_eq!(rec.log_index, (i + 1) as u64);
-            assert_eq!(rec.command.as_publish().topic_id(), (i % 10) as u64);
+            assert_eq!(
+                rec.command.as_publish().unwrap().topic_id(),
+                (i % 10) as u64
+            );
         }
 
         // Filter for topic 5.
@@ -896,29 +911,29 @@ mod tests {
         let rec = cursor.next_record().unwrap();
         assert_eq!(rec.log_index, 1);
         assert_eq!(rec.command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(rec.command.as_publish().topic_id(), 1);
+        assert_eq!(rec.command.as_publish().unwrap().topic_id(), 1);
 
         // Records 2-4: exploded batch sub-commands (all share log_index=2).
         let rec = cursor.next_record().unwrap();
         assert_eq!(rec.log_index, 2);
         assert_eq!(rec.command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(rec.command.as_publish().topic_id(), 10);
+        assert_eq!(rec.command.as_publish().unwrap().topic_id(), 10);
 
         let rec = cursor.next_record().unwrap();
         assert_eq!(rec.log_index, 2);
         assert_eq!(rec.command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(rec.command.as_publish().topic_id(), 20);
+        assert_eq!(rec.command.as_publish().unwrap().topic_id(), 20);
 
         let rec = cursor.next_record().unwrap();
         assert_eq!(rec.log_index, 2);
         assert_eq!(rec.command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(rec.command.as_publish().topic_id(), 30);
+        assert_eq!(rec.command.as_publish().unwrap().topic_id(), 30);
 
         // Record 5: standalone publish after batch.
         let rec = cursor.next_record().unwrap();
         assert_eq!(rec.log_index, 3);
         assert_eq!(rec.command.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(rec.command.as_publish().topic_id(), 2);
+        assert_eq!(rec.command.as_publish().unwrap().topic_id(), 2);
 
         assert!(cursor.next_record().is_none());
     }
@@ -971,11 +986,11 @@ mod tests {
 
         let all = cursor.collect_all();
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].command.as_publish().topic_id(), 1);
+        assert_eq!(all[0].command.as_publish().unwrap().topic_id(), 1);
         assert_eq!(all[0].log_index, 1);
-        assert_eq!(all[1].command.as_publish().topic_id(), 2);
+        assert_eq!(all[1].command.as_publish().unwrap().topic_id(), 2);
         assert_eq!(all[1].log_index, 1);
-        assert_eq!(all[2].command.as_publish().topic_id(), 3);
+        assert_eq!(all[2].command.as_publish().unwrap().topic_id(), 3);
         assert_eq!(all[2].log_index, 2);
     }
 
@@ -993,7 +1008,7 @@ mod tests {
         let all = cursor.collect_all();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].log_index, 2);
-        assert_eq!(all[0].command.as_publish().topic_id(), 1);
+        assert_eq!(all[0].command.as_publish().unwrap().topic_id(), 1);
     }
 
     #[test]
@@ -1012,7 +1027,7 @@ mod tests {
 
         // First record should succeed.
         let rec = cursor.next_record().unwrap();
-        assert_eq!(rec.command.as_publish().topic_id(), 1);
+        assert_eq!(rec.command.as_publish().unwrap().topic_id(), 1);
         // Second record is truncated — cursor should stop.
         assert!(cursor.next_record().is_none());
     }
@@ -1034,15 +1049,15 @@ mod tests {
 
         // Read first sub-command from batch.
         let rec = cursor.next_record().unwrap();
-        assert_eq!(rec.command.as_publish().topic_id(), 1);
+        assert_eq!(rec.command.as_publish().unwrap().topic_id(), 1);
 
         // Rewind — should reset batch state.
         cursor.rewind();
         let all = cursor.collect_all();
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].command.as_publish().topic_id(), 1);
-        assert_eq!(all[1].command.as_publish().topic_id(), 2);
-        assert_eq!(all[2].command.as_publish().topic_id(), 3);
+        assert_eq!(all[0].command.as_publish().unwrap().topic_id(), 1);
+        assert_eq!(all[1].command.as_publish().unwrap().topic_id(), 2);
+        assert_eq!(all[2].command.as_publish().unwrap().topic_id(), 3);
     }
 
     #[test]

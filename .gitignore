@@ -28,6 +28,8 @@ build/
 !**/build.gradle.kts
 
 scratch
+.tmp
+.test-output.txt
 
 .kotlin
 web/starter

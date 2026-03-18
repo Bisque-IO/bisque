@@ -316,7 +316,7 @@ impl ArchiveManager {
 
         let retention_cutoff = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs()
             .saturating_sub(self.config.min_local_retention_secs);
 
@@ -375,12 +375,12 @@ impl ArchiveManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::test_support::TestTempDir;
 
     #[tokio::test]
     async fn test_in_memory_archive_upload_download() {
         let archive = InMemoryArchive::new();
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
 
         // Create a fake segment file
         let seg_path = tmp.path().join("seg_000001.log");
@@ -409,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_archive_exists_delete() {
         let archive = InMemoryArchive::new();
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
 
         let seg_path = tmp.path().join("seg.log");
         tokio::fs::write(&seg_path, b"data").await.unwrap();
@@ -424,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_archive_download_not_found() {
         let archive = InMemoryArchive::new();
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let dl_path = tmp.path().join("missing.log");
         let result = archive.download("nonexistent", &dl_path).await;
         assert!(result.is_err());
@@ -440,7 +440,7 @@ mod tests {
             ..Default::default()
         };
         let mgr = ArchiveManager::new(archive.clone(), config);
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
 
         // Create and upload a segment
         let seg_path = tmp.path().join("seg_000042.log");
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_compress_decompress_roundtrip() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let original = tmp.path().join("original.log");
         let compressed = tmp.path().join("compressed.log.zst");
         let restored = tmp.path().join("restored.log");
@@ -530,7 +530,7 @@ mod tests {
             ..Default::default()
         };
         let mgr = ArchiveManager::new(archive.clone(), config);
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
 
         // Create a segment file with repetitive data (compresses well)
         let seg_path = tmp.path().join("seg_000010.log");

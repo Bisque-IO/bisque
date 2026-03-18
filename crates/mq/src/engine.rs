@@ -23,6 +23,20 @@ use crate::session::*;
 use crate::topic::*;
 use crate::types::*;
 
+/// Unwrap a `Result` from a variable-field decode, writing an error response
+/// and returning from `apply_command` if the decode fails.
+macro_rules! try_decode {
+    ($expr:expr, $buf:expr, $log_index:expr) => {
+        match $expr {
+            Ok(v) => v,
+            Err(_) => {
+                ResponseEntry::write_error($buf, $log_index, 0, "malformed command buffer");
+                return;
+            }
+        }
+    };
+}
+
 /// Core MQ engine — thin wrapper around `Arc<MqMetadata>`.
 ///
 /// All entity state lives in `MqMetadata` (papaya::HashMap + atomics) for lock-free
@@ -79,13 +93,33 @@ impl MqEngine {
         self.m_apply_count.increment(1);
         let md = &self.metadata;
 
+        // Single bounds check: all commands need at least the 8-byte header to
+        // read tag(). Per-tag fixed-field validation is done inline via the
+        // `check_min!` macro to keep a single tag dispatch.
+        let cmd_len = cmd.as_bytes().len();
+        if cmd_len < 8 {
+            ResponseEntry::write_error(buf, log_index, 0, "command buffer too short");
+            return;
+        }
+
+        /// Validate the command has at least `$min` bytes for this tag's
+        /// fixed-field reads. One check per match arm, zero redundant dispatches.
+        macro_rules! check_min {
+            ($min:expr) => {
+                if cmd_len < $min {
+                    ResponseEntry::write_error(buf, log_index, 0, "command buffer too short");
+                    return;
+                }
+            };
+        }
+
         match cmd.tag() {
             // =================================================================
             // Topics (0-5)
             // =================================================================
             MqCommand::TAG_CREATE_TOPIC => {
-                let v = cmd.as_create_topic();
-                let name_str = v.name();
+                let v = try_decode!(cmd.as_create_topic(), buf, log_index);
+                let name_str = try_decode!(v.name(), buf, log_index);
                 let name_h = name_hash(name_str);
                 if let Some(r) = md.topic_names.pin().get(&name_h) {
                     ResponseEntry::write_mq_error(
@@ -100,7 +134,8 @@ impl MqEngine {
                 }
                 let topic_id = md.alloc_id();
                 let name = name_str.to_owned();
-                let mut meta = TopicMeta::new(topic_id, name, current_time, v.retention());
+                let retention = try_decode!(v.retention(), buf, log_index);
+                let mut meta = TopicMeta::new(topic_id, name, current_time, retention);
                 meta.partition_count = v.partition_count();
                 // Extended fields: lifetime, retained, dedup, cron are parsed
                 // from the trailing portion of the create_topic buffer.
@@ -116,6 +151,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DELETE_TOPIC => {
+                check_min!(16);
                 let topic_id = cmd.field_u64(8);
                 let guard = md.topics.pin();
                 if let Some(state) = guard.get(&topic_id).cloned() {
@@ -138,7 +174,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_PUBLISH => {
-                let v = cmd.as_publish();
+                let v = try_decode!(cmd.as_publish(), buf, log_index);
                 let topic_id = v.topic_id();
                 let count = v.message_count() as u64;
                 if let Some(topic) = md.topics.pin().get(&topic_id) {
@@ -180,6 +216,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_COMMIT_OFFSET => {
+                check_min!(32);
                 // Wire: [tag:1][topic_id:8][consumer_id:8][offset:8]
                 let topic_id = cmd.field_u64(8);
                 let consumer_id = cmd.field_u64(16);
@@ -201,6 +238,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_PURGE_TOPIC => {
+                check_min!(24);
                 // Wire: [tag:1][topic_id:8][before_index:8]
                 let topic_id = cmd.field_u64(8);
                 let before_index = cmd.field_u64(16);
@@ -221,11 +259,11 @@ impl MqEngine {
             }
 
             MqCommand::TAG_SET_RETAINED => {
-                let v = cmd.as_set_retained();
+                let v = try_decode!(cmd.as_set_retained(), buf, log_index);
                 let exchange_id = v.exchange_id();
                 if let Some(exchange) = md.exchanges.pin().get(&exchange_id) {
-                    let routing_key = v.routing_key().to_owned();
-                    let message = v.message();
+                    let routing_key = try_decode!(v.routing_key(), buf, log_index).to_owned();
+                    let message = try_decode!(v.message(), buf, log_index);
                     let retained = match segment_id {
                         Some(seg_id) => RetainedValue::mmap_backed(seg_id, message),
                         None => RetainedValue::heap(message),
@@ -245,9 +283,9 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GET_RETAINED => {
-                let v = cmd.as_get_retained();
+                let v = try_decode!(cmd.as_get_retained(), buf, log_index);
                 let exchange_id = v.exchange_id();
-                let filter = v.routing_key_filter();
+                let filter = try_decode!(v.routing_key_filter(), buf, log_index);
                 if let Some(exchange) = md.exchanges.pin().get(&exchange_id) {
                     let retained = exchange.retained.read();
                     let messages: Vec<RetainedEntry> = retained
@@ -275,10 +313,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DELETE_RETAINED => {
-                let v = cmd.as_delete_retained();
+                let v = try_decode!(cmd.as_delete_retained(), buf, log_index);
                 let exchange_id = v.exchange_id();
                 if let Some(exchange) = md.exchanges.pin().get(&exchange_id) {
-                    let routing_key = v.routing_key();
+                    let routing_key = try_decode!(v.routing_key(), buf, log_index);
                     exchange.retained.write().remove(routing_key);
                     ResponseEntry::write_ok(buf, log_index)
                 } else {
@@ -297,8 +335,8 @@ impl MqEngine {
             // Exchanges (6-10)
             // =================================================================
             MqCommand::TAG_CREATE_EXCHANGE => {
-                let v = cmd.as_create_exchange();
-                let name_str = v.name();
+                let v = try_decode!(cmd.as_create_exchange(), buf, log_index);
+                let name_str = try_decode!(v.name(), buf, log_index);
                 let exchange_type = v.exchange_type();
                 let name_h = name_hash(name_str);
                 if let Some(r) = md.exchange_names.pin().get(&name_h) {
@@ -324,6 +362,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DELETE_EXCHANGE => {
+                check_min!(16);
                 let exchange_id = cmd.field_u64(8);
                 let guard = md.exchanges.pin();
                 if let Some(state) = guard.get(&exchange_id).cloned() {
@@ -348,12 +387,12 @@ impl MqEngine {
             }
 
             MqCommand::TAG_CREATE_BINDING => {
-                let v = cmd.as_create_binding();
+                let v = try_decode!(cmd.as_create_binding(), buf, log_index);
                 let exchange_id = v.exchange_id();
                 let target_topic_id = v.topic_id();
-                let routing_key = v.routing_key();
+                let routing_key = try_decode!(v.routing_key(), buf, log_index);
                 let no_local = v.no_local();
-                let shared_group = v.shared_group();
+                let shared_group = try_decode!(v.shared_group(), buf, log_index);
                 let subscription_id = v.subscription_id();
 
                 // MQTT 5.0 §3.8.3.1: no_local on shared subscriptions is a protocol error
@@ -398,6 +437,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DELETE_BINDING => {
+                check_min!(16);
                 let binding_id = cmd.field_u64(8);
                 let binding_guard = md.binding_index.pin();
                 if let Some(&exchange_id) = binding_guard.get(&binding_id) {
@@ -419,7 +459,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_PUBLISH_TO_EXCHANGE => {
-                let v = cmd.as_publish_to_exchange();
+                let v = try_decode!(cmd.as_publish_to_exchange(), buf, log_index);
                 let exchange_id = v.exchange_id();
 
                 let exchange_guard = md.exchanges.pin();
@@ -513,8 +553,8 @@ impl MqEngine {
             // Consumer Groups (11-18)
             // =================================================================
             MqCommand::TAG_CREATE_CONSUMER_GROUP => {
-                let v = cmd.as_create_consumer_group();
-                let name_str = v.name();
+                let v = try_decode!(cmd.as_create_consumer_group(), buf, log_index);
+                let name_str = try_decode!(v.name(), buf, log_index);
                 let name_h = name_hash(name_str);
 
                 // Check for name collision with existing groups
@@ -538,7 +578,7 @@ impl MqEngine {
                     _ => AutoOffsetReset::Latest,
                 };
 
-                let variant_config = v.variant_config();
+                let variant_config = try_decode!(v.variant_config(), buf, log_index);
                 let variant = match &variant_config {
                     VariantConfig::Offset => GroupVariant::Offset,
                     VariantConfig::Ack(_) => GroupVariant::Ack,
@@ -552,10 +592,11 @@ impl MqEngine {
                         *existing
                     } else {
                         let tid = md.alloc_id();
+                        let topic_retention = try_decode!(v.topic_retention(), buf, log_index);
                         let mut topic_meta =
-                            TopicMeta::new(tid, name.clone(), current_time, v.topic_retention());
+                            TopicMeta::new(tid, name.clone(), current_time, topic_retention);
                         topic_meta.lifetime = v.topic_lifetime();
-                        topic_meta.dedup_config = v.topic_dedup();
+                        topic_meta.dedup_config = try_decode!(v.topic_dedup(), buf, log_index);
                         let topic_state = TopicState::new(topic_meta, md.catalog_name());
                         md.topics.pin().insert(tid, Arc::new(topic_state));
                         md.topic_names.pin().insert(topic_name_h, tid);
@@ -571,7 +612,7 @@ impl MqEngine {
                 };
 
                 // Auto-create DLQ topic if specified
-                if let Some(dlq_name) = v.dlq_topic_name() {
+                if let Some(dlq_name) = try_decode!(v.dlq_topic_name(), buf, log_index) {
                     let dlq_h = name_hash(&dlq_name);
                     if !md.topic_names.pin().contains_key(&dlq_h) {
                         let dlq_id = md.alloc_id();
@@ -588,7 +629,7 @@ impl MqEngine {
                 }
 
                 // Auto-create response topic if specified
-                if let Some(resp_name) = v.response_topic_name() {
+                if let Some(resp_name) = try_decode!(v.response_topic_name(), buf, log_index) {
                     let resp_h = name_hash(&resp_name);
                     if !md.topic_names.pin().contains_key(&resp_h) {
                         let resp_id = md.alloc_id();
@@ -635,6 +676,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DELETE_CONSUMER_GROUP => {
+                check_min!(16);
                 let group_id = cmd.field_u64(8);
                 let cg_guard = md.consumer_groups.pin();
                 if let Some(group) = cg_guard.get(&group_id).cloned() {
@@ -680,10 +722,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_JOIN_CONSUMER_GROUP => {
-                let v = cmd.as_join_consumer_group();
+                let v = try_decode!(cmd.as_join_consumer_group(), buf, log_index);
                 let group_id = v.group_id();
-                let member_id_str = v.member_id();
-                let client_id = v.client_id();
+                let member_id_str = try_decode!(v.member_id(), buf, log_index);
+                let client_id = try_decode!(v.client_id(), buf, log_index);
 
                 let cg_guard = md.consumer_groups.pin();
                 let group = match cg_guard.get(&group_id) {
@@ -710,13 +752,13 @@ impl MqEngine {
                 };
 
                 // Insert/update member
-                let protocols = SmallVec::from_vec(v.protocols());
+                let protocols = SmallVec::from_vec(try_decode!(v.protocols(), buf, log_index));
                 group.upsert_member(GroupMemberState {
                     member_id: actual_member_id.clone(),
                     client_id: client_id.to_string(),
                     session_timeout_ms: v.session_timeout_ms(),
                     rebalance_timeout_ms: v.rebalance_timeout_ms(),
-                    protocol_type: v.protocol_type().to_string(),
+                    protocol_type: try_decode!(v.protocol_type(), buf, log_index).to_string(),
                     protocols,
                     assignment: parking_lot::RwLock::new(Bytes::new()),
                     last_heartbeat_at: std::sync::atomic::AtomicU64::new(current_time),
@@ -766,10 +808,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_SYNC_CONSUMER_GROUP => {
-                let v = cmd.as_sync_consumer_group();
+                let v = try_decode!(cmd.as_sync_consumer_group(), buf, log_index);
                 let group_id = v.group_id();
                 let generation = v.generation();
-                let member_id = v.member_id();
+                let member_id = try_decode!(v.member_id(), buf, log_index);
 
                 let cg_guard = md.consumer_groups.pin();
                 let group = match cg_guard.get(&group_id) {
@@ -793,7 +835,7 @@ impl MqEngine {
                 }
 
                 // If this is the leader with assignments, store them
-                let assignments = v.assignments();
+                let assignments = try_decode!(v.assignments(), buf, log_index);
                 if !assignments.is_empty() {
                     for (mid, data) in &assignments {
                         group.set_member_assignment(mid, Bytes::from(data.clone()));
@@ -825,9 +867,9 @@ impl MqEngine {
             }
 
             MqCommand::TAG_LEAVE_CONSUMER_GROUP => {
-                let v = cmd.as_leave_consumer_group();
+                let v = try_decode!(cmd.as_leave_consumer_group(), buf, log_index);
                 let group_id = v.group_id();
-                let member_id = v.member_id();
+                let member_id = try_decode!(v.member_id(), buf, log_index);
 
                 let cg_guard = md.consumer_groups.pin();
                 let group = match cg_guard.get(&group_id) {
@@ -852,9 +894,9 @@ impl MqEngine {
             }
 
             MqCommand::TAG_HEARTBEAT_CONSUMER_GROUP => {
-                let v = cmd.as_heartbeat_consumer_group();
+                let v = try_decode!(cmd.as_heartbeat_consumer_group(), buf, log_index);
                 let group_id = v.group_id();
-                let member_id = v.member_id();
+                let member_id = try_decode!(v.member_id(), buf, log_index);
                 let generation = v.generation();
 
                 let cg_guard = md.consumer_groups.pin();
@@ -894,7 +936,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_COMMIT_GROUP_OFFSET => {
-                let v = cmd.as_commit_group_offset();
+                let v = try_decode!(cmd.as_commit_group_offset(), buf, log_index);
                 let group_id = v.group_id();
                 let generation = v.generation();
 
@@ -925,7 +967,8 @@ impl MqEngine {
                         topic_id: v.topic_id(),
                         partition_index: v.partition_index(),
                         committed_offset: v.offset(),
-                        metadata: v.metadata_bytes().map(Bytes::copy_from_slice),
+                        metadata: try_decode!(v.metadata_bytes(), buf, log_index)
+                            .map(Bytes::copy_from_slice),
                         committed_at: v.timestamp(),
                     },
                 );
@@ -936,6 +979,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_EXPIRE_GROUP_SESSIONS => {
+                check_min!(16);
                 // Wire: [tag:1][now_ms:8]
                 let now_ms = cmd.field_u64(8);
 
@@ -967,6 +1011,7 @@ impl MqEngine {
             // Ack Variant (19-29)
             // =================================================================
             MqCommand::TAG_GROUP_DELIVER => {
+                check_min!(28);
                 // Wire: @8 group_id:8, @16 consumer_id:8, @24 max_count:4,
                 //       @32 exclude_publisher_id:8, @40 current_time_ms:8
                 let group_id = cmd.field_u64(8);
@@ -1046,9 +1091,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_ACK => {
+                check_min!(24);
                 // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64, @24 response:opt_flex8
                 let group_id = cmd.field_u64(8);
-                let message_ids = cmd.field_vec_u64(16);
+                let message_ids = try_decode!(cmd.field_vec_u64(16), buf, log_index);
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -1093,9 +1139,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_NACK => {
+                check_min!(24);
                 // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
                 let group_id = cmd.field_u64(8);
-                let message_ids = cmd.field_vec_u64(16);
+                let message_ids = try_decode!(cmd.field_vec_u64(16), buf, log_index);
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -1107,9 +1154,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_RELEASE => {
+                check_min!(24);
                 // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
                 let group_id = cmd.field_u64(8);
-                let message_ids = cmd.field_vec_u64(16);
+                let message_ids = try_decode!(cmd.field_vec_u64(16), buf, log_index);
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -1121,9 +1169,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_MODIFY => {
+                check_min!(24);
                 // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
                 let group_id = cmd.field_u64(8);
-                let message_ids = cmd.field_vec_u64(16);
+                let message_ids = try_decode!(cmd.field_vec_u64(16), buf, log_index);
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -1136,9 +1185,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_EXTEND_VISIBILITY => {
+                check_min!(32);
                 // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64, @24 extension_ms:u64
                 let group_id = cmd.field_u64(8);
-                let message_ids = cmd.field_vec_u64(16);
+                let message_ids = try_decode!(cmd.field_vec_u64(16), buf, log_index);
                 let extension_ms = cmd.field_u64(24);
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
@@ -1150,9 +1200,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_TIMEOUT_EXPIRED => {
+                check_min!(24);
                 // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
                 let group_id = cmd.field_u64(8);
-                let message_ids = cmd.field_vec_u64(16);
+                let message_ids = try_decode!(cmd.field_vec_u64(16), buf, log_index);
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
                     if let (Some(ack), Some(config)) = (group.ack_state(), group.ack_config()) {
@@ -1176,10 +1227,10 @@ impl MqEngine {
 
             MqCommand::TAG_GROUP_PUBLISH_TO_DLQ => {
                 // Wire: [tag:1][group_id:8][dlq_topic_id:8][vec_u64(dead_letter_ids)][vec_bytes(messages)]
-                let v = cmd.as_publish_to_dlq();
+                let v = try_decode!(cmd.as_publish_to_dlq(), buf, log_index);
                 let source_group_id = v.source_group_id();
                 let dlq_topic_id = v.dlq_topic_id();
-                let dead_letter_ids = v.dead_letter_ids();
+                let dead_letter_ids = try_decode!(v.dead_letter_ids(), buf, log_index);
                 let messages = v.messages();
 
                 // Publish dead-lettered messages to the DLQ topic
@@ -1198,9 +1249,10 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_EXPIRE_PENDING => {
+                check_min!(24);
                 // Wire v2: @8 group_id:u64, @16 message_ids:vec_u64
                 let group_id = cmd.field_u64(8);
-                let message_ids = cmd.field_vec_u64(16);
+                let message_ids = try_decode!(cmd.field_vec_u64(16), buf, log_index);
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
                     if let Some(ack) = group.ack_state() {
@@ -1212,6 +1264,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_PURGE => {
+                check_min!(16);
                 // Wire: [tag:1][group_id:8]
                 let group_id = cmd.field_u64(8);
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
@@ -1225,6 +1278,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_GET_ATTRIBUTES => {
+                check_min!(16);
                 // Wire: [tag:1][group_id:8]
                 let group_id = cmd.field_u64(8);
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
@@ -1267,13 +1321,18 @@ impl MqEngine {
             // Actor Variant (30-35)
             // =================================================================
             MqCommand::TAG_GROUP_DELIVER_ACTOR => {
+                check_min!(28);
                 // Wire v2: @8 group_id:u64, @16 consumer_id:u64, @24 actor_ids:vec_bytes
                 let group_id = cmd.field_u64(8);
                 let consumer_id = cmd.field_u64(16);
                 let actor_count = cmd.field_vec_bytes_count(24) as usize;
                 let mut actor_ids: SmallVec<[Bytes; 8]> = SmallVec::with_capacity(actor_count);
                 for i in 0..actor_count {
-                    actor_ids.push(cmd.field_vec_bytes_get_bytes(24, i));
+                    actor_ids.push(try_decode!(
+                        cmd.field_vec_bytes_get_bytes(24, i),
+                        buf,
+                        log_index
+                    ));
                 }
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
@@ -1309,10 +1368,11 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_ACK_ACTOR => {
+                check_min!(24);
                 // Wire v2: @8 group_id:u64, @16 message_id:u64, @24 actor_id:flex8
                 let group_id = cmd.field_u64(8);
                 let message_id = cmd.field_u64(16);
-                let actor_id_data = cmd.field_flex8(24);
+                let actor_id_data = try_decode!(cmd.field_flex8(24), buf, log_index);
                 let actor_id = Bytes::copy_from_slice(actor_id_data);
 
                 self.on_message_removed(message_id);
@@ -1340,10 +1400,11 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_NACK_ACTOR => {
+                check_min!(24);
                 // Wire v2: @8 group_id:u64, @16 message_id:u64, @24 actor_id:flex8
                 let group_id = cmd.field_u64(8);
                 let message_id = cmd.field_u64(16);
-                let actor_id_data = cmd.field_flex8(24);
+                let actor_id_data = try_decode!(cmd.field_flex8(24), buf, log_index);
                 let actor_id = Bytes::copy_from_slice(actor_id_data);
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
@@ -1355,13 +1416,18 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_ASSIGN_ACTORS => {
+                check_min!(28);
                 // Wire v2: @8 group_id:u64, @16 consumer_id:u64, @24 actor_ids:vec_bytes
                 let group_id = cmd.field_u64(8);
                 let consumer_id = cmd.field_u64(16);
                 let count = cmd.field_vec_bytes_count(24) as usize;
                 let mut actor_ids: Vec<Bytes> = Vec::with_capacity(count);
                 for i in 0..count {
-                    actor_ids.push(cmd.field_vec_bytes_get_bytes(24, i));
+                    actor_ids.push(try_decode!(
+                        cmd.field_vec_bytes_get_bytes(24, i),
+                        buf,
+                        log_index
+                    ));
                 }
 
                 if let Some(group) = md.consumer_groups.pin().get(&group_id) {
@@ -1374,6 +1440,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_RELEASE_ACTORS => {
+                check_min!(24);
                 // Wire: [tag:1][group_id:8][consumer_id:8]
                 let group_id = cmd.field_u64(8);
                 let consumer_id = cmd.field_u64(16);
@@ -1387,6 +1454,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_GROUP_EVICT_IDLE => {
+                check_min!(24);
                 // Wire: [tag:1][group_id:8][before_timestamp:8]
                 let group_id = cmd.field_u64(8);
                 let before_timestamp = cmd.field_u64(16);
@@ -1404,6 +1472,7 @@ impl MqEngine {
             // Cron (36-39)
             // =================================================================
             MqCommand::TAG_CRON_ENABLE => {
+                check_min!(16);
                 // Wire: [tag:1][topic_id:8]
                 let topic_id = cmd.field_u64(8);
                 if let Some(topic) = md.topics.pin().get(&topic_id) {
@@ -1422,6 +1491,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_CRON_DISABLE => {
+                check_min!(16);
                 // Wire: [tag:1][topic_id:8]
                 let topic_id = cmd.field_u64(8);
                 if let Some(topic) = md.topics.pin().get(&topic_id) {
@@ -1440,6 +1510,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_CRON_TRIGGER => {
+                check_min!(24);
                 // Wire: [tag:1][topic_id:8][triggered_at:8]
                 let topic_id = cmd.field_u64(8);
                 let triggered_at = cmd.field_u64(16);
@@ -1468,6 +1539,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_CRON_UPDATE => {
+                check_min!(16);
                 // Wire: [tag:1][topic_id:8] + trailing cron config fields
                 // For now, just acknowledge — full cron config update requires codec extension
                 let topic_id = cmd.field_u64(8);
@@ -1489,9 +1561,10 @@ impl MqEngine {
             // Sessions (40-48)
             // =================================================================
             MqCommand::TAG_CREATE_SESSION => {
+                check_min!(40);
                 // Wire v2: @8 session_id:u64, @16 keep_alive_ms:u64, @24 session_expiry_ms:u64, @32 client_id:flex8
                 let session_id = cmd.field_u64(8);
-                let client_id = cmd.field_flex8_str(32).to_string();
+                let client_id = try_decode!(cmd.field_flex8_str(32), buf, log_index).to_string();
                 let keep_alive_ms = cmd.field_u64(16);
                 let session_expiry_ms = cmd.field_u64(24);
 
@@ -1538,6 +1611,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_DISCONNECT_SESSION => {
+                check_min!(16);
                 // Wire v2: flags=publish_will, @8 session_id:u64
                 let session_id = cmd.field_u64(8);
                 let publish_will = cmd.flags() != 0;
@@ -1551,6 +1625,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_HEARTBEAT_SESSION => {
+                check_min!(16);
                 // Wire: [tag:1][session_id:8]
                 let session_id = cmd.field_u64(8);
                 if let Some(session) = md.sessions.pin().get(&session_id) {
@@ -1570,12 +1645,12 @@ impl MqEngine {
 
             MqCommand::TAG_SET_WILL => {
                 // Reuse old codec view struct (consumer_id = session_id)
-                let v = cmd.as_set_will();
+                let v = try_decode!(cmd.as_set_will(), buf, log_index);
                 let session_id = v.consumer_id();
                 if let Some(session) = md.sessions.pin().get(&session_id) {
                     let will = WillConfig {
                         topic_id: v.exchange_id(),
-                        payload: v.message(),
+                        payload: try_decode!(v.message(), buf, log_index),
                         delay_ms: v.delay_secs() as u64 * 1000,
                         retained: v.retain(),
                     };
@@ -1594,6 +1669,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_CLEAR_WILL => {
+                check_min!(16);
                 // Wire: [tag:1][session_id:8]
                 let session_id = cmd.field_u64(8);
                 if let Some(session) = md.sessions.pin().get(&session_id) {
@@ -1612,6 +1688,7 @@ impl MqEngine {
             }
 
             MqCommand::TAG_FIRE_PENDING_WILLS => {
+                check_min!(16);
                 // Wire: [tag:1][now_ms:8]
                 let now_ms = cmd.field_u64(8);
                 let mut count = 0u32;
@@ -1635,12 +1712,12 @@ impl MqEngine {
             }
 
             MqCommand::TAG_PERSIST_SESSION => {
-                let v = cmd.as_persist_session();
+                let v = try_decode!(cmd.as_persist_session(), buf, log_index);
                 let session_id = v.consumer_id(); // reuses old field name
-                let client_id = v.client_id().to_string();
+                let client_id = try_decode!(v.client_id(), buf, log_index).to_string();
                 let client_id_hash = name_hash(&client_id);
                 let session_expiry_ms = v.session_expiry_secs() as u64 * 1000;
-                let subscription_data = v.subscription_data();
+                let subscription_data = try_decode!(v.subscription_data(), buf, log_index);
 
                 // Remove old session for this client_id if it maps to a different session_id
                 if let Some(&old_id) = md.session_client_index.pin().get(&client_id_hash) {
@@ -1677,8 +1754,8 @@ impl MqEngine {
             }
 
             MqCommand::TAG_RESTORE_SESSION => {
-                let v = cmd.as_restore_session();
-                let client_id = v.client_id();
+                let v = try_decode!(cmd.as_restore_session(), buf, log_index);
+                let client_id = try_decode!(v.client_id(), buf, log_index);
                 let client_id_hash = name_hash(client_id);
 
                 // O(1) lookup via client_id hash
@@ -1780,7 +1857,7 @@ impl MqEngine {
         current_time: u64,
         segment_id: Option<u64>,
     ) {
-        let batch = cmd.as_batch();
+        let batch = try_decode!(cmd.as_batch(), buf, log_index);
         let count = batch.count() as usize;
         let cmds: SmallVec<[&[u8]; 16]> = batch.commands().collect();
         let mut responses: Vec<ResponseEntry> = Vec::with_capacity(count);
@@ -1788,6 +1865,14 @@ impl MqEngine {
 
         let mut i = 0;
         while i < cmds.len() {
+            // Sub-commands must have at least 8 bytes (header) for buf_tag to be safe.
+            if cmds[i].len() < 8 {
+                sub_buf.clear();
+                ResponseEntry::write_error(&mut sub_buf, log_index, 0, "command buffer too short");
+                responses.push(ResponseEntry::split_from(&mut sub_buf));
+                i += 1;
+                continue;
+            }
             let tag = buf_tag(cmds[i]);
 
             // Detect consecutive runs of same (tag, entity_id) for batch optimization.
@@ -1853,8 +1938,8 @@ impl MqEngine {
     fn find_run_end(&self, cmds: &[&[u8]], start: usize, tag: u8, entity_id: u64) -> usize {
         let mut end = start + 1;
         while end < cmds.len()
-            && buf_tag(cmds[end]) == tag
             && cmds[end].len() >= 16
+            && buf_tag(cmds[end]) == tag
             && buf_field_u64(cmds[end], 8) == entity_id
         {
             end += 1;
@@ -1882,7 +1967,19 @@ impl MqEngine {
                 let mut all_messages: SmallVec<[SmallVec<[Bytes; 16]>; 4]> =
                     SmallVec::with_capacity(cmds.len());
                 for sub in cmds {
-                    let v = CmdPublish::from_buf(sub);
+                    let v = match CmdPublish::from_buf(sub) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            ResponseEntry::write_error(
+                                sub_buf,
+                                log_index,
+                                0,
+                                "malformed command buffer",
+                            );
+                            responses.push(ResponseEntry::split_from(sub_buf));
+                            continue;
+                        }
+                    };
                     let msgs: SmallVec<[Bytes; 16]> = v.messages().collect();
                     let msg_count = msgs.len() as u64;
                     let base_offset =
@@ -1908,7 +2005,19 @@ impl MqEngine {
                 }
             } else {
                 for sub in cmds {
-                    let v = CmdPublish::from_buf(sub);
+                    let v = match CmdPublish::from_buf(sub) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            ResponseEntry::write_error(
+                                sub_buf,
+                                log_index,
+                                0,
+                                "malformed command buffer",
+                            );
+                            responses.push(ResponseEntry::split_from(sub_buf));
+                            continue;
+                        }
+                    };
                     let msg_count = v.message_count() as u64;
                     let base_offset = topic.apply_publish(log_index, v.messages(), segment_id);
                     ResponseEntry::write_published(sub_buf, log_index, base_offset, msg_count);
@@ -1946,7 +2055,19 @@ impl MqEngine {
         if let Some(group) = md.consumer_groups.pin().get(&group_id) {
             if let Some(ack) = group.ack_state() {
                 for sub in cmds {
-                    let ids = buf_field_vec_u64(sub, 16);
+                    let ids = match buf_field_vec_u64(sub, 16) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            ResponseEntry::write_error(
+                                sub_buf,
+                                log_index,
+                                0,
+                                "malformed command buffer",
+                            );
+                            responses.push(ResponseEntry::split_from(sub_buf));
+                            continue;
+                        }
+                    };
                     match tag {
                         MqCommand::TAG_GROUP_ACK => {
                             ack.apply_ack(&ids);
@@ -1960,7 +2081,12 @@ impl MqEngine {
                         MqCommand::TAG_GROUP_RELEASE => {
                             ack.apply_release(&ids);
                         }
-                        _ => unreachable!(),
+                        _ => {
+                            tracing::error!(tag, "unexpected ack-variant tag in batch run");
+                            ResponseEntry::write_error(sub_buf, log_index, 0, "unexpected tag");
+                            responses.push(ResponseEntry::split_from(sub_buf));
+                            continue;
+                        }
                     }
                     ResponseEntry::write_ok(sub_buf, log_index);
                     responses.push(ResponseEntry::split_from(sub_buf));

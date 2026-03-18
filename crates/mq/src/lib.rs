@@ -12,6 +12,7 @@ pub mod metadata;
 pub mod notifier;
 pub mod purge;
 pub mod raft;
+pub mod raft_writer;
 pub mod retention;
 pub mod segment_index;
 pub mod session;
@@ -21,8 +22,8 @@ pub mod types;
 pub mod write_batcher;
 
 pub use async_apply::{
-    AsyncApplyManager, ClientRegistry, HighWaterMark, PendingRequest, PendingRequests,
-    ResponseCallback, ResponseEntry,
+    AppliedBatchTable, AsyncApplyManager, ClientRegistry, HighWaterMark, PendingRequest,
+    PendingRequests, ResponseCallback, ResponseEntry,
 };
 pub use config::MqConfig;
 pub use cursor::{
@@ -31,14 +32,18 @@ pub use cursor::{
 };
 pub use engine::MqEngine;
 pub use forward::{
-    ForwardAcceptor, ForwardClient, ForwardConfig, ForwardHandle, ForwardedBatch,
-    ForwardedBatchIter,
+    ForwardAcceptor, ForwardClient, ForwardConfig, ForwardFrameBatch, ForwardHandle, ForwardWriter,
+    RaftBacklog,
 };
 pub use manifest::MqManifestManager;
 pub use metadata::{MqMetadata, TopicMeta};
 pub use raft::MqRaftNode;
+pub use raft_writer::{MqCommandTx, RaftWriter, RaftWriterConfig, RaftWriterStats};
 pub use state_machine::MqStateMachine;
-pub use types::{MqApplyResponse, MqCommand};
+pub use types::{
+    DecodeError, MqApplyResponse, MqCommand, read_i32_le, read_slice, read_u8, read_u16_le,
+    read_u32_le, read_u64_le,
+};
 pub use write_batcher::{
     LocalBatcher, LocalFrameBatch, LocalWriter, MqBatcherError, MqWriteBatcher,
     MqWriteBatcherConfig,

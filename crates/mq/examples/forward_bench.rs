@@ -1,48 +1,63 @@
-//! Forwarding transport benchmark for bisque-mq.
+//! Production pipeline benchmark for bisque-mq command ingestion.
 //!
-//! Measures throughput and latency for the full forwarding pipeline:
-//! follower → TCP → leader → NodeRoute → TCP → follower.
+//! Benchmarks two ingestion paths using the real Raft cluster:
+//!
+//! **Local path**: `LocalWriter::send` → `LocalBatcher` → `raft.client_write`
+//! → state machine apply
+//!
+//! **Forward path**: `ForwardClient::forward` → TCP → `ForwardAcceptor`
+//! → `raft.client_write` → state machine apply
+//!
+//! Both paths produce `TAG_FORWARDED_BATCH` log entries; semantics are identical.
 //!
 //! Usage:
 //!   cargo run --release --example forward_bench
-//!   cargo run --release --example forward_bench -- --messages 500000 --sizes 64,256,1024
-//!   cargo run --release --example forward_bench -- --partitions 1,2,4,8
-//!   cargo run --release --example forward_bench -- --stats        # p50/p99 percentiles
+//!   cargo run --release --example forward_bench -- --messages 500000 --sizes 16,1024
 
+use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
+use openraft::{BasicNode, Raft};
+use tempfile::TempDir;
 
-use bisque_mq::async_apply::{ClientRegistry, ResponseCallback};
-use bisque_mq::forward::{ForwardAcceptor, ForwardClient, ForwardConfig};
+use bisque_mq::async_apply::{ClientRegistry, ResponderBroadcast};
+use bisque_mq::config::MqConfig;
+use bisque_mq::engine::MqEngine;
+use bisque_mq::forward::RaftBacklog;
+use bisque_mq::{
+    ForwardAcceptor, ForwardClient, ForwardConfig, ForwardFrameBatch, LocalBatcher,
+    LocalFrameBatch, MqStateMachine, MqTypeConfig, MqWriteBatcherConfig, RaftWriter,
+    RaftWriterConfig,
+};
 
-// ─── Configuration ──────────────────────────────────────────────────────────
+use bisque_raft::{
+    BisqueTcpTransport, BisqueTcpTransportConfig, DefaultNodeRegistry, MmapStorageConfig,
+    MultiRaftManager, MultiplexedLogStorage, NodeAddressResolver,
+};
+
+// ─── Raft cluster type aliases ────────────────────────────────────────────────
+
+type MqManager = MultiRaftManager<
+    MqTypeConfig,
+    BisqueTcpTransport<MqTypeConfig>,
+    MultiplexedLogStorage<MqTypeConfig>,
+>;
+
+// ─── Configuration ───────────────────────────────────────────────────────────
 
 struct BenchConfig {
     messages: usize,
     sizes: Vec<usize>,
-    partitions: Vec<usize>,
-    connections: Vec<usize>,
-    /// Collect full size distributions and print p50/p99 percentiles.
-    stats: bool,
-    /// Capacity of the batch_rx channel (leader inbound queue). Default: 4096.
-    /// Higher values let more batches queue up, increasing greedy-drain effectiveness.
-    inbound_cap: usize,
-    /// Capacity of the per-follower responder channel (leader → TCP writer). Default: 256.
-    responder_cap: usize,
 }
 
 impl BenchConfig {
     fn from_args() -> Self {
         let mut messages = 200_000;
         let mut sizes = vec![64, 256, 1024, 4096];
-        let mut partitions = vec![1, 2, 4, 8];
-        let mut connections = vec![1, 2, 4, 8];
-        let mut stats = false;
-        let mut inbound_cap = 65536usize;
-        let mut responder_cap = 65536usize;
         let args: Vec<String> = std::env::args().collect();
         let mut i = 1;
         while i < args.len() {
@@ -58,37 +73,8 @@ impl BenchConfig {
                         .map(|s| s.trim().parse().expect("invalid size"))
                         .collect();
                 }
-                "--partitions" | "-p" => {
-                    i += 1;
-                    partitions = args[i]
-                        .split(',')
-                        .map(|s| s.trim().parse().expect("invalid partition count"))
-                        .collect();
-                }
-                "--connections" | "-c" => {
-                    i += 1;
-                    connections = args[i]
-                        .split(',')
-                        .map(|s| s.trim().parse().expect("invalid connection count"))
-                        .collect();
-                }
-                "--stats" => {
-                    stats = true;
-                }
-                "--inbound-cap" => {
-                    i += 1;
-                    inbound_cap = args[i].parse().expect("invalid --inbound-cap");
-                }
-                "--responder-cap" => {
-                    i += 1;
-                    responder_cap = args[i].parse().expect("invalid --responder-cap");
-                }
                 "--help" | "-h" => {
-                    eprintln!(
-                        "Usage: forward_bench [--messages N] [--sizes 64,256,1024] \
-                         [--partitions 1,2,4,8] [--connections 1,2,4,8] [--stats] \
-                         [--inbound-cap N] [--responder-cap N]"
-                    );
+                    eprintln!("Usage: forward_bench [--messages N] [--sizes 64,256,1024]");
                     std::process::exit(0);
                 }
                 _ => {
@@ -98,19 +84,11 @@ impl BenchConfig {
             }
             i += 1;
         }
-        Self {
-            messages,
-            sizes,
-            partitions,
-            connections,
-            stats,
-            inbound_cap,
-            responder_cap,
-        }
+        Self { messages, sizes }
     }
 }
 
-// ─── Formatting ─────────────────────────────────────────────────────────────
+// ─── Formatting ──────────────────────────────────────────────────────────────
 
 fn format_throughput(count: usize, elapsed: Duration) -> String {
     let secs = elapsed.as_secs_f64();
@@ -150,7 +128,7 @@ fn format_latency(elapsed: Duration, count: usize) -> String {
 fn print_result(label: &str, count: usize, payload_size: usize, elapsed: Duration) {
     let total_bytes = count * payload_size;
     println!(
-        "  {:<50} {:>12}  {:>12}  {:>10}",
+        "  {:<52} {:>12}  {:>12}  {:>10}",
         label,
         format_throughput(count, elapsed),
         format_bandwidth(total_bytes, elapsed),
@@ -158,807 +136,487 @@ fn print_result(label: &str, count: usize, payload_size: usize, elapsed: Duratio
     );
 }
 
+/// Like `print_result` but prefixes `\r` to overwrite the current progress line.
+fn print_result_cr(label: &str, count: usize, payload_size: usize, elapsed: Duration) {
+    let total_bytes = count * payload_size;
+    println!(
+        "\r  {:<52} {:>12}  {:>12}  {:>10}",
+        label,
+        format_throughput(count, elapsed),
+        format_bandwidth(total_bytes, elapsed),
+        format_latency(elapsed, count),
+    );
+}
+
+/// Print a live progress line (no newline, overwrites with `\r` on next call).
+fn print_progress(label: &str, count: usize, payload_size: usize, elapsed: Duration) {
+    let total_bytes = count * payload_size;
+    print!(
+        "\r  {:<52} {:>12}  {:>12}  {:>10}",
+        label,
+        format_throughput(count, elapsed),
+        format_bandwidth(total_bytes, elapsed),
+        format_latency(elapsed, count.max(1)),
+    );
+    let _ = std::io::stdout().flush();
+}
+
 fn print_header() {
     println!(
-        "  {:<50} {:>12}  {:>12}  {:>10}",
+        "  {:<52} {:>12}  {:>12}  {:>10}",
         "Benchmark", "Throughput", "Bandwidth", "Latency"
     );
-    println!("  {}", "-".repeat(88));
+    println!("  {}", "-".repeat(92));
 }
 
-// ─── Telemetry ───────────────────────────────────────────────────────────────
+// ─── Raft cluster setup ───────────────────────────────────────────────────────
 
-/// Collects a distribution of u64 samples.
-/// Always tracks min/max/mean; collects full distribution for percentiles when
-/// `full` is true (controlled by `--stats`).
-struct Dist {
-    count: u64,
-    total: u64,
-    min: u64,
-    max: u64,
-    samples: Vec<u32>,
-    full: bool,
-}
+async fn setup_raft(backlog: Arc<RaftBacklog>) -> (Raft<MqTypeConfig>, Arc<MqManager>, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let node_id = 1u64;
+    let group_id = 0u64;
 
-impl Dist {
-    fn new(full: bool) -> Self {
-        Self {
-            count: 0,
-            total: 0,
-            min: u64::MAX,
-            max: 0,
-            samples: Vec::new(),
-            full,
+    let mq_config = MqConfig::new(tmp.path().join("mq").to_str().unwrap());
+    let engine = MqEngine::new(mq_config);
+    let sm = MqStateMachine::new(engine).with_raft_backlog(Arc::clone(&backlog));
+
+    let storage_config = MmapStorageConfig::new(tmp.path().join("raft"));
+    let storage = MultiplexedLogStorage::new(storage_config).await.unwrap();
+
+    let node_registry = Arc::new(DefaultNodeRegistry::new());
+    node_registry.register(node_id, "127.0.0.1:0".parse().unwrap());
+    let transport = BisqueTcpTransport::new(BisqueTcpTransportConfig::default(), node_registry);
+
+    let manager: Arc<MqManager> = Arc::new(MultiRaftManager::new(transport, storage));
+    let raft_config = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 200,
+            election_timeout_max: 400,
+            ..Default::default()
         }
-    }
+        .validate()
+        .unwrap(),
+    );
+    let raft = manager
+        .add_group(group_id, node_id, raft_config, sm)
+        .await
+        .unwrap();
 
-    #[inline]
-    fn push(&mut self, n: u64) {
-        self.count += 1;
-        self.total += n;
-        if n < self.min {
-            self.min = n;
-        }
-        if n > self.max {
-            self.max = n;
-        }
-        if self.full {
-            self.samples.push(n as u32);
-        }
-    }
+    let mut members = BTreeMap::new();
+    members.insert(node_id, BasicNode::default());
+    raft.initialize(members).await.unwrap();
 
-    fn mean(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.total as f64 / self.count as f64
-        }
-    }
-
-    fn percentile(&mut self, p: f64) -> u64 {
-        if self.samples.is_empty() {
-            return 0;
-        }
-        self.samples.sort_unstable();
-        let idx = ((self.samples.len() as f64 * p / 100.0) as usize).min(self.samples.len() - 1);
-        self.samples[idx] as u64
-    }
-
-    /// Print stats, indented under the bench result line.
-    fn print(&mut self, label: &str) {
-        if self.count == 0 {
-            return;
-        }
-        let min = if self.min == u64::MAX { 0 } else { self.min };
-        if self.full {
-            let p50 = self.percentile(50.0);
-            let p99 = self.percentile(99.0);
-            println!(
-                "    ↳ {:<28} batches={:>6}  min={:>5}  mean={:>7.1}  p50={:>5}  p99={:>5}  max={:>5}",
-                label,
-                self.count,
-                min,
-                self.mean(),
-                p50,
-                p99,
-                self.max,
-            );
-        } else {
-            println!(
-                "    ↳ {:<28} batches={:>6}  min={:>5}  mean={:>7.1}  max={:>5}",
-                label,
-                self.count,
-                min,
-                self.mean(),
-                self.max,
-            );
-        }
-    }
-}
-
-// ─── Bench: Inbound frame boundary scan ─────────────────────────────────────
-
-fn bench_frame_boundary_scan(messages: usize, payload_size: usize) {
-    // Build wire-format buffer: [len:4][client_id:4][payload:N]...
-    let mut buf = BytesMut::with_capacity(messages * (4 + 4 + payload_size));
-    let payload = vec![0xABu8; payload_size];
-    for i in 0..messages as u32 {
-        let frame_len = (4 + payload.len()) as u32;
-        buf.put_u32_le(frame_len);
-        buf.put_u32_le(i);
-        buf.put_slice(&payload);
-    }
-
-    // Simulate the frame boundary scan in run_inbound_loop.
-    let start = Instant::now();
-    let mut pos = 0usize;
-    let mut count = 0u32;
-    while pos + 4 <= buf.len() {
-        let frame_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        if frame_len == 0 || pos + 4 + frame_len > buf.len() {
+    for _ in 0..60 {
+        if raft.current_leader().await == Some(node_id) {
             break;
         }
-        pos += 4 + frame_len;
-        count += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let elapsed = start.elapsed();
-    assert_eq!(count as usize, messages);
+    assert_eq!(
+        raft.current_leader().await,
+        Some(node_id),
+        "node must become leader"
+    );
 
-    std::hint::black_box(pos);
-    print_result("  frame boundary scan", messages, payload_size, elapsed);
+    (raft, manager, tmp)
 }
 
-// ─── Bench: ForwardedBatch iter parse ───────────────────────────────────────
+// ─── Local path benchmark ─────────────────────────────────────────────────────
+//
+// LocalWriter::send → LocalBatcher drain loop → raft.client_write → state machine apply
+//
+// Completion: LocalBatcher::shutdown() joins the drain task, which only exits
+// after all raft.client_write() calls have returned (commit + apply).
+//
+// Sub-frame packing: each LocalWriter::send() carries PACK_SIZE sub-frames so
+// the batcher always receives a full batch and proposes immediately.  Sending
+// one sub-frame at a time leaves try_recv() empty on every loop iteration
+// (the sender hasn't written the next frame yet), collapsing batch size to 1
+// and capping throughput at ~1/raft_rt.  In production a connection task
+// buffers a read-cycle's worth of commands before calling send(), so pre-packing
+// is the realistic workload.
 
-fn bench_batch_iter_parse(messages: usize, payload_size: usize) {
-    // Build wire-format buffer: [len:4][client_id:4][payload:N]... (no padding).
-    let mut buf = BytesMut::with_capacity(messages * (4 + 4 + payload_size));
-    let payload = vec![0xABu8; payload_size];
-    for i in 0..messages as u32 {
-        let frame_len = (4 + payload.len()) as u32;
-        buf.put_u32_le(frame_len);
-        buf.put_u32_le(i);
-        buf.put_slice(&payload);
-    }
-    let frozen = buf.freeze();
-
-    // Parse using the same logic as ForwardedBatchIter.
-    let start = Instant::now();
-    let mut pos = 0usize;
-    let mut count = 0usize;
-    while pos + 4 <= frozen.len() {
-        let frame_len = u32::from_le_bytes(frozen[pos..pos + 4].try_into().unwrap()) as usize;
-        if frame_len < 4 || pos + 4 + frame_len > frozen.len() {
-            break;
-        }
-        let payload_start = pos + 4;
-        let client_id =
-            u32::from_le_bytes(frozen[payload_start..payload_start + 4].try_into().unwrap());
-        let cmd = &frozen[payload_start + 4..payload_start + frame_len];
-        std::hint::black_box(client_id);
-        std::hint::black_box(cmd);
-        pos = payload_start + frame_len;
-        count += 1;
-    }
-    let elapsed = start.elapsed();
-    assert_eq!(count, messages);
-
-    print_result("  batch iter parse", messages, payload_size, elapsed);
+/// Compute sub-frames per send so each LocalFrameBatch stays under
+/// `max_raft_entry_bytes`.  At least 1 sub-frame per send.
+fn pack_size(frame_wire_len: usize, max_entry_bytes: usize) -> u32 {
+    // Reserve 32 bytes for the TAG_FORWARDED_BATCH header.
+    let usable = max_entry_bytes.saturating_sub(32);
+    (usable / frame_wire_len).max(1) as u32
 }
 
-// ─── Bench: Local ClientRegistry callback dispatch ───────────────────────────
-//
-// Measures the full async dispatch pipeline:
-//   encode_log_index_frame (batch per partition) → send_to_partition_async → ClientPartition task
-//   → callback invocation.
-//
-// Uses a counter + oneshot channel to wait for all callbacks to fire.
-
-async fn bench_local_registry_dispatch(
+async fn bench_local_batcher(
+    raft_writer: Arc<RaftWriter>,
     messages: usize,
     payload_size: usize,
     num_clients: usize,
-    full_stats: bool,
+    use_scattered: bool,
 ) {
-    let registry = ClientRegistry::new(4, 16384);
     let total = messages * num_clients;
 
-    let received = Arc::new(AtomicUsize::new(0));
-    // channel(1) is race-free: the signal persists even if sent before recv().await.
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Sub-frame wire format: [payload_len:4][client_id:4][request_seq:8][cmd_bytes...]
+    let frame_body_len = 12 + payload_size;
+    let frame_wire_len = 4 + frame_body_len; // length prefix + body
 
-    let mut cids = Vec::with_capacity(num_clients);
-    for _ in 0..num_clients {
-        let received_cb = Arc::clone(&received);
-        let done_tx_cb = done_tx.clone();
-        let cb: ResponseCallback = Arc::new(move |_slab, _offset, _msg, is_done| {
-            if !is_done {
-                if received_cb.fetch_add(1, Ordering::Relaxed) + 1 >= total {
-                    let _ = done_tx_cb.try_send(());
-                }
-            }
-        });
-        cids.push(registry.register(cb));
-    }
-    // Drop the original sender; only callback clones keep senders alive.
-    drop(done_tx);
+    let max_entry = bisque_mq::write_batcher::DEFAULT_MAX_RAFT_ENTRY_BYTES;
+    let ps = pack_size(frame_wire_len, max_entry);
+    let config = MqWriteBatcherConfig {
+        max_batch_count: ps as usize,
+        channel_capacity: 1024,
+        use_scattered,
+        ..Default::default()
+    };
+    let batcher = LocalBatcher::new(Arc::clone(&raft_writer), 0, config);
 
-    // Yield so partition tasks are scheduled before we start sending.
-    tokio::task::yield_now().await;
-
-    let n = registry.num_partitions();
-    let mut part_bufs: Vec<BytesMut> = (0..n).map(|_| BytesMut::new()).collect();
-
-    // Telemetry: frames per send call per active partition.
-    let mut frames_per_send = Dist::new(full_stats);
-    // Telemetry: how many partitions are active (non-empty) per message iteration.
-    let mut active_parts_per_iter = Dist::new(full_stats);
-
+    let mode = if use_scattered { "vec" } else { "cpy" };
+    let label = format!(
+        "  local-{mode} ({num_clients} client{})",
+        if num_clients == 1 { "" } else { "s" }
+    );
+    let sent = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
-    for _ in 0..messages {
-        for &cid in &cids {
-            let p = (cid as usize) % n;
-            // Frame: [len=20:4][client_id:4][request_seq:8][log_index:8]
-            part_bufs[p].put_u32_le(20u32);
-            part_bufs[p].put_u32_le(cid);
-            part_bufs[p].put_u64_le(0u64); // request_seq
-            part_bufs[p].put_u64_le(42u64); // log_index
-        }
-        let mut active = 0u64;
-        for (p, buf) in part_bufs.iter_mut().enumerate() {
-            if !buf.is_empty() {
-                // Each 24-byte record is one frame (4 len + 4 cid + 8 req_seq + 8 log_idx).
-                let nframes = buf.len() as u64 / 24;
-                frames_per_send.push(nframes);
-                active += 1;
-                registry
-                    .send_to_partition_async(p, buf.split().freeze())
-                    .await;
+
+    // Spawn 250ms progress printer.
+    let progress = {
+        let sent = Arc::clone(&sent);
+        let label = label.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                let n = sent.load(Ordering::Relaxed) as usize;
+                if n > 0 {
+                    print_progress(&label, n, payload_size, start.elapsed());
+                }
             }
-        }
-        active_parts_per_iter.push(active);
-    }
-    let send_elapsed = start.elapsed();
-
-    done_rx.recv().await;
-    let e2e_elapsed = start.elapsed();
-
-    for cid in cids {
-        registry.unregister(cid);
-    }
-
-    print_result(
-        &format!("  registry send    ({num_clients} clients)"),
-        total,
-        payload_size,
-        send_elapsed,
-    );
-    frames_per_send.print("frames/send");
-    active_parts_per_iter.print("active parts/iter");
-    print_result(
-        &format!("  registry e2e     ({num_clients} clients)"),
-        total,
-        payload_size,
-        e2e_elapsed,
-    );
-}
-
-// ─── Bench: One-way throughput (follower → leader only) ─────────────────────
-
-async fn bench_one_way_throughput(
-    messages: usize,
-    payload_size: usize,
-    full_stats: bool,
-    inbound_cap: usize,
-) {
-    let config = ForwardConfig {
-        inbound_buffer_capacity: inbound_cap,
-        ..Default::default()
+        })
     };
 
-    let (mut acceptor, mut batch_rx) =
-        ForwardAcceptor::start_with_channel(config.clone(), "127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-    let addr = acceptor.local_addr();
+    // Spawn one task per client — each packs and sends independently,
+    // matching production where each connection task calls writer.send().
+    let mut handles = Vec::with_capacity(num_clients);
+    for cid in 0..num_clients as u32 {
+        let writer = batcher.writer();
+        let sent = Arc::clone(&sent);
+        handles.push(tokio::spawn(async move {
+            let mut buf = BytesMut::with_capacity(ps as usize * frame_wire_len);
+            let mut packed: u32 = 0;
+            let mut seq: u64 = 0;
 
-    // ClientRegistry with 4 partitions, capacity 4096.
-    let client_registry = ClientRegistry::new(4, 4096);
-    let mut client = ForwardClient::start(
-        config.clone(),
-        1,
-        0,
-        Some(addr),
-        Arc::clone(&client_registry),
-    );
+            for _ in 0..messages {
+                buf.put_u32_le(frame_body_len as u32);
+                buf.put_u32_le(cid);
+                buf.put_u64_le(seq);
+                buf.put_bytes(0, payload_size);
+                packed += 1;
+                seq += 1;
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let payload = vec![0xABu8; payload_size];
-
-    // Producer: use client_id=1 (no responses expected).
-    let producer_payload = payload.clone();
-    let producer_client = client.clone_handle();
-    let producer = tokio::spawn(async move {
-        for _ in 0..messages {
-            producer_client.forward(1u32, 0u64, &producer_payload).await;
-        }
-    });
-
-    // Consumer on leader side — count individual commands from batches.
-    let consumer = tokio::spawn(async move {
-        let mut batch_dist = Dist::new(full_stats);
-        // Telemetry: batches already queued (try_recv after first recv) shows
-        // how much TCP coalescing is occurring from the leader's perspective.
-        let mut pending_on_drain = Dist::new(full_stats);
-
-        let start = Instant::now();
-        let mut consumed = 0usize;
-        while consumed < messages {
-            if let Some(batch) = batch_rx.recv().await {
-                batch_dist.push(batch.len() as u64);
-                consumed += batch.len();
-
-                // Drain any already-queued batches (greedy).
-                let mut extra = 0u64;
-                while consumed < messages {
-                    match batch_rx.try_recv() {
-                        Ok(b) => {
-                            batch_dist.push(b.len() as u64);
-                            consumed += b.len();
-                            extra += 1;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                pending_on_drain.push(extra);
-
-                std::hint::black_box(consumed);
-            }
-        }
-        let elapsed = start.elapsed();
-        acceptor.shutdown().await;
-        (elapsed, consumed, batch_dist, pending_on_drain)
-    });
-
-    let (_, consumer_result) = tokio::join!(producer, consumer);
-    let (elapsed, consumed, mut batch_dist, mut pending_dist) = consumer_result.unwrap();
-
-    print_result(
-        &format!("  one-way follower->leader ({consumed} msgs)"),
-        consumed,
-        payload_size,
-        elapsed,
-    );
-    batch_dist.print("rx batch size (msgs)");
-    pending_dist.print("extra batches drained");
-
-    client.shutdown().await;
-}
-
-// ─── Bench: Full roundtrip (follower → leader → follower) ──────────────────
-
-async fn bench_full_roundtrip(
-    messages: usize,
-    payload_size: usize,
-    num_partitions: usize,
-    full_stats: bool,
-    inbound_cap: usize,
-    responder_cap: usize,
-) {
-    let config = ForwardConfig {
-        responder_channel_capacity: responder_cap,
-        inbound_buffer_capacity: inbound_cap,
-        ..Default::default()
-    };
-
-    let (mut acceptor, mut batch_rx) =
-        ForwardAcceptor::start_with_channel(config.clone(), "127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-    let addr = acceptor.local_addr();
-
-    let client_registry = ClientRegistry::new(num_partitions, 4096);
-
-    // Register one local client; its callback counts received responses.
-    let received = Arc::new(AtomicUsize::new(0));
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let received_cb = Arc::clone(&received);
-    let done_tx_cb = done_tx.clone();
-    let target = messages;
-    let callback: ResponseCallback = Arc::new(move |_slab, _offset, _msg, is_done| {
-        if !is_done {
-            if received_cb.fetch_add(1, Ordering::Relaxed) + 1 >= target {
-                let _ = done_tx_cb.try_send(());
-            }
-        }
-    });
-    drop(done_tx);
-    let local_cid = client_registry.register(callback);
-
-    let mut client = ForwardClient::start(
-        config.clone(),
-        1,
-        0,
-        Some(addr),
-        Arc::clone(&client_registry),
-    );
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let payload = vec![0xABu8; payload_size];
-
-    // Producer: forwards commands through the client.
-    let producer_payload = payload.clone();
-    let producer_client = client.clone_handle();
-    let producer = tokio::spawn(async move {
-        let start = Instant::now();
-        for _ in 0..messages {
-            producer_client
-                .forward(local_cid, 0u64, &producer_payload)
-                .await;
-        }
-        start.elapsed()
-    });
-
-    // Leader: receives batches, sends log-index responses via push_response_async.
-    // Greedy drain: after blocking recv, try_recv all queued batches before responding.
-    // This coalesces responses for multiple TCP batches into one send.
-    let leader = tokio::spawn(async move {
-        let start = Instant::now();
-        let mut consumed = 0usize;
-
-        let mut rx_batch_dist = Dist::new(full_stats); // msgs per TCP batch
-        let mut resp_batch_dist = Dist::new(full_stats); // msgs per push_response_async
-        let mut drain_dist = Dist::new(full_stats); // extra batches per greedy drain
-
-        while consumed < messages {
-            if let Some(batch) = batch_rx.recv().await {
-                let node_id = batch.node_id;
-                let mut resp = BytesMut::with_capacity(batch.len() * 24);
-                rx_batch_dist.push(batch.len() as u64);
-                for (client_id, _request_seq, _cmd) in batch.iter() {
-                    resp.put_u32_le(20u32);
-                    resp.put_u32_le(client_id);
-                    resp.put_u64_le(0u64); // request_seq
-                    resp.put_u64_le(consumed as u64);
-                    consumed += 1;
-                }
-
-                // Greedy drain: coalesce all already-queued batches from the same
-                // node into a single response send.
-                let mut extra = 0u64;
-                while consumed < messages {
-                    match batch_rx.try_recv() {
-                        Ok(b) if b.node_id == node_id => {
-                            rx_batch_dist.push(b.len() as u64);
-                            for (client_id, _request_seq, _cmd) in b.iter() {
-                                resp.put_u32_le(20u32);
-                                resp.put_u32_le(client_id);
-                                resp.put_u64_le(0u64);
-                                resp.put_u64_le(consumed as u64);
-                                consumed += 1;
-                            }
-                            extra += 1;
-                        }
-                        Ok(b) => {
-                            // Different node — put stats but can't unrecv; just process it.
-                            rx_batch_dist.push(b.len() as u64);
-                            for (client_id, _request_seq, _cmd) in b.iter() {
-                                resp.put_u32_le(20u32);
-                                resp.put_u32_le(client_id);
-                                resp.put_u64_le(0u64);
-                                resp.put_u64_le(consumed as u64);
-                                consumed += 1;
-                            }
-                            extra += 1;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                drain_dist.push(extra);
-                resp_batch_dist.push(resp.len() as u64 / 24);
-                acceptor.push_response_async(node_id, resp.freeze()).await;
-            }
-        }
-        (
-            start.elapsed(),
-            acceptor,
-            rx_batch_dist,
-            resp_batch_dist,
-            drain_dist,
-        )
-    });
-
-    // Consumer: wait for all responses via callback notification.
-    let consumer_start = Instant::now();
-    done_rx.recv().await;
-    let consumer_elapsed = consumer_start.elapsed();
-
-    let (producer_elapsed, leader_result) = tokio::join!(producer, leader);
-    let producer_elapsed = producer_elapsed.unwrap();
-    let (leader_elapsed, mut acceptor, mut rx_dist, mut resp_dist, mut drain_dist) =
-        leader_result.unwrap();
-
-    acceptor.shutdown().await;
-    client.shutdown().await;
-    client_registry.unregister(local_cid);
-
-    print_result(
-        &format!("  producer send    ({num_partitions} parts)"),
-        messages,
-        payload_size,
-        producer_elapsed,
-    );
-    print_result(
-        &format!("  leader apply     ({num_partitions} parts)"),
-        messages,
-        payload_size,
-        leader_elapsed,
-    );
-    rx_dist.print("rx batch size (msgs)");
-    drain_dist.print("extra batches drained");
-    resp_dist.print("resp batch size (msgs)");
-    print_result(
-        &format!("  e2e roundtrip    ({num_partitions} parts)"),
-        messages,
-        payload_size,
-        consumer_elapsed,
-    );
-}
-
-// ─── Bench: Full roundtrip with N concurrent connections ────────────────────
-//
-// Spins up `num_conns` ForwardClient instances (simulating N follower nodes),
-// each with a dedicated producer task.  All producers start simultaneously via
-// a barrier.  Throughput and bandwidth are reported as the aggregate across all
-// connections.
-
-async fn bench_full_roundtrip_n_conns(
-    messages_per_conn: usize,
-    payload_size: usize,
-    num_conns: usize,
-    full_stats: bool,
-    inbound_cap: usize,
-    responder_cap: usize,
-) {
-    use tokio::sync::Barrier;
-
-    let config = ForwardConfig {
-        responder_channel_capacity: responder_cap,
-        inbound_buffer_capacity: inbound_cap,
-        ..Default::default()
-    };
-
-    let (mut acceptor, mut batch_rx) =
-        ForwardAcceptor::start_with_channel(config.clone(), "127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-    let addr = acceptor.local_addr();
-
-    // 4 partitions; each connection registers one client.
-    let client_registry = ClientRegistry::new(4, 4096);
-    let total_messages = messages_per_conn * num_conns;
-
-    // Shared counter + channel for completion signaling.
-    let received = Arc::new(AtomicUsize::new(0));
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
-
-    // Start N ForwardClients (one per simulated follower node), each with one
-    // registered client.
-    let mut clients: Vec<ForwardClient> = Vec::with_capacity(num_conns);
-    let mut cids: Vec<u32> = Vec::with_capacity(num_conns);
-    for node_id in 1..=num_conns as u32 {
-        let received_cb = Arc::clone(&received);
-        let done_tx_cb = done_tx.clone();
-        let total = total_messages;
-        let cb: ResponseCallback = Arc::new(move |_slab, _offset, _msg, is_done| {
-            if !is_done {
-                if received_cb.fetch_add(1, Ordering::Relaxed) + 1 >= total {
-                    let _ = done_tx_cb.try_send(());
+                if packed == ps {
+                    writer
+                        .send(LocalFrameBatch {
+                            bytes: buf.split().freeze(),
+                            count: packed,
+                        })
+                        .await
+                        .unwrap();
+                    sent.fetch_add(packed as u64, Ordering::Relaxed);
+                    packed = 0;
                 }
             }
-        });
-        let cid = client_registry.register(cb);
-        cids.push(cid);
-        // node_id used as the positional arg, not keyword
-        clients.push(ForwardClient::start(
-            config.clone(),
-            node_id,
-            0,
-            Some(addr),
-            Arc::clone(&client_registry),
-        ));
-    }
-
-    // Drop original sender; only callback clones keep senders alive.
-    drop(done_tx);
-
-    // Wait for all TCP connections to establish.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let payload = vec![0xABu8; payload_size];
-
-    // Barrier: all producer tasks + main wait here before starting.
-    let barrier = Arc::new(Barrier::new(num_conns + 1));
-
-    // Spawn one producer task per connection.
-    let mut producer_handles = Vec::with_capacity(num_conns);
-    for (i, &cid) in cids.iter().enumerate() {
-        let handle = clients[i].clone_handle();
-        let payload = payload.clone();
-        let barrier = Arc::clone(&barrier);
-        producer_handles.push(tokio::spawn(async move {
-            barrier.wait().await;
-            for _ in 0..messages_per_conn {
-                handle.forward(cid, 0u64, &payload).await;
+            // Flush any remaining sub-frames.
+            if packed > 0 {
+                writer
+                    .send(LocalFrameBatch {
+                        bytes: buf.freeze(),
+                        count: packed,
+                    })
+                    .await
+                    .unwrap();
+                sent.fetch_add(packed as u64, Ordering::Relaxed);
             }
         }));
     }
 
-    // Leader: receive batches from all connections and route responses.
-    // Greedy drain to coalesce responses across multiple in-flight batches.
-    let leader = tokio::spawn(async move {
-        let mut consumed = 0usize;
-        let mut rx_batch_dist = Dist::new(full_stats);
-        let mut resp_batch_dist = Dist::new(full_stats);
-        let mut drain_dist = Dist::new(full_stats);
-
-        // Per-node accumulation buffers: node_id < 64.
-        let mut node_bufs: Vec<(u32, BytesMut)> = Vec::with_capacity(8);
-
-        while consumed < total_messages {
-            if let Some(batch) = batch_rx.recv().await {
-                // Accumulate the first batch.
-                rx_batch_dist.push(batch.len() as u64);
-                let first_node = batch.node_id;
-                let mut first_resp = BytesMut::with_capacity(batch.len() * 24);
-                for (client_id, _request_seq, _cmd) in batch.iter() {
-                    first_resp.put_u32_le(20u32);
-                    first_resp.put_u32_le(client_id);
-                    first_resp.put_u64_le(0u64); // request_seq
-                    first_resp.put_u64_le(consumed as u64);
-                    consumed += 1;
-                }
-                node_bufs.push((first_node, first_resp));
-
-                // Greedy drain: accumulate per-node so responses reach the right follower.
-                let mut extra = 0u64;
-                while consumed < total_messages {
-                    match batch_rx.try_recv() {
-                        Ok(b) => {
-                            rx_batch_dist.push(b.len() as u64);
-                            let nid = b.node_id;
-                            let buf =
-                                if let Some(e) = node_bufs.iter_mut().find(|(id, _)| *id == nid) {
-                                    &mut e.1
-                                } else {
-                                    node_bufs.push((nid, BytesMut::with_capacity(b.len() * 24)));
-                                    &mut node_bufs.last_mut().unwrap().1
-                                };
-                            for (client_id, _request_seq, _cmd) in b.iter() {
-                                buf.put_u32_le(20u32);
-                                buf.put_u32_le(client_id);
-                                buf.put_u64_le(0u64); // request_seq
-                                buf.put_u64_le(consumed as u64);
-                                consumed += 1;
-                            }
-                            extra += 1;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                drain_dist.push(extra);
-
-                // Send one coalesced response per node.
-                for (nid, buf) in node_bufs.drain(..) {
-                    resp_batch_dist.push(buf.len() as u64 / 24);
-                    acceptor.push_response_async(nid, buf.freeze()).await;
-                }
-            }
-        }
-        (acceptor, rx_batch_dist, resp_batch_dist, drain_dist)
-    });
-
-    // Release all producers simultaneously, start the wall clock.
-    barrier.wait().await;
-    let wall_start = Instant::now();
-
-    // Wait for all producers to finish sending.
-    for h in producer_handles {
+    for h in handles {
         h.await.unwrap();
     }
-    let prod_elapsed = wall_start.elapsed();
 
-    // Wait for all consumers to receive their responses via callbacks.
-    done_rx.recv().await;
-    let e2e_elapsed = wall_start.elapsed();
+    // Grab stats before shutdown (which consumes batcher).
+    let bs = Arc::clone(batcher.stats());
 
-    let (mut acceptor, mut rx_dist, mut resp_dist, mut drain_dist) = leader.await.unwrap();
-    acceptor.shutdown().await;
-    for mut client in clients {
-        client.shutdown().await;
+    // Drain the batcher channel, then wait for the RaftWriter backlog to reach
+    // zero (all proposals committed + applied by the state machine).
+    batcher.shutdown().await;
+    tokio::select! {
+        _ = raft_writer.backlog().wait_for_drain() => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            eprintln!("  WARNING: local batcher backlog drain timed out (backlog={})", raft_writer.backlog().current());
+        }
     }
-    for cid in cids {
-        client_registry.unregister(cid);
-    }
 
-    print_result(
-        &format!("  producer send    ({num_conns} conns)"),
-        total_messages,
-        payload_size,
-        prod_elapsed,
-    );
-    rx_dist.print("rx batch size (msgs)");
-    drain_dist.print("extra batches drained");
-    resp_dist.print("resp batch size (msgs)");
-    print_result(
-        &format!("  e2e roundtrip    ({num_conns} conns)"),
-        total_messages,
-        payload_size,
-        e2e_elapsed,
-    );
+    progress.abort();
+    print_result_cr(&label, total, payload_size, start.elapsed());
+
+    // Print batching stats.
+    let bs = &bs;
+    let batches = bs.batch_count.load(Ordering::Relaxed);
+    let payload = bs.total_payload_bytes.load(Ordering::Relaxed);
+    let recvs = bs.channel_recvs.load(Ordering::Relaxed);
+    let rs = raft_writer.stats();
+    let proposals = rs.proposals.load(Ordering::Relaxed);
+    let entries = rs.entries.load(Ordering::Relaxed);
+    let rbytes = rs.bytes.load(Ordering::Relaxed);
+    if batches > 0 && proposals > 0 {
+        eprintln!(
+            "    drain: {} batches, avg {:.1} KB payload, {:.1} recvs/batch | raft: {} proposals, {:.1} entries/proposal, avg {:.1} KB/entry",
+            batches,
+            payload as f64 / batches as f64 / 1024.0,
+            recvs as f64 / batches as f64,
+            proposals,
+            entries as f64 / proposals as f64,
+            rbytes as f64 / entries as f64 / 1024.0,
+        );
+    }
+    rs.reset();
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+// ─── Forward path benchmark ───────────────────────────────────────────────────
+//
+// ForwardClient::forward → OutboundBuf → TCP → ForwardAcceptor reads → charge
+// backlog → raft.client_write → state machine apply → release backlog
+//
+// The forward() call provides end-to-end backpressure: it blocks when the
+// OutboundBuf is full, which happens when TCP is blocked, which happens when
+// the leader pauses reads via backlog.wait_for_capacity().  This means
+// send_elapsed naturally captures full-pipeline throughput.
+//
+// For e2e_elapsed we additionally drain the final in-flight batch: we poll
+// the backlog until it reaches zero, using the "ever seen non-zero" flag to
+// guard against checking before the first batch has been charged.
+
+async fn bench_forward_path(
+    raft_writer: Arc<RaftWriter>,
+    messages: usize,
+    payload_size: usize,
+    num_clients: usize,
+) {
+    let total = messages * num_clients;
+    let config = ForwardConfig::default();
+
+    let mut acceptor = ForwardAcceptor::start(
+        config.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&raft_writer),
+        ResponderBroadcast::new_empty(),
+    )
+    .await
+    .unwrap();
+    let acceptor_addr = acceptor.local_addr();
+
+    // Simulated follower: node_id=2 distinguishes it from the Raft leader (node_id=1).
+    let client_registry = ClientRegistry::new(4, 16384); // returns Arc<ClientRegistry>
+    let mut fc = ForwardClient::start(config, 2, 0, Some(acceptor_addr), client_registry);
+
+    // Wait for handshake to complete.
+    for _ in 0..100 {
+        if acceptor.connected_nodes() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        acceptor.connected_nodes() >= 1,
+        "ForwardClient must connect to acceptor"
+    );
+
+    // Sub-frame wire format: [payload_len:4][client_id:4][request_seq:8][cmd_bytes...]
+    let frame_body_len = 12 + payload_size;
+    let frame_wire_len = 4 + frame_body_len; // length prefix + body
+    let max_entry = bisque_mq::write_batcher::DEFAULT_MAX_RAFT_ENTRY_BYTES;
+    let ps = pack_size(frame_wire_len, max_entry);
+
+    let send_label = format!(
+        "  forward send  ({num_clients} client{})",
+        if num_clients == 1 { "" } else { "s" }
+    );
+    let e2e_label = format!(
+        "  forward e2e   ({num_clients} client{})",
+        if num_clients == 1 { "" } else { "s" }
+    );
+
+    let sent = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+
+    // Spawn 250ms progress printer for the send phase.
+    let progress_send = {
+        let sent = Arc::clone(&sent);
+        let label = send_label.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let n = sent.load(Ordering::Relaxed) as usize;
+                if n > 0 {
+                    print_progress(&label, n, payload_size, start.elapsed());
+                }
+            }
+        })
+    };
+
+    // Spawn one task per client — each packs sub-frames and sends batches
+    // through ForwardWriter (channel-based, zero cross-core contention).
+    let mut send_handles = Vec::with_capacity(num_clients);
+    for cid in 0..num_clients as u32 {
+        let writer = fc.writer();
+        let sent = Arc::clone(&sent);
+        send_handles.push(tokio::spawn(async move {
+            let mut buf = BytesMut::with_capacity(ps as usize * frame_wire_len);
+            let mut packed: u32 = 0;
+            let mut seq: u64 = 0;
+
+            for _ in 0..messages {
+                buf.put_u32_le(frame_body_len as u32);
+                buf.put_u32_le(cid);
+                buf.put_u64_le(seq);
+                buf.put_bytes(0, payload_size);
+                packed += 1;
+                seq += 1;
+
+                if packed == ps {
+                    writer
+                        .send(ForwardFrameBatch {
+                            bytes: buf.split().freeze(),
+                            count: packed,
+                        })
+                        .await
+                        .unwrap();
+                    sent.fetch_add(packed as u64, Ordering::Relaxed);
+                    packed = 0;
+                }
+            }
+            // Flush any remaining sub-frames.
+            if packed > 0 {
+                writer
+                    .send(ForwardFrameBatch {
+                        bytes: buf.freeze(),
+                        count: packed,
+                    })
+                    .await
+                    .unwrap();
+                sent.fetch_add(packed as u64, Ordering::Relaxed);
+            }
+        }));
+    }
+    for h in send_handles {
+        h.await.unwrap();
+    }
+    progress_send.abort();
+    let send_elapsed = start.elapsed();
+    print_result_cr(&send_label, total, payload_size, send_elapsed);
+
+    // Spawn 250ms progress printer for the e2e drain phase.
+    let progress_e2e = {
+        let label = e2e_label.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let elapsed = start.elapsed();
+                print_progress(&label, total, payload_size, elapsed);
+            }
+        })
+    };
+
+    // Shut down the ForwardClient (cancel drain loop + TCP), then wait for
+    // all charged batches to be applied.  Cancel drops at most 1 in-flight
+    // batch — negligible.  Most data already flowed through Raft during
+    // the send phase (writers experienced backpressure).
+    fc.shutdown().await;
+
+    tokio::select! {
+        _ = raft_writer.backlog().wait_for_drain() => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            eprintln!("  WARNING: forward path backlog drain timed out (backlog={})", raft_writer.backlog().current());
+        }
+    }
+
+    progress_e2e.abort();
+    let e2e_elapsed = start.elapsed();
+
+    acceptor.shutdown().await;
+
+    print_result_cr(&e2e_label, total, payload_size, e2e_elapsed);
+
+    // Print raft batching stats for forward path.
+    let rs = raft_writer.stats();
+    let proposals = rs.proposals.load(Ordering::Relaxed);
+    let entries = rs.entries.load(Ordering::Relaxed);
+    let rbytes = rs.bytes.load(Ordering::Relaxed);
+    if proposals > 0 {
+        eprintln!(
+            "    raft: {} proposals, {:.1} entries/proposal, avg {:.1} KB/entry",
+            proposals,
+            entries as f64 / proposals as f64,
+            rbytes as f64 / entries as f64 / 1024.0,
+        );
+    }
+    rs.reset();
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
     let config = BenchConfig::from_args();
 
     println!();
-    println!("=== Forward Transport Benchmark ===");
+    println!("=== Command Ingestion Benchmark (Real Raft) ===");
     println!(
-        "    messages: {}  sizes: {:?}  partitions: {:?}  connections: {:?}  stats: {}",
-        config.messages,
-        config.sizes,
-        config.partitions,
-        config.connections,
-        if config.stats {
-            "full (p50/p99)"
-        } else {
-            "min/mean/max"
-        },
-    );
-    println!(
-        "    inbound-cap: {}  responder-cap: {}",
-        config.inbound_cap, config.responder_cap,
+        "    messages: {}  sizes: {:?}",
+        config.messages, config.sizes
     );
     println!();
 
     for &size in &config.sizes {
         println!("--- payload size: {} bytes ---", size);
         print_header();
-
-        // 1. Pure CPU: frame boundary scan.
-        bench_frame_boundary_scan(config.messages, size);
-
-        // 2. Pure CPU: batch iter parse.
-        bench_batch_iter_parse(config.messages, size);
-
-        // 3. Local ClientRegistry callback dispatch.
         println!();
+
+        // Create backlog first so it can be shared between the state machine
+        // (for apply-side release) and the RaftWriter (for submit-side charge).
+        let backlog = Arc::new(bisque_mq::forward::RaftBacklog::new(256 * 1024 * 1024));
+        let (raft, manager, _tmp) = setup_raft(Arc::clone(&backlog)).await;
+        let raft_writer =
+            RaftWriter::with_backlog(raft.clone(), RaftWriterConfig::default(), backlog);
+
         for &clients in &[1usize, 4, 16] {
-            bench_local_registry_dispatch(config.messages, size, clients, config.stats).await;
-        }
-
-        // Scale TCP message count down for larger payloads to keep runtime bounded.
-        let scale = (64.0 / size as f64).sqrt().max(0.1);
-        let one_way_msgs = ((config.messages as f64 * scale) as usize).max(1000);
-        let rt_msgs = ((config.messages as f64 * scale) as usize).max(1000);
-
-        // 4. TCP one-way (follower→leader only).
-        println!();
-        bench_one_way_throughput(one_way_msgs, size, config.stats, config.inbound_cap).await;
-
-        // 5. Full roundtrip per partition count (single connection).
-        println!();
-        for &parts in &config.partitions {
-            bench_full_roundtrip(
-                rt_msgs,
+            bench_local_batcher(
+                Arc::clone(&raft_writer),
+                config.messages,
                 size,
-                parts,
-                config.stats,
-                config.inbound_cap,
-                config.responder_cap,
+                clients,
+                true, // scattered (vectored)
             )
             .await;
-        }
 
-        // 6. Full roundtrip per connection count.
-        println!();
-        for &conns in &config.connections {
-            bench_full_roundtrip_n_conns(
-                rt_msgs,
+            bench_local_batcher(
+                Arc::clone(&raft_writer),
+                config.messages,
                 size,
-                conns,
-                config.stats,
-                config.inbound_cap,
-                config.responder_cap,
+                clients,
+                false, // contiguous (memcpy)
             )
             .await;
+
+            bench_forward_path(Arc::clone(&raft_writer), config.messages, size, clients).await;
+
+            println!();
         }
 
-        println!();
+        let _ = raft.shutdown().await;
+        manager.shutdown_all().await;
     }
 }

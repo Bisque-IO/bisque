@@ -20,6 +20,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use smallvec::SmallVec;
 
 use crate::types::*;
+use crate::types::{DecodeError, read_slice, read_u32_le, read_u64_le};
 
 // =============================================================================
 // MqCommand tag aliases (delegate to MqCommand::TAG_*)
@@ -824,11 +825,17 @@ impl Decode for MqCommand {
         reader.read_to_end(&mut buf)?;
         Ok(MqCommand {
             buf: Bytes::from(buf),
+            header: [0u8; 32],
+            extra: Vec::new(),
         })
     }
 
     fn decode_from_bytes(data: Bytes) -> Result<Self, CodecError> {
-        Ok(MqCommand { buf: data })
+        Ok(MqCommand {
+            buf: data,
+            header: [0u8; 32],
+            extra: Vec::new(),
+        })
     }
 }
 
@@ -1640,11 +1647,20 @@ impl MqCommand {
     // -- ForwardedBatch (55) --
 
     /// Write TAG_FORWARDED_BATCH into `buf`.
-    /// Layout: `@8 node_id:u32, @12 count:u32, @16 [sub-frames...]`
-    pub fn write_forwarded_batch(buf: &mut BytesMut, node_id: u32, count: u32, frames: &[u8]) {
-        let base = write_cmd_begin(buf, Self::TAG_FORWARDED_BATCH, 0, 16);
+    /// Layout: `@8 node_id:u32, @12 count:u32, @16 batch_seq:u64, @24 leader_seq:u64, @32 [sub-frames...]`
+    pub fn write_forwarded_batch(
+        buf: &mut BytesMut,
+        node_id: u32,
+        count: u32,
+        batch_seq: u64,
+        leader_seq: u64,
+        frames: &[u8],
+    ) {
+        let base = write_cmd_begin(buf, Self::TAG_FORWARDED_BATCH, 0, 32);
         write_u32_field(buf, base, 8, node_id);
         write_u32_field(buf, base, 12, count);
+        write_u64_field(buf, base, 16, batch_seq);
+        write_u64_field(buf, base, 24, leader_seq);
         buf.extend_from_slice(frames);
         write_cmd_finish(buf, base);
     }
@@ -2117,96 +2133,98 @@ impl MqCommand {
 // =============================================================================
 
 impl MqCommand {
-    pub fn as_create_topic(&self) -> CmdCreateTopic<'_> {
-        CmdCreateTopic { buf: &self.buf }
+    pub fn as_create_topic(&self) -> Result<CmdCreateTopic<'_>, DecodeError> {
+        CmdCreateTopic::from_buf(&self.buf)
     }
 
-    pub fn as_publish(&self) -> CmdPublish<'_> {
-        CmdPublish { buf: &self.buf }
+    pub fn as_publish(&self) -> Result<CmdPublish<'_>, DecodeError> {
+        CmdPublish::from_buf(&self.buf)
     }
 
-    pub fn collect_publish_messages(&self) -> Vec<Bytes> {
-        self.as_publish().messages().collect()
+    pub fn collect_publish_messages(&self) -> Result<Vec<Bytes>, DecodeError> {
+        Ok(self.as_publish()?.messages().collect())
     }
 
-    pub fn take_publish_segments(&mut self) -> Vec<Bytes> {
-        CmdPublish { buf: &self.buf }.messages().collect()
+    pub fn take_publish_segments(&mut self) -> Result<Vec<Bytes>, DecodeError> {
+        Ok(CmdPublish::from_buf(&self.buf)?.messages().collect())
     }
 
-    pub fn as_create_exchange(&self) -> CmdCreateExchange<'_> {
-        CmdCreateExchange { buf: &self.buf }
+    pub fn as_create_exchange(&self) -> Result<CmdCreateExchange<'_>, DecodeError> {
+        CmdCreateExchange::from_buf(&self.buf)
     }
 
-    pub fn as_create_binding(&self) -> CmdCreateBinding<'_> {
-        CmdCreateBinding { buf: &self.buf }
+    pub fn as_create_binding(&self) -> Result<CmdCreateBinding<'_>, DecodeError> {
+        CmdCreateBinding::from_buf(&self.buf)
     }
 
-    pub fn as_publish_to_exchange(&self) -> CmdPublishToExchange<'_> {
-        CmdPublishToExchange { buf: &self.buf }
+    pub fn as_publish_to_exchange(&self) -> Result<CmdPublishToExchange<'_>, DecodeError> {
+        CmdPublishToExchange::from_buf(&self.buf)
     }
 
-    pub fn as_batch(&self) -> CmdBatch<'_> {
-        CmdBatch { buf: &self.buf }
+    pub fn as_batch(&self) -> Result<CmdBatch<'_>, DecodeError> {
+        CmdBatch::from_buf(&self.buf)
     }
 
-    pub fn as_forwarded_batch(&self) -> CmdForwardedBatch<'_> {
-        CmdForwardedBatch { buf: &self.buf }
+    pub fn as_forwarded_batch(&self) -> Result<CmdForwardedBatch<'_>, DecodeError> {
+        CmdForwardedBatch::from_buf(&self.buf)
     }
 
-    pub fn as_resume(&self) -> CmdResume<'_> {
-        CmdResume { buf: &self.buf }
+    pub fn as_resume(&self) -> Result<CmdResume<'_>, DecodeError> {
+        CmdResume::from_buf(&self.buf)
     }
 
-    pub fn as_create_consumer_group(&self) -> CmdCreateConsumerGroup<'_> {
-        CmdCreateConsumerGroup { buf: &self.buf }
+    pub fn as_create_consumer_group(&self) -> Result<CmdCreateConsumerGroup<'_>, DecodeError> {
+        CmdCreateConsumerGroup::from_buf(&self.buf)
     }
 
-    pub fn as_commit_group_offset(&self) -> CmdCommitGroupOffset<'_> {
-        CmdCommitGroupOffset { buf: &self.buf }
+    pub fn as_commit_group_offset(&self) -> Result<CmdCommitGroupOffset<'_>, DecodeError> {
+        CmdCommitGroupOffset::from_buf(&self.buf)
     }
 
-    pub fn as_join_consumer_group(&self) -> CmdJoinConsumerGroup<'_> {
-        CmdJoinConsumerGroup { buf: &self.buf }
+    pub fn as_join_consumer_group(&self) -> Result<CmdJoinConsumerGroup<'_>, DecodeError> {
+        CmdJoinConsumerGroup::from_buf(&self.buf)
     }
 
-    pub fn as_sync_consumer_group(&self) -> CmdSyncConsumerGroup<'_> {
-        CmdSyncConsumerGroup { buf: &self.buf }
+    pub fn as_sync_consumer_group(&self) -> Result<CmdSyncConsumerGroup<'_>, DecodeError> {
+        CmdSyncConsumerGroup::from_buf(&self.buf)
     }
 
-    pub fn as_leave_consumer_group(&self) -> CmdLeaveConsumerGroup<'_> {
-        CmdLeaveConsumerGroup { buf: &self.buf }
+    pub fn as_leave_consumer_group(&self) -> Result<CmdLeaveConsumerGroup<'_>, DecodeError> {
+        CmdLeaveConsumerGroup::from_buf(&self.buf)
     }
 
-    pub fn as_heartbeat_consumer_group(&self) -> CmdHeartbeatConsumerGroup<'_> {
-        CmdHeartbeatConsumerGroup { buf: &self.buf }
+    pub fn as_heartbeat_consumer_group(
+        &self,
+    ) -> Result<CmdHeartbeatConsumerGroup<'_>, DecodeError> {
+        CmdHeartbeatConsumerGroup::from_buf(&self.buf)
     }
 
-    pub fn as_set_retained(&self) -> CmdSetRetained<'_> {
-        CmdSetRetained { buf: &self.buf }
+    pub fn as_set_retained(&self) -> Result<CmdSetRetained<'_>, DecodeError> {
+        CmdSetRetained::from_buf(&self.buf)
     }
 
-    pub fn as_get_retained(&self) -> CmdGetRetained<'_> {
-        CmdGetRetained { buf: &self.buf }
+    pub fn as_get_retained(&self) -> Result<CmdGetRetained<'_>, DecodeError> {
+        CmdGetRetained::from_buf(&self.buf)
     }
 
-    pub fn as_delete_retained(&self) -> CmdDeleteRetained<'_> {
-        CmdDeleteRetained { buf: &self.buf }
+    pub fn as_delete_retained(&self) -> Result<CmdDeleteRetained<'_>, DecodeError> {
+        CmdDeleteRetained::from_buf(&self.buf)
     }
 
-    pub fn as_set_will(&self) -> CmdSetWill<'_> {
-        CmdSetWill { buf: &self.buf }
+    pub fn as_set_will(&self) -> Result<CmdSetWill<'_>, DecodeError> {
+        CmdSetWill::from_buf(&self.buf)
     }
 
-    pub fn as_persist_session(&self) -> CmdPersistSession<'_> {
-        CmdPersistSession { buf: &self.buf }
+    pub fn as_persist_session(&self) -> Result<CmdPersistSession<'_>, DecodeError> {
+        CmdPersistSession::from_buf(&self.buf)
     }
 
-    pub fn as_restore_session(&self) -> CmdRestoreSession<'_> {
-        CmdRestoreSession { buf: &self.buf }
+    pub fn as_restore_session(&self) -> Result<CmdRestoreSession<'_>, DecodeError> {
+        CmdRestoreSession::from_buf(&self.buf)
     }
 
-    pub fn as_publish_to_dlq(&self) -> CmdPublishToDlq<'_> {
-        CmdPublishToDlq { buf: &self.buf }
+    pub fn as_publish_to_dlq(&self) -> Result<CmdPublishToDlq<'_>, DecodeError> {
+        CmdPublishToDlq::from_buf(&self.buf)
     }
 
     // -- Message extraction helpers --
@@ -2240,7 +2258,7 @@ impl MqCommand {
 
     #[inline]
     pub fn publish_messages_for_topic(&self, topic_id: u64) -> Option<VecBytesIter<'_>> {
-        if self.tag() != Self::TAG_PUBLISH {
+        if self.tag() != Self::TAG_PUBLISH || self.buf.len() < 24 {
             return None;
         }
         if self.field_u64(8) != topic_id {
@@ -2259,37 +2277,45 @@ impl MqCommand {
 ///
 /// Bit-0 tag: `byte[0] & 1 == 0` → small inline, `byte[0] & 1 == 1` → large.
 #[inline]
-fn read_flex8(buf: &[u8], offset: usize) -> &[u8] {
+fn read_flex8(buf: &[u8], offset: usize) -> Result<&[u8], DecodeError> {
+    if offset >= buf.len() {
+        return Err(DecodeError::BufferTooShort {
+            need: 1,
+            offset,
+            have: buf.len(),
+        });
+    }
     let first = buf[offset];
     if first & 1 == 0 {
         let len = (first >> 1) as usize;
         if len == 0 {
-            return &[];
+            return Ok(&[]);
         }
-        &buf[offset + 1..offset + 1 + len]
+        read_slice(buf, offset + 1, len)
     } else {
-        let raw = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
+        let raw = read_u32_le(buf, offset)?;
         let data_offset = (raw >> 1) as usize;
-        let size = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        &buf[data_offset..data_offset + size]
+        let size = read_u32_le(buf, offset + 4)? as usize;
+        read_slice(buf, data_offset, size)
     }
 }
 
 /// Read a flex8 slot as &str.
 #[inline]
-fn read_flex8_str(buf: &[u8], offset: usize) -> &str {
-    std::str::from_utf8(read_flex8(buf, offset)).unwrap_or("")
+fn read_flex8_str(buf: &[u8], offset: usize) -> Result<&str, DecodeError> {
+    let bytes = read_flex8(buf, offset)?;
+    Ok(std::str::from_utf8(bytes).unwrap_or(""))
 }
 
 /// Read a blob slot from a raw buffer: `[offset:4][size:4]`.
 #[inline]
-fn read_blob(buf: &[u8], offset: usize) -> &[u8] {
-    let data_offset = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-    let size = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
+fn read_blob(buf: &[u8], offset: usize) -> Result<&[u8], DecodeError> {
+    let data_offset = read_u32_le(buf, offset)? as usize;
+    let size = read_u32_le(buf, offset + 4)? as usize;
     if size == 0 {
-        return &[];
+        return Ok(&[]);
     }
-    &buf[data_offset..data_offset + size]
+    read_slice(buf, data_offset, size)
 }
 
 // =============================================================================
@@ -2303,21 +2329,30 @@ pub struct CmdCreateTopic<'a> {
 }
 
 impl<'a> CmdCreateTopic<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 28;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
-    pub fn name(&self) -> &str {
-        std::str::from_utf8(read_flex8(self.buf, 8)).unwrap_or("")
+    pub fn name(&self) -> Result<&str, DecodeError> {
+        read_flex8_str(self.buf, 8)
     }
 
-    pub fn retention(&self) -> RetentionPolicy {
-        let blob = read_blob(self.buf, 16);
+    pub fn retention(&self) -> Result<RetentionPolicy, DecodeError> {
+        let blob = read_blob(self.buf, 16)?;
         if blob.is_empty() {
-            return RetentionPolicy::default();
+            return Ok(RetentionPolicy::default());
         }
         let mut cursor = std::io::Cursor::new(blob);
-        RetentionPolicy::decode(&mut cursor).unwrap_or_default()
+        Ok(RetentionPolicy::decode(&mut cursor).unwrap_or_default())
     }
 
     pub fn partition_count(&self) -> u32 {
@@ -2332,8 +2367,17 @@ pub struct CmdPublish<'a> {
 }
 
 impl<'a> CmdPublish<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 24;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn topic_id(&self) -> u64 {
@@ -2360,11 +2404,20 @@ pub struct CmdCreateExchange<'a> {
 }
 
 impl<'a> CmdCreateExchange<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 16;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 8)
     }
 
@@ -2387,8 +2440,17 @@ pub struct CmdCreateBinding<'a> {
 }
 
 impl<'a> CmdCreateBinding<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 40;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn exchange_id(&self) -> u64 {
@@ -2399,12 +2461,12 @@ impl<'a> CmdCreateBinding<'a> {
         u64::from_le_bytes(self.buf[16..24].try_into().unwrap())
     }
 
-    pub fn routing_key(&self) -> Option<String> {
-        let data = read_flex8(self.buf, 24);
+    pub fn routing_key(&self) -> Result<Option<String>, DecodeError> {
+        let data = read_flex8(self.buf, 24)?;
         if data.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(std::str::from_utf8(data).unwrap_or("").to_string())
+            Ok(Some(std::str::from_utf8(data).unwrap_or("").to_string()))
         }
     }
 
@@ -2412,12 +2474,12 @@ impl<'a> CmdCreateBinding<'a> {
         self.buf[7] & 1 != 0 // flags bit 0
     }
 
-    pub fn shared_group(&self) -> Option<String> {
-        let data = read_flex8(self.buf, 32);
+    pub fn shared_group(&self) -> Result<Option<String>, DecodeError> {
+        let data = read_flex8(self.buf, 32)?;
         if data.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(std::str::from_utf8(data).unwrap_or("").to_string())
+            Ok(Some(std::str::from_utf8(data).unwrap_or("").to_string()))
         }
     }
 
@@ -2438,8 +2500,17 @@ pub struct CmdPublishToExchange<'a> {
 }
 
 impl<'a> CmdPublishToExchange<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 24;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn exchange_id(&self) -> u64 {
@@ -2464,8 +2535,17 @@ pub struct CmdPublishToDlq<'a> {
 }
 
 impl<'a> CmdPublishToDlq<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 40;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn source_group_id(&self) -> u64 {
@@ -2476,20 +2556,18 @@ impl<'a> CmdPublishToDlq<'a> {
         u64::from_le_bytes(self.buf[16..24].try_into().unwrap())
     }
 
-    pub fn dead_letter_ids(&self) -> SmallVec<[u64; 8]> {
+    pub fn dead_letter_ids(&self) -> Result<SmallVec<[u64; 8]>, DecodeError> {
         let count = u32::from_le_bytes(self.buf[24..28].try_into().unwrap()) as usize;
         if count == 0 {
-            return SmallVec::new();
+            return Ok(SmallVec::new());
         }
-        let data_offset = u32::from_le_bytes(self.buf[28..32].try_into().unwrap()) as usize;
+        let data_offset = read_u32_le(self.buf, 28)? as usize;
         let mut v = SmallVec::with_capacity(count.min(4096));
         for i in 0..count.min(4096) {
             let off = data_offset + i * 8;
-            v.push(u64::from_le_bytes(
-                self.buf[off..off + 8].try_into().unwrap(),
-            ));
+            v.push(read_u64_le(self.buf, off)?);
         }
-        v
+        Ok(v)
     }
 
     pub fn messages(&self) -> VecBytesIter<'a> {
@@ -2505,8 +2583,17 @@ pub struct CmdBatch<'a> {
 }
 
 impl<'a> CmdBatch<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 16;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn count(&self) -> u32 {
@@ -2542,11 +2629,20 @@ pub struct CmdCreateConsumerGroup<'a> {
 }
 
 impl<'a> CmdCreateConsumerGroup<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 59;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 8)
     }
 
@@ -2554,35 +2650,35 @@ impl<'a> CmdCreateConsumerGroup<'a> {
         self.buf[56]
     }
 
-    pub fn variant_config(&self) -> VariantConfig {
-        let blob = read_blob(self.buf, 32);
+    pub fn variant_config(&self) -> Result<VariantConfig, DecodeError> {
+        let blob = read_blob(self.buf, 32)?;
         if blob.is_empty() {
-            return VariantConfig::default();
+            return Ok(VariantConfig::default());
         }
         let mut cursor = std::io::Cursor::new(blob);
-        VariantConfig::decode(&mut cursor).unwrap_or_default()
+        Ok(VariantConfig::decode(&mut cursor).unwrap_or_default())
     }
 
     pub fn auto_create_topic(&self) -> bool {
         self.buf[57] != 0
     }
 
-    pub fn topic_retention(&self) -> RetentionPolicy {
-        let blob = read_blob(self.buf, 40);
+    pub fn topic_retention(&self) -> Result<RetentionPolicy, DecodeError> {
+        let blob = read_blob(self.buf, 40)?;
         if blob.is_empty() {
-            return RetentionPolicy::default();
+            return Ok(RetentionPolicy::default());
         }
         let mut cursor = std::io::Cursor::new(blob);
-        RetentionPolicy::decode(&mut cursor).unwrap_or_default()
+        Ok(RetentionPolicy::decode(&mut cursor).unwrap_or_default())
     }
 
-    pub fn topic_dedup(&self) -> Option<TopicDedupConfig> {
-        let blob = read_blob(self.buf, 48);
+    pub fn topic_dedup(&self) -> Result<Option<TopicDedupConfig>, DecodeError> {
+        let blob = read_blob(self.buf, 48)?;
         if blob.is_empty() {
-            return None;
+            return Ok(None);
         }
         let mut cursor = std::io::Cursor::new(blob);
-        TopicDedupConfig::decode(&mut cursor).ok()
+        Ok(TopicDedupConfig::decode(&mut cursor).ok())
     }
 
     pub fn topic_lifetime(&self) -> TopicLifetimePolicy {
@@ -2592,21 +2688,21 @@ impl<'a> CmdCreateConsumerGroup<'a> {
         }
     }
 
-    pub fn dlq_topic_name(&self) -> Option<String> {
-        let data = read_flex8(self.buf, 16);
+    pub fn dlq_topic_name(&self) -> Result<Option<String>, DecodeError> {
+        let data = read_flex8(self.buf, 16)?;
         if data.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(std::str::from_utf8(data).unwrap_or("").to_string())
+            Ok(Some(std::str::from_utf8(data).unwrap_or("").to_string()))
         }
     }
 
-    pub fn response_topic_name(&self) -> Option<String> {
-        let data = read_flex8(self.buf, 24);
+    pub fn response_topic_name(&self) -> Result<Option<String>, DecodeError> {
+        let data = read_flex8(self.buf, 24)?;
         if data.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(std::str::from_utf8(data).unwrap_or("").to_string())
+            Ok(Some(std::str::from_utf8(data).unwrap_or("").to_string()))
         }
     }
 }
@@ -2620,8 +2716,17 @@ pub struct CmdCommitGroupOffset<'a> {
 }
 
 impl<'a> CmdCommitGroupOffset<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 56;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn group_id(&self) -> u64 {
@@ -2644,19 +2749,23 @@ impl<'a> CmdCommitGroupOffset<'a> {
         u64::from_le_bytes(self.buf[24..32].try_into().unwrap())
     }
 
-    pub fn metadata(&self) -> Option<&str> {
-        let data = read_flex8(self.buf, 40);
+    pub fn metadata(&self) -> Result<Option<&str>, DecodeError> {
+        let data = read_flex8(self.buf, 40)?;
         if data.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(std::str::from_utf8(data).unwrap_or(""))
+            Ok(Some(std::str::from_utf8(data).unwrap_or("")))
         }
     }
 
     /// Zero-copy metadata bytes from the command buffer.
-    pub fn metadata_bytes(&self) -> Option<&'a [u8]> {
-        let data = read_flex8(self.buf, 40);
-        if data.is_empty() { None } else { Some(data) }
+    pub fn metadata_bytes(&self) -> Result<Option<&'a [u8]>, DecodeError> {
+        let data = read_flex8(self.buf, 40)?;
+        if data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(data))
+        }
     }
 
     pub fn timestamp(&self) -> u64 {
@@ -2673,19 +2782,28 @@ pub struct CmdJoinConsumerGroup<'a> {
 }
 
 impl<'a> CmdJoinConsumerGroup<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 56;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn group_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
-    pub fn member_id(&self) -> &str {
+    pub fn member_id(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 16)
     }
 
-    pub fn client_id(&self) -> &str {
+    pub fn client_id(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 24)
     }
 
@@ -2697,7 +2815,7 @@ impl<'a> CmdJoinConsumerGroup<'a> {
         i32::from_le_bytes(self.buf[44..48].try_into().unwrap())
     }
 
-    pub fn protocol_type(&self) -> &str {
+    pub fn protocol_type(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 32)
     }
 
@@ -2705,20 +2823,20 @@ impl<'a> CmdJoinConsumerGroup<'a> {
         u32::from_le_bytes(self.buf[48..52].try_into().unwrap())
     }
 
-    pub fn protocols(&self) -> Vec<(String, Bytes)> {
+    pub fn protocols(&self) -> Result<Vec<(String, Bytes)>, DecodeError> {
         let count = self.protocols_count() as usize;
         if count == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let table_offset = u32::from_le_bytes(self.buf[52..56].try_into().unwrap()) as usize;
+        let table_offset = read_u32_le(self.buf, 52)? as usize;
         let mut result = Vec::with_capacity(count);
         for i in 0..count {
             let entry_off = table_offset + i * 16;
-            let name = read_flex8_str(self.buf, entry_off);
-            let val = read_flex8(self.buf, entry_off + 8);
+            let name = read_flex8_str(self.buf, entry_off)?;
+            let val = read_flex8(self.buf, entry_off + 8)?;
             result.push((name.to_string(), Bytes::copy_from_slice(val)));
         }
-        result
+        Ok(result)
     }
 }
 
@@ -2730,8 +2848,17 @@ pub struct CmdSyncConsumerGroup<'a> {
 }
 
 impl<'a> CmdSyncConsumerGroup<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 40;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn group_id(&self) -> u64 {
@@ -2742,7 +2869,7 @@ impl<'a> CmdSyncConsumerGroup<'a> {
         i32::from_le_bytes(self.buf[24..28].try_into().unwrap())
     }
 
-    pub fn member_id(&self) -> &str {
+    pub fn member_id(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 16)
     }
 
@@ -2750,20 +2877,20 @@ impl<'a> CmdSyncConsumerGroup<'a> {
         u32::from_le_bytes(self.buf[32..36].try_into().unwrap())
     }
 
-    pub fn assignments(&self) -> Vec<(String, Vec<u8>)> {
+    pub fn assignments(&self) -> Result<Vec<(String, Vec<u8>)>, DecodeError> {
         let count = self.assignments_count() as usize;
         if count == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let table_offset = u32::from_le_bytes(self.buf[36..40].try_into().unwrap()) as usize;
+        let table_offset = read_u32_le(self.buf, 36)? as usize;
         let mut result = Vec::with_capacity(count);
         for i in 0..count {
             let entry_off = table_offset + i * 16;
-            let mid = read_flex8_str(self.buf, entry_off);
-            let data = read_flex8(self.buf, entry_off + 8);
+            let mid = read_flex8_str(self.buf, entry_off)?;
+            let data = read_flex8(self.buf, entry_off + 8)?;
             result.push((mid.to_string(), data.to_vec()));
         }
-        result
+        Ok(result)
     }
 }
 
@@ -2774,15 +2901,24 @@ pub struct CmdLeaveConsumerGroup<'a> {
 }
 
 impl<'a> CmdLeaveConsumerGroup<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 24;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn group_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
-    pub fn member_id(&self) -> &str {
+    pub fn member_id(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 16)
     }
 }
@@ -2794,15 +2930,24 @@ pub struct CmdHeartbeatConsumerGroup<'a> {
 }
 
 impl<'a> CmdHeartbeatConsumerGroup<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 28;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn group_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
-    pub fn member_id(&self) -> &str {
+    pub fn member_id(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 16)
     }
 
@@ -2821,24 +2966,33 @@ pub struct CmdSetRetained<'a> {
 }
 
 impl<'a> CmdSetRetained<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 32;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn exchange_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
-    pub fn routing_key(&self) -> &str {
+    pub fn routing_key(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 16)
     }
 
-    pub fn message(&self) -> Bytes {
-        Bytes::copy_from_slice(read_flex8(self.buf, 24))
+    pub fn message(&self) -> Result<Bytes, DecodeError> {
+        Ok(Bytes::copy_from_slice(read_flex8(self.buf, 24)?))
     }
 
     /// Zero-copy message slice from the command buffer.
-    pub fn message_bytes(&self) -> &'a [u8] {
+    pub fn message_bytes(&self) -> Result<&'a [u8], DecodeError> {
         read_flex8(self.buf, 24)
     }
 }
@@ -2849,20 +3003,29 @@ pub struct CmdGetRetained<'a> {
 }
 
 impl<'a> CmdGetRetained<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 24;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn exchange_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
-    pub fn routing_key_filter(&self) -> Option<String> {
-        let data = read_flex8(self.buf, 16);
+    pub fn routing_key_filter(&self) -> Result<Option<String>, DecodeError> {
+        let data = read_flex8(self.buf, 16)?;
         if data.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(std::str::from_utf8(data).unwrap_or("").to_string())
+            Ok(Some(std::str::from_utf8(data).unwrap_or("").to_string()))
         }
     }
 }
@@ -2873,15 +3036,24 @@ pub struct CmdDeleteRetained<'a> {
 }
 
 impl<'a> CmdDeleteRetained<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 24;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn exchange_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
-    pub fn routing_key(&self) -> &str {
+    pub fn routing_key(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 16)
     }
 }
@@ -2893,8 +3065,17 @@ pub struct CmdSetWill<'a> {
 }
 
 impl<'a> CmdSetWill<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 44;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn consumer_id(&self) -> u64 {
@@ -2917,12 +3098,12 @@ impl<'a> CmdSetWill<'a> {
         self.buf[7] & 0x04 != 0 // flags bit 2
     }
 
-    pub fn routing_key(&self) -> String {
-        read_flex8_str(self.buf, 24).to_string()
+    pub fn routing_key(&self) -> Result<String, DecodeError> {
+        Ok(read_flex8_str(self.buf, 24)?.to_string())
     }
 
-    pub fn message(&self) -> Bytes {
-        Bytes::copy_from_slice(read_flex8(self.buf, 32))
+    pub fn message(&self) -> Result<Bytes, DecodeError> {
+        Ok(Bytes::copy_from_slice(read_flex8(self.buf, 32)?))
     }
 }
 
@@ -2934,15 +3115,24 @@ pub struct CmdPersistSession<'a> {
 }
 
 impl<'a> CmdPersistSession<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 52;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
     pub fn consumer_id(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
     }
 
-    pub fn client_id(&self) -> &str {
+    pub fn client_id(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 24)
     }
 
@@ -2950,8 +3140,8 @@ impl<'a> CmdPersistSession<'a> {
         u32::from_le_bytes(self.buf[40..44].try_into().unwrap())
     }
 
-    pub fn subscription_data(&self) -> Bytes {
-        Bytes::copy_from_slice(read_flex8(self.buf, 32))
+    pub fn subscription_data(&self) -> Result<Bytes, DecodeError> {
+        Ok(Bytes::copy_from_slice(read_flex8(self.buf, 32)?))
     }
 
     pub fn inbound_qos_inflight(&self) -> u32 {
@@ -2973,11 +3163,20 @@ pub struct CmdRestoreSession<'a> {
 }
 
 impl<'a> CmdRestoreSession<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        Self { buf }
+    const MIN_SIZE: usize = 16;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
     }
 
-    pub fn client_id(&self) -> &str {
+    pub fn client_id(&self) -> Result<&str, DecodeError> {
         read_flex8_str(self.buf, 8)
     }
 }
@@ -3000,9 +3199,17 @@ impl<'a> Iterator for BatchIter<'a> {
             return None;
         }
         self.remaining -= 1;
+        if self.offset + 4 > self.buf.len() {
+            self.remaining = 0;
+            return None;
+        }
         // Each sub-command is self-sized: first 4 bytes = total size (including header)
         let size =
             u32::from_le_bytes(self.buf[self.offset..self.offset + 4].try_into().unwrap()) as usize;
+        if size == 0 || self.offset + size > self.buf.len() {
+            self.remaining = 0;
+            return None;
+        }
         let slice = &self.buf[self.offset..self.offset + size];
         // Advance by size, padded to 8-byte boundary
         let padded = (size + 7) & !7;
@@ -3026,9 +3233,11 @@ impl ExactSizeIterator for BatchIter<'_> {}
 ///
 /// Fixed region:
 /// ```text
-/// @8  node_id:   u32  — originating follower node ID (0 = local/leader)
-/// @12 count:     u32  — number of sub-frames
-/// @16 [sub-frames...]
+/// @8  node_id:    u32  — originating follower node ID (0 = local/leader)
+/// @12 count:      u32  — number of sub-frames
+/// @16 batch_seq:  u64  — follower-assigned monotonic sequence (for dedup and ACK)
+/// @24 leader_seq: u64  — leader-assigned monotonic sequence (total order across all followers)
+/// @32 [sub-frames...]
 /// ```
 ///
 /// Each sub-frame:
@@ -3042,6 +3251,19 @@ pub struct CmdForwardedBatch<'a> {
 }
 
 impl<'a> CmdForwardedBatch<'a> {
+    const MIN_SIZE: usize = 32;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
+    }
+
     /// Originating follower node ID (`0` means local/leader).
     #[inline]
     pub fn node_id(&self) -> u32 {
@@ -3054,12 +3276,25 @@ impl<'a> CmdForwardedBatch<'a> {
         u32::from_le_bytes(self.buf[12..16].try_into().unwrap())
     }
 
+    /// Follower-assigned forwarding sequence number for dedup and ACK.
+    #[inline]
+    pub fn batch_seq(&self) -> u64 {
+        u64::from_le_bytes(self.buf[16..24].try_into().unwrap())
+    }
+
+    /// Leader-assigned monotonic sequence providing total order across all
+    /// followers. Used by followers to confirm raft apply via local log scan.
+    #[inline]
+    pub fn leader_seq(&self) -> u64 {
+        u64::from_le_bytes(self.buf[24..32].try_into().unwrap())
+    }
+
     /// Iterate over `(client_id, request_seq, cmd_bytes)` sub-frames.
     #[inline]
     pub fn iter(&self) -> CmdForwardedBatchIter<'a> {
         CmdForwardedBatchIter {
             buf: self.buf,
-            pos: 16, // sub-frames start at offset 16
+            pos: 32, // sub-frames start at offset 32
         }
     }
 }
@@ -3090,16 +3325,12 @@ impl<'a> Iterator for CmdForwardedBatchIter<'a> {
         }
         // payload_len = client_id(4) + request_seq(8) + cmd_bytes.len()
         // Excludes the 4-byte payload_len field itself.
-        let payload_len =
-            u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
-        // Minimum payload: client_id(4) + request_seq(8) = 12 bytes.
+        let payload_len = read_u32_le(self.buf, self.pos).ok()? as usize;
         if payload_len < 12 || self.pos + 4 + payload_len > self.buf.len() {
             return None;
         }
-        let client_id =
-            u32::from_le_bytes(self.buf[self.pos + 4..self.pos + 8].try_into().unwrap());
-        let request_seq =
-            u64::from_le_bytes(self.buf[self.pos + 8..self.pos + 16].try_into().unwrap());
+        let client_id = read_u32_le(self.buf, self.pos + 4).ok()?;
+        let request_seq = read_u64_le(self.buf, self.pos + 8).ok()?;
         let cmd_bytes = &self.buf[self.pos + 16..self.pos + 4 + payload_len];
         self.pos += 4 + payload_len;
         Some((client_id, request_seq, cmd_bytes))
@@ -3130,6 +3361,19 @@ pub struct CmdResume<'a> {
 }
 
 impl<'a> CmdResume<'a> {
+    const MIN_SIZE: usize = 16;
+
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                need: Self::MIN_SIZE,
+                offset: 0,
+                have: buf.len(),
+            });
+        }
+        Ok(Self { buf })
+    }
+
     /// The `client_id` from the previous session to look up.
     #[inline]
     pub fn session_client_id(&self) -> u32 {
@@ -3160,7 +3404,7 @@ impl<'a> VecBytesIter<'a> {
         let pos = if count == 0 {
             0
         } else {
-            u32::from_le_bytes(buf[slot_offset + 4..slot_offset + 8].try_into().unwrap()) as usize
+            read_u32_le(buf, slot_offset + 4).unwrap_or(0) as usize
         };
         Self {
             buf,
@@ -3184,8 +3428,16 @@ impl<'a> Iterator for VecBytesIter<'a> {
         if self.index >= self.count {
             return None;
         }
+        if self.pos + 4 > self.buf.len() {
+            self.count = self.index;
+            return None;
+        }
         let len = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
         self.pos += 4;
+        if self.pos + len > self.buf.len() {
+            self.count = self.index;
+            return None;
+        }
         let data = Bytes::copy_from_slice(&self.buf[self.pos..self.pos + len]);
         self.pos += len;
         self.index += 1;
@@ -3211,12 +3463,11 @@ pub struct VecSliceIter<'a> {
 
 impl<'a> VecSliceIter<'a> {
     pub fn new(buf: &'a [u8], slot_offset: usize) -> Self {
-        let count =
-            u32::from_le_bytes(buf[slot_offset..slot_offset + 4].try_into().unwrap()) as usize;
+        let count = read_u32_le(buf, slot_offset).unwrap_or(0) as usize;
         let pos = if count == 0 {
             0
         } else {
-            u32::from_le_bytes(buf[slot_offset + 4..slot_offset + 8].try_into().unwrap()) as usize
+            read_u32_le(buf, slot_offset + 4).unwrap_or(0) as usize
         };
         Self {
             buf,
@@ -3235,8 +3486,16 @@ impl<'a> Iterator for VecSliceIter<'a> {
         if self.index >= self.count {
             return None;
         }
+        if self.pos + 4 > self.buf.len() {
+            self.count = self.index;
+            return None;
+        }
         let len = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
         self.pos += 4;
+        if self.pos + len > self.buf.len() {
+            self.count = self.index;
+            return None;
+        }
         let data = &self.buf[self.pos..self.pos + len];
         self.pos += len;
         self.index += 1;
@@ -3270,14 +3529,26 @@ impl<'a> Iterator for FlatOptBytes<'a> {
             return None;
         }
         self.remaining -= 1;
+        if self.offset >= self.buf.len() {
+            self.remaining = 0;
+            return None;
+        }
         let present = self.buf[self.offset];
         self.offset += 1;
         if present == 0 {
             Some(None)
         } else {
+            if self.offset + 4 > self.buf.len() {
+                self.remaining = 0;
+                return None;
+            }
             let len = u32::from_le_bytes(self.buf[self.offset..self.offset + 4].try_into().unwrap())
                 as usize;
             self.offset += 4;
+            if self.offset + len > self.buf.len() {
+                self.remaining = 0;
+                return None;
+            }
             let val = Bytes::copy_from_slice(&self.buf[self.offset..self.offset + len]);
             self.offset += len;
             Some(Some(val))
@@ -3346,291 +3617,298 @@ impl ExactSizeIterator for FlatMessages<'_> {}
 // =============================================================================
 
 pub fn fmt_mq_command(cmd: &MqCommand, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    // Guard: Display formatting must not panic on truncated commands.
+    if cmd.as_bytes().len() < 8 {
+        return write!(f, "MqCommand(<truncated, {} bytes>)", cmd.as_bytes().len());
+    }
+    // Safe field reads for display — return 0 on OOB instead of panicking.
+    let id8 = if cmd.as_bytes().len() >= 16 {
+        cmd.field_u64(8)
+    } else {
+        0
+    };
+    let id16 = if cmd.as_bytes().len() >= 24 {
+        cmd.field_u64(16)
+    } else {
+        0
+    };
+    let id24 = if cmd.as_bytes().len() >= 32 {
+        cmd.field_u64(24)
+    } else {
+        0
+    };
+    let u32_24 = if cmd.as_bytes().len() >= 28 {
+        cmd.field_u32(24)
+    } else {
+        0
+    };
+
     match cmd.tag() {
         MqCommand::TAG_CREATE_TOPIC => {
-            let v = cmd.as_create_topic();
-            write!(f, "CreateTopic({})", v.name())
+            if let Ok(v) = cmd.as_create_topic() {
+                write!(f, "CreateTopic({})", v.name().unwrap_or("<corrupt>"))
+            } else {
+                write!(f, "CreateTopic(<corrupt>)")
+            }
         }
-        MqCommand::TAG_DELETE_TOPIC => write!(f, "DeleteTopic({})", cmd.field_u64(8)),
+        MqCommand::TAG_DELETE_TOPIC => write!(f, "DeleteTopic({})", id8),
         MqCommand::TAG_PUBLISH => {
-            let v = cmd.as_publish();
-            write!(
-                f,
-                "Publish(topic={}, count={})",
-                v.topic_id(),
-                v.message_count()
-            )
+            if let Ok(v) = cmd.as_publish() {
+                write!(
+                    f,
+                    "Publish(topic={}, count={})",
+                    v.topic_id(),
+                    v.message_count()
+                )
+            } else {
+                write!(f, "Publish(<corrupt>)")
+            }
         }
         MqCommand::TAG_COMMIT_OFFSET => {
             write!(
                 f,
                 "CommitOffset(topic={}, consumer={}, offset={})",
-                cmd.field_u64(8),
-                cmd.field_u64(16),
-                cmd.field_u64(24)
+                id8, id16, id24
             )
         }
         MqCommand::TAG_PURGE_TOPIC => {
-            write!(
-                f,
-                "PurgeTopic(topic={}, before={})",
-                cmd.field_u64(8),
-                cmd.field_u64(16)
-            )
+            write!(f, "PurgeTopic(topic={}, before={})", id8, id16)
         }
         MqCommand::TAG_SET_RETAINED | MqCommand::TAG_SET_RETAINED_MQTT => {
-            let v = cmd.as_set_retained();
-            write!(
-                f,
-                "SetRetained(exchange={}, rk={})",
-                v.exchange_id(),
-                v.routing_key()
-            )
+            if let Ok(v) = cmd.as_set_retained() {
+                write!(
+                    f,
+                    "SetRetained(exchange={}, rk={})",
+                    v.exchange_id(),
+                    v.routing_key().unwrap_or("<corrupt>")
+                )
+            } else {
+                write!(f, "SetRetained(<corrupt>)")
+            }
         }
         MqCommand::TAG_GET_RETAINED => {
-            let v = cmd.as_get_retained();
-            write!(
-                f,
-                "GetRetained(exchange={}, filter={:?})",
-                v.exchange_id(),
-                v.routing_key_filter()
-            )
+            if let Ok(v) = cmd.as_get_retained() {
+                write!(
+                    f,
+                    "GetRetained(exchange={}, filter={:?})",
+                    v.exchange_id(),
+                    v.routing_key_filter().unwrap_or_default()
+                )
+            } else {
+                write!(f, "GetRetained(<corrupt>)")
+            }
         }
         MqCommand::TAG_DELETE_RETAINED => {
-            let v = cmd.as_delete_retained();
-            write!(
-                f,
-                "DeleteRetained(exchange={}, rk={})",
-                v.exchange_id(),
-                v.routing_key()
-            )
+            if let Ok(v) = cmd.as_delete_retained() {
+                write!(
+                    f,
+                    "DeleteRetained(exchange={}, rk={})",
+                    v.exchange_id(),
+                    v.routing_key().unwrap_or("<corrupt>")
+                )
+            } else {
+                write!(f, "DeleteRetained(<corrupt>)")
+            }
         }
         MqCommand::TAG_CREATE_EXCHANGE => {
-            let v = cmd.as_create_exchange();
-            write!(f, "CreateExchange({})", v.name())
+            if let Ok(v) = cmd.as_create_exchange() {
+                write!(f, "CreateExchange({})", v.name().unwrap_or("<corrupt>"))
+            } else {
+                write!(f, "CreateExchange(<corrupt>)")
+            }
         }
-        MqCommand::TAG_DELETE_EXCHANGE => write!(f, "DeleteExchange({})", cmd.field_u64(8)),
+        MqCommand::TAG_DELETE_EXCHANGE => write!(f, "DeleteExchange({})", id8),
         MqCommand::TAG_CREATE_BINDING => {
-            let v = cmd.as_create_binding();
-            write!(
-                f,
-                "CreateBinding(exchange={}, topic={})",
-                v.exchange_id(),
-                v.topic_id()
-            )
+            if let Ok(v) = cmd.as_create_binding() {
+                write!(
+                    f,
+                    "CreateBinding(exchange={}, topic={})",
+                    v.exchange_id(),
+                    v.topic_id()
+                )
+            } else {
+                write!(f, "CreateBinding(<corrupt>)")
+            }
         }
-        MqCommand::TAG_DELETE_BINDING => write!(f, "DeleteBinding({})", cmd.field_u64(8)),
+        MqCommand::TAG_DELETE_BINDING => write!(f, "DeleteBinding({})", id8),
         MqCommand::TAG_PUBLISH_TO_EXCHANGE | MqCommand::TAG_PUBLISH_TO_EXCHANGE_MQTT => {
-            let v = cmd.as_publish_to_exchange();
-            write!(f, "PublishToExchange(exchange={})", v.exchange_id())
+            if let Ok(v) = cmd.as_publish_to_exchange() {
+                write!(f, "PublishToExchange(exchange={})", v.exchange_id())
+            } else {
+                write!(f, "PublishToExchange(<corrupt>)")
+            }
         }
         MqCommand::TAG_CREATE_CONSUMER_GROUP => {
-            let v = cmd.as_create_consumer_group();
-            write!(f, "CreateConsumerGroup(name={})", v.name())
+            if let Ok(v) = cmd.as_create_consumer_group() {
+                write!(
+                    f,
+                    "CreateConsumerGroup(name={})",
+                    v.name().unwrap_or("<corrupt>")
+                )
+            } else {
+                write!(f, "CreateConsumerGroup(<corrupt>)")
+            }
         }
-        MqCommand::TAG_DELETE_CONSUMER_GROUP => {
-            write!(f, "DeleteConsumerGroup({})", cmd.field_u64(8))
-        }
+        MqCommand::TAG_DELETE_CONSUMER_GROUP => write!(f, "DeleteConsumerGroup({})", id8),
         MqCommand::TAG_JOIN_CONSUMER_GROUP => {
-            let v = cmd.as_join_consumer_group();
-            write!(
-                f,
-                "JoinConsumerGroup(group={}, member={}, client={})",
-                v.group_id(),
-                v.member_id(),
-                v.client_id()
-            )
+            if let Ok(v) = cmd.as_join_consumer_group() {
+                write!(
+                    f,
+                    "JoinConsumerGroup(group={}, member={}, client={})",
+                    v.group_id(),
+                    v.member_id().unwrap_or("<corrupt>"),
+                    v.client_id().unwrap_or("<corrupt>")
+                )
+            } else {
+                write!(f, "JoinConsumerGroup(<corrupt>)")
+            }
         }
         MqCommand::TAG_SYNC_CONSUMER_GROUP => {
-            let v = cmd.as_sync_consumer_group();
-            write!(
-                f,
-                "SyncConsumerGroup(group={}, gen={}, member={})",
-                v.group_id(),
-                v.generation(),
-                v.member_id()
-            )
+            if let Ok(v) = cmd.as_sync_consumer_group() {
+                write!(
+                    f,
+                    "SyncConsumerGroup(group={}, gen={}, member={})",
+                    v.group_id(),
+                    v.generation(),
+                    v.member_id().unwrap_or("<corrupt>")
+                )
+            } else {
+                write!(f, "SyncConsumerGroup(<corrupt>)")
+            }
         }
         MqCommand::TAG_LEAVE_CONSUMER_GROUP => {
-            let v = cmd.as_leave_consumer_group();
-            write!(
-                f,
-                "LeaveConsumerGroup(group={}, member={})",
-                v.group_id(),
-                v.member_id()
-            )
+            if let Ok(v) = cmd.as_leave_consumer_group() {
+                write!(
+                    f,
+                    "LeaveConsumerGroup(group={}, member={})",
+                    v.group_id(),
+                    v.member_id().unwrap_or("<corrupt>")
+                )
+            } else {
+                write!(f, "LeaveConsumerGroup(<corrupt>)")
+            }
         }
         MqCommand::TAG_HEARTBEAT_CONSUMER_GROUP => {
-            let v = cmd.as_heartbeat_consumer_group();
-            write!(
-                f,
-                "HeartbeatConsumerGroup(group={}, member={}, gen={})",
-                v.group_id(),
-                v.member_id(),
-                v.generation()
-            )
+            if let Ok(v) = cmd.as_heartbeat_consumer_group() {
+                write!(
+                    f,
+                    "HeartbeatConsumerGroup(group={}, member={}, gen={})",
+                    v.group_id(),
+                    v.member_id().unwrap_or("<corrupt>"),
+                    v.generation()
+                )
+            } else {
+                write!(f, "HeartbeatConsumerGroup(<corrupt>)")
+            }
         }
         MqCommand::TAG_COMMIT_GROUP_OFFSET => {
-            let v = cmd.as_commit_group_offset();
-            write!(
-                f,
-                "CommitGroupOffset(group={}, gen={}, topic={}, part={}, offset={})",
-                v.group_id(),
-                v.generation(),
-                v.topic_id(),
-                v.partition_index(),
-                v.offset()
-            )
+            if let Ok(v) = cmd.as_commit_group_offset() {
+                write!(
+                    f,
+                    "CommitGroupOffset(group={}, gen={}, topic={}, part={}, offset={})",
+                    v.group_id(),
+                    v.generation(),
+                    v.topic_id(),
+                    v.partition_index(),
+                    v.offset()
+                )
+            } else {
+                write!(f, "CommitGroupOffset(<corrupt>)")
+            }
         }
-        MqCommand::TAG_EXPIRE_GROUP_SESSIONS => {
-            write!(f, "ExpireGroupSessions(now={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_GROUP_DELIVER => {
-            write!(
-                f,
-                "GroupDeliver(group={}, consumer={}, max={})",
-                cmd.field_u64(8),
-                cmd.field_u64(16),
-                cmd.field_u32(24)
-            )
-        }
-        MqCommand::TAG_GROUP_ACK => {
-            write!(f, "GroupAck(group={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_GROUP_NACK => {
-            write!(f, "GroupNack(group={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_GROUP_RELEASE => {
-            write!(f, "GroupRelease(group={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_GROUP_MODIFY => {
-            write!(f, "GroupModify(group={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_GROUP_EXTEND_VISIBILITY => {
-            write!(f, "GroupExtendVisibility(group={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_GROUP_TIMEOUT_EXPIRED => {
-            write!(f, "GroupTimeoutExpired(group={})", cmd.field_u64(8))
-        }
+        MqCommand::TAG_EXPIRE_GROUP_SESSIONS => write!(f, "ExpireGroupSessions(now={})", id8),
+        MqCommand::TAG_GROUP_DELIVER => write!(
+            f,
+            "GroupDeliver(group={}, consumer={}, max={})",
+            id8, id16, u32_24
+        ),
+        MqCommand::TAG_GROUP_ACK => write!(f, "GroupAck(group={})", id8),
+        MqCommand::TAG_GROUP_NACK => write!(f, "GroupNack(group={})", id8),
+        MqCommand::TAG_GROUP_RELEASE => write!(f, "GroupRelease(group={})", id8),
+        MqCommand::TAG_GROUP_MODIFY => write!(f, "GroupModify(group={})", id8),
+        MqCommand::TAG_GROUP_EXTEND_VISIBILITY => write!(f, "GroupExtendVisibility(group={})", id8),
+        MqCommand::TAG_GROUP_TIMEOUT_EXPIRED => write!(f, "GroupTimeoutExpired(group={})", id8),
         MqCommand::TAG_GROUP_PUBLISH_TO_DLQ => {
-            let v = cmd.as_publish_to_dlq();
-            write!(
-                f,
-                "GroupPublishToDlq(group={}, dlq_topic={})",
-                v.source_group_id(),
-                v.dlq_topic_id()
-            )
+            if let Ok(v) = cmd.as_publish_to_dlq() {
+                write!(
+                    f,
+                    "GroupPublishToDlq(group={}, dlq_topic={})",
+                    v.source_group_id(),
+                    v.dlq_topic_id()
+                )
+            } else {
+                write!(f, "GroupPublishToDlq(<corrupt>)")
+            }
         }
-        MqCommand::TAG_GROUP_EXPIRE_PENDING => {
-            write!(f, "GroupExpirePending(group={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_GROUP_PURGE => {
-            write!(f, "GroupPurge(group={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_GROUP_GET_ATTRIBUTES => {
-            write!(f, "GroupGetAttributes(group={})", cmd.field_u64(8))
-        }
+        MqCommand::TAG_GROUP_EXPIRE_PENDING => write!(f, "GroupExpirePending(group={})", id8),
+        MqCommand::TAG_GROUP_PURGE => write!(f, "GroupPurge(group={})", id8),
+        MqCommand::TAG_GROUP_GET_ATTRIBUTES => write!(f, "GroupGetAttributes(group={})", id8),
         MqCommand::TAG_GROUP_DELIVER_ACTOR => {
-            write!(
-                f,
-                "GroupDeliverActor(group={}, consumer={})",
-                cmd.field_u64(8),
-                cmd.field_u64(16)
-            )
+            write!(f, "GroupDeliverActor(group={}, consumer={})", id8, id16)
         }
-        MqCommand::TAG_GROUP_ACK_ACTOR => {
-            write!(f, "GroupAckActor(group={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_GROUP_NACK_ACTOR => {
-            write!(f, "GroupNackActor(group={})", cmd.field_u64(8))
-        }
+        MqCommand::TAG_GROUP_ACK_ACTOR => write!(f, "GroupAckActor(group={})", id8),
+        MqCommand::TAG_GROUP_NACK_ACTOR => write!(f, "GroupNackActor(group={})", id8),
         MqCommand::TAG_GROUP_ASSIGN_ACTORS => {
-            write!(
-                f,
-                "GroupAssignActors(group={}, consumer={})",
-                cmd.field_u64(8),
-                cmd.field_u64(16)
-            )
+            write!(f, "GroupAssignActors(group={}, consumer={})", id8, id16)
         }
         MqCommand::TAG_GROUP_RELEASE_ACTORS => {
-            write!(
-                f,
-                "GroupReleaseActors(group={}, consumer={})",
-                cmd.field_u64(8),
-                cmd.field_u64(16)
-            )
+            write!(f, "GroupReleaseActors(group={}, consumer={})", id8, id16)
         }
-        MqCommand::TAG_GROUP_EVICT_IDLE => {
-            write!(f, "GroupEvictIdle(group={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_CRON_ENABLE => {
-            write!(f, "CronEnable(topic={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_CRON_DISABLE => {
-            write!(f, "CronDisable(topic={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_CRON_TRIGGER => {
-            write!(
-                f,
-                "CronTrigger(topic={}, at={})",
-                cmd.field_u64(8),
-                cmd.field_u64(16)
-            )
-        }
-        MqCommand::TAG_CRON_UPDATE => {
-            write!(f, "CronUpdate(topic={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_CREATE_SESSION => {
-            write!(f, "CreateSession(session={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_DISCONNECT_SESSION => {
-            write!(f, "DisconnectSession(session={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_HEARTBEAT_SESSION => {
-            write!(f, "HeartbeatSession(session={})", cmd.field_u64(8))
-        }
+        MqCommand::TAG_GROUP_EVICT_IDLE => write!(f, "GroupEvictIdle(group={})", id8),
+        MqCommand::TAG_CRON_ENABLE => write!(f, "CronEnable(topic={})", id8),
+        MqCommand::TAG_CRON_DISABLE => write!(f, "CronDisable(topic={})", id8),
+        MqCommand::TAG_CRON_TRIGGER => write!(f, "CronTrigger(topic={}, at={})", id8, id16),
+        MqCommand::TAG_CRON_UPDATE => write!(f, "CronUpdate(topic={})", id8),
+        MqCommand::TAG_CREATE_SESSION => write!(f, "CreateSession(session={})", id8),
+        MqCommand::TAG_DISCONNECT_SESSION => write!(f, "DisconnectSession(session={})", id8),
+        MqCommand::TAG_HEARTBEAT_SESSION => write!(f, "HeartbeatSession(session={})", id8),
         MqCommand::TAG_SET_WILL => {
-            let v = cmd.as_set_will();
-            write!(
-                f,
-                "SetWill(session={}, topic={})",
-                v.consumer_id(),
-                v.exchange_id()
-            )
+            if let Ok(v) = cmd.as_set_will() {
+                write!(
+                    f,
+                    "SetWill(session={}, topic={})",
+                    v.consumer_id(),
+                    v.exchange_id()
+                )
+            } else {
+                write!(f, "SetWill(<corrupt>)")
+            }
         }
-        MqCommand::TAG_CLEAR_WILL => {
-            write!(f, "ClearWill(session={})", cmd.field_u64(8))
-        }
-        MqCommand::TAG_FIRE_PENDING_WILLS => {
-            write!(f, "FirePendingWills(now={})", cmd.field_u64(8))
-        }
+        MqCommand::TAG_CLEAR_WILL => write!(f, "ClearWill(session={})", id8),
+        MqCommand::TAG_FIRE_PENDING_WILLS => write!(f, "FirePendingWills(now={})", id8),
         MqCommand::TAG_PERSIST_SESSION => {
-            let v = cmd.as_persist_session();
-            write!(
-                f,
-                "PersistSession(session={}, client={})",
-                v.consumer_id(),
-                v.client_id()
-            )
+            if let Ok(v) = cmd.as_persist_session() {
+                write!(
+                    f,
+                    "PersistSession(session={}, client={})",
+                    v.consumer_id(),
+                    v.client_id().unwrap_or("<corrupt>")
+                )
+            } else {
+                write!(f, "PersistSession(<corrupt>)")
+            }
         }
         MqCommand::TAG_RESTORE_SESSION => {
-            let v = cmd.as_restore_session();
-            write!(f, "RestoreSession(client={})", v.client_id())
+            if let Ok(v) = cmd.as_restore_session() {
+                write!(
+                    f,
+                    "RestoreSession(client={})",
+                    v.client_id().unwrap_or("<corrupt>")
+                )
+            } else {
+                write!(f, "RestoreSession(<corrupt>)")
+            }
         }
-        MqCommand::TAG_EXPIRE_SESSIONS => {
-            write!(f, "ExpireSessions(now={})", cmd.field_u64(8))
-        }
+        MqCommand::TAG_EXPIRE_SESSIONS => write!(f, "ExpireSessions(now={})", id8),
         MqCommand::TAG_BATCH => {
-            let v = cmd.as_batch();
-            write!(f, "Batch(count={})", v.count())
+            if let Ok(v) = cmd.as_batch() {
+                write!(f, "Batch(count={})", v.count())
+            } else {
+                write!(f, "Batch(<corrupt>)")
+            }
         }
         MqCommand::TAG_PRUNE_DEDUP_WINDOW => {
-            write!(
-                f,
-                "PruneDedupWindow(topic={}, before={})",
-                cmd.field_u64(8),
-                cmd.field_u64(16)
-            )
+            write!(f, "PruneDedupWindow(topic={}, before={})", id8, id16)
         }
         _ => write!(f, "MqCommand(tag={})", cmd.tag()),
     }
@@ -3654,7 +3932,7 @@ mod tests {
             &[Bytes::from_static(b"hello"), Bytes::from_static(b"world")],
         );
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_publish();
+        let v = cmd.as_publish().unwrap();
         assert_eq!(v.topic_id(), 42);
         let msgs: Vec<Bytes> = v.messages().collect();
         assert_eq!(msgs.len(), 2);
@@ -3676,9 +3954,9 @@ mod tests {
             8,
         );
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_topic();
-        assert_eq!(v.name(), "my-topic");
-        let ret = v.retention();
+        let v = cmd.as_create_topic().unwrap();
+        assert_eq!(v.name().unwrap(), "my-topic");
+        let ret = v.retention().unwrap();
         assert_eq!(ret.max_age_secs, Some(3600));
         assert_eq!(ret.max_bytes, None);
         assert_eq!(ret.max_messages, Some(1_000_000));
@@ -3697,7 +3975,7 @@ mod tests {
         let cmds = vec![c1, c2, c3];
         MqCommand::write_batch(&mut buf, &cmds);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_batch();
+        let v = cmd.as_batch().unwrap();
         assert_eq!(v.count(), 3);
         let sub_cmds: Vec<&[u8]> = v.commands().collect();
         assert_eq!(sub_cmds.len(), 3);
@@ -3723,7 +4001,7 @@ mod tests {
         let cmd = MqCommand::split_from(&mut buf);
 
         assert_eq!(cmd.tag(), MqCommand::TAG_PUBLISH);
-        assert_eq!(cmd.as_publish().topic_id(), 42);
+        assert_eq!(cmd.as_publish().unwrap().topic_id(), 42);
 
         let msgs: Vec<Bytes> = cmd.publish_messages().unwrap().collect();
         assert_eq!(msgs.len(), 2);
@@ -3754,8 +4032,8 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_exchange(&mut buf, "my-exchange", ExchangeType::Topic);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_exchange();
-        assert_eq!(v.name(), "my-exchange");
+        let v = cmd.as_create_exchange().unwrap();
+        assert_eq!(v.name().unwrap(), "my-exchange");
         assert_eq!(v.exchange_type(), ExchangeType::Topic);
     }
 
@@ -3764,10 +4042,10 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_binding(&mut buf, 1, 2, Some("routing.key"));
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_binding();
+        let v = cmd.as_create_binding().unwrap();
         assert_eq!(v.exchange_id(), 1);
         assert_eq!(v.topic_id(), 2);
-        assert_eq!(v.routing_key(), Some("routing.key".to_string()));
+        assert_eq!(v.routing_key().unwrap(), Some("routing.key".to_string()));
     }
 
     #[test]
@@ -3808,8 +4086,8 @@ mod tests {
 
         MqCommand::write_create_consumer_group(&mut buf, "my-group", 1);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_consumer_group();
-        assert_eq!(v.name(), "my-group");
+        let v = cmd.as_create_consumer_group().unwrap();
+        assert_eq!(v.name().unwrap(), "my-group");
         assert_eq!(v.auto_offset_reset(), 1);
 
         MqCommand::write_delete_consumer_group(&mut buf, 42);
@@ -3818,19 +4096,19 @@ mod tests {
 
         MqCommand::write_commit_group_offset(&mut buf, 10, 3, 20, 0, 100, Some("md"), 5000);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_commit_group_offset();
+        let v = cmd.as_commit_group_offset().unwrap();
         assert_eq!(v.group_id(), 10);
         assert_eq!(v.generation(), 3);
         assert_eq!(v.topic_id(), 20);
         assert_eq!(v.partition_index(), 0);
         assert_eq!(v.offset(), 100);
-        assert_eq!(v.metadata(), Some("md"));
+        assert_eq!(v.metadata().unwrap(), Some("md"));
         assert_eq!(v.timestamp(), 5000);
 
         MqCommand::write_commit_group_offset(&mut buf, 10, 3, 20, 0, 100, None, 5000);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_commit_group_offset();
-        assert_eq!(v.metadata(), None);
+        let v = cmd.as_commit_group_offset().unwrap();
+        assert_eq!(v.metadata().unwrap(), None);
         assert_eq!(v.timestamp(), 5000);
 
         MqCommand::write_join_consumer_group(
@@ -3844,14 +4122,14 @@ mod tests {
             &[("range", b"\x01\x02"), ("roundrobin", b"\x03")],
         );
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_join_consumer_group();
+        let v = cmd.as_join_consumer_group().unwrap();
         assert_eq!(v.group_id(), 10);
-        assert_eq!(v.member_id(), "member-1");
-        assert_eq!(v.client_id(), "client-1");
+        assert_eq!(v.member_id().unwrap(), "member-1");
+        assert_eq!(v.client_id().unwrap(), "client-1");
         assert_eq!(v.session_timeout_ms(), 30_000);
         assert_eq!(v.rebalance_timeout_ms(), 60_000);
-        assert_eq!(v.protocol_type(), "consumer");
-        let protocols = v.protocols();
+        assert_eq!(v.protocol_type().unwrap(), "consumer");
+        let protocols = v.protocols().unwrap();
         assert_eq!(protocols[0].0, "range");
         assert_eq!(protocols[1].0, "roundrobin");
 
@@ -3863,24 +4141,24 @@ mod tests {
             &[("member-1", b"assign-1"), ("member-2", b"assign-2")],
         );
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_sync_consumer_group();
+        let v = cmd.as_sync_consumer_group().unwrap();
         assert_eq!(v.group_id(), 10);
         assert_eq!(v.generation(), 5);
-        assert_eq!(v.member_id(), "member-1");
-        let assignments = v.assignments();
+        assert_eq!(v.member_id().unwrap(), "member-1");
+        let assignments = v.assignments().unwrap();
         assert_eq!(assignments.len(), 2);
 
         MqCommand::write_leave_consumer_group(&mut buf, 10, "member-1");
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_leave_consumer_group();
+        let v = cmd.as_leave_consumer_group().unwrap();
         assert_eq!(v.group_id(), 10);
-        assert_eq!(v.member_id(), "member-1");
+        assert_eq!(v.member_id().unwrap(), "member-1");
 
         MqCommand::write_heartbeat_consumer_group(&mut buf, 10, "member-1", 7);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_heartbeat_consumer_group();
+        let v = cmd.as_heartbeat_consumer_group().unwrap();
         assert_eq!(v.group_id(), 10);
-        assert_eq!(v.member_id(), "member-1");
+        assert_eq!(v.member_id().unwrap(), "member-1");
         assert_eq!(v.generation(), 7);
     }
 
@@ -3899,7 +4177,7 @@ mod tests {
         let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_GROUP_ACK);
         assert_eq!(cmd.field_u64(8), 5);
-        let ids = cmd.field_vec_u64(16);
+        let ids = cmd.field_vec_u64(16).unwrap();
         assert_eq!(&*ids, &[1, 2, 3]);
 
         MqCommand::write_group_nack(&mut buf, 7, &[10, 20]);
@@ -3913,7 +4191,7 @@ mod tests {
         MqCommand::write_group_publish_to_dlq(&mut buf, 1, 2, &[10], &[b"dead".as_ref()]);
         let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_GROUP_PUBLISH_TO_DLQ);
-        let v = cmd.as_publish_to_dlq();
+        let v = cmd.as_publish_to_dlq().unwrap();
         assert_eq!(v.source_group_id(), 1);
         assert_eq!(v.dlq_topic_id(), 2);
     }
@@ -3995,8 +4273,8 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_topic(&mut buf, "abc", &RetentionPolicy::default(), 1);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_topic();
-        assert_eq!(v.name(), "abc");
+        let v = cmd.as_create_topic().unwrap();
+        assert_eq!(v.name().unwrap(), "abc");
         // Verify it's inline: bit 0 = 0, len = byte >> 1
         assert_eq!(cmd.as_bytes()[8] & 1, 0);
         assert_eq!(cmd.as_bytes()[8] >> 1, 3);
@@ -4010,8 +4288,8 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_topic(&mut buf, long_name, &RetentionPolicy::default(), 1);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_topic();
-        assert_eq!(v.name(), long_name);
+        let v = cmd.as_create_topic().unwrap();
+        assert_eq!(v.name().unwrap(), long_name);
         // Verify it's in flex: bit 0 = 1
         assert_eq!(cmd.as_bytes()[8] & 1, 1);
     }
@@ -4022,8 +4300,8 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_topic(&mut buf, name, &RetentionPolicy::default(), 1);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_topic();
-        assert_eq!(v.name(), name);
+        let v = cmd.as_create_topic().unwrap();
+        assert_eq!(v.name().unwrap(), name);
         // Should be inline: bit 0 = 0, len = 7
         assert_eq!(cmd.as_bytes()[8] & 1, 0);
         assert_eq!(cmd.as_bytes()[8] >> 1, 7);
@@ -4035,8 +4313,8 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_topic(&mut buf, name, &RetentionPolicy::default(), 1);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_topic();
-        assert_eq!(v.name(), name);
+        let v = cmd.as_create_topic().unwrap();
+        assert_eq!(v.name().unwrap(), name);
         // Should be in flex region: bit 0 = 1
         assert_eq!(cmd.as_bytes()[8] & 1, 1);
     }
@@ -4046,8 +4324,8 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_topic(&mut buf, "", &RetentionPolicy::default(), 1);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_topic();
-        assert_eq!(v.name(), "");
+        let v = cmd.as_create_topic().unwrap();
+        assert_eq!(v.name().unwrap(), "");
     }
 
     #[test]
@@ -4055,7 +4333,7 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_publish_bytes(&mut buf, 1, &[]);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_publish();
+        let v = cmd.as_publish().unwrap();
         assert_eq!(v.topic_id(), 1);
         assert_eq!(v.message_count(), 0);
         let msgs: Vec<Bytes> = v.messages().collect();
@@ -4067,7 +4345,7 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_publish_bytes(&mut buf, 1, &[Bytes::from_static(b"single")]);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_publish();
+        let v = cmd.as_publish().unwrap();
         assert_eq!(v.message_count(), 1);
         let msgs: Vec<Bytes> = v.messages().collect();
         assert_eq!(msgs.len(), 1);
@@ -4082,7 +4360,7 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_publish_bytes(&mut buf, 42, &messages);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_publish();
+        let v = cmd.as_publish().unwrap();
         assert_eq!(v.topic_id(), 42);
         assert_eq!(v.message_count(), 100);
         let decoded: Vec<Bytes> = v.messages().collect();
@@ -4103,9 +4381,9 @@ mod tests {
         MqCommand::write_publish_bytes(&mut buf, 1, &messages);
         let cmd = MqCommand::split_from(&mut buf);
         // Random access via field_vec_bytes_get
-        assert_eq!(cmd.field_vec_bytes_get(16, 0), b"zero");
-        assert_eq!(cmd.field_vec_bytes_get(16, 1), b"one");
-        assert_eq!(cmd.field_vec_bytes_get(16, 2), b"two");
+        assert_eq!(cmd.field_vec_bytes_get(16, 0).unwrap(), b"zero");
+        assert_eq!(cmd.field_vec_bytes_get(16, 1).unwrap(), b"one");
+        assert_eq!(cmd.field_vec_bytes_get(16, 2).unwrap(), b"two");
     }
 
     #[test]
@@ -4118,7 +4396,7 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_publish_bytes(&mut buf, 1, &messages);
         let cmd = MqCommand::split_from(&mut buf);
-        let mut iter = cmd.as_publish().messages();
+        let mut iter = cmd.as_publish().unwrap().messages();
         assert_eq!(iter.remaining(), 3);
         iter.next();
         assert_eq!(iter.remaining(), 2);
@@ -4135,7 +4413,7 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_group_ack(&mut buf, 42, &ids, None);
         let cmd = MqCommand::split_from(&mut buf);
-        let decoded = cmd.field_vec_u64(16);
+        let decoded = cmd.field_vec_u64(16).unwrap();
         assert_eq!(&*decoded, &ids);
     }
 
@@ -4144,7 +4422,7 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_group_ack(&mut buf, 42, &[], None);
         let cmd = MqCommand::split_from(&mut buf);
-        let decoded = cmd.field_vec_u64(16);
+        let decoded = cmd.field_vec_u64(16).unwrap();
         assert!(decoded.is_empty());
     }
 
@@ -4158,8 +4436,8 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_topic(&mut buf, "t", &retention, 4);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_topic();
-        let decoded_ret = v.retention();
+        let v = cmd.as_create_topic().unwrap();
+        let decoded_ret = v.retention().unwrap();
         assert_eq!(decoded_ret.max_age_secs, retention.max_age_secs);
         assert_eq!(decoded_ret.max_bytes, retention.max_bytes);
         assert_eq!(decoded_ret.max_messages, retention.max_messages);
@@ -4170,8 +4448,8 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_topic(&mut buf, "t", &RetentionPolicy::default(), 1);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_topic();
-        let ret = v.retention();
+        let v = cmd.as_create_topic().unwrap();
+        let ret = v.retention().unwrap();
         assert_eq!(ret.max_age_secs, None);
         assert_eq!(ret.max_bytes, None);
         assert_eq!(ret.max_messages, None);
@@ -4212,7 +4490,7 @@ mod tests {
         let cmds = vec![c1, c2, c3];
         MqCommand::write_batch(&mut buf, &cmds);
         let batch = MqCommand::split_from(&mut buf);
-        let v = batch.as_batch();
+        let v = batch.as_batch().unwrap();
         let sub_cmds: Vec<&[u8]> = v.commands().collect();
         assert_eq!(sub_cmds.len(), 3);
         assert_eq!(crate::types::buf_field_u64(sub_cmds[0], 8), 1);
@@ -4232,16 +4510,25 @@ mod tests {
         let cmds = vec![c1, c2, c3];
         MqCommand::write_batch(&mut buf, &cmds);
         let batch = MqCommand::split_from(&mut buf);
-        let sub_cmds: Vec<&[u8]> = batch.as_batch().commands().collect();
+        let sub_cmds: Vec<&[u8]> = batch.as_batch().unwrap().commands().collect();
         assert_eq!(sub_cmds.len(), 3);
         assert_eq!(
             crate::types::buf_tag(sub_cmds[0]),
             MqCommand::TAG_CREATE_TOPIC
         );
-        assert_eq!(CmdCreateTopic::from_buf(sub_cmds[0]).name(), "short");
+        assert_eq!(
+            CmdCreateTopic::from_buf(sub_cmds[0])
+                .unwrap()
+                .name()
+                .unwrap(),
+            "short"
+        );
         assert_eq!(crate::types::buf_tag(sub_cmds[1]), MqCommand::TAG_PUBLISH);
-        assert_eq!(CmdPublish::from_buf(sub_cmds[1]).topic_id(), 1);
-        let msgs: Vec<Bytes> = CmdPublish::from_buf(sub_cmds[1]).messages().collect();
+        assert_eq!(CmdPublish::from_buf(sub_cmds[1]).unwrap().topic_id(), 1);
+        let msgs: Vec<Bytes> = CmdPublish::from_buf(sub_cmds[1])
+            .unwrap()
+            .messages()
+            .collect();
         assert_eq!(msgs[0], Bytes::from_static(b"hello world data"));
         assert_eq!(
             crate::types::buf_tag(sub_cmds[2]),
@@ -4316,7 +4603,7 @@ mod tests {
         assert_eq!(cmd.field_u64(8), 99);
         assert_eq!(cmd.field_u64(16), 30_000);
         assert_eq!(cmd.field_u64(24), 3_600_000);
-        assert_eq!(cmd.field_flex8_str(32), "my-client-id");
+        assert_eq!(cmd.field_flex8_str(32).unwrap(), "my-client-id");
     }
 
     #[test]
@@ -4329,8 +4616,8 @@ mod tests {
         ] {
             MqCommand::write_create_exchange(&mut buf, name, etype);
             let cmd = MqCommand::split_from(&mut buf);
-            let v = cmd.as_create_exchange();
-            assert_eq!(v.name(), name);
+            let v = cmd.as_create_exchange().unwrap();
+            assert_eq!(v.name().unwrap(), name);
             assert_eq!(v.exchange_type(), etype);
         }
     }
@@ -4348,12 +4635,18 @@ mod tests {
             Some(42),
         );
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_binding();
+        let v = cmd.as_create_binding().unwrap();
         assert_eq!(v.exchange_id(), 10);
         assert_eq!(v.topic_id(), 20);
-        assert_eq!(v.routing_key(), Some("my.routing.key.pattern".to_string()));
+        assert_eq!(
+            v.routing_key().unwrap(),
+            Some("my.routing.key.pattern".to_string())
+        );
         assert!(v.no_local());
-        assert_eq!(v.shared_group(), Some("shared-group-name".to_string()));
+        assert_eq!(
+            v.shared_group().unwrap(),
+            Some("shared-group-name".to_string())
+        );
         assert_eq!(v.subscription_id(), Some(42));
     }
 
@@ -4362,12 +4655,12 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_create_binding(&mut buf, 1, 2, None);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_create_binding();
+        let v = cmd.as_create_binding().unwrap();
         assert_eq!(v.exchange_id(), 1);
         assert_eq!(v.topic_id(), 2);
-        assert_eq!(v.routing_key(), None);
+        assert_eq!(v.routing_key().unwrap(), None);
         assert!(!v.no_local());
-        assert_eq!(v.shared_group(), None);
+        assert_eq!(v.shared_group().unwrap(), None);
         assert_eq!(v.subscription_id(), None);
     }
 
@@ -4377,7 +4670,7 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_publish_to_exchange_bytes(&mut buf, 55, &msgs);
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_publish_to_exchange();
+        let v = cmd.as_publish_to_exchange().unwrap();
         assert_eq!(v.exchange_id(), 55);
         let decoded: Vec<Bytes> = v.messages().collect();
         assert_eq!(decoded.len(), 2);
@@ -4402,7 +4695,7 @@ mod tests {
         let cmd = MqCommand::split_from(&mut buf);
         assert_eq!(cmd.tag(), MqCommand::TAG_GROUP_EXTEND_VISIBILITY);
         assert_eq!(cmd.field_u64(8), 7);
-        let ids = cmd.field_vec_u64(16);
+        let ids = cmd.field_vec_u64(16).unwrap();
         assert_eq!(&*ids, &[10, 20, 30]);
         assert_eq!(cmd.field_u64(24), 60000);
     }
@@ -4418,10 +4711,10 @@ mod tests {
             &[b"dead-1".as_ref(), b"dead-2".as_ref()],
         );
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_publish_to_dlq();
+        let v = cmd.as_publish_to_dlq().unwrap();
         assert_eq!(v.source_group_id(), 10);
         assert_eq!(v.dlq_topic_id(), 20);
-        let dl_ids = v.dead_letter_ids();
+        let dl_ids = v.dead_letter_ids().unwrap();
         assert_eq!(&*dl_ids, &[100, 200]);
         let bodies: Vec<Bytes> = v.messages().collect();
         assert_eq!(bodies.len(), 2);
@@ -4439,7 +4732,7 @@ mod tests {
         let deserialized: MqCommand = serde_json::from_slice(&serialized).unwrap();
         assert_eq!(deserialized.tag(), MqCommand::TAG_PUBLISH);
         assert_eq!(deserialized.field_u64(8), 42);
-        let msgs: Vec<Bytes> = deserialized.as_publish().messages().collect();
+        let msgs: Vec<Bytes> = deserialized.as_publish().unwrap().messages().collect();
         assert_eq!(msgs[0], Bytes::from_static(b"serde-test"));
     }
 
@@ -4452,8 +4745,11 @@ mod tests {
         let encoded = cmd.encode_to_vec().unwrap();
         let decoded = MqCommand::decode_from_slice(&encoded).unwrap();
         assert_eq!(decoded.tag(), MqCommand::TAG_CREATE_TOPIC);
-        assert_eq!(decoded.as_create_topic().name(), "raft-test");
-        assert_eq!(decoded.as_create_topic().partition_count(), 4);
+        assert_eq!(
+            decoded.as_create_topic().unwrap().name().unwrap(),
+            "raft-test"
+        );
+        assert_eq!(decoded.as_create_topic().unwrap().partition_count(), 4);
     }
 
     #[test]
@@ -4470,14 +4766,14 @@ mod tests {
             &[("range", b"\x01"), ("sticky", b"\x02\x03")],
         );
         let cmd = MqCommand::split_from(&mut buf);
-        let v = cmd.as_join_consumer_group();
+        let v = cmd.as_join_consumer_group().unwrap();
         assert_eq!(v.group_id(), 1);
-        assert_eq!(v.member_id(), "m1");
-        assert_eq!(v.client_id(), "c1");
+        assert_eq!(v.member_id().unwrap(), "m1");
+        assert_eq!(v.client_id().unwrap(), "c1");
         assert_eq!(v.session_timeout_ms(), 10000);
         assert_eq!(v.rebalance_timeout_ms(), 20000);
-        assert_eq!(v.protocol_type(), "consumer");
-        let protocols = v.protocols();
+        assert_eq!(v.protocol_type().unwrap(), "consumer");
+        let protocols = v.protocols().unwrap();
         assert_eq!(protocols.len(), 2);
         assert_eq!(protocols[0].0, "range");
         assert_eq!(&*protocols[0].1, &[0x01]);
@@ -4497,7 +4793,7 @@ mod tests {
             .collect();
         MqCommand::write_batch(&mut buf, &cmds);
         let batch = MqCommand::split_from(&mut buf);
-        let v = batch.as_batch();
+        let v = batch.as_batch().unwrap();
         assert_eq!(v.count(), 50);
         let sub_cmds: Vec<&[u8]> = v.commands().collect();
         assert_eq!(sub_cmds.len(), 50);
@@ -4531,7 +4827,7 @@ mod tests {
 
         // Decode the encoded bytes and verify field access works
         let decoded = MqCommand::decode_from_bytes(Bytes::from(b2)).unwrap();
-        let v = decoded.as_publish();
+        let v = decoded.as_publish().unwrap();
         assert_eq!(v.topic_id(), 42);
         let decoded_msgs: Vec<Bytes> = v.messages().collect();
         assert_eq!(decoded_msgs.len(), 3);
@@ -4564,16 +4860,16 @@ mod tests {
 
         MqCommand::write_batch(&mut buf, &[pub1_cmd, pub2_cmd, delete]);
         let batch = MqCommand::split_from(&mut buf);
-        let v = batch.as_batch();
+        let v = batch.as_batch().unwrap();
         assert_eq!(v.count(), 3);
 
         let sub_cmds: Vec<&[u8]> = v.commands().collect();
-        let pub1 = CmdPublish::from_buf(sub_cmds[0]);
+        let pub1 = CmdPublish::from_buf(sub_cmds[0]).unwrap();
         assert_eq!(pub1.topic_id(), 1);
         let m1: Vec<Bytes> = pub1.messages().collect();
         assert_eq!(m1, msgs);
 
-        let pub2 = CmdPublish::from_buf(sub_cmds[1]);
+        let pub2 = CmdPublish::from_buf(sub_cmds[1]).unwrap();
         assert_eq!(pub2.topic_id(), 2);
         let m2: Vec<Bytes> = pub2.messages().collect();
         assert_eq!(m2, msgs);
@@ -4591,12 +4887,12 @@ mod tests {
         let mut buf = BytesMut::new();
         MqCommand::write_publish_bytes(&mut buf, 1, &msgs);
         let cmd = MqCommand::split_from(&mut buf);
-        let collected = cmd.collect_publish_messages();
+        let collected = cmd.collect_publish_messages().unwrap();
         assert_eq!(collected, msgs);
 
         MqCommand::write_publish_bytes(&mut buf, 1, &msgs);
         let cmd = MqCommand::split_from(&mut buf);
-        let collected = cmd.collect_publish_messages();
+        let collected = cmd.collect_publish_messages().unwrap();
         assert_eq!(collected, msgs);
     }
 }

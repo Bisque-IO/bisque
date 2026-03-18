@@ -15,6 +15,7 @@ use std::time::Duration;
 use bisque_raft::BisqueRaftTypeConfig;
 use bisque_raft::NodeAddressResolver;
 use bisque_raft::codec;
+use bisque_raft::test_support::TestTempDir;
 use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
@@ -238,13 +239,13 @@ struct E2eNode {
     server: Arc<Server>,
     serve_handle: tokio::task::JoinHandle<()>,
     data_dir: PathBuf,
-    _dir_handle: Option<tempfile::TempDir>,
+    _dir_handle: Option<TestTempDir>,
 }
 
 struct StoppedNode {
     node_id: u64,
     data_dir: PathBuf,
-    _dir_handle: Option<tempfile::TempDir>,
+    _dir_handle: Option<TestTempDir>,
 }
 
 struct E2eCluster {
@@ -309,7 +310,7 @@ impl E2eCluster {
         node_id: u64,
         registry: &Arc<DefaultNodeRegistry<u64>>,
         transport_cfg: &BisqueTcpTransportConfig,
-        existing_dir: Option<(PathBuf, Option<tempfile::TempDir>)>,
+        existing_dir: Option<(PathBuf, Option<TestTempDir>)>,
     ) -> E2eNode {
         let addr = pick_unused_local_addr();
         registry.register(node_id, addr);
@@ -317,7 +318,7 @@ impl E2eCluster {
         let (data_dir, dir_handle) = match existing_dir {
             Some((path, handle)) => (path, handle),
             None => {
-                let td = tempfile::tempdir().expect("tempdir");
+                let td = TestTempDir::new();
                 let path = td.path().to_path_buf();
                 (path, Some(td))
             }

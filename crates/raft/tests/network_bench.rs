@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use bisque_raft::BisqueRaftTypeConfig;
 use bisque_raft::codec;
 use bisque_raft::network::MultiplexedTransport;
+use bisque_raft::test_support::TestTempDir;
 use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
@@ -261,7 +262,7 @@ struct SingleNodeHarness {
             MultiplexedLogStorage<TestConfig>,
         >,
     >,
-    _dir: tempfile::TempDir,
+    _dir: TestTempDir,
 }
 
 impl SingleNodeHarness {
@@ -274,7 +275,7 @@ impl SingleNodeHarness {
         let node_registry = Arc::new(DefaultNodeRegistry::<u64>::new());
         node_registry.register(1, addr);
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = TestTempDir::new();
         let storage = MultiplexedLogStorage::<TestConfig>::new(
             MmapStorageConfig::new(dir.path())
                 .with_segment_size(64 * 1024 * 1024)

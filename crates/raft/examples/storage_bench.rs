@@ -8,6 +8,7 @@
 
 use bisque_raft::codec::{BorrowPayload, CodecError, Decode, Encode};
 use bisque_raft::storage_mmap::{MmapGroupLogStorage, MmapPerGroupLogStorage, MmapStorageConfig};
+use bisque_raft::test_support::TestTempDir;
 use bisque_raft::type_config::ManiacRaftTypeConfig;
 use openraft::storage::{IOFlushed, RaftLogReader, RaftLogStorage};
 use openraft::type_config::async_runtime::{AsyncRuntime, Oneshot};
@@ -558,7 +559,7 @@ async fn main() -> io::Result<()> {
             let total_bytes = cfg.total_entries * cfg.payload_size as u64;
             println!("  {}", cfg.label);
 
-            let dir = tempfile::tempdir()?;
+            let dir = TestTempDir::new();
             match bench_write(
                 cfg,
                 dir.path().to_path_buf(),
@@ -585,7 +586,7 @@ async fn main() -> io::Result<()> {
             let total_bytes = cfg.total_entries * cfg.payload_size as u64;
             println!("  {}", cfg.label);
 
-            let dir = tempfile::tempdir()?;
+            let dir = TestTempDir::new();
             match bench_read_seq(
                 cfg,
                 dir.path().to_path_buf(),
@@ -613,7 +614,7 @@ async fn main() -> io::Result<()> {
             let total_bytes = num_reads * cfg.payload_size as u64;
             println!("  {}", cfg.label);
 
-            let dir = tempfile::tempdir()?;
+            let dir = TestTempDir::new();
             match bench_read_random(
                 cfg,
                 dir.path().to_path_buf(),
@@ -656,7 +657,7 @@ async fn main() -> io::Result<()> {
             let total_bytes = total_entries * *payload_size as u64;
             println!("  {}", label);
 
-            let dir = tempfile::tempdir()?;
+            let dir = TestTempDir::new();
             match bench_multi_group_write(
                 *num_groups,
                 *payload_size,

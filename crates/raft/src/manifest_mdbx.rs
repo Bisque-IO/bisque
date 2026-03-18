@@ -239,21 +239,17 @@ impl MdbxManifest {
     }
 
     /// Create an in-memory manifest for filesystems that don't support MDBX
-    pub(crate) fn new_in_memory() -> Self {
+    pub(crate) fn new_in_memory() -> io::Result<Self> {
         // Use a temp directory that should work
         let temp_dir = std::env::temp_dir().join(".raft_manifest_in_memory");
-        // Try to use temp dir, if that fails too, use a no-op implementation
+        // Try to use temp dir, if that fails too, try a fallback path
         match Self::open(&temp_dir) {
-            Ok(manifest) => manifest,
+            Ok(manifest) => Ok(manifest),
             Err(_) => {
-                // This should not happen in practice, but if it does, we'll create a minimal
-                // in-memory database. However, libmdbx requires a path, so we need to use a temp path.
-                // For true in-memory, we'd need a different approach.
+                // libmdbx requires a path, so we need to use a temp path.
                 let fallback_path = std::env::temp_dir()
                     .join(format!(".raft_manifest_fallback_{}", std::process::id()));
-                Self::open(&fallback_path).unwrap_or_else(|_| {
-                    panic!("Failed to create in-memory manifest even with temp directory");
-                })
+                Self::open(&fallback_path)
             }
         }
     }
@@ -381,8 +377,8 @@ impl ManifestManager {
 
     /// Open an in-memory manifest for filesystems that don't support MDBX (e.g., tmpfs)
     /// This is best-effort metadata only - recovery will work but may be slower
-    pub(crate) fn open_in_memory() -> Self {
-        let manifest = Arc::new(MdbxManifest::new_in_memory());
+    pub(crate) fn open_in_memory() -> io::Result<Self> {
+        let manifest = Arc::new(MdbxManifest::new_in_memory()?);
         let (tx, rx) = crossfire::mpsc::bounded_async_blocking::<SegmentMeta>(4096);
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let manifest_clone = manifest.clone();
@@ -392,14 +388,14 @@ impl ManifestManager {
             .spawn(move || {
                 Self::worker_loop(manifest_clone, rx, shutdown_clone);
             })
-            .expect("Failed to spawn manifest worker thread");
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-        Self {
+        Ok(Self {
             tx,
             manifest,
             shutdown,
             worker_thread: Arc::new(std::sync::Mutex::new(Some(handle))),
-        }
+        })
     }
 
     pub(crate) fn sender(&self) -> MAsyncTx<Array<SegmentMeta>> {
@@ -410,7 +406,12 @@ impl ManifestManager {
     pub(crate) fn stop(&self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
-        if let Some(handle) = self.worker_thread.lock().unwrap().take() {
+        if let Some(handle) = self
+            .worker_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = handle.join();
         }
     }
@@ -486,8 +487,8 @@ impl ManifestManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestTempDir;
     use std::time::Duration;
-    use tempfile::TempDir;
 
     // =========================================================================
     // SegmentMeta tests
@@ -856,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_mdbx_manifest_open() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         // Verify empty read
@@ -866,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_mdbx_manifest_reopen() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
 
         // Write some data
         {
@@ -905,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_mdbx_manifest_write_read_single_segment() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         let meta = SegmentMeta {
@@ -944,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_mdbx_manifest_write_read_multiple_segments() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         let metas = vec![
@@ -1012,7 +1013,7 @@ mod tests {
 
     #[test]
     fn test_mdbx_manifest_multiple_groups_isolation() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         let metas = vec![
@@ -1085,7 +1086,7 @@ mod tests {
 
     #[test]
     fn test_mdbx_manifest_update_existing_segment() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         // Initial write
@@ -1139,7 +1140,7 @@ mod tests {
 
     #[test]
     fn test_mdbx_manifest_large_segment_ids() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         let metas = vec![
@@ -1201,7 +1202,7 @@ mod tests {
 
     #[test]
     fn test_mdbx_manifest_segment_ordering() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         // Insert out of order
@@ -1270,7 +1271,7 @@ mod tests {
 
     #[test]
     fn test_manifest_manager_open() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
 
         // Verify we can get a sender
@@ -1283,7 +1284,7 @@ mod tests {
 
     #[test]
     fn test_manifest_manager_async_write() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let sender = manager.sender();
 
@@ -1316,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_manifest_manager_coalesces_updates() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let sender = manager.sender();
 
@@ -1357,7 +1358,7 @@ mod tests {
 
     #[test]
     fn test_manifest_manager_multiple_groups() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let sender = manager.sender();
 
@@ -1392,7 +1393,7 @@ mod tests {
 
     #[test]
     fn test_manifest_manager_clone() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let manager2 = manager.clone();
 
@@ -1430,7 +1431,7 @@ mod tests {
 
     #[test]
     fn test_manifest_manager_batch_updates() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let sender = manager.sender();
 
@@ -1471,7 +1472,7 @@ mod tests {
 
     #[test]
     fn test_manifest_manager_stop_idempotent() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
 
         // Calling stop twice should not panic
@@ -1481,7 +1482,7 @@ mod tests {
 
     #[test]
     fn test_manifest_manager_read_after_stop() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let sender = manager.sender();
 
@@ -1513,7 +1514,7 @@ mod tests {
 
     #[test]
     fn test_manifest_open_reopen_persistence() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
 
         // Write via manager
         {
@@ -1555,7 +1556,7 @@ mod tests {
 
     #[test]
     fn test_manifest_empty_group_read() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         // Non-existent groups return empty HashMap
@@ -1698,7 +1699,7 @@ mod tests {
 
     #[test]
     fn test_manifest_many_segments() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         // 1000 segments in one group
@@ -1730,7 +1731,7 @@ mod tests {
 
     #[test]
     fn test_manifest_many_groups() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manifest = MdbxManifest::open(tmp.path()).unwrap();
 
         // 100 groups with 10 segments each
@@ -1771,7 +1772,7 @@ mod tests {
 
     #[test]
     fn test_manifest_concurrent_read_write() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let sender = manager.sender();
 
@@ -1831,7 +1832,7 @@ mod tests {
 
     #[test]
     fn test_manifest_worker_batch_timing() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let sender = manager.sender();
 
@@ -1874,7 +1875,7 @@ mod tests {
 
     #[test]
     fn test_manifest_sender_dropped_before_stop() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let sender = manager.sender();
 
@@ -1903,7 +1904,7 @@ mod tests {
 
     #[test]
     fn test_manifest_concurrent_stop_and_send() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TestTempDir::new();
         let manager = ManifestManager::open(tmp.path()).unwrap();
         let sender = manager.sender();
 

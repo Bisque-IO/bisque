@@ -16,13 +16,12 @@ pub mod storage_mmap;
 pub mod transport_tcp;
 pub mod type_config;
 
-#[cfg(test)]
-mod test_support;
+pub mod test_support;
 
 #[cfg(test)]
 mod network_tests;
 
-pub use manager::MultiRaftManager;
+pub use manager::{AddGroupError, MultiRaftManager};
 pub use network::{MultiRaftNetwork, MultiRaftNetworkFactory, MultiplexedTransport};
 pub use openraft::TokioRuntime;
 pub use rpc_server::{

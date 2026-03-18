@@ -497,11 +497,30 @@ pub enum EntityStats {
 /// `MqCommand::split_from` splits the result out zero-copy. On the read path,
 /// the buffer is decoded from the raft log zero-copy.
 ///
-/// Commands are always a single contiguous `Bytes` — no scatter/gather.
-/// Per-variant accessor structs (in `codec`) provide typed APIs over the raw buffer.
+/// Zero-copy command wrapper over a flat binary buffer.
+///
+/// Most commands are a single contiguous `Bytes` (`extra` is empty).
+/// The local batcher creates **scattered** commands where `header` holds
+/// the 32-byte TAG_FORWARDED_BATCH header inline (no allocation) and
+/// `extra` holds the sub-frame slabs — the Raft log writer scatter-writes
+/// them to disk via [`BorrowPayload::extra_payload_segments`] with zero
+/// copies of payload bytes.
+///
+/// Discriminant: `extra.is_empty()` → contiguous, else scattered.
+///
+/// Per-variant accessor structs (in `codec`) provide typed APIs over the
+/// raw buffer.  They are only used on the read path (contiguous commands
+/// from the Raft log); scattered commands are write-only.
 #[derive(Clone)]
 pub struct MqCommand {
+    /// Full command bytes for contiguous commands; empty for scattered.
     pub(crate) buf: Bytes,
+    /// Inline 32-byte header for scattered commands (no allocation).
+    /// Zeroed and unused for contiguous commands.
+    pub(crate) header: [u8; 32],
+    /// Extra payload segments for scattered (vectored) writes.
+    /// Empty for contiguous commands (the common case — no heap allocation).
+    pub(crate) extra: Vec<Bytes>,
 }
 
 // Tag constants for MqCommand discriminants — unified allocation.
@@ -589,9 +608,11 @@ impl MqCommand {
     /// Wire format (all 8-byte aligned):
     /// ```text
     /// @0  [size:4][fixed:2][tag:1][flags:1]   MqCommand header
-    /// @8  node_id: u32                        originating follower node
-    /// @12 count:   u32                        number of sub-frames
-    /// @24 Frame 0: [payload_len:4][client_id:4][request_seq:8][cmd_bytes + opt_pad]
+    /// @8  node_id:    u32                     originating follower node
+    /// @12 count:      u32                     number of sub-frames
+    /// @16 batch_seq:  u64                     follower-assigned dedup sequence
+    /// @24 leader_seq: u64                     leader-assigned total-order sequence
+    /// @32 Frame 0: [payload_len:4][client_id:4][request_seq:8][cmd_bytes + opt_pad]
     /// @.. Frame 1: [payload_len:4][client_id:4][request_seq:8][cmd_bytes + opt_pad]
     /// ```
     ///
@@ -637,6 +658,138 @@ impl MqCommand {
 // =============================================================================
 // Free-standing buffer accessors — read from raw &[u8] command buffers
 // =============================================================================
+// DecodeError
+// =============================================================================
+
+/// Error returned when decoding a binary buffer fails due to truncation or
+/// corruption.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum DecodeError {
+    /// The buffer is too short to read the requested field.
+    #[error("buffer too short: need {need} bytes at offset {offset}, have {have}")]
+    BufferTooShort {
+        need: usize,
+        offset: usize,
+        have: usize,
+    },
+
+    /// The data is structurally invalid.
+    #[error("invalid data: {0}")]
+    Invalid(String),
+}
+
+// =============================================================================
+// Safe byte-reading helpers
+// =============================================================================
+
+/// Read a `u16` in little-endian from `buf` at `offset`, returning an error if
+/// the buffer is too short.
+#[inline]
+pub fn read_u16_le(buf: &[u8], offset: usize) -> Result<u16, DecodeError> {
+    const N: usize = 2;
+    if offset + N > buf.len() {
+        return Err(DecodeError::BufferTooShort {
+            need: N,
+            offset,
+            have: buf.len(),
+        });
+    }
+    Ok(u16::from_le_bytes([buf[offset], buf[offset + 1]]))
+}
+
+/// Read a `u32` in little-endian from `buf` at `offset`, returning an error if
+/// the buffer is too short.
+#[inline]
+pub fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32, DecodeError> {
+    const N: usize = 4;
+    if offset + N > buf.len() {
+        return Err(DecodeError::BufferTooShort {
+            need: N,
+            offset,
+            have: buf.len(),
+        });
+    }
+    Ok(u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ]))
+}
+
+/// Read an `i32` in little-endian from `buf` at `offset`, returning an error if
+/// the buffer is too short.
+#[inline]
+pub fn read_i32_le(buf: &[u8], offset: usize) -> Result<i32, DecodeError> {
+    const N: usize = 4;
+    if offset + N > buf.len() {
+        return Err(DecodeError::BufferTooShort {
+            need: N,
+            offset,
+            have: buf.len(),
+        });
+    }
+    Ok(i32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ]))
+}
+
+/// Read a `u64` in little-endian from `buf` at `offset`, returning an error if
+/// the buffer is too short.
+#[inline]
+pub fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64, DecodeError> {
+    const N: usize = 8;
+    if offset + N > buf.len() {
+        return Err(DecodeError::BufferTooShort {
+            need: N,
+            offset,
+            have: buf.len(),
+        });
+    }
+    Ok(u64::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ]))
+}
+
+/// Read a sub-slice from `buf` at `[offset..offset+len]`, returning an error if
+/// the buffer is too short.
+#[inline]
+pub fn read_slice(buf: &[u8], offset: usize, len: usize) -> Result<&[u8], DecodeError> {
+    if offset + len > buf.len() {
+        return Err(DecodeError::BufferTooShort {
+            need: len,
+            offset,
+            have: buf.len(),
+        });
+    }
+    Ok(&buf[offset..offset + len])
+}
+
+/// Read a `u8` from `buf` at `offset`, returning an error if the buffer is too
+/// short.
+#[inline]
+pub fn read_u8(buf: &[u8], offset: usize) -> Result<u8, DecodeError> {
+    if offset >= buf.len() {
+        return Err(DecodeError::BufferTooShort {
+            need: 1,
+            offset,
+            have: buf.len(),
+        });
+    }
+    Ok(buf[offset])
+}
+
+// =============================================================================
 
 /// Read the command tag from a raw buffer (byte at offset 6).
 #[inline]
@@ -651,26 +804,36 @@ pub fn buf_flags(buf: &[u8]) -> u8 {
 }
 
 /// Read a u64 LE field from a raw buffer at the given byte offset.
+///
+/// The caller must ensure `offset + 8 ≤ buf.len()` (via prior validation).
 #[inline]
 pub fn buf_field_u64(buf: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
 }
 
 /// Read a u32 LE field from a raw buffer at the given byte offset.
+///
+/// The caller must ensure `offset + 4 ≤ buf.len()` (via prior validation).
 #[inline]
 pub fn buf_field_u32(buf: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
 }
 
 /// Read a vec_u64 slot from a raw buffer: `[count:4][offset:4]` in fixed.
+///
+/// Variable-length field — returns `Result` because internal data offsets are
+/// untrusted even after fixed-region validation.
 #[inline]
-pub fn buf_field_vec_u64(buf: &[u8], offset: usize) -> crate::codec::DecodeU64s<'_> {
-    let count = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+pub fn buf_field_vec_u64(
+    buf: &[u8],
+    offset: usize,
+) -> Result<crate::codec::DecodeU64s<'_>, DecodeError> {
+    let count = read_u32_le(buf, offset)? as usize;
     if count == 0 {
-        return crate::codec::DecodeU64s::Owned(SmallVec::new());
+        return Ok(crate::codec::DecodeU64s::Owned(SmallVec::new()));
     }
-    let data_offset = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
-    crate::codec::decode_u64s_at(buf, data_offset, count)
+    let data_offset = read_u32_le(buf, offset + 4)? as usize;
+    Ok(crate::codec::decode_u64s_at(buf, data_offset, count))
 }
 
 impl MqCommand {
@@ -687,8 +850,12 @@ impl MqCommand {
     }
 
     /// Total message size from the header.
+    ///
+    /// Callers must ensure the buffer has been validated (≥ 8 bytes for the
+    /// header).  All MqCommand construction paths guarantee this.
     #[inline]
     pub fn cmd_size(&self) -> u32 {
+        // SAFETY: header is validated at construction; OFF_SIZE + 4 ≤ 8.
         u32::from_le_bytes(
             self.buf[Self::OFF_SIZE..Self::OFF_SIZE + 4]
                 .try_into()
@@ -699,6 +866,7 @@ impl MqCommand {
     /// Fixed region size (= flex region start offset).
     #[inline]
     pub fn fixed_size(&self) -> u16 {
+        // SAFETY: header is validated at construction; OFF_FIXED + 2 ≤ 8.
         u16::from_le_bytes(
             self.buf[Self::OFF_FIXED..Self::OFF_FIXED + 2]
                 .try_into()
@@ -711,18 +879,32 @@ impl MqCommand {
     /// For topic commands this is `topic_id`, for consumer group commands
     /// this is `group_id`, for session commands this is `session_id`, etc.
     /// Used by async apply workers for partition routing.
+    ///
+    /// Callers must ensure `buf.len() >= 16`. All non-header-only commands
+    /// satisfy this; for safety in untrusted contexts use [`try_primary_id`].
     #[inline]
     pub fn primary_id(&self) -> u64 {
         self.field_u64(8)
     }
 
+    /// Fallible variant of [`primary_id`] for untrusted buffers.
+    #[inline]
+    pub fn try_primary_id(&self) -> Result<u64, DecodeError> {
+        read_u64_le(&self.buf, 8)
+    }
+
     /// Read a u64 LE field at the given byte offset.
+    ///
+    /// The caller must ensure `offset + 8 ≤ buf.len()` (typically proven by
+    /// tag dispatch or view-struct construction validation).
     #[inline]
     pub(crate) fn field_u64(&self, offset: usize) -> u64 {
         u64::from_le_bytes(self.buf[offset..offset + 8].try_into().unwrap())
     }
 
     /// Read a u32 LE field at the given byte offset.
+    ///
+    /// The caller must ensure `offset + 4 ≤ buf.len()`.
     #[inline]
     pub(crate) fn field_u32(&self, offset: usize) -> u32 {
         u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap())
@@ -734,52 +916,52 @@ impl MqCommand {
     /// - Small (≤7): `[(len<<1):u8][data:7]`              — bit 0 = 0
     /// - Large (>7): `[(offset<<1|1):u32_le][size:u32_le]` — bit 0 = 1, 31-bit offset
     #[inline]
-    pub(crate) fn field_flex8(&self, offset: usize) -> &[u8] {
-        let first = self.buf[offset];
+    pub(crate) fn field_flex8(&self, offset: usize) -> Result<&[u8], DecodeError> {
+        let first = read_u8(&self.buf, offset)?;
         if first & 1 == 0 {
             let len = (first >> 1) as usize;
             if len == 0 {
-                return &[];
+                return Ok(&[]);
             }
-            &self.buf[offset + 1..offset + 1 + len]
+            read_slice(&self.buf, offset + 1, len)
         } else {
-            let raw = u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap());
+            let raw = read_u32_le(&self.buf, offset)?;
             let data_offset = (raw >> 1) as usize;
-            let size =
-                u32::from_le_bytes(self.buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
-            &self.buf[data_offset..data_offset + size]
+            let size = read_u32_le(&self.buf, offset + 4)? as usize;
+            read_slice(&self.buf, data_offset, size)
         }
     }
 
     /// Read a flex8 slot as a str.
     #[inline]
-    pub(crate) fn field_flex8_str(&self, offset: usize) -> &str {
-        std::str::from_utf8(self.field_flex8(offset)).unwrap_or("")
+    pub(crate) fn field_flex8_str(&self, offset: usize) -> Result<&str, DecodeError> {
+        let bytes = self.field_flex8(offset)?;
+        Ok(std::str::from_utf8(bytes).unwrap_or(""))
     }
 
     /// Read a flex8 slot as optional Bytes (None if length is 0).
     #[inline]
-    pub(crate) fn field_opt_flex8_bytes(&self, offset: usize) -> Option<Bytes> {
-        let first = self.buf[offset];
+    pub(crate) fn field_opt_flex8_bytes(
+        &self,
+        offset: usize,
+    ) -> Result<Option<Bytes>, DecodeError> {
+        let first = read_u8(&self.buf, offset)?;
         if first & 1 == 0 {
             let len = (first >> 1) as usize;
             if len == 0 {
-                return None;
+                return Ok(None);
             }
-            Some(Bytes::copy_from_slice(
-                &self.buf[offset + 1..offset + 1 + len],
-            ))
+            let data = read_slice(&self.buf, offset + 1, len)?;
+            Ok(Some(Bytes::copy_from_slice(data)))
         } else {
-            let raw = u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap());
+            let raw = read_u32_le(&self.buf, offset)?;
             let data_offset = (raw >> 1) as usize;
-            let size =
-                u32::from_le_bytes(self.buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let size = read_u32_le(&self.buf, offset + 4)? as usize;
             if size == 0 {
-                None
+                Ok(None)
             } else {
-                Some(Bytes::copy_from_slice(
-                    &self.buf[data_offset..data_offset + size],
-                ))
+                let data = read_slice(&self.buf, data_offset, size)?;
+                Ok(Some(Bytes::copy_from_slice(data)))
             }
         }
     }
@@ -789,20 +971,23 @@ impl MqCommand {
     /// Returns a zero-copy `&[u64]` when the data is 8-byte aligned (common),
     /// otherwise falls back to a bulk memcpy into SmallVec.
     #[inline]
-    pub(crate) fn field_vec_u64(&self, offset: usize) -> crate::codec::DecodeU64s<'_> {
-        let count = u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap()) as usize;
+    pub(crate) fn field_vec_u64(
+        &self,
+        offset: usize,
+    ) -> Result<crate::codec::DecodeU64s<'_>, DecodeError> {
+        let count = read_u32_le(&self.buf, offset)? as usize;
         if count == 0 {
-            return crate::codec::DecodeU64s::Owned(SmallVec::new());
+            return Ok(crate::codec::DecodeU64s::Owned(SmallVec::new()));
         }
-        let data_offset =
-            u32::from_le_bytes(self.buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        crate::codec::decode_u64s_at(&self.buf, data_offset, count)
+        let data_offset = read_u32_le(&self.buf, offset + 4)? as usize;
+        Ok(crate::codec::decode_u64s_at(&self.buf, data_offset, count))
     }
 
     /// Read a vec_bytes descriptor table: `[count:4][offset:4]` in fixed,
     /// `[size0:4][offset0:4]...` descriptors in flex.
     ///
-    /// Returns an iterator yielding `&[u8]` slices for each element.
+    /// Returns the count from the fixed-region slot. The caller must ensure
+    /// the buffer is validated (fixed region is readable).
     #[inline]
     pub(crate) fn field_vec_bytes_count(&self, offset: usize) -> u32 {
         u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap())
@@ -811,26 +996,72 @@ impl MqCommand {
     /// Walk to the i-th element in a sequential vec_bytes stream.
     /// Slot format: `[count:4][data_start:4]`; stream: `[len:4][data]...`
     #[inline]
-    pub(crate) fn field_vec_bytes_get(&self, slot_offset: usize, index: usize) -> &[u8] {
-        let data_start = u32::from_le_bytes(
-            self.buf[slot_offset + 4..slot_offset + 8]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+    pub(crate) fn field_vec_bytes_get(
+        &self,
+        slot_offset: usize,
+        index: usize,
+    ) -> Result<&[u8], DecodeError> {
+        let data_start = read_u32_le(&self.buf, slot_offset + 4)? as usize;
         let mut pos = data_start;
         for _ in 0..index {
-            let len = u32::from_le_bytes(self.buf[pos..pos + 4].try_into().unwrap()) as usize;
+            let len = read_u32_le(&self.buf, pos)? as usize;
             pos += 4 + len;
         }
-        let len = u32::from_le_bytes(self.buf[pos..pos + 4].try_into().unwrap()) as usize;
-        &self.buf[pos + 4..pos + 4 + len]
+        let len = read_u32_le(&self.buf, pos)? as usize;
+        read_slice(&self.buf, pos + 4, len)
     }
 
     /// Same as `field_vec_bytes_get` but returns a zero-copy `Bytes` slice.
     #[inline]
-    pub(crate) fn field_vec_bytes_get_bytes(&self, slot_offset: usize, index: usize) -> Bytes {
-        let data = self.field_vec_bytes_get(slot_offset, index);
-        self.buf.slice_ref(data)
+    pub(crate) fn field_vec_bytes_get_bytes(
+        &self,
+        slot_offset: usize,
+        index: usize,
+    ) -> Result<Bytes, DecodeError> {
+        let data = self.field_vec_bytes_get(slot_offset, index)?;
+        Ok(self.buf.slice_ref(data))
+    }
+
+    /// Validate that the buffer is large enough for its declared size.
+    ///
+    /// Returns `Ok(())` if the buffer has at least 8 bytes (the header) and
+    /// the total `cmd_size()` fits within the buffer. Call this once at the
+    /// boundary (network receive, raft decode) before using any field
+    /// accessors.
+    #[inline]
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.buf.len() < 8 {
+            return Err(DecodeError::BufferTooShort {
+                need: 8,
+                offset: 0,
+                have: self.buf.len(),
+            });
+        }
+        let size = self.cmd_size() as usize;
+        if size > self.buf.len() {
+            return Err(DecodeError::BufferTooShort {
+                need: size,
+                offset: 0,
+                have: self.buf.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate that the buffer is at least `min_size` bytes.
+    ///
+    /// Used by view-struct constructors to enforce the minimum fixed-region
+    /// size for a specific command type.
+    #[inline]
+    pub fn validate_min(&self, min_size: usize) -> Result<(), DecodeError> {
+        if self.buf.len() < min_size {
+            return Err(DecodeError::BufferTooShort {
+                need: min_size,
+                offset: 0,
+                have: self.buf.len(),
+            });
+        }
+        Ok(())
     }
 
     /// Raw buffer access.
@@ -842,7 +1073,11 @@ impl MqCommand {
     /// Wrap raw bytes as an MqCommand (zero-copy).
     #[inline]
     pub fn from_bytes(buf: Bytes) -> Self {
-        Self { buf }
+        Self {
+            buf,
+            header: [0u8; 32],
+            extra: Vec::new(),
+        }
     }
 
     /// Wrap a Vec<u8> as an MqCommand.
@@ -850,6 +1085,8 @@ impl MqCommand {
     pub fn from_vec(buf: Vec<u8>) -> Self {
         Self {
             buf: Bytes::from(buf),
+            header: [0u8; 32],
+            extra: Vec::new(),
         }
     }
 
@@ -859,13 +1096,33 @@ impl MqCommand {
     pub fn split_from(buf: &mut bytes::BytesMut) -> Self {
         Self {
             buf: buf.split().freeze(),
+            header: [0u8; 32],
+            extra: Vec::new(),
         }
     }
 
-    /// Total encoded size in bytes.
+    /// Create a scattered command from an inline header and payload slabs.
+    ///
+    /// The header is stored inline (no allocation). The Raft log writer
+    /// scatter-writes `header` followed by each slab in `extra` — zero
+    /// copies of command payload bytes.
+    #[inline]
+    pub fn scattered(header: [u8; 32], slabs: Vec<Bytes>) -> Self {
+        Self {
+            buf: Bytes::new(),
+            header,
+            extra: slabs,
+        }
+    }
+
+    /// Total encoded size in bytes (header + all extra segments).
     #[inline]
     pub fn total_encoded_size(&self) -> usize {
-        self.buf.len()
+        if self.extra.is_empty() {
+            self.buf.len()
+        } else {
+            32 + self.extra.iter().map(|b| b.len()).sum::<usize>()
+        }
     }
 }
 
@@ -877,7 +1134,12 @@ impl fmt::Display for MqCommand {
 
 impl fmt::Debug for MqCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MqCommand(tag={}, {} bytes)", self.tag(), self.buf.len())
+        write!(
+            f,
+            "MqCommand(tag={}, {} bytes)",
+            self.tag(),
+            self.total_encoded_size()
+        )
     }
 }
 
@@ -886,7 +1148,18 @@ impl fmt::Debug for MqCommand {
 
 impl Serialize for MqCommand {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.buf)
+        if self.extra.is_empty() {
+            serializer.serialize_bytes(&self.buf)
+        } else {
+            // Scattered: concatenate for serde (rare — only snapshot serialisation).
+            let total = self.total_encoded_size();
+            let mut all = Vec::with_capacity(total);
+            all.extend_from_slice(&self.header);
+            for seg in &self.extra {
+                all.extend_from_slice(seg);
+            }
+            serializer.serialize_bytes(&all)
+        }
     }
 }
 
@@ -895,6 +1168,8 @@ impl<'de> Deserialize<'de> for MqCommand {
         let bytes = <Vec<u8>>::deserialize(deserializer)?;
         Ok(Self {
             buf: Bytes::from(bytes),
+            header: [0u8; 32],
+            extra: Vec::new(),
         })
     }
 }

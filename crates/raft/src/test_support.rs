@@ -6,7 +6,6 @@ use crate::codec::{BorrowPayload, CodecError, Decode, Encode};
 use bytes::Bytes;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
-use tempfile::TempDir;
 
 /// Byte wrapper for tests that implements all required traits.
 /// Backed by `bytes::Bytes` to enable zero-copy decoding from mmap storage.
@@ -134,25 +133,63 @@ impl Default for PortAllocator {
     }
 }
 
-/// Temporary directory helper for storage tests
+/// Temporary directory helper for storage tests.
+///
+/// Uses a local `.tmp` directory in the project root instead of OS `/tmp`
+/// to avoid disk quota issues.  Each instance creates a UUID subdirectory
+/// that is removed on drop.
 pub struct TestTempDir {
-    inner: TempDir,
+    path: PathBuf,
 }
+
+/// Base directory for all test temp dirs (relative to the crate root).
+const TEST_TMP_BASE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.tmp");
 
 impl TestTempDir {
     pub fn new() -> Self {
-        Self {
-            inner: tempfile::tempdir().expect("Failed to create temp directory"),
-        }
+        let base = std::path::Path::new(TEST_TMP_BASE);
+        std::fs::create_dir_all(base).expect("Failed to create .tmp base directory");
+        static COUNTER: AtomicU16 = AtomicU16::new(0);
+        let id = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        );
+        let path = base.join(id.to_string());
+        std::fs::create_dir_all(&path).expect("Failed to create test temp directory");
+        Self { path }
     }
 
-    pub fn path(&self) -> PathBuf {
-        self.inner.path().to_path_buf()
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }
 
 impl Default for TestTempDir {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for TestTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+impl std::ops::Deref for TestTempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TestTempDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
     }
 }

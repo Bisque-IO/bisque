@@ -823,12 +823,18 @@ fn test_create_binding_with_opts_codec() {
     );
     assert_eq!(cmd.tag(), MqCommand::TAG_CREATE_BINDING);
 
-    let view = cmd.as_create_binding();
+    let view = cmd.as_create_binding().unwrap();
     assert_eq!(view.exchange_id(), 10);
     assert_eq!(view.topic_id(), 20);
-    assert_eq!(view.routing_key(), Some("sensors/+/temp".to_string()));
+    assert_eq!(
+        view.routing_key().unwrap(),
+        Some("sensors/+/temp".to_string())
+    );
     assert!(view.no_local(), "no_local should be true");
-    assert_eq!(view.shared_group(), Some("shared-group-1".to_string()));
+    assert_eq!(
+        view.shared_group().unwrap(),
+        Some("shared-group-1".to_string())
+    );
     assert_eq!(view.subscription_id(), Some(42));
 }
 
@@ -837,13 +843,13 @@ fn test_create_binding_backward_compat() {
     let mut buf = BytesMut::new();
 
     let cmd = MqCommand::create_binding(&mut buf, 10, 20, Some("topic/#"));
-    let view = cmd.as_create_binding();
+    let view = cmd.as_create_binding().unwrap();
     assert!(
         !view.no_local(),
         "backward compat: no_local should be false"
     );
     assert!(
-        view.shared_group().is_none(),
+        view.shared_group().unwrap().is_none(),
         "backward compat: shared_group should be None"
     );
 }

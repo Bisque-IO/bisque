@@ -16,6 +16,7 @@ use bisque_raft::BisqueRaftTypeConfig;
 use bisque_raft::NodeAddressResolver;
 use bisque_raft::codec::{self, Decode, Encode};
 use bisque_raft::network::GroupNetworkFactory;
+use bisque_raft::test_support::TestTempDir;
 use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiRaftNetworkFactory,
@@ -328,7 +329,7 @@ struct ClusterNode {
             MultiplexedLogStorage<TestConfig>,
         >,
     >,
-    _dir: tempfile::TempDir,
+    _dir: TestTempDir,
 }
 
 struct TestCluster {
@@ -347,7 +348,7 @@ impl TestCluster {
             let addr = pick_unused_local_addr();
             node_registry.register(node_id, addr);
 
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = TestTempDir::new();
             let storage = MultiplexedLogStorage::<TestConfig>::new(
                 MmapStorageConfig::new(dir.path())
                     .with_segment_size(4 * 1024 * 1024)

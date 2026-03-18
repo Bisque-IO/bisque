@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use crate::types::MqCommand;
+use crate::types::{MqCommand, read_u32_le, read_u64_le};
 
 // ---- Constants ----
 
@@ -817,6 +817,10 @@ impl SegmentIndexMap {
         let (seg_id, rec_offset) = record_location;
         let cmd_len = cmd.as_bytes().len() as u32;
 
+        if cmd.as_bytes().len() < 16 {
+            return;
+        }
+
         match cmd.tag() {
             MqCommand::TAG_PUBLISH => {
                 let topic_id = cmd.field_u64(8);
@@ -827,8 +831,14 @@ impl SegmentIndexMap {
                 self.add_entry(seg_id, ENTITY_TOPIC, exchange_id, rec_offset, cmd_len);
             }
             MqCommand::TAG_BATCH => {
-                let batch = cmd.as_batch();
+                let batch = match cmd.as_batch() {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
                 for sub_buf in batch.commands() {
+                    if sub_buf.len() < 16 {
+                        continue;
+                    }
                     match crate::types::buf_tag(sub_buf) {
                         MqCommand::TAG_PUBLISH => {
                             let topic_id = crate::types::buf_field_u64(sub_buf, 8);
@@ -915,11 +925,11 @@ impl FrozenSegmentIndex {
         if &data[0..4] != &SIDX_MAGIC {
             return None;
         }
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let version = read_u32_le(&data, 4).ok()?;
         if version != SIDX_VERSION {
             return None;
         }
-        let bucket_count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        let bucket_count = read_u32_le(&data, 12).ok()? as usize;
         if !bucket_count.is_power_of_two() {
             return None;
         }
@@ -937,7 +947,7 @@ impl FrozenSegmentIndex {
 
     #[inline]
     fn bucket_count(&self) -> usize {
-        u32::from_le_bytes(self.data[12..16].try_into().unwrap()) as usize
+        read_u32_le(&self.data, 12).unwrap_or(0) as usize
     }
 
     /// Look up the records region for a given entity.
@@ -951,6 +961,9 @@ impl FrozenSegmentIndex {
 
         loop {
             let b_off = SIDX_HEADER_SIZE + bucket * SIDX_BUCKET_SIZE;
+            if b_off + SIDX_BUCKET_SIZE > self.data.len() {
+                return None;
+            }
             let b_type = self.data[b_off];
 
             if b_type == BUCKET_EMPTY {
@@ -958,14 +971,10 @@ impl FrozenSegmentIndex {
             }
 
             if b_type == entity_type {
-                let b_id = u64::from_le_bytes(self.data[b_off + 4..b_off + 12].try_into().unwrap());
+                let b_id = read_u64_le(&self.data, b_off + 4).ok()?;
                 if b_id == entity_id {
-                    let rec_off =
-                        u32::from_le_bytes(self.data[b_off + 12..b_off + 16].try_into().unwrap())
-                            as usize;
-                    let rec_count =
-                        u32::from_le_bytes(self.data[b_off + 16..b_off + 20].try_into().unwrap())
-                            as usize;
+                    let rec_off = read_u32_le(&self.data, b_off + 12).ok()? as usize;
+                    let rec_count = read_u32_le(&self.data, b_off + 16).ok()? as usize;
                     return Some((rec_off, rec_count));
                 }
             }
@@ -980,10 +989,11 @@ impl FrozenSegmentIndex {
         let mut total = 0usize;
         for i in 0..bucket_count {
             let b_off = SIDX_HEADER_SIZE + i * SIDX_BUCKET_SIZE;
+            if b_off + SIDX_BUCKET_SIZE > self.data.len() {
+                break;
+            }
             if self.data[b_off] != BUCKET_EMPTY {
-                let rec_count =
-                    u32::from_le_bytes(self.data[b_off + 16..b_off + 20].try_into().unwrap())
-                        as usize;
+                let rec_count = read_u32_le(&self.data, b_off + 16).unwrap_or(0) as usize;
                 total += rec_count;
             }
         }
@@ -993,7 +1003,7 @@ impl FrozenSegmentIndex {
 
 impl SegmentIndex for FrozenSegmentIndex {
     fn segment_id(&self) -> u32 {
-        u32::from_le_bytes(self.data[8..12].try_into().unwrap())
+        read_u32_le(&self.data, 8).unwrap_or(0)
     }
 
     fn is_empty(&self) -> bool {
@@ -1017,11 +1027,15 @@ impl SegmentIndex for FrozenSegmentIndex {
             None => return Vec::new(),
         };
 
+        if rec_off + rec_count * SIDX_RECORD_SIZE > self.data.len() {
+            return Vec::new();
+        }
+
         let mut out = Vec::with_capacity(rec_count);
         for i in 0..rec_count {
             let r = rec_off + i * SIDX_RECORD_SIZE;
-            let offset = u32::from_le_bytes(self.data[r..r + 4].try_into().unwrap());
-            let len = u32::from_le_bytes(self.data[r + 4..r + 8].try_into().unwrap());
+            let offset = read_u32_le(&self.data, r).unwrap_or(0);
+            let len = read_u32_le(&self.data, r + 4).unwrap_or(0);
             out.push(RecordLoc { offset, len });
         }
         out

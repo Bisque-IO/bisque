@@ -924,10 +924,10 @@ fn test_set_retained_codec() {
     let cmd = MqCommand::set_retained(&mut buf, 42, "sensors/temp", &msg);
 
     assert_eq!(cmd.tag(), MqCommand::TAG_SET_RETAINED);
-    let v = cmd.as_set_retained();
+    let v = cmd.as_set_retained().unwrap();
     assert_eq!(v.exchange_id(), 42);
-    assert_eq!(v.routing_key(), "sensors/temp");
-    assert!(!v.message().is_empty());
+    assert_eq!(v.routing_key().unwrap(), "sensors/temp");
+    assert!(!v.message().unwrap().is_empty());
 }
 
 #[test]
@@ -936,9 +936,12 @@ fn test_get_retained_codec_with_filter() {
     let cmd = MqCommand::get_retained(&mut buf, 42, Some("sensors/+"));
 
     assert_eq!(cmd.tag(), MqCommand::TAG_GET_RETAINED);
-    let v = cmd.as_get_retained();
+    let v = cmd.as_get_retained().unwrap();
     assert_eq!(v.exchange_id(), 42);
-    assert_eq!(v.routing_key_filter(), Some("sensors/+".to_string()));
+    assert_eq!(
+        v.routing_key_filter().unwrap(),
+        Some("sensors/+".to_string())
+    );
 }
 
 #[test]
@@ -948,9 +951,9 @@ fn test_get_retained_codec_no_filter() {
     let cmd = MqCommand::get_retained(&mut buf, 42, None);
 
     assert_eq!(cmd.tag(), MqCommand::TAG_GET_RETAINED);
-    let v = cmd.as_get_retained();
+    let v = cmd.as_get_retained().unwrap();
     assert_eq!(v.exchange_id(), 42);
-    assert_eq!(v.routing_key_filter(), None);
+    assert_eq!(v.routing_key_filter().unwrap(), None);
 }
 
 #[test]
@@ -959,9 +962,9 @@ fn test_delete_retained_codec() {
     let cmd = MqCommand::delete_retained(&mut buf, 42, "sensors/temp");
 
     assert_eq!(cmd.tag(), MqCommand::TAG_DELETE_RETAINED);
-    let v = cmd.as_delete_retained();
+    let v = cmd.as_delete_retained().unwrap();
     assert_eq!(v.exchange_id(), 42);
-    assert_eq!(v.routing_key(), "sensors/temp");
+    assert_eq!(v.routing_key().unwrap(), "sensors/temp");
 }
 
 // =============================================================================
@@ -1016,9 +1019,9 @@ fn test_set_retained_raft_encode_decode() {
 
     let decoded = MqCommand::decode(&mut &buf[..]).unwrap();
     assert_eq!(decoded.tag(), MqCommand::TAG_SET_RETAINED);
-    let v = decoded.as_set_retained();
+    let v = decoded.as_set_retained().unwrap();
     assert_eq!(v.exchange_id(), 42);
-    assert_eq!(v.routing_key(), "key");
+    assert_eq!(v.routing_key().unwrap(), "key");
 }
 
 #[test]
@@ -1034,9 +1037,12 @@ fn test_get_retained_raft_encode_decode() {
 
     let decoded = MqCommand::decode(&mut &buf[..]).unwrap();
     assert_eq!(decoded.tag(), MqCommand::TAG_GET_RETAINED);
-    let v = decoded.as_get_retained();
+    let v = decoded.as_get_retained().unwrap();
     assert_eq!(v.exchange_id(), 99);
-    assert_eq!(v.routing_key_filter(), Some("pattern/#".to_string()));
+    assert_eq!(
+        v.routing_key_filter().unwrap(),
+        Some("pattern/#".to_string())
+    );
 }
 
 #[test]
@@ -1051,9 +1057,9 @@ fn test_delete_retained_raft_encode_decode() {
 
     let decoded = MqCommand::decode(&mut &buf[..]).unwrap();
     assert_eq!(decoded.tag(), MqCommand::TAG_DELETE_RETAINED);
-    let v = decoded.as_delete_retained();
+    let v = decoded.as_delete_retained().unwrap();
     assert_eq!(v.exchange_id(), 99);
-    assert_eq!(v.routing_key(), "del/key");
+    assert_eq!(v.routing_key().unwrap(), "del/key");
 }
 
 // =============================================================================

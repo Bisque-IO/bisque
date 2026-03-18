@@ -14,6 +14,7 @@ use std::time::Duration;
 use bisque_raft::NodeAddressResolver;
 use bisque_raft::codec::{Decode, Encode};
 use bisque_raft::network::GroupNetworkFactory;
+use bisque_raft::test_support::TestTempDir;
 use bisque_raft::{BisqueRaftTypeConfig, multi::codec};
 use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
@@ -213,8 +214,8 @@ fn test_two_node_two_group_cluster() {
         node_registry.register(2, addr2);
 
         // Storage (temp dirs per node)
-        let dir1 = tempfile::tempdir().expect("tempdir node1");
-        let dir2 = tempfile::tempdir().expect("tempdir node2");
+        let dir1 = TestTempDir::new();
+        let dir2 = TestTempDir::new();
 
         let storage1 = MultiplexedLogStorage::<TestConfig>::new(
             MmapStorageConfig::new(dir1.path())

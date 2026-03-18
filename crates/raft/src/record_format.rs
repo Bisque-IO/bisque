@@ -636,7 +636,7 @@ impl AtomicLogId {
         }
     }
 
-    pub fn store<C>(&self, log_id: Option<&LogId<C>>)
+    pub fn store<C>(&self, log_id: Option<&LogId<C>>) -> io::Result<()>
     where
         C: RaftTypeConfig<
                 NodeId = u64,
@@ -650,19 +650,31 @@ impl AtomicLogId {
 
         match log_id {
             Some(lid) => {
-                // Check bounds in both debug and release builds to prevent silent corruption
-                assert!(
-                    lid.leader_id.term <= Self::MAX_TERM,
-                    "term {} exceeds maximum {} for packed AtomicLogId",
-                    lid.leader_id.term,
-                    Self::MAX_TERM
-                );
-                assert!(
-                    lid.leader_id.node_id <= Self::MAX_NODE_ID,
-                    "node_id {} exceeds maximum {} for packed AtomicLogId",
-                    lid.leader_id.node_id,
-                    Self::MAX_NODE_ID
-                );
+                // Check bounds to prevent silent corruption from bit-packing overflow
+                if lid.leader_id.term > Self::MAX_TERM {
+                    // Restore even sequence before returning error
+                    self.seq.fetch_add(1, Ordering::Release);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "term {} exceeds maximum {} for packed AtomicLogId",
+                            lid.leader_id.term,
+                            Self::MAX_TERM
+                        ),
+                    ));
+                }
+                if lid.leader_id.node_id > Self::MAX_NODE_ID {
+                    // Restore even sequence before returning error
+                    self.seq.fetch_add(1, Ordering::Release);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "node_id {} exceeds maximum {} for packed AtomicLogId",
+                            lid.leader_id.node_id,
+                            Self::MAX_NODE_ID
+                        ),
+                    ));
+                }
                 let high = (lid.leader_id.term << Self::TERM_SHIFT)
                     | (lid.leader_id.node_id & Self::MAX_NODE_ID);
                 let low = (lid.index << Self::INDEX_SHIFT) | Self::VALID_BIT;
@@ -677,6 +689,7 @@ impl AtomicLogId {
 
         // Increment sequence to even (write complete)
         self.seq.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     pub fn load<C>(&self) -> Option<LogId<C>>

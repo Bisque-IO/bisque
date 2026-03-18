@@ -617,7 +617,10 @@ where
                     let msg =
                         Self::process_codec_request(&manager, &snapshot_transfers, request, mcr)
                             .await;
-                    encode_framed(&msg).expect("encode to Vec cannot fail")
+                    encode_framed(&msg).unwrap_or_else(|e| {
+                        tracing::error!("RPC: failed to encode response: {e}");
+                        Vec::new()
+                    })
                 });
             }
 

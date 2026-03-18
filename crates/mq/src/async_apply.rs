@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex as ParkingMutex;
@@ -23,7 +23,7 @@ use crate::cursor::MqSegmentScanner;
 use crate::engine::MqEngine;
 use crate::manifest::MqManifestManager;
 use crate::state_machine::{classify_structural, collect_structural_writes};
-use crate::types::MqCommand;
+use crate::types::{self, MqCommand};
 
 // =============================================================================
 // High-Water Mark
@@ -81,6 +81,98 @@ impl HighWaterMark {
     #[inline]
     pub fn current(&self) -> u64 {
         self.value.load(Ordering::Acquire)
+    }
+}
+
+// =============================================================================
+// Applied batch tracker (per-node, gap-aware)
+// =============================================================================
+
+/// Shared per-node high-water marks for applied `batch_seq` values.
+///
+/// Each slot is an `AtomicU64` holding the highest *contiguous* `batch_seq`
+/// applied for that node_id.  `u64::MAX` = nothing applied yet.
+///
+/// Updated by partition-0's worker (which owns the gap-tracking state) and
+/// readable by anyone with an `Arc` reference — e.g. the `ForwardClient`
+/// can poll its own slot to know which batches have been committed to raft.
+pub struct AppliedBatchTable {
+    slots: [AtomicU64; 64],
+}
+
+impl AppliedBatchTable {
+    pub fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+        }
+    }
+
+    /// Read the highest contiguous applied `batch_seq` for `node_id`.
+    /// Returns `u64::MAX` if nothing has been applied yet.
+    #[inline]
+    pub fn high_water(&self, node_id: u32) -> u64 {
+        self.slots[node_id as usize].load(Ordering::Acquire)
+    }
+
+    /// Publish a new high-water mark for `node_id`.
+    #[inline]
+    fn publish(&self, node_id: u32, hwm: u64) {
+        self.slots[node_id as usize].store(hwm, Ordering::Release);
+    }
+}
+
+/// Per-node gap-aware tracker that drives [`AppliedBatchTable`] updates.
+///
+/// Maintains a contiguous high-water mark and a set of above-HWM sequences
+/// applied out of order.  The HWM advances automatically as gaps fill —
+/// same algorithm as `FollowerDedup` on the leader side.
+///
+/// Lives inside partition-0's worker (not shared directly).
+struct AppliedBatchTracker {
+    high_water: u64,
+    above_hwm: HashSet<u64>,
+}
+
+impl AppliedBatchTracker {
+    fn new() -> Self {
+        Self {
+            high_water: u64::MAX,
+            above_hwm: HashSet::new(),
+        }
+    }
+
+    /// Record that `batch_seq` has been applied. Returns the new high-water
+    /// mark if it advanced (caller should publish), or `None` if unchanged.
+    fn record(&mut self, batch_seq: u64) -> Option<u64> {
+        if self.high_water == u64::MAX {
+            self.high_water = batch_seq;
+            self.advance();
+            return Some(self.high_water);
+        }
+        if batch_seq <= self.high_water {
+            return None; // already covered
+        }
+        if !self.above_hwm.insert(batch_seq) {
+            return None; // duplicate
+        }
+        let before = self.high_water;
+        self.advance();
+        if self.high_water != before {
+            Some(self.high_water)
+        } else {
+            None
+        }
+    }
+
+    fn advance(&mut self) {
+        loop {
+            let next = self.high_water.wrapping_add(1);
+            if self.above_hwm.remove(&next) {
+                self.high_water = next;
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -557,6 +649,10 @@ impl ResponseEntry {
     pub fn is_ok(&self) -> bool {
         self.buf[1] == Self::STATUS_OK
     }
+    // SAFETY: all fixed-offset accessors below rely on ResponseEntry being
+    // constructed by our own write_ok / write_published / etc. helpers, which
+    // always produce buffers of sufficient size.  The `try_into().unwrap()`
+    // calls on fixed slices are therefore structurally guaranteed to succeed.
     #[inline]
     pub fn log_index(&self) -> u64 {
         u64::from_le_bytes(self.buf[8..16].try_into().unwrap())
@@ -585,16 +681,20 @@ impl ResponseEntry {
     /// For TAG_MESSAGES: iterate delivered messages
     pub fn messages(&self) -> impl Iterator<Item = crate::types::DeliveredMessage> + '_ {
         let count = self.message_count() as usize;
-        (0..count).map(move |i| {
+        let buf_len = self.buf.len();
+        (0..count).filter_map(move |i| {
             let off = 16 + i * 32;
-            crate::types::DeliveredMessage {
+            if off + 32 > buf_len {
+                return None;
+            }
+            Some(crate::types::DeliveredMessage {
                 message_id: u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap()),
                 original_timestamp: u64::from_le_bytes(
                     self.buf[off + 8..off + 16].try_into().unwrap(),
                 ),
                 group_id: u64::from_le_bytes(self.buf[off + 16..off + 24].try_into().unwrap()),
                 attempt: u32::from_le_bytes(self.buf[off + 24..off + 28].try_into().unwrap()),
-            }
+            })
         })
     }
 
@@ -649,13 +749,25 @@ impl ResponseEntry {
         let count = self.batch_count() as usize;
         let mut pos = 16usize; // after [tag:1][status:1][count:2][pad:4][log_index:8]
         let buf = self.buf.clone();
-        (0..count).map(move |_| {
+        let mut done = false;
+        (0..count).filter_map(move |_| {
+            if done {
+                return None;
+            }
+            if pos + 8 > buf.len() {
+                done = true;
+                return None;
+            }
             let entry_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 8; // skip [entry_len:4][pad:4]
-            let entry_buf = buf.slice(pos..pos + entry_len);
             let padded = (entry_len + 7) & !7;
+            if pos + padded > buf.len() {
+                done = true;
+                return None;
+            }
+            let entry_buf = buf.slice(pos..pos + entry_len);
             pos += padded;
-            ResponseEntry { buf: entry_buf }
+            Some(ResponseEntry { buf: entry_buf })
         })
     }
 
@@ -672,9 +784,15 @@ impl ResponseEntry {
     /// For TAG_DEAD_LETTERED: iterate dead letter ids
     pub fn dead_letter_ids(&self) -> impl Iterator<Item = u64> + '_ {
         let count = self.dead_letter_count() as usize;
-        (0..count).map(move |i| {
+        let buf_len = self.buf.len();
+        (0..count).filter_map(move |i| {
             let off = 24 + i * 8;
-            u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap())
+            if off + 8 > buf_len {
+                return None;
+            }
+            Some(u64::from_le_bytes(
+                self.buf[off..off + 8].try_into().unwrap(),
+            ))
         })
     }
 
@@ -700,8 +818,12 @@ impl ResponseEntry {
 
     /// For TAG_GROUP_SYNCED: assignment bytes
     pub fn group_synced_assignment(&self) -> &[u8] {
-        let len = u32::from_le_bytes(self.buf[16..20].try_into().unwrap()) as usize;
-        &self.buf[24..24 + len]
+        let len = types::read_u32_le(&self.buf, 16).unwrap_or(0) as usize;
+        let end = 24 + len;
+        if end > self.buf.len() {
+            return &[];
+        }
+        &self.buf[24..end]
     }
 
     /// For TAG_GROUP_JOINED: generation from buf[4..8] as i32
@@ -722,12 +844,21 @@ impl ResponseEntry {
     /// For TAG_GROUP_JOINED: parse leader, member_id, protocol_name, members
     /// Returns (leader, member_id, protocol_name, members: Vec<(String, Bytes)>)
     pub fn group_joined_fields(&self) -> (String, String, String, Vec<(String, bytes::Bytes)>) {
+        let defaults = (String::new(), String::new(), String::new(), Vec::new());
+        if self.buf.len() < 24 {
+            return defaults;
+        }
         let leader_len = u16::from_le_bytes(self.buf[16..18].try_into().unwrap()) as usize;
         let member_id_len = u16::from_le_bytes(self.buf[18..20].try_into().unwrap()) as usize;
         let protocol_len = u16::from_le_bytes(self.buf[20..22].try_into().unwrap()) as usize;
         let member_count = u16::from_le_bytes(self.buf[22..24].try_into().unwrap()) as usize;
 
         let mut pos = 24usize;
+        // Bounds-check the total string region before slicing.
+        let total_strings = leader_len + member_id_len + protocol_len;
+        if pos + total_strings > self.buf.len() {
+            return defaults;
+        }
         let leader = String::from_utf8_lossy(&self.buf[pos..pos + leader_len]).into_owned();
         pos += leader_len;
         let member_id = String::from_utf8_lossy(&self.buf[pos..pos + member_id_len]).into_owned();
@@ -740,15 +871,21 @@ impl ResponseEntry {
         let strings_pad = (8 - (strings_total % 8)) % 8;
         pos += strings_pad;
 
+        let buf = &self.buf;
         let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
-            let mid_len = u32::from_le_bytes(self.buf[pos..pos + 4].try_into().unwrap()) as usize;
-            let meta_len =
-                u32::from_le_bytes(self.buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            if pos + 8 > buf.len() {
+                break;
+            }
+            let mid_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            let meta_len = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
             pos += 8;
             let mid_padded = (mid_len + 7) & !7;
             let meta_padded = (meta_len + 7) & !7;
-            let mid = String::from_utf8_lossy(&self.buf[pos..pos + mid_len]).into_owned();
+            if pos + mid_padded + meta_padded > buf.len() {
+                break;
+            }
+            let mid = String::from_utf8_lossy(&buf[pos..pos + mid_len]).into_owned();
             pos += mid_padded;
             let meta = self.buf.slice(pos..pos + meta_len);
             pos += meta_padded;
@@ -769,8 +906,12 @@ impl ResponseEntry {
 
     /// For TAG_SESSION_RESTORED: subscription_data bytes
     pub fn session_restored_subscription_data(&self) -> bytes::Bytes {
-        let len = u32::from_le_bytes(self.buf[32..36].try_into().unwrap()) as usize;
-        self.buf.slice(40..40 + len)
+        let len = types::read_u32_le(&self.buf, 32).unwrap_or(0) as usize;
+        let end = 40 + len;
+        if end > self.buf.len() {
+            return bytes::Bytes::new();
+        }
+        self.buf.slice(40..end)
     }
 
     /// For TAG_RETAINED_MESSAGES: parse all entries into a Vec.
@@ -787,11 +928,19 @@ impl ResponseEntry {
                 return None;
             }
             remaining -= 1;
+            if pos + 8 > buf.len() {
+                remaining = 0;
+                return None;
+            }
             let rk_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
             let msg_len = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
             pos += 8;
             let rk_padded = (rk_len + 7) & !7;
             let msg_padded = (msg_len + 7) & !7;
+            if pos + rk_padded + msg_padded > buf.len() {
+                remaining = 0;
+                return None;
+            }
             let routing_key = buf.slice(pos..pos + rk_len);
             pos += rk_padded;
             let message = buf.slice(pos..pos + msg_len);
@@ -883,6 +1032,215 @@ impl ResponderBroadcast {
 ///   the callback can use this signal to flush or batch its own output.
 pub type ResponseCallback = Arc<dyn Fn(&Bytes, usize, &[u8], bool) + Send + Sync + 'static>;
 
+// =============================================================================
+// Partition Inbox — lock-free slot-based inbox for Bytes
+// =============================================================================
+
+/// Capacity of each inbox segment in slots (number of [`Bytes`] objects).
+const INBOX_SEG_CAPACITY: u32 = 4096;
+
+/// Bit 31 of `write_pos` is set by the drainer to seal the segment.
+const INBOX_SEALED_BIT: u32 = 1 << 31;
+
+/// One fixed-capacity slot buffer for a single inbox partition.
+///
+/// Mirrors [`OutboundSeg`](crate::forward) but stores [`Bytes`] fat pointers
+/// instead of raw bytes, so the response payload is never copied.
+struct InboxSeg {
+    data: std::cell::UnsafeCell<Vec<Bytes>>,
+    write_pos: AtomicU32, // bit 31 = INBOX_SEALED_BIT
+    committed: AtomicU32,
+    capacity: u32,
+}
+
+// Safety: producers write to non-overlapping slots claimed via CAS;
+// the drainer reads only after all producers have committed.
+unsafe impl Send for InboxSeg {}
+unsafe impl Sync for InboxSeg {}
+
+impl InboxSeg {
+    fn new(capacity: u32) -> Box<Self> {
+        let mut v = Vec::with_capacity(capacity as usize);
+        // Safety: we manage initialization manually via write_pos / committed.
+        unsafe { v.set_len(capacity as usize) };
+        Box::new(Self {
+            data: std::cell::UnsafeCell::new(v),
+            write_pos: AtomicU32::new(0),
+            committed: AtomicU32::new(0),
+            capacity,
+        })
+    }
+}
+
+/// Per-partition state: an atomically-swappable active segment.
+struct InboxPartition {
+    active: std::sync::atomic::AtomicPtr<InboxSeg>,
+}
+
+unsafe impl Send for InboxPartition {}
+unsafe impl Sync for InboxPartition {}
+
+/// Lock-free inbox waker — coalesces rapid pushes into one task wakeup.
+struct InboxWaker {
+    pending: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl InboxWaker {
+    #[inline]
+    fn wake(&self) {
+        if !self.pending.swap(true, Ordering::Release) {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+/// Lock-free [`Bytes`]-slot inbox used by [`ClientPartition`].
+///
+/// Producers call [`try_push`] / [`push`] lock-free (CAS + fat-pointer write).
+/// The drain loop calls [`drain`] after [`wait_for_data`] wakes it, installing
+/// a fresh segment before processing the old one — identical discipline to
+/// [`OutboundBuf`](crate::forward::OutboundBuf).
+pub(crate) struct PartitionInbox {
+    partition: InboxPartition,
+    waker: InboxWaker,
+}
+
+impl PartitionInbox {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            partition: InboxPartition {
+                active: std::sync::atomic::AtomicPtr::new(Box::into_raw(InboxSeg::new(
+                    INBOX_SEG_CAPACITY,
+                ))),
+            },
+            waker: InboxWaker {
+                pending: AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+            },
+        })
+    }
+
+    /// Try to push a [`Bytes`] slot lock-free. Returns `false` on backpressure
+    /// (segment sealed or full).
+    #[inline]
+    pub fn try_push(&self, bytes: Bytes) -> bool {
+        self.try_push_or_return(bytes).is_ok()
+    }
+
+    /// Async push — yields on backpressure until the slot is accepted.
+    #[inline]
+    pub async fn push(&self, mut bytes: Bytes) {
+        loop {
+            match self.try_push_or_return(bytes) {
+                Ok(()) => return,
+                Err(b) => {
+                    bytes = b;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    /// Try to push; on failure return ownership of `bytes` so the caller can retry
+    /// without cloning.
+    #[inline]
+    fn try_push_or_return(&self, bytes: Bytes) -> Result<(), Bytes> {
+        loop {
+            let seg_ptr = self.partition.active.load(Ordering::Acquire);
+            let seg = unsafe { &*seg_ptr };
+            let pos = seg.write_pos.load(Ordering::Relaxed);
+            if pos & INBOX_SEALED_BIT != 0 || pos >= seg.capacity {
+                return Err(bytes);
+            }
+            if seg
+                .write_pos
+                .compare_exchange(pos, pos + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            unsafe {
+                (*seg.data.get())
+                    .as_mut_ptr()
+                    .add(pos as usize)
+                    .write(bytes);
+            }
+            seg.committed.fetch_add(1, Ordering::Release);
+            self.waker.wake();
+            return Ok(());
+        }
+    }
+
+    /// Wait for data to be available.
+    async fn wait_for_data(&self) {
+        let notified = self.waker.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.waker.pending.swap(false, Ordering::AcqRel) {
+            notified.await;
+            self.waker.pending.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Seal the segment, install a fresh one (unblocks producers immediately),
+    /// spin-wait for in-flight writes, then return the drained [`Bytes`] slots.
+    fn drain(&self) -> Vec<Bytes> {
+        let old_ptr = self.partition.active.load(Ordering::Acquire);
+        let old_seg = unsafe { &*old_ptr };
+
+        let sealed = old_seg
+            .write_pos
+            .fetch_or(INBOX_SEALED_BIT, Ordering::AcqRel);
+        let final_pos = sealed & !INBOX_SEALED_BIT;
+
+        if final_pos == 0 {
+            // Empty — unseal and reuse.
+            old_seg
+                .write_pos
+                .fetch_and(!INBOX_SEALED_BIT, Ordering::Relaxed);
+            return Vec::new();
+        }
+
+        // Install fresh segment so producers can proceed immediately.
+        let new_seg = Box::into_raw(InboxSeg::new(INBOX_SEG_CAPACITY));
+        self.partition.active.store(new_seg, Ordering::Release);
+
+        // Spin-wait for all in-flight producers to commit.
+        while old_seg.committed.load(Ordering::Acquire) < final_pos {
+            std::hint::spin_loop();
+        }
+
+        // Extract the initialized slots (they are fully written now).
+        let slots: Vec<Bytes> = unsafe {
+            let v = &mut *old_seg.data.get();
+            // Truncate to initialized range, then drain.
+            v.set_len(final_pos as usize);
+            std::mem::take(v)
+        };
+
+        // Drop the old segment (Vec is now empty; no double-drop).
+        unsafe { drop(Box::from_raw(old_ptr)) };
+
+        slots
+    }
+}
+
+impl Drop for PartitionInbox {
+    fn drop(&mut self) {
+        // Drop the active segment and any initialized Bytes slots in it.
+        let ptr = self.partition.active.load(Ordering::Acquire);
+        let seg = unsafe { &mut *ptr };
+        let pos = seg.write_pos.load(Ordering::Relaxed) & !INBOX_SEALED_BIT;
+        unsafe {
+            let v = &mut *seg.data.get();
+            v.set_len(pos as usize);
+            // Vec drops when seg is dropped below.
+            drop(Box::from_raw(ptr));
+        }
+    }
+}
+
 enum ClientPartitionMsg {
     Register(u32, ResponseCallback),
     Unregister(u32),
@@ -890,17 +1248,17 @@ enum ClientPartitionMsg {
 
 /// Per-partition task that dispatches response frames to registered client callbacks.
 ///
-/// Receives [`Bytes`] chunks via a crossfire MPSC channel. Each chunk contains
+/// Receives [`Bytes`] chunks via a [`PartitionInbox`]. Each chunk contains
 /// one or more wire frames: `[len:4 LE][client_id:4 LE][payload...]`.
-/// The task scans linearly, invokes the matching callback for frames belonging
-/// to its partition (`client_id % num_partitions == partition_id`), and signals
-/// `is_done = true` to all touched callbacks after draining the channel.
+/// The task drains the inbox lock-free, invokes the matching callback for frames
+/// belonging to its partition (`client_id % num_partitions == partition_id`), and
+/// signals `is_done = true` to all touched callbacks after each drain cycle.
 ///
 /// The callback map is owned exclusively by this task — no mutex required.
 struct ClientPartition {
     partition_id: usize,
     num_partitions: usize,
-    bytes_rx: crossfire::AsyncRx<crossfire::mpsc::Array<Bytes>>,
+    inbox: Arc<PartitionInbox>,
     reg_rx: tokio::sync::mpsc::UnboundedReceiver<ClientPartitionMsg>,
     callbacks: HashMap<u32, ResponseCallback>,
     seen_ids: HashSet<u32>,
@@ -920,10 +1278,18 @@ impl ClientPartition {
         let p = self.partition_id;
         let buf = slab.as_ref();
         let mut pos = 0;
-        while pos + 4 <= buf.len() {
+        while pos + 8 <= buf.len() {
             let frame_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-            // Minimum frame: client_id(4) + request_seq(8) + log_index(8) = 20
-            if frame_len < 20 || pos + 4 + frame_len > buf.len() {
+            // Minimum frame: client_id(4) + request_seq(8) + log_index(8) = 20.
+            // Short frames are skipped.
+            if frame_len < 20 {
+                if pos + 4 + frame_len > buf.len() {
+                    break;
+                }
+                pos += 4 + frame_len;
+                continue;
+            }
+            if pos + 4 + frame_len > buf.len() {
                 break;
             }
             let payload_start = pos + 4;
@@ -969,14 +1335,12 @@ impl ClientPartition {
                         None => return,
                     }
                 }
-                result = self.bytes_rx.recv() => {
-                    let slab = match result {
-                        Ok(b) => b,
-                        Err(_) => return,
-                    };
-                    self.dispatch(&slab);
-                    while let Ok(more) = self.bytes_rx.try_recv() {
-                        self.dispatch(&more);
+                _ = self.inbox.wait_for_data() => {
+                    // Yield once to let producers batch more slots before we seal.
+                    tokio::task::yield_now().await;
+                    let batch = self.inbox.drain();
+                    for slab in &batch {
+                        self.dispatch(slab);
                     }
                     // Signal all touched callbacks: drain cycle complete.
                     for &id in &self.seen_ids {
@@ -999,35 +1363,35 @@ impl ClientPartition {
 ///
 /// Each client is assigned to a [`ClientPartition`] by `client_id % num_partitions`.
 /// The partition task owns the callback map for its shard — no mutex required.
-/// Response frames are pushed via crossfire MPSC channels; registrations via
+/// Response frames are pushed via lock-free [`PartitionInbox`]es; registrations via
 /// unbounded tokio channels.
 pub struct ClientRegistry {
     next_id: AtomicU32,
     num_partitions: usize,
-    bytes_txs: Vec<crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>>,
+    inboxes: Vec<Arc<PartitionInbox>>,
     reg_txs: Vec<tokio::sync::mpsc::UnboundedSender<ClientPartitionMsg>>,
 }
 
 impl ClientRegistry {
     /// Create a new `ClientRegistry` with `num_partitions` client partitions,
-    /// each backed by a live [`ClientPartition`] task with the given channel `capacity`.
+    /// each backed by a live [`ClientPartition`] task.
     ///
     /// Spawns `num_partitions` tokio tasks — must be called from within a tokio runtime.
-    pub fn new(num_partitions: usize, capacity: usize) -> Arc<Self> {
+    pub fn new(num_partitions: usize, _capacity: usize) -> Arc<Self> {
         let n = num_partitions.max(1);
-        let mut bytes_txs = Vec::with_capacity(n);
+        let mut inboxes = Vec::with_capacity(n);
         let mut reg_txs = Vec::with_capacity(n);
 
         for i in 0..n {
-            let (bytes_tx, bytes_rx) = crossfire::mpsc::bounded_async::<Bytes>(capacity);
+            let inbox = PartitionInbox::new();
             let (reg_tx, reg_rx) = tokio::sync::mpsc::unbounded_channel::<ClientPartitionMsg>();
-            bytes_txs.push(bytes_tx);
+            inboxes.push(Arc::clone(&inbox));
             reg_txs.push(reg_tx);
 
             let partition = ClientPartition {
                 partition_id: i,
                 num_partitions: n,
-                bytes_rx,
+                inbox,
                 reg_rx,
                 callbacks: HashMap::new(),
                 seen_ids: HashSet::new(),
@@ -1038,7 +1402,7 @@ impl ClientRegistry {
         Arc::new(Self {
             next_id: AtomicU32::new(1),
             num_partitions: n,
-            bytes_txs,
+            inboxes,
             reg_txs,
         })
     }
@@ -1063,22 +1427,22 @@ impl ClientRegistry {
 
     /// Push a raw [`Bytes`] chunk (complete wire frames) to a specific partition.
     ///
-    /// Used by the TCP inbound loop after bitmap-based partition selection.
-    /// Non-blocking — drops if full.
+    /// Lock-free on the fast path (CAS slot claim). Yields on backpressure
+    /// (inbox segment full) — callers in sync contexts should prefer the async
+    /// variant.
     pub fn send_to_partition(&self, partition: usize, bytes: Bytes) {
         debug_assert!(partition < self.num_partitions);
-        let _ = self.bytes_txs[partition].try_send(bytes);
+        if partition < self.num_partitions {
+            // try_push covers the common case; if the segment is momentarily
+            // full/sealed we drop rather than block in a sync context.
+            let _ = self.inboxes[partition].try_push(bytes);
+        }
     }
 
-    /// Async variant of [`send_to_partition`] — try_send first (fast path, no future
-    /// machinery when the channel has space), falling back to a blocking await only if the
-    /// channel is momentarily full (rare with the default 4096-chunk capacity).
+    /// Async variant — lock-free on the fast path, yields on backpressure.
     pub async fn send_to_partition_async(&self, partition: usize, bytes: Bytes) {
         if partition < self.num_partitions {
-            let tx = &self.bytes_txs[partition];
-            if let Err(e) = tx.try_send(bytes) {
-                let _ = tx.send(e.into_inner()).await;
-            }
+            self.inboxes[partition].push(bytes).await;
         }
     }
 }
@@ -1168,6 +1532,12 @@ struct PartitionWorker {
     purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
     group_id: u64,
     cursor_notify: Arc<tokio::sync::Notify>,
+    /// Shared table of per-node applied batch high-water marks.
+    /// All partitions hold a reference; only partition 0 writes.
+    applied_batch_table: Arc<AppliedBatchTable>,
+    /// Per-node gap-aware trackers. Only partition 0 allocates these;
+    /// other partitions leave this `None`.
+    applied_trackers: Option<Box<[Option<AppliedBatchTracker>; 64]>>,
     m_apply_count: metrics::Counter,
     m_skip_count: metrics::Counter,
 }
@@ -1260,6 +1630,7 @@ impl PartitionWorker {
             };
             *scanner = Some(MqSegmentScanner::new(self.prefetcher.clone(), start_seg));
         }
+        // SAFETY: set to Some in the block above; the early-return guards the None case.
         let scan = scanner.as_mut().unwrap();
 
         let mut apply_count = 0u64;
@@ -1287,7 +1658,12 @@ impl PartitionWorker {
             if cmd.tag() == MqCommand::TAG_BATCH {
                 if (rec.log_index as usize) % self.num_partitions == self.partition_id {
                     let segment_id = scan.current_segment_id().unwrap_or(0);
-                    let batch_id = cmd.as_batch().batch_id();
+                    let batch_id = match cmd.as_batch() {
+                        Ok(b) => b.batch_id(),
+                        Err(_) => {
+                            continue;
+                        }
+                    };
                     let mut resp_buf = BytesMut::new();
                     self.engine.apply_command(
                         &cmd,
@@ -1311,12 +1687,26 @@ impl PartitionWorker {
             // TAG_FORWARDED_BATCH: accumulate response frames for follower responders
             // (by client_id % N), and apply sub-commands to the engine (by primary_id % N).
             if cmd.tag() == MqCommand::TAG_FORWARDED_BATCH {
-                let view = cmd.as_forwarded_batch();
+                let view = match cmd.as_forwarded_batch() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        continue;
+                    }
+                };
                 let node_id = view.node_id();
                 debug_assert!(
                     (node_id as usize) < 64,
                     "node_id {node_id} exceeds response_buf capacity"
                 );
+                // Track applied batch_seq per-node (partition 0 only).
+                // When the HWM advances, publish to the shared atomic table.
+                if let Some(ref mut trackers) = self.applied_trackers {
+                    let tracker =
+                        trackers[node_id as usize].get_or_insert_with(AppliedBatchTracker::new);
+                    if let Some(new_hwm) = tracker.record(view.batch_seq()) {
+                        self.applied_batch_table.publish(node_id, new_hwm);
+                    }
+                }
                 // Response routing: accumulate frames for sub-commands owned by this partition.
                 for (client_id, request_seq, _) in view.iter() {
                     if (client_id as usize) % self.num_partitions == self.partition_id {
@@ -1367,7 +1757,10 @@ impl PartitionWorker {
             }
 
             // Segment location from the cursor — no index lookup needed.
-            let segment_id = scan.current_segment_id().unwrap();
+            let segment_id = match scan.current_segment_id() {
+                Some(id) => id,
+                None => continue,
+            };
 
             // Apply command.
             let mut resp_buf = BytesMut::new();
@@ -1425,7 +1818,10 @@ impl PartitionWorker {
             }
 
             // Data-plane: assigned by primary_id for entity co-location.
-            _ => (cmd.primary_id() as usize) % self.num_partitions == self.partition_id,
+            _ => match cmd.try_primary_id() {
+                Ok(id) => (id as usize) % self.num_partitions == self.partition_id,
+                Err(_) => false, // malformed command — skip
+            },
         }
     }
 
@@ -1545,6 +1941,10 @@ pub struct AsyncApplyManager {
     pub(crate) batch_registry:
         Arc<ParkingMutex<HashMap<u32, tokio::sync::oneshot::Sender<ResponseEntry>>>>,
     batch_id_counter: Arc<AtomicU32>,
+    /// Per-node applied batch high-water marks. Readable by anyone — e.g.
+    /// the follower's `ForwardClient` can poll its own slot to know which
+    /// `batch_seq` values have been committed through raft.
+    applied_batch_table: Arc<AppliedBatchTable>,
 }
 
 impl AsyncApplyManager {
@@ -1576,21 +1976,20 @@ impl AsyncApplyManager {
             txs: responder_update_txs,
         };
 
-        // Build ClientRegistry channels and spawn ClientPartition tasks.
-        let mut bytes_txs = Vec::with_capacity(n);
+        // Build ClientRegistry inboxes and spawn ClientPartition tasks.
+        let mut inboxes = Vec::with_capacity(n);
         let mut reg_txs = Vec::with_capacity(n);
 
         for i in 0..n {
-            let (bytes_tx, bytes_rx) =
-                crossfire::mpsc::bounded_async::<Bytes>(config.response_partition_capacity);
+            let inbox = PartitionInbox::new();
             let (reg_tx, reg_rx) = tokio::sync::mpsc::unbounded_channel::<ClientPartitionMsg>();
-            bytes_txs.push(bytes_tx);
+            inboxes.push(Arc::clone(&inbox));
             reg_txs.push(reg_tx);
 
             let partition = ClientPartition {
                 partition_id: i,
                 num_partitions: n,
-                bytes_rx,
+                inbox,
                 reg_rx,
                 callbacks: HashMap::new(),
                 seen_ids: HashSet::new(),
@@ -1601,7 +2000,7 @@ impl AsyncApplyManager {
         let client_registry = Arc::new(ClientRegistry {
             next_id: AtomicU32::new(1),
             num_partitions: n,
-            bytes_txs,
+            inboxes,
             reg_txs,
         });
 
@@ -1609,6 +2008,8 @@ impl AsyncApplyManager {
             ParkingMutex<HashMap<u32, tokio::sync::oneshot::Sender<ResponseEntry>>>,
         > = Arc::new(ParkingMutex::new(HashMap::new()));
         let batch_id_counter = Arc::new(AtomicU32::new(1));
+
+        let applied_batch_table = Arc::new(AppliedBatchTable::new());
 
         let mut worker_cursors = Vec::with_capacity(n);
         let mut worker_handles = Vec::with_capacity(n);
@@ -1650,6 +2051,12 @@ impl AsyncApplyManager {
                 purged_segments: purged_segments.clone(),
                 group_id,
                 cursor_notify: Arc::clone(&cursor_notify),
+                applied_batch_table: Arc::clone(&applied_batch_table),
+                applied_trackers: if i == 0 {
+                    Some(Box::new(std::array::from_fn(|_| None)))
+                } else {
+                    None
+                },
                 m_apply_count,
                 m_skip_count,
             };
@@ -1671,11 +2078,19 @@ impl AsyncApplyManager {
             responder_broadcast,
             batch_registry,
             batch_id_counter,
+            applied_batch_table,
         }
     }
 
     pub fn responder_broadcast(&self) -> ResponderBroadcast {
         self.responder_broadcast.clone()
+    }
+
+    /// Shared table of per-node applied batch high-water marks.
+    /// The follower can poll `table.high_water(my_node_id)` to know which
+    /// `batch_seq` values have been committed through raft.
+    pub fn applied_batch_table(&self) -> &Arc<AppliedBatchTable> {
+        &self.applied_batch_table
     }
 
     /// Allocate a batch_id and register a response sender. Call BEFORE raft write.

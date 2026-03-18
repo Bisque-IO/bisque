@@ -4,8 +4,8 @@
 //! ## MqWriteBatcher
 //!
 //! External clients submit commands via [`MqWriteBatcher::submit`]. The batcher
-//! accumulates requests over a short linger window (or until a count threshold),
-//! merges same-topic publishes, and proposes a single `MqCommand::Batch` to Raft.
+//! accumulates available requests up to a count threshold, merges same-topic
+//! publishes, and proposes a single `MqCommand::Batch` to Raft.
 //!
 //! ## LocalBatcher
 //!
@@ -17,14 +17,14 @@
 //! [payload_len:4][client_id:4][request_seq:8][cmd_bytes...][opt_pad]
 //! ```
 //!
-//! The [`LocalBatcher`] drain loop collects frames from a crossfire MPSC channel,
-//! accumulates them until the linger deadline or count threshold fires, then
-//! builds a vectored `MqCommand` (header buf + extra frame chunks) and proposes
-//! it to Raft — zero copies of command bytes anywhere in the pipeline.
+//! The [`LocalBatcher`] drain loop blocks on the first frame, then non-blockingly
+//! drains all immediately available frames up to `max_batch_count`, builds a
+//! vectored `MqCommand` (header buf + extra frame chunks) and proposes it to
+//! Raft — zero copies of command bytes anywhere in the pipeline.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use openraft::Raft;
@@ -34,6 +34,8 @@ use tracing::{debug, warn};
 
 use crate::MqTypeConfig;
 use crate::async_apply::{AsyncApplyManager, ResponseEntry};
+use crate::forward::RaftBacklog;
+use crate::raft_writer::RaftWriter;
 use crate::types::{MqCommand, MqError};
 
 // ---------------------------------------------------------------------------
@@ -43,30 +45,38 @@ use crate::types::{MqCommand, MqError};
 /// Configuration for the MQ write batcher.
 #[derive(Debug, Clone)]
 pub struct MqWriteBatcherConfig {
-    /// How long to wait after the first request before flushing a batch.
-    pub linger: Duration,
-    /// Maximum number of commands to accumulate before flushing early.
+    /// Maximum number of commands to accumulate before flushing.
     pub max_batch_count: usize,
     /// Crossfire channel capacity.
     pub channel_capacity: usize,
+    /// Maximum byte size of a single Raft log entry.
+    ///
+    /// The drain loop aggregates channel receives until the total payload
+    /// reaches this threshold, then cuts a new entry. Prevents oversized
+    /// entries from stalling the Raft pipeline. Default: 512 KiB.
+    pub max_raft_entry_bytes: usize,
+    /// Use scattered (vectored) MqCommand instead of memcpy into one
+    /// contiguous buffer.  Scattered avoids copying frame bytes; contiguous
+    /// produces a single `Bytes` that may be cheaper for small payloads.
+    /// Default: true (scattered).
+    pub use_scattered: bool,
 }
+
+/// Default maximum Raft entry size: 512 KiB.
+pub const DEFAULT_MAX_RAFT_ENTRY_BYTES: usize = 512 * 1024;
 
 impl Default for MqWriteBatcherConfig {
     fn default() -> Self {
         Self {
-            linger: Duration::from_millis(5),
             max_batch_count: 256,
             channel_capacity: 1024,
+            max_raft_entry_bytes: DEFAULT_MAX_RAFT_ENTRY_BYTES,
+            use_scattered: true,
         }
     }
 }
 
 impl MqWriteBatcherConfig {
-    pub fn with_linger(mut self, linger: Duration) -> Self {
-        self.linger = linger;
-        self
-    }
-
     pub fn with_max_batch_count(mut self, max_batch_count: usize) -> Self {
         self.max_batch_count = max_batch_count;
         self
@@ -74,6 +84,11 @@ impl MqWriteBatcherConfig {
 
     pub fn with_channel_capacity(mut self, channel_capacity: usize) -> Self {
         self.channel_capacity = channel_capacity;
+        self
+    }
+
+    pub fn with_max_raft_entry_bytes(mut self, max_raft_entry_bytes: usize) -> Self {
+        self.max_raft_entry_bytes = max_raft_entry_bytes;
         self
     }
 }
@@ -125,7 +140,7 @@ impl LocalWriter {
 ///
 /// Connections submit pre-framed sub-frame bytes via [`LocalWriter`]s obtained
 /// from [`LocalBatcher::writer`]. The batcher drain loop accumulates frames
-/// until the linger deadline or `max_batch_count` fires, then builds a vectored
+/// until `max_batch_count` is reached or no more items are immediately available, then builds a vectored
 /// `TAG_FORWARDED_BATCH` [`MqCommand`] (24-byte header buf + frame chunks as
 /// extra) and proposes it through Raft — zero copies of command bytes.
 ///
@@ -133,20 +148,45 @@ impl LocalWriter {
 /// responses to local clients via the in-process [`ClientRegistry`].
 ///
 /// [`ClientRegistry`]: crate::async_apply::ClientRegistry
+/// Lightweight stats for the local batcher drain loop.
+#[derive(Default)]
+pub struct LocalBatcherStats {
+    /// Number of MqCommands produced by the drain loop.
+    pub batch_count: AtomicU64,
+    /// Total payload bytes across all batches (excluding 32-byte headers).
+    pub total_payload_bytes: AtomicU64,
+    /// Number of channel receives (LocalFrameBatch items consumed).
+    pub channel_recvs: AtomicU64,
+}
+
 pub struct LocalBatcher {
     tx: crossfire::MAsyncTx<crossfire::mpsc::Array<LocalFrameBatch>>,
     task: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    stats: Arc<LocalBatcherStats>,
 }
 
 impl LocalBatcher {
     /// Create a new `LocalBatcher` and spawn the drain loop.
-    pub fn new(raft: Raft<MqTypeConfig>, node_id: u32, config: MqWriteBatcherConfig) -> Self {
+    pub fn new(raft_writer: Arc<RaftWriter>, node_id: u32, config: MqWriteBatcherConfig) -> Self {
         let (tx, rx) = crossfire::mpsc::bounded_async::<LocalFrameBatch>(config.channel_capacity);
-        let task = tokio::spawn(local_batcher_loop(rx, raft, config, node_id));
+        let stats = Arc::new(LocalBatcherStats::default());
+        let task = tokio::spawn(local_batcher_loop(
+            rx,
+            raft_writer,
+            config,
+            node_id,
+            Arc::clone(&stats),
+        ));
         Self {
             tx,
             task: parking_lot::Mutex::new(Some(task)),
+            stats,
         }
+    }
+
+    /// Batching stats (batch count, payload bytes, channel receives).
+    pub fn stats(&self) -> &Arc<LocalBatcherStats> {
+        &self.stats
     }
 
     /// Return a clone-able [`LocalWriter`] that sends frames into this batcher.
@@ -181,30 +221,49 @@ impl LocalBatcher {
         Self {
             tx,
             task: parking_lot::Mutex::new(Some(task)),
+            stats: Arc::new(LocalBatcherStats::default()),
         }
     }
 }
 
-/// Write a `TAG_FORWARDED_BATCH` header placeholder into `scratch` (16 zero bytes),
-/// then patch `total_size` and `total_count` after all frame bytes have been appended.
+/// Build a 32-byte TAG_FORWARDED_BATCH header for a scattered command.
+///
+/// `total_payload_bytes` is the sum of all slab lengths (excluding the header).
 #[inline]
-fn patch_forwarded_batch_header(scratch: &mut BytesMut, total_count: u32, node_id: u32) {
-    let total_size = scratch.len() as u32;
-    scratch[0..4].copy_from_slice(&total_size.to_le_bytes());
-    scratch[4..6].copy_from_slice(&16u16.to_le_bytes()); // fixed region size
-    scratch[6] = MqCommand::TAG_FORWARDED_BATCH;
-    scratch[7] = 0u8; // flags
-    scratch[8..12].copy_from_slice(&node_id.to_le_bytes());
-    scratch[12..16].copy_from_slice(&total_count.to_le_bytes());
+fn build_forwarded_batch_header(
+    total_payload_bytes: usize,
+    total_count: u32,
+    node_id: u32,
+) -> [u8; 32] {
+    let total_size = (32 + total_payload_bytes) as u32;
+    let mut hdr = [0u8; 32];
+    hdr[0..4].copy_from_slice(&total_size.to_le_bytes());
+    hdr[4..6].copy_from_slice(&32u16.to_le_bytes()); // fixed region size
+    hdr[6] = MqCommand::TAG_FORWARDED_BATCH;
+    // hdr[7] = 0 flags; hdr[8..12] node_id; hdr[12..16] total_count
+    hdr[8..12].copy_from_slice(&node_id.to_le_bytes());
+    hdr[12..16].copy_from_slice(&total_count.to_le_bytes());
+    // batch_seq = 0, leader_seq = 0 for locally-originated batches; bytes 16..32 already zeroed.
+    hdr
 }
 
 async fn local_batcher_loop(
     rx: crossfire::AsyncRx<crossfire::mpsc::Array<LocalFrameBatch>>,
-    raft: Raft<MqTypeConfig>,
+    raft_writer: Arc<RaftWriter>,
     config: MqWriteBatcherConfig,
     node_id: u32,
+    stats: Arc<LocalBatcherStats>,
 ) {
+    // Cache the crossfire MPMC sender and backlog — avoids a mutex lock
+    // on every submit. The forward acceptor does the same.
+    let tx = raft_writer.clone_tx();
+    let backlog = raft_writer.backlog().clone();
+    let use_scattered = config.use_scattered;
+
+    // Reuse across iterations to avoid per-batch heap allocation.
+    let mut slabs: Vec<Bytes> = Vec::new();
     let mut scratch = BytesMut::new();
+
     loop {
         // Block until the first frame batch arrives.
         let first = match rx.recv().await {
@@ -212,37 +271,61 @@ async fn local_batcher_loop(
             Err(_) => return, // channel closed, all senders dropped
         };
 
-        scratch.reserve(16 + first.bytes.len());
-        scratch.put_bytes(0, 16); // header placeholder
-        scratch.put_slice(&first.bytes);
+        let mut total_payload: usize = first.bytes.len();
         let mut total_count = first.count;
+        let mut recvs: u64 = 1;
 
-        // Drain more frames within the linger window or until max_batch_count.
-        if total_count < config.max_batch_count as u32 {
-            let deadline = Instant::now() + config.linger;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                match tokio::time::timeout(remaining, rx.recv()).await {
-                    Ok(Ok(fb)) => {
-                        total_count += fb.count;
+        if use_scattered {
+            slabs.push(first.bytes);
+        } else {
+            scratch.reserve(32 + first.bytes.len());
+            scratch.put_bytes(0, 32); // header placeholder
+            scratch.put_slice(&first.bytes);
+        }
+
+        // Non-blockingly drain all immediately available frames up to byte limit.
+        while total_payload < config.max_raft_entry_bytes {
+            match rx.try_recv() {
+                Ok(fb) => {
+                    total_payload += fb.bytes.len();
+                    total_count += fb.count;
+                    recvs += 1;
+                    if use_scattered {
+                        slabs.push(fb.bytes);
+                    } else {
                         scratch.put_slice(&fb.bytes);
-                        if total_count >= config.max_batch_count as u32 {
-                            break;
-                        }
                     }
-                    // Timeout expired or channel closed — flush what we have.
-                    _ => break,
                 }
+                Err(_) => break,
             }
         }
 
-        patch_forwarded_batch_header(&mut scratch, total_count, node_id);
-        let cmd = MqCommand::split_from(&mut scratch);
-        if let Err(e) = raft.client_write(cmd).await {
-            debug!(error = %e, "local batcher raft proposal failed");
+        let (cmd, cmd_len) = if use_scattered {
+            let hdr = build_forwarded_batch_header(total_payload, total_count, node_id);
+            let cmd = MqCommand::scattered(hdr, std::mem::take(&mut slabs));
+            let len = cmd.total_encoded_size();
+            (cmd, len)
+        } else {
+            let total_size = scratch.len() as u32;
+            scratch[0..4].copy_from_slice(&total_size.to_le_bytes());
+            scratch[4..6].copy_from_slice(&32u16.to_le_bytes());
+            scratch[6] = MqCommand::TAG_FORWARDED_BATCH;
+            scratch[8..12].copy_from_slice(&node_id.to_le_bytes());
+            scratch[12..16].copy_from_slice(&total_count.to_le_bytes());
+            let cmd = MqCommand::split_from(&mut scratch);
+            let len = cmd.total_encoded_size();
+            (cmd, len)
+        };
+
+        stats.batch_count.fetch_add(1, Ordering::Relaxed);
+        stats
+            .total_payload_bytes
+            .fetch_add(total_payload as u64, Ordering::Relaxed);
+        stats.channel_recvs.fetch_add(recvs, Ordering::Relaxed);
+
+        backlog.charge(cmd_len).await;
+        if let Some(ref tx) = tx {
+            let _ = tx.send((cmd, cmd_len)).await;
         }
     }
 }
@@ -254,6 +337,8 @@ async fn local_batcher_loop_test(
     config: MqWriteBatcherConfig,
     node_id: u32,
 ) {
+    // Test loop produces contiguous commands so test assertions can
+    // inspect the full buffer via as_forwarded_batch() etc.
     let mut scratch = BytesMut::new();
     loop {
         let first = match rx.recv().await {
@@ -261,32 +346,27 @@ async fn local_batcher_loop_test(
             Err(_) => return,
         };
 
-        scratch.reserve(16 + first.bytes.len());
-        scratch.put_bytes(0, 16); // header placeholder
+        scratch.reserve(32 + first.bytes.len());
+        scratch.put_bytes(0, 32); // header placeholder
         scratch.put_slice(&first.bytes);
         let mut total_count = first.count;
 
-        if total_count < config.max_batch_count as u32 {
-            let deadline = Instant::now() + config.linger;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
+        while scratch.len() < config.max_raft_entry_bytes {
+            match rx.try_recv() {
+                Ok(fb) => {
+                    total_count += fb.count;
+                    scratch.put_slice(&fb.bytes);
                 }
-                match tokio::time::timeout(remaining, rx.recv()).await {
-                    Ok(Ok(fb)) => {
-                        total_count += fb.count;
-                        scratch.put_slice(&fb.bytes);
-                        if total_count >= config.max_batch_count as u32 {
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
+                Err(_) => break,
             }
         }
 
-        patch_forwarded_batch_header(&mut scratch, total_count, node_id);
+        let total_size = scratch.len() as u32;
+        scratch[0..4].copy_from_slice(&total_size.to_le_bytes());
+        scratch[4..6].copy_from_slice(&32u16.to_le_bytes());
+        scratch[6] = MqCommand::TAG_FORWARDED_BATCH;
+        scratch[8..12].copy_from_slice(&node_id.to_le_bytes());
+        scratch[12..16].copy_from_slice(&total_count.to_le_bytes());
         let cmd = MqCommand::split_from(&mut scratch);
         if sink.send(cmd).is_err() {
             return; // sink closed
@@ -335,7 +415,6 @@ pub struct MqWriteBatcher {
     task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     // Pre-initialized metrics handles.
     m_flush_count: metrics::Counter,
-    m_flush_linger: metrics::Counter,
     m_commands_batched: metrics::Histogram,
 }
 
@@ -351,6 +430,7 @@ impl MqWriteBatcher {
         async_apply: Option<Arc<AsyncApplyManager>>,
         group_id: u64,
         catalog_name: &str,
+        backlog: Option<Arc<RaftBacklog>>,
     ) -> Self {
         let (tx, rx) = crossfire::mpsc::bounded_async::<BatchedRequest>(config.channel_capacity);
 
@@ -360,13 +440,6 @@ impl MqWriteBatcher {
             "mq.batcher.flushes",
             "catalog" => catalog.clone(),
             "group" => group_label.clone(),
-            "reason" => "count"
-        );
-        let m_flush_linger = metrics::counter!(
-            "mq.batcher.flushes",
-            "catalog" => catalog.clone(),
-            "group" => group_label.clone(),
-            "reason" => "linger"
         );
         let m_commands_batched = metrics::histogram!(
             "mq.batcher.commands_per_flush",
@@ -380,15 +453,14 @@ impl MqWriteBatcher {
             async_apply,
             config,
             m_flush_count.clone(),
-            m_flush_linger.clone(),
             m_commands_batched.clone(),
+            backlog,
         ));
 
         Self {
             tx,
             task: parking_lot::Mutex::new(Some(task)),
             m_flush_count,
-            m_flush_linger,
             m_commands_batched,
         }
     }
@@ -414,7 +486,6 @@ impl MqWriteBatcher {
             tx,
             task: parking_lot::Mutex::new(Some(task)),
             m_flush_count: metrics::counter!("test.flush_count"),
-            m_flush_linger: metrics::counter!("test.flush_linger"),
             m_commands_batched: metrics::histogram!("test.commands_batched"),
         }
     }
@@ -473,13 +544,20 @@ fn merge_pending(
     for mut req in pending.drain(..) {
         match req.command.tag() {
             MqCommand::TAG_PUBLISH => {
-                let topic_id = req.command.as_publish().topic_id();
-                let msg_count = req.command.as_publish().message_count() as usize;
+                let pub_view = req.command.as_publish().expect("TAG_PUBLISH must be valid");
+                let topic_id = pub_view.topic_id();
+                let msg_count = pub_view.message_count() as usize;
                 if let Some(&idx) = publish_idx.get(&topic_id) {
                     // Merge: combine payload segments from both commands
                     // into a single scatter publish (zero-copy).
-                    let mut all_msgs = commands[idx].take_publish_segments();
-                    all_msgs.extend(req.command.take_publish_segments());
+                    let mut all_msgs = commands[idx]
+                        .take_publish_segments()
+                        .expect("TAG_PUBLISH must be valid");
+                    all_msgs.extend(
+                        req.command
+                            .take_publish_segments()
+                            .expect("TAG_PUBLISH must be valid"),
+                    );
                     MqCommand::write_publish_bytes(&mut scratch, topic_id, &all_msgs);
                     commands[idx] = MqCommand::split_from(&mut scratch);
                     if let ResponseSlot::MergedPublish(ref mut callers) = slots[idx] {
@@ -513,7 +591,10 @@ fn dispatch_response(slot: ResponseSlot, response: ResponseEntry) {
         }
         ResponseSlot::MergedPublish(callers) => {
             if callers.len() == 1 {
-                let _ = callers.into_iter().next().unwrap().0.send(response);
+                // SAFETY: len() == 1 guarantees next() returns Some.
+                if let Some((tx, _)) = callers.into_iter().next() {
+                    let _ = tx.send(response);
+                }
                 return;
             }
             if response.tag() == ResponseEntry::TAG_PUBLISHED {
@@ -546,8 +627,8 @@ async fn batcher_loop(
     async_apply: Option<Arc<AsyncApplyManager>>,
     config: MqWriteBatcherConfig,
     m_flush_count: metrics::Counter,
-    m_flush_linger: metrics::Counter,
     m_commands_batched: metrics::Histogram,
+    backlog: Option<Arc<RaftBacklog>>,
 ) {
     let mut pending: Vec<BatchedRequest> = Vec::with_capacity(config.max_batch_count);
     // Reusable scratch map for merge_pending — avoids per-flush HashMap allocation.
@@ -566,25 +647,15 @@ async fn batcher_loop(
         pending.clear();
         pending.push(first);
 
-        // Step 2: If below threshold, wait linger then drain.
-        if pending.len() < config.max_batch_count {
-            tokio::time::sleep(config.linger).await;
-
-            loop {
-                match rx.try_recv() {
-                    Ok(req) => {
-                        pending.push(req);
-                        if pending.len() >= config.max_batch_count {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
+        // Step 2: Non-blockingly drain all immediately available requests.
+        while pending.len() < config.max_batch_count {
+            match rx.try_recv() {
+                Ok(req) => pending.push(req),
+                Err(_) => break,
             }
         }
 
         let num_commands = pending.len();
-        let flushed_by_count = num_commands >= config.max_batch_count;
 
         // Step 3: Merge same-topic Publishes.
         let (commands, slots) = merge_pending(&mut pending, &mut publish_idx);
@@ -606,6 +677,10 @@ async fn batcher_loop(
             let mut scratch = BytesMut::new();
             MqCommand::write_batch_with_id(&mut scratch, batch_id, &commands);
             let batch_cmd = MqCommand::split_from(&mut scratch);
+            let cmd_len = batch_cmd.total_encoded_size();
+            if let Some(ref bl) = backlog {
+                bl.charge(cmd_len).await;
+            }
 
             match raft.client_write(batch_cmd).await {
                 Ok(_resp) => {
@@ -656,6 +731,9 @@ async fn batcher_loop(
                     if let Some(ref am) = async_apply {
                         am.batch_registry.lock().remove(&batch_id);
                     }
+                    if let Some(ref bl) = backlog {
+                        bl.release(cmd_len);
+                    }
                     warn!("mq batcher: raft batch error: {}", e);
                     let mut buf = BytesMut::new();
                     ResponseEntry::write_mq_error(
@@ -671,11 +749,7 @@ async fn batcher_loop(
             }
         }
 
-        if flushed_by_count {
-            m_flush_count.increment(1);
-        } else {
-            m_flush_linger.increment(1);
-        }
+        m_flush_count.increment(1);
         m_commands_batched.record(num_commands as f64);
 
         debug!(commands = num_commands, "mq batcher_loop: flushed batch");
@@ -684,6 +758,8 @@ async fn batcher_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use bisque_raft::codec::Encode;
 
     use super::*;
@@ -698,12 +774,12 @@ mod tests {
     /// without going through the async batcher loop.
     fn build_forwarded_batch_cmd(frames: Vec<Bytes>, count: u32, node_id: u32) -> MqCommand {
         let total_frame_bytes: usize = frames.iter().map(|f| f.len()).sum();
-        let mut scratch = BytesMut::with_capacity(16 + total_frame_bytes);
-        scratch.put_bytes(0, 16); // header placeholder
+        let hdr = build_forwarded_batch_header(total_frame_bytes, count, node_id);
+        let mut scratch = BytesMut::with_capacity(32 + total_frame_bytes);
+        scratch.put_slice(&hdr);
         for frame in frames {
             scratch.put_slice(&frame);
         }
-        patch_forwarded_batch_header(&mut scratch, count, node_id);
         MqCommand::split_from(&mut scratch)
     }
 
@@ -756,7 +832,7 @@ mod tests {
         // count at buf[12..16]
         let count = u32::from_le_bytes(cmd.buf[12..16].try_into().unwrap());
         assert_eq!(count, 1);
-        // Sub-frames start at offset 16 (no batch_seq field).
+        // Sub-frames start at offset 32 (after fixed header).
     }
 
     #[test]
@@ -765,9 +841,9 @@ mod tests {
         let frame_len = frame.len();
         let cmd = build_forwarded_batch_cmd(vec![frame], 1, 0);
 
-        // Size field at buf[0..4] must equal 16 (header) + frame bytes
+        // Size field at buf[0..4] must equal 32 (header) + frame bytes
         let size = u32::from_le_bytes(cmd.buf[0..4].try_into().unwrap()) as usize;
-        assert_eq!(size, 16 + frame_len);
+        assert_eq!(size, 32 + frame_len);
         assert_eq!(size, cmd.total_encoded_size());
     }
 
@@ -779,8 +855,8 @@ mod tests {
 
         let cmd = build_forwarded_batch_cmd(vec![frame_a, frame_b], 2, 0);
 
-        // All frame bytes are concatenated after the 16-byte header.
-        assert_eq!(cmd.buf.len(), 16 + total);
+        // All frame bytes are concatenated after the 32-byte header.
+        assert_eq!(cmd.buf.len(), 32 + total);
     }
 
     #[test]
@@ -789,7 +865,7 @@ mod tests {
         let cmd = build_forwarded_batch_cmd(vec![frame], 1, 5);
         let flat = flatten(cmd);
 
-        let view = flat.as_forwarded_batch();
+        let view = flat.as_forwarded_batch().unwrap();
         assert_eq!(view.node_id(), 5);
         assert_eq!(view.count(), 1);
         let entries: Vec<_> = view.iter().collect();
@@ -809,7 +885,7 @@ mod tests {
         let cmd = build_forwarded_batch_cmd(frames, 3, 7);
         let flat = flatten(cmd);
 
-        let view = flat.as_forwarded_batch();
+        let view = flat.as_forwarded_batch().unwrap();
         assert_eq!(view.node_id(), 7);
         assert_eq!(view.count(), 3);
 
@@ -843,7 +919,7 @@ mod tests {
         let cmd = build_forwarded_batch_cmd(vec![combined], 2, 0);
         let flat = flatten(cmd);
 
-        let view = flat.as_forwarded_batch();
+        let view = flat.as_forwarded_batch().unwrap();
         assert_eq!(view.count(), 2); // count reflects both sub-frames
         let entries: Vec<_> = view.iter().collect();
         assert_eq!(entries.len(), 2);
@@ -857,8 +933,8 @@ mod tests {
         let cmd = build_forwarded_batch_cmd(vec![], 0, 0);
         assert_eq!(cmd.tag(), MqCommand::TAG_FORWARDED_BATCH);
         let size = u32::from_le_bytes(cmd.buf[0..4].try_into().unwrap()) as usize;
-        assert_eq!(size, 16);
-        assert_eq!(cmd.total_encoded_size(), 16);
+        assert_eq!(size, 32);
+        assert_eq!(cmd.total_encoded_size(), 32);
     }
 
     // -------------------------------------------------------------------------
@@ -866,10 +942,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_writer_send_single_frame_fires_on_linger() {
-        let config = MqWriteBatcherConfig::default()
-            .with_linger(Duration::from_millis(10))
-            .with_max_batch_count(256);
+    async fn local_writer_send_single_frame_fires_immediately() {
+        let config = MqWriteBatcherConfig::default().with_max_batch_count(256);
         let (batcher, mut sink) = make_test_batcher(config, 1);
         let writer = batcher.writer();
 
@@ -882,7 +956,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait long enough for linger to fire
         let cmd = tokio::time::timeout(Duration::from_millis(100), sink.recv())
             .await
             .expect("timed out waiting for batch")
@@ -897,10 +970,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_batcher_fires_at_count_threshold_before_linger() {
-        // max_batch_count=3, send 3 frames rapidly — should fire before linger expires.
+    async fn local_batcher_fires_at_count_threshold() {
+        // max_batch_count=3, send 3 frames — should coalesce into one batch.
         let config = MqWriteBatcherConfig::default()
-            .with_linger(Duration::from_secs(60)) // huge linger — must fire on count
             .with_max_batch_count(3)
             .with_channel_capacity(16);
         let (batcher, mut sink) = make_test_batcher(config, 0);
@@ -922,7 +994,7 @@ mod tests {
             .unwrap();
 
         let flat = flatten(cmd);
-        assert_eq!(flat.as_forwarded_batch().count(), 3);
+        assert_eq!(flat.as_forwarded_batch().unwrap().count(), 3);
 
         drop(writer);
         batcher.shutdown().await;
@@ -932,7 +1004,6 @@ mod tests {
     async fn local_batcher_count_accumulates_across_multi_subframe_batches() {
         // Send two LocalFrameBatches each carrying count=2; total=4 → fires at threshold=4.
         let config = MqWriteBatcherConfig::default()
-            .with_linger(Duration::from_secs(60))
             .with_max_batch_count(4)
             .with_channel_capacity(16);
         let (batcher, mut sink) = make_test_batcher(config, 0);
@@ -959,7 +1030,7 @@ mod tests {
             .unwrap();
 
         let flat = flatten(cmd);
-        let view = flat.as_forwarded_batch();
+        let view = flat.as_forwarded_batch().unwrap();
         assert_eq!(view.count(), 4);
         // Iterator should yield 4 sub-frames
         assert_eq!(view.iter().count(), 4);
@@ -971,7 +1042,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_batcher_multiple_writers_same_channel() {
         let config = MqWriteBatcherConfig::default()
-            .with_linger(Duration::from_millis(20))
             .with_max_batch_count(256)
             .with_channel_capacity(64);
         let (batcher, mut sink) = make_test_batcher(config, 0);
@@ -1000,32 +1070,28 @@ mod tests {
         };
         tokio::join!(send_a, send_b);
 
-        let cmd = tokio::time::timeout(Duration::from_millis(200), sink.recv())
-            .await
-            .expect("timed out")
-            .unwrap();
-
-        let flat = flatten(cmd);
-        let view = flat.as_forwarded_batch();
-        assert_eq!(view.count(), 2);
-
-        let entries: Vec<_> = view.iter().collect();
-        assert_eq!(entries.len(), 2);
-        // Both client_ids present (order may vary)
-        let cids: std::collections::HashSet<u32> = entries.iter().map(|e| e.0).collect();
-        assert!(cids.contains(&1));
-        assert!(cids.contains(&2));
-
+        // Without linger, the two frames may land in one or two batches depending
+        // on scheduling. Drain until we have collected both client_ids.
         drop(writer_a);
         drop(writer_b);
         batcher.shutdown().await;
+
+        let mut all_cids = std::collections::HashSet::new();
+        while let Ok(Some(cmd)) =
+            tokio::time::timeout(Duration::from_millis(200), sink.recv()).await
+        {
+            let flat = flatten(cmd);
+            for (cid, _, _) in flat.as_forwarded_batch().unwrap().iter() {
+                all_cids.insert(cid);
+            }
+        }
+        assert!(all_cids.contains(&1));
+        assert!(all_cids.contains(&2));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_batcher_node_id_propagated() {
-        let config = MqWriteBatcherConfig::default()
-            .with_linger(Duration::from_millis(10))
-            .with_max_batch_count(256);
+        let config = MqWriteBatcherConfig::default().with_max_batch_count(256);
         let (batcher, mut sink) = make_test_batcher(config, 42);
         let writer = batcher.writer();
 
@@ -1043,7 +1109,7 @@ mod tests {
             .unwrap();
 
         let flat = flatten(cmd);
-        assert_eq!(flat.as_forwarded_batch().node_id(), 42);
+        assert_eq!(flat.as_forwarded_batch().unwrap().node_id(), 42);
 
         drop(writer);
         batcher.shutdown().await;
@@ -1051,9 +1117,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_batcher_shutdown_drains_cleanly() {
-        let config = MqWriteBatcherConfig::default()
-            .with_linger(Duration::from_millis(50))
-            .with_max_batch_count(256);
+        let config = MqWriteBatcherConfig::default().with_max_batch_count(256);
         let (batcher, mut sink) = make_test_batcher(config, 0);
         let writer = batcher.writer();
 
@@ -1065,13 +1129,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Drop the writer first so the channel drains, then shutdown the batcher.
         drop(writer);
         batcher.shutdown().await;
 
-        // The command should have been flushed (by linger) before or during shutdown.
-        // Channel may or may not have the command depending on timing; just verify
-        // no panic and sink is eventually closed.
+        // Verify the frame was flushed and sink is eventually closed.
         let _ = sink.recv().await;
     }
 
@@ -1102,7 +1163,6 @@ mod tests {
     async fn local_batcher_multiple_flushes_sequential() {
         // Verify the batcher loops correctly and handles multiple flush cycles.
         let config = MqWriteBatcherConfig::default()
-            .with_linger(Duration::from_millis(15))
             .with_max_batch_count(256)
             .with_channel_capacity(64);
         let (batcher, mut sink) = make_test_batcher(config, 0);
@@ -1122,7 +1182,7 @@ mod tests {
                 .expect("timed out on cycle")
                 .unwrap();
             let flat = flatten(cmd);
-            assert_eq!(flat.as_forwarded_batch().count(), 1);
+            assert_eq!(flat.as_forwarded_batch().unwrap().count(), 1);
         }
 
         drop(writer);
@@ -1130,13 +1190,12 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // MqWriteBatcherConfig tests (unchanged)
+    // MqWriteBatcherConfig tests
     // -------------------------------------------------------------------------
 
     #[test]
     fn test_config_defaults() {
         let config = MqWriteBatcherConfig::default();
-        assert_eq!(config.linger, Duration::from_millis(5));
         assert_eq!(config.max_batch_count, 256);
         assert_eq!(config.channel_capacity, 1024);
     }
@@ -1144,10 +1203,8 @@ mod tests {
     #[test]
     fn test_config_builder() {
         let config = MqWriteBatcherConfig::default()
-            .with_linger(Duration::from_millis(10))
             .with_max_batch_count(512)
             .with_channel_capacity(2048);
-        assert_eq!(config.linger, Duration::from_millis(10));
         assert_eq!(config.max_batch_count, 512);
         assert_eq!(config.channel_capacity, 2048);
     }

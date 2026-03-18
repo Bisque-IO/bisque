@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bisque_raft::codec::{BorrowPayload, Decode, Encode};
+use bisque_raft::test_support::TestTempDir;
 use bisque_raft::type_config::ManiacRaftTypeConfig;
 use bisque_raft::{
     InMemoryArchive, MmapPerGroupLogStorage, MmapStorageConfig, S3ArchiveConfig, SegmentArchive,
@@ -18,7 +19,6 @@ use openraft::type_config::async_runtime::AsyncRuntime;
 use openraft::type_config::async_runtime::oneshot::Oneshot;
 use openraft::{LogId, RaftTypeConfig};
 use serde::{Deserialize, Serialize};
-use tempfile::TempDir;
 
 // -- Test data type (same as unit tests) --
 
@@ -91,7 +91,7 @@ fn make_callback() -> (
 /// Verifies the full hot -> warm -> cold -> warm path with zstd compression.
 #[tokio::test]
 async fn test_tiered_storage_compressed_end_to_end() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = TestTempDir::new();
     let archive = Arc::new(InMemoryArchive::new());
     let s3_config = S3ArchiveConfig {
         bucket: "integration-test".to_string(),
@@ -167,7 +167,7 @@ async fn test_tiered_storage_compressed_end_to_end() {
 /// Verify that uncompressed archival still works (no regression from compression changes).
 #[tokio::test]
 async fn test_tiered_storage_uncompressed_end_to_end() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = TestTempDir::new();
     let archive = Arc::new(InMemoryArchive::new());
     let s3_config = S3ArchiveConfig {
         bucket: "integration-test".to_string(),
@@ -228,7 +228,7 @@ async fn test_tiered_storage_uncompressed_end_to_end() {
 /// Multi-group: verify tiered storage works independently per raft group.
 #[tokio::test]
 async fn test_tiered_storage_multi_group() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = TestTempDir::new();
     let archive = Arc::new(InMemoryArchive::new());
     let s3_config = S3ArchiveConfig {
         bucket: "test".to_string(),
@@ -289,7 +289,7 @@ async fn test_tiered_storage_multi_group() {
 /// Write, purge old entries, verify remaining entries survive across tiers.
 #[tokio::test]
 async fn test_tiered_storage_purge_with_archival() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = TestTempDir::new();
     let archive = Arc::new(InMemoryArchive::new());
     let s3_config = S3ArchiveConfig {
         bucket: "test".to_string(),
@@ -350,7 +350,7 @@ async fn test_tiered_storage_purge_with_archival() {
 /// Verify that compression actually reduces stored size for repetitive data.
 #[tokio::test]
 async fn test_compression_reduces_stored_size() {
-    let tmp = TempDir::new().unwrap();
+    let tmp = TestTempDir::new();
     let compressed_archive = Arc::new(InMemoryArchive::new());
     let uncompressed_archive = Arc::new(InMemoryArchive::new());
 
