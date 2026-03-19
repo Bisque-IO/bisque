@@ -57,8 +57,8 @@ const NEXT_ID_KEY: &[u8] = b"next_id";
 /// Persisted per-group Raft metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GroupMeta {
-    last_applied_term: u64,
-    last_applied_node_id: u64,
+    last_applied_term: u32,
+    last_applied_node_id: u32,
     last_applied_index: u64,
     last_applied_present: bool,
     membership_bytes: Vec<u8>,
@@ -66,8 +66,8 @@ pub(crate) struct GroupMeta {
 
 impl GroupMeta {
     pub(crate) fn from_raft(
-        last_applied: &Option<LogId<MqTypeConfig>>,
-        last_membership: &StoredMembership<MqTypeConfig>,
+        last_applied: &Option<openraft::alias::LogIdOf<MqTypeConfig>>,
+        last_membership: &openraft::alias::StoredMembershipOf<MqTypeConfig>,
     ) -> Self {
         let (term, node_id, index, present) = match last_applied {
             Some(lid) => (lid.leader_id.term, lid.leader_id.node_id, lid.index, true),
@@ -87,7 +87,10 @@ impl GroupMeta {
 
     pub(crate) fn to_raft(
         &self,
-    ) -> io::Result<(Option<LogId<MqTypeConfig>>, StoredMembership<MqTypeConfig>)> {
+    ) -> io::Result<(
+        Option<openraft::alias::LogIdOf<MqTypeConfig>>,
+        openraft::alias::StoredMembershipOf<MqTypeConfig>,
+    )> {
         let last_applied = if self.last_applied_present {
             Some(LogId {
                 leader_id: openraft::impls::leader_id_adv::LeaderId {
@@ -99,7 +102,7 @@ impl GroupMeta {
         } else {
             None
         };
-        let (membership, _): (StoredMembership<MqTypeConfig>, _) =
+        let (membership, _): (openraft::alias::StoredMembershipOf<MqTypeConfig>, _) =
             bincode::serde::decode_from_slice(&self.membership_bytes, bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok((last_applied, membership))
@@ -1269,7 +1272,12 @@ impl MqManifestManager {
     pub fn read_applied_state(
         &self,
         group_id: u64,
-    ) -> io::Result<Option<(Option<LogId<MqTypeConfig>>, StoredMembership<MqTypeConfig>)>> {
+    ) -> io::Result<
+        Option<(
+            Option<openraft::alias::LogIdOf<MqTypeConfig>>,
+            openraft::alias::StoredMembershipOf<MqTypeConfig>,
+        )>,
+    > {
         let envs = self.read_envs.read();
         let env = match envs.get(&group_id) {
             Some(e) => e,

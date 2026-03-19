@@ -49,7 +49,7 @@ struct SnapshotAccumulator<C: RaftTypeConfig> {
     /// Vote from the leader sending the snapshot
     vote: C::Vote,
     /// Snapshot metadata
-    meta: openraft::storage::SnapshotMeta<C>,
+    meta: openraft::alias::SnapshotMetaOf<C>,
     /// Accumulated data chunks
     data: Vec<u8>,
     /// Expected next offset
@@ -59,7 +59,7 @@ struct SnapshotAccumulator<C: RaftTypeConfig> {
 }
 
 impl<C: RaftTypeConfig> SnapshotAccumulator<C> {
-    fn new(vote: C::Vote, meta: openraft::storage::SnapshotMeta<C>) -> Self {
+    fn new(vote: C::Vote, meta: openraft::alias::SnapshotMetaOf<C>) -> Self {
         Self {
             vote,
             meta,
@@ -125,7 +125,7 @@ impl<C: RaftTypeConfig> SnapshotTransferManager<C> {
         group_id: u64,
         snapshot_id: String,
         vote: C::Vote,
-        meta: openraft::storage::SnapshotMeta<C>,
+        meta: openraft::alias::SnapshotMetaOf<C>,
     ) -> dashmap::mapref::one::RefMut<'_, SnapshotTransferKey, SnapshotAccumulator<C>> {
         let key = SnapshotTransferKey {
             group_id,
@@ -189,14 +189,14 @@ impl Default for BisqueRpcServerConfig {
 }
 
 /// RPC server for handling incoming Raft requests with true multiplexing
-pub struct BisqueRpcServer<C, T, S>
+pub struct BisqueRpcServer<C, T, S, SM>
 where
     C: RaftTypeConfig,
     T: MultiplexedTransport<C>,
     S: MultiRaftLogStorage<C>,
 {
     config: BisqueRpcServerConfig,
-    manager: Arc<MultiRaftManager<C, T, S>>,
+    manager: Arc<MultiRaftManager<C, T, S, SM>>,
     /// Active connection count
     active_connections: AtomicU64,
     /// Manages in-progress chunked snapshot transfers
@@ -208,24 +208,25 @@ where
     _phantom: PhantomData<(C, T, S)>,
 }
 
-impl<C, T, S> BisqueRpcServer<C, T, S>
+impl<C, T, S, SM> BisqueRpcServer<C, T, S, SM>
 where
     C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-            Vote = openraft::impls::Vote<C>,
+            NodeId = u32,
+            Term = u32,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<u32, u32>,
+            Vote = openraft::impls::Vote<openraft::impls::leader_id_adv::LeaderId<u32, u32>>,
             Node = openraft::impls::BasicNode,
-            Entry = openraft::impls::Entry<C>,
+            Entry = openraft::alias::DefaultEntryOf<C>,
             SnapshotData = std::io::Cursor<Vec<u8>>,
         >,
     C::Entry: Clone,
     C::D: Encode + Decode,
     T: MultiplexedTransport<C>,
     S: MultiRaftLogStorage<C>,
+    SM: Send + Sync + 'static,
 {
     /// Create a new RPC server
-    pub fn new(config: BisqueRpcServerConfig, manager: Arc<MultiRaftManager<C, T, S>>) -> Self {
+    pub fn new(config: BisqueRpcServerConfig, manager: Arc<MultiRaftManager<C, T, S, SM>>) -> Self {
         let snapshot_transfers = Arc::new(SnapshotTransferManager::new(
             config.snapshot_transfer_timeout,
         ));
@@ -736,7 +737,7 @@ where
 
     /// Process a codec request and return a codec response
     async fn process_codec_request(
-        manager: &Arc<MultiRaftManager<C, T, S>>,
+        manager: &Arc<MultiRaftManager<C, T, S, SM>>,
         snapshot_transfers: &Arc<SnapshotTransferManager<C>>,
         request: CodecRpcMessage<C>,
         _max_concurrent_requests: usize,
@@ -1086,24 +1087,24 @@ mod tests {
 
     type C = crate::test_support::TestConfig;
 
-    fn test_vote() -> openraft::impls::Vote<C> {
+    fn test_vote() -> openraft::alias::VoteOf<C> {
         openraft::impls::Vote {
             leader_id: openraft::impls::leader_id_adv::LeaderId {
-                term: 1,
-                node_id: 1,
+                term: 1u32,
+                node_id: 1u32,
             },
             committed: true,
         }
     }
 
-    fn test_snapshot_meta() -> openraft::storage::SnapshotMeta<C> {
+    fn test_snapshot_meta() -> openraft::alias::SnapshotMetaOf<C> {
         openraft::storage::SnapshotMeta {
             last_log_id: None,
             last_membership: openraft::StoredMembership::new(
                 None,
                 openraft::Membership::new_with_defaults(
-                    vec![vec![1u64].into_iter().collect()],
-                    Vec::<u64>::new(),
+                    vec![vec![1u32].into_iter().collect()],
+                    Vec::<u32>::new(),
                 ),
             ),
             snapshot_id: "test-snap".to_string(),

@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use openraft::Config;
 use openraft::Raft;
 use openraft::RaftTypeConfig;
+use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftStateMachine;
 use std::marker::Unpin;
 use std::sync::Arc;
@@ -44,13 +45,14 @@ pub struct MultiRaftManager<
     C: RaftTypeConfig,
     T: MultiplexedTransport<C>,
     S: MultiRaftLogStorage<C>,
+    SM = (),
 > {
-    groups: DashMap<u64, Raft<C>>,
+    groups: DashMap<u64, Raft<C, SM>>,
     network_factory: Arc<MultiRaftNetworkFactory<C, T>>,
     storage: Arc<S>,
 }
 
-impl<C, T, S> MultiRaftManager<C, T, S>
+impl<C, T, S, SM> MultiRaftManager<C, T, S, SM>
 where
     C: RaftTypeConfig,
     T: MultiplexedTransport<C>,
@@ -72,13 +74,13 @@ where
     ///
     /// Each group can have its own state machine type/implementation.
     /// The log storage is obtained from the shared multiplexed storage.
-    pub async fn add_group<SM>(
+    pub async fn add_group(
         &self,
         group_id: u64,
         node_id: C::NodeId,
         raft_config: Arc<Config>,
         state_machine: SM,
-    ) -> Result<Raft<C>, AddGroupError<C>>
+    ) -> Result<Raft<C, SM>, AddGroupError<C>>
     where
         C::SnapshotData: AsyncRead + AsyncWrite + Unpin,
         C::Entry: Clone,
@@ -105,8 +107,42 @@ where
         Ok(raft)
     }
 
+    /// Add a new Raft group with the provided state machine and storage.
+    ///
+    /// Each group can have its own state machine type/implementation.
+    /// The log storage is provided directly instead of from the shared storage.
+    pub async fn add_group_with_storage<LS>(
+        &self,
+        group_id: u64,
+        node_id: C::NodeId,
+        raft_config: Arc<Config>,
+        state_machine: SM,
+        log_store: LS,
+    ) -> Result<Raft<C, SM>, AddGroupError<C>>
+    where
+        C::SnapshotData: AsyncRead + AsyncWrite + Unpin,
+        C::Entry: Clone,
+        SM: RaftStateMachine<C>,
+        LS: RaftLogStorage<C>,
+    {
+        let group_factory = GroupNetworkFactory::new(self.network_factory.clone(), group_id);
+
+        let raft = Raft::new(
+            node_id,
+            raft_config,
+            group_factory,
+            log_store,
+            state_machine,
+        )
+        .await
+        .map_err(AddGroupError::Raft)?;
+
+        self.groups.insert(group_id, raft.clone());
+        Ok(raft)
+    }
+
     /// Get a handle to an existing group
-    pub fn get_group(&self, group_id: u64) -> Option<Raft<C>> {
+    pub fn get_group(&self, group_id: u64) -> Option<Raft<C, SM>> {
         self.groups.get(&group_id).map(|r| r.clone())
     }
 
@@ -131,7 +167,7 @@ where
 
     /// Shut down all Raft groups and remove them from the manager.
     pub async fn shutdown_all(&self) {
-        let groups: Vec<(u64, Raft<C>)> = self
+        let groups: Vec<(u64, Raft<C, SM>)> = self
             .groups
             .iter()
             .map(|entry| (*entry.key(), entry.value().clone()))

@@ -8,7 +8,7 @@ use parking_lot::Mutex as ParkingMutex;
 
 use futures::StreamExt;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
-use openraft::{EntryPayload, LogId, OptionalSend, Snapshot, SnapshotMeta, StoredMembership};
+use openraft::{EntryPayload, LogId, OptionalSend};
 use tracing::{info, warn};
 
 use bisque_raft::{SegmentPrefetcher, SegmentSyncClient};
@@ -37,8 +37,8 @@ use crate::types::{MqApplyResponse, MqCommand, MqSnapshotData};
 /// the entries after the snapshot point.
 pub struct MqStateMachine {
     engine: Arc<MqEngine>,
-    last_applied: Option<LogId<MqTypeConfig>>,
-    last_membership: StoredMembership<MqTypeConfig>,
+    last_applied: Option<openraft::alias::LogIdOf<MqTypeConfig>>,
+    last_membership: openraft::alias::StoredMembershipOf<MqTypeConfig>,
     purge_floor: Option<Arc<AtomicU64>>,
     pin_ceiling: Option<Arc<AtomicU64>>,
     prefetcher: Option<SegmentPrefetcher>,
@@ -71,11 +71,16 @@ pub struct MqStateMachine {
 }
 
 impl MqStateMachine {
+    /// Returns a shared reference to the engine.
+    pub fn engine(&self) -> &Arc<MqEngine> {
+        &self.engine
+    }
+
     pub fn new(engine: MqEngine) -> Self {
         Self {
             engine: Arc::new(engine),
             last_applied: None,
-            last_membership: StoredMembership::default(),
+            last_membership: openraft::StoredMembership::default(),
             purge_floor: None,
             pin_ceiling: None,
             prefetcher: None,
@@ -258,7 +263,13 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<MqTypeConfig>>, StoredMembership<MqTypeConfig>), io::Error> {
+    ) -> Result<
+        (
+            Option<openraft::alias::LogIdOf<MqTypeConfig>>,
+            openraft::alias::StoredMembershipOf<MqTypeConfig>,
+        ),
+        io::Error,
+    > {
         if let Some(ref manifest) = self.manifest {
             // First check for a previously installed snapshot (new/lagging node).
             if let Some(snapshot_data) = manifest.read_snapshot_data(self.group_id)? {
@@ -365,12 +376,12 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
                         "MQ state machine restored structural state from MDBX"
                     );
 
-                    return Ok((self.last_applied, StoredMembership::default()));
+                    return Ok((self.last_applied, openraft::StoredMembership::default()));
                 }
             }
         }
 
-        Ok((None, StoredMembership::default()))
+        Ok((None, openraft::StoredMembership::default()))
     }
 
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
@@ -390,7 +401,7 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
             match &entry.payload {
                 EntryPayload::Membership(membership) => {
                     self.last_membership =
-                        StoredMembership::new(Some(entry.log_id), membership.clone());
+                        openraft::StoredMembership::new(Some(entry.log_id), membership.clone());
                 }
                 EntryPayload::Normal(cmd) => {
                     // Release raft backlog budget for commands that were charged
@@ -541,7 +552,7 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<MqTypeConfig>,
+        meta: &openraft::alias::SnapshotMetaOf<MqTypeConfig>,
         snapshot: Cursor<Vec<u8>>,
     ) -> Result<(), io::Error> {
         // Barrier: drain all workers before restoring snapshot.
@@ -622,7 +633,9 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<MqTypeConfig>>, io::Error> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<openraft::alias::SnapshotOf<MqTypeConfig>>, io::Error> {
         let last_applied = match self.last_applied {
             Some(la) => la,
             None => return Ok(None),
@@ -635,8 +648,8 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
 
         let snapshot_id = format!("mq-{}-{}", last_applied.leader_id.term, last_applied.index);
 
-        Ok(Some(Snapshot {
-            meta: SnapshotMeta {
+        Ok(Some(openraft::storage::Snapshot {
+            meta: openraft::storage::SnapshotMeta {
                 last_log_id: Some(last_applied),
                 last_membership: self.last_membership.clone(),
                 snapshot_id,
@@ -651,13 +664,15 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
 // =============================================================================
 
 pub struct MqSnapshotBuilder {
-    last_applied: Option<LogId<MqTypeConfig>>,
-    last_membership: StoredMembership<MqTypeConfig>,
+    last_applied: Option<openraft::alias::LogIdOf<MqTypeConfig>>,
+    last_membership: openraft::alias::StoredMembershipOf<MqTypeConfig>,
     snapshot_data: MqSnapshotData,
 }
 
 impl RaftSnapshotBuilder<MqTypeConfig> for MqSnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<MqTypeConfig>, io::Error> {
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<openraft::alias::SnapshotOf<MqTypeConfig>, io::Error> {
         let last_applied = self.last_applied.unwrap_or(LogId {
             leader_id: openraft::impls::leader_id_adv::LeaderId {
                 term: 0,
@@ -671,8 +686,8 @@ impl RaftSnapshotBuilder<MqTypeConfig> for MqSnapshotBuilder {
 
         let snapshot_id = format!("mq-{}-{}", last_applied.leader_id.term, last_applied.index);
 
-        Ok(Snapshot {
-            meta: SnapshotMeta {
+        Ok(openraft::storage::Snapshot {
+            meta: openraft::storage::SnapshotMeta {
                 last_log_id: Some(last_applied),
                 last_membership: self.last_membership.clone(),
                 snapshot_id,

@@ -45,7 +45,7 @@ pub use types::{
     read_u32_le, read_u64_le,
 };
 pub use write_batcher::{
-    LocalBatcher, LocalFrameBatch, LocalWriter, MqBatcherError, MqWriteBatcher,
+    LocalBatcher, LocalFrameBatch, LocalSubmitter, LocalWriter, MqBatcherError,
     MqWriteBatcherConfig,
 };
 

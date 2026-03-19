@@ -10,12 +10,12 @@ use base64::Engine as _;
 use bisque_mq::async_apply::ResponseEntry;
 use bisque_mq::flat::FlatMessageBuilder;
 use bisque_mq::types::{DeliveredMessage, MqCommand, name_hash};
-use bisque_mq::write_batcher::MqWriteBatcher;
+use bisque_mq::write_batcher::LocalSubmitter;
 
 /// Shared state for the SQS handler.
 pub struct SqsState {
     /// The write batcher for submitting commands.
-    batcher: Arc<MqWriteBatcher>,
+    batcher: Arc<LocalSubmitter>,
     /// Log reader for fetching message payloads from raft log segments.
     log_reader: bisque_raft::SegmentPrefetcher,
     /// Base URL for queue URL construction.
@@ -33,7 +33,7 @@ const RECEIPT_HANDLE_RAW_LEN: usize = 16;
 
 impl SqsState {
     pub fn new(
-        batcher: Arc<MqWriteBatcher>,
+        batcher: Arc<LocalSubmitter>,
         log_reader: bisque_raft::SegmentPrefetcher,
         base_url: String,
         group_id: u64,

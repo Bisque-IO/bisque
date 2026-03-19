@@ -424,66 +424,45 @@ impl TryFrom<u8> for AppendEntriesResponseType {
 
 // --- LeaderId ---
 
-impl<C> Encode for openraft::impls::leader_id_adv::LeaderId<C>
-where
-    C: RaftTypeConfig<NodeId = u64, Term = u64>,
-{
-    /// Wire format: `[term:8][node_id:4][pad:4]` = 16 bytes, 8-byte aligned.
+impl Encode for openraft::impls::leader_id_adv::LeaderId<u32, u32> {
+    /// Wire format: `[term:4][node_id:4]` = 8 bytes, 8-byte aligned.
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         self.term.encode(writer)?;
-        (self.node_id as u32).encode(writer)?;
-        writer.write_all(&[0u8; 4])?; // padding for 8-byte alignment
+        self.node_id.encode(writer)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
-        16 // 8 + 4 + 4pad
+        8 // 4 + 4
     }
 }
 
-impl<C> Decode for openraft::impls::leader_id_adv::LeaderId<C>
-where
-    C: RaftTypeConfig<NodeId = u64, Term = u64>,
-{
+impl Decode for openraft::impls::leader_id_adv::LeaderId<u32, u32> {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
-        let term = u64::decode(reader)?;
-        let node_id = u32::decode(reader)? as u64;
-        let mut _pad = [0u8; 4];
-        reader.read_exact(&mut _pad)?;
+        let term = u32::decode(reader)?;
+        let node_id = u32::decode(reader)?;
         Ok(Self { term, node_id })
     }
 }
 
 // --- LogId ---
 
-impl<C> Encode for openraft::LogId<C>
-where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-{
-    /// Wire format: `[leader_id:16][index:8]` = 24 bytes, 8-byte aligned.
+type ConcreteLeaderId = openraft::impls::leader_id_adv::LeaderId<u32, u32>;
+
+impl Encode for openraft::LogId<ConcreteLeaderId> {
+    /// Wire format: `[leader_id:8][index:8]` = 16 bytes, 8-byte aligned.
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         self.leader_id.encode(writer)?;
         self.index.encode(writer)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
-        24 // 16 + 8
+        16 // 8 + 8
     }
 }
 
-impl<C> Decode for openraft::LogId<C>
-where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-{
+impl Decode for openraft::LogId<ConcreteLeaderId> {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
-        let leader_id = openraft::impls::leader_id_adv::LeaderId::<C>::decode(reader)?;
+        let leader_id = ConcreteLeaderId::decode(reader)?;
         let index = u64::decode(reader)?;
         Ok(Self { leader_id, index })
     }
@@ -491,45 +470,29 @@ where
 
 // --- Vote ---
 
-impl<C> Encode for openraft::impls::Vote<C>
-where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-{
-    /// Wire format: `[term:8][node_id:4][committed:1][pad:3]` = 16 bytes, 8-byte aligned.
-    /// Packs committed into LeaderId's trailing padding to avoid wasting a full
-    /// 8-byte slot on a single boolean.
+impl Encode for openraft::impls::Vote<ConcreteLeaderId> {
+    /// Wire format: `[term:4][node_id:4][committed:1][pad:7]` = 16 bytes, 8-byte aligned.
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         self.leader_id.term.encode(writer)?;
-        (self.leader_id.node_id as u32).encode(writer)?;
+        self.leader_id.node_id.encode(writer)?;
         self.committed.encode(writer)?;
-        writer.write_all(&[0u8; 3])?; // padding for 8-byte alignment
+        writer.write_all(&[0u8; 7])?; // padding for 8-byte alignment
         Ok(())
     }
     fn encoded_size(&self) -> usize {
-        16 // 8 + 4 + 1 + 3pad
+        16 // 4 + 4 + 1 + 7pad
     }
 }
 
-impl<C> Decode for openraft::impls::Vote<C>
-where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-{
+impl Decode for openraft::impls::Vote<ConcreteLeaderId> {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
-        let term = u64::decode(reader)?;
-        let node_id = u32::decode(reader)? as u64;
+        let term = u32::decode(reader)?;
+        let node_id = u32::decode(reader)?;
         let committed = bool::decode(reader)?;
-        let mut _pad = [0u8; 3];
+        let mut _pad = [0u8; 7];
         reader.read_exact(&mut _pad)?;
         Ok(Self {
-            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
+            leader_id: ConcreteLeaderId { term, node_id },
             committed,
         })
     }
@@ -556,10 +519,7 @@ impl Decode for openraft::impls::BasicNode {
 
 // --- Membership ---
 
-impl<C> Encode for openraft::Membership<C>
-where
-    C: RaftTypeConfig<NodeId = u64, Node = openraft::impls::BasicNode>,
-{
+impl Encode for openraft::Membership<u32, openraft::impls::BasicNode> {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         let configs = self.get_joint_config();
         (configs.len() as u32).encode(writer)?;
@@ -581,20 +541,17 @@ where
 
     fn encoded_size(&self) -> usize {
         let configs = self.get_joint_config();
-        let configs_size: usize = 4 + configs.iter().map(|c| 4 + c.len() * 8).sum::<usize>();
+        let configs_size: usize = 4 + configs.iter().map(|c| 4 + c.len() * 4).sum::<usize>();
         // Iterate directly — no Vec allocation needed for size computation.
         let nodes_size: usize = 4 + self
             .nodes()
-            .map(|(_, n)| 8 + n.encoded_size())
+            .map(|(_, n)| 4 + n.encoded_size())
             .sum::<usize>();
         configs_size + nodes_size
     }
 }
 
-impl<C> Decode for openraft::Membership<C>
-where
-    C: RaftTypeConfig<NodeId = u64, Node = openraft::impls::BasicNode>,
-{
+impl Decode for openraft::Membership<u32, openraft::impls::BasicNode> {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         let configs_len = u32::decode(reader)? as usize;
         let mut configs = Vec::with_capacity(configs_len);
@@ -602,14 +559,14 @@ where
             let config_len = u32::decode(reader)? as usize;
             let mut config = BTreeSet::new();
             for _ in 0..config_len {
-                config.insert(u64::decode(reader)?);
+                config.insert(u32::decode(reader)?);
             }
             configs.push(config);
         }
         let nodes_len = u32::decode(reader)? as usize;
         let mut nodes = BTreeMap::new();
         for _ in 0..nodes_len {
-            let node_id = u64::decode(reader)?;
+            let node_id = u32::decode(reader)?;
             let node = openraft::impls::BasicNode::decode(reader)?;
             nodes.insert(node_id, node);
         }
@@ -622,10 +579,9 @@ where
 
 // --- EntryPayload ---
 
-impl<C> Encode for openraft::EntryPayload<C>
+impl<D> Encode for openraft::EntryPayload<D, u32, openraft::impls::BasicNode>
 where
-    C: RaftTypeConfig<NodeId = u64, Node = openraft::impls::BasicNode>,
-    C::D: Encode,
+    D: openraft::AppData + Encode,
 {
     /// Encode the payload data **without** the tag byte.
     ///
@@ -655,10 +611,9 @@ where
     }
 }
 
-impl<C> Decode for openraft::EntryPayload<C>
+impl<D> Decode for openraft::EntryPayload<D, u32, openraft::impls::BasicNode>
 where
-    C: RaftTypeConfig<NodeId = u64, Node = openraft::impls::BasicNode>,
-    C::D: Decode,
+    D: openraft::AppData + Decode,
 {
     /// Decode payload data **without** reading a tag byte.
     ///
@@ -679,31 +634,23 @@ where
 
 // --- Entry ---
 
-impl<C> Encode for openraft::impls::Entry<C>
+impl<D> Encode for openraft::Entry<ConcreteLeaderId, D, u32, openraft::impls::BasicNode>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-    C::D: Encode,
+    D: openraft::AppData + Encode,
 {
-    /// Wire format: `[term:8][node_id:4][tag:1][pad:3][index:8][payload_data...]`
+    /// Wire format: `[term:4][node_id_tag:4][index:8][payload_data...]`
     ///
-    /// The payload tag is packed into the 4-byte padding after node_id (within
-    /// the LeaderId region), saving 8 bytes of alignment waste per entry
-    /// compared to the old `[term:8][node_id:8][index:8][tag:1]` layout.
+    /// `node_id_tag` packs `(node_id << 8) | tag` into 4 bytes.
+    /// Header is 16 bytes (8-byte aligned).
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         self.log_id.leader_id.term.encode(writer)?;
-        (self.log_id.leader_id.node_id as u32).encode(writer)?;
-        // Pack tag + 3 pad bytes into the 4 bytes after node_id
         let tag = match &self.payload {
             openraft::EntryPayload::Blank => EntryPayloadType::Blank as u8,
             openraft::EntryPayload::Normal(_) => EntryPayloadType::Normal as u8,
             openraft::EntryPayload::Membership(_) => EntryPayloadType::Membership as u8,
         };
-        writer.write_all(&[tag, 0, 0, 0])?; // tag + 3 pad
+        let node_id_tag = (self.log_id.leader_id.node_id << 8) | tag as u32;
+        node_id_tag.encode(writer)?;
         self.log_id.index.encode(writer)?;
         // Write payload data (without tag — it's already in the header)
         match &self.payload {
@@ -715,7 +662,7 @@ where
     }
 
     fn encoded_size(&self) -> usize {
-        24 + match &self.payload {
+        16 + match &self.payload {
             openraft::EntryPayload::Blank => 0,
             openraft::EntryPayload::Normal(data) => data.encoded_size(),
             openraft::EntryPayload::Membership(membership) => membership.encoded_size(),
@@ -723,35 +670,31 @@ where
     }
 }
 
-impl<C> Decode for openraft::impls::Entry<C>
+impl<D> Decode for openraft::Entry<ConcreteLeaderId, D, u32, openraft::impls::BasicNode>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-    C::D: Decode,
+    D: openraft::AppData + Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
-        let term = u64::decode(reader)?;
-        let node_id = u32::decode(reader)? as u64;
-        let tag = u8::decode(reader)?;
-        let mut _pad = [0u8; 3];
-        reader.read_exact(&mut _pad)?;
+        let term = u32::decode(reader)?;
+        let node_id_tag = u32::decode(reader)?;
         let index = u64::decode(reader)?;
+        let tag = (node_id_tag & 0xFF) as u8;
+        let node_id = node_id_tag >> 8;
 
-        let log_id = openraft::LogId::<C> {
-            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
+        let log_id = openraft::LogId {
+            leader_id: ConcreteLeaderId { term, node_id },
             index,
         };
 
         let payload_tag = EntryPayloadType::try_from(tag)?;
         let payload = match payload_tag {
             EntryPayloadType::Blank => openraft::EntryPayload::Blank,
-            EntryPayloadType::Normal => openraft::EntryPayload::Normal(C::D::decode(reader)?),
+            EntryPayloadType::Normal => openraft::EntryPayload::Normal(D::decode(reader)?),
             EntryPayloadType::Membership => {
-                openraft::EntryPayload::Membership(openraft::Membership::<C>::decode(reader)?)
+                openraft::EntryPayload::Membership(openraft::Membership::<
+                    u32,
+                    openraft::impls::BasicNode,
+                >::decode(reader)?)
             }
         };
 
@@ -759,21 +702,21 @@ where
     }
 
     fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, CodecError> {
-        // Entry layout: [term:8][node_id:4][tag:1][pad:3][index:8][payload_data...]
-        if data.len() < 24 {
+        // Entry layout: [term:4][node_id_tag:4][index:8][payload_data...]
+        if data.len() < 16 {
             return Err(CodecError::BufferTooSmall {
-                needed: 24,
+                needed: 16,
                 have: data.len(),
             });
         }
-        let term = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let node_id = u32::from_le_bytes(data[8..12].try_into().unwrap()) as u64;
-        let tag = data[12];
-        // data[13..16] = padding
-        let index = u64::from_le_bytes(data[16..24].try_into().unwrap());
+        let term = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let node_id_tag = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let index = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let tag = (node_id_tag & 0xFF) as u8;
+        let node_id = node_id_tag >> 8;
 
-        let log_id = openraft::LogId::<C> {
-            leader_id: openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id },
+        let log_id = openraft::LogId {
+            leader_id: ConcreteLeaderId { term, node_id },
             index,
         };
 
@@ -781,13 +724,16 @@ where
         let payload = match payload_tag {
             EntryPayloadType::Blank => openraft::EntryPayload::Blank,
             EntryPayloadType::Normal => {
-                let payload_bytes = data.slice(24..);
-                openraft::EntryPayload::Normal(C::D::decode_from_bytes(payload_bytes)?)
+                let payload_bytes = data.slice(16..);
+                openraft::EntryPayload::Normal(D::decode_from_bytes(payload_bytes)?)
             }
             EntryPayloadType::Membership => {
-                let payload_bytes = data.slice(24..);
-                openraft::EntryPayload::Membership(openraft::Membership::<C>::decode_from_slice(
-                    &payload_bytes,
+                let payload_bytes = data.slice(16..);
+                openraft::EntryPayload::Membership(openraft::Membership::<
+                    u32,
+                    openraft::impls::BasicNode,
+                >::decode_from_slice(
+                    &payload_bytes
                 )?)
             }
         };
@@ -798,15 +744,7 @@ where
 
 // --- StoredMembership ---
 
-impl<C> Encode for openraft::StoredMembership<C>
-where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-{
+impl Encode for openraft::StoredMembership<ConcreteLeaderId, u32, openraft::impls::BasicNode> {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         // log_id() returns Option<&LogId<C>> — encode manually
         match self.log_id() {
@@ -831,33 +769,17 @@ where
     }
 }
 
-impl<C> Decode for openraft::StoredMembership<C>
-where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-{
+impl Decode for openraft::StoredMembership<ConcreteLeaderId, u32, openraft::impls::BasicNode> {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
-        let log_id = Option::<openraft::LogId<C>>::decode(reader)?;
-        let membership = openraft::Membership::<C>::decode(reader)?;
+        let log_id = Option::<openraft::LogId<ConcreteLeaderId>>::decode(reader)?;
+        let membership = openraft::Membership::<u32, openraft::impls::BasicNode>::decode(reader)?;
         Ok(openraft::StoredMembership::new(log_id, membership))
     }
 }
 
 // --- SnapshotMeta ---
 
-impl<C> Encode for openraft::storage::SnapshotMeta<C>
-where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-{
+impl Encode for openraft::storage::SnapshotMeta<ConcreteLeaderId, u32, openraft::impls::BasicNode> {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
         self.last_log_id.encode(writer)?;
         self.last_membership.encode(writer)?;
@@ -872,19 +794,15 @@ where
     }
 }
 
-impl<C> Decode for openraft::storage::SnapshotMeta<C>
-where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
-{
+impl Decode for openraft::storage::SnapshotMeta<ConcreteLeaderId, u32, openraft::impls::BasicNode> {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         Ok(openraft::storage::SnapshotMeta {
-            last_log_id: Option::<openraft::LogId<C>>::decode(reader)?,
-            last_membership: openraft::StoredMembership::<C>::decode(reader)?,
+            last_log_id: Option::<openraft::LogId<ConcreteLeaderId>>::decode(reader)?,
+            last_membership: openraft::StoredMembership::<
+                ConcreteLeaderId,
+                u32,
+                openraft::impls::BasicNode,
+            >::decode(reader)?,
             snapshot_id: String::decode(reader)?,
         })
     }
@@ -899,10 +817,10 @@ where
 impl<C> Encode for openraft::raft::AppendEntriesRequest<C>
 where
     C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
+            NodeId = u32,
+            Term = u32,
             Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+            LeaderId = ConcreteLeaderId,
         >,
     C::Vote: Encode,
     C::Entry: Encode,
@@ -926,10 +844,10 @@ where
 impl<C> Decode for openraft::raft::AppendEntriesRequest<C>
 where
     C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
+            NodeId = u32,
+            Term = u32,
             Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+            LeaderId = ConcreteLeaderId,
         >,
     C::Vote: Decode,
     C::Entry: Decode,
@@ -937,9 +855,9 @@ where
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         Ok(Self {
             vote: C::Vote::decode(reader)?,
-            prev_log_id: Option::<openraft::LogId<C>>::decode(reader)?,
+            prev_log_id: Option::<openraft::LogId<ConcreteLeaderId>>::decode(reader)?,
             entries: Vec::<C::Entry>::decode(reader)?,
-            leader_commit: Option::<openraft::LogId<C>>::decode(reader)?,
+            leader_commit: Option::<openraft::LogId<ConcreteLeaderId>>::decode(reader)?,
         })
     }
 }
@@ -948,11 +866,7 @@ where
 
 impl<C> Encode for openraft::raft::AppendEntriesResponse<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -987,11 +901,7 @@ where
 
 impl<C> Decode for openraft::raft::AppendEntriesResponse<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -1002,7 +912,7 @@ where
             }
             AppendEntriesResponseType::PartialSuccess => {
                 Ok(openraft::raft::AppendEntriesResponse::PartialSuccess(
-                    Option::<openraft::LogId<C>>::decode(reader)?,
+                    Option::<openraft::LogId<ConcreteLeaderId>>::decode(reader)?,
                 ))
             }
             AppendEntriesResponseType::Conflict => {
@@ -1019,11 +929,7 @@ where
 
 impl<C> Encode for openraft::raft::VoteRequest<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -1039,17 +945,13 @@ where
 
 impl<C> Decode for openraft::raft::VoteRequest<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         Ok(Self {
             vote: C::Vote::decode(reader)?,
-            last_log_id: Option::<openraft::LogId<C>>::decode(reader)?,
+            last_log_id: Option::<openraft::LogId<ConcreteLeaderId>>::decode(reader)?,
         })
     }
 }
@@ -1058,11 +960,7 @@ where
 
 impl<C> Encode for openraft::raft::VoteResponse<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -1079,18 +977,14 @@ where
 
 impl<C> Decode for openraft::raft::VoteResponse<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         Ok(Self {
             vote: C::Vote::decode(reader)?,
             vote_granted: bool::decode(reader)?,
-            last_log_id: Option::<openraft::LogId<C>>::decode(reader)?,
+            last_log_id: Option::<openraft::LogId<ConcreteLeaderId>>::decode(reader)?,
         })
     }
 }
@@ -1102,10 +996,10 @@ where
 impl<C> Encode for openraft::raft::InstallSnapshotRequest<C>
 where
     C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
+            NodeId = u32,
+            Term = u32,
             Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+            LeaderId = ConcreteLeaderId,
         >,
     C::Vote: Encode,
 {
@@ -1128,16 +1022,20 @@ where
 impl<C> Decode for openraft::raft::InstallSnapshotRequest<C>
 where
     C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
+            NodeId = u32,
+            Term = u32,
             Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+            LeaderId = ConcreteLeaderId,
         >,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
         let vote = C::Vote::decode(reader)?;
-        let meta = openraft::storage::SnapshotMeta::<C>::decode(reader)?;
+        let meta = openraft::storage::SnapshotMeta::<
+            ConcreteLeaderId,
+            u32,
+            openraft::impls::BasicNode,
+        >::decode(reader)?;
         let offset = u64::decode(reader)?;
         let data_len = u32::decode(reader)? as usize;
         let mut data = vec![0u8; data_len];
@@ -1157,11 +1055,7 @@ where
 
 impl<C> Encode for openraft::raft::InstallSnapshotResponse<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -1175,11 +1069,7 @@ where
 
 impl<C> Decode for openraft::raft::InstallSnapshotResponse<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -1253,11 +1143,7 @@ pub enum ResponseMessage<C: RaftTypeConfig> {
 
 impl<C> Encode for ResponseMessage<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Encode,
 {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<(), CodecError> {
@@ -1289,11 +1175,7 @@ where
 
 impl<C> Decode for ResponseMessage<C>
 where
-    C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-        >,
+    C: RaftTypeConfig<NodeId = u32, Term = u32, LeaderId = ConcreteLeaderId>,
     C::Vote: Decode,
 {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, CodecError> {
@@ -1367,10 +1249,10 @@ impl<C: RaftTypeConfig> RpcMessage<C> {
 impl<C> Encode for RpcMessage<C>
 where
     C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
+            NodeId = u32,
+            Term = u32,
             Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+            LeaderId = ConcreteLeaderId,
         >,
     C::Vote: Encode,
     C::Entry: Encode,
@@ -1467,10 +1349,10 @@ where
 impl<C> Decode for RpcMessage<C>
 where
     C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
+            NodeId = u32,
+            Term = u32,
             Node = openraft::impls::BasicNode,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+            LeaderId = ConcreteLeaderId,
         >,
     C::Vote: Decode,
     C::Entry: Decode,
@@ -1519,19 +1401,23 @@ mod tests {
 
     type C = crate::test_support::TestConfig;
 
-    fn make_leader_id(term: u64, node_id: u64) -> openraft::impls::leader_id_adv::LeaderId<C> {
-        openraft::impls::leader_id_adv::LeaderId::<C> { term, node_id }
+    fn make_leader_id(term: u32, node_id: u32) -> ConcreteLeaderId {
+        ConcreteLeaderId { term, node_id }
     }
 
-    fn make_log_id(term: u64, node_id: u64, index: u64) -> openraft::LogId<C> {
-        openraft::LogId::<C> {
+    fn make_log_id(term: u32, node_id: u32, index: u64) -> openraft::LogId<ConcreteLeaderId> {
+        openraft::LogId {
             leader_id: make_leader_id(term, node_id),
             index,
         }
     }
 
-    fn make_vote(term: u64, node_id: u64, committed: bool) -> openraft::impls::Vote<C> {
-        openraft::impls::Vote::<C> {
+    fn make_vote(
+        term: u32,
+        node_id: u32,
+        committed: bool,
+    ) -> openraft::impls::Vote<ConcreteLeaderId> {
+        openraft::impls::Vote {
             leader_id: make_leader_id(term, node_id),
             committed,
         }
@@ -1584,9 +1470,8 @@ mod tests {
     fn test_leader_id_roundtrip() {
         let val = make_leader_id(5, 10);
         let encoded = val.encode_to_vec().unwrap();
-        assert_eq!(encoded.len(), 16);
-        let decoded =
-            openraft::impls::leader_id_adv::LeaderId::<C>::decode_from_slice(&encoded).unwrap();
+        assert_eq!(encoded.len(), 8);
+        let decoded = ConcreteLeaderId::decode_from_slice(&encoded).unwrap();
         assert_eq!(val, decoded);
     }
 
@@ -1594,8 +1479,8 @@ mod tests {
     fn test_log_id_roundtrip() {
         let val = make_log_id(5, 10, 100);
         let encoded = val.encode_to_vec().unwrap();
-        assert_eq!(encoded.len(), 24);
-        let decoded = openraft::LogId::<C>::decode_from_slice(&encoded).unwrap();
+        assert_eq!(encoded.len(), 16);
+        let decoded = openraft::LogId::<ConcreteLeaderId>::decode_from_slice(&encoded).unwrap();
         assert_eq!(val, decoded);
     }
 
@@ -1604,7 +1489,8 @@ mod tests {
         let val = make_vote(5, 10, true);
         let encoded = val.encode_to_vec().unwrap();
         assert_eq!(encoded.len(), 16);
-        let decoded = openraft::impls::Vote::<C>::decode_from_slice(&encoded).unwrap();
+        let decoded =
+            openraft::impls::Vote::<ConcreteLeaderId>::decode_from_slice(&encoded).unwrap();
         assert_eq!(val, decoded);
     }
 
@@ -1739,11 +1625,11 @@ mod tests {
     #[test]
     fn test_membership_roundtrip() {
         let configs = vec![
-            vec![1u64, 2, 3].into_iter().collect::<BTreeSet<u64>>(),
-            vec![4u64, 5].into_iter().collect::<BTreeSet<u64>>(),
+            vec![1u32, 2, 3].into_iter().collect::<BTreeSet<u32>>(),
+            vec![4u32, 5].into_iter().collect::<BTreeSet<u32>>(),
         ];
         let mut nodes = BTreeMap::new();
-        for id in [1u64, 2, 3, 4, 5] {
+        for id in [1u32, 2, 3, 4, 5] {
             nodes.insert(
                 id,
                 openraft::impls::BasicNode {
@@ -1751,17 +1637,23 @@ mod tests {
                 },
             );
         }
-        let val = openraft::Membership::<C>::new(configs, nodes).unwrap();
+        let val =
+            openraft::Membership::<u32, openraft::impls::BasicNode>::new(configs, nodes).unwrap();
         let encoded = val.encode_to_vec().unwrap();
-        let decoded = openraft::Membership::<C>::decode_from_slice(&encoded).unwrap();
+        let decoded =
+            openraft::Membership::<u32, openraft::impls::BasicNode>::decode_from_slice(&encoded)
+                .unwrap();
         // Compare via accessors since Membership may not derive PartialEq
         assert_eq!(val.get_joint_config(), decoded.get_joint_config());
     }
 
     #[test]
     fn test_entry_with_membership_roundtrip() {
-        let configs = vec![vec![1u64, 2, 3].into_iter().collect::<BTreeSet<u64>>()];
-        let membership = openraft::Membership::<C>::new_with_defaults(configs, Vec::<u64>::new());
+        let configs = vec![vec![1u32, 2, 3].into_iter().collect::<BTreeSet<u32>>()];
+        let membership = openraft::Membership::<u32, openraft::impls::BasicNode>::new_with_defaults(
+            configs,
+            Vec::<u32>::new(),
+        );
 
         let val = openraft::impls::Entry::<C> {
             log_id: make_log_id(5, 10, 100),
@@ -1774,8 +1666,11 @@ mod tests {
 
     #[test]
     fn test_install_snapshot_roundtrip() {
-        let configs = vec![vec![1u64, 2, 3].into_iter().collect::<BTreeSet<u64>>()];
-        let membership = openraft::Membership::<C>::new_with_defaults(configs, Vec::<u64>::new());
+        let configs = vec![vec![1u32, 2, 3].into_iter().collect::<BTreeSet<u32>>()];
+        let membership = openraft::Membership::<u32, openraft::impls::BasicNode>::new_with_defaults(
+            configs,
+            Vec::<u32>::new(),
+        );
 
         let val = openraft::raft::InstallSnapshotRequest::<C> {
             vote: make_vote(5, 10, true),
@@ -1863,14 +1758,17 @@ mod tests {
 
         // Vote doesn't include CRC validation; the only reliable failure mode is truncation.
         let invalid_too_short = vec![0xFFu8; 15];
-        assert!(openraft::impls::Vote::<C>::decode_from_slice(&invalid_too_short).is_err());
+        assert!(
+            openraft::impls::Vote::<ConcreteLeaderId>::decode_from_slice(&invalid_too_short)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_corrupted_log_id() {
-        // Test with invalid data length - LogId should be 24 bytes
-        let invalid_data = vec![0xFFu8; 20]; // Too short
-        assert!(openraft::LogId::<C>::decode_from_slice(&invalid_data).is_err());
+        // Test with invalid data length - LogId should be 16 bytes
+        let invalid_data = vec![0xFFu8; 12]; // Too short
+        assert!(openraft::LogId::<ConcreteLeaderId>::decode_from_slice(&invalid_data).is_err());
     }
 
     #[test]
@@ -1970,11 +1868,12 @@ mod tests {
     #[test]
     fn test_codec_snapshot_zero_offset() {
         let vote = make_vote(1, 1, true);
-        let meta = openraft::storage::SnapshotMeta::<C> {
-            last_log_id: None,
-            last_membership: openraft::StoredMembership::default(),
-            snapshot_id: "snap-0".to_string(),
-        };
+        let meta =
+            openraft::storage::SnapshotMeta::<ConcreteLeaderId, u32, openraft::impls::BasicNode> {
+                last_log_id: None,
+                last_membership: openraft::StoredMembership::default(),
+                snapshot_id: "snap-0".to_string(),
+            };
 
         let req = openraft::raft::InstallSnapshotRequest::<C> {
             vote,
@@ -2006,11 +1905,12 @@ mod tests {
     #[test]
     fn test_codec_snapshot_large_data() {
         let vote = make_vote(1, 1, true);
-        let meta = openraft::storage::SnapshotMeta::<C> {
-            last_log_id: Some(make_log_id(1, 1, 100)),
-            last_membership: openraft::StoredMembership::default(),
-            snapshot_id: "snap-large".to_string(),
-        };
+        let meta =
+            openraft::storage::SnapshotMeta::<ConcreteLeaderId, u32, openraft::impls::BasicNode> {
+                last_log_id: Some(make_log_id(1, 1, 100)),
+                last_membership: openraft::StoredMembership::default(),
+                snapshot_id: "snap-large".to_string(),
+            };
 
         let large_data = vec![0xAB; 1024 * 1024]; // 1MB
         let req = openraft::raft::InstallSnapshotRequest::<C> {

@@ -17,7 +17,7 @@ use openraft::raft::InstallSnapshotResponse;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
-use openraft::storage::Snapshot;
+
 use openraft::{ErrorSubject, ErrorVerb};
 use std::borrow::Cow;
 use std::future::Future;
@@ -181,7 +181,7 @@ where
     async fn full_snapshot(
         &mut self,
         vote: openraft::type_config::alias::VoteOf<C>,
-        snapshot: Snapshot<C>,
+        snapshot: openraft::alias::SnapshotOf<C>,
         _cancel: impl Future<Output = openraft::error::ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<C>, StreamingError<C>> {
@@ -301,8 +301,8 @@ mod tests {
     /// Fake transport that records calls
     #[derive(Clone)]
     struct FakeTransport {
-        append_entries_calls: Arc<DashMap<(u64, u64), Vec<AppendEntriesRequest<TestConfig>>>>,
-        vote_calls: Arc<DashMap<(u64, u64), Vec<VoteRequest<TestConfig>>>>,
+        append_entries_calls: Arc<DashMap<(u32, u64), Vec<AppendEntriesRequest<TestConfig>>>>,
+        vote_calls: Arc<DashMap<(u32, u64), Vec<VoteRequest<TestConfig>>>>,
         call_count: Arc<AtomicU64>,
     }
 
@@ -319,7 +319,7 @@ mod tests {
     impl MultiplexedTransport<TestConfig> for FakeTransport {
         async fn send_append_entries(
             &self,
-            target: u64,
+            target: u32,
             group_id: u64,
             rpc: AppendEntriesRequest<TestConfig>,
         ) -> Result<AppendEntriesResponse<TestConfig>, RPCError<TestConfig, RaftError<TestConfig>>>
@@ -341,7 +341,7 @@ mod tests {
 
         async fn send_vote(
             &self,
-            target: u64,
+            target: u32,
             group_id: u64,
             rpc: VoteRequest<TestConfig>,
         ) -> Result<VoteResponse<TestConfig>, RPCError<TestConfig, RaftError<TestConfig>>> {
@@ -360,7 +360,7 @@ mod tests {
 
         async fn send_install_snapshot(
             &self,
-            _target: u64,
+            _target: u32,
             _group_id: u64,
             _rpc: InstallSnapshotRequest<TestConfig>,
         ) -> Result<
@@ -374,7 +374,7 @@ mod tests {
         }
     }
 
-    fn make_heartbeat_request(term: u64, node_id: u64) -> AppendEntriesRequest<TestConfig> {
+    fn make_heartbeat_request(term: u32, node_id: u32) -> AppendEntriesRequest<TestConfig> {
         AppendEntriesRequest {
             vote: openraft::impls::Vote::new(term, node_id),
             prev_log_id: None,
@@ -384,8 +384,8 @@ mod tests {
     }
 
     fn make_append_request(
-        term: u64,
-        node_id: u64,
+        term: u32,
+        node_id: u32,
         data: String,
     ) -> AppendEntriesRequest<TestConfig> {
         use openraft::LogId;
@@ -565,13 +565,13 @@ mod tests {
 
             let snapshot_data: Vec<u8> = vec![1, 2, 3, 4, 5];
             let cursor = std::io::Cursor::new(snapshot_data);
-            let snapshot_meta = openraft::storage::SnapshotMeta::<TestConfig> {
+            let snapshot_meta = openraft::alias::SnapshotMetaOf::<TestConfig> {
                 last_log_id: None,
                 last_membership: openraft::StoredMembership::default(),
                 snapshot_id: "test-snapshot".to_string(),
             };
 
-            let snapshot = openraft::storage::Snapshot::<TestConfig> {
+            let snapshot = openraft::alias::SnapshotOf::<TestConfig> {
                 meta: snapshot_meta,
                 snapshot: cursor,
             };
@@ -611,7 +611,7 @@ mod tests {
             impl MultiplexedTransport<TestConfig> for RejectingTransport {
                 async fn send_append_entries(
                     &self,
-                    _target: u64,
+                    _target: u32,
                     _group_id: u64,
                     _rpc: AppendEntriesRequest<TestConfig>,
                 ) -> Result<
@@ -623,7 +623,7 @@ mod tests {
 
                 async fn send_vote(
                     &self,
-                    _target: u64,
+                    _target: u32,
                     _group_id: u64,
                     _rpc: VoteRequest<TestConfig>,
                 ) -> Result<VoteResponse<TestConfig>, RPCError<TestConfig, RaftError<TestConfig>>>
@@ -637,7 +637,7 @@ mod tests {
 
                 async fn send_install_snapshot(
                     &self,
-                    _target: u64,
+                    _target: u32,
                     _group_id: u64,
                     _rpc: InstallSnapshotRequest<TestConfig>,
                 ) -> Result<
@@ -664,7 +664,7 @@ mod tests {
 
             let snapshot_data: Vec<u8> = vec![1, 2, 3, 4, 5];
             let cursor = std::io::Cursor::new(snapshot_data);
-            let snapshot_meta = openraft::storage::SnapshotMeta::<TestConfig> {
+            let snapshot_meta = openraft::alias::SnapshotMetaOf::<TestConfig> {
                 last_log_id: None,
                 last_membership: openraft::StoredMembership::default(),
                 snapshot_id: "test-snapshot".to_string(),

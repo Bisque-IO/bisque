@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use bisque_mq::MqMetadata;
-use bisque_mq::write_batcher::MqWriteBatcher;
+use bisque_mq::write_batcher::LocalSubmitter;
 use bisque_mq_protocol::frame::{
     decode_client_frame_bytes, encode_server_frame_prefixed, read_tcp_frame_bytes,
 };
@@ -133,10 +133,22 @@ impl MqState {
         let mq_manifest = Arc::new(bisque_mq::MqManifestManager::new(&mq_manifest_dir)?);
         mq_manifest.open_group(group_id)?;
 
-        // State machine
-        let mq_state_machine =
-            bisque_mq::MqStateMachine::new(mq_engine).with_manifest(mq_manifest.clone(), group_id);
+        // Backlog budget (shared between RaftWriter and state machine)
+        let mq_backlog = Arc::new(bisque_mq::forward::RaftBacklog::new(256 * 1024 * 1024));
+
+        // Prefetcher (from log storage, needed by async apply)
+        let mq_prefetcher = mq_manager.storage().prefetcher();
+
+        // State machine with async apply
+        let mut mq_state_machine = bisque_mq::MqStateMachine::new(mq_engine)
+            .with_manifest(mq_manifest.clone(), group_id)
+            .with_prefetcher(mq_prefetcher)
+            .with_raft_backlog(Arc::clone(&mq_backlog));
         let mq_shared_metadata = mq_state_machine.shared_metadata();
+        mq_state_machine.init_async_apply(&mq_config)?;
+        let mq_async_apply = mq_state_machine
+            .async_apply()
+            .expect("init_async_apply succeeded but async_apply() returned None");
 
         // Raft group
         let mq_raft_config = Arc::new(
@@ -199,16 +211,17 @@ impl MqState {
             }
         }
 
-        // Write batcher
-        // TODO: pass `Some(Arc<AsyncApplyManager>)` once async apply is wired up here.
-        let mq_batcher = Arc::new(bisque_mq::MqWriteBatcher::new(
-            bisque_mq::MqWriteBatcherConfig::default(),
+        // Write pipeline: RaftWriter → LocalBatcher → LocalSubmitter
+        let mq_raft_writer = bisque_mq::RaftWriter::with_backlog(
             mq_raft,
-            None,
-            group_id,
-            &catalog_name,
-            None,
-        ));
+            bisque_mq::RaftWriterConfig::default(),
+            mq_backlog,
+        );
+        let mq_local_batcher = bisque_mq::LocalBatcher::new(
+            mq_raft_writer,
+            self.node_id as u32,
+            bisque_mq::MqWriteBatcherConfig::default(),
+        );
 
         // Router
         let mq_router = Arc::new(
@@ -217,7 +230,11 @@ impl MqState {
                 self.token_manager.clone(),
                 self.meta_engine.clone(),
             )
-            .with_batcher(group_id, mq_batcher),
+            .with_submitter_factory(
+                group_id,
+                mq_local_batcher.writer(),
+                Arc::clone(mq_async_apply.client_registry()),
+            ),
         );
 
         // TCP server
@@ -292,14 +309,20 @@ impl MqState {
 /// - Topic heads use `AtomicU64` for lock-free reads
 /// - Topic watchers use `DashMap` instead of `RwLock<HashMap>`
 /// - Batcher lookup uses a direct `Arc` (single-group) with `DashMap` fallback
+/// Submitter factory: stores the building blocks for creating per-connection
+/// `LocalSubmitter` instances.
+struct SubmitterFactory {
+    writer: bisque_mq::LocalWriter,
+    client_registry: Arc<bisque_mq::async_apply::ClientRegistry>,
+}
+
 pub struct BisqueMqRouter {
     /// Lock-free MQ metadata — all lookups are DashMap/atomic reads.
     metadata: Arc<MqMetadata>,
-    /// Primary batcher (single-group fast path).
-    primary_batcher: Option<(u64, Arc<MqWriteBatcher>)>,
-    /// Partition group batchers: partition_group_id → batcher.
-    /// Populated when partitioned topics are provisioned.
-    partition_batchers: DashMap<u64, Arc<MqWriteBatcher>>,
+    /// Primary submitter factory (single-group fast path).
+    primary_factory: Option<(u64, Arc<SubmitterFactory>)>,
+    /// Partition group factories: partition_group_id → factory.
+    partition_factories: DashMap<u64, Arc<SubmitterFactory>>,
     /// Token manager for handshake validation.
     token_manager: Arc<TokenManager>,
     /// Lock-free entity name→id cache: (entity_type, name_hash) → entity_id.
@@ -321,8 +344,8 @@ impl BisqueMqRouter {
     ) -> Self {
         Self {
             metadata,
-            primary_batcher: None,
-            partition_batchers: DashMap::new(),
+            primary_factory: None,
+            partition_factories: DashMap::new(),
             token_manager,
             entity_cache: DashMap::new(),
             topic_head_cache: DashMap::new(),
@@ -330,14 +353,20 @@ impl BisqueMqRouter {
         }
     }
 
-    pub fn with_batcher(mut self, group_id: u64, batcher: Arc<MqWriteBatcher>) -> Self {
-        self.primary_batcher = Some((group_id, batcher));
+    pub fn with_submitter_factory(
+        mut self,
+        group_id: u64,
+        writer: bisque_mq::LocalWriter,
+        client_registry: Arc<bisque_mq::async_apply::ClientRegistry>,
+    ) -> Self {
+        self.primary_factory = Some((
+            group_id,
+            Arc::new(SubmitterFactory {
+                writer,
+                client_registry,
+            }),
+        ));
         self
-    }
-
-    /// Register a batcher for a partition group.
-    pub fn add_partition_batcher(&self, partition_group_id: u64, batcher: Arc<MqWriteBatcher>) {
-        self.partition_batchers.insert(partition_group_id, batcher);
     }
 }
 
@@ -354,14 +383,25 @@ impl MqRouter for BisqueMqRouter {
         Some(entity_id)
     }
 
-    fn get_batcher(&self, group_id: u64) -> Option<Arc<MqWriteBatcher>> {
-        // Fast path: single-group direct Arc clone (no map lookup).
-        if let Some((gid, ref batcher)) = self.primary_batcher {
+    fn create_submitter(
+        &self,
+        group_id: u64,
+        callback: bisque_mq::async_apply::ResponseCallback,
+    ) -> Option<LocalSubmitter> {
+        let factory = if let Some((gid, ref f)) = self.primary_factory {
             if gid == group_id {
-                return Some(Arc::clone(batcher));
+                Some(Arc::clone(f))
+            } else {
+                None
             }
-        }
-        None
+        } else {
+            None
+        }?;
+        Some(LocalSubmitter::new(
+            factory.writer.clone(),
+            Arc::clone(&factory.client_registry),
+            callback,
+        ))
     }
 
     fn validate_token(
@@ -424,10 +464,20 @@ impl MqRouter for BisqueMqRouter {
         self.metadata.get_topic_partitions(entity_id)
     }
 
-    fn get_partition_batcher(&self, partition_group_id: u64) -> Option<Arc<MqWriteBatcher>> {
-        self.partition_batchers
+    fn create_partition_submitter(
+        &self,
+        partition_group_id: u64,
+        callback: bisque_mq::async_apply::ResponseCallback,
+    ) -> Option<LocalSubmitter> {
+        let factory = self
+            .partition_factories
             .get(&partition_group_id)
-            .map(|entry| Arc::clone(entry.value()))
+            .map(|entry| Arc::clone(entry.value()))?;
+        Some(LocalSubmitter::new(
+            factory.writer.clone(),
+            Arc::clone(&factory.client_registry),
+            callback,
+        ))
     }
 }
 

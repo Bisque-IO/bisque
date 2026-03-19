@@ -30,7 +30,7 @@ use crate::types::MqCommand;
 /// - Actor rebalancing
 pub struct MqRaftNode {
     raft: Raft<MqTypeConfig>,
-    node_id: u64,
+    node_id: u32,
     group_id: u64,
     config: MqConfig,
     metadata: Option<Arc<MqMetadata>>,
@@ -42,7 +42,7 @@ pub struct MqRaftNode {
 }
 
 impl MqRaftNode {
-    pub fn new(raft: Raft<MqTypeConfig>, node_id: u64, config: MqConfig) -> Self {
+    pub fn new(raft: Raft<MqTypeConfig>, node_id: u32, config: MqConfig) -> Self {
         Self {
             raft,
             node_id,
@@ -217,7 +217,7 @@ impl MqRaftNode {
     where
         F: Fn(
                 Raft<MqTypeConfig>,
-                u64,
+                u32,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
             + Send
             + Sync

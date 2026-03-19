@@ -32,6 +32,12 @@ pub struct RaftWriterStats {
     pub entries: AtomicU64,
     /// Total bytes across all proposals.
     pub bytes: AtomicU64,
+    /// Number of `client_write_many` calls that returned `Err` (whole-batch failure).
+    pub proposal_errors: AtomicU64,
+    /// Number of individual entries whose stream result was `Err`.
+    pub entry_errors: AtomicU64,
+    /// Bytes released due to errors (not applied by state machine).
+    pub error_released_bytes: AtomicU64,
 }
 
 impl RaftWriterStats {
@@ -39,6 +45,9 @@ impl RaftWriterStats {
         self.proposals.store(0, Ordering::Relaxed);
         self.entries.store(0, Ordering::Relaxed);
         self.bytes.store(0, Ordering::Relaxed);
+        self.proposal_errors.store(0, Ordering::Relaxed);
+        self.entry_errors.store(0, Ordering::Relaxed);
+        self.error_released_bytes.store(0, Ordering::Relaxed);
     }
 }
 
@@ -63,6 +72,12 @@ pub struct RaftWriterConfig {
     ///
     /// [`submit`]: RaftWriter::submit
     pub max_backlog_bytes: usize,
+    /// Maximum entries a single worker will batch into one
+    /// `client_write_many` call. Capping this prevents a single worker from
+    /// accumulating a giant proposal that serialises mmap writes and fsync —
+    /// smaller proposals allow the Raft core to pipeline append→fsync
+    /// across multiple workers. Default: 64.
+    pub max_entries_per_proposal: usize,
 }
 
 impl Default for RaftWriterConfig {
@@ -71,6 +86,7 @@ impl Default for RaftWriterConfig {
             worker_count: 8,
             queue_capacity: 256,
             max_backlog_bytes: 256 * 1024 * 1024,
+            max_entries_per_proposal: 64,
         }
     }
 }
@@ -88,6 +104,11 @@ impl RaftWriterConfig {
 
     pub fn with_max_backlog_bytes(mut self, n: usize) -> Self {
         self.max_backlog_bytes = n;
+        self
+    }
+
+    pub fn with_max_entries_per_proposal(mut self, n: usize) -> Self {
+        self.max_entries_per_proposal = n;
         self
     }
 }
@@ -111,7 +132,10 @@ pub struct RaftWriter {
 impl RaftWriter {
     /// Create a new `RaftWriter` with an internal backlog budget derived from
     /// `config.max_backlog_bytes`.
-    pub fn new(raft: Raft<MqTypeConfig>, config: RaftWriterConfig) -> Arc<Self> {
+    pub fn new<SM: Send + 'static>(
+        raft: Raft<MqTypeConfig, SM>,
+        config: RaftWriterConfig,
+    ) -> Arc<Self> {
         let backlog = Arc::new(RaftBacklog::new(config.max_backlog_bytes));
         Self::with_backlog(raft, config, backlog)
     }
@@ -121,8 +145,8 @@ impl RaftWriter {
     /// Use this when the same backlog budget must be shared between multiple
     /// components (e.g. a local batcher and a forward acceptor on the same
     /// Raft group).
-    pub fn with_backlog(
-        raft: Raft<MqTypeConfig>,
+    pub fn with_backlog<SM: Send + 'static>(
+        raft: Raft<MqTypeConfig, SM>,
         config: RaftWriterConfig,
         backlog: Arc<RaftBacklog>,
     ) -> Arc<Self> {
@@ -130,13 +154,14 @@ impl RaftWriter {
         let (tx, rx) = crossfire::mpmc::bounded_async::<(MqCommand, usize)>(config.queue_capacity);
         let stats = Arc::new(RaftWriterStats::default());
 
+        let max_entries = config.max_entries_per_proposal.max(1);
         let workers = (0..worker_count)
             .map(|_| {
                 let rx = rx.clone();
                 let raft = raft.clone();
                 let backlog = Arc::clone(&backlog);
                 let stats = Arc::clone(&stats);
-                tokio::spawn(raft_worker_loop(rx, raft, backlog, stats))
+                tokio::spawn(raft_worker_loop(rx, raft, backlog, stats, max_entries))
             })
             .collect();
 
@@ -200,11 +225,12 @@ impl RaftWriter {
 // Worker loop
 // ---------------------------------------------------------------------------
 
-async fn raft_worker_loop(
+async fn raft_worker_loop<SM: Send + 'static>(
     rx: crossfire::MAsyncRx<crossfire::mpmc::Array<(MqCommand, usize)>>,
-    raft: Raft<MqTypeConfig>,
+    raft: Raft<MqTypeConfig, SM>,
     backlog: Arc<RaftBacklog>,
     stats: Arc<RaftWriterStats>,
+    max_entries: usize,
 ) {
     loop {
         // Block until at least one command is available.
@@ -216,11 +242,17 @@ async fn raft_worker_loop(
         let mut cmds = vec![first_cmd];
         let mut sizes = vec![first_len];
 
-        // Greedily drain all immediately available commands so Raft sees
-        // as large a batch as possible per client_write_many call.
-        while let Ok((cmd, len)) = rx.try_recv() {
-            cmds.push(cmd);
-            sizes.push(len);
+        // Greedily drain immediately available commands, up to the per-proposal
+        // cap. Smaller proposals let the Raft core pipeline append→fsync
+        // across workers instead of serialising one giant write.
+        while cmds.len() < max_entries {
+            match rx.try_recv() {
+                Ok((cmd, len)) => {
+                    cmds.push(cmd);
+                    sizes.push(len);
+                }
+                Err(_) => break,
+            }
         }
 
         // Record stats.
@@ -235,7 +267,12 @@ async fn raft_worker_loop(
         let batch_size = cmds.len();
         match raft.client_write_many(cmds).await {
             Err(e) => {
-                debug!(error = %e, "raft_writer: write_many fatal error");
+                debug!(error = %e, entries = batch_size, "raft_writer: write_many error");
+                stats.proposal_errors.fetch_add(1, Ordering::Relaxed);
+                let err_bytes: usize = sizes.iter().sum();
+                stats
+                    .error_released_bytes
+                    .fetch_add(err_bytes as u64, Ordering::Relaxed);
                 for &sz in &sizes {
                     backlog.release(sz);
                 }
@@ -245,7 +282,11 @@ async fn raft_worker_loop(
                 let mut i = 0usize;
                 while let Some(result) = stream.next().await {
                     if result.is_err() {
+                        stats.entry_errors.fetch_add(1, Ordering::Relaxed);
                         if i < sizes.len() {
+                            stats
+                                .error_released_bytes
+                                .fetch_add(sizes[i] as u64, Ordering::Relaxed);
                             backlog.release(sizes[i]);
                         }
                     }

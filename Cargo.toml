@@ -219,6 +219,7 @@ opentelemetry-proto = { version = "0.31", default-features = false, features = [
 openraft = { git = "https://github.com/databendlabs/openraft", branch = "main", default-features = false, features = [
     "serde",
     "tokio-rt",
+    "type-alias",
 ] }
 openraft-macros = { git = "https://github.com/databendlabs/openraft", branch = "main" }
 # maniac-rusqlite = { path = "crates/rusqlite", version = "0.9.29" }

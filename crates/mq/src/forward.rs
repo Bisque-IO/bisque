@@ -89,323 +89,6 @@ const FRAME_PREFIX_LEN: usize = 4;
 /// adding zero extra syscalls.
 const BATCH_HEADER_LEN: usize = 24;
 
-// ---------------------------------------------------------------------------
-// Lock-free outbound partition buffer
-// ---------------------------------------------------------------------------
-
-/// Capacity of each outbound segment. 1 MiB fits many sub-frames.
-const OUTBOUND_SEG_CAPACITY: u32 = 1 << 20; // 1 MiB
-
-/// Bit 31 of `write_pos` is set by the drainer to seal the segment.
-const OUTBOUND_SEALED_BIT: u32 = 1 << 31;
-
-// Sub-frame format (directly usable as TCP wire frames):
-//   [payload_len: 4 LE][client_id: 4 LE][request_seq: 8 LE][cmd_bytes...]
-//   payload_len = 12 + cmd.len()
-//   total frame  = 16 + cmd.len() bytes
-
-/// One fixed-capacity buffer for a single outbound partition.
-///
-/// # Concurrency
-/// - `write_pos` is claimed by producers via CAS; bit 31 is the seal flag.
-/// - `committed` is incremented by producers (Release) after each write.
-/// - Drainer spins (Acquire) until `committed == final_write_pos` before reading.
-struct OutboundSeg {
-    data: std::cell::UnsafeCell<BytesMut>,
-    write_pos: AtomicU32, // bit 31 = OUTBOUND_SEALED_BIT
-    committed: AtomicU32,
-    capacity: u32,
-}
-
-// Safety: producers write to non-overlapping ranges claimed via CAS; the drainer
-// reads only after all producers have committed (spin-wait on `committed`).
-unsafe impl Send for OutboundSeg {}
-unsafe impl Sync for OutboundSeg {}
-
-impl OutboundSeg {
-    fn new(capacity: u32) -> Box<Self> {
-        Box::new(Self {
-            data: std::cell::UnsafeCell::new(BytesMut::with_capacity(capacity as usize)),
-            write_pos: AtomicU32::new(0),
-            committed: AtomicU32::new(0),
-            capacity,
-        })
-    }
-}
-
-/// Per-partition state: an atomically-swappable active segment.
-struct OutboundPartition {
-    active: AtomicPtr<OutboundSeg>,
-}
-
-unsafe impl Send for OutboundPartition {}
-unsafe impl Sync for OutboundPartition {}
-
-impl Drop for OutboundPartition {
-    fn drop(&mut self) {
-        let p = self.active.load(Ordering::Relaxed);
-        if !p.is_null() {
-            unsafe { drop(Box::from_raw(p)) };
-        }
-    }
-}
-
-/// Shared waker state for the drainer. Coalesces rapid writes into one wakeup.
-struct OutboundWaker {
-    pending: AtomicBool,
-    notify: tokio::sync::Notify,
-}
-
-impl OutboundWaker {
-    #[inline]
-    fn wake(&self) {
-        if !self.pending.swap(true, Ordering::Release) {
-            self.notify.notify_waiters();
-        }
-    }
-}
-
-/// Shared lock-free outbound buffer — held by `ForwardClient`/`ForwardHandle`
-/// writers and the background drain task.
-///
-/// Writers call [`try_write`] or [`write`] to append sub-frames lock-free.
-/// The drain loop calls [`drain_to_tcp`] after [`wait_for_data`] wakes it.
-pub struct OutboundBuf {
-    partitions: Vec<Arc<OutboundPartition>>,
-    waker: OutboundWaker,
-    /// Wakes writers blocked on a sealed/full segment after `collect_slabs()`
-    /// installs fresh segments.
-    writer_waker: tokio::sync::Notify,
-    mask: u32,
-    /// Raft group ID embedded in batch headers.
-    raft_group_id: u32,
-    /// Monotonically increasing batch sequence counter for dedup.
-    next_batch_seq: AtomicU64,
-    /// Cumulative ACK: highest response-slab counter received from the leader.
-    /// Set by the inbound loop, read by `drain_to_tcp` and stamped into the
-    /// batch header — zero extra syscalls.
-    ack_seq: AtomicU64,
-}
-
-impl OutboundBuf {
-    fn new(num_partitions: usize, raft_group_id: u32) -> Self {
-        let n = num_partitions.next_power_of_two().max(1);
-        let partitions = (0..n)
-            .map(|_| {
-                Arc::new(OutboundPartition {
-                    active: AtomicPtr::new(Box::into_raw(OutboundSeg::new(OUTBOUND_SEG_CAPACITY))),
-                })
-            })
-            .collect();
-        Self {
-            partitions,
-            waker: OutboundWaker {
-                pending: AtomicBool::new(false),
-                notify: tokio::sync::Notify::new(),
-            },
-            writer_waker: tokio::sync::Notify::new(),
-            mask: (n - 1) as u32,
-            raft_group_id,
-            next_batch_seq: AtomicU64::new(0),
-            ack_seq: AtomicU64::new(0),
-        }
-    }
-
-    /// Try to write one sub-frame to the partition for `client_id`.
-    ///
-    /// Returns `false` if the segment is sealed or full (backpressure).
-    #[inline]
-    pub fn try_write(&self, client_id: u32, request_seq: u64, cmd: &[u8]) -> bool {
-        let entry_size = (16 + cmd.len()) as u32;
-        let payload_len = (12 + cmd.len()) as u32;
-        let idx = (client_id & self.mask) as usize;
-        let partition = &self.partitions[idx];
-
-        loop {
-            let seg_ptr = partition.active.load(Ordering::Acquire);
-            let seg = unsafe { &*seg_ptr };
-
-            let pos = seg.write_pos.load(Ordering::Relaxed);
-            if pos & OUTBOUND_SEALED_BIT != 0 || pos + entry_size > seg.capacity {
-                return false;
-            }
-            if seg
-                .write_pos
-                .compare_exchange(pos, pos + entry_size, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-            {
-                continue; // lost slot race, retry
-            }
-
-            unsafe {
-                let dst = (*seg.data.get()).as_ptr().add(pos as usize) as *mut u8;
-                (dst as *mut u32).write_unaligned(payload_len.to_le());
-                (dst.add(4) as *mut u32).write_unaligned(client_id.to_le());
-                (dst.add(8) as *mut u64).write_unaligned(request_seq.to_le());
-                std::ptr::copy_nonoverlapping(cmd.as_ptr(), dst.add(16), cmd.len());
-            }
-
-            seg.committed.fetch_add(entry_size, Ordering::Release);
-            self.waker.wake();
-            return true;
-        }
-    }
-
-    /// Async write — spins briefly then waits on Notify for segment availability.
-    #[inline]
-    pub async fn write(&self, client_id: u32, request_seq: u64, cmd: &[u8]) {
-        // Fast path: usually succeeds on the first try.
-        if self.try_write(client_id, request_seq, cmd) {
-            return;
-        }
-        // Brief spin: the drainer installs new segments very quickly after sealing.
-        for _ in 0..8 {
-            std::hint::spin_loop();
-            if self.try_write(client_id, request_seq, cmd) {
-                return;
-            }
-        }
-        // Slow path: register for notification and wait.
-        loop {
-            let notified = self.writer_waker.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.try_write(client_id, request_seq, cmd) {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    /// Wait for data to be available (HighWaterMark pattern).
-    async fn wait_for_data(&self) {
-        let notified = self.waker.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !self.waker.pending.swap(false, Ordering::AcqRel) {
-            notified.await;
-            self.waker.pending.store(false, Ordering::Relaxed);
-        }
-    }
-
-    /// Seal all partitions, install fresh segments (unblocking producers immediately),
-    /// spin-wait for in-flight writes, and return the collected slabs with a pre-built
-    /// batch header. Returns `None` if all partitions were empty.
-    ///
-    /// This is the fast, synchronous half of the drain: no I/O happens here.
-    /// The caller is responsible for writing the returned [`DrainBatch`] to TCP.
-    fn collect_slabs(&self) -> Option<DrainBatch> {
-        let mut slabs: Vec<Bytes> = Vec::new();
-        let mut total_payload = 0usize;
-
-        for partition in self.partitions.iter() {
-            let old_ptr = partition.active.load(Ordering::Acquire);
-            let old_seg = unsafe { &*old_ptr };
-
-            let sealed = old_seg
-                .write_pos
-                .fetch_or(OUTBOUND_SEALED_BIT, Ordering::AcqRel);
-            let final_pos = sealed & !OUTBOUND_SEALED_BIT;
-
-            if final_pos == 0 {
-                // Empty segment — unseal and reuse.
-                old_seg
-                    .write_pos
-                    .fetch_and(!OUTBOUND_SEALED_BIT, Ordering::Relaxed);
-                continue;
-            }
-
-            // Install a fresh segment so writers can proceed immediately.
-            let new_seg = Box::into_raw(OutboundSeg::new(OUTBOUND_SEG_CAPACITY));
-            partition.active.store(new_seg, Ordering::Release);
-
-            // Spin-wait for all in-flight producers to finish committing.
-            while old_seg.committed.load(Ordering::Acquire) < final_pos {
-                std::hint::spin_loop();
-            }
-
-            // Extract the committed bytes (zero-copy split).
-            let data = unsafe {
-                let bm = &mut *old_seg.data.get();
-                bm.set_len(final_pos as usize);
-                bm.split().freeze()
-            };
-            // Drop the old segment now that we own `data`.
-            unsafe { drop(Box::from_raw(old_ptr)) };
-
-            total_payload += data.len();
-            slabs.push(data);
-        }
-
-        // Wake writers that were blocked on sealed/full segments.
-        self.writer_waker.notify_waiters();
-
-        if total_payload == 0 {
-            return None;
-        }
-
-        // Build batch header: [batch_seq:8][raft_group_id:4][payload_len:4][ack_seq:8]
-        let batch_seq = self.next_batch_seq.fetch_add(1, Ordering::Relaxed);
-        let ack = self.ack_seq.load(Ordering::Relaxed);
-        let mut header = [0u8; BATCH_HEADER_LEN];
-        header[0..8].copy_from_slice(&batch_seq.to_le_bytes());
-        header[8..12].copy_from_slice(&self.raft_group_id.to_le_bytes());
-        header[12..16].copy_from_slice(&(total_payload as u32).to_le_bytes());
-        header[16..24].copy_from_slice(&ack.to_le_bytes());
-
-        Some(DrainBatch { header, slabs })
-    }
-}
-
-/// A batch of sealed outbound slabs with a pre-built wire header, ready to write to TCP.
-struct DrainBatch {
-    header: [u8; BATCH_HEADER_LEN],
-    slabs: Vec<Bytes>,
-}
-
-/// Write a length-prefixed frame.
-async fn write_frame(writer: &mut BoxedWriter, data: &[u8]) -> io::Result<()> {
-    let len = data.len() as u32;
-    writer.write_all(&len.to_le_bytes()).await?;
-    if !data.is_empty() {
-        writer.write_all(data).await?;
-    }
-    Ok(())
-}
-
-/// Write a command/response frame: `[4-byte len][client_id:u32][payload]`.
-async fn write_client_frame(
-    writer: &mut BoxedWriter,
-    client_id: u32,
-    payload: &[u8],
-) -> io::Result<()> {
-    let total_len = (4 + payload.len()) as u32;
-    writer.write_all(&total_len.to_le_bytes()).await?;
-    writer.write_all(&client_id.to_le_bytes()).await?;
-    if !payload.is_empty() {
-        writer.write_all(payload).await?;
-    }
-    Ok(())
-}
-
-/// Flush and write multiple client frames batched.
-async fn write_client_frames_batched(
-    writer: &mut BoxedWriter,
-    buf: &mut BytesMut,
-    frames: &[(u32, Bytes)],
-) -> io::Result<()> {
-    buf.clear();
-    for (client_id, payload) in frames {
-        let total_len = (4 + payload.len()) as u32;
-        buf.put_u32_le(total_len);
-        buf.put_u32_le(*client_id);
-        buf.put_slice(payload);
-    }
-    writer.write_all(buf).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
 /// Read a length-prefixed frame into `buf`. Returns the payload length.
 /// Returns `Ok(0)` on clean EOF.
 async fn read_frame_into(reader: &mut BoxedReader, buf: &mut BytesMut) -> io::Result<usize> {
@@ -427,13 +110,20 @@ async fn read_frame_into(reader: &mut BoxedReader, buf: &mut BytesMut) -> io::Re
     Ok(payload_len)
 }
 
-/// Parse a client frame payload: `[client_id:u32][data...]`.
-fn parse_client_frame(buf: &BytesMut) -> Option<(u32, &[u8])> {
-    if buf.len() < 4 {
-        return None;
+/// A batch of sealed outbound slabs with a pre-built wire header, ready to write to TCP.
+struct DrainBatch {
+    header: [u8; BATCH_HEADER_LEN],
+    slabs: Vec<Bytes>,
+}
+
+/// Write a length-prefixed frame.
+async fn write_frame(writer: &mut BoxedWriter, data: &[u8]) -> io::Result<()> {
+    let len = data.len() as u32;
+    writer.write_all(&len.to_le_bytes()).await?;
+    if !data.is_empty() {
+        writer.write_all(data).await?;
     }
-    let client_id = read_u32_le(buf, 0).ok()?;
-    Some((client_id, &buf[4..]))
+    Ok(())
 }
 
 // =============================================================================
@@ -454,6 +144,14 @@ pub struct RaftBacklog {
     semaphore: tokio::sync::Semaphore,
     notify: tokio::sync::Notify,
     max: usize,
+    /// Total bytes charged (diagnostic counter).
+    pub total_charged: std::sync::atomic::AtomicU64,
+    /// Total bytes released (diagnostic counter).
+    pub total_released: std::sync::atomic::AtomicU64,
+    /// Number of charge() calls completed (diagnostic).
+    pub charge_count: std::sync::atomic::AtomicU64,
+    /// Number of release() calls (diagnostic).
+    pub release_count: std::sync::atomic::AtomicU64,
 }
 
 impl RaftBacklog {
@@ -462,6 +160,10 @@ impl RaftBacklog {
             semaphore: tokio::sync::Semaphore::new(max_bytes),
             notify: tokio::sync::Notify::new(),
             max: max_bytes,
+            total_charged: std::sync::atomic::AtomicU64::new(0),
+            total_released: std::sync::atomic::AtomicU64::new(0),
+            charge_count: std::sync::atomic::AtomicU64::new(0),
+            release_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -470,6 +172,10 @@ impl RaftBacklog {
     /// Fair: waiters are served in FIFO order.  The call blocks until
     /// enough budget has been released, then atomically reserves `bytes`.
     pub async fn charge(&self, bytes: usize) {
+        self.total_charged
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        self.charge_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let permit = self.semaphore.acquire_many(bytes as u32).await.unwrap();
         permit.forget();
     }
@@ -482,6 +188,8 @@ impl RaftBacklog {
     pub fn try_charge(&self, bytes: usize) -> bool {
         match self.semaphore.try_acquire_many(bytes as u32) {
             Ok(permit) => {
+                self.total_charged
+                    .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
                 permit.forget();
                 true
             }
@@ -492,8 +200,24 @@ impl RaftBacklog {
     /// Remove bytes from the backlog (after raft apply or on proposal failure).
     #[inline]
     pub fn release(&self, bytes: usize) {
+        self.total_released
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        self.release_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.semaphore.add_permits(bytes);
         self.notify.notify_waiters();
+    }
+
+    /// Reset diagnostic counters.
+    pub fn reset_counters(&self) {
+        self.total_charged
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.total_released
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.charge_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.release_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Current backlog in bytes.
@@ -506,6 +230,12 @@ impl RaftBacklog {
     #[inline]
     pub fn max(&self) -> usize {
         self.max
+    }
+
+    /// Raw semaphore permit count (diagnostic).
+    #[inline]
+    pub fn semaphore_permits(&self) -> usize {
+        self.semaphore.available_permits()
     }
 
     /// Wait until the backlog drains to zero.
@@ -1035,7 +765,7 @@ const OUTBOUND_WRITE_CHANNEL_CAP: usize = 64;
 /// across reconnections.
 async fn run_drain_loop(
     frame_rx: FrameRx,
-    batch_tx: tokio::sync::mpsc::Sender<DrainBatch>,
+    batch_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<DrainBatch>>,
     raft_group_id: u32,
     max_batch_bytes: usize,
     ack_seq: Arc<AtomicU64>,
@@ -1089,11 +819,11 @@ async fn run_drain_loop(
 /// Runs independently of the drain loop so that slow TCP writes never delay
 /// segment installation and producer progress.
 async fn run_tcp_write_loop(
-    mut batch_rx: tokio::sync::mpsc::Receiver<DrainBatch>,
+    batch_rx: crossfire::AsyncRx<crossfire::mpsc::Array<DrainBatch>>,
     mut writer: BoxedWriter,
     failed: CancellationToken,
 ) {
-    while let Some(batch) = batch_rx.recv().await {
+    while let Ok(batch) = batch_rx.recv().await {
         if let Err(e) = write_drain_batch(&mut writer, &batch).await {
             debug!(error = %e, "outbound TCP write failed");
             failed.cancel();
@@ -1131,7 +861,8 @@ async fn run_forward_client_connection(
     let stop_drain = cancel.child_token();
     let outbound_failed = CancellationToken::new();
 
-    let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<DrainBatch>(OUTBOUND_WRITE_CHANNEL_CAP);
+    let (batch_tx, batch_rx) =
+        crossfire::mpsc::bounded_async::<DrainBatch>(OUTBOUND_WRITE_CHANNEL_CAP);
 
     let drain_handle = tokio::spawn(run_drain_loop(
         frame_rx,
@@ -1750,27 +1481,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_and_read_client_frame() {
-        let (c, s) = tokio::io::duplex(8192);
-        let (_cr, cw) = tokio::io::split(c);
-        let (sr, _sw) = tokio::io::split(s);
-        let mut writer: BoxedWriter = Box::new(cw);
-        let mut reader: BoxedReader = Box::new(sr);
-
-        write_client_frame(&mut writer, 42, b"test payload")
-            .await
-            .unwrap();
-        writer.flush().await.unwrap();
-
-        let mut buf = BytesMut::new();
-        let len = read_frame_into(&mut reader, &mut buf).await.unwrap();
-        assert_eq!(len, 4 + b"test payload".len());
-        let (cid, data) = parse_client_frame(&buf).unwrap();
-        assert_eq!(cid, 42);
-        assert_eq!(data, b"test payload");
-    }
-
-    #[tokio::test]
     async fn client_server_roundtrip() {
         let config = ForwardConfig::default();
         let (mut acceptor, mut batch_rx) =
@@ -1926,22 +1636,6 @@ mod tests {
         assert_eq!(config.responder_channel_capacity, 256);
         assert_eq!(config.num_outbound_partitions, 4);
         assert!(config.tcp_nodelay);
-    }
-
-    #[test]
-    fn parse_client_frame_valid() {
-        let mut buf = BytesMut::new();
-        buf.put_u32_le(123);
-        buf.put_slice(b"data");
-        let (cid, data) = parse_client_frame(&buf).unwrap();
-        assert_eq!(cid, 123);
-        assert_eq!(data, b"data");
-    }
-
-    #[test]
-    fn parse_client_frame_too_short() {
-        let buf = BytesMut::from(&[1u8, 2, 3][..]);
-        assert!(parse_client_frame(&buf).is_none());
     }
 
     // =========================================================================

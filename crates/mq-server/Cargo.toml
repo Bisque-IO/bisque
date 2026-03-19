@@ -11,6 +11,7 @@ bisque-mq = { workspace = true }
 bisque-mq-protocol = { workspace = true }
 bisque-raft = { workspace = true }
 bytes = { workspace = true }
+crossfire = { workspace = true }
 metrics = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }

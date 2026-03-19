@@ -40,6 +40,7 @@ pub use storage_mmap::MmapPerGroupLogStorage;
 pub use storage_mmap::MmapPerGroupLogStorage as MultiplexedLogStorage;
 pub use storage_mmap::MmapStorageConfig;
 pub use storage_mmap::MmapStorageConfig as MultiplexedStorageConfig;
+pub use storage_mmap::MmapStorageStats;
 pub use storage_mmap::SegmentPrefetcher;
 pub use storage_mmap::SegmentView;
 pub use storage_mmap::scan_segment_ids;

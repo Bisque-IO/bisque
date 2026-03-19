@@ -805,13 +805,24 @@ impl Decode for EntityStats {
 impl Encode for MqCommand {
     #[inline]
     fn encode<W: Write>(&self, w: &mut W) -> Result<(), CodecError> {
-        w.write_all(&self.buf)?;
+        if self.extra.is_empty() {
+            w.write_all(&self.buf)?;
+        } else {
+            w.write_all(&self.header)?;
+            for seg in &self.extra {
+                w.write_all(seg)?;
+            }
+        }
         Ok(())
     }
 
     #[inline]
     fn encoded_size(&self) -> usize {
-        self.buf.len()
+        if self.extra.is_empty() {
+            self.buf.len()
+        } else {
+            32 + self.extra.iter().map(|b| b.len()).sum::<usize>()
+        }
     }
 }
 
@@ -841,11 +852,15 @@ impl Decode for MqCommand {
 
 impl BorrowPayload for MqCommand {
     fn payload_bytes(&self) -> &[u8] {
-        &self.buf
+        if self.extra.is_empty() {
+            &self.buf
+        } else {
+            &self.header
+        }
     }
 
     fn extra_payload_segments(&self) -> &[bytes::Bytes] {
-        &[]
+        &self.extra
     }
 }
 

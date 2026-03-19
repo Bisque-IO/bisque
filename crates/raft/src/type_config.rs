@@ -9,6 +9,14 @@ use openraft::impls::Vote;
 use openraft::impls::leader_id_adv::LeaderId;
 use std::io::Cursor;
 
+/// Bisque Raft type aliases — centralise the concrete types so downstream
+/// code can use `LeaderIdOf<C>`, `LogIdOf<C>`, etc. without spelling out
+/// all the generic parameters.
+pub type BisqueNodeId = u32;
+pub type BisqueTerm = u32;
+pub type BisqueLeaderId = LeaderId<BisqueTerm, BisqueNodeId>;
+pub type BisqueCommittedLeaderId = BisqueLeaderId; // leader_id_adv: Committed = Self
+
 pub struct BisqueRaftTypeConfig<D, R> {
     _d: std::marker::PhantomData<D>,
     _r: std::marker::PhantomData<R>,
@@ -67,12 +75,12 @@ where
 {
     type D = D;
     type R = R;
-    type NodeId = u64;
+    type NodeId = BisqueNodeId;
     type Node = BasicNode;
-    type Term = u64;
-    type LeaderId = LeaderId<Self>;
-    type Vote = Vote<Self>;
-    type Entry = Entry<Self>;
+    type Term = BisqueTerm;
+    type LeaderId = BisqueLeaderId;
+    type Vote = Vote<BisqueLeaderId>;
+    type Entry = Entry<BisqueCommittedLeaderId, D, BisqueNodeId, BasicNode>;
     type SnapshotData = Cursor<Vec<u8>>;
     type Responder<T: openraft::OptionalSend + 'static> = OneshotResponder<Self, T>;
     type AsyncRuntime = TokioRuntime;

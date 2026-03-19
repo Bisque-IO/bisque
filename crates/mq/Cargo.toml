@@ -43,3 +43,5 @@ tls = ["dep:tokio-rustls", "dep:rustls"]
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memmap2 = { workspace = true }
+libc = { workspace = true }

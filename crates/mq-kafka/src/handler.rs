@@ -7,7 +7,7 @@ use bisque_mq::MqMetadata;
 use bisque_mq::ResponseEntry;
 use bisque_mq::consumer_group::GroupPhase;
 use bisque_mq::types::{MqCommand, MqError, RetentionPolicy, name_hash};
-use bisque_mq::write_batcher::MqWriteBatcher;
+use bisque_mq::write_batcher::LocalSubmitter;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use smallvec::smallvec;
@@ -173,7 +173,7 @@ impl TopicNotifier {
 /// The partition map uses `ArcSwap` for lock-free reads — no mutex contention
 /// on the hot produce/fetch/heartbeat paths.
 pub struct KafkaHandler {
-    batcher: Arc<MqWriteBatcher>,
+    batcher: Arc<LocalSubmitter>,
     log_reader: Arc<dyn KafkaLogReader>,
     metadata: Arc<MqMetadata>,
     /// Lock-free partition map: readers get an Arc snapshot with zero contention.
@@ -203,7 +203,7 @@ pub struct KafkaHandler {
 
 impl KafkaHandler {
     pub fn new(
-        batcher: Arc<MqWriteBatcher>,
+        batcher: Arc<LocalSubmitter>,
         log_reader: Arc<dyn KafkaLogReader>,
         metadata: Arc<MqMetadata>,
         broker_id: i32,
@@ -2653,7 +2653,7 @@ mod tests {
     use super::*;
     use bisque_mq::config::MqConfig;
     use bisque_mq::engine::MqEngine;
-    use bisque_mq::write_batcher::MqWriteBatcher;
+    use bisque_mq::write_batcher::LocalSubmitter;
     use std::sync::Arc;
 
     struct MockLogReader {
@@ -2703,7 +2703,7 @@ mod tests {
         let engine = MqEngine::new(config);
         let metadata = engine.shared_metadata();
         let engine = Arc::new(engine);
-        let batcher = Arc::new(MqWriteBatcher::new_test(Arc::clone(&engine)));
+        let batcher = Arc::new(LocalSubmitter::new_test(Arc::clone(&engine)));
         let log_reader = Arc::new(MockLogReader::new());
         let handler = KafkaHandler::new(
             batcher,

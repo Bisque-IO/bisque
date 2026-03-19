@@ -1259,7 +1259,7 @@ struct ClientPartition {
     partition_id: usize,
     num_partitions: usize,
     inbox: Arc<PartitionInbox>,
-    reg_rx: tokio::sync::mpsc::UnboundedReceiver<ClientPartitionMsg>,
+    reg_rx: crossfire::AsyncRx<crossfire::mpsc::Array<ClientPartitionMsg>>,
     callbacks: HashMap<u32, ResponseCallback>,
     seen_ids: HashSet<u32>,
 }
@@ -1331,8 +1331,8 @@ impl ClientPartition {
                 biased;
                 msg = self.reg_rx.recv() => {
                     match msg {
-                        Some(m) => self.handle_reg(m),
-                        None => return,
+                        Ok(m) => self.handle_reg(m),
+                        Err(_) => return,
                     }
                 }
                 _ = self.inbox.wait_for_data() => {
@@ -1369,7 +1369,7 @@ pub struct ClientRegistry {
     next_id: AtomicU32,
     num_partitions: usize,
     inboxes: Vec<Arc<PartitionInbox>>,
-    reg_txs: Vec<tokio::sync::mpsc::UnboundedSender<ClientPartitionMsg>>,
+    reg_txs: Vec<crossfire::MAsyncTx<crossfire::mpsc::Array<ClientPartitionMsg>>>,
 }
 
 impl ClientRegistry {
@@ -1384,7 +1384,7 @@ impl ClientRegistry {
 
         for i in 0..n {
             let inbox = PartitionInbox::new();
-            let (reg_tx, reg_rx) = tokio::sync::mpsc::unbounded_channel::<ClientPartitionMsg>();
+            let (reg_tx, reg_rx) = crossfire::mpsc::bounded_async::<ClientPartitionMsg>(128);
             inboxes.push(Arc::clone(&inbox));
             reg_txs.push(reg_tx);
 
@@ -1415,14 +1415,14 @@ impl ClientRegistry {
     pub fn register(&self, callback: ResponseCallback) -> u32 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let partition = (id as usize) % self.num_partitions;
-        let _ = self.reg_txs[partition].send(ClientPartitionMsg::Register(id, callback));
+        let _ = self.reg_txs[partition].try_send(ClientPartitionMsg::Register(id, callback));
         id
     }
 
     /// Unregister a client. The partition task drops the callback asynchronously.
     pub fn unregister(&self, client_id: u32) {
         let partition = (client_id as usize) % self.num_partitions;
-        let _ = self.reg_txs[partition].send(ClientPartitionMsg::Unregister(client_id));
+        let _ = self.reg_txs[partition].try_send(ClientPartitionMsg::Unregister(client_id));
     }
 
     /// Push a raw [`Bytes`] chunk (complete wire frames) to a specific partition.
@@ -1504,7 +1504,6 @@ struct PartitionWorker {
     engine: Arc<MqEngine>,
     client_registry: Arc<ClientRegistry>,
     client_id_table: Arc<ClientIdTable>,
-    batch_registry: Arc<ParkingMutex<HashMap<u32, tokio::sync::oneshot::Sender<ResponseEntry>>>>,
     /// Owned per-follower responder tx table, indexed by node_id.
     /// Updated via `responder_update_rx` when followers connect/disconnect.
     responder_txs: Box<[Option<crossfire::MAsyncTx<crossfire::mpsc::Array<Bytes>>>; 64]>,
@@ -1653,39 +1652,15 @@ impl PartitionWorker {
 
             let cmd = rec.command;
 
-            // TAG_BATCH: designated worker (log_index % num_partitions == partition_id)
-            // applies the full batch and delivers response via batch_registry.
-            if cmd.tag() == MqCommand::TAG_BATCH {
-                if (rec.log_index as usize) % self.num_partitions == self.partition_id {
-                    let segment_id = scan.current_segment_id().unwrap_or(0);
-                    let batch_id = match cmd.as_batch() {
-                        Ok(b) => b.batch_id(),
-                        Err(_) => {
-                            continue;
-                        }
-                    };
-                    let mut resp_buf = BytesMut::new();
-                    self.engine.apply_command(
-                        &cmd,
-                        &mut resp_buf,
-                        rec.log_index,
-                        current_time,
-                        Some(segment_id),
-                    );
-                    let response = ResponseEntry::split_from(&mut resp_buf);
-                    self.handle_structural_writes(&cmd, &response, rec.log_index);
-                    // Deliver to batcher via registry.
-                    if batch_id != 0 {
-                        if let Some(tx) = self.batch_registry.lock().remove(&batch_id) {
-                            let _ = tx.send(response);
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // TAG_FORWARDED_BATCH: accumulate response frames for follower responders
-            // (by client_id % N), and apply sub-commands to the engine (by primary_id % N).
+            // TAG_FORWARDED_BATCH: apply sub-commands and deliver responses.
+            //
+            // For node_id=0 (local): single merged loop — apply sub-commands
+            // owned by this partition and deliver rich ResponseEntry frames
+            // directly via ClientRegistry (same path as non-batched commands).
+            //
+            // For node_id>0 (remote follower): two-phase — accumulate minimal
+            // response frames in response_buf for TCP delivery, then apply
+            // sub-commands in a second pass.
             if cmd.tag() == MqCommand::TAG_FORWARDED_BATCH {
                 let view = match cmd.as_forwarded_batch() {
                     Ok(v) => v,
@@ -1707,45 +1682,84 @@ impl PartitionWorker {
                         self.applied_batch_table.publish(node_id, new_hwm);
                     }
                 }
-                // Response routing: accumulate frames for sub-commands owned by this partition.
-                for (client_id, request_seq, _) in view.iter() {
-                    if (client_id as usize) % self.num_partitions == self.partition_id {
-                        let buf = &mut self.response_buf[node_id as usize];
-                        // Frame: [len:4][client_id:4][request_seq:8][log_index:8]
-                        buf.put_u32_le(20u32); // 4 (client_id) + 8 (request_seq) + 8 (log_index)
-                        buf.put_u32_le(client_id);
-                        buf.put_u64_le(request_seq);
-                        buf.put_u64_le(rec.log_index);
-                        self.response_buf_mask |= 1u64 << node_id;
-                        self.entries_since_flush += 1;
-                        self.bytes_since_flush += 24;
-                    }
-                }
-                if self.entries_since_flush >= self.config_flush_entries
-                    || self.bytes_since_flush >= self.config_flush_bytes
-                {
-                    self.flush_response_buf().await;
-                }
-                // Engine apply: apply sub-commands owned by this partition (by primary_id % N).
-                for (_, _, sub_cmd_bytes) in view.iter() {
-                    let sub_cmd = MqCommand::from_bytes(cmd.buf.slice_ref(sub_cmd_bytes));
-                    if sub_cmd.tag() == MqCommand::TAG_RESUME {
-                        continue;
-                    }
-                    if !self.should_process(&sub_cmd, rec.log_index) {
-                        continue;
-                    }
+
+                if node_id == 0 {
+                    // Local batch: merged apply + response delivery loop.
+                    // Each worker applies sub-commands it owns (by primary_id % N)
+                    // and delivers rich responses via ClientRegistry.
                     let segment_id = scan.current_segment_id().unwrap_or(0);
-                    let mut resp_buf = BytesMut::new();
-                    self.engine.apply_command(
-                        &sub_cmd,
-                        &mut resp_buf,
-                        rec.log_index,
-                        current_time,
-                        Some(segment_id),
-                    );
-                    let response = ResponseEntry::split_from(&mut resp_buf);
-                    self.handle_structural_writes(&sub_cmd, &response, rec.log_index);
+                    for (client_id, request_seq, sub_cmd_bytes) in view.iter() {
+                        let sub_cmd = MqCommand::from_bytes(cmd.buf.slice_ref(sub_cmd_bytes));
+                        if sub_cmd.tag() == MqCommand::TAG_RESUME {
+                            continue;
+                        }
+                        if !self.should_process(&sub_cmd, rec.log_index) {
+                            continue;
+                        }
+                        let mut resp_buf = BytesMut::new();
+                        self.engine.apply_command(
+                            &sub_cmd,
+                            &mut resp_buf,
+                            rec.log_index,
+                            current_time,
+                            Some(segment_id),
+                        );
+                        let response = ResponseEntry::split_from(&mut resp_buf);
+                        self.handle_structural_writes(&sub_cmd, &response, rec.log_index);
+
+                        // Deliver rich response: [len:4][client_id:4][request_seq:8][log_index:8][response.buf...]
+                        let partition = (client_id as usize) % self.num_partitions;
+                        let resp_len = 4 + 8 + 8 + response.buf.len(); // client_id + request_seq + log_index + response
+                        let mut frame = BytesMut::with_capacity(4 + resp_len);
+                        frame.put_u32_le(resp_len as u32);
+                        frame.put_u32_le(client_id);
+                        frame.put_u64_le(request_seq);
+                        frame.put_u64_le(rec.log_index);
+                        frame.put_slice(&response.buf);
+                        self.client_registry
+                            .send_to_partition(partition, frame.freeze());
+                    }
+                } else {
+                    // Remote follower: accumulate minimal response frames in response_buf,
+                    // then apply sub-commands in a second pass.
+                    for (client_id, request_seq, _) in view.iter() {
+                        if (client_id as usize) % self.num_partitions == self.partition_id {
+                            let buf = &mut self.response_buf[node_id as usize];
+                            // Frame: [len:4][client_id:4][request_seq:8][log_index:8]
+                            buf.put_u32_le(20u32);
+                            buf.put_u32_le(client_id);
+                            buf.put_u64_le(request_seq);
+                            buf.put_u64_le(rec.log_index);
+                            self.response_buf_mask |= 1u64 << node_id;
+                            self.entries_since_flush += 1;
+                            self.bytes_since_flush += 24;
+                        }
+                    }
+                    if self.entries_since_flush >= self.config_flush_entries
+                        || self.bytes_since_flush >= self.config_flush_bytes
+                    {
+                        self.flush_response_buf().await;
+                    }
+                    for (_, _, sub_cmd_bytes) in view.iter() {
+                        let sub_cmd = MqCommand::from_bytes(cmd.buf.slice_ref(sub_cmd_bytes));
+                        if sub_cmd.tag() == MqCommand::TAG_RESUME {
+                            continue;
+                        }
+                        if !self.should_process(&sub_cmd, rec.log_index) {
+                            continue;
+                        }
+                        let segment_id = scan.current_segment_id().unwrap_or(0);
+                        let mut resp_buf = BytesMut::new();
+                        self.engine.apply_command(
+                            &sub_cmd,
+                            &mut resp_buf,
+                            rec.log_index,
+                            current_time,
+                            Some(segment_id),
+                        );
+                        let response = ResponseEntry::split_from(&mut resp_buf);
+                        self.handle_structural_writes(&sub_cmd, &response, rec.log_index);
+                    }
                 }
                 continue;
             }
@@ -1936,11 +1950,6 @@ pub struct AsyncApplyManager {
     purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
     /// Broadcasts follower connect/disconnect events to all partition workers.
     responder_broadcast: ResponderBroadcast,
-    /// Registry for TAG_BATCH response delivery. Batcher registers before raft write,
-    /// designated worker sends response after apply.
-    pub(crate) batch_registry:
-        Arc<ParkingMutex<HashMap<u32, tokio::sync::oneshot::Sender<ResponseEntry>>>>,
-    batch_id_counter: Arc<AtomicU32>,
     /// Per-node applied batch high-water marks. Readable by anyone — e.g.
     /// the follower's `ForwardClient` can poll its own slot to know which
     /// `batch_seq` values have been committed through raft.
@@ -1982,7 +1991,7 @@ impl AsyncApplyManager {
 
         for i in 0..n {
             let inbox = PartitionInbox::new();
-            let (reg_tx, reg_rx) = tokio::sync::mpsc::unbounded_channel::<ClientPartitionMsg>();
+            let (reg_tx, reg_rx) = crossfire::mpsc::bounded_async::<ClientPartitionMsg>(128);
             inboxes.push(Arc::clone(&inbox));
             reg_txs.push(reg_tx);
 
@@ -2003,11 +2012,6 @@ impl AsyncApplyManager {
             inboxes,
             reg_txs,
         });
-
-        let batch_registry: Arc<
-            ParkingMutex<HashMap<u32, tokio::sync::oneshot::Sender<ResponseEntry>>>,
-        > = Arc::new(ParkingMutex::new(HashMap::new()));
-        let batch_id_counter = Arc::new(AtomicU32::new(1));
 
         let applied_batch_table = Arc::new(AppliedBatchTable::new());
 
@@ -2038,7 +2042,6 @@ impl AsyncApplyManager {
                 engine: Arc::clone(&engine),
                 client_registry: Arc::clone(&client_registry),
                 client_id_table: Arc::clone(&client_id_table),
-                batch_registry: Arc::clone(&batch_registry),
                 responder_txs: Box::new(std::array::from_fn(|_| None)),
                 responder_update_rx: responder_update_rxs.remove(0),
                 response_buf: Box::new(std::array::from_fn(|_| BytesMut::new())),
@@ -2076,8 +2079,6 @@ impl AsyncApplyManager {
             num_partitions: n,
             purged_segments,
             responder_broadcast,
-            batch_registry,
-            batch_id_counter,
             applied_batch_table,
         }
     }
@@ -2091,13 +2092,6 @@ impl AsyncApplyManager {
     /// `batch_seq` values have been committed through raft.
     pub fn applied_batch_table(&self) -> &Arc<AppliedBatchTable> {
         &self.applied_batch_table
-    }
-
-    /// Allocate a batch_id and register a response sender. Call BEFORE raft write.
-    pub fn alloc_batch(&self, tx: tokio::sync::oneshot::Sender<ResponseEntry>) -> u32 {
-        let id = self.batch_id_counter.fetch_add(1, Ordering::Relaxed);
-        self.batch_registry.lock().insert(id, tx);
-        id
     }
 
     /// Advance the HWM to the given index.

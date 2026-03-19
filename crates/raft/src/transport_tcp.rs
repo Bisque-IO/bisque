@@ -78,7 +78,7 @@ pub enum BisqueTransportError {
     ConnectionClosed,
 
     #[error("Unknown node: {0}")]
-    UnknownNode(u64),
+    UnknownNode(u32),
 
     #[error("Channel error: {0}")]
     ChannelError(Cow<'static, str>),
@@ -903,12 +903,12 @@ where
 impl<C> MultiplexedTransport<C> for BisqueTcpTransport<C>
 where
     C: RaftTypeConfig<
-            NodeId = u64,
-            Term = u64,
-            LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
-            Vote = openraft::impls::Vote<C>,
+            NodeId = u32,
+            Term = u32,
+            LeaderId = openraft::impls::leader_id_adv::LeaderId<u32, u32>,
+            Vote = openraft::impls::Vote<openraft::impls::leader_id_adv::LeaderId<u32, u32>>,
             Node = openraft::impls::BasicNode,
-            Entry = openraft::impls::Entry<C>,
+            Entry = openraft::alias::DefaultEntryOf<C>,
         >,
     C::SnapshotData: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
     C::Entry: Clone,
@@ -1161,7 +1161,7 @@ mod tests {
 
     #[test]
     fn test_node_registry_register_resolve() {
-        let registry = DefaultNodeRegistry::<u64>::new();
+        let registry = DefaultNodeRegistry::<u32>::new();
         let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         registry.register(1, addr);
         assert_eq!(registry.resolve(&1), Some(addr));
@@ -1169,7 +1169,7 @@ mod tests {
 
     #[test]
     fn test_node_registry_unregister() {
-        let registry = DefaultNodeRegistry::<u64>::new();
+        let registry = DefaultNodeRegistry::<u32>::new();
         let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         registry.register(1, addr);
         registry.unregister(&1);
@@ -1178,13 +1178,13 @@ mod tests {
 
     #[test]
     fn test_node_registry_resolve_unknown() {
-        let registry = DefaultNodeRegistry::<u64>::new();
+        let registry = DefaultNodeRegistry::<u32>::new();
         assert_eq!(registry.resolve(&999), None);
     }
 
     #[test]
     fn test_node_registry_overwrite() {
-        let registry = DefaultNodeRegistry::<u64>::new();
+        let registry = DefaultNodeRegistry::<u32>::new();
         let addr1: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:6000".parse().unwrap();
         registry.register(1, addr1);
@@ -1194,7 +1194,7 @@ mod tests {
 
     #[test]
     fn test_node_registry_multiple_nodes() {
-        let registry = DefaultNodeRegistry::<u64>::new();
+        let registry = DefaultNodeRegistry::<u32>::new();
         for i in 1..=100u64 {
             let addr: SocketAddr = format!("127.0.0.1:{}", 5000 + i).parse().unwrap();
             registry.register(i, addr);
@@ -1580,7 +1580,7 @@ mod tests {
 
     #[test]
     fn test_default_node_registry_default_trait() {
-        let registry = DefaultNodeRegistry::<u64>::default();
+        let registry = DefaultNodeRegistry::<u32>::default();
         assert_eq!(registry.resolve(&1), None);
     }
 }

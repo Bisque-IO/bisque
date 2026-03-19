@@ -14,7 +14,7 @@ use std::time::Duration;
 use bisque_mq::flat::{FlatMessage, MqttEnvelope, is_mqtt_envelope};
 use bisque_mq::notifier::GroupNotifier;
 use bisque_mq::types::{ExchangeType, RetentionPolicy};
-use bisque_mq::{MqCommand, MqReader, MqWriteBatcher, ResponseEntry};
+use bisque_mq::{LocalSubmitter, MqCommand, MqReader, ResponseEntry};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -202,7 +202,7 @@ struct RetainedFilterInfo {
 /// MQTT TCP server that accepts connections and translates MQTT to bisque-mq.
 pub struct MqttServer {
     config: MqttServerConfig,
-    batcher: Arc<MqWriteBatcher>,
+    batcher: Arc<LocalSubmitter>,
     log_reader: Arc<MqReader>,
     stats: Arc<MqttServerStats>,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -220,7 +220,7 @@ impl MqttServer {
     /// Create a new MQTT server.
     pub fn new(
         config: MqttServerConfig,
-        batcher: Arc<MqWriteBatcher>,
+        batcher: Arc<LocalSubmitter>,
         log_reader: Arc<MqReader>,
         catalog_name: &str,
     ) -> Self {
@@ -320,7 +320,7 @@ impl MqttServer {
 async fn accept_loop(
     listener: TcpListener,
     config: MqttServerConfig,
-    batcher: Arc<MqWriteBatcher>,
+    batcher: Arc<LocalSubmitter>,
     log_reader: Arc<MqReader>,
     stats: Arc<MqttServerStats>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -439,7 +439,7 @@ fn extract_entity_id(resp: &ResponseEntry) -> Option<u64> {
 /// Accepts owned `String` (zero-alloc cache insert) or `&str`.
 async fn ensure_exchange(
     session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
+    batcher: &LocalSubmitter,
     exchange_name: impl AsRef<str> + Into<String>,
     cached_id: Option<u64>,
 ) -> Result<u64, ConnectionError> {
@@ -474,7 +474,7 @@ async fn ensure_exchange(
 /// Accepts owned `String` (zero-alloc cache insert) or `&str`.
 async fn ensure_topic(
     session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
+    batcher: &LocalSubmitter,
     topic_name: impl AsRef<str> + Into<String>,
     cached_id: Option<u64>,
     retention: RetentionPolicy,
@@ -517,7 +517,7 @@ async fn ensure_topic(
 /// Normal PUBLISH batching uses `flush_publish_batch` instead.
 async fn orchestrate_publish(
     session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
+    batcher: &LocalSubmitter,
     plan: PublishPlan,
 ) -> Result<(), ConnectionError> {
     let mut buf = bytes::BytesMut::new();
@@ -571,7 +571,7 @@ async fn orchestrate_publish(
 /// After flush, `msg_buf` is cleared for the next batch.
 async fn flush_publish_batch(
     session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
+    batcher: &LocalSubmitter,
     publish_ranges: &mut SmallVec<[(usize, usize); 32]>,
     msg_buf: &mut BytesMut,
     retained_batch: &mut SmallVec<[RetainedPlan; 4]>,
@@ -622,7 +622,7 @@ async fn flush_publish_batch(
 /// Execute a RetainedPlan: create/publish to the retained topic.
 async fn orchestrate_retained(
     session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
+    batcher: &LocalSubmitter,
     plan: RetainedPlan,
 ) -> Result<(), ConnectionError> {
     let mut buf = bytes::BytesMut::new();
@@ -672,7 +672,7 @@ async fn orchestrate_retained(
 /// for retained delivery) — used to update subscription mappings.
 async fn orchestrate_subscribe(
     session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
+    batcher: &LocalSubmitter,
     exchange_name: &'static str,
     cached_exchange_id: Option<u64>,
     filters: SmallVec<[SubscribeFilterPlan; 4]>,
@@ -819,7 +819,7 @@ async fn orchestrate_subscribe(
 
 async fn deliver_outbound(
     session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
+    batcher: &LocalSubmitter,
     log_reader: &MqReader,
     stream: &mut TcpStream,
     stats: &MqttServerStats,
@@ -1068,7 +1068,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     config: &MqttServerConfig,
-    batcher: &Arc<MqWriteBatcher>,
+    batcher: &Arc<LocalSubmitter>,
     log_reader: &Arc<MqReader>,
     stats: &Arc<MqttServerStats>,
     active_sessions: &ActiveSessions,
@@ -1367,7 +1367,7 @@ async fn handle_connection(
 async fn connection_loop(
     stream: &mut TcpStream,
     session: &mut MqttSession,
-    batcher: &Arc<MqWriteBatcher>,
+    batcher: &Arc<LocalSubmitter>,
     log_reader: &Arc<MqReader>,
     stats: &Arc<MqttServerStats>,
     read_buf: &mut BytesMut,
@@ -1654,7 +1654,7 @@ async fn dispatch_inbound_packet(
     remaining_length: usize,
     packet_bytes: &Bytes,
     session: &mut MqttSession,
-    batcher: &MqWriteBatcher,
+    batcher: &LocalSubmitter,
     log_reader: &Arc<MqReader>,
     stream: &mut TcpStream,
     stats: &MqttServerStats,

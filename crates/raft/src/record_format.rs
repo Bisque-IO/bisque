@@ -344,19 +344,22 @@ pub fn validate_record(data: &[u8], max_record_size: usize) -> io::Result<Parsed
     let checksummed_data = &data[..payload_end];
     let stored_crc = u64::from_le_bytes(data[payload_end..].try_into().unwrap());
 
-    // Verify CRC
-    let mut digest = Digest::new(CrcAlgorithm::Crc64Nvme);
-    digest.update(checksummed_data);
-    let computed_crc = digest.finalize();
+    // Verify CRC. A stored CRC of zero means CRC was disabled at write time
+    // (see MmapStorageConfig::disable_crc) — skip verification.
+    if stored_crc != 0 {
+        let mut digest = Digest::new(CrcAlgorithm::Crc64Nvme);
+        digest.update(checksummed_data);
+        let computed_crc = digest.finalize();
 
-    if computed_crc != stored_crc {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "CRC mismatch: stored {:#x}, computed {:#x}",
-                stored_crc, computed_crc
-            ),
-        ));
+        if computed_crc != stored_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CRC mismatch: stored {:#x}, computed {:#x}",
+                    stored_crc, computed_crc
+                ),
+            ));
+        }
     }
 
     // Parse header
@@ -528,12 +531,14 @@ impl AtomicVote {
         }
     }
 
-    pub fn store<C>(&self, vote: Option<&openraft::impls::Vote<C>>)
-    where
+    pub fn store<C>(
+        &self,
+        vote: Option<&openraft::impls::Vote<openraft::impls::leader_id_adv::LeaderId<u32, u32>>>,
+    ) where
         C: RaftTypeConfig<
-                NodeId = u64,
-                Term = u64,
-                LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+                NodeId = u32,
+                Term = u32,
+                LeaderId = openraft::impls::leader_id_adv::LeaderId<u32, u32>,
             >,
     {
         // Increment sequence to odd (write in progress)
@@ -542,8 +547,8 @@ impl AtomicVote {
 
         match vote {
             Some(v) => {
-                let high = v.leader_id.term;
-                let low = (v.leader_id.node_id << Self::NODE_ID_SHIFT)
+                let high = v.leader_id.term as u64;
+                let low = ((v.leader_id.node_id as u64) << Self::NODE_ID_SHIFT)
                     | if v.committed { Self::COMMITTED_BIT } else { 0 }
                     | Self::VALID_BIT;
                 self.high.store(high, Ordering::Relaxed);
@@ -559,12 +564,14 @@ impl AtomicVote {
         self.seq.fetch_add(1, Ordering::Release);
     }
 
-    pub fn load<C>(&self) -> Option<openraft::impls::Vote<C>>
+    pub fn load<C>(
+        &self,
+    ) -> Option<openraft::impls::Vote<openraft::impls::leader_id_adv::LeaderId<u32, u32>>>
     where
         C: RaftTypeConfig<
-                NodeId = u64,
-                Term = u64,
-                LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+                NodeId = u32,
+                Term = u32,
+                LeaderId = openraft::impls::leader_id_adv::LeaderId<u32, u32>,
             >,
     {
         loop {
@@ -590,8 +597,8 @@ impl AtomicVote {
                 return None;
             }
 
-            let term = high;
-            let node_id = low >> Self::NODE_ID_SHIFT;
+            let term = high as u32;
+            let node_id = (low >> Self::NODE_ID_SHIFT) as u32;
             let committed = (low & Self::COMMITTED_BIT) != 0;
 
             return Some(openraft::impls::Vote {
@@ -636,12 +643,15 @@ impl AtomicLogId {
         }
     }
 
-    pub fn store<C>(&self, log_id: Option<&LogId<C>>) -> io::Result<()>
+    pub fn store<C>(
+        &self,
+        log_id: Option<&LogId<openraft::impls::leader_id_adv::LeaderId<u32, u32>>>,
+    ) -> io::Result<()>
     where
         C: RaftTypeConfig<
-                NodeId = u64,
-                Term = u64,
-                LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+                NodeId = u32,
+                Term = u32,
+                LeaderId = openraft::impls::leader_id_adv::LeaderId<u32, u32>,
             >,
     {
         // Increment sequence to odd (write in progress)
@@ -651,7 +661,9 @@ impl AtomicLogId {
         match log_id {
             Some(lid) => {
                 // Check bounds to prevent silent corruption from bit-packing overflow
-                if lid.leader_id.term > Self::MAX_TERM {
+                let term64 = lid.leader_id.term as u64;
+                let node_id64 = lid.leader_id.node_id as u64;
+                if term64 > Self::MAX_TERM {
                     // Restore even sequence before returning error
                     self.seq.fetch_add(1, Ordering::Release);
                     return Err(io::Error::new(
@@ -663,7 +675,7 @@ impl AtomicLogId {
                         ),
                     ));
                 }
-                if lid.leader_id.node_id > Self::MAX_NODE_ID {
+                if node_id64 > Self::MAX_NODE_ID {
                     // Restore even sequence before returning error
                     self.seq.fetch_add(1, Ordering::Release);
                     return Err(io::Error::new(
@@ -675,8 +687,7 @@ impl AtomicLogId {
                         ),
                     ));
                 }
-                let high = (lid.leader_id.term << Self::TERM_SHIFT)
-                    | (lid.leader_id.node_id & Self::MAX_NODE_ID);
+                let high = (term64 << Self::TERM_SHIFT) | (node_id64 & Self::MAX_NODE_ID);
                 let low = (lid.index << Self::INDEX_SHIFT) | Self::VALID_BIT;
                 self.high.store(high, Ordering::Relaxed);
                 self.low.store(low, Ordering::Relaxed);
@@ -692,12 +703,12 @@ impl AtomicLogId {
         Ok(())
     }
 
-    pub fn load<C>(&self) -> Option<LogId<C>>
+    pub fn load<C>(&self) -> Option<LogId<openraft::impls::leader_id_adv::LeaderId<u32, u32>>>
     where
         C: RaftTypeConfig<
-                NodeId = u64,
-                Term = u64,
-                LeaderId = openraft::impls::leader_id_adv::LeaderId<C>,
+                NodeId = u32,
+                Term = u32,
+                LeaderId = openraft::impls::leader_id_adv::LeaderId<u32, u32>,
             >,
     {
         loop {
@@ -723,8 +734,8 @@ impl AtomicLogId {
                 return None;
             }
 
-            let term = high >> Self::TERM_SHIFT;
-            let node_id = high & Self::MAX_NODE_ID;
+            let term = (high >> Self::TERM_SHIFT) as u32;
+            let node_id = (high & Self::MAX_NODE_ID) as u32;
             let index = low >> Self::INDEX_SHIFT;
 
             return Some(LogId {
