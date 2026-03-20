@@ -19,6 +19,10 @@ pub struct ParallelApplyConfig {
     /// Capacity of the per-follower [`FollowerResponder`] crossfire MPSC channel
     /// (in `Bytes` chunks). Default: 256.
     pub responder_channel_capacity: usize,
+    /// Capacity of each [`ClientPartition`]'s registration crossfire MPSC channel.
+    /// Higher values reduce the chance of dropped register/unregister messages
+    /// during connection storms. Default: 4096.
+    pub client_registry_channel_capacity: usize,
 }
 
 impl Default for ParallelApplyConfig {
@@ -31,7 +35,68 @@ impl Default for ParallelApplyConfig {
             response_flush_entries: 64,
             response_flush_bytes: 8192,
             responder_channel_capacity: 256,
+            client_registry_channel_capacity: 4096,
         }
+    }
+}
+
+// =============================================================================
+// Per-raft-group resource limits
+// =============================================================================
+
+/// Per-raft-group resource limits. These flow into the underlying subsystem
+/// configs ([`RaftBacklog`], [`MmapStorageConfig`], protocol servers).
+#[derive(Debug, Clone)]
+pub struct ResourceLimits {
+    /// Maximum in-flight write bytes (RaftBacklog semaphore). Default: 256 MiB.
+    pub max_inflight_bytes: usize,
+
+    /// Maximum number of sealed segments to keep pinned (mmap'd) in memory.
+    /// Controls Tier 1 hot data. 0 = unlimited. Default: 256.
+    pub max_pinned_segments: u32,
+
+    /// Maximum total bytes of raft log segment files on local disk.
+    /// When exceeded, the retention evaluator is triggered urgently and new
+    /// writes may be rejected if disk usage cannot be reduced.
+    /// 0 = unlimited. Default: 0.
+    pub max_disk_bytes: u64,
+
+    /// Soft threshold as a fraction of `max_disk_bytes` (0.0–1.0). When disk
+    /// usage exceeds this fraction, retention evaluation is triggered at
+    /// accelerated interval. Default: 0.8.
+    pub disk_pressure_threshold: f64,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_inflight_bytes: 256 * 1024 * 1024,
+            max_pinned_segments: 256,
+            max_disk_bytes: 0,
+            disk_pressure_threshold: 0.8,
+        }
+    }
+}
+
+impl ResourceLimits {
+    pub fn with_max_inflight_bytes(mut self, bytes: usize) -> Self {
+        self.max_inflight_bytes = bytes;
+        self
+    }
+
+    pub fn with_max_pinned_segments(mut self, segments: u32) -> Self {
+        self.max_pinned_segments = segments;
+        self
+    }
+
+    pub fn with_max_disk_bytes(mut self, bytes: u64) -> Self {
+        self.max_disk_bytes = bytes;
+        self
+    }
+
+    pub fn with_disk_pressure_threshold(mut self, threshold: f64) -> Self {
+        self.disk_pressure_threshold = threshold.clamp(0.0, 1.0);
+        self
     }
 }
 
@@ -67,6 +132,8 @@ pub struct MqConfig {
     /// How often to evaluate segment retention policies (default: 30s).
     /// Set to Duration::ZERO to disable retention evaluation.
     pub retention_eval_interval: Duration,
+    /// Per-raft-group resource limits.
+    pub resource_limits: ResourceLimits,
 }
 
 impl MqConfig {
@@ -88,6 +155,7 @@ impl MqConfig {
             session_expiry_interval: Duration::from_secs(5),
             parallel_apply: ParallelApplyConfig::default(),
             retention_eval_interval: Duration::from_secs(30),
+            resource_limits: ResourceLimits::default(),
         }
     }
 
@@ -109,6 +177,11 @@ impl MqConfig {
     pub fn with_catalog(mut self, catalog_id: u64, catalog_name: String) -> Self {
         self.catalog_id = catalog_id;
         self.catalog_name = catalog_name;
+        self
+    }
+
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = limits;
         self
     }
 }

@@ -211,6 +211,10 @@ pub struct ConsumerHandlerConfig {
     pub max_deliver_batch: u32,
     /// Catalog name for metrics labeling.
     pub catalog_name: String,
+    /// Capacity of the response crossfire channel from async-apply callbacks.
+    /// Higher values reduce the chance of dropped responses under burst load.
+    /// Default: 2048.
+    pub response_channel_capacity: usize,
 }
 
 impl Default for ConsumerHandlerConfig {
@@ -221,6 +225,7 @@ impl Default for ConsumerHandlerConfig {
             handshake_timeout: Duration::from_secs(10),
             max_deliver_batch: 10,
             catalog_name: "default".to_string(),
+            response_channel_capacity: 2048,
         }
     }
 }
@@ -339,6 +344,8 @@ pub struct ConsumerHandler<R: MqRouter> {
     resp_rx: crossfire::AsyncRx<crossfire::mpsc::Array<SubmitResponse>>,
     /// Sender half — moved into the callback at submitter creation.
     resp_tx: Option<crossfire::MAsyncTx<crossfire::mpsc::Array<SubmitResponse>>>,
+    /// Tracks dropped response callbacks due to channel backpressure.
+    m_response_drops: metrics::Counter,
 }
 
 impl<R: MqRouter> ConsumerHandler<R> {
@@ -348,7 +355,9 @@ impl<R: MqRouter> ConsumerHandler<R> {
         frame_rx: mpsc::Receiver<ClientFrame>,
         frame_tx: mpsc::Sender<ServerFrame>,
     ) -> Self {
-        let (resp_tx, resp_rx) = crossfire::mpsc::bounded_async::<SubmitResponse>(256);
+        let (resp_tx, resp_rx) =
+            crossfire::mpsc::bounded_async::<SubmitResponse>(config.response_channel_capacity);
+        let m_response_drops = metrics::counter!("mq.handler.response_drops");
         let (topic_update_tx, topic_update_rx) = mpsc::unbounded_channel();
         Self {
             router,
@@ -368,6 +377,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
             pending_ops: HashMap::new(),
             resp_rx,
             resp_tx: Some(resp_tx),
+            m_response_drops,
         }
     }
 
@@ -382,6 +392,7 @@ impl<R: MqRouter> ConsumerHandler<R> {
         // Build a callback that feeds resp_tx. Clone the sender so we can
         // restore it if create_submitter returns None (e.g. in tests).
         let resp_tx = self.resp_tx.as_ref()?.clone();
+        let m_drops = self.m_response_drops.clone();
         let callback: bisque_mq::async_apply::ResponseCallback = Arc::new(
             move |slab: &Bytes, msg_offset: usize, msg: &[u8], _is_done: bool| {
                 if msg.len() < 16 {
@@ -391,12 +402,17 @@ impl<R: MqRouter> ConsumerHandler<R> {
                 let resp_start = msg_offset + 16;
                 let resp_end = msg_offset + msg.len();
                 if resp_start < resp_end {
-                    let _ = resp_tx.try_send(SubmitResponse {
-                        request_seq,
-                        response: ResponseEntry {
-                            buf: slab.slice(resp_start..resp_end),
-                        },
-                    });
+                    if resp_tx
+                        .try_send(SubmitResponse {
+                            request_seq,
+                            response: ResponseEntry {
+                                buf: slab.slice(resp_start..resp_end),
+                            },
+                        })
+                        .is_err()
+                    {
+                        m_drops.increment(1);
+                    }
                 }
             },
         );
@@ -3572,6 +3588,7 @@ mod tests {
             handshake_timeout: Duration::from_millis(200),
             max_deliver_batch: 5,
             catalog_name: "test".to_string(),
+            response_channel_capacity: 2048,
         };
         assert_eq!(config.heartbeat_interval, Duration::from_millis(100));
         assert_eq!(config.heartbeat_timeout, Duration::from_millis(500));

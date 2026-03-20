@@ -15,7 +15,6 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use bisque_mq::MqManifestManager;
 use bisque_mq::config::MqConfig;
 use bisque_mq::engine::MqEngine;
 use bisque_mq::exchange::RetainedValue;
@@ -807,110 +806,6 @@ async fn test_snapshot_install_with_retained_messages() {
     assert_eq!(s.exchanges.len(), 1);
     assert_eq!(s.exchanges[0].retained.len(), 1);
     assert_eq!(&s.exchanges[0].retained[0].routing_key[..], b"key");
-}
-
-// =============================================================================
-// Manifest persistence and recovery of retained messages
-// =============================================================================
-
-#[tokio::test]
-async fn test_manifest_recovery_with_retained_messages() {
-    let mut buf = bytes::BytesMut::new();
-    let tmp = tempfile::tempdir().unwrap();
-    let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-    manifest.open_group(1).unwrap();
-
-    // First lifecycle: install snapshot with retained messages
-    let mut engine = make_engine();
-    let exchange_id = create_exchange(&mut engine, "mqtt/exchange", 1, 1000);
-
-    let msg = make_msg(b"persisted-retained");
-    apply_engine(
-        &engine,
-        &MqCommand::set_retained(&mut buf, exchange_id, "persist/key", &msg),
-        2,
-        1001,
-    );
-
-    let snap = engine.snapshot();
-    let snap_bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
-
-    let mut sm1 = MqStateMachine::new(make_engine()).with_manifest(manifest.clone(), 1);
-    sm1.install_snapshot(
-        &make_snapshot_meta(2, "retained-manifest"),
-        Cursor::new(snap_bytes),
-    )
-    .await
-    .unwrap();
-    drop(sm1);
-
-    // Second lifecycle: recover from manifest
-    let mut sm2 = MqStateMachine::new(make_engine()).with_manifest(manifest.clone(), 1);
-    let (la, _) = sm2.applied_state().await.unwrap();
-    assert_eq!(la.unwrap().index, 2);
-
-    // Check snapshot after recovery
-    let s = sm2.snapshot();
-    assert_eq!(s.exchanges.len(), 1);
-    assert_eq!(s.exchanges[0].retained.len(), 1);
-    assert_eq!(&s.exchanges[0].retained[0].routing_key[..], b"persist/key");
-
-    manifest.shutdown();
-}
-
-#[tokio::test]
-async fn test_manifest_recovery_multiple_retained() {
-    let mut buf = bytes::BytesMut::new();
-    let tmp = tempfile::tempdir().unwrap();
-    let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-    manifest.open_group(1).unwrap();
-
-    // Build engine with multiple retained messages on multiple exchanges
-    let mut engine = make_engine();
-    let ex1 = create_exchange(&mut engine, "exchange1", 1, 1000);
-    let ex2 = create_exchange(&mut engine, "exchange2", 2, 1001);
-
-    for i in 0..5 {
-        let msg = make_msg(format!("msg-{}", i).as_bytes());
-        apply_engine(
-            &engine,
-            &MqCommand::set_retained(&mut buf, ex1, &format!("key/{}", i), &msg),
-            i as u64 + 3,
-            1002 + i as u64,
-        );
-    }
-    let msg = make_msg(b"ex2-msg");
-    apply_engine(
-        &engine,
-        &MqCommand::set_retained(&mut buf, ex2, "other/key", &msg),
-        8,
-        1007,
-    );
-
-    let snap = engine.snapshot();
-    let snap_bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
-
-    let mut sm1 = MqStateMachine::new(make_engine()).with_manifest(manifest.clone(), 1);
-    sm1.install_snapshot(
-        &make_snapshot_meta(8, "multi-retained"),
-        Cursor::new(snap_bytes),
-    )
-    .await
-    .unwrap();
-    drop(sm1);
-
-    // Recover
-    let mut sm2 = MqStateMachine::new(make_engine()).with_manifest(manifest.clone(), 1);
-    let (la, _) = sm2.applied_state().await.unwrap();
-    assert_eq!(la.unwrap().index, 8);
-
-    let s = sm2.snapshot();
-    assert_eq!(s.exchanges.len(), 2);
-
-    let total_retained: usize = s.exchanges.iter().map(|e| e.retained.len()).sum();
-    assert_eq!(total_retained, 6, "5 on ex1 + 1 on ex2");
-
-    manifest.shutdown();
 }
 
 // =============================================================================

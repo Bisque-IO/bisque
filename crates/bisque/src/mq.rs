@@ -111,11 +111,14 @@ impl MqState {
             bisque_mq::MqConfig::new(&mq_dir).with_catalog(group_id, catalog_name.clone());
         let mq_engine = bisque_mq::MqEngine::new(mq_config.clone());
 
-        // Raft log storage
+        // Raft log storage (apply resource limits)
         let mq_raft_dir = self.data_dir.join("mq-raft-data");
         std::fs::create_dir_all(&mq_raft_dir)?;
-        let mq_storage_config =
-            MmapStorageConfig::new(&mq_raft_dir).with_segment_size(8 * 1024 * 1024);
+        let resource_limits = &mq_config.resource_limits;
+        let mq_storage_config = MmapStorageConfig::new(&mq_raft_dir)
+            .with_segment_size(8 * 1024 * 1024)
+            .with_max_pinned_segments(resource_limits.max_pinned_segments)
+            .with_max_local_bytes(resource_limits.max_disk_bytes);
         let mq_storage = MultiplexedLogStorage::new(mq_storage_config).await?;
 
         // Transport
@@ -127,21 +130,17 @@ impl MqState {
         // Multi-raft manager
         let mq_manager: Arc<MqManager> = Arc::new(MultiRaftManager::new(mq_transport, mq_storage));
 
-        // MDBX manifest
-        let mq_manifest_dir = self.data_dir.join("mq-manifest");
-        std::fs::create_dir_all(&mq_manifest_dir)?;
-        let mq_manifest = Arc::new(bisque_mq::MqManifestManager::new(&mq_manifest_dir)?);
-        mq_manifest.open_group(group_id)?;
-
         // Backlog budget (shared between RaftWriter and state machine)
-        let mq_backlog = Arc::new(bisque_mq::forward::RaftBacklog::new(256 * 1024 * 1024));
+        let mq_backlog = Arc::new(bisque_mq::forward::RaftBacklog::new(
+            resource_limits.max_inflight_bytes,
+        ));
 
         // Prefetcher (from log storage, needed by async apply)
         let mq_prefetcher = mq_manager.storage().prefetcher();
 
         // State machine with async apply
         let mut mq_state_machine = bisque_mq::MqStateMachine::new(mq_engine)
-            .with_manifest(mq_manifest.clone(), group_id)
+            .with_group_id(group_id)
             .with_prefetcher(mq_prefetcher)
             .with_raft_backlog(Arc::clone(&mq_backlog));
         let mq_shared_metadata = mq_state_machine.shared_metadata();
@@ -186,8 +185,7 @@ impl MqState {
         let mq_raft_node = Arc::new(
             bisque_mq::MqRaftNode::new(mq_raft.clone(), self.node_id, mq_config)
                 .with_group_id(group_id)
-                .with_metadata(mq_shared_metadata.clone())
-                .with_manifest(mq_manifest),
+                .with_metadata(mq_shared_metadata.clone()),
         );
         mq_raft_node.start();
 

@@ -14,7 +14,6 @@ use bytes::BytesMut;
 
 use crate::MqTypeConfig;
 use crate::config::MqConfig;
-use crate::manifest::MqManifestManager;
 use crate::metadata::MqMetadata;
 use crate::types::MqCommand;
 
@@ -34,7 +33,6 @@ pub struct MqRaftNode {
     group_id: u64,
     config: MqConfig,
     metadata: Option<Arc<MqMetadata>>,
-    manifest: Option<Arc<MqManifestManager>>,
     shutdown: Arc<Notify>,
     shutdown_flag: Arc<AtomicBool>,
     task_handles: parking_lot::Mutex<Vec<JoinHandle<()>>>,
@@ -49,7 +47,6 @@ impl MqRaftNode {
             group_id: 0,
             config,
             metadata: None,
-            manifest: None,
             shutdown: Arc::new(Notify::new()),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             task_handles: parking_lot::Mutex::new(Vec::new()),
@@ -59,11 +56,6 @@ impl MqRaftNode {
 
     pub fn with_group_id(mut self, group_id: u64) -> Self {
         self.group_id = group_id;
-        self
-    }
-
-    pub fn with_manifest(mut self, manifest: Arc<MqManifestManager>) -> Self {
-        self.manifest = Some(manifest);
         self
     }
 

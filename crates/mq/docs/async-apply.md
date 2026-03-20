@@ -434,7 +434,8 @@ struct PartitionWorker {
     engine: Arc<MqEngine>,
     registry: Arc<ClientRegistry>,
     client_id_table: Arc<ClientIdTable>,  // log_index → client_id
-    manifest: Option<Arc<MqManifestManager>>,
+    // Note: MqManifestManager has been removed. bisque-mq no longer has
+    // a manifest system — recovery uses Raft snapshots + log replay.
     segment_indexes: Arc<SegmentIndexMap>,
     m_apply_count: metrics::Counter,
 }
@@ -485,9 +486,6 @@ impl PartitionWorker {
             let response = self.engine.apply_command(
                 &cmd, log_index, current_time, segment_id,
             );
-
-            // Post-apply: structural writes (fire-and-forget).
-            self.handle_structural_write(&cmd, &response, log_index);
 
             // Segment index tracking.
             if let Some(loc) = record_location {

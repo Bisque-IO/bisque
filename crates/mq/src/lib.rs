@@ -7,7 +7,6 @@ pub mod engine;
 pub mod exchange;
 pub mod flat;
 pub mod forward;
-pub mod manifest;
 pub mod metadata;
 pub mod notifier;
 pub mod purge;
@@ -25,7 +24,7 @@ pub use async_apply::{
     AppliedBatchTable, AsyncApplyManager, ClientRegistry, HighWaterMark, PendingRequest,
     PendingRequests, ResponseCallback, ResponseEntry,
 };
-pub use config::MqConfig;
+pub use config::{MqConfig, ParallelApplyConfig, ResourceLimits};
 pub use cursor::{
     MqReader, MqSegmentCursor, MqSegmentScanner, SegmentRecord, read_command,
     read_latest_topic_message, read_message_at, read_messages_at_into,
@@ -35,7 +34,6 @@ pub use forward::{
     ForwardAcceptor, ForwardClient, ForwardConfig, ForwardFrameBatch, ForwardHandle, ForwardWriter,
     RaftBacklog,
 };
-pub use manifest::MqManifestManager;
 pub use metadata::{MqMetadata, TopicMeta};
 pub use raft::MqRaftNode;
 pub use raft_writer::{MqCommandTx, RaftWriter, RaftWriterConfig, RaftWriterStats};

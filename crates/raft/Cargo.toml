@@ -23,7 +23,6 @@ crossfire = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }
-libmdbx = { workspace = true }
 memmap2 = { workspace = true }
 openraft = { workspace = true, features = ["tokio-rt"] }
 parking_lot = { workspace = true }

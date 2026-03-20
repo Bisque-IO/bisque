@@ -1215,6 +1215,8 @@ pub enum MqError {
     RebalanceInProgress,
     /// Unknown member ID in a consumer group operation
     UnknownMemberId,
+    /// Disk usage budget exceeded — new writes rejected until retention frees space.
+    DiskFull,
     /// Dynamic error message (escape hatch)
     Custom(String),
 }
@@ -1237,6 +1239,7 @@ impl fmt::Display for MqError {
             Self::IllegalGeneration => f.write_str("illegal generation"),
             Self::RebalanceInProgress => f.write_str("rebalance in progress"),
             Self::UnknownMemberId => f.write_str("unknown member id"),
+            Self::DiskFull => f.write_str("disk usage budget exceeded"),
             Self::Custom(msg) => f.write_str(msg),
         }
     }

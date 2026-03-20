@@ -1,0 +1,1814 @@
+#![allow(clippy::missing_safety_doc)]
+
+use std::borrow::{Borrow, BorrowMut};
+use std::mem::MaybeUninit;
+use std::ops::RangeBounds;
+use std::sync::atomic::{AtomicU32, Ordering, fence};
+use std::{cmp, fmt, ptr, slice};
+
+use bisque_mimalloc_sys as ffi;
+
+use crate::Heap;
+
+// =========================================================================
+// Constants
+// =========================================================================
+
+const TAG_INLINE: u8 = 0;
+const TAG_HEAP: u8 = 1;
+const TAG_STATIC: u8 = 2;
+
+/// Maximum bytes storable inline (no heap allocation).
+const INLINE_CAP: usize = 30;
+
+/// Bit 31 of ref_cnt: frozen flag. When set, the buffer is immutable.
+const FROZEN_BIT: u32 = 1 << 31;
+const COUNT_MASK: u32 = !FROZEN_BIT;
+
+// =========================================================================
+// Header
+// =========================================================================
+
+#[repr(C)]
+struct Header {
+    ref_cnt: AtomicU32,
+    cap: u32,
+    heap: Heap,
+}
+
+const HEADER_SIZE: usize = std::mem::size_of::<Header>();
+
+impl Header {
+    #[inline]
+    fn data_ptr(&self) -> *mut u8 {
+        unsafe { (self as *const Self as *mut u8).add(HEADER_SIZE) }
+    }
+
+    #[inline]
+    fn count(&self) -> u32 {
+        self.ref_cnt.load(Ordering::Acquire) & COUNT_MASK
+    }
+}
+
+// =========================================================================
+// Stack representation — 32 bytes, tag at byte 31
+// =========================================================================
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InlineRepr {
+    data: [u8; INLINE_CAP],
+    len: u8,
+    tag: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OwnedRepr {
+    ptr: *const u8,
+    len: usize,
+    header: *mut Header,
+    _pad: [u8; 7],
+    tag: u8,
+}
+
+#[repr(C)]
+union Repr {
+    inline: InlineRepr,
+    owned: OwnedRepr,
+    raw: [u8; 32],
+}
+
+const _: () = assert!(std::mem::size_of::<Repr>() == 32);
+
+impl Repr {
+    #[inline]
+    fn tag(&self) -> u8 {
+        unsafe { self.raw[31] }
+    }
+}
+
+impl Clone for Repr {
+    #[inline]
+    fn clone(&self) -> Self {
+        unsafe {
+            let mut dst = Repr { raw: [0; 32] };
+            ptr::copy_nonoverlapping(self.raw.as_ptr(), dst.raw.as_mut_ptr(), 32);
+            dst
+        }
+    }
+}
+
+/// Resolve a `RangeBounds` to a concrete `(start, end)` within `[0, len)`.
+fn resolve_range(range: impl RangeBounds<usize>, len: usize) -> (usize, usize) {
+    let start = match range.start_bound() {
+        std::ops::Bound::Included(&n) => n,
+        std::ops::Bound::Excluded(&n) => n + 1,
+        std::ops::Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        std::ops::Bound::Included(&n) => n + 1,
+        std::ops::Bound::Excluded(&n) => n,
+        std::ops::Bound::Unbounded => len,
+    };
+    assert!(
+        start <= end && end <= len,
+        "range {start}..{end} out of bounds for length {len}"
+    );
+    (start, end)
+}
+
+// =========================================================================
+// Bytes
+// =========================================================================
+
+/// Immutable byte buffer. 32 bytes on the stack.
+///
+/// Three modes: inline (≤30B), heap (refcounted, arena-backed), static.
+pub struct Bytes {
+    repr: Repr,
+}
+
+unsafe impl Send for Bytes {}
+unsafe impl Sync for Bytes {}
+
+impl Bytes {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            repr: Repr {
+                inline: InlineRepr {
+                    data: [0; INLINE_CAP],
+                    len: 0,
+                    tag: TAG_INLINE,
+                },
+            },
+        }
+    }
+
+    #[inline]
+    pub const fn from_static(data: &'static [u8]) -> Self {
+        Self {
+            repr: Repr {
+                owned: OwnedRepr {
+                    ptr: data.as_ptr(),
+                    len: data.len(),
+                    header: ptr::null_mut(),
+                    _pad: [0; 7],
+                    tag: TAG_STATIC,
+                },
+            },
+        }
+    }
+
+    /// Copy a slice into a new `Bytes`. Inline if ≤30 bytes, otherwise single heap alloc.
+    pub fn copy_from_slice(
+        data: &[u8],
+        heap: &Heap,
+    ) -> Result<Self, allocator_api2::alloc::AllocError> {
+        if data.len() <= INLINE_CAP {
+            let mut inline = InlineRepr {
+                data: [0; INLINE_CAP],
+                len: data.len() as u8,
+                tag: TAG_INLINE,
+            };
+            inline.data[..data.len()].copy_from_slice(data);
+            return Ok(Self {
+                repr: Repr { inline },
+            });
+        }
+        let (header, data_ptr) = alloc_header_and_data(heap, data.len())?;
+        unsafe {
+            (*header).ref_cnt.store(1 | FROZEN_BIT, Ordering::Relaxed);
+            ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
+        }
+        Ok(Self {
+            repr: Repr {
+                owned: OwnedRepr {
+                    ptr: data_ptr,
+                    len: data.len(),
+                    header,
+                    _pad: [0; 7],
+                    tag: TAG_HEAP,
+                },
+            },
+        })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self.repr.tag() {
+            TAG_INLINE => unsafe { self.repr.inline.len as usize },
+            _ => unsafe { self.repr.owned.len },
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self.repr.tag() {
+            TAG_INLINE => unsafe { &self.repr.inline.data[..self.repr.inline.len as usize] },
+            _ => unsafe { slice::from_raw_parts(self.repr.owned.ptr, self.repr.owned.len) },
+        }
+    }
+
+    /// Truncate to `len` bytes. No-op if `len >= self.len()`.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len() {
+            return;
+        }
+        unsafe {
+            match self.repr.tag() {
+                TAG_INLINE => {
+                    self.repr.inline.len = len as u8;
+                }
+                _ => {
+                    self.repr.owned.len = len;
+                }
+            }
+        }
+    }
+
+    /// Clear all bytes. Equivalent to `truncate(0)`.
+    pub fn clear(&mut self) {
+        self.truncate(0);
+    }
+
+    /// Create a sub-slice. Accepts any range type (`0..5`, `..5`, `5..`, `..`, `0..=4`).
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> Self {
+        let (start, end) = resolve_range(range, self.len());
+        let data = self.as_slice();
+        match self.repr.tag() {
+            TAG_INLINE | TAG_STATIC => {
+                let sub = &data[start..end];
+                if sub.len() <= INLINE_CAP {
+                    let mut inline = InlineRepr {
+                        data: [0; INLINE_CAP],
+                        len: sub.len() as u8,
+                        tag: TAG_INLINE,
+                    };
+                    inline.data[..sub.len()].copy_from_slice(sub);
+                    Self {
+                        repr: Repr { inline },
+                    }
+                } else {
+                    debug_assert_eq!(self.repr.tag(), TAG_STATIC);
+                    unsafe {
+                        Self {
+                            repr: Repr {
+                                owned: OwnedRepr {
+                                    ptr: self.repr.owned.ptr.add(start),
+                                    len: end - start,
+                                    header: ptr::null_mut(),
+                                    _pad: [0; 7],
+                                    tag: TAG_STATIC,
+                                },
+                            },
+                        }
+                    }
+                }
+            }
+            TAG_HEAP => {
+                let header = unsafe { &*self.repr.owned.header };
+                header.ref_cnt.fetch_add(1, Ordering::Relaxed);
+                unsafe {
+                    Self {
+                        repr: Repr {
+                            owned: OwnedRepr {
+                                ptr: self.repr.owned.ptr.add(start),
+                                len: end - start,
+                                header: self.repr.owned.header,
+                                _pad: [0; 7],
+                                tag: TAG_HEAP,
+                            },
+                        },
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Get a `Bytes` reference from an interior sub-slice pointer.
+    ///
+    /// # Panics
+    /// Panics if `subset` is not within the bounds of `self`.
+    pub fn slice_ref(&self, subset: &[u8]) -> Self {
+        if subset.is_empty() {
+            return Self::new();
+        }
+        let self_ptr = self.as_slice().as_ptr() as usize;
+        let self_end = self_ptr + self.len();
+        let sub_ptr = subset.as_ptr() as usize;
+        let sub_end = sub_ptr + subset.len();
+        assert!(
+            sub_ptr >= self_ptr && sub_end <= self_end,
+            "subset is not within Bytes bounds"
+        );
+        let start = sub_ptr - self_ptr;
+        let end = start + subset.len();
+        self.slice(start..end)
+    }
+
+    /// Split at position, returning `[0..at)`, leaving `[at..len)` in self.
+    pub fn split_to(&mut self, at: usize) -> Self {
+        let len = self.len();
+        assert!(at <= len);
+        match self.repr.tag() {
+            TAG_HEAP => unsafe {
+                let header = &*self.repr.owned.header;
+                header.ref_cnt.fetch_add(1, Ordering::Relaxed);
+                let base_ptr = self.repr.owned.ptr;
+                let head = Self {
+                    repr: Repr {
+                        owned: OwnedRepr {
+                            ptr: base_ptr,
+                            len: at,
+                            header: self.repr.owned.header,
+                            _pad: [0; 7],
+                            tag: TAG_HEAP,
+                        },
+                    },
+                };
+                self.repr.owned.ptr = base_ptr.add(at);
+                self.repr.owned.len = len - at;
+                head
+            },
+            TAG_INLINE => {
+                let data = unsafe { &self.repr.inline.data[..len] };
+                let mut head = InlineRepr {
+                    data: [0; INLINE_CAP],
+                    len: at as u8,
+                    tag: TAG_INLINE,
+                };
+                head.data[..at].copy_from_slice(&data[..at]);
+                let mut tail = InlineRepr {
+                    data: [0; INLINE_CAP],
+                    len: (len - at) as u8,
+                    tag: TAG_INLINE,
+                };
+                tail.data[..len - at].copy_from_slice(&data[at..]);
+                self.repr = Repr { inline: tail };
+                Self {
+                    repr: Repr { inline: head },
+                }
+            }
+            TAG_STATIC => unsafe {
+                let base_ptr = self.repr.owned.ptr;
+                let head = Self {
+                    repr: Repr {
+                        owned: OwnedRepr {
+                            ptr: base_ptr,
+                            len: at,
+                            header: ptr::null_mut(),
+                            _pad: [0; 7],
+                            tag: TAG_STATIC,
+                        },
+                    },
+                };
+                self.repr.owned.ptr = base_ptr.add(at);
+                self.repr.owned.len = len - at;
+                head
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// Split at position, returning `[at..len)`, leaving `[0..at)` in self.
+    pub fn split_off(&mut self, at: usize) -> Self {
+        let len = self.len();
+        assert!(at <= len);
+        match self.repr.tag() {
+            TAG_HEAP => unsafe {
+                let header = &*self.repr.owned.header;
+                header.ref_cnt.fetch_add(1, Ordering::Relaxed);
+                let base_ptr = self.repr.owned.ptr;
+                let tail = Self {
+                    repr: Repr {
+                        owned: OwnedRepr {
+                            ptr: base_ptr.add(at),
+                            len: len - at,
+                            header: self.repr.owned.header,
+                            _pad: [0; 7],
+                            tag: TAG_HEAP,
+                        },
+                    },
+                };
+                self.repr.owned.len = at;
+                tail
+            },
+            TAG_INLINE => {
+                let data = unsafe { &self.repr.inline.data[..len] };
+                let mut head = InlineRepr {
+                    data: [0; INLINE_CAP],
+                    len: at as u8,
+                    tag: TAG_INLINE,
+                };
+                head.data[..at].copy_from_slice(&data[..at]);
+                let mut tail = InlineRepr {
+                    data: [0; INLINE_CAP],
+                    len: (len - at) as u8,
+                    tag: TAG_INLINE,
+                };
+                tail.data[..len - at].copy_from_slice(&data[at..]);
+                self.repr = Repr { inline: head };
+                Self {
+                    repr: Repr { inline: tail },
+                }
+            }
+            TAG_STATIC => unsafe {
+                let base_ptr = self.repr.owned.ptr;
+                let tail = Self {
+                    repr: Repr {
+                        owned: OwnedRepr {
+                            ptr: base_ptr.add(at),
+                            len: len - at,
+                            header: ptr::null_mut(),
+                            _pad: [0; 7],
+                            tag: TAG_STATIC,
+                        },
+                    },
+                };
+                self.repr.owned.len = at;
+                tail
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// Try to convert back to mutable. Succeeds only for heap mode with refcount == 1.
+    pub fn try_mut(self) -> Result<BytesMut, Self> {
+        if self.repr.tag() != TAG_HEAP {
+            return Err(self);
+        }
+        let header = unsafe { self.repr.owned.header };
+        let h = unsafe { &*header };
+        let current = h.ref_cnt.load(Ordering::Acquire);
+        if current & COUNT_MASK != 1 {
+            return Err(self);
+        }
+        h.ref_cnt.store(1, Ordering::Release);
+        let ptr = unsafe { self.repr.owned.ptr as *mut u8 };
+        let len = unsafe { self.repr.owned.len };
+        let heap = h.heap.clone();
+        let cap = h.cap as usize;
+        std::mem::forget(self);
+        Ok(BytesMut {
+            ptr,
+            len,
+            cap,
+            header,
+            heap,
+        })
+    }
+
+    #[inline]
+    pub fn is_unique(&self) -> bool {
+        match self.repr.tag() {
+            TAG_INLINE | TAG_STATIC => true,
+            TAG_HEAP => unsafe { (*self.repr.owned.header).count() == 1 },
+            _ => false,
+        }
+    }
+}
+
+// -- Bytes trait impls --
+
+impl Clone for Bytes {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self.repr.tag() {
+            TAG_INLINE | TAG_STATIC => Self {
+                repr: self.repr.clone(),
+            },
+            TAG_HEAP => {
+                unsafe {
+                    (*self.repr.owned.header)
+                        .ref_cnt
+                        .fetch_add(1, Ordering::Relaxed)
+                };
+                Self {
+                    repr: self.repr.clone(),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Drop for Bytes {
+    #[inline]
+    fn drop(&mut self) {
+        if self.repr.tag() != TAG_HEAP {
+            return;
+        }
+        let header = unsafe { self.repr.owned.header };
+        let h = unsafe { &*header };
+        if h.ref_cnt.fetch_sub(1, Ordering::Release) & COUNT_MASK == 1 {
+            fence(Ordering::Acquire);
+            // Read heap handle out before freeing the header allocation.
+            let heap = unsafe { ptr::read(&h.heap) };
+            // Free through the heap — triggers pressure notification if needed.
+            unsafe { heap.dealloc(header as *mut u8) };
+            drop(heap);
+        }
+    }
+}
+
+impl Default for Bytes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl AsRef<[u8]> for Bytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl Borrow<[u8]> for Bytes {
+    #[inline]
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for Bytes {
+    fn eq(&self, o: &Self) -> bool {
+        self.as_slice() == o.as_slice()
+    }
+}
+impl Eq for Bytes {}
+impl PartialOrd for Bytes {
+    fn partial_cmp(&self, o: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Bytes {
+    fn cmp(&self, o: &Self) -> cmp::Ordering {
+        self.as_slice().cmp(o.as_slice())
+    }
+}
+
+impl std::hash::Hash for Bytes {
+    fn hash<H: std::hash::Hasher>(&self, s: &mut H) {
+        self.as_slice().hash(s);
+    }
+}
+
+// Cross-type PartialEq
+impl PartialEq<[u8]> for Bytes {
+    fn eq(&self, o: &[u8]) -> bool {
+        self.as_slice() == o
+    }
+}
+impl PartialEq<Bytes> for [u8] {
+    fn eq(&self, o: &Bytes) -> bool {
+        self == o.as_slice()
+    }
+}
+impl PartialEq<&[u8]> for Bytes {
+    fn eq(&self, o: &&[u8]) -> bool {
+        self.as_slice() == *o
+    }
+}
+impl PartialEq<Bytes> for &[u8] {
+    fn eq(&self, o: &Bytes) -> bool {
+        *self == o.as_slice()
+    }
+}
+impl PartialEq<str> for Bytes {
+    fn eq(&self, o: &str) -> bool {
+        self.as_slice() == o.as_bytes()
+    }
+}
+impl PartialEq<Bytes> for str {
+    fn eq(&self, o: &Bytes) -> bool {
+        self.as_bytes() == o.as_slice()
+    }
+}
+impl PartialEq<&str> for Bytes {
+    fn eq(&self, o: &&str) -> bool {
+        self.as_slice() == o.as_bytes()
+    }
+}
+impl PartialEq<Bytes> for &str {
+    fn eq(&self, o: &Bytes) -> bool {
+        self.as_bytes() == o.as_slice()
+    }
+}
+impl PartialEq<Vec<u8>> for Bytes {
+    fn eq(&self, o: &Vec<u8>) -> bool {
+        self.as_slice() == o.as_slice()
+    }
+}
+impl PartialEq<Bytes> for Vec<u8> {
+    fn eq(&self, o: &Bytes) -> bool {
+        self.as_slice() == o.as_slice()
+    }
+}
+impl PartialEq<String> for Bytes {
+    fn eq(&self, o: &String) -> bool {
+        self.as_slice() == o.as_bytes()
+    }
+}
+impl PartialEq<Bytes> for String {
+    fn eq(&self, o: &Bytes) -> bool {
+        self.as_bytes() == o.as_slice()
+    }
+}
+
+// Cross-type PartialOrd
+impl PartialOrd<[u8]> for Bytes {
+    fn partial_cmp(&self, o: &[u8]) -> Option<cmp::Ordering> {
+        self.as_slice().partial_cmp(o)
+    }
+}
+impl PartialOrd<Bytes> for [u8] {
+    fn partial_cmp(&self, o: &Bytes) -> Option<cmp::Ordering> {
+        self.partial_cmp(o.as_slice())
+    }
+}
+impl PartialOrd<str> for Bytes {
+    fn partial_cmp(&self, o: &str) -> Option<cmp::Ordering> {
+        self.as_slice().partial_cmp(o.as_bytes())
+    }
+}
+impl PartialOrd<Bytes> for str {
+    fn partial_cmp(&self, o: &Bytes) -> Option<cmp::Ordering> {
+        self.as_bytes().partial_cmp(o.as_slice())
+    }
+}
+
+// From conversions
+impl From<&'static [u8]> for Bytes {
+    fn from(s: &'static [u8]) -> Self {
+        Self::from_static(s)
+    }
+}
+impl From<&'static str> for Bytes {
+    fn from(s: &'static str) -> Self {
+        Self::from_static(s.as_bytes())
+    }
+}
+impl From<BytesMut> for Bytes {
+    fn from(bm: BytesMut) -> Self {
+        bm.freeze()
+    }
+}
+
+// IntoIterator
+impl<'a> IntoIterator for &'a Bytes {
+    type Item = &'a u8;
+    type IntoIter = slice::Iter<'a, u8>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+// Buf trait
+impl bytes::Buf for Bytes {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    fn chunk(&self) -> &[u8] {
+        self.as_slice()
+    }
+
+    fn advance(&mut self, cnt: usize) {
+        assert!(cnt <= self.len(), "advance past end");
+        match self.repr.tag() {
+            TAG_INLINE => unsafe {
+                let len = self.repr.inline.len as usize;
+                let new_len = len - cnt;
+                if cnt > 0 && new_len > 0 {
+                    ptr::copy(
+                        self.repr.inline.data.as_ptr().add(cnt),
+                        self.repr.inline.data.as_mut_ptr(),
+                        new_len,
+                    );
+                }
+                self.repr.inline.len = new_len as u8;
+            },
+            _ => unsafe {
+                self.repr.owned.ptr = self.repr.owned.ptr.add(cnt);
+                self.repr.owned.len -= cnt;
+            },
+        }
+    }
+
+    fn copy_to_bytes(&mut self, len: usize) -> bytes::Bytes {
+        // Return as bytes crate Bytes for compatibility
+        let data = &self.as_slice()[..len];
+        let result = bytes::Bytes::copy_from_slice(data);
+        self.advance(len);
+        result
+    }
+}
+
+impl fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Bytes")
+            .field("len", &self.len())
+            .field(
+                "mode",
+                &match self.repr.tag() {
+                    TAG_INLINE => "inline",
+                    TAG_HEAP => "heap",
+                    TAG_STATIC => "static",
+                    _ => "?",
+                },
+            )
+            .finish()
+    }
+}
+
+// =========================================================================
+// BytesMut
+// =========================================================================
+
+/// Mutable byte buffer allocated from a [`Heap`]. 40 bytes on the stack.
+pub struct BytesMut {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+    header: *mut Header,
+    heap: Heap,
+}
+
+unsafe impl Send for BytesMut {}
+unsafe impl Sync for BytesMut {}
+
+impl BytesMut {
+    pub fn new(heap: &Heap) -> Self {
+        Self {
+            ptr: ptr::null_mut(),
+            len: 0,
+            cap: 0,
+            header: ptr::null_mut(),
+            heap: heap.clone(),
+        }
+    }
+
+    pub fn with_capacity(
+        cap: usize,
+        heap: &Heap,
+    ) -> Result<Self, allocator_api2::alloc::AllocError> {
+        if cap == 0 {
+            return Ok(Self::new(heap));
+        }
+        let (header, data_ptr) = alloc_header_and_data(heap, cap)?;
+        Ok(Self {
+            ptr: data_ptr,
+            len: 0,
+            cap,
+            header,
+            heap: heap.clone(),
+        })
+    }
+
+    /// Create a zeroed buffer of `len` bytes.
+    pub fn zeroed(len: usize, heap: &Heap) -> Result<Self, allocator_api2::alloc::AllocError> {
+        let mut bm = Self::with_capacity(len, heap)?;
+        if len > 0 {
+            unsafe {
+                ptr::write_bytes(bm.ptr, 0, len);
+            }
+            bm.len = len;
+        }
+        Ok(bm)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            &mut []
+        } else {
+            unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.len {
+            self.len = len;
+        }
+    }
+
+    /// Resize the buffer. If growing, fills new bytes with `value`.
+    pub fn resize(
+        &mut self,
+        new_len: usize,
+        value: u8,
+    ) -> Result<(), allocator_api2::alloc::AllocError> {
+        if new_len > self.len {
+            self.reserve(new_len - self.len)?;
+            unsafe {
+                ptr::write_bytes(self.ptr.add(self.len), value, new_len - self.len);
+            }
+        }
+        self.len = new_len;
+        Ok(())
+    }
+
+    pub fn extend_from_slice(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), allocator_api2::alloc::AllocError> {
+        let needed = self.len + data.len();
+        if needed > self.cap {
+            self.try_grow(needed)?;
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(self.len), data.len());
+        }
+        self.len += data.len();
+        Ok(())
+    }
+
+    #[inline]
+    pub fn push(&mut self, byte: u8) -> Result<(), allocator_api2::alloc::AllocError> {
+        if self.len == self.cap {
+            self.try_grow(self.len + 1)?;
+        }
+        unsafe {
+            *self.ptr.add(self.len) = byte;
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn reserve(&mut self, additional: usize) -> Result<(), allocator_api2::alloc::AllocError> {
+        let needed = self.len + additional;
+        if needed > self.cap {
+            self.try_grow(needed)?;
+        }
+        Ok(())
+    }
+
+    /// Split off all data, leaving self empty. Returns a new `BytesMut` with the data.
+    pub fn split(&mut self) -> Self {
+        let len = self.len;
+        if len == 0 {
+            return Self::new(&self.heap);
+        }
+        // Take ownership of the allocation, give self a new empty one.
+        let result = Self {
+            ptr: self.ptr,
+            len,
+            cap: self.cap,
+            header: self.header,
+            heap: self.heap.clone(),
+        };
+        self.ptr = ptr::null_mut();
+        self.len = 0;
+        self.cap = 0;
+        self.header = ptr::null_mut();
+        result
+    }
+
+    /// Split at `at`, returning `[0..at)` and leaving `[at..len)` in self.
+    pub fn split_to(&mut self, at: usize) -> Bytes {
+        assert!(at <= self.len);
+        let data = unsafe { slice::from_raw_parts(self.ptr, at) };
+        let result = if at <= INLINE_CAP {
+            let mut inline = InlineRepr {
+                data: [0; INLINE_CAP],
+                len: at as u8,
+                tag: TAG_INLINE,
+            };
+            inline.data[..at].copy_from_slice(data);
+            Bytes {
+                repr: Repr { inline },
+            }
+        } else {
+            // Copy to new allocation as frozen Bytes
+            let h = &self.heap;
+            match Bytes::copy_from_slice(data, h) {
+                Ok(b) => b,
+                Err(_) => panic!("OOM in BytesMut::split_to"),
+            }
+        };
+        unsafe {
+            ptr::copy(self.ptr.add(at), self.ptr, self.len - at);
+        }
+        self.len -= at;
+        result
+    }
+
+    /// Split at `at`, returning `[at..len)` and leaving `[0..at)` in self.
+    pub fn split_off(&mut self, at: usize) -> Bytes {
+        assert!(at <= self.len);
+        let tail_len = self.len - at;
+        let data = unsafe { slice::from_raw_parts(self.ptr.add(at), tail_len) };
+        let result = if tail_len <= INLINE_CAP {
+            let mut inline = InlineRepr {
+                data: [0; INLINE_CAP],
+                len: tail_len as u8,
+                tag: TAG_INLINE,
+            };
+            inline.data[..tail_len].copy_from_slice(data);
+            Bytes {
+                repr: Repr { inline },
+            }
+        } else {
+            match Bytes::copy_from_slice(data, &self.heap) {
+                Ok(b) => b,
+                Err(_) => panic!("OOM in BytesMut::split_off"),
+            }
+        };
+        self.len = at;
+        result
+    }
+
+    /// Unsplit: append `other` to self.
+    pub fn unsplit(&mut self, other: BytesMut) -> Result<(), allocator_api2::alloc::AllocError> {
+        self.extend_from_slice(other.as_slice())
+    }
+
+    /// Set the length directly.
+    ///
+    /// # Safety
+    /// `new_len` must be ≤ `capacity()` and the bytes in `[0..new_len)` must be initialized.
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.cap);
+        self.len = new_len;
+    }
+
+    /// Access the spare capacity as uninitialized bytes.
+    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        if self.cap == 0 || self.header.is_null() {
+            return &mut [];
+        }
+        unsafe {
+            slice::from_raw_parts_mut(
+                self.ptr.add(self.len) as *mut MaybeUninit<u8>,
+                self.cap - self.len,
+            )
+        }
+    }
+
+    /// Freeze into immutable [`Bytes`]. Zero-cost for >30 bytes.
+    #[inline]
+    pub fn freeze(self) -> Bytes {
+        let len = self.len;
+        let header = self.header;
+        if len == 0 {
+            return Bytes::new();
+        }
+        if len <= INLINE_CAP {
+            let mut inline = InlineRepr {
+                data: [0; INLINE_CAP],
+                len: len as u8,
+                tag: TAG_INLINE,
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(self.ptr, inline.data.as_mut_ptr(), len);
+            }
+            if !header.is_null() {
+                unsafe { self.heap.dealloc(header as *mut u8) };
+            }
+            std::mem::forget(self);
+            return Bytes {
+                repr: Repr { inline },
+            };
+        }
+        if !header.is_null() {
+            unsafe { (*header).ref_cnt.fetch_or(FROZEN_BIT, Ordering::Release) };
+        }
+        let bytes = Bytes {
+            repr: Repr {
+                owned: OwnedRepr {
+                    ptr: self.ptr,
+                    len,
+                    header,
+                    _pad: [0; 7],
+                    tag: TAG_HEAP,
+                },
+            },
+        };
+        std::mem::forget(self);
+        bytes
+    }
+
+    /// Convert into `bytes::Bytes` for ecosystem interop.
+    pub fn into_bytes_crate(self) -> ::bytes::Bytes {
+        let frozen = self.freeze();
+        if frozen.is_empty() {
+            return ::bytes::Bytes::new();
+        }
+        ::bytes::Bytes::from_owner(frozen)
+    }
+
+    fn try_grow(&mut self, min_cap: usize) -> Result<(), allocator_api2::alloc::AllocError> {
+        let new_cap = min_cap.next_power_of_two().max(64);
+        if self.header.is_null() {
+            let (header, data_ptr) = alloc_header_and_data(&self.heap, new_cap)?;
+            self.header = header;
+            self.ptr = data_ptr;
+            self.cap = new_cap;
+        } else {
+            let new_total = HEADER_SIZE + new_cap;
+            let align = std::mem::align_of::<Header>();
+            let new_raw = unsafe {
+                ffi::mi_heap_realloc_aligned(
+                    self.heap.raw(),
+                    self.header as *mut core::ffi::c_void,
+                    new_total,
+                    align,
+                )
+            };
+            if new_raw.is_null() {
+                return Err(allocator_api2::alloc::AllocError);
+            }
+            let new_header = new_raw as *mut Header;
+            unsafe { (*new_header).cap = new_cap as u32 };
+            self.header = new_header;
+            self.ptr = unsafe { (new_raw as *mut u8).add(HEADER_SIZE) };
+            self.cap = new_cap;
+        }
+        Ok(())
+    }
+}
+
+// -- BytesMut trait impls --
+
+impl Drop for BytesMut {
+    fn drop(&mut self) {
+        if self.header.is_null() {
+            return;
+        }
+        let h = unsafe { &*self.header };
+        let heap = unsafe { ptr::read(&h.heap) };
+        unsafe { heap.dealloc(self.header as *mut u8) };
+        drop(heap);
+    }
+}
+
+impl Default for BytesMut {
+    fn default() -> Self {
+        // Requires a heap — use default heap.
+        Self::new(&Heap::default())
+    }
+}
+
+impl Clone for BytesMut {
+    fn clone(&self) -> Self {
+        let mut new = Self::with_capacity(self.len, &self.heap).expect("clone OOM");
+        new.extend_from_slice(self.as_slice()).expect("clone OOM");
+        new
+    }
+}
+
+impl AsRef<[u8]> for BytesMut {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl AsMut<[u8]> for BytesMut {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+impl Borrow<[u8]> for BytesMut {
+    #[inline]
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl BorrowMut<[u8]> for BytesMut {
+    #[inline]
+    fn borrow_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+impl std::ops::Deref for BytesMut {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl std::ops::DerefMut for BytesMut {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
+impl PartialEq for BytesMut {
+    fn eq(&self, o: &Self) -> bool {
+        self.as_slice() == o.as_slice()
+    }
+}
+impl Eq for BytesMut {}
+impl PartialOrd for BytesMut {
+    fn partial_cmp(&self, o: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for BytesMut {
+    fn cmp(&self, o: &Self) -> cmp::Ordering {
+        self.as_slice().cmp(o.as_slice())
+    }
+}
+impl std::hash::Hash for BytesMut {
+    fn hash<H: std::hash::Hasher>(&self, s: &mut H) {
+        self.as_slice().hash(s);
+    }
+}
+
+// Cross-type PartialEq for BytesMut
+impl PartialEq<[u8]> for BytesMut {
+    fn eq(&self, o: &[u8]) -> bool {
+        self.as_slice() == o
+    }
+}
+impl PartialEq<BytesMut> for [u8] {
+    fn eq(&self, o: &BytesMut) -> bool {
+        self == o.as_slice()
+    }
+}
+impl PartialEq<&[u8]> for BytesMut {
+    fn eq(&self, o: &&[u8]) -> bool {
+        self.as_slice() == *o
+    }
+}
+impl PartialEq<BytesMut> for &[u8] {
+    fn eq(&self, o: &BytesMut) -> bool {
+        *self == o.as_slice()
+    }
+}
+impl PartialEq<str> for BytesMut {
+    fn eq(&self, o: &str) -> bool {
+        self.as_slice() == o.as_bytes()
+    }
+}
+impl PartialEq<BytesMut> for str {
+    fn eq(&self, o: &BytesMut) -> bool {
+        self.as_bytes() == o.as_slice()
+    }
+}
+impl PartialEq<&str> for BytesMut {
+    fn eq(&self, o: &&str) -> bool {
+        self.as_slice() == o.as_bytes()
+    }
+}
+impl PartialEq<BytesMut> for &str {
+    fn eq(&self, o: &BytesMut) -> bool {
+        self.as_bytes() == o.as_slice()
+    }
+}
+impl PartialEq<Vec<u8>> for BytesMut {
+    fn eq(&self, o: &Vec<u8>) -> bool {
+        self.as_slice() == o.as_slice()
+    }
+}
+impl PartialEq<BytesMut> for Vec<u8> {
+    fn eq(&self, o: &BytesMut) -> bool {
+        self.as_slice() == o.as_slice()
+    }
+}
+impl PartialEq<Bytes> for BytesMut {
+    fn eq(&self, o: &Bytes) -> bool {
+        self.as_slice() == o.as_slice()
+    }
+}
+impl PartialEq<BytesMut> for Bytes {
+    fn eq(&self, o: &BytesMut) -> bool {
+        self.as_slice() == o.as_slice()
+    }
+}
+
+// Extend
+impl Extend<u8> for BytesMut {
+    fn extend<I: IntoIterator<Item = u8>>(&mut self, iter: I) {
+        for b in iter {
+            self.push(b).expect("extend OOM");
+        }
+    }
+}
+impl<'a> Extend<&'a u8> for BytesMut {
+    fn extend<I: IntoIterator<Item = &'a u8>>(&mut self, iter: I) {
+        for &b in iter {
+            self.push(b).expect("extend OOM");
+        }
+    }
+}
+
+// IntoIterator
+impl<'a> IntoIterator for &'a BytesMut {
+    type Item = &'a u8;
+    type IntoIter = slice::Iter<'a, u8>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+// fmt::Write
+impl fmt::Write for BytesMut {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.extend_from_slice(s.as_bytes()).map_err(|_| fmt::Error)
+    }
+}
+
+// Buf trait for BytesMut (read from written region)
+impl bytes::Buf for BytesMut {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.len
+    }
+    #[inline]
+    fn chunk(&self) -> &[u8] {
+        self.as_slice()
+    }
+    fn advance(&mut self, cnt: usize) {
+        assert!(cnt <= self.len, "advance past end");
+        if cnt > 0 && self.len - cnt > 0 {
+            unsafe {
+                ptr::copy(self.ptr.add(cnt), self.ptr, self.len - cnt);
+            }
+        }
+        self.len -= cnt;
+    }
+}
+
+// BufMut trait for BytesMut
+unsafe impl bytes::BufMut for BytesMut {
+    #[inline]
+    fn remaining_mut(&self) -> usize {
+        // Return usize::MAX to match bytes crate behavior (grow on demand).
+        // Actual capacity limit is enforced by our try_grow returning AllocError,
+        // which will panic in the default put_* impls.
+        usize::MAX
+    }
+
+    #[inline]
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        let new_len = self.len + cnt;
+        debug_assert!(new_len <= self.cap, "advance_mut past capacity");
+        self.len = new_len;
+    }
+
+    #[inline]
+    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        // Ensure we have at least some capacity.
+        if self.cap == self.len {
+            self.reserve(64).expect("chunk_mut OOM");
+        }
+        unsafe {
+            let ptr = self.ptr.add(self.len);
+            let len = self.cap - self.len;
+            bytes::buf::UninitSlice::from_raw_parts_mut(ptr, len)
+        }
+    }
+
+    fn put_slice(&mut self, src: &[u8]) {
+        self.extend_from_slice(src).expect("put_slice OOM");
+    }
+
+    fn put_bytes(&mut self, val: u8, cnt: usize) {
+        self.reserve(cnt).expect("put_bytes OOM");
+        unsafe {
+            ptr::write_bytes(self.ptr.add(self.len), val, cnt);
+            self.len += cnt;
+        }
+    }
+}
+
+impl fmt::Debug for BytesMut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BytesMut")
+            .field("len", &self.len)
+            .field("cap", &self.cap)
+            .finish()
+    }
+}
+
+// =========================================================================
+// Helpers
+// =========================================================================
+
+fn alloc_header_and_data(
+    heap: &Heap,
+    cap: usize,
+) -> Result<(*mut Header, *mut u8), allocator_api2::alloc::AllocError> {
+    let total = HEADER_SIZE + cap;
+    let align = std::mem::align_of::<Header>();
+    let raw = heap.alloc(total, align);
+    if raw.is_null() {
+        return Err(allocator_api2::alloc::AllocError);
+    }
+    let header = raw as *mut Header;
+    unsafe {
+        ptr::write(
+            header,
+            Header {
+                ref_cnt: AtomicU32::new(1),
+                cap: cap as u32,
+                heap: heap.clone(),
+            },
+        );
+    }
+    Ok((header, unsafe { raw.add(HEADER_SIZE) }))
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{Buf, BufMut};
+    use std::fmt::Write;
+
+    fn heap() -> Heap {
+        Heap::new(64 * 1024 * 1024).unwrap()
+    }
+
+    // -- Bytes basic --
+
+    #[test]
+    fn bytes_empty() {
+        let b = Bytes::new();
+        assert!(b.is_empty());
+        assert_eq!(&b[..], b"");
+    }
+    #[test]
+    fn bytes_inline() {
+        let b = Bytes::copy_from_slice(b"hello", &heap()).unwrap();
+        assert_eq!(&b[..], b"hello");
+    }
+    #[test]
+    fn bytes_inline_max() {
+        let d = [0xABu8; INLINE_CAP];
+        let b = Bytes::copy_from_slice(&d, &heap()).unwrap();
+        assert_eq!(&b[..], &d);
+    }
+    #[test]
+    fn bytes_heap() {
+        let d = vec![42u8; 128];
+        let b = Bytes::copy_from_slice(&d, &heap()).unwrap();
+        assert_eq!(&b[..], &d[..]);
+    }
+    #[test]
+    fn bytes_static() {
+        let b = Bytes::from_static(b"static");
+        assert_eq!(&b[..], b"static");
+    }
+
+    // -- Bytes truncate/clear --
+
+    #[test]
+    fn bytes_truncate() {
+        let h = heap();
+        let mut b = Bytes::copy_from_slice(b"hello world", &h).unwrap();
+        b.truncate(5);
+        assert_eq!(&b[..], b"hello");
+        b.truncate(100); // no-op
+        assert_eq!(&b[..], b"hello");
+    }
+
+    #[test]
+    fn bytes_clear() {
+        let mut b = Bytes::copy_from_slice(b"data", &heap()).unwrap();
+        b.clear();
+        assert!(b.is_empty());
+    }
+
+    // -- Bytes clone --
+
+    #[test]
+    fn bytes_clone_inline() {
+        let b = Bytes::copy_from_slice(b"s", &heap()).unwrap();
+        assert_eq!(b.clone()[..], b[..]);
+    }
+    #[test]
+    fn bytes_clone_heap() {
+        let b = Bytes::copy_from_slice(&[1u8; 100], &heap()).unwrap();
+        let c = b.clone();
+        assert_eq!(&b[..], &c[..]);
+        assert!(!b.is_unique());
+        drop(c);
+        assert!(b.is_unique());
+    }
+
+    // -- Bytes slice with RangeBounds --
+
+    #[test]
+    fn bytes_slice_range_types() {
+        let h = heap();
+        let b = Bytes::copy_from_slice(b"hello world", &h).unwrap();
+        assert_eq!(&b.slice(0..5)[..], b"hello");
+        assert_eq!(&b.slice(..5)[..], b"hello");
+        assert_eq!(&b.slice(6..)[..], b"world");
+        assert_eq!(&b.slice(..)[..], b"hello world");
+        assert_eq!(&b.slice(0..=4)[..], b"hello");
+    }
+
+    // -- Bytes slice_ref --
+
+    #[test]
+    fn bytes_slice_ref() {
+        let h = heap();
+        let b = Bytes::copy_from_slice(&[0u8; 128], &h).unwrap();
+        let sub = &b[10..50];
+        let sliced = b.slice_ref(sub);
+        assert_eq!(sliced.len(), 40);
+        assert_eq!(&sliced[..], &b[10..50]);
+    }
+
+    // -- Bytes split --
+
+    #[test]
+    fn bytes_split_to() {
+        let mut b = Bytes::copy_from_slice(b"hello world", &heap()).unwrap();
+        let head = b.split_to(5);
+        assert_eq!(&head[..], b"hello");
+        assert_eq!(&b[..], b" world");
+    }
+
+    #[test]
+    fn bytes_split_off() {
+        let mut b = Bytes::copy_from_slice(b"hello world", &heap()).unwrap();
+        let tail = b.split_off(5);
+        assert_eq!(&b[..], b"hello");
+        assert_eq!(&tail[..], b" world");
+    }
+
+    // -- Bytes comparisons --
+
+    #[test]
+    fn bytes_eq_cross_type() {
+        let b = Bytes::copy_from_slice(b"abc", &heap()).unwrap();
+        assert_eq!(b, b"abc" as &[u8]);
+        assert_eq!(b, "abc");
+        assert_eq!(b, b"abc".to_vec());
+        assert_eq!(b, String::from("abc"));
+        // Reverse
+        assert_eq!(b"abc" as &[u8], b);
+        assert_eq!("abc", b);
+    }
+
+    #[test]
+    fn bytes_ord() {
+        let a = Bytes::copy_from_slice(b"abc", &heap()).unwrap();
+        let b = Bytes::copy_from_slice(b"abd", &heap()).unwrap();
+        assert!(a < b);
+        assert!(b > a);
+    }
+
+    // -- Bytes From --
+
+    #[test]
+    fn bytes_from_static_slice() {
+        let b: Bytes = b"hello".as_slice().into();
+        assert_eq!(&b[..], b"hello");
+    }
+
+    #[test]
+    fn bytes_from_static_str() {
+        let b: Bytes = "hello".into();
+        assert_eq!(&b[..], b"hello");
+    }
+
+    #[test]
+    fn bytes_from_bytes_mut() {
+        let h = heap();
+        let mut bm = BytesMut::with_capacity(64, &h).unwrap();
+        bm.extend_from_slice(b"convert").unwrap();
+        let b: Bytes = bm.into();
+        assert_eq!(&b[..], b"convert");
+    }
+
+    // -- Bytes Buf trait --
+
+    #[test]
+    fn bytes_buf_trait() {
+        let mut b = Bytes::copy_from_slice(b"hello", &heap()).unwrap();
+        assert_eq!(b.remaining(), 5);
+        assert_eq!(b.chunk(), b"hello");
+        b.advance(2);
+        assert_eq!(b.remaining(), 3);
+        assert_eq!(b.chunk(), b"llo");
+    }
+
+    // -- Bytes Borrow --
+
+    #[test]
+    fn bytes_borrow() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        let key = Bytes::copy_from_slice(b"key", &heap()).unwrap();
+        map.insert(key, 42);
+        assert_eq!(map.get(b"key".as_slice()), Some(&42));
+    }
+
+    // -- BytesMut basic --
+
+    #[test]
+    fn bm_empty() {
+        let bm = BytesMut::new(&heap());
+        assert!(bm.is_empty());
+    }
+    #[test]
+    fn bm_extend() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.extend_from_slice(b"hello ").unwrap();
+        bm.extend_from_slice(b"world").unwrap();
+        assert_eq!(&bm[..], b"hello world");
+    }
+    #[test]
+    fn bm_push() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        for &b in b"test" {
+            bm.push(b).unwrap();
+        }
+        assert_eq!(&bm[..], b"test");
+    }
+
+    // -- BytesMut zeroed --
+
+    #[test]
+    fn bm_zeroed() {
+        let bm = BytesMut::zeroed(100, &heap()).unwrap();
+        assert_eq!(bm.len(), 100);
+        assert!(bm.as_slice().iter().all(|&b| b == 0));
+    }
+
+    // -- BytesMut resize --
+
+    #[test]
+    fn bm_resize_grow() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.extend_from_slice(b"hi").unwrap();
+        bm.resize(10, 0xFF).unwrap();
+        assert_eq!(bm.len(), 10);
+        assert_eq!(&bm[..2], b"hi");
+        assert!(bm[2..].iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn bm_resize_shrink() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.extend_from_slice(b"hello world").unwrap();
+        bm.resize(5, 0).unwrap();
+        assert_eq!(&bm[..], b"hello");
+    }
+
+    // -- BytesMut split --
+
+    #[test]
+    fn bm_split() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.extend_from_slice(b"hello").unwrap();
+        let taken = bm.split();
+        assert_eq!(&taken[..], b"hello");
+        assert!(bm.is_empty());
+    }
+
+    // -- BytesMut unsplit --
+
+    #[test]
+    fn bm_unsplit() {
+        let h = heap();
+        let mut a = BytesMut::new(&h);
+        a.extend_from_slice(b"hello ").unwrap();
+        let mut b = BytesMut::new(&h);
+        b.extend_from_slice(b"world").unwrap();
+        a.unsplit(b).unwrap();
+        assert_eq!(&a[..], b"hello world");
+    }
+
+    // -- BytesMut set_len --
+
+    #[test]
+    fn bm_set_len() {
+        let h = heap();
+        let mut bm = BytesMut::with_capacity(100, &h).unwrap();
+        unsafe {
+            bm.set_len(50);
+        }
+        assert_eq!(bm.len(), 50);
+    }
+
+    // -- BytesMut spare_capacity_mut --
+
+    #[test]
+    fn bm_spare_capacity() {
+        let h = heap();
+        let mut bm = BytesMut::with_capacity(100, &h).unwrap();
+        bm.extend_from_slice(b"hi").unwrap();
+        let spare = bm.spare_capacity_mut();
+        assert!(spare.len() >= 98);
+    }
+
+    // -- BytesMut Clone --
+
+    #[test]
+    fn bm_clone() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.extend_from_slice(b"clone me").unwrap();
+        let c = bm.clone();
+        assert_eq!(&bm[..], &c[..]);
+    }
+
+    // -- BytesMut comparisons --
+
+    #[test]
+    fn bm_eq_cross_type() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.extend_from_slice(b"abc").unwrap();
+        assert_eq!(bm, b"abc" as &[u8]);
+        assert_eq!(bm, "abc");
+        assert_eq!(bm, b"abc".to_vec());
+        let b = Bytes::copy_from_slice(b"abc", &h).unwrap();
+        assert_eq!(bm, b);
+        assert_eq!(b, bm);
+    }
+
+    // -- BytesMut Extend --
+
+    #[test]
+    fn bm_extend_iter() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.extend(b"hello".iter().copied());
+        assert_eq!(&bm[..], b"hello");
+    }
+
+    // -- BytesMut fmt::Write --
+
+    #[test]
+    fn bm_fmt_write() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        write!(bm, "hello {}", 42).unwrap();
+        assert_eq!(&bm[..], b"hello 42");
+    }
+
+    // -- BytesMut Buf trait --
+
+    #[test]
+    fn bm_buf_trait() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.extend_from_slice(b"hello").unwrap();
+        assert_eq!(Buf::remaining(&bm), 5);
+        assert_eq!(Buf::chunk(&bm), b"hello");
+    }
+
+    // -- BytesMut BufMut trait --
+
+    #[test]
+    fn bm_bufmut_put_u8() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.put_u8(0x42);
+        assert_eq!(&bm[..], &[0x42]);
+    }
+
+    #[test]
+    fn bm_bufmut_put_u32_le() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.put_u32_le(0xDEADBEEF);
+        assert_eq!(&bm[..], &[0xEF, 0xBE, 0xAD, 0xDE]);
+    }
+
+    #[test]
+    fn bm_bufmut_put_slice() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.put_slice(b"hello");
+        assert_eq!(&bm[..], b"hello");
+    }
+
+    #[test]
+    fn bm_bufmut_put_bytes() {
+        let h = heap();
+        let mut bm = BytesMut::new(&h);
+        bm.put_bytes(0xFF, 10);
+        assert_eq!(bm.len(), 10);
+        assert!(bm.as_slice().iter().all(|&b| b == 0xFF));
+    }
+
+    // -- freeze / try_mut --
+
+    #[test]
+    fn freeze_small_inline() {
+        let h = heap();
+        let mut bm = BytesMut::with_capacity(64, &h).unwrap();
+        bm.extend_from_slice(b"tiny").unwrap();
+        let b = bm.freeze();
+        assert_eq!(&b[..], b"tiny");
+    }
+
+    #[test]
+    fn freeze_large_heap() {
+        let h = heap();
+        let mut bm = BytesMut::with_capacity(128, &h).unwrap();
+        bm.extend_from_slice(&[0xAA; 100]).unwrap();
+        let b = bm.freeze();
+        assert_eq!(b.len(), 100);
+        assert!(b.is_unique());
+    }
+
+    #[test]
+    fn freeze_then_try_mut() {
+        let h = heap();
+        let mut bm = BytesMut::with_capacity(128, &h).unwrap();
+        bm.extend_from_slice(b"mutable data that is bigger than inline")
+            .unwrap();
+        let b = bm.freeze();
+        let mut bm2 = b.try_mut().unwrap();
+        bm2.extend_from_slice(b" + more").unwrap();
+        assert!(bm2.as_slice().starts_with(b"mutable data"));
+    }
+
+    #[test]
+    fn try_mut_fails_with_clones() {
+        let h = heap();
+        let mut bm = BytesMut::with_capacity(128, &h).unwrap();
+        bm.extend_from_slice(&[0xFF; 64]).unwrap();
+        let b = bm.freeze();
+        let _c = b.clone();
+        assert!(b.try_mut().is_err());
+    }
+
+    // -- interop --
+
+    #[test]
+    fn into_bytes_crate() {
+        let h = heap();
+        let mut bm = BytesMut::with_capacity(64, &h).unwrap();
+        bm.extend_from_slice(b"interop").unwrap();
+        let b = bm.into_bytes_crate();
+        assert_eq!(&b[..], b"interop");
+    }
+
+    // -- OOM --
+
+    #[test]
+    fn bytes_mut_oom() {
+        let h = Heap::new(32 * 1024 * 1024).unwrap();
+        let mut bm = BytesMut::new(&h);
+        let mut oom = false;
+        for _ in 0..10_000 {
+            if bm.extend_from_slice(&[0u8; 8192]).is_err() {
+                oom = true;
+                break;
+            }
+        }
+        assert!(oom, "expected OOM");
+    }
+}

@@ -21,8 +21,6 @@ use bisque_raft::SegmentPrefetcher;
 use crate::config::ParallelApplyConfig;
 use crate::cursor::MqSegmentScanner;
 use crate::engine::MqEngine;
-use crate::manifest::MqManifestManager;
-use crate::state_machine::{classify_structural, collect_structural_writes};
 use crate::types::{self, MqCommand};
 
 // =============================================================================
@@ -238,6 +236,7 @@ impl ResponseEntry {
     pub const ERR_ILLEGAL_GENERATION: u8 = 5;
     pub const ERR_REBALANCE_IN_PROGRESS: u8 = 6;
     pub const ERR_UNKNOWN_MEMBER_ID: u8 = 7;
+    pub const ERR_DISK_FULL: u8 = 8;
 
     pub fn split_from(buf: &mut BytesMut) -> Self {
         Self {
@@ -295,6 +294,7 @@ impl ResponseEntry {
             MqError::IllegalGeneration => (Self::ERR_ILLEGAL_GENERATION, 0),
             MqError::RebalanceInProgress => (Self::ERR_REBALANCE_IN_PROGRESS, 0),
             MqError::UnknownMemberId => (Self::ERR_UNKNOWN_MEMBER_ID, 0),
+            MqError::DiskFull => (Self::ERR_DISK_FULL, 0),
             MqError::Custom(_) => (Self::ERR_CUSTOM, 0),
         };
         let msg = error.to_string();
@@ -1370,21 +1370,31 @@ pub struct ClientRegistry {
     num_partitions: usize,
     inboxes: Vec<Arc<PartitionInbox>>,
     reg_txs: Vec<crossfire::MAsyncTx<crossfire::mpsc::Array<ClientPartitionMsg>>>,
+    m_register_drops: metrics::Counter,
+    m_unregister_drops: metrics::Counter,
 }
 
 impl ClientRegistry {
     /// Create a new `ClientRegistry` with `num_partitions` client partitions,
     /// each backed by a live [`ClientPartition`] task.
     ///
+    /// `reg_channel_capacity` controls the bounded crossfire channel capacity for
+    /// register/unregister messages per partition. Default: 4096.
+    ///
     /// Spawns `num_partitions` tokio tasks — must be called from within a tokio runtime.
-    pub fn new(num_partitions: usize, _capacity: usize) -> Arc<Self> {
+    pub fn new(num_partitions: usize, reg_channel_capacity: usize) -> Arc<Self> {
         let n = num_partitions.max(1);
+        let cap = if reg_channel_capacity == 0 {
+            4096
+        } else {
+            reg_channel_capacity
+        };
         let mut inboxes = Vec::with_capacity(n);
         let mut reg_txs = Vec::with_capacity(n);
 
         for i in 0..n {
             let inbox = PartitionInbox::new();
-            let (reg_tx, reg_rx) = crossfire::mpsc::bounded_async::<ClientPartitionMsg>(128);
+            let (reg_tx, reg_rx) = crossfire::mpsc::bounded_async::<ClientPartitionMsg>(cap);
             inboxes.push(Arc::clone(&inbox));
             reg_txs.push(reg_tx);
 
@@ -1399,11 +1409,16 @@ impl ClientRegistry {
             tokio::spawn(partition.run());
         }
 
+        let m_register_drops = metrics::counter!("mq.client_registry.register_drops");
+        let m_unregister_drops = metrics::counter!("mq.client_registry.unregister_drops");
+
         Arc::new(Self {
             next_id: AtomicU32::new(1),
             num_partitions: n,
             inboxes,
             reg_txs,
+            m_register_drops,
+            m_unregister_drops,
         })
     }
 
@@ -1412,17 +1427,45 @@ impl ClientRegistry {
     }
 
     /// Register a client with a response callback. Returns the assigned `client_id`.
+    ///
+    /// Retries up to 3 times with `yield_now()` between attempts if the
+    /// registration channel is full (connection setup path, not hot).
     pub fn register(&self, callback: ResponseCallback) -> u32 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let partition = (id as usize) % self.num_partitions;
-        let _ = self.reg_txs[partition].try_send(ClientPartitionMsg::Register(id, callback));
+        let mut msg = ClientPartitionMsg::Register(id, callback);
+        for _ in 0..3 {
+            match self.reg_txs[partition].try_send(msg) {
+                Ok(()) => return id,
+                Err(e) => {
+                    msg = e.into_inner();
+                    std::thread::yield_now();
+                }
+            }
+        }
+        self.m_register_drops.increment(1);
+        tracing::warn!(
+            client_id = id,
+            partition,
+            "client registration channel full, registration dropped"
+        );
         id
     }
 
     /// Unregister a client. The partition task drops the callback asynchronously.
     pub fn unregister(&self, client_id: u32) {
         let partition = (client_id as usize) % self.num_partitions;
-        let _ = self.reg_txs[partition].try_send(ClientPartitionMsg::Unregister(client_id));
+        if self.reg_txs[partition]
+            .try_send(ClientPartitionMsg::Unregister(client_id))
+            .is_err()
+        {
+            self.m_unregister_drops.increment(1);
+            tracing::warn!(
+                client_id,
+                partition,
+                "client registration channel full, unregister dropped"
+            );
+        }
     }
 
     /// Push a raw [`Bytes`] chunk (complete wire frames) to a specific partition.
@@ -1524,7 +1567,6 @@ struct PartitionWorker {
     config_flush_entries: usize,
     /// Flush after this many accumulated bytes (from config).
     config_flush_bytes: usize,
-    manifest: Option<Arc<MqManifestManager>>,
     /// Purged segment IDs shared with log storage. Workers peek (without
     /// draining) after each range to sweep retained messages on their own
     /// exchanges. Detach is idempotent so overlapping sweeps are safe.
@@ -1705,7 +1747,6 @@ impl PartitionWorker {
                             Some(segment_id),
                         );
                         let response = ResponseEntry::split_from(&mut resp_buf);
-                        self.handle_structural_writes(&sub_cmd, &response, rec.log_index);
 
                         // Deliver rich response: [len:4][client_id:4][request_seq:8][log_index:8][response.buf...]
                         let partition = (client_id as usize) % self.num_partitions;
@@ -1757,8 +1798,7 @@ impl PartitionWorker {
                             current_time,
                             Some(segment_id),
                         );
-                        let response = ResponseEntry::split_from(&mut resp_buf);
-                        self.handle_structural_writes(&sub_cmd, &response, rec.log_index);
+                        let _response = ResponseEntry::split_from(&mut resp_buf);
                     }
                 }
                 continue;
@@ -1786,9 +1826,6 @@ impl PartitionWorker {
                 Some(segment_id),
             );
             let response = ResponseEntry::split_from(&mut resp_buf);
-
-            // Post-apply: structural writes to MDBX.
-            self.handle_structural_writes(&cmd, &response, rec.log_index);
 
             // Deliver response to the owning ClientPartition.
             if let Some(client_id) = cid_guard.remove(&rec.log_index).copied() {
@@ -1879,15 +1916,7 @@ impl PartitionWorker {
                 }
             }
 
-            if detached {
-                if let Some(ref manifest) = self.manifest {
-                    let entries: Vec<(String, Vec<u8>)> = retained
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.message.to_vec()))
-                        .collect();
-                    manifest.persist_retained_fire_and_forget(self.group_id, exchange_id, entries);
-                }
-            }
+            let _ = detached;
         }
 
         // Sweep topic retained messages.
@@ -1907,21 +1936,6 @@ impl PartitionWorker {
                         rv.detach();
                     }
                 }
-            }
-        }
-    }
-
-    fn handle_structural_writes(&self, cmd: &MqCommand, response: &ResponseEntry, log_index: u64) {
-        let manifest = match self.manifest {
-            Some(ref m) => m,
-            None => return,
-        };
-
-        let kind = classify_structural(cmd);
-        if let Some(writes) = collect_structural_writes(self.engine.metadata(), response, kind) {
-            let next_id = self.engine.metadata().next_id.load(Ordering::Relaxed);
-            for w in writes {
-                manifest.structural_update_fire_and_forget(self.group_id, log_index, next_id, w);
             }
         }
     }
@@ -1962,7 +1976,6 @@ impl AsyncApplyManager {
         config: &ParallelApplyConfig,
         engine: Arc<MqEngine>,
         prefetcher: SegmentPrefetcher,
-        manifest: Option<Arc<MqManifestManager>>,
         purged_segments: Option<Arc<ParkingMutex<Vec<u64>>>>,
         group_id: u64,
         initial_cursor: u64,
@@ -1986,12 +1999,13 @@ impl AsyncApplyManager {
         };
 
         // Build ClientRegistry inboxes and spawn ClientPartition tasks.
+        let reg_cap = config.client_registry_channel_capacity.max(1);
         let mut inboxes = Vec::with_capacity(n);
         let mut reg_txs = Vec::with_capacity(n);
 
         for i in 0..n {
             let inbox = PartitionInbox::new();
-            let (reg_tx, reg_rx) = crossfire::mpsc::bounded_async::<ClientPartitionMsg>(128);
+            let (reg_tx, reg_rx) = crossfire::mpsc::bounded_async::<ClientPartitionMsg>(reg_cap);
             inboxes.push(Arc::clone(&inbox));
             reg_txs.push(reg_tx);
 
@@ -2011,6 +2025,8 @@ impl AsyncApplyManager {
             num_partitions: n,
             inboxes,
             reg_txs,
+            m_register_drops: metrics::counter!("mq.client_registry.register_drops"),
+            m_unregister_drops: metrics::counter!("mq.client_registry.unregister_drops"),
         });
 
         let applied_batch_table = Arc::new(AppliedBatchTable::new());
@@ -2050,7 +2066,6 @@ impl AsyncApplyManager {
                 bytes_since_flush: 0,
                 config_flush_entries: config.response_flush_entries,
                 config_flush_bytes: config.response_flush_bytes,
-                manifest: manifest.clone(),
                 purged_segments: purged_segments.clone(),
                 group_id,
                 cursor_notify: Arc::clone(&cursor_notify),

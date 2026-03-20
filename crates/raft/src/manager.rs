@@ -203,9 +203,12 @@ where
 mod tests {
     use super::*;
     use crate::test_support::run_async;
-    use crate::type_config::ManiacRaftTypeConfig;
+    use crate::type_config::{
+        BisqueCommittedLeaderId, BisqueLeaderId, BisqueNodeId, ManiacRaftTypeConfig,
+    };
     use dashmap::DashMap;
     use openraft::error::{InstallSnapshotError, RPCError, RaftError};
+    use openraft::impls::BasicNode;
     use openraft::raft::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
         InstallSnapshotResponse, VoteRequest, VoteResponse,
@@ -216,6 +219,24 @@ mod tests {
     use std::fmt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Concrete type aliases matching the openraft 0.10 degenericized API
+    type TestEntry =
+        openraft::impls::Entry<BisqueCommittedLeaderId, TestData, BisqueNodeId, BasicNode>;
+    type TestVote = openraft::impls::Vote<BisqueLeaderId>;
+    type TestLogId = LogId<BisqueCommittedLeaderId>;
+    type TestStoredMembership =
+        openraft::StoredMembership<BisqueCommittedLeaderId, BisqueNodeId, BasicNode>;
+    type TestSnapshotMeta =
+        openraft::storage::SnapshotMeta<BisqueCommittedLeaderId, BisqueNodeId, BasicNode>;
+    type TestSnapshot = openraft::storage::Snapshot<
+        BisqueCommittedLeaderId,
+        BisqueNodeId,
+        BasicNode,
+        std::io::Cursor<Vec<u8>>,
+    >;
+    type TestManager =
+        MultiRaftManager<TestConfig, FakeTransport, InMemoryMultiStorage, TestStateMachine>;
 
     // Test data type that implements AppData
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -244,8 +265,8 @@ mod tests {
     // In-memory log storage for testing
     #[derive(Clone)]
     struct InMemoryLogStorage {
-        log: Arc<DashMap<u64, openraft::impls::Entry<TestConfig>>>,
-        vote: Arc<parking_lot::RwLock<Option<openraft::impls::Vote<TestConfig>>>>,
+        log: Arc<DashMap<u64, TestEntry>>,
+        vote: Arc<parking_lot::RwLock<Option<TestVote>>>,
         last_purged: Arc<AtomicU64>,
     }
 
@@ -285,10 +306,7 @@ mod tests {
             self.clone()
         }
 
-        async fn save_vote(
-            &mut self,
-            vote: &openraft::impls::Vote<TestConfig>,
-        ) -> Result<(), std::io::Error> {
+        async fn save_vote(&mut self, vote: &TestVote) -> Result<(), std::io::Error> {
             *self.vote.write() = Some(vote.clone());
             Ok(())
         }
@@ -299,7 +317,7 @@ mod tests {
             callback: IOFlushed<TestConfig>,
         ) -> Result<(), std::io::Error>
         where
-            I: IntoIterator<Item = openraft::impls::Entry<TestConfig>> + Send,
+            I: IntoIterator<Item = TestEntry> + Send,
         {
             for entry in entries {
                 self.log.insert(entry.log_id.index, entry);
@@ -308,10 +326,7 @@ mod tests {
             Ok(())
         }
 
-        async fn truncate_after(
-            &mut self,
-            after: Option<LogId<TestConfig>>,
-        ) -> Result<(), std::io::Error> {
+        async fn truncate_after(&mut self, after: Option<TestLogId>) -> Result<(), std::io::Error> {
             match after {
                 Some(log_id) => {
                     let keys: Vec<u64> = self
@@ -331,7 +346,7 @@ mod tests {
             Ok(())
         }
 
-        async fn purge(&mut self, log_id: LogId<TestConfig>) -> Result<(), std::io::Error> {
+        async fn purge(&mut self, log_id: TestLogId) -> Result<(), std::io::Error> {
             let keys: Vec<u64> = self
                 .log
                 .iter()
@@ -350,7 +365,7 @@ mod tests {
         async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Send>(
             &mut self,
             range: RB,
-        ) -> Result<Vec<openraft::impls::Entry<TestConfig>>, std::io::Error> {
+        ) -> Result<Vec<TestEntry>, std::io::Error> {
             let entries: Vec<_> = self
                 .log
                 .iter()
@@ -360,9 +375,7 @@ mod tests {
             Ok(entries)
         }
 
-        async fn read_vote(
-            &mut self,
-        ) -> Result<Option<openraft::impls::Vote<TestConfig>>, std::io::Error> {
+        async fn read_vote(&mut self) -> Result<Option<TestVote>, std::io::Error> {
             Ok(self.vote.read().clone())
         }
     }
@@ -431,13 +444,7 @@ mod tests {
 
         async fn applied_state(
             &mut self,
-        ) -> Result<
-            (
-                Option<LogId<TestConfig>>,
-                openraft::StoredMembership<TestConfig>,
-            ),
-            std::io::Error,
-        > {
+        ) -> Result<(Option<TestLogId>, TestStoredMembership), std::io::Error> {
             Ok((None, openraft::StoredMembership::default()))
         }
 
@@ -473,24 +480,20 @@ mod tests {
 
         async fn install_snapshot(
             &mut self,
-            _meta: &openraft::storage::SnapshotMeta<TestConfig>,
+            _meta: &TestSnapshotMeta,
             snapshot: std::io::Cursor<Vec<u8>>,
         ) -> Result<(), std::io::Error> {
             let _ = snapshot.into_inner();
             Ok(())
         }
 
-        async fn get_current_snapshot(
-            &mut self,
-        ) -> Result<Option<openraft::storage::Snapshot<TestConfig>>, std::io::Error> {
+        async fn get_current_snapshot(&mut self) -> Result<Option<TestSnapshot>, std::io::Error> {
             Ok(None)
         }
     }
 
     impl openraft::RaftSnapshotBuilder<TestConfig> for TestStateMachine {
-        async fn build_snapshot(
-            &mut self,
-        ) -> Result<openraft::storage::Snapshot<TestConfig>, std::io::Error> {
+        async fn build_snapshot(&mut self) -> Result<TestSnapshot, std::io::Error> {
             let data = self.data.read();
             let content = bincode::serde::encode_to_vec(&*data, bincode::config::standard())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -512,7 +515,7 @@ mod tests {
     impl MultiplexedTransport<TestConfig> for FakeTransport {
         async fn send_append_entries(
             &self,
-            _target: u64,
+            _target: BisqueNodeId,
             _group_id: u64,
             _rpc: AppendEntriesRequest<TestConfig>,
         ) -> Result<AppendEntriesResponse<TestConfig>, RPCError<TestConfig, RaftError<TestConfig>>>
@@ -522,12 +525,12 @@ mod tests {
 
         async fn send_vote(
             &self,
-            _target: u64,
+            _target: BisqueNodeId,
             _group_id: u64,
             _rpc: VoteRequest<TestConfig>,
         ) -> Result<VoteResponse<TestConfig>, RPCError<TestConfig, RaftError<TestConfig>>> {
             Ok(VoteResponse {
-                vote: openraft::impls::Vote::new(1, 1),
+                vote: TestVote::new(1, 1),
                 vote_granted: true,
                 last_log_id: None,
             })
@@ -535,7 +538,7 @@ mod tests {
 
         async fn send_install_snapshot(
             &self,
-            _target: u64,
+            _target: BisqueNodeId,
             _group_id: u64,
             _rpc: InstallSnapshotRequest<TestConfig>,
         ) -> Result<
@@ -543,7 +546,7 @@ mod tests {
             RPCError<TestConfig, RaftError<TestConfig, InstallSnapshotError>>,
         > {
             Ok(InstallSnapshotResponse {
-                vote: openraft::impls::Vote::new(1, 1),
+                vote: TestVote::new(1, 1),
             })
         }
     }
@@ -553,7 +556,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
             let state_machine = TestStateMachine::new();
@@ -574,7 +577,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 
@@ -600,7 +603,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 
@@ -627,7 +630,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             assert!(manager.get_group(42).is_none());
             assert!(manager.get_group(0).is_none());
@@ -640,7 +643,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             // Should not panic
             manager.remove_group(999).await;
@@ -653,7 +656,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             assert!(manager.group_ids().is_empty());
             assert_eq!(manager.group_count(), 0);
@@ -665,7 +668,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 
@@ -693,7 +696,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             // InMemoryMultiStorage always returns None for purge_floor
             assert!(manager.get_purge_floor(0).is_none());
@@ -706,7 +709,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 
@@ -729,7 +732,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 
@@ -754,7 +757,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 
@@ -779,7 +782,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let mut config1 = openraft::Config::default();
             config1.heartbeat_interval = 100;
@@ -809,7 +812,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 
@@ -849,7 +852,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 
@@ -888,7 +891,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             // All operations on empty manager should work
             assert!(manager.get_group(0).is_none());
@@ -904,7 +907,7 @@ mod tests {
         run_async(async {
             let transport = FakeTransport;
             let storage = InMemoryMultiStorage::new();
-            let manager = Arc::new(MultiRaftManager::new(transport, storage));
+            let manager = Arc::new(TestManager::new(transport, storage));
 
             let raft_config = Arc::new(openraft::Config::default());
 

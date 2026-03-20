@@ -296,7 +296,7 @@ pub struct ForwardConfig {
 impl Default for ForwardConfig {
     fn default() -> Self {
         Self {
-            responder_channel_capacity: 256,
+            responder_channel_capacity: 1024,
             num_outbound_partitions: 4,
             max_batch_bytes: crate::write_batcher::DEFAULT_MAX_RAFT_ENTRY_BYTES,
             connect_timeout: Duration::from_secs(10),
@@ -992,6 +992,8 @@ pub struct ForwardAcceptor {
     local_addr: SocketAddr,
     /// Shared Raft write pool. `None` for the bench/channel path.
     raft_writer: Option<Arc<RaftWriter>>,
+    /// Tracks dropped response chunks due to responder channel backpressure.
+    m_responder_drops: metrics::Counter,
 }
 
 impl ForwardAcceptor {
@@ -1022,6 +1024,7 @@ impl ForwardAcceptor {
             handle: Some(handle),
             local_addr,
             raft_writer: Some(raft_writer),
+            m_responder_drops: metrics::counter!("mq.forward.responder_drops"),
         })
     }
 
@@ -1043,7 +1046,18 @@ impl ForwardAcceptor {
     pub fn push_response(&mut self, node_id: u32, bytes: Bytes) -> bool {
         self.drain_updates();
         if let Some(tx) = &self.responder_txs[node_id as usize] {
-            tx.try_send(bytes).is_ok()
+            if tx.try_send(bytes.clone()).is_ok() {
+                return true;
+            }
+            // Retry once after draining — a disconnect/reconnect may have swapped the tx.
+            self.drain_updates();
+            if let Some(tx) = &self.responder_txs[node_id as usize] {
+                if tx.try_send(bytes).is_ok() {
+                    return true;
+                }
+            }
+            self.m_responder_drops.increment(1);
+            false
         } else {
             false
         }
@@ -1327,6 +1341,7 @@ mod tests {
                     handle: Some(handle),
                     local_addr,
                     raft_writer: None,
+                    m_responder_drops: metrics::counter!("mq.forward.responder_drops"),
                 },
                 rx,
             ))

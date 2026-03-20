@@ -97,7 +97,7 @@ retention.
 ```
 ┌─────────────────┐
 │  Sealed segment  │  .sidx written with entity summaries
-│  (segment_id=5)  │  MDBX: mq_segment_ranges updated
+│  (segment_id=5)  │
 └────────┬─────────┘
          │
          ▼
@@ -127,7 +127,6 @@ retention.
          ▼
 ┌─────────────────┐
 │  Delete file     │  std::fs::remove_file
-│  + MDBX cleanup  │  delete_segment_ranges_by_segment
 └──────────────────┘
 ```
 
@@ -138,17 +137,9 @@ A sealed segment is eligible for deletion when ALL of these hold:
 1. **Unpinned**: the segment is below the Level 1 purge floor (no active
    consumers reference it).
 
-2. **Retention satisfied for every entity**: for each entity (topic,
-   consumer group) that has data in this segment, the entity's retention
-   policy allows the data to be discarded:
-   - `max_age_secs`: the segment's newest record timestamp is older than
-     `now - max_age_secs`
-   - `max_bytes`: the entity's total bytes across all segments MINUS this
-     segment's bytes is still ≥ the tail data needed
-   - `max_messages`: similar — removing this segment's messages still leaves
-     the entity within its message count budget
-   - **No retention policy** (`None/None/None`): this entity blocks deletion
-     — retain forever
+2. **Age-based retention**: the segment file's mtime is older than the
+   configured `max_age_secs`. (Per-entity byte/message retention tracking
+   via MDBX has been removed.)
 
 3. **Archived** (if archive configured): the segment has been uploaded to
    remote storage. Checked via `ArchiveManager`.
@@ -165,82 +156,73 @@ Lives in `crates/mq/src/retention.rs`:
 pub struct RetentionEvaluator {
     /// Raft group directory — segment files live here.
     group_dir: PathBuf,
-    /// Group ID for manifest lookups.
+    /// Group ID (retained for metrics labels).
     group_id: u64,
-    /// Manifest manager for reading segment ranges from MDBX.
-    manifest: Arc<MqManifestManager>,
     /// Engine metadata — reads topic retention policies.
     metadata: Arc<MqMetadata>,
     /// Level 1 purge floor — segments below this are unpinned.
     purge_floor: Arc<AtomicU64>,
-    /// Optional archive manager — checks if segment is archived.
-    archive: Option<Arc<ArchiveManager>>,
-    /// Segment IDs confirmed deleted (for dedup across eval cycles).
+    /// Active segment ID — never delete the active (being written) segment.
+    active_segment_id: AtomicU64,
+    /// Guard against concurrent evaluations.
+    evaluating: AtomicBool,
+    /// Segment IDs that have been deleted (avoid re-scanning).
     deleted_segments: Mutex<HashSet<u64>>,
+    /// Last evaluation time for rate limiting.
+    last_eval: Mutex<Option<Instant>>,
     /// Pre-initialized metrics.
     m_segments_deleted: metrics::Counter,
     m_bytes_deleted: metrics::Counter,
+    m_eval_count: metrics::Counter,
 }
 ```
+
+Note: The evaluator no longer depends on MDBX or per-entity segment
+tracking. Segment deletion eligibility is determined by the purge floor
+and age-based retention via file mtime. There is no `MqManifestManager`.
 
 ### Evaluation algorithm
 
 ```
-fn evaluate(&self, current_time: u64) -> Vec<u64>:
+fn evaluate(&self) -> Vec<u64>:
   floor = purge_floor.load()
+  active = active_segment_id.load()
   candidates = scan_segment_ids(group_dir)
-                 .filter(|id| id < active_segment_id)
+                 .filter(|id| id < active)
                  .filter(|id| !deleted_segments.contains(id))
 
   for each candidate segment_id:
     // Check 1: is it below the unpin floor?
-    // We use the segment's max_index from .sidx or MDBX.
-    // If we can't determine, skip (conservative).
+    if segment_max_index > floor:
+      skip (still pinned)
 
-    // Check 2: every entity in this segment allows deletion
-    entity_summaries = manifest.read_all_entities_for_segment(segment_id)
-    all_satisfied = true
-    for (entity_type, entity_id, record_count, total_bytes) in summaries:
-      policy = lookup_retention_policy(entity_type, entity_id)
-      if policy is None/None/None:
-        all_satisfied = false  // retain forever
-        break
-      if !policy_allows_deletion(policy, segment_id, entity_type, entity_id):
-        all_satisfied = false
-        break
+    // Check 2: age-based retention via file mtime
+    // If the segment file's mtime is older than the retention age,
+    // the segment is eligible for deletion.
 
-    if !all_satisfied: continue
-
-    // Check 3: archived (if required)
-    if archive.is_some() && !is_archived(segment_id):
-      trigger_upload(segment_id)
-      continue
-
-    // Check 4: cooldown
-    if archive.is_some() && !cooldown_elapsed(segment_id):
-      continue
-
-    // All checks passed — mark for deletion
+    // All checks passed — delete file and record deletion
     deletable.push(segment_id)
 
   return deletable
 ```
 
+Note: The old algorithm performed per-entity segment tracking via MDBX
+(`manifest.read_all_entities_for_segment`) to check per-entity retention
+policies (max_bytes, max_messages). This has been simplified. The
+evaluator now uses the purge floor (which already accounts for active
+consumers) plus age-based retention via file mtime. Per-entity byte/message
+counting is no longer performed.
+
 ### How retention policies map to segment decisions
 
-**max_age_secs**: We need to know the timestamp of the newest record in the
-segment. Options:
-- Track `max_timestamp` in the segment index or MDBX segment metadata.
-- Use the segment's file mtime as a proxy (less accurate but zero-cost).
-- For now, use file mtime. If a segment file was last modified more than
-  `max_age_secs` ago, the age policy is satisfied for that entity.
+**max_age_secs**: Uses the segment file's mtime as a proxy. If a segment
+file was last modified more than `max_age_secs` ago, the age policy is
+satisfied. This is zero-cost and avoids any need for per-entity metadata.
 
-**max_bytes**: The entity's total bytes across all segments is tracked in
-MDBX segment ranges. Sum all segment ranges for the entity, then check if
-removing this segment's contribution still leaves enough data. Since we
-process oldest segments first, we trim from the tail.
-
-**max_messages**: Same approach as max_bytes but with record counts.
+**max_bytes / max_messages**: Per-entity byte and message counting across
+segments has been removed. The purge floor already ensures no active
+consumers reference the segment. Age-based retention via mtime is the
+primary deletion criterion.
 
 ### Lifecycle integration
 
@@ -250,8 +232,7 @@ The `RetentionEvaluator` runs periodically, NOT on every apply:
 - **Location**: `MqStateMachine::apply()` — after updating the purge floor,
   optionally run a retention evaluation cycle.
 - **Execution**: on `spawn_blocking` to avoid blocking the apply path.
-- **Deletion**: `std::fs::remove_file` on the blocking pool, then
-  `manifest.purge_segment_fire_and_forget()` to clean MDBX.
+- **Deletion**: `std::fs::remove_file` on the blocking pool.
 
 ### Configuration
 
@@ -281,16 +262,12 @@ pub struct RetentionConfig {
 
 ### Step 2: Create `RetentionEvaluator`
 
-**File**: `crates/mq/src/retention.rs` (new)
+**File**: `crates/mq/src/retention.rs`
 
 - `RetentionEvaluator::new(...)` — constructor
-- `RetentionEvaluator::evaluate(current_time) -> Vec<u64>` — returns
-  deletable segment IDs
-- `RetentionEvaluator::delete_segments(ids: &[u64])` — deletes files and
-  cleans MDBX
-- Helper: `manifest.read_all_entities_for_segment(segment_id)` — new method
-  that scans MDBX segment ranges to find all entities with data in a given
-  segment
+- `RetentionEvaluator::evaluate() -> Vec<u64>` — returns deletable segment IDs
+- `RetentionEvaluator::delete_segments(ids: &[u64])` — deletes files
+- Uses purge floor + file mtime for deletion eligibility (no MDBX dependency)
 
 ### Step 3: Wire into state machine
 
@@ -300,13 +277,11 @@ pub struct RetentionConfig {
 - After `update_purge_floor()`, check if retention eval is due
 - Spawn blocking task for evaluation + deletion
 
-### Step 4: Add manifest helper
+### Step 4: *(Removed — no manifest helper needed)*
 
-**File**: `crates/mq/src/manifest.rs`
-
-- `read_entities_for_segment(segment_id) -> Vec<(u8, u64, u64, u64)>` —
-  scans all keys in `mq_segment_ranges`, returns entries where the segment
-  ID matches.
+The old plan required an MDBX-backed `read_entities_for_segment()` helper
+in `crates/mq/src/manifest.rs`. This is no longer needed because bisque-mq
+no longer has a manifest system. Recovery uses Raft snapshots + log replay.
 
 ---
 

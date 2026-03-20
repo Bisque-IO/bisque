@@ -1,0 +1,22 @@
+[package]
+name = "bisque-alloc"
+version = "0.1.0"
+edition = "2024"
+description = "Per-group heap memory allocation for bisque multi-tenant workloads"
+license = "MIT"
+
+[dependencies]
+bisque-mimalloc-sys = { path = "mimalloc-sys" }
+bytes = "1"
+hashbrown = "0.15"
+allocator-api2 = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Memory"] }
+
+[dev-dependencies]
+comfy-table = { version = "7.2" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

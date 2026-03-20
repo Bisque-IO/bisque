@@ -5,7 +5,7 @@
 pub mod codec;
 pub mod config;
 pub mod manager;
-pub(crate) mod manifest_mdbx;
+pub mod manifest;
 pub mod network;
 pub mod record_format;
 pub mod rpc_server;

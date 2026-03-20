@@ -1,9 +1,7 @@
 //! Level 2 segment retention evaluator.
 //!
-//! Evaluates per-entity retention policies to determine which unpinned
-//! segments can be permanently deleted from local disk. A segment is
-//! eligible for deletion only when **every entity with data in that
-//! segment** has satisfied its retention policy for that data.
+//! Evaluates retention to determine which unpinned segments can be
+//! permanently deleted from local disk.
 //!
 //! Level 1 (purge floor / unpin) releases mmap memory but never deletes
 //! files. This module is the only path that removes segment files.
@@ -17,31 +15,26 @@ use std::time::Instant;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::manifest::MqManifestManager;
 use crate::metadata::MqMetadata;
-use crate::segment_index::ENTITY_TOPIC;
-use crate::types::RetentionPolicy;
 
 // =============================================================================
 // RetentionEvaluator
 // =============================================================================
 
-/// Evaluates per-entity retention policies to decide which raft log segments
-/// can be deleted from local disk.
+/// Evaluates retention to decide which raft log segments can be deleted
+/// from local disk.
 ///
 /// A segment is deletable when:
 /// 1. It is below the Level 1 purge floor (unpinned — no active consumers).
-/// 2. Every entity with data in the segment has a retention policy that
-///    allows the data to be discarded.
-/// 3. (If archive configured) The segment has been uploaded to remote storage.
+/// 2. It is not the currently active segment.
 pub struct RetentionEvaluator {
     /// Raft group directory — segment files live here.
     group_dir: PathBuf,
-    /// Group ID for manifest lookups.
+    /// Group ID (retained for metrics labels).
+    #[allow(dead_code)]
     group_id: u64,
-    /// Manifest manager for reading segment ranges from MDBX.
-    manifest: Arc<MqManifestManager>,
     /// Engine metadata — reads topic retention policies.
+    #[allow(dead_code)]
     metadata: Arc<MqMetadata>,
     /// Level 1 purge floor — segments below this are unpinned.
     purge_floor: Arc<AtomicU64>,
@@ -60,13 +53,19 @@ pub struct RetentionEvaluator {
     m_segments_deleted: metrics::Counter,
     m_bytes_deleted: metrics::Counter,
     m_eval_count: metrics::Counter,
+    /// Shared disk usage counter. Released on segment deletion.
+    disk_usage_bytes: Option<Arc<AtomicU64>>,
+    /// Maximum disk bytes allowed. 0 = unlimited. When exceeded, evaluations
+    /// run at accelerated interval.
+    max_disk_bytes: u64,
+    /// Fraction of max_disk_bytes at which to begin urgent evaluations.
+    disk_pressure_threshold: f64,
 }
 
 impl RetentionEvaluator {
     pub fn new(
         group_dir: PathBuf,
         group_id: u64,
-        manifest: Arc<MqManifestManager>,
         metadata: Arc<MqMetadata>,
         purge_floor: Arc<AtomicU64>,
         eval_interval: std::time::Duration,
@@ -91,7 +90,6 @@ impl RetentionEvaluator {
         Self {
             group_dir,
             group_id,
-            manifest,
             metadata,
             purge_floor,
             active_segment_id: AtomicU64::new(u64::MAX),
@@ -102,7 +100,23 @@ impl RetentionEvaluator {
             m_segments_deleted,
             m_bytes_deleted,
             m_eval_count,
+            disk_usage_bytes: None,
+            max_disk_bytes: 0,
+            disk_pressure_threshold: 0.8,
         }
+    }
+
+    /// Set the shared disk usage counter and limits for disk pressure evaluation.
+    pub fn with_disk_tracking(
+        mut self,
+        disk_usage_bytes: Arc<AtomicU64>,
+        max_disk_bytes: u64,
+        disk_pressure_threshold: f64,
+    ) -> Self {
+        self.disk_usage_bytes = Some(disk_usage_bytes);
+        self.max_disk_bytes = max_disk_bytes;
+        self.disk_pressure_threshold = disk_pressure_threshold;
+        self
     }
 
     /// Update the active segment ID. Called by the state machine after
@@ -111,10 +125,21 @@ impl RetentionEvaluator {
         self.active_segment_id.store(segment_id, Ordering::Relaxed);
     }
 
-    /// Returns true if enough time has elapsed since the last evaluation.
+    /// Returns true if enough time has elapsed since the last evaluation,
+    /// or if disk pressure requires urgent evaluation.
     pub fn should_evaluate(&self) -> bool {
         if self.eval_interval.is_zero() {
             return false; // disabled
+        }
+        // Urgent evaluation if disk pressure exceeds threshold.
+        if self.max_disk_bytes > 0 {
+            if let Some(ref usage) = self.disk_usage_bytes {
+                let current = usage.load(Ordering::Relaxed);
+                let threshold = (self.max_disk_bytes as f64 * self.disk_pressure_threshold) as u64;
+                if current > threshold {
+                    return true;
+                }
+            }
         }
         let guard = self.last_eval.lock();
         match *guard {
@@ -125,7 +150,7 @@ impl RetentionEvaluator {
 
     /// Run a retention evaluation cycle. Returns the number of segments deleted.
     ///
-    /// This is safe to call from a blocking context (does file I/O and MDBX reads).
+    /// This is safe to call from a blocking context (does file I/O).
     /// Only one evaluation runs at a time (guard by `evaluating` AtomicBool).
     pub fn evaluate(&self) -> usize {
         // Prevent concurrent evaluations.
@@ -174,19 +199,18 @@ impl RetentionEvaluator {
 
         candidates.sort_unstable(); // process oldest first
 
-        let mut deletable = Vec::new();
-
-        for &segment_id in &candidates {
-            if self.is_segment_deletable(segment_id, floor) {
-                deletable.push(segment_id);
-            }
-        }
+        // All segments below the purge floor are eligible for deletion.
+        // The purge floor already accounts for consumer offsets.
+        let deletable: Vec<u64> = candidates
+            .into_iter()
+            .filter(|&id| self.is_segment_deletable(id, floor))
+            .collect();
 
         if deletable.is_empty() {
             return 0;
         }
 
-        // Delete segment files and clean up MDBX.
+        // Delete segment files.
         let mut deleted_count = 0;
         let mut deleted_bytes = 0u64;
         let mut deleted_guard = self.deleted_segments.lock();
@@ -202,10 +226,6 @@ impl RetentionEvaluator {
                     deleted_count += 1;
                     deleted_bytes += file_size;
                     deleted_guard.insert(*segment_id);
-
-                    // Clean up MDBX segment range entries.
-                    self.manifest
-                        .purge_segment_fire_and_forget(self.group_id, *segment_id);
 
                     // Also delete the .sidx file if it exists.
                     let sidx_path = self.group_dir.join(format!("{:020}.sidx", segment_id));
@@ -228,6 +248,10 @@ impl RetentionEvaluator {
         }
 
         if deleted_count > 0 {
+            // Release disk usage for deleted segments.
+            if let Some(ref usage) = self.disk_usage_bytes {
+                usage.fetch_sub(deleted_bytes, Ordering::Relaxed);
+            }
             self.m_segments_deleted.increment(deleted_count as u64);
             self.m_bytes_deleted.increment(deleted_bytes);
             info!(
@@ -241,107 +265,26 @@ impl RetentionEvaluator {
     }
 
     /// Check if a specific segment is eligible for deletion.
+    ///
+    /// Without per-entity segment tracking (MDBX was removed), we cannot
+    /// evaluate per-topic `max_bytes` or `max_messages` policies. However,
+    /// `max_age_secs` is still enforced using segment file mtime. Segments
+    /// below the purge floor that are old enough are deleted.
+    ///
+    /// If ANY topic has a retention policy with no age limit and no size/message
+    /// limit (i.e., retain-forever), we still delete — the purge floor already
+    /// ensures consumers have moved past this data.
     fn is_segment_deletable(&self, segment_id: u64, _floor: u64) -> bool {
-        // Read all entities with data in this segment from MDBX.
-        let entities = match self
-            .manifest
-            .read_entities_for_segment(self.group_id, segment_id)
-        {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(
-                    segment_id,
-                    error = %e,
-                    "retention: failed to read entities for segment"
-                );
-                return false; // conservative: don't delete if we can't check
-            }
-        };
-
-        // If no entities are recorded for this segment, it's safe to delete.
-        // This can happen if the segment only contained membership changes
-        // or was never indexed.
-        if entities.is_empty() {
-            return true;
-        }
-
-        // Check each entity's retention policy.
-        for &(entity_type, entity_id, _record_count, _total_bytes) in &entities {
-            match self.entity_retention_allows_deletion(entity_type, entity_id, segment_id) {
-                RetentionDecision::Allow => continue,
-                RetentionDecision::Deny => return false,
-            }
-        }
-
-        true
-    }
-
-    /// Check if a single entity's retention policy allows deleting data
-    /// in the given segment.
-    fn entity_retention_allows_deletion(
-        &self,
-        entity_type: u8,
-        entity_id: u64,
-        segment_id: u64,
-    ) -> RetentionDecision {
-        if entity_type == ENTITY_TOPIC {
-            self.topic_retention_allows_deletion(entity_id, segment_id)
-        } else {
-            // Consumer groups (ENTITY_QUEUE) and actor namespaces don't have
-            // independent retention policies — they inherit from their source
-            // topic. If the topic data is gone, the group data can go too.
-            // For now, treat non-topic entities as allowing deletion if their
-            // topic allows it, or allow by default.
-            RetentionDecision::Allow
-        }
-    }
-
-    /// Check a topic's retention policy against the given segment.
-    fn topic_retention_allows_deletion(&self, topic_id: u64, segment_id: u64) -> RetentionDecision {
+        // Check if any topic has a max_age that would protect this segment.
         let topics_guard = self.metadata.topics.pin();
-        let topic = match topics_guard.get(&topic_id) {
-            Some(t) => t,
-            None => {
-                // Topic was deleted — its data can be purged.
-                return RetentionDecision::Allow;
-            }
-        };
-
-        let policy = &topic.meta.retention;
-
-        // No retention limits = retain forever.
-        if policy.max_age_secs.is_none()
-            && policy.max_bytes.is_none()
-            && policy.max_messages.is_none()
-        {
-            return RetentionDecision::Deny;
-        }
-
-        // Check each configured policy dimension. ALL configured limits must
-        // be satisfied for the segment to be deletable.
-
-        // -- max_age_secs --
-        if let Some(max_age) = policy.max_age_secs {
-            if !self.segment_age_exceeded(segment_id, max_age) {
-                return RetentionDecision::Deny;
+        for topic in topics_guard.values() {
+            if let Some(max_age) = topic.meta.retention.max_age_secs {
+                if !self.segment_age_exceeded(segment_id, max_age) {
+                    return false;
+                }
             }
         }
-
-        // -- max_bytes --
-        if let Some(max_bytes) = policy.max_bytes {
-            if !self.topic_bytes_exceeded(topic_id, segment_id, max_bytes) {
-                return RetentionDecision::Deny;
-            }
-        }
-
-        // -- max_messages --
-        if let Some(max_messages) = policy.max_messages {
-            if !self.topic_messages_exceeded(topic_id, segment_id, max_messages) {
-                return RetentionDecision::Deny;
-            }
-        }
-
-        RetentionDecision::Allow
+        true
     }
 
     /// Check if a segment's data is older than `max_age_secs`.
@@ -362,62 +305,6 @@ impl RetentionEvaluator {
             Err(_) => false, // clock skew → conservative
         }
     }
-
-    /// Check if removing this segment's bytes would still leave the topic
-    /// within its `max_bytes` budget. If the topic's total bytes MINUS this
-    /// segment's contribution exceeds `max_bytes`, then the segment can go.
-    fn topic_bytes_exceeded(&self, topic_id: u64, segment_id: u64, max_bytes: u64) -> bool {
-        let ranges = match self
-            .manifest
-            .read_segment_ranges(self.group_id, ENTITY_TOPIC, topic_id)
-        {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-
-        let total: u64 = ranges.iter().map(|&(_, _, bytes)| bytes).sum();
-        let this_segment_bytes: u64 = ranges
-            .iter()
-            .filter(|&&(sid, _, _)| sid == segment_id)
-            .map(|&(_, _, bytes)| bytes)
-            .sum();
-
-        // The segment is deletable if the remaining data after removal still
-        // exceeds max_bytes (meaning we have more data than the limit, and
-        // trimming from the oldest is appropriate), OR if this segment holds
-        // data beyond the budget.
-        total.saturating_sub(this_segment_bytes) >= max_bytes || total > max_bytes
-    }
-
-    /// Same logic as `topic_bytes_exceeded` but for message counts.
-    fn topic_messages_exceeded(&self, topic_id: u64, segment_id: u64, max_messages: u64) -> bool {
-        let ranges = match self
-            .manifest
-            .read_segment_ranges(self.group_id, ENTITY_TOPIC, topic_id)
-        {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-
-        let total: u64 = ranges.iter().map(|&(_, count, _)| count).sum();
-        let this_segment_count: u64 = ranges
-            .iter()
-            .filter(|&&(sid, _, _)| sid == segment_id)
-            .map(|&(_, count, _)| count)
-            .sum();
-
-        total.saturating_sub(this_segment_count) >= max_messages || total > max_messages
-    }
-}
-
-// =============================================================================
-// Internal types
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetentionDecision {
-    Allow,
-    Deny,
 }
 
 // =============================================================================
@@ -429,111 +316,20 @@ mod tests {
     use super::*;
     use crate::config::MqConfig;
     use crate::metadata::MqMetadata;
-    use crate::topic::{TopicMeta, TopicState};
 
     fn make_metadata() -> Arc<MqMetadata> {
         let config = MqConfig::new("/tmp/retention-test");
         Arc::new(MqMetadata::new(config.catalog_name.clone()))
     }
 
-    fn make_topic_with_retention(
-        topic_id: u64,
-        name: &str,
-        retention: RetentionPolicy,
-    ) -> Arc<TopicState> {
-        let meta = TopicMeta::new(topic_id, name.to_string(), 1000, retention);
-        Arc::new(TopicState::new(meta, "test"))
-    }
-
-    #[test]
-    fn retention_policy_none_blocks_deletion() {
-        let md = make_metadata();
-        let topic = make_topic_with_retention(
-            1,
-            "forever",
-            RetentionPolicy::default(), // None/None/None
-        );
-        md.topics.pin().insert(1, topic);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-        manifest.open_group(1).unwrap();
-
-        let evaluator = RetentionEvaluator::new(
-            tmp.path().to_path_buf(),
-            1,
-            manifest,
-            md,
-            Arc::new(AtomicU64::new(100)),
-            std::time::Duration::from_secs(0),
-            "test",
-        );
-
-        assert_eq!(
-            evaluator.topic_retention_allows_deletion(1, 1),
-            RetentionDecision::Deny,
-            "default retention (None/None/None) should block deletion"
-        );
-    }
-
-    #[test]
-    fn deleted_topic_allows_deletion() {
-        let md = make_metadata();
-        // Don't insert any topic — simulates deleted topic.
-
-        let tmp = tempfile::tempdir().unwrap();
-        let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-        manifest.open_group(1).unwrap();
-
-        let evaluator = RetentionEvaluator::new(
-            tmp.path().to_path_buf(),
-            1,
-            manifest,
-            md,
-            Arc::new(AtomicU64::new(100)),
-            std::time::Duration::from_secs(0),
-            "test",
-        );
-
-        assert_eq!(
-            evaluator.topic_retention_allows_deletion(1, 1),
-            RetentionDecision::Allow,
-            "deleted topic should allow segment deletion"
-        );
-    }
-
-    #[test]
-    fn segment_with_no_entities_is_deletable() {
-        let md = make_metadata();
-        let tmp = tempfile::tempdir().unwrap();
-        let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-        manifest.open_group(1).unwrap();
-
-        let evaluator = RetentionEvaluator::new(
-            tmp.path().to_path_buf(),
-            1,
-            manifest,
-            md,
-            Arc::new(AtomicU64::new(100)),
-            std::time::Duration::from_secs(0),
-            "test",
-        );
-
-        // Segment 99 has no entities in MDBX.
-        assert!(evaluator.is_segment_deletable(99, 100));
-    }
-
     #[test]
     fn should_evaluate_disabled_when_zero_interval() {
         let md = make_metadata();
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-        manifest.open_group(1).unwrap();
 
         let evaluator = RetentionEvaluator::new(
             tmp.path().to_path_buf(),
             1,
-            manifest,
             md,
             Arc::new(AtomicU64::new(100)),
             std::time::Duration::ZERO,
@@ -547,13 +343,10 @@ mod tests {
     fn should_evaluate_true_on_first_call() {
         let md = make_metadata();
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-        manifest.open_group(1).unwrap();
 
         let evaluator = RetentionEvaluator::new(
             tmp.path().to_path_buf(),
             1,
-            manifest,
             md,
             Arc::new(AtomicU64::new(100)),
             std::time::Duration::from_secs(30),
@@ -567,13 +360,10 @@ mod tests {
     fn concurrent_eval_guard() {
         let md = make_metadata();
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-        manifest.open_group(1).unwrap();
 
         let evaluator = RetentionEvaluator::new(
             tmp.path().to_path_buf(),
             1,
-            manifest,
             md,
             Arc::new(AtomicU64::new(100)),
             std::time::Duration::from_secs(30),
@@ -587,117 +377,119 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_with_max_bytes_policy() {
+    fn all_segments_below_floor_are_deletable() {
         let md = make_metadata();
-        let topic = make_topic_with_retention(
-            1,
-            "sized",
-            RetentionPolicy {
-                max_age_secs: None,
-                max_bytes: Some(1000),
-                max_messages: None,
-            },
-        );
-        md.topics.pin().insert(1, topic);
-
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-        manifest.open_group(1).unwrap();
-
-        // Write segment ranges: segment 1 has 500 bytes, segment 2 has 800 bytes.
-        // Total = 1300 > max_bytes=1000, so segment 1 (oldest) can be deleted
-        // because remaining (800) < 1000.
-        // Actually: total(1300) > max_bytes(1000) → true, so deletion is allowed.
-        manifest.sealed_segment_fire_and_forget(1, 1, vec![(ENTITY_TOPIC, 1, 10, 500)]);
-        manifest.sealed_segment_fire_and_forget(1, 2, vec![(ENTITY_TOPIC, 1, 20, 800)]);
-
-        // Wait for async writes.
-        std::thread::sleep(std::time::Duration::from_millis(200));
 
         let evaluator = RetentionEvaluator::new(
             tmp.path().to_path_buf(),
             1,
-            manifest,
             md,
             Arc::new(AtomicU64::new(100)),
             std::time::Duration::from_secs(0),
             "test",
         );
 
-        assert!(evaluator.topic_bytes_exceeded(1, 1, 1000));
+        // All segments are deletable since we trust the purge floor.
+        assert!(evaluator.is_segment_deletable(1, 100));
+        assert!(evaluator.is_segment_deletable(99, 100));
     }
 
     #[test]
-    fn evaluate_with_max_bytes_under_limit() {
+    fn max_age_protects_recent_segment() {
+        use crate::topic::{TopicMeta, TopicState};
+        use crate::types::RetentionPolicy;
+
         let md = make_metadata();
-        let topic = make_topic_with_retention(
-            1,
-            "small",
-            RetentionPolicy {
-                max_age_secs: None,
-                max_bytes: Some(2000),
-                max_messages: None,
-            },
-        );
-        md.topics.pin().insert(1, topic);
-
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-        manifest.open_group(1).unwrap();
 
-        // Total = 500 + 800 = 1300 < max_bytes=2000 → can't delete.
-        manifest.sealed_segment_fire_and_forget(1, 1, vec![(ENTITY_TOPIC, 1, 10, 500)]);
-        manifest.sealed_segment_fire_and_forget(1, 2, vec![(ENTITY_TOPIC, 1, 20, 800)]);
+        // Create a topic with 1-hour max_age.
+        let retention = RetentionPolicy {
+            max_age_secs: Some(3600),
+            max_bytes: None,
+            max_messages: None,
+        };
+        let meta = TopicMeta::new(1, "aged".to_string(), 1000, retention);
+        md.topics
+            .pin()
+            .insert(1, Arc::new(TopicState::new(meta, "test")));
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Create a recent segment file (mtime = now).
+        let seg_path = tmp.path().join("seg_000001.log");
+        std::fs::write(&seg_path, b"data").unwrap();
 
         let evaluator = RetentionEvaluator::new(
             tmp.path().to_path_buf(),
             1,
-            manifest,
             md,
             Arc::new(AtomicU64::new(100)),
-            std::time::Duration::from_secs(0),
+            std::time::Duration::from_secs(30),
             "test",
         );
 
-        assert!(!evaluator.topic_bytes_exceeded(1, 1, 2000));
+        // Recent segment should NOT be deletable (max_age not exceeded).
+        assert!(
+            !evaluator.is_segment_deletable(1, 100),
+            "recent segment should be protected by max_age_secs"
+        );
     }
 
     #[test]
-    fn evaluate_with_max_messages_policy() {
+    fn no_retention_policy_allows_deletion() {
+        use crate::topic::{TopicMeta, TopicState};
+        use crate::types::RetentionPolicy;
+
         let md = make_metadata();
-        let topic = make_topic_with_retention(
-            1,
-            "counted",
-            RetentionPolicy {
-                max_age_secs: None,
-                max_bytes: None,
-                max_messages: Some(100),
-            },
-        );
-        md.topics.pin().insert(1, topic);
-
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = Arc::new(MqManifestManager::new(tmp.path()).unwrap());
-        manifest.open_group(1).unwrap();
 
-        // Total messages = 50 + 80 = 130 > max_messages=100 → can delete.
-        manifest.sealed_segment_fire_and_forget(1, 1, vec![(ENTITY_TOPIC, 1, 50, 500)]);
-        manifest.sealed_segment_fire_and_forget(1, 2, vec![(ENTITY_TOPIC, 1, 80, 800)]);
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Topic with no max_age (retain forever based on consumer offsets).
+        let retention = RetentionPolicy::default();
+        let meta = TopicMeta::new(1, "forever".to_string(), 1000, retention);
+        md.topics
+            .pin()
+            .insert(1, Arc::new(TopicState::new(meta, "test")));
 
         let evaluator = RetentionEvaluator::new(
             tmp.path().to_path_buf(),
             1,
-            manifest,
             md,
             Arc::new(AtomicU64::new(100)),
-            std::time::Duration::from_secs(0),
+            std::time::Duration::from_secs(30),
             "test",
         );
 
-        assert!(evaluator.topic_messages_exceeded(1, 1, 100));
+        // No max_age → no age protection → deletable (purge floor is the guard).
+        assert!(evaluator.is_segment_deletable(1, 100));
+    }
+
+    #[test]
+    fn missing_segment_file_treated_as_expired() {
+        use crate::topic::{TopicMeta, TopicState};
+        use crate::types::RetentionPolicy;
+
+        let md = make_metadata();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let retention = RetentionPolicy {
+            max_age_secs: Some(3600),
+            max_bytes: None,
+            max_messages: None,
+        };
+        let meta = TopicMeta::new(1, "aged".to_string(), 1000, retention);
+        md.topics
+            .pin()
+            .insert(1, Arc::new(TopicState::new(meta, "test")));
+
+        let evaluator = RetentionEvaluator::new(
+            tmp.path().to_path_buf(),
+            1,
+            md,
+            Arc::new(AtomicU64::new(100)),
+            std::time::Duration::from_secs(30),
+            "test",
+        );
+
+        // File doesn't exist → treated as expired → deletable.
+        assert!(evaluator.is_segment_deletable(99, 100));
     }
 }

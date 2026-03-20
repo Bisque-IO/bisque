@@ -19,7 +19,6 @@ crossbeam-utils = { workspace = true }
 crossfire = { workspace = true }
 papaya = { workspace = true }
 futures = { workspace = true }
-libmdbx = { workspace = true }
 metrics = { workspace = true }
 openraft = { workspace = true, features = ["tokio-rt"] }
 parking_lot = { workspace = true }

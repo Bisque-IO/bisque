@@ -15,7 +15,7 @@ All phases executed successfully. Workspace compiles cleanly.
 
 ## Phase 1: `std::sync::Mutex` Poisoning Recovery ✅
 
-**Files**: `storage_mmap.rs`, `manifest_mdbx.rs`
+**Files**: `storage_mmap.rs`, `manifest.rs`
 
 All `std::sync::Mutex::lock().unwrap()` replaced with `lock().unwrap_or_else(|e| e.into_inner())`.
 All `std::sync::Condvar::wait().unwrap()` and `wait_timeout().unwrap()` similarly recovered.
@@ -24,8 +24,9 @@ All `std::sync::Condvar::wait().unwrap()` and `wait_timeout().unwrap()` similarl
 
 ## Phase 2: Explicit `panic!()` Removal ✅
 
-### 2a. `manifest_mdbx.rs` — `new_in_memory()` panic ✅
+### 2a. `manifest.rs` — `new_in_memory()` panic ✅
 Changed `new_in_memory()` to return `io::Result<Self>`.
+*(Note: the manifest system was later rewritten from MDBX to an append-only WAL with periodic snapshots.)*
 
 ### 2b. `network.rs` — `MultiRaftNetworkFactory::new_client()` ✅
 Replaced `panic!()` with `unreachable!()` + documentation. This is an OpenRaft trait guard — calling it is a programming error, not a runtime condition.
@@ -37,7 +38,7 @@ Replaced `panic!()` with `unreachable!()` + documentation. This is an OpenRaft t
 ### 3a. `storage_mmap.rs` — fsync thread spawn ✅
 Converted to `?` operator.
 
-### 3b. `manifest_mdbx.rs` — manifest worker thread spawn ✅
+### 3b. `manifest.rs` — manifest worker thread spawn ✅
 Now returns `io::Result` via `?`.
 
 ---
@@ -106,7 +107,7 @@ Replaced with `unwrap_or_else` that logs the error and returns an empty `Vec`.
 |------|--------|
 | `storage.rs` | 9a (trait signature) |
 | `storage_mmap.rs` | 1, 3a, 4a, 6a, 7a, 8a, 9a |
-| `manifest_mdbx.rs` | 1, 2a, 3b |
+| `manifest.rs` | 1, 2a, 3b |
 | `record_format.rs` | 5 |
 | `segment_archive.rs` | 7b |
 | `network.rs` | 2b |

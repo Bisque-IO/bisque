@@ -10,7 +10,7 @@ Total potential panic points found in **production code** (excluding `#[cfg(test
 | `std::sync::Condvar::wait().unwrap()` / `wait_timeout().unwrap()` | 2 | **FIXED** — same recovery pattern |
 | `.expect()` on thread spawn | 2 | **FIXED** — returns `io::Result` |
 | `.expect()` on invariant | 1 | **FIXED** — returns `io::Error` |
-| `panic!()` in `manifest_mdbx::new_in_memory()` | 1 | **FIXED** — returns `io::Error` |
+| `panic!()` in `manifest::new_in_memory()` | 1 | **FIXED** — returns `io::Error` |
 | `panic!()` in `network::new_client()` | 1 | **FIXED** — replaced with `unreachable!()` (programming error trap) |
 | `.expect()` on `MultiRaftLogStorage::get_log_storage` | 1 | **FIXED** — trait returns `io::Result`, `.expect()` removed |
 | `.expect()` on `encode_framed` in rpc_server | 1 | **FIXED** — `unwrap_or_else` with error logging |
@@ -64,19 +64,16 @@ Rewritten as idiomatic `map_or` / pattern match.
 #### 1i. `MultiRaftLogStorage::get_log_storage` `.expect()` — FIXED
 The `MultiRaftLogStorage` trait now returns `io::Result<Self::GroupLogStorage>`, eliminating the `.expect()`. A new `AddGroupError<C>` error type in `manager.rs` propagates both storage and raft initialization errors.
 
-### 2. `manifest_mdbx.rs`
+### 2. `manifest.rs` (WAL-based manifest, replaced the former MDBX-based `manifest_mdbx.rs`)
 
 #### 2a. `std::sync::Mutex::lock().unwrap()` in `stop()` — FIXED
 Converted to `unwrap_or_else(|e| e.into_inner())`.
 
-#### 2b. `.expect()` on thread spawn in `open_in_memory()` — FIXED
+#### 2b. `.expect()` on thread spawn — FIXED
 Converted to `?` operator.
 
 #### 2c. `panic!()` in `new_in_memory()` — FIXED
 `new_in_memory()` now returns `io::Result<Self>`.
-
-#### 2d. `.try_into().unwrap()` on key bytes — ACCEPTABLE
-Preceded by `kb.len() != 16` check. Infallible.
 
 ### 3. `transport_tcp.rs`
 
@@ -129,7 +126,7 @@ Test utility module. Panicking on setup failures is standard test practice.
 ### Fixed (all production panics that could crash the process)
 1. ✅ All `std::sync::Mutex::lock().unwrap()` → `unwrap_or_else(|e| e.into_inner())`
 2. ✅ All `std::sync::Condvar::wait().unwrap()` → same recovery
-3. ✅ `panic!()` in `MdbxManifest::new_in_memory()` → returns `io::Error`
+3. ✅ `panic!()` in manifest `new_in_memory()` → returns `io::Error`
 4. ✅ `panic!()` in `MultiRaftNetworkFactory::new_client()` → `unreachable!()`
 5. ✅ `.expect()` on thread spawn → returns `io::Result`
 6. ✅ `.expect()` on group insertion invariant → returns `io::Error`

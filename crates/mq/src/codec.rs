@@ -478,6 +478,7 @@ impl Encode for MqError {
                 7u8.encode(w)?;
                 group_id.encode(w)
             }
+            MqError::DiskFull => 8u8.encode(w),
         }
     }
     fn encoded_size(&self) -> usize {
@@ -486,7 +487,8 @@ impl Encode for MqError {
             MqError::MailboxFull { .. } => 4,
             MqError::IllegalGeneration
             | MqError::RebalanceInProgress
-            | MqError::UnknownMemberId => 0,
+            | MqError::UnknownMemberId
+            | MqError::DiskFull => 0,
             MqError::Custom(msg) => msg.encoded_size(),
             MqError::BackPressure { .. } => 8,
         }
@@ -514,6 +516,7 @@ impl Decode for MqError {
             7 => Ok(MqError::BackPressure {
                 group_id: u64::decode(r)?,
             }),
+            8 => Ok(MqError::DiskFull),
             t => Err(CodecError::InvalidDiscriminant(t)),
         }
     }

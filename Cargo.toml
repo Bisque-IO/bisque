@@ -11,6 +11,8 @@ members = [
     # "crates/maniac-sys",
     # "crates/maniac-usockets",
     # "crates/macros",
+    "crates/alloc",              # bisque-alloc: Per-group heap memory allocation
+    "crates/alloc/mimalloc-sys", # bisque-mimalloc-sys: Raw FFI bindings to mimalloc
     "crates/maniac",
     "crates/raft",           # maniac-raft: OpenRaft adapter for Maniac runtime
     "crates/protocol",       # bisque-protocol: Shared WebSocket protocol types

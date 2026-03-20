@@ -14,11 +14,10 @@ use tracing::{info, warn};
 use bisque_raft::{SegmentPrefetcher, SegmentSyncClient};
 
 use crate::MqTypeConfig;
-use crate::async_apply::{AsyncApplyManager, ResponseEntry};
+use crate::async_apply::AsyncApplyManager;
 use crate::config::MqConfig;
 use crate::engine::MqEngine;
 use crate::forward::RaftBacklog;
-use crate::manifest::{GroupMeta, MqManifestManager, StructuralWrite};
 use crate::metadata::MqMetadata;
 use crate::retention::RetentionEvaluator;
 use crate::segment_index::SegmentIndexMap;
@@ -26,15 +25,9 @@ use crate::types::{MqApplyResponse, MqCommand, MqSnapshotData};
 
 /// Raft state machine that drives the MQ engine.
 ///
-/// On normal startup the state machine returns `(None, Default)` from
+/// On every startup the state machine returns `(None, Default)` from
 /// `applied_state()`, forcing openraft to replay the entire available raft
-/// log. This rebuilds the in-memory `MqEngine` from scratch — no periodic
-/// MDBX snapshots are needed.
-///
-/// The MDBX manifest is only used when a snapshot is *installed* from the
-/// leader (new/lagging nodes). In that case the snapshot is persisted so
-/// that `applied_state()` can load it on the next restart and replay only
-/// the entries after the snapshot point.
+/// log. This rebuilds the in-memory `MqEngine` from scratch.
 pub struct MqStateMachine {
     engine: Arc<MqEngine>,
     last_applied: Option<openraft::alias::LogIdOf<MqTypeConfig>>,
@@ -42,12 +35,7 @@ pub struct MqStateMachine {
     purge_floor: Option<Arc<AtomicU64>>,
     pin_ceiling: Option<Arc<AtomicU64>>,
     prefetcher: Option<SegmentPrefetcher>,
-    manifest: Option<Arc<MqManifestManager>>,
     group_id: u64,
-    /// Tracks the structural purge floor loaded from MDBX.
-    /// Used in combination with the message purge floor to determine
-    /// the actual raft log purge point.
-    structural_purge_floor: u64,
     /// Client for syncing segment files from the leader during snapshot install.
     sync_client: Option<SegmentSyncClient>,
     /// Address of this node's segment sync server (included in outgoing snapshots).
@@ -84,9 +72,7 @@ impl MqStateMachine {
             purge_floor: None,
             pin_ceiling: None,
             prefetcher: None,
-            manifest: None,
             group_id: 0,
-            structural_purge_floor: 0,
             sync_client: None,
             sync_addr: None,
             group_dir: None,
@@ -110,7 +96,6 @@ impl MqStateMachine {
             &config.parallel_apply,
             Arc::clone(&self.engine),
             prefetcher,
-            self.manifest.clone(),
             self.purged_segments.clone(),
             self.group_id,
             initial_cursor,
@@ -127,12 +112,8 @@ impl MqStateMachine {
     }
 
     /// Initialize the Level 2 retention evaluator. Call after all builder
-    /// methods are invoked. Requires a manifest, purge_floor, and group_dir.
+    /// methods are invoked. Requires a purge_floor and group_dir.
     pub fn init_retention(&mut self, config: &MqConfig) {
-        let manifest = match self.manifest.as_ref() {
-            Some(m) => Arc::clone(m),
-            None => return, // no manifest → no retention
-        };
         let purge_floor = match self.purge_floor.as_ref() {
             Some(f) => Arc::clone(f),
             None => return,
@@ -145,7 +126,6 @@ impl MqStateMachine {
         let evaluator = RetentionEvaluator::new(
             group_dir,
             self.group_id,
-            manifest,
             self.engine.shared_metadata(),
             purge_floor,
             config.retention_eval_interval,
@@ -174,8 +154,7 @@ impl MqStateMachine {
         self
     }
 
-    pub fn with_manifest(mut self, manifest: Arc<MqManifestManager>, group_id: u64) -> Self {
-        self.manifest = Some(manifest);
+    pub fn with_group_id(mut self, group_id: u64) -> Self {
         self.group_id = group_id;
         self
     }
@@ -217,29 +196,13 @@ impl MqStateMachine {
 
     fn update_purge_floor(&mut self) {
         if let Some(ref floor) = self.purge_floor {
-            let message_floor = self.engine.compute_purge_floor();
-            // Actual purge point is min of message floor and structural floor.
-            // We can't purge past either: structural commands before structural_purge_floor
-            // may not be in MDBX yet, and messages before message_floor are still referenced.
-            let mut effective = if self.structural_purge_floor > 0 && message_floor > 0 {
-                message_floor.min(self.structural_purge_floor)
-            } else if message_floor > 0 {
-                message_floor
-            } else if self.structural_purge_floor > 0 {
-                self.structural_purge_floor
-            } else {
-                0
-            };
-
-            // With async apply, also account for slowest worker cursor —
-            // can't purge segments workers haven't yet read.
+            let mut effective = self.engine.compute_purge_floor();
             if let Some(ref async_apply) = self.async_apply {
                 let min_cursor = async_apply.min_worker_cursor();
                 if min_cursor > 0 && (effective == 0 || min_cursor < effective) {
                     effective = min_cursor;
                 }
             }
-
             if effective > 0 {
                 floor.store(effective, Ordering::Release);
             }
@@ -270,117 +233,8 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
         ),
         io::Error,
     > {
-        if let Some(ref manifest) = self.manifest {
-            // First check for a previously installed snapshot (new/lagging node).
-            if let Some(snapshot_data) = manifest.read_snapshot_data(self.group_id)? {
-                if let Some((last_applied, membership)) =
-                    manifest.read_applied_state(self.group_id)?
-                {
-                    self.last_applied = last_applied;
-                    self.last_membership = membership.clone();
-
-                    self.engine.restore(snapshot_data);
-                    self.segment_indexes.clear();
-                    info!(
-                        group_id = self.group_id,
-                        last_applied = ?self.last_applied,
-                        "MQ state machine restored from installed snapshot"
-                    );
-
-                    return Ok((self.last_applied, membership));
-                }
-            }
-
-            // No snapshot — check for structural state persisted by normal operation.
-            // This loads entity metadata (topics, exchanges, consumer groups, sessions)
-            // from MDBX and returns the structural_purge_floor so openraft replays
-            // only entries from that point forward.
-            if let Some(structural) = manifest.read_structural_state(self.group_id)? {
-                if structural.structural_purge_floor > 0 {
-                    self.structural_purge_floor = structural.structural_purge_floor;
-
-                    // Convert StructuralState into MqSnapshotData for restore_structural.
-                    let snap = MqSnapshotData {
-                        topics: structural
-                            .topics
-                            .into_iter()
-                            .map(|meta| crate::types::TopicSnapshot {
-                                meta,
-                                consumer_offsets: Vec::new(),
-                            })
-                            .collect(),
-                        exchanges: structural
-                            .exchanges
-                            .into_iter()
-                            .map(|meta| crate::types::ExchangeSnapshot {
-                                meta,
-                                bindings: Vec::new(),
-                                retained: Vec::new(),
-                            })
-                            .collect(),
-                        consumer_groups: structural
-                            .consumer_groups
-                            .into_iter()
-                            .map(|meta| crate::consumer_group::ConsumerGroupSnapshot {
-                                meta,
-                                offsets: Vec::new(),
-                                ack_state: None,
-                                actor_state: None,
-                            })
-                            .collect(),
-                        sessions: structural
-                            .sessions
-                            .into_iter()
-                            .map(|meta| crate::types::SessionSnapshot { meta })
-                            .collect(),
-                        pending_wills: Vec::new(),
-                        next_id: structural.next_id,
-                        file_manifest: Vec::new(),
-                        sync_addr: None,
-                        client_sessions: Default::default(),
-                    };
-                    self.engine.restore_structural(snap);
-                    self.segment_indexes.clear();
-
-                    // Populate retained messages from MDBX into exchange state.
-                    // These were persisted during segment purge sweeps.
-                    let exchanges_guard = self.engine.metadata().exchanges.pin();
-                    for (exchange_id, entries) in structural.retained {
-                        if let Some(exchange) = exchanges_guard.get(&exchange_id) {
-                            let mut retained = exchange.retained.write();
-                            for (key, msg_bytes) in entries {
-                                retained.insert(
-                                    key,
-                                    crate::exchange::RetainedValue::heap(bytes::Bytes::from(
-                                        msg_bytes,
-                                    )),
-                                );
-                            }
-                        }
-                    }
-
-                    // Return a synthetic last_applied at structural_purge_floor
-                    // so openraft replays from there.
-                    let last_applied = LogId {
-                        leader_id: openraft::impls::leader_id_adv::LeaderId {
-                            term: 0,
-                            node_id: 0,
-                        },
-                        index: self.structural_purge_floor,
-                    };
-                    self.last_applied = Some(last_applied);
-
-                    info!(
-                        group_id = self.group_id,
-                        structural_purge_floor = self.structural_purge_floor,
-                        "MQ state machine restored structural state from MDBX"
-                    );
-
-                    return Ok((self.last_applied, openraft::StoredMembership::default()));
-                }
-            }
-        }
-
+        // Always return (None, Default) — openraft replays the entire available
+        // raft log on startup, rebuilding the in-memory MqEngine from scratch.
         Ok((None, openraft::StoredMembership::default()))
     }
 
@@ -452,20 +306,6 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
             let sealed = self.segment_indexes.take_sealed(current_seg_id);
 
             if !sealed.is_empty() {
-                // Fire segment range updates to MDBX before writing .sidx files
-                if let Some(ref manifest) = self.manifest {
-                    for (seg_id, idx) in &sealed {
-                        let summaries = idx.entity_summaries();
-                        if !summaries.is_empty() {
-                            manifest.sealed_segment_fire_and_forget(
-                                self.group_id,
-                                *seg_id as u64,
-                                summaries,
-                            );
-                        }
-                    }
-                }
-
                 let dir = group_dir.clone();
                 tokio::task::spawn_blocking(move || {
                     for (seg_id, idx) in sealed {
@@ -605,24 +445,12 @@ impl RaftStateMachine<MqTypeConfig> for MqStateMachine {
             }
         }
 
-        // Clone snapshot for MDBX persistence before engine.restore() consumes it.
-        // Bytes fields are refcounted so this clone is cheap.
-        let snap_for_mdbx = snap.clone();
-
         self.engine.restore(snap);
         self.update_purge_floor();
         self.segment_indexes.clear();
 
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
-
-        // Persist to MDBX as individual entity records (not one big blob).
-        if let Some(ref manifest) = self.manifest {
-            let group_meta = GroupMeta::from_raft(&self.last_applied, &self.last_membership);
-            manifest
-                .install_snapshot(self.group_id, group_meta, snap_for_mdbx)
-                .await?;
-        }
 
         self.update_pin_ceiling();
 
@@ -694,207 +522,5 @@ impl RaftSnapshotBuilder<MqTypeConfig> for MqSnapshotBuilder {
             },
             snapshot: Cursor::new(data),
         })
-    }
-}
-
-// =============================================================================
-// Structural command classification
-// =============================================================================
-
-/// Identifies what kind of structural command this is (if any).
-#[derive(Debug, Clone)]
-pub(crate) enum StructuralKind {
-    None,
-    CreateTopic,
-    DeleteTopic(u64),
-    CreateExchange,
-    DeleteExchange(u64),
-    CreateConsumerGroup,
-    DeleteConsumerGroup(u64),
-    CreateSession,
-    SetRetained {
-        exchange_id: u64,
-        routing_key: String,
-        message: Vec<u8>,
-    },
-    DeleteRetained {
-        exchange_id: u64,
-        routing_key: String,
-    },
-    Batch(Vec<StructuralKind>),
-}
-
-pub(crate) fn classify_structural(cmd: &MqCommand) -> StructuralKind {
-    classify_structural_buf(cmd.as_bytes())
-}
-
-fn classify_structural_buf(buf: &[u8]) -> StructuralKind {
-    use crate::codec::{CmdBatch, CmdDeleteRetained, CmdSetRetained};
-    use crate::types::{buf_field_u64, buf_tag};
-
-    if buf.len() < 8 {
-        return StructuralKind::None;
-    }
-
-    match buf_tag(buf) {
-        MqCommand::TAG_CREATE_TOPIC => StructuralKind::CreateTopic,
-        MqCommand::TAG_DELETE_TOPIC if buf.len() >= 16 => {
-            StructuralKind::DeleteTopic(buf_field_u64(buf, 8))
-        }
-        MqCommand::TAG_CREATE_EXCHANGE => StructuralKind::CreateExchange,
-        MqCommand::TAG_DELETE_EXCHANGE if buf.len() >= 16 => {
-            StructuralKind::DeleteExchange(buf_field_u64(buf, 8))
-        }
-        MqCommand::TAG_CREATE_CONSUMER_GROUP => StructuralKind::CreateConsumerGroup,
-        MqCommand::TAG_DELETE_CONSUMER_GROUP if buf.len() >= 16 => {
-            StructuralKind::DeleteConsumerGroup(buf_field_u64(buf, 8))
-        }
-        MqCommand::TAG_CREATE_SESSION => StructuralKind::CreateSession,
-        MqCommand::TAG_SET_RETAINED | MqCommand::TAG_SET_RETAINED_MQTT => {
-            let v = match CmdSetRetained::from_buf(buf) {
-                Ok(v) => v,
-                Err(_) => return StructuralKind::None,
-            };
-            StructuralKind::SetRetained {
-                exchange_id: v.exchange_id(),
-                routing_key: v.routing_key().unwrap_or("").to_owned(),
-                message: v.message().unwrap_or_default().to_vec(),
-            }
-        }
-        MqCommand::TAG_DELETE_RETAINED => {
-            let v = match CmdDeleteRetained::from_buf(buf) {
-                Ok(v) => v,
-                Err(_) => return StructuralKind::None,
-            };
-            StructuralKind::DeleteRetained {
-                exchange_id: v.exchange_id(),
-                routing_key: v.routing_key().unwrap_or("").to_owned(),
-            }
-        }
-        MqCommand::TAG_BATCH => {
-            let batch = match CmdBatch::from_buf(buf) {
-                Ok(b) => b,
-                Err(_) => return StructuralKind::None,
-            };
-            let kinds: Vec<StructuralKind> = batch
-                .commands()
-                .map(|c| classify_structural_buf(c))
-                .collect();
-            if kinds.iter().all(|k| matches!(k, StructuralKind::None)) {
-                StructuralKind::None
-            } else {
-                StructuralKind::Batch(kinds)
-            }
-        }
-        // ForwardedBatch sub-commands are applied by the engine one at a time;
-        // structural writes from individual sub-commands are handled inline.
-        MqCommand::TAG_FORWARDED_BATCH => StructuralKind::None,
-        _ => StructuralKind::None,
-    }
-}
-
-/// After apply_command, collect the structural writes to send to MDBX.
-/// For creates, reads the newly-created entity metadata from the metadata store.
-/// For deletes, uses the ID captured before apply.
-pub(crate) fn collect_structural_writes(
-    meta: &MqMetadata,
-    response: &ResponseEntry,
-    kind: StructuralKind,
-) -> Option<Vec<StructuralWrite>> {
-    match kind {
-        StructuralKind::None => None,
-        StructuralKind::CreateTopic => {
-            if response.tag() == ResponseEntry::TAG_ENTITY_CREATED {
-                let id = response.entity_id();
-                meta.topics
-                    .pin()
-                    .get(&id)
-                    .map(|t| vec![StructuralWrite::CreateTopic(t.snapshot_meta())])
-            } else {
-                None
-            }
-        }
-        StructuralKind::DeleteTopic(id) => Some(vec![StructuralWrite::DeleteTopic(id)]),
-        StructuralKind::CreateExchange => {
-            if response.tag() == ResponseEntry::TAG_ENTITY_CREATED {
-                let id = response.entity_id();
-                meta.exchanges
-                    .pin()
-                    .get(&id)
-                    .map(|e| vec![StructuralWrite::CreateExchange(e.meta.clone())])
-            } else {
-                None
-            }
-        }
-        StructuralKind::DeleteExchange(id) => Some(vec![StructuralWrite::DeleteExchange(id)]),
-        StructuralKind::CreateConsumerGroup => {
-            if response.tag() == ResponseEntry::TAG_ENTITY_CREATED {
-                let id = response.entity_id();
-                meta.consumer_groups
-                    .pin()
-                    .get(&id)
-                    .map(|g| vec![StructuralWrite::CreateConsumerGroup(g.snapshot_meta())])
-            } else {
-                None
-            }
-        }
-        StructuralKind::DeleteConsumerGroup(id) => {
-            Some(vec![StructuralWrite::DeleteConsumerGroup(id)])
-        }
-        StructuralKind::CreateSession => {
-            if response.tag() == ResponseEntry::TAG_ENTITY_CREATED {
-                let id = response.entity_id();
-                meta.sessions
-                    .pin()
-                    .get(&id)
-                    .map(|s| vec![StructuralWrite::CreateSession(s.snapshot_meta())])
-            } else {
-                None
-            }
-        }
-        StructuralKind::SetRetained {
-            exchange_id,
-            routing_key,
-            message,
-        } => {
-            if response.tag() == ResponseEntry::TAG_OK {
-                Some(vec![StructuralWrite::SetRetained {
-                    exchange_id,
-                    routing_key,
-                    message,
-                }])
-            } else {
-                None
-            }
-        }
-        StructuralKind::DeleteRetained {
-            exchange_id,
-            routing_key,
-        } => {
-            if response.tag() == ResponseEntry::TAG_OK {
-                Some(vec![StructuralWrite::DeleteRetained {
-                    exchange_id,
-                    routing_key,
-                }])
-            } else {
-                None
-            }
-        }
-        StructuralKind::Batch(kinds) => {
-            if response.tag() != ResponseEntry::TAG_BATCH {
-                return None;
-            }
-            let mut writes = Vec::new();
-            for (kind, resp) in kinds.into_iter().zip(response.batch_entries()) {
-                if let Some(w) = collect_structural_writes(meta, &resp, kind) {
-                    writes.extend(w);
-                }
-            }
-            if writes.is_empty() {
-                None
-            } else {
-                Some(writes)
-            }
-        }
     }
 }

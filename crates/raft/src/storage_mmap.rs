@@ -18,17 +18,16 @@
 //!   ...
 //! ```
 //!
-//! Plus shared manifest MDBX in `{base_dir}/.raft_manifest/` for fast recovery.
+//! Plus shared manifest WAL in `{base_dir}/.raft_manifest/` for fast recovery.
 
 use crate::codec::{BorrowPayload, Decode, Encode};
-use crate::manifest_mdbx::{ManifestManager, SegmentLocation, SegmentMeta};
+use crate::manifest::{ManifestWriter, SegmentLocation, SegmentMeta};
 use crate::record_format::{
     AtomicLogId, AtomicVote, CRC64_SIZE, GROUP_ID_SIZE, HEADER_SIZE, LENGTH_SIZE, LogIndex,
     LogLocation, MAX_GROUPS, RecordType, RecordTypeFlags, align8, append_record_into,
     append_record_into_scattered, append_record_into_scattered_many, validate_record, write_u24_le,
 };
 use arc_swap::ArcSwap;
-use crossfire::{MAsyncTx, mpsc::Array};
 use memmap2::{Mmap, MmapRaw};
 use openraft::{
     LogId, LogState, RaftTypeConfig,
@@ -72,7 +71,7 @@ const ENTRY_HEADER_SIZE: usize = 16;
 pub struct MmapStorageConfig {
     /// Base directory for all raft data
     pub base_dir: Arc<PathBuf>,
-    /// Optional manifest directory for filesystems that don't support MDBX
+    /// Optional manifest directory override (defaults to base_dir)
     pub manifest_dir: Option<Arc<PathBuf>>,
     /// Maximum segment size in bytes. When exceeded, a new segment is created.
     pub segment_size: u64,
@@ -125,7 +124,7 @@ impl Default for MmapStorageConfig {
             manifest_dir: None,
             segment_size: DEFAULT_SEGMENT_SIZE,
             max_record_size: DEFAULT_MAX_RECORD_SIZE,
-            fsync_delay: std::time::Duration::from_millis(100),
+            fsync_delay: std::time::Duration::from_micros(500),
             disable_fsync: false,
             disable_crc: false,
             prealloc_pool_size: 2,
@@ -1051,7 +1050,7 @@ struct SealRequest {
     max_index: Option<u64>,
     record_count: u64,
     record_type_flags: RecordTypeFlags,
-    manifest_tx: MAsyncTx<Array<SegmentMeta>>,
+    manifest: ManifestWriter,
     entry_count: u64,
     first_entry_offset: u64,
     /// Optional archive for uploading sealed segments to remote storage.
@@ -1249,7 +1248,7 @@ fn seal_segment(req: SealRequest, skip_fsync: bool) {
     }
 
     // Update manifest with all metadata.
-    let _ = req.manifest_tx.try_send(SegmentMeta {
+    req.manifest.send_segment_update(SegmentMeta {
         group_id: req.group_id,
         segment_id: req.segment.segment_id,
         valid_bytes: req.valid_bytes,
@@ -1270,7 +1269,7 @@ fn seal_segment(req: SealRequest, skip_fsync: bool) {
         let path = req.segment.path.clone();
         let group_id = req.group_id;
         let segment_id = req.segment.segment_id;
-        let manifest_tx = req.manifest_tx.clone();
+        let manifest = req.manifest.clone();
         let valid_bytes = req.valid_bytes;
         let min_index = req.min_index;
         let max_index = req.max_index;
@@ -1283,7 +1282,7 @@ fn seal_segment(req: SealRequest, skip_fsync: bool) {
             handle.spawn(async move {
                 match archive.upload_segment(group_id, segment_id, &path).await {
                     Ok(()) => {
-                        let _ = manifest_tx.try_send(SegmentMeta {
+                        manifest.send_segment_update(SegmentMeta {
                             group_id,
                             segment_id,
                             valid_bytes,
@@ -1646,6 +1645,8 @@ struct WriterState {
     entry_count: u64,
     /// Optional archive for uploading sealed segments to remote storage.
     archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
+    /// Shared disk usage counter. Charged on segment creation.
+    disk_usage_bytes: Arc<AtomicU64>,
 }
 
 impl WriterState {
@@ -1656,7 +1657,7 @@ impl WriterState {
         data: &[u8],
         config: &MmapStorageConfig,
         segment_map: &MmapSegmentMap,
-        manifest_tx: &MAsyncTx<Array<SegmentMeta>>,
+        manifest: &ManifestWriter,
         fsync_state: &FsyncState<impl RaftTypeConfig>,
     ) -> io::Result<usize> {
         let data_len = data.len() as u64;
@@ -1670,7 +1671,7 @@ impl WriterState {
             self.rotate_segment_with_min(
                 config,
                 segment_map,
-                manifest_tx,
+                manifest,
                 fsync_state,
                 min_capacity,
                 None,
@@ -1716,7 +1717,7 @@ impl WriterState {
         len: usize,
         config: &MmapStorageConfig,
         segment_map: &MmapSegmentMap,
-        manifest_tx: &MAsyncTx<Array<SegmentMeta>>,
+        manifest: &ManifestWriter,
         fsync_state: &FsyncState<impl RaftTypeConfig>,
         stats: Option<&MmapStorageStats>,
     ) -> io::Result<(usize, *mut u8, usize)> {
@@ -1726,7 +1727,7 @@ impl WriterState {
             self.rotate_segment_with_min(
                 config,
                 segment_map,
-                manifest_tx,
+                manifest,
                 fsync_state,
                 data_len,
                 stats,
@@ -1781,10 +1782,10 @@ impl WriterState {
         &mut self,
         config: &MmapStorageConfig,
         segment_map: &MmapSegmentMap,
-        manifest_tx: &MAsyncTx<Array<SegmentMeta>>,
+        manifest: &ManifestWriter,
         fsync_state: &FsyncState<impl RaftTypeConfig>,
     ) -> io::Result<()> {
-        self.rotate_segment_with_min(config, segment_map, manifest_tx, fsync_state, 0, None)
+        self.rotate_segment_with_min(config, segment_map, manifest, fsync_state, 0, None)
     }
 
     /// Rotate with a minimum capacity for the new segment. If `min_capacity`
@@ -1794,7 +1795,7 @@ impl WriterState {
         &mut self,
         config: &MmapStorageConfig,
         segment_map: &MmapSegmentMap,
-        manifest_tx: &MAsyncTx<Array<SegmentMeta>>,
+        manifest: &ManifestWriter,
         fsync_state: &FsyncState<impl RaftTypeConfig>,
         min_capacity: u64,
         stats: Option<&MmapStorageStats>,
@@ -1852,6 +1853,10 @@ impl WriterState {
             }
         }
 
+        // Charge disk usage for the new segment.
+        self.disk_usage_bytes
+            .fetch_add(segment_size, Ordering::Relaxed);
+
         // Refill the pool after consuming a segment.
         self.refill_pool(config);
 
@@ -1875,7 +1880,7 @@ impl WriterState {
             max_index: self.active.max_entry_index,
             record_count,
             record_type_flags: flags,
-            manifest_tx: manifest_tx.clone(),
+            manifest: manifest.clone(),
             entry_count,
             first_entry_offset,
             archive: self.archive.clone(),
@@ -2099,8 +2104,8 @@ struct MmapGroupState<C: RaftTypeConfig> {
     writer: Mutex<WriterState>,
     /// Config for segment size etc.
     config: Arc<MmapStorageConfig>,
-    /// Manifest sender for tracking sealed segments
-    manifest_tx: MAsyncTx<Array<SegmentMeta>>,
+    /// Manifest writer for tracking sealed segments
+    manifest: ManifestWriter,
     /// Shared fsync state (one thread for all groups, owned by MmapPerGroupLogStorage)
     fsync_state: Arc<FsyncState<C>>,
     /// Floor below which purge() will not remove log entries.
@@ -2117,6 +2122,10 @@ struct MmapGroupState<C: RaftTypeConfig> {
     archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
     /// Append-path diagnostic counters.
     stats: Arc<MmapStorageStats>,
+    /// Tracks total bytes of segment files on local disk for this group.
+    /// Charged on segment creation, released on segment deletion.
+    /// Initialized by scanning segment files at startup.
+    disk_usage_bytes: Arc<AtomicU64>,
 }
 
 impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
@@ -2125,7 +2134,8 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
         group_id: u64,
         config: &Arc<MmapStorageConfig>,
         group_dir: &Path,
-        manifest: &ManifestManager,
+        manifest: &ManifestWriter,
+        manifest_segments: &HashMap<u64, SegmentMeta>,
         fsync_state: Arc<FsyncState<C>>,
         archive: Option<Arc<crate::segment_archive::ArchiveManager>>,
     ) -> io::Result<Self>
@@ -2154,11 +2164,18 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             archive.clone(),
         )?);
 
-        // Load manifest data for this group
-        let manifest_segments = manifest.read_group_segments(group_id).unwrap_or_default();
-
         // Scan directory for segment files
         let segment_ids = scan_segment_ids(group_dir)?;
+
+        // Compute initial disk usage by summing segment file sizes.
+        let mut initial_disk_bytes: u64 = 0;
+        for &seg_id in &segment_ids {
+            let path = segment_path(group_dir, seg_id);
+            if let Ok(meta) = std::fs::metadata(&path) {
+                initial_disk_bytes += meta.len();
+            }
+        }
+        let disk_usage_bytes = Arc::new(AtomicU64::new(initial_disk_bytes));
 
         let mut vote: Option<openraft::alias::VoteOf<C>> = None;
         let mut last_log_id: Option<openraft::alias::LogIdOf<C>> = None;
@@ -2293,7 +2310,7 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
 
             // Repair manifest: emit entry for segments missing or not yet sealed
             if !meta.map_or(false, |m| m.sealed) {
-                let _ = manifest.sender().try_send(SegmentMeta {
+                manifest.send_segment_update(SegmentMeta {
                     group_id,
                     segment_id: seg_id,
                     valid_bytes: valid as u64,
@@ -2416,9 +2433,8 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             entry_offsets: Vec::new(),
             entry_count: 0,
             archive: archive.clone(),
+            disk_usage_bytes: disk_usage_bytes.clone(),
         };
-
-        let manifest_tx = manifest.sender();
 
         Ok(Self {
             vote: atomic_vote,
@@ -2430,13 +2446,14 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
             segment_map,
             writer: Mutex::new(writer),
             config: config.clone(),
-            manifest_tx,
+            manifest: manifest.clone(),
             fsync_state,
             purge_floor,
             pin_ceiling,
             purged_segments: Arc::new(Mutex::new(Vec::new())),
             archive,
             stats: Arc::new(MmapStorageStats::default()),
+            disk_usage_bytes,
         })
     }
 
@@ -2586,7 +2603,9 @@ impl<C: RaftTypeConfig + 'static> MmapGroupState<C> {
 /// ensures durability without blocking the writer.
 pub struct MmapPerGroupLogStorage<C: RaftTypeConfig> {
     config: Arc<MmapStorageConfig>,
-    manifest: Arc<ManifestManager>,
+    manifest: ManifestWriter,
+    /// Recovered segment metadata, shared with groups during initialization.
+    manifest_segments: std::sync::Arc<HashMap<(u64, u64), SegmentMeta>>,
     groups: MmapGroupIndex<C>,
     creation_lock: tokio::sync::Mutex<()>,
     /// Single shared fsync thread for all groups
@@ -2626,18 +2645,9 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
             .as_ref()
             .map(|p| (**p).clone())
             .unwrap_or(base);
-        let manifest =
-            tokio::task::spawn_blocking(move || match ManifestManager::open(&manifest_dir) {
-                Ok(manifest) => Ok(manifest),
-                Err(e)
-                    if e.raw_os_error() == Some(22) || e.kind() == io::ErrorKind::InvalidInput =>
-                {
-                    ManifestManager::open_in_memory()
-                }
-                Err(e) => Err(e),
-            })
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+        let manifest_dir = manifest_dir.join(".raft_manifest");
+        let (manifest, recovery) = ManifestWriter::open(&manifest_dir, 4 * 1024 * 1024).await?;
+        let manifest_segments = std::sync::Arc::new(recovery.segments);
 
         // Spawn single shared fsync thread for all groups
         let fsync_state = Arc::new(FsyncState::new(config.fsync_delay, config.disable_fsync));
@@ -2651,7 +2661,8 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
 
         Ok(Self {
             config,
-            manifest: Arc::new(manifest),
+            manifest,
+            manifest_segments,
             groups: MmapGroupIndex::new(),
             creation_lock: tokio::sync::Mutex::new(()),
             fsync_state,
@@ -2671,8 +2682,7 @@ impl<C: RaftTypeConfig + 'static> MmapPerGroupLogStorage<C> {
         if let Some(handle) = self.fsync_thread.lock().take() {
             let _ = handle.join();
         }
-        // Stop the manifest worker thread
-        self.manifest.stop();
+        // Manifest worker task exits when all senders drop.
     }
 }
 
@@ -2712,12 +2722,21 @@ impl<C: RaftTypeConfig> MmapPerGroupLogStorage<C> {
         let fsync_state = self.fsync_state.clone();
         let archive = self.archive.clone();
 
+        // Extract recovered segment metadata for this group.
+        let group_segments: HashMap<u64, SegmentMeta> = self
+            .manifest_segments
+            .iter()
+            .filter(|&(&(gid, _), _)| gid == group_id)
+            .map(|(&(_, sid), meta)| (sid, *meta))
+            .collect();
+
         let state = tokio::task::spawn_blocking(move || {
             MmapGroupState::new(
                 group_id,
                 &config,
                 &group_dir,
                 &manifest,
+                &group_segments,
                 fsync_state,
                 archive,
             )
@@ -2795,6 +2814,14 @@ impl<C: RaftTypeConfig> MmapPerGroupLogStorage<C> {
         self.groups
             .get(group_id)
             .map(|state| state.purged_segments.clone())
+    }
+
+    /// Get the disk usage tracking handle for a specific group.
+    /// Returns `None` if the group has not been initialized yet.
+    pub fn get_disk_usage_bytes(&self, group_id: u64) -> Option<Arc<AtomicU64>> {
+        self.groups
+            .get(group_id)
+            .map(|state| state.disk_usage_bytes.clone())
     }
 
     /// Get a segment prefetcher handle for a specific group.
@@ -3321,7 +3348,7 @@ where
             VOTE_ALIGNED,
             &self.state.config,
             &self.state.segment_map,
-            &self.state.manifest_tx,
+            &self.state.manifest,
             &self.state.fsync_state,
             None,
         )?;
@@ -3431,7 +3458,7 @@ where
                 aligned,
                 &self.state.config,
                 &self.state.segment_map,
-                &self.state.manifest_tx,
+                &self.state.manifest,
                 &self.state.fsync_state,
                 Some(&stats),
             )?;
@@ -3541,7 +3568,7 @@ where
             writer.rotate_segment(
                 &self.state.config,
                 &self.state.segment_map,
-                &self.state.manifest_tx,
+                &self.state.manifest,
                 &self.state.fsync_state,
             )?;
         }
@@ -4427,8 +4454,16 @@ mod tests {
 
         // Phase 2: Verify sealed segment metadata is in manifest
         run_async(async move {
-            let manifest = ManifestManager::open(&path2).unwrap();
-            let segments = manifest.read_group_segments(0).unwrap();
+            let manifest_dir = path2.join(".raft_manifest");
+            let (_, recovery) = crate::manifest::ManifestLog::open(&manifest_dir, 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            let segments: HashMap<u64, crate::manifest::SegmentMeta> = recovery
+                .segments
+                .into_iter()
+                .filter(|&((gid, _), _)| gid == 0)
+                .map(|((_, sid), meta)| (sid, meta))
+                .collect();
 
             let mut sealed_count = 0;
             for (_seg_id, meta) in &segments {
@@ -4845,20 +4880,8 @@ mod tests {
             storage.stop();
             drop(storage);
 
-            // Delete the manifest to simulate missing seal metadata
-            let manifest_dir = path.clone();
-            for entry in std::fs::read_dir(&manifest_dir).unwrap() {
-                let entry = entry.unwrap();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("manifest")
-                    || name.ends_with(".mdbx")
-                    || name.ends_with("-lock")
-                {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-            // Also remove any mdbx files that might be inside subdirs
-            let _ = std::fs::remove_dir_all(path.join("manifest.mdbx"));
+            // Delete the manifest WAL directory to simulate missing seal metadata
+            let _ = std::fs::remove_dir_all(path.join(".raft_manifest"));
         });
 
         // Recovery should use slow path and repair manifest
@@ -5172,7 +5195,7 @@ mod tests {
 
         // Wipe manifest
         run_async(async move {
-            let _ = std::fs::remove_dir_all(path2.join("manifest.mdbx"));
+            let _ = std::fs::remove_dir_all(path2.join(".raft_manifest"));
         });
 
         // Recovery should repair everything
@@ -9899,7 +9922,7 @@ mod tests {
     #[test]
     fn test_segment_location_config_roundtrip() {
         // Verify that SegmentLocation is correctly encoded/decoded in manifest
-        use crate::manifest_mdbx::{SegmentLocation, SegmentMeta as ManifestSegmentMeta};
+        use crate::manifest::{SegmentLocation, SegmentMeta as ManifestSegmentMeta};
         use crate::record_format::RecordTypeFlags;
 
         for &loc in &[
@@ -9939,7 +9962,7 @@ mod tests {
     #[test]
     fn test_segment_location_backward_compat() {
         // Old data (location byte = 0) should decode as Local
-        use crate::manifest_mdbx::SegmentMeta as ManifestSegmentMeta;
+        use crate::manifest::SegmentMeta as ManifestSegmentMeta;
         use crate::record_format::RecordTypeFlags;
 
         let meta = ManifestSegmentMeta {
@@ -9964,7 +9987,7 @@ mod tests {
             ManifestSegmentMeta::decode_value(1, 1, &encoded).expect("decode should succeed");
         assert_eq!(
             decoded.location,
-            crate::manifest_mdbx::SegmentLocation::Local,
+            crate::manifest::SegmentLocation::Local,
             "Old format should decode as Local"
         );
     }

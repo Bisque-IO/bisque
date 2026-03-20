@@ -51,6 +51,7 @@ struct MqttMetrics {
     packets_sent: metrics::Counter,
     connections_total: metrics::Counter,
     connections_active: metrics::Gauge,
+    connections_rejected: metrics::Counter,
     publishes_in: metrics::Counter,
     publishes_out: metrics::Counter,
     subscribes: metrics::Counter,
@@ -66,6 +67,7 @@ impl MqttMetrics {
             packets_sent: metrics::counter!("mqtt.packets.sent", &labels),
             connections_total: metrics::counter!("mqtt.connections.total", &labels),
             connections_active: metrics::gauge!("mqtt.connections.active", &labels),
+            connections_rejected: metrics::counter!("mqtt.connections.rejected", &labels),
             publishes_in: metrics::counter!("mqtt.publishes.in", &labels),
             publishes_out: metrics::counter!("mqtt.publishes.out", &labels),
             subscribes: metrics::counter!("mqtt.subscribes", &labels),
@@ -79,6 +81,17 @@ static MQTT_METRICS: std::sync::OnceLock<MqttMetrics> = std::sync::OnceLock::new
 
 fn shared_metrics() -> &'static MqttMetrics {
     MQTT_METRICS.get_or_init(|| MqttMetrics::new("default"))
+}
+
+/// Write with a timeout to protect against slow consumers blocking a tokio task.
+async fn timed_write_all<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    buf: &[u8],
+    timeout: Duration,
+) -> std::io::Result<()> {
+    tokio::time::timeout(timeout, writer.write_all(buf))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "MQTT write timeout"))?
 }
 
 // =============================================================================
@@ -108,6 +121,13 @@ pub struct MqttServerConfig {
     /// When set, all CONNECT requests receive a CONNACK with the specified reason
     /// code and Server Reference, directing clients to another server.
     pub server_redirect: Option<ServerRedirect>,
+    /// Maximum concurrent MQTT connections. When exceeded, new connections are
+    /// immediately dropped. 0 = unlimited. Default: 10_000.
+    pub max_connections: usize,
+    /// Timeout for TCP write operations. If a `write_all` does not complete
+    /// within this duration, the connection is closed. Protects against slow
+    /// consumers blocking a tokio task indefinitely. Default: 30s.
+    pub write_timeout: Duration,
 }
 
 /// Server redirection configuration per MQTT 5.0 §4.13.
@@ -132,6 +152,8 @@ impl Default for MqttServerConfig {
             delivery_batch_size: 10,
             session_store: None,
             server_redirect: None,
+            max_connections: 10_000,
+            write_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -338,6 +360,21 @@ async fn accept_loop(
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer_addr)) => {
+                        // Enforce max_connections limit (0 = unlimited).
+                        if config.max_connections > 0 {
+                            let active = stats.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+                            if active >= config.max_connections as u64 {
+                                warn!(
+                                    max_connections = config.max_connections,
+                                    peer = %peer_addr,
+                                    "rejecting MQTT connection: limit reached"
+                                );
+                                shared_metrics().connections_rejected.increment(1);
+                                drop(stream);
+                                continue;
+                            }
+                        }
+
                         stats.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         stats.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -827,6 +864,7 @@ async fn deliver_outbound(
     write_buf: &mut BytesMut,
     sub_buf: &mut Vec<SubDeliveryInfo>,
     flat_messages_buf: &mut Vec<Bytes>,
+    write_timeout: Duration,
 ) -> Result<(), ConnectionError> {
     let mut buf = bytes::BytesMut::new();
     if session.is_inflight_full() {
@@ -1051,7 +1089,7 @@ async fn deliver_outbound(
     // Batch write: flush all encoded packets in a single write_all.
     if !write_buf.is_empty() {
         let len = write_buf.len();
-        stream.write_all(write_buf).await?;
+        timed_write_all(stream, write_buf, write_timeout).await?;
         m.bytes_out.increment(len as u64);
         m.packets_sent.increment(1);
         write_buf.clear();
@@ -1081,6 +1119,7 @@ async fn handle_connection(
     // Reusable write buffer — cleared between uses, never re-allocated.
     let mut write_buf = BytesMut::with_capacity(config.read_buffer_size);
     let mut session = MqttSession::new(config.session_config.clone());
+    let write_timeout = config.write_timeout;
 
     // Wait for CONNECT packet with timeout.
     let connect = tokio::time::timeout(config.connect_timeout, async {
@@ -1106,7 +1145,7 @@ async fn handle_connection(
                     };
                     write_buf.clear();
                     codec::encode_connack_v(&connack, &mut write_buf, false);
-                    let _ = stream.write_all(&write_buf).await;
+                    let _ = timed_write_all(&mut stream, &write_buf, write_timeout).await;
                     return Err(ConnectionError::Codec(
                         CodecError::UnsupportedProtocolVersion(0),
                     ));
@@ -1141,7 +1180,7 @@ async fn handle_connection(
         };
         write_buf.clear();
         codec::encode_connack_v(&connack, &mut write_buf, false);
-        let _ = stream.write_all(&write_buf).await;
+        let _ = timed_write_all(&mut stream, &write_buf, write_timeout).await;
         return Err(ConnectionError::Closed);
     }
 
@@ -1215,7 +1254,7 @@ async fn handle_connection(
 
     // Send CONNACK (already encoded in session.out_buf by handle_connect).
     if !session.out_buf.is_empty() {
-        stream.write_all(&session.out_buf).await?;
+        timed_write_all(&mut stream, &session.out_buf, write_timeout).await?;
         stats
             .total_packets_sent
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1233,7 +1272,7 @@ async fn handle_connection(
                 count = retransmit_count,
                 "retransmitting pending QoS messages on session resume"
             );
-            stream.write_all(&session.out_buf).await?;
+            timed_write_all(&mut stream, &session.out_buf, write_timeout).await?;
             stats.total_packets_sent.fetch_add(
                 retransmit_count as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -1283,6 +1322,7 @@ async fn handle_connection(
         config.delivery_batch_size,
         takeover_rx,
         group_notifier,
+        write_timeout,
     )
     .await;
 
@@ -1376,6 +1416,7 @@ async fn connection_loop(
     delivery_batch_size: u32,
     mut takeover_rx: tokio::sync::oneshot::Receiver<()>,
     group_notifier: Option<&GroupNotifier>,
+    write_timeout: Duration,
 ) -> Result<(), ConnectionError> {
     let keep_alive_timeout = if session.keep_alive > 0 {
         Duration::from_secs(session.keep_alive as u64 * 3 / 2)
@@ -1522,7 +1563,7 @@ async fn connection_loop(
                                         // then dispatch per packet type.
                                         _ => {
                                             if !ack_buf.is_empty() {
-                                                stream.write_all(&ack_buf).await?;
+                                                timed_write_all(stream, &ack_buf, write_timeout).await?;
                                                 stats.total_packets_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                 ack_buf.clear();
                                             }
@@ -1540,7 +1581,7 @@ async fn connection_loop(
                                                 packet_type, flags, header_size, total_size,
                                                 remaining_length, &packet_bytes,
                                                 session, batcher, log_reader, stream, stats,
-                                                write_buf, m,
+                                                write_buf, m, write_timeout,
                                             ).await {
                                                 return Err(e);
                                             }
@@ -1554,7 +1595,7 @@ async fn connection_loop(
 
                                     if need_disconnect {
                                         if !ack_buf.is_empty() {
-                                            stream.write_all(&ack_buf).await?;
+                                            timed_write_all(stream, &ack_buf, write_timeout).await?;
                                             stats.total_packets_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
                                         return Err(ConnectionError::Codec(CodecError::ProtocolError));
@@ -1575,7 +1616,7 @@ async fn connection_loop(
                         // Flush accumulated PUBLISH batch after processing all
                         // complete packets from this read.
                         if !ack_buf.is_empty() {
-                            stream.write_all(&ack_buf).await?;
+                            timed_write_all(stream, &ack_buf, write_timeout).await?;
                             stats.total_packets_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         if !publish_ranges.is_empty() {
@@ -1608,12 +1649,12 @@ async fn connection_loop(
             // Outbound (push-based): wake immediately when any subscription queue
             // has new messages. Single Notify per connection — coalescing semantics.
             _ = delivery_notify.notified(), if has_push_delivery && !watched_queue_ids.is_empty() && !session.is_inflight_full() && session.subscription_count() > 0 => {
-                deliver_outbound(session, batcher, log_reader.as_ref(), stream, stats, delivery_batch_size, write_buf, &mut sub_buf, &mut flat_messages_buf).await?;
+                deliver_outbound(session, batcher, log_reader.as_ref(), stream, stats, delivery_batch_size, write_buf, &mut sub_buf, &mut flat_messages_buf, write_timeout).await?;
             }
 
             // Outbound (poll fallback): safety net for push-based, or primary for non-push.
             _ = delivery_interval.tick(), if !session.is_inflight_full() && session.subscription_count() > 0 => {
-                deliver_outbound(session, batcher, log_reader.as_ref(), stream, stats, delivery_batch_size, write_buf, &mut sub_buf, &mut flat_messages_buf).await?;
+                deliver_outbound(session, batcher, log_reader.as_ref(), stream, stats, delivery_batch_size, write_buf, &mut sub_buf, &mut flat_messages_buf, write_timeout).await?;
             }
 
             // Session takeover: another connection with the same ClientID connected.
@@ -1660,6 +1701,7 @@ async fn dispatch_inbound_packet(
     stats: &MqttServerStats,
     write_buf: &mut BytesMut,
     m: &MqttMetrics,
+    write_timeout: Duration,
 ) -> Result<(), ConnectionError> {
     let version = session.protocol_version;
     let is_v5 = version == ProtocolVersion::V5;
@@ -1675,7 +1717,7 @@ async fn dispatch_inbound_packet(
                     Some(b"second CONNECT not allowed"),
                     write_buf,
                 );
-                let _ = stream.write_all(write_buf).await;
+                let _ = timed_write_all(stream, write_buf, write_timeout).await;
                 stats
                     .total_packets_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1702,7 +1744,7 @@ async fn dispatch_inbound_packet(
             let packet_id = codec::read_ack_packet_id(packet_bytes, header_size)?;
             session.handle_pubrec(packet_id);
             if !session.out_buf.is_empty() {
-                stream.write_all(&session.out_buf).await?;
+                timed_write_all(stream, &session.out_buf, write_timeout).await?;
                 stats
                     .total_packets_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1714,7 +1756,7 @@ async fn dispatch_inbound_packet(
             let packet_id = codec::read_ack_packet_id(packet_bytes, header_size)?;
             session.handle_pubrel(packet_id);
             if !session.out_buf.is_empty() {
-                stream.write_all(&session.out_buf).await?;
+                timed_write_all(stream, &session.out_buf, write_timeout).await?;
                 stats
                     .total_packets_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1775,7 +1817,7 @@ async fn dispatch_inbound_packet(
 
             // SUBACK already encoded in session.out_buf by handle_subscribe.
             if !session.out_buf.is_empty() {
-                stream.write_all(&session.out_buf).await?;
+                timed_write_all(stream, &session.out_buf, write_timeout).await?;
                 stats
                     .total_packets_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1788,6 +1830,7 @@ async fn dispatch_inbound_packet(
                 stats,
                 &retained_infos,
                 write_buf,
+                write_timeout,
             )
             .await
             {
@@ -1810,7 +1853,7 @@ async fn dispatch_inbound_packet(
                 let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
             if !session.out_buf.is_empty() {
-                stream.write_all(&session.out_buf).await?;
+                timed_write_all(stream, &session.out_buf, write_timeout).await?;
                 stats
                     .total_packets_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1824,7 +1867,7 @@ async fn dispatch_inbound_packet(
                 let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
             if !session.out_buf.is_empty() {
-                stream.write_all(&session.out_buf).await?;
+                timed_write_all(stream, &session.out_buf, write_timeout).await?;
                 stats
                     .total_packets_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1862,7 +1905,7 @@ async fn dispatch_inbound_packet(
                 let _ = batcher.submit(session.cmd_buf[i].clone()).await;
             }
             if !session.out_buf.is_empty() {
-                stream.write_all(&session.out_buf).await?;
+                timed_write_all(stream, &session.out_buf, write_timeout).await?;
                 stats
                     .total_packets_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1898,7 +1941,7 @@ async fn send_disconnect_and_close(
             reason_string.map(|s| s.as_bytes()),
             write_buf,
         );
-        let _ = stream.write_all(write_buf).await;
+        let _ = timed_write_all(stream, write_buf, Duration::from_secs(5)).await;
         stats
             .total_packets_sent
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1922,6 +1965,7 @@ async fn deliver_retained_on_subscribe(
     stats: &MqttServerStats,
     retained_filters: &[RetainedFilterInfo],
     write_buf: &mut BytesMut,
+    write_timeout: Duration,
 ) -> Result<(), ConnectionError> {
     // Clone once per subscribe (not per message) to avoid borrow conflict with `session`.
     let retained_prefix = session.config.retained_prefix.clone();
@@ -1954,7 +1998,14 @@ async fn deliver_retained_on_subscribe(
             for (name, topic_id) in topics {
                 if name.as_ref() == retained_topic_name.as_bytes() {
                     deliver_single_retained(
-                        session, log_reader, stream, stats, topic_id, info.qos, write_buf,
+                        session,
+                        log_reader,
+                        stream,
+                        stats,
+                        topic_id,
+                        info.qos,
+                        write_buf,
+                        write_timeout,
                     )
                     .await?;
                 }
@@ -1967,7 +2018,14 @@ async fn deliver_retained_on_subscribe(
                 if let Some(mqtt_topic) = name_str.strip_prefix(&*retained_prefix) {
                     if mqtt_topic_matches_filter(mqtt_topic, filter) {
                         deliver_single_retained(
-                            session, log_reader, stream, stats, topic_id, info.qos, write_buf,
+                            session,
+                            log_reader,
+                            stream,
+                            stats,
+                            topic_id,
+                            info.qos,
+                            write_buf,
+                            write_timeout,
                         )
                         .await?;
                     }
@@ -1990,6 +2048,7 @@ async fn deliver_single_retained(
     topic_id: u64,
     max_qos: QoS,
     write_buf: &mut BytesMut,
+    write_timeout: Duration,
 ) -> Result<(), ConnectionError> {
     if let Some(msg_bytes) = log_reader.read_latest_topic_message(topic_id) {
         if let Some(flat) = FlatMessage::new(&msg_bytes) {
@@ -2047,7 +2106,7 @@ async fn deliver_single_retained(
                 adjusted_expiry_secs,
                 write_buf,
             );
-            stream.write_all(write_buf).await?;
+            timed_write_all(stream, write_buf, write_timeout).await?;
             stats
                 .total_packets_sent
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
