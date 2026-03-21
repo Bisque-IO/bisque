@@ -12,6 +12,12 @@
 // Auto-generated bindings from mimalloc.h
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+/// Ensure mimalloc is initialized. Must be called before any mimalloc API.
+/// Safe to call multiple times (internally uses `mi_atomic_once`).
+pub fn ensure_initialized() {
+    unsafe { mi_thread_init() };
+}
+
 // ---------------------------------------------------------------------------
 // GlobalAlloc implementation
 // ---------------------------------------------------------------------------
@@ -31,8 +37,8 @@ pub struct MiMalloc;
 unsafe impl GlobalAlloc for MiMalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // unsafe { mi_malloc_aligned(layout.size(), layout.align()) as *mut u8 }
-        unsafe { mi_malloc(layout.size()) as *mut u8 }
+        unsafe { mi_malloc_aligned(layout.size(), layout.align()) as *mut u8 }
+        // unsafe { mi_malloc(layout.size()) as *mut u8 }
     }
 
     #[inline]
@@ -56,3 +62,40 @@ unsafe impl GlobalAlloc for MiMalloc {
 // Ensure Send+Sync for the global allocator marker type.
 unsafe impl Send for MiMalloc {}
 unsafe impl Sync for MiMalloc {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_thread_malloc_free() {
+        let t = std::thread::spawn(|| {
+            ensure_initialized();
+            let p = unsafe { mi_malloc(256) };
+            assert!(!p.is_null());
+            unsafe { mi_free(p) };
+        });
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn test_exclusive_heap_create() {
+        let t = std::thread::spawn(|| {
+            ensure_initialized();
+            // MI_SEGMENT_SIZE = 32 MiB on 64-bit, need at least 2 blocks = 64 MiB
+            let size: usize = 128 * 1024 * 1024;
+            let align: usize = 32 * 1024 * 1024; // MI_SEGMENT_ALIGN
+            let mem = unsafe { mi_malloc_aligned(size, align) };
+            assert!(!mem.is_null(), "aligned alloc failed");
+            unsafe { std::ptr::write_bytes(mem as *mut u8, 0, size) };
+
+            let heap = unsafe { _mi_exclusive_heap_create(mem, size, true, true, -1) };
+            assert!(!heap.is_null(), "exclusive heap create failed");
+
+            let p = unsafe { mi_heap_malloc_aligned(heap, 256, 8) };
+            assert!(!p.is_null(), "heap alloc failed");
+            unsafe { mi_free(p) };
+        });
+        t.join().unwrap();
+    }
+}

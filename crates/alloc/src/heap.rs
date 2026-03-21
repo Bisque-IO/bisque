@@ -1,17 +1,17 @@
-//! Fixed-size, arena-backed mimalloc heap.
+//! Memory-limited mimalloc heap.
 //!
-//! A [`Heap`] reserves an exclusive mimalloc arena and pins a heap to it.
-//! Allocations are confined to that arena — when it's exhausted, allocations
-//! return NULL (and the `Allocator` impl returns `AllocError`).
+//! [`HeapMaster`] owns the heap and its memory limit. [`Heap`] is a cheap,
+//! cloneable handle. Drop the master last — once it drops, the striped
+//! refcount enters "closed" mode and the next [`Heap`] drop triggers cleanup.
 //!
 //! Internally reference-counted with a striped refcount for near-zero
-//! contention on clone/drop. The refcount metadata lives *inside* the arena
-//! it manages (self-hosted). On last drop the arena is bulk-freed and unmapped.
+//! contention on clone/drop. The refcount metadata lives *inside* the heap
+//! it manages (self-hosted). On last-ref drop the heap is bulk-freed.
 //!
 //! # Thread Safety
 //!
-//! mimalloc heaps are thread-local — `mi_heap_new_ex()` creates a heap on the
-//! calling thread. `mi_free()` can free from any thread.
+//! mimalloc heaps are thread-local for allocation — `mi_heap_new_ex()` creates
+//! a heap on the calling thread. `mi_free()` can free from any thread.
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
@@ -19,15 +19,16 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use allocator_api2::alloc::{AllocError, Allocator};
 
-use crate::os_mmap;
 use crate::padded::CachePadded;
 use bisque_mimalloc_sys as ffi;
 
 // Re-export for use in async contexts.
 pub use allocator_api2::alloc::AllocError as HeapAllocError;
 
-/// Mimalloc segment alignment (32 MiB on x86_64).
-const MI_SEGMENT_ALIGN: usize = 32 * 1024 * 1024;
+/// Minimum arena size for tests with OOM scenarios.
+/// Must be large enough for at least one segment (32 MiB on 64-bit).
+#[cfg(test)]
+const TEST_SMALL_ARENA: usize = 64 * 1024 * 1024; // 64 MiB
 
 // =========================================================================
 // Striped refcount (inline, no allocation)
@@ -85,26 +86,23 @@ impl StripedRefCount {
 }
 
 // =========================================================================
-// HeapInner — self-hosted inside the arena it manages
+// HeapInner — metadata for a memory-limited mimalloc heap
 // =========================================================================
 
-/// Lives at a fixed address inside the arena's mmap region. The striped
-/// refcount counters are inline (no sub-allocation). On last-ref drop
-/// the entire arena is destroyed and unmapped.
+/// Allocated via the heap itself. On last-ref drop, the heap is destroyed
+/// via `mi_heap_destroy`, which bulk-frees all pages and segments.
 #[repr(C)]
 struct HeapInner {
     refcount: StripedRefCount,
     mi_heap: *mut ffi::mi_heap_t,
-    mmap_ptr: *mut u8,
-    mmap_len: usize,
-    arena_id: ffi::mi_arena_id_t,
+    memory_limit: usize,
     /// True when at least one allocation has failed (OOM). Enables
     /// freed-byte tracking on dealloc so waiters can be notified.
     pressure: AtomicBool,
     /// Bytes freed since pressure mode was entered. Reset when
     /// pressure mode exits. Only written when `pressure == true`.
     freed_since_pressure: AtomicU64,
-    /// Wait queue for tasks blocked on OOM. Slots pre-allocated from the arena.
+    /// Wait queue for tasks blocked on OOM. Slots pre-allocated from the heap.
     pressure_wq: crate::wait_queue::WaitQueue,
     /// Max concurrent async waiters (configurable at construction).
     max_waiters: usize,
@@ -113,30 +111,14 @@ struct HeapInner {
 unsafe impl Send for HeapInner {}
 unsafe impl Sync for HeapInner {}
 
-/// Destroy the arena. Called exactly once when refcount reaches zero.
-///
-/// Reads all fields to stack locals, then:
-/// 1. `mi_heap_destroy` — bulk-frees all allocations (including HeapInner itself)
-/// 2. `mi_arena_unload` — removes arena from mimalloc's table
-/// 3. `free_pages` — releases virtual memory
-unsafe fn destroy_arena(ptr: *const HeapInner) {
+/// Destroy the heap. Called exactly once when refcount reaches zero.
+/// `mi_heap_destroy` bulk-frees all pages, segments, and the heap struct itself.
+unsafe fn destroy_heap(ptr: *const HeapInner) {
     unsafe {
         let mi_heap = (*ptr).mi_heap;
-        let mmap_ptr = (*ptr).mmap_ptr;
-        let mmap_len = (*ptr).mmap_len;
-        let arena_id = (*ptr).arena_id;
-
-        // After this call, `ptr` is dangling — the HeapInner was in the arena.
+        // mi_heap_destroy frees all pages/segments and the heap struct.
+        // HeapInner was allocated from this heap, so it's freed too.
         ffi::mi_heap_destroy(mi_heap);
-
-        ffi::mi_arena_unload(
-            arena_id,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-
-        os_mmap::free_pages(mmap_ptr, mmap_len);
     }
 }
 
@@ -144,36 +126,43 @@ unsafe fn destroy_arena(ptr: *const HeapInner) {
 // Heap — the public handle
 // =========================================================================
 
-/// A fixed-size, arena-backed mimalloc heap.
+// =========================================================================
+// HeapMaster — owns the heap, not cloneable
+// =========================================================================
+
+/// Owns a memory-limited mimalloc heap. Not cloneable.
 ///
-/// Clone is a single striped atomic increment (near-zero contention).
-/// The reference-counted metadata lives inside the arena it manages.
+/// Create cheap [`Heap`] handles via [`heap()`](HeapMaster::heap). The master
+/// must outlive all `Heap` clones — dropping it closes the refcount so the
+/// next `Heap` drop triggers cleanup. Keeping it alive avoids the close/check
+/// overhead on every clone drop.
 ///
 /// # Examples
 ///
 /// ```rust,no_run
-/// use bisque_alloc::{Heap, HeapVec};
+/// use bisque_alloc::{HeapMaster, Heap, HeapVec};
 ///
-/// let heap = Heap::new(64 * 1024 * 1024).unwrap(); // 64 MiB arena
+/// let master = HeapMaster::new(64 * 1024 * 1024).unwrap();
+/// let heap: Heap = master.heap();
 /// let mut v = HeapVec::new(&heap);
 /// v.extend_from_slice(&[1, 2, 3]).unwrap();
+/// // master must outlive heap and v
 /// ```
-pub struct Heap {
+pub struct HeapMaster {
     ptr: *const HeapInner,
-    master: bool,
 }
 
-unsafe impl Send for Heap {}
-unsafe impl Sync for Heap {}
+unsafe impl Send for HeapMaster {}
+unsafe impl Sync for HeapMaster {}
 
-impl Heap {
+impl HeapMaster {
     /// Default number of async waiter slots for `alloc_async`.
     const DEFAULT_MAX_WAITERS: usize = 64;
 
-    /// Create a new heap backed by an exclusive mimalloc arena.
+    /// Create a new memory-limited heap.
     ///
-    /// `max_bytes` is rounded up to 32 MiB alignment. When the arena is
-    /// exhausted, allocations return `AllocError`.
+    /// `max_bytes` sets the per-heap memory limit (0 = unlimited).
+    /// Tracked at 64 KiB slice granularity.
     pub fn new(max_bytes: usize) -> Result<Self, AllocError> {
         Self::with_max_waiters(max_bytes, Self::DEFAULT_MAX_WAITERS)
     }
@@ -185,63 +174,24 @@ impl Heap {
     /// If all slots are exhausted, `alloc_async` returns `AllocError`
     /// immediately.
     pub fn with_max_waiters(max_bytes: usize, max_waiters: usize) -> Result<Self, AllocError> {
-        let aligned = (max_bytes + MI_SEGMENT_ALIGN - 1) & !(MI_SEGMENT_ALIGN - 1);
-        let aligned = aligned.max(MI_SEGMENT_ALIGN);
+        ffi::ensure_initialized();
 
-        // 1. Allocate virtual memory (cross-platform).
-        let mmap_ptr = os_mmap::alloc_pages(aligned);
-        if mmap_ptr.is_null() {
-            return Err(AllocError);
-        }
-
-        // 2. Register as exclusive mimalloc arena.
-        let mut arena_id: ffi::mi_arena_id_t = std::ptr::null_mut();
-        let ok = unsafe {
-            ffi::mi_manage_os_memory_ex(
-                mmap_ptr as *mut core::ffi::c_void,
-                aligned,
-                true,
-                false,
-                true,
-                -1,
-                true,
-                &mut arena_id,
-            )
-        };
-        if !ok {
-            unsafe { os_mmap::free_pages(mmap_ptr, aligned) };
-            return Err(AllocError);
-        }
-
-        // 3. Create mimalloc heap pinned to arena.
-        let mi_heap = unsafe { ffi::mi_heap_new_ex(0, true, arena_id) };
+        // 1. Create a standard mimalloc heap with allow_destroy=true.
+        let mi_heap = unsafe { ffi::mi_heap_new_ex(0, true, ffi::mi_arena_id_t::default()) };
         if mi_heap.is_null() {
-            unsafe {
-                ffi::mi_arena_unload(
-                    arena_id,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-                os_mmap::free_pages(mmap_ptr, aligned);
-            }
             return Err(AllocError);
         }
 
-        // 4. Allocate HeapInner *inside* the arena.
+        // 2. Set the memory limit.
+        if max_bytes > 0 {
+            unsafe { ffi::mi_heap_set_memory_limit(mi_heap, max_bytes) };
+        }
+
+        // 3. Allocate HeapInner from the heap itself.
         let layout = Layout::new::<HeapInner>();
         let raw = unsafe { ffi::mi_heap_malloc_aligned(mi_heap, layout.size(), layout.align()) };
         if raw.is_null() {
-            unsafe {
-                ffi::mi_heap_destroy(mi_heap);
-                ffi::mi_arena_unload(
-                    arena_id,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-                os_mmap::free_pages(mmap_ptr, aligned);
-            }
+            unsafe { ffi::mi_heap_destroy(mi_heap) };
             return Err(AllocError);
         }
 
@@ -253,34 +203,112 @@ impl Heap {
                 HeapInner {
                     refcount: StripedRefCount::new(),
                     mi_heap,
-                    mmap_ptr,
-                    mmap_len: aligned,
-                    arena_id,
+                    memory_limit: max_bytes,
                     pressure: AtomicBool::new(false),
                     freed_since_pressure: AtomicU64::new(0),
                     pressure_wq,
                     max_waiters,
                 },
             );
-            // Start with refcount of 1.
+            // The master holds one reference.
             (*inner).refcount.increment();
         }
 
-        Ok(Self {
-            ptr: inner,
-            master: true,
-        })
+        Ok(Self { ptr: inner })
     }
 
+    /// Create a cheap, cloneable [`Heap`] handle.
     #[inline]
+    pub fn heap(&self) -> Heap {
+        let inner = unsafe { &*self.ptr };
+        inner.refcount.increment();
+        Heap { ptr: self.ptr }
+    }
+
+    #[inline(always)]
     fn inner(&self) -> &HeapInner {
         unsafe { &*self.ptr }
     }
 
-    /// Total arena capacity in bytes.
+    fn try_cleanup(&self) {
+        let inner = self.inner();
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let total = inner.refcount.total();
+        debug_assert!(total >= 0, "Heap refcount went negative: {total}");
+        if total == 0 && inner.refcount.try_claim_cleanup() {
+            unsafe { destroy_heap(self.ptr) };
+        }
+    }
+}
+
+impl std::ops::Deref for HeapMaster {
+    type Target = Heap;
+
+    #[inline(always)]
+    fn deref(&self) -> &Heap {
+        // Safety: Heap is repr(transparent) over *const HeapInner,
+        // and &HeapMaster.ptr has the same layout as &Heap.ptr.
+        unsafe { &*(self as *const HeapMaster as *const Heap) }
+    }
+}
+
+impl Drop for HeapMaster {
+    fn drop(&mut self) {
+        let inner = self.inner();
+        // Close all stripes — subsequent Heap drops will see the closed flag.
+        inner.refcount.close_all();
+        // Decrement the master's own reference.
+        inner.refcount.counters[stripe_index() & STRIPE_MASK].fetch_sub(1, Ordering::AcqRel);
+        self.try_cleanup();
+    }
+}
+
+impl std::fmt::Debug for HeapMaster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let heap: &Heap = self;
+        f.debug_struct("HeapMaster")
+            .field("capacity", &heap.capacity())
+            .field("memory_usage", &heap.memory_usage())
+            .finish()
+    }
+}
+
+// =========================================================================
+// Heap — cheap cloneable handle
+// =========================================================================
+
+/// Cheap, cloneable handle to a memory-limited mimalloc heap.
+///
+/// Created from a [`HeapMaster`] via [`heap()`](HeapMaster::heap) or by
+/// cloning an existing `Heap`. Clone is a single striped atomic increment.
+///
+/// The [`HeapMaster`] that created this handle should not be dropped while
+/// `Heap` clones are still active — doing so enters "closed" mode where
+/// every `Heap` drop must check the total refcount (slower).
+#[repr(transparent)]
+pub struct Heap {
+    ptr: *const HeapInner,
+}
+
+unsafe impl Send for Heap {}
+unsafe impl Sync for Heap {}
+
+impl Heap {
+    #[inline(always)]
+    fn inner(&self) -> &HeapInner {
+        unsafe { &*self.ptr }
+    }
+
+    /// Memory limit in bytes (0 = unlimited).
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.inner().mmap_len
+        self.inner().memory_limit
+    }
+
+    /// Current memory usage in bytes (tracked at 64 KiB slice granularity).
+    #[inline]
+    pub fn memory_usage(&self) -> usize {
+        unsafe { ffi::mi_heap_get_memory_usage(self.inner().mi_heap) }
     }
 
     /// Allocate `size` bytes with the given alignment. Returns null on OOM.
@@ -289,7 +317,12 @@ impl Heap {
         if size == 0 {
             return align as *mut u8;
         }
-        unsafe { ffi::mi_heap_malloc_aligned(self.inner().mi_heap, size, align) as *mut u8 }
+        let heap = self.inner().mi_heap;
+        if align <= core::mem::size_of::<usize>() {
+            unsafe { ffi::mi_heap_malloc(heap, size) as *mut u8 }
+        } else {
+            unsafe { ffi::mi_heap_malloc_aligned(heap, size, align) as *mut u8 }
+        }
     }
 
     /// Allocate `size` bytes zero-initialized. Returns null on OOM.
@@ -346,33 +379,6 @@ impl Heap {
         }
         unsafe { ffi::mi_free(ptr as *mut core::ffi::c_void) }
     }
-
-    /*
-    Normal mode:                        Pressure mode:
-    ┌─────────┐                        ┌─────────────────────┐
-    │ alloc() │                        │ alloc()             │
-    │  └→ mi_heap_malloc               │  └→ mi_heap_malloc  │
-    │  └→ return ptr (0 ns overhead)   │  └→ return ptr      │
-    └─────────┘                        └─────────────────────┘
-
-    ┌───────────┐                      ┌────────────────────────┐
-    │ dealloc() │                      │ dealloc()              │
-    │  └→ mi_free (0 ns overhead)      │  └→ mi_usable_size     │
-    │                                  │  └→ freed += size      │
-    └───────────┘                      │  └→ event.notify(1)    │
-                                       │  └→ mi_free            │
-                                       └────────────────────────┘
-                ┌───────────────────┐
-                │ alloc_async()     │
-                │  └→ try alloc()   │ ← fast path: returns immediately
-                │  └→ if null:      │
-                │     └→ enter pressure mode
-                │     └→ event.listen().await  ← suspends task
-                │     └→ woken by dealloc's notify(1)
-                │     └→ retry alloc()
-                │     └→ if ok: try_exit_pressure()
-                └───────────────────┘
-     */
 
     /// Async allocation — tries immediately, and if OOM, enters pressure
     /// mode and awaits until freed memory makes retry worthwhile.
@@ -500,7 +506,7 @@ impl Heap {
         let total = inner.refcount.total();
         debug_assert!(total >= 0, "Heap refcount went negative: {total}");
         if total == 0 && inner.refcount.try_claim_cleanup() {
-            unsafe { destroy_arena(self.ptr) };
+            unsafe { destroy_heap(self.ptr) };
         }
     }
 }
@@ -509,43 +515,26 @@ impl Clone for Heap {
     #[inline]
     fn clone(&self) -> Self {
         self.inner().refcount.increment();
-        Self {
-            ptr: self.ptr,
-            master: false,
-        }
+        Self { ptr: self.ptr }
     }
 }
 
 impl Drop for Heap {
     fn drop(&mut self) {
         let inner = self.inner();
-        if self.master {
-            inner.refcount.close_all();
-            inner.refcount.counters[stripe_index() & STRIPE_MASK].fetch_sub(1, Ordering::AcqRel);
-            self.try_cleanup();
-        } else if inner.refcount.decrement_and_check_closed() {
+        if inner.refcount.decrement_and_check_closed() {
+            // Master already dropped — check if we're the last reference.
             inner.refcount.close_all();
             self.try_cleanup();
         }
     }
 }
 
-impl Default for Heap {
-    fn default() -> Self {
-        Self::new(64 * 1024 * 1024).expect("failed to create default 64 MiB heap")
-    }
-}
-
-// Remove the old `WaitQueue::new()` const — it's no longer available.
-// WaitQueue now requires `new_in(count, mi_heap)` for arena allocation.
-
 impl std::fmt::Debug for Heap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (committed, used) = self.visit_stats();
         f.debug_struct("Heap")
             .field("capacity", &self.capacity())
-            .field("committed_bytes", &committed)
-            .field("used_blocks", &used)
+            .field("memory_usage", &self.memory_usage())
             .finish()
     }
 }
@@ -682,7 +671,7 @@ mod tests {
 
     #[test]
     fn heap_create_and_alloc() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         assert!(heap.capacity() >= 64 * 1024 * 1024);
         let ptr = heap.alloc(256, 8);
         assert!(!ptr.is_null());
@@ -691,7 +680,7 @@ mod tests {
 
     #[test]
     fn heap_zeroed() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let ptr = heap.alloc_zeroed(128, 8);
         assert!(!ptr.is_null());
         let s = unsafe { std::slice::from_raw_parts(ptr, 128) };
@@ -701,16 +690,17 @@ mod tests {
 
     #[test]
     fn heap_allocator_trait() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let master = HeapMaster::new(64 * 1024 * 1024).unwrap();
+        let heap: &Heap = &master;
         let layout = Layout::from_size_align(128, 8).unwrap();
-        let ptr = Allocator::allocate(&heap, layout).unwrap();
+        let ptr = Allocator::allocate(heap, layout).unwrap();
         assert_eq!(ptr.len(), 128);
-        unsafe { Allocator::deallocate(&heap, ptr.cast(), layout) };
+        unsafe { Allocator::deallocate(heap, ptr.cast(), layout) };
     }
 
     #[test]
     fn heap_allocator_oom() {
-        let heap = Heap::new(MI_SEGMENT_ALIGN).unwrap();
+        let heap = HeapMaster::new(TEST_SMALL_ARENA).unwrap();
         let mut ptrs = Vec::new();
         let mut oom = false;
         for _ in 0..10_000 {
@@ -729,7 +719,7 @@ mod tests {
 
     #[test]
     fn heap_visit_stats() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let p1 = heap.alloc(1024, 8);
         let p2 = heap.alloc(4096, 8);
         let (committed, used) = heap.visit_stats();
@@ -743,7 +733,7 @@ mod tests {
 
     #[test]
     fn heap_destroy_bulk_frees() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         for _ in 0..100 {
             let _ = heap.alloc(512, 8);
         }
@@ -752,7 +742,8 @@ mod tests {
 
     #[test]
     fn heap_clone_shares() {
-        let h1 = Heap::new(64 * 1024 * 1024).unwrap();
+        let master = HeapMaster::new(64 * 1024 * 1024).unwrap();
+        let h1 = master.heap();
         let h2 = h1.clone();
         let ptr = h1.alloc(256, 8);
         unsafe { h2.dealloc(ptr) };
@@ -760,20 +751,20 @@ mod tests {
 
     #[test]
     fn heap_clone_drop_order() {
-        let h1 = Heap::new(64 * 1024 * 1024).unwrap();
+        let master = HeapMaster::new(64 * 1024 * 1024).unwrap();
+        let h1 = master.heap();
         let h2 = h1.clone();
-        let h3 = h2.clone();
-        drop(h1); // master drops first — closes stripes
-        drop(h3);
-        drop(h2); // last clone triggers cleanup
+        drop(master); // master drops first — closes stripes
+        drop(h2);
+        drop(h1); // last clone triggers cleanup
     }
 
     #[test]
     fn heap_threaded_clone_drop() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let master = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let mut handles = Vec::new();
         for _ in 0..8 {
-            let h = heap.clone();
+            let h = master.heap();
             handles.push(std::thread::spawn(move || {
                 let ptr = h.alloc(128, 8);
                 assert!(!ptr.is_null());
@@ -783,12 +774,12 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        drop(heap);
+        drop(master);
     }
 
     #[test]
     fn heap_vec_basic() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let mut v = HeapVec::with_capacity(64, &heap).unwrap();
         v.extend_from_slice(b"hello").unwrap();
         v.push(b'!').unwrap();
@@ -797,7 +788,7 @@ mod tests {
 
     #[test]
     fn heap_vec_grow() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let mut v = HeapVec::new(&heap);
         for i in 0..1000u16 {
             v.extend_from_slice(&i.to_le_bytes()).unwrap();
@@ -807,7 +798,7 @@ mod tests {
 
     #[test]
     fn heap_vec_into_bytes() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let mut v = HeapVec::with_capacity(64, &heap).unwrap();
         v.extend_from_slice(b"hello world").unwrap();
         let b = v.into_bytes();
@@ -817,7 +808,7 @@ mod tests {
 
     #[test]
     fn heap_vec_oom() {
-        let heap = Heap::new(MI_SEGMENT_ALIGN).unwrap();
+        let heap = HeapMaster::new(TEST_SMALL_ARENA).unwrap();
         let mut v = HeapVec::new(&heap);
         let mut oom = false;
         for _ in 0..10_000 {
@@ -831,7 +822,7 @@ mod tests {
 
     #[test]
     fn heap_collect() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let p = heap.alloc(256, 8);
         unsafe { heap.dealloc(p) };
         heap.collect(true);
@@ -845,20 +836,20 @@ mod tests {
 
     #[test]
     fn heap_pressure_mode_off_by_default() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         assert!(!heap.is_under_pressure());
-        assert_eq!(heap.max_waiters(), Heap::DEFAULT_MAX_WAITERS);
+        assert_eq!(heap.max_waiters(), HeapMaster::DEFAULT_MAX_WAITERS);
     }
 
     #[test]
     fn heap_custom_max_waiters() {
-        let heap = Heap::with_max_waiters(64 * 1024 * 1024, 128).unwrap();
+        let heap = HeapMaster::with_max_waiters(64 * 1024 * 1024, 128).unwrap();
         assert_eq!(heap.max_waiters(), 128);
     }
 
     #[tokio::test]
     async fn heap_alloc_async_fast_path() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let ptr = heap.alloc_async(256, 8).await.unwrap();
         assert!(!heap.is_under_pressure());
         unsafe { heap.dealloc(ptr.as_ptr()) };
@@ -866,7 +857,7 @@ mod tests {
 
     #[tokio::test]
     async fn heap_alloc_async_zero_size() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let ptr = heap.alloc_async(0, 8).await.unwrap();
         // ZST returns dangling aligned pointer.
         assert!(!ptr.as_ptr().is_null());
@@ -874,7 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn heap_alloc_async_under_pressure() {
-        let heap = Heap::new(MI_SEGMENT_ALIGN).unwrap();
+        let heap = HeapMaster::new(TEST_SMALL_ARENA).unwrap();
 
         // Fill the arena.
         let mut ptrs = Vec::new();
@@ -888,7 +879,7 @@ mod tests {
         assert!(!ptrs.is_empty());
 
         // Spawn a task that frees after yielding.
-        let heap2 = heap.clone();
+        let heap2 = heap.heap();
         let ptr_to_free = ptrs.pop().unwrap() as usize;
         let free_task = tokio::spawn(async move {
             tokio::task::yield_now().await;
@@ -910,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn heap_alloc_async_retry_on_contention() {
         // Two tasks competing for the last free block.
-        let heap = Heap::new(MI_SEGMENT_ALIGN).unwrap();
+        let heap = HeapMaster::new(TEST_SMALL_ARENA).unwrap();
 
         let mut ptrs = Vec::new();
         loop {
@@ -924,8 +915,8 @@ mod tests {
         let p1 = ptrs.pop().unwrap();
         let p2 = ptrs.pop().unwrap();
 
-        let heap2 = heap.clone();
-        let heap3 = heap.clone();
+        let heap2 = heap.heap();
+        let heap3 = heap.heap();
         let p1_addr = p1 as usize;
         let p2_addr = p2 as usize;
 
@@ -970,7 +961,7 @@ mod tests {
     #[tokio::test]
     async fn heap_alloc_async_waiter_slots_exhausted() {
         // Create heap with only 2 waiter slots.
-        let heap = Heap::with_max_waiters(MI_SEGMENT_ALIGN, 2).unwrap();
+        let heap = HeapMaster::with_max_waiters(TEST_SMALL_ARENA, 2).unwrap();
         assert_eq!(heap.max_waiters(), 2);
 
         // Fill the arena completely.
@@ -984,8 +975,8 @@ mod tests {
         }
 
         // Spawn 2 waiters — they should get slots.
-        let heap2 = heap.clone();
-        let heap3 = heap.clone();
+        let heap2 = heap.heap();
+        let heap3 = heap.heap();
         let _task1 = tokio::spawn(async move {
             let _ = heap2.alloc_async(65536, 8).await;
         });
@@ -1012,7 +1003,7 @@ mod tests {
 
     #[tokio::test]
     async fn heap_pressure_mode_exits_when_no_waiters() {
-        let heap = Heap::new(MI_SEGMENT_ALIGN).unwrap();
+        let heap = HeapMaster::new(TEST_SMALL_ARENA).unwrap();
 
         // Fill, alloc_async, free — pressure should exit after.
         let mut ptrs = Vec::new();
@@ -1025,7 +1016,7 @@ mod tests {
         }
         let to_free = ptrs.pop().unwrap() as usize;
 
-        let heap2 = heap.clone();
+        let heap2 = heap.heap();
         tokio::spawn(async move {
             tokio::task::yield_now().await;
             unsafe { heap2.dealloc(to_free as *mut u8) };
@@ -1046,7 +1037,7 @@ mod tests {
     #[tokio::test]
     async fn heap_alloc_async_multiple_frees_needed() {
         // Waiter needs a large block, but frees come in small chunks.
-        let heap = Heap::new(MI_SEGMENT_ALIGN).unwrap();
+        let heap = HeapMaster::new(TEST_SMALL_ARENA).unwrap();
 
         // Fill with small blocks.
         let mut ptrs = Vec::new();
@@ -1058,7 +1049,7 @@ mod tests {
             ptrs.push(ptr);
         }
 
-        let heap2 = heap.clone();
+        let heap2 = heap.heap();
         // Free blocks one by one on a background task.
         let ptrs_to_free: Vec<usize> = ptrs
             .drain(ptrs.len().saturating_sub(20)..)
@@ -1081,5 +1072,468 @@ mod tests {
         for p in ptrs {
             unsafe { heap.dealloc(p) };
         }
+    }
+
+    // =====================================================================
+    // Memlimit battle tests
+    // =====================================================================
+
+    /// Helper: allocate until OOM, return all pointers and the count.
+    fn fill_heap(heap: &Heap, size: usize) -> Vec<*mut u8> {
+        let mut ptrs = Vec::new();
+        loop {
+            let p = heap.alloc(size, 8);
+            if p.is_null() {
+                break;
+            }
+            ptrs.push(p);
+        }
+        ptrs
+    }
+
+    /// After freeing everything and collecting, memory_usage must return to zero.
+    /// Note: mimalloc retains pages for reuse after blocks are freed.
+    /// `collect(true)` forces page retirement.
+    #[test]
+    fn memlimit_usage_returns_to_zero_small() {
+        let heap = HeapMaster::new(4 * 1024 * 1024).unwrap();
+        let ptrs = fill_heap(&heap, 64);
+        assert!(!ptrs.is_empty());
+        assert!(heap.memory_usage() > 0);
+        for p in ptrs {
+            unsafe { heap.dealloc(p) };
+        }
+        heap.collect(true);
+        assert!(
+            heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+            "small: usage not zero after free+collect"
+        );
+    }
+
+    #[test]
+    fn memlimit_usage_returns_to_zero_medium() {
+        let heap = HeapMaster::new(4 * 1024 * 1024).unwrap();
+        let ptrs = fill_heap(&heap, 16 * 1024);
+        assert!(!ptrs.is_empty());
+        for p in ptrs {
+            unsafe { heap.dealloc(p) };
+        }
+        heap.collect(true);
+        assert!(
+            heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+            "medium: usage not zero after free+collect"
+        );
+    }
+
+    #[test]
+    fn memlimit_usage_returns_to_zero_large() {
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
+        let ptrs = fill_heap(&heap, 512 * 1024);
+        assert!(!ptrs.is_empty());
+        for p in ptrs {
+            unsafe { heap.dealloc(p) };
+        }
+        heap.collect(true);
+        assert!(
+            heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+            "large: usage not zero after free+collect"
+        );
+    }
+
+    #[test]
+    fn memlimit_usage_returns_to_zero_mixed() {
+        let heap = HeapMaster::new(32 * 1024 * 1024).unwrap();
+        let sizes = [
+            32,
+            128,
+            1024,
+            4096,
+            8192,
+            32768,
+            65536,
+            256 * 1024,
+            1024 * 1024,
+        ];
+        let mut ptrs = Vec::new();
+        for &sz in sizes.iter().cycle().take(200) {
+            let p = heap.alloc(sz, 8);
+            if p.is_null() {
+                break;
+            }
+            ptrs.push(p);
+        }
+        assert!(!ptrs.is_empty());
+        for p in ptrs {
+            unsafe { heap.dealloc(p) };
+        }
+        heap.collect(true);
+        assert!(
+            heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+            "mixed: usage not zero after free+collect"
+        );
+    }
+
+    /// Usage must stay within limit + bounded overshoot.
+    /// Overshoot is at most MI_MEDIUM_PAGE_SIZE (512 KiB) per concurrent allocating thread.
+    // With CAS-based enforcement in page_queue_push, memory_usage never exceeds memory_limit.
+    // Zero overshoot on the limit itself.
+    const MEMLIMIT_MAX_OVERSHOOT: usize = 0;
+
+    // After free+collect, mimalloc may retain pages for reuse. This is the tolerance
+    // for "returns to zero" tests. Bounded by a few retained small pages.
+    const MEMLIMIT_COLLECT_TOLERANCE: usize = 16 * 65536; // 16 slices (1 MiB) — accounts for page retention after collect
+
+    #[test]
+    fn memlimit_never_exceeds_limit() {
+        let limit = 8 * 1024 * 1024; // 8 MiB
+        let heap = HeapMaster::new(limit).unwrap();
+        let sizes = [64, 256, 4096, 16384, 65536, 256 * 1024];
+        let mut ptrs = Vec::new();
+        for &sz in sizes.iter().cycle().take(5000) {
+            let p = heap.alloc(sz, 8);
+            if p.is_null() {
+                break;
+            }
+            ptrs.push(p);
+            assert!(
+                heap.memory_usage() <= limit + MEMLIMIT_MAX_OVERSHOOT,
+                "usage {} exceeded limit {} + overshoot {} after alloc of {} bytes",
+                heap.memory_usage(),
+                limit,
+                MEMLIMIT_MAX_OVERSHOOT,
+                sz
+            );
+        }
+        for p in ptrs {
+            unsafe { heap.dealloc(p) };
+        }
+    }
+
+    /// Alloc-free-alloc cycles: usage must never exceed limit and must stay bounded.
+    #[test]
+    fn memlimit_alloc_free_cycles() {
+        let limit = 4 * 1024 * 1024;
+        let heap = HeapMaster::new(limit).unwrap();
+        for _ in 0..1000 {
+            let p = heap.alloc(4096, 8);
+            assert!(!p.is_null());
+            assert!(heap.memory_usage() <= limit + MEMLIMIT_MAX_OVERSHOOT);
+            unsafe { heap.dealloc(p) };
+        }
+        // After cycles, usage may be non-zero (mimalloc retains pages for reuse).
+        // But it must still be within the limit.
+        assert!(heap.memory_usage() <= limit + MEMLIMIT_MAX_OVERSHOOT);
+    }
+
+    /// Fill to OOM, free half, allocate more, verify usage stays bounded.
+    #[test]
+    fn memlimit_partial_free_realloc() {
+        let limit = 8 * 1024 * 1024;
+        let heap = HeapMaster::new(limit).unwrap();
+        let mut ptrs = fill_heap(&heap, 1024);
+        let usage_at_full = heap.memory_usage();
+        assert!(usage_at_full > 0);
+        assert!(
+            usage_at_full <= limit,
+            "usage_at_full={} limit={}",
+            usage_at_full,
+            limit
+        );
+
+        // Free half
+        let half = ptrs.len() / 2;
+        for p in ptrs.drain(..half) {
+            unsafe { heap.dealloc(p) };
+        }
+        let usage_after_free = heap.memory_usage();
+        assert!(usage_after_free < usage_at_full);
+
+        // Allocate more — should succeed since we freed space
+        let mut more = Vec::new();
+        for _ in 0..half {
+            let p = heap.alloc(1024, 8);
+            if p.is_null() {
+                break;
+            }
+            more.push(p);
+            assert!(heap.memory_usage() <= limit + MEMLIMIT_MAX_OVERSHOOT);
+        }
+        assert!(!more.is_empty());
+
+        // Clean up
+        for p in ptrs {
+            unsafe { heap.dealloc(p) };
+        }
+        for p in more {
+            unsafe { heap.dealloc(p) };
+        }
+        heap.collect(true);
+        assert!(heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE);
+    }
+
+    /// Multi-threaded: each thread has its own heap, all respect their limits.
+    #[test]
+    fn memlimit_multithread_per_thread_heap() {
+        let thread_count = 8;
+        let limit = 4 * 1024 * 1024;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(thread_count));
+
+        std::thread::scope(|s| {
+            for _ in 0..thread_count {
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    let heap = HeapMaster::new(limit).unwrap();
+                    barrier.wait(); // synchronize start
+                    let ptrs = fill_heap(&heap, 256);
+                    assert!(!ptrs.is_empty());
+                    assert!(heap.memory_usage() <= limit + MEMLIMIT_MAX_OVERSHOOT);
+                    for p in ptrs {
+                        unsafe { heap.dealloc(p) };
+                    }
+                    heap.collect(true);
+                    assert!(heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE);
+                });
+            }
+        });
+    }
+
+    /// Multi-threaded: main thread allocates, worker threads free.
+    /// mimalloc heaps are thread-local for allocation; mi_free is safe from any thread.
+    #[test]
+    fn memlimit_multithread_cross_thread_free() {
+        let limit = 16 * 1024 * 1024;
+        let heap = HeapMaster::new(limit).unwrap();
+
+        // Allocate on main thread
+        let mut ptrs: Vec<*mut u8> = Vec::new();
+        for _ in 0..1000 {
+            let p = heap.alloc(256, 8);
+            if p.is_null() {
+                break;
+            }
+            ptrs.push(p);
+        }
+        assert!(!ptrs.is_empty());
+        assert!(heap.memory_usage() <= limit + MEMLIMIT_MAX_OVERSHOOT);
+
+        // Free from worker threads (wrap raw pointers for Send)
+        let chunks: Vec<Vec<usize>> = ptrs
+            .chunks(250)
+            .map(|c| c.iter().map(|p| *p as usize).collect())
+            .collect();
+        std::thread::scope(|s| {
+            for chunk in chunks {
+                let heap = heap.heap();
+                s.spawn(move || {
+                    for p in chunk {
+                        unsafe { heap.dealloc(p as *mut u8) };
+                    }
+                });
+            }
+        });
+        // Process delayed frees and retire pages
+        heap.collect(true);
+        assert!(
+            heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+            "cross-thread free: usage not zero"
+        );
+    }
+
+    /// Multi-threaded: per-thread heaps, verify limit never exceeded under contention.
+    #[test]
+    fn memlimit_multithread_concurrent_heaps_limit_check() {
+        let limit = 4 * 1024 * 1024;
+        let violation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let violation = violation.clone();
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    let heap = HeapMaster::new(limit).unwrap();
+                    barrier.wait();
+                    let mut held = Vec::new();
+                    for _ in 0..500 {
+                        let p = heap.alloc(4096, 8);
+                        if !p.is_null() {
+                            held.push(p);
+                            if heap.memory_usage() > limit + MEMLIMIT_MAX_OVERSHOOT {
+                                violation.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        if held.len() > 10 {
+                            for p in held.drain(..5) {
+                                unsafe { heap.dealloc(p) };
+                            }
+                        }
+                    }
+                    for p in held {
+                        unsafe { heap.dealloc(p) };
+                    }
+                });
+            }
+        });
+        assert!(
+            !violation.load(std::sync::atomic::Ordering::Relaxed),
+            "limit was exceeded"
+        );
+    }
+
+    /// Stress: rapid create/destroy of many heaps.
+    #[test]
+    fn memlimit_rapid_heap_lifecycle() {
+        for _ in 0..100 {
+            let heap = HeapMaster::new(2 * 1024 * 1024).unwrap();
+            let mut ptrs = Vec::new();
+            for _ in 0..50 {
+                let p = heap.alloc(1024, 8);
+                if p.is_null() {
+                    break;
+                }
+                ptrs.push(p);
+            }
+            for p in ptrs {
+                unsafe { heap.dealloc(p) };
+            }
+            heap.collect(true);
+            assert!(heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE);
+            drop(heap);
+        }
+    }
+
+    /// Different size classes in same heap: verify accounting is exact.
+    #[test]
+    fn memlimit_size_class_accounting() {
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
+
+        // Small: <= 8 KiB → 64 KiB page (1 slice)
+        let p1 = heap.alloc(64, 8);
+        assert!(!p1.is_null());
+        let u1 = heap.memory_usage();
+        assert!(u1 > 0, "small alloc should register usage");
+
+        // Medium: 8 KiB < size <= 64 KiB → 512 KiB page (8 slices)
+        let p2 = heap.alloc(16 * 1024, 8);
+        assert!(!p2.is_null());
+        let u2 = heap.memory_usage();
+        assert!(u2 > u1, "medium alloc should increase usage");
+
+        // Large: 64 KiB < size <= 16 MiB
+        let p3 = heap.alloc(256 * 1024, 8);
+        assert!(!p3.is_null());
+        let u3 = heap.memory_usage();
+        assert!(u3 > u2, "large alloc should increase usage");
+
+        // Free all — usage tracks pages, not blocks. Pages are freed/retired
+        // asynchronously by mimalloc, so usage may not decrease immediately.
+        unsafe { heap.dealloc(p3) };
+        unsafe { heap.dealloc(p2) };
+        unsafe { heap.dealloc(p1) };
+        heap.collect(true);
+        // After freeing all blocks + collect, usage should be bounded
+        assert!(
+            heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+            "all freed but usage not zero"
+        );
+    }
+
+    /// Fuzz-style: random sizes, random alloc/free pattern, verify invariants.
+    #[test]
+    fn memlimit_fuzz_random_pattern() {
+        use std::collections::VecDeque;
+        let limit = 16 * 1024 * 1024;
+        let heap = HeapMaster::new(limit).unwrap();
+        let mut live: VecDeque<*mut u8> = VecDeque::new();
+        let sizes = [
+            8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
+            262144, 524288, 1048576,
+        ];
+
+        for i in 0..10_000u64 {
+            let sz = sizes[(i
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407)
+                >> 48) as usize
+                % sizes.len()];
+            if i % 3 != 0 {
+                // allocate
+                let p = heap.alloc(sz, 8);
+                if !p.is_null() {
+                    live.push_back(p);
+                }
+            } else if let Some(p) = live.pop_front() {
+                // free oldest
+                unsafe { heap.dealloc(p) };
+            }
+            // invariant: usage never exceeds limit
+            assert!(
+                heap.memory_usage() <= limit + MEMLIMIT_MAX_OVERSHOOT,
+                "fuzz: usage {} > limit {} + overshoot at iter {}",
+                heap.memory_usage(),
+                limit,
+                i
+            );
+        }
+        // free all remaining
+        for p in live {
+            unsafe { heap.dealloc(p) };
+        }
+        heap.collect(true);
+        assert!(
+            heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+            "fuzz: usage not zero after cleanup"
+        );
+    }
+
+    /// Fuzz-style multi-threaded: each thread owns its heap, random alloc/free.
+    #[test]
+    fn memlimit_fuzz_multithread() {
+        let limit = 16 * 1024 * 1024;
+        let violation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+
+        std::thread::scope(|s| {
+            for tid in 0..4u64 {
+                let violation = violation.clone();
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    let heap = HeapMaster::new(limit).unwrap();
+                    barrier.wait();
+                    let mut live = Vec::new();
+                    let sizes = [64, 512, 4096, 32768, 131072, 524288];
+                    for i in 0..5_000u64 {
+                        let hash = i
+                            .wrapping_mul(2862933555777941757)
+                            .wrapping_add(tid.wrapping_mul(3037000493));
+                        let sz = sizes[(hash >> 48) as usize % sizes.len()];
+                        if hash % 3 != 0 {
+                            let p = heap.alloc(sz, 8);
+                            if !p.is_null() {
+                                live.push(p);
+                            }
+                            if heap.memory_usage() > limit + MEMLIMIT_MAX_OVERSHOOT {
+                                violation.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if let Some(p) = live.pop() {
+                            unsafe { heap.dealloc(p) };
+                        }
+                    }
+                    for p in live {
+                        unsafe { heap.dealloc(p) };
+                    }
+                    heap.collect(true);
+                    assert!(
+                        heap.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+                        "mt fuzz tid {}: usage not zero",
+                        tid
+                    );
+                });
+            }
+        });
+        assert!(
+            !violation.load(std::sync::atomic::Ordering::Relaxed),
+            "mt fuzz: limit exceeded"
+        );
     }
 }

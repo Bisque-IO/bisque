@@ -8,7 +8,7 @@ use std::{cmp, fmt, ptr, slice};
 
 use bisque_mimalloc_sys as ffi;
 
-use crate::Heap;
+use crate::{Heap, HeapMaster};
 
 // =========================================================================
 // Constants
@@ -459,8 +459,8 @@ impl Bytes {
         std::mem::forget(self);
         Ok(BytesMut {
             ptr,
-            len,
-            cap,
+            len: len as u32,
+            cap: cap as u32,
             header,
             heap,
         })
@@ -740,11 +740,11 @@ impl fmt::Debug for Bytes {
 // BytesMut
 // =========================================================================
 
-/// Mutable byte buffer allocated from a [`Heap`]. 40 bytes on the stack.
+/// Mutable byte buffer allocated from a [`Heap`]. 32 bytes on the stack.
 pub struct BytesMut {
     ptr: *mut u8,
-    len: usize,
-    cap: usize,
+    len: u32,
+    cap: u32,
     header: *mut Header,
     heap: Heap,
 }
@@ -774,7 +774,7 @@ impl BytesMut {
         Ok(Self {
             ptr: data_ptr,
             len: 0,
-            cap,
+            cap: cap as u32,
             header,
             heap: heap.clone(),
         })
@@ -787,14 +787,18 @@ impl BytesMut {
             unsafe {
                 ptr::write_bytes(bm.ptr, 0, len);
             }
-            bm.len = len;
+            bm.len = len as u32;
         }
         Ok(bm)
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.len as usize
+    }
+    #[inline]
+    pub fn cap(&self) -> usize {
+        self.cap as usize
     }
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -802,7 +806,7 @@ impl BytesMut {
     }
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.cap
+        self.cap as usize
     }
 
     #[inline]
@@ -810,7 +814,7 @@ impl BytesMut {
         if self.len == 0 {
             &[]
         } else {
-            unsafe { slice::from_raw_parts(self.ptr, self.len) }
+            unsafe { slice::from_raw_parts(self.ptr, self.len as usize) }
         }
     }
 
@@ -819,7 +823,7 @@ impl BytesMut {
         if self.len == 0 {
             &mut []
         } else {
-            unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+            unsafe { slice::from_raw_parts_mut(self.ptr, self.len as usize) }
         }
     }
 
@@ -829,8 +833,8 @@ impl BytesMut {
     }
 
     pub fn truncate(&mut self, len: usize) {
-        if len < self.len {
-            self.len = len;
+        if len < self.len() {
+            self.len = len as u32;
         }
     }
 
@@ -840,13 +844,13 @@ impl BytesMut {
         new_len: usize,
         value: u8,
     ) -> Result<(), allocator_api2::alloc::AllocError> {
-        if new_len > self.len {
-            self.reserve(new_len - self.len)?;
+        if new_len > self.len() {
+            self.reserve(new_len - self.len())?;
             unsafe {
-                ptr::write_bytes(self.ptr.add(self.len), value, new_len - self.len);
+                ptr::write_bytes(self.ptr.add(self.len()), value, new_len - self.len());
             }
         }
-        self.len = new_len;
+        self.len = new_len as u32;
         Ok(())
     }
 
@@ -854,32 +858,32 @@ impl BytesMut {
         &mut self,
         data: &[u8],
     ) -> Result<(), allocator_api2::alloc::AllocError> {
-        let needed = self.len + data.len();
-        if needed > self.cap {
+        let needed = self.len() + data.len();
+        if needed > self.cap as usize {
             self.try_grow(needed)?;
         }
         unsafe {
-            ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(self.len), data.len());
+            ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(self.len()), data.len());
         }
-        self.len += data.len();
+        self.len += data.len() as u32;
         Ok(())
     }
 
     #[inline]
     pub fn push(&mut self, byte: u8) -> Result<(), allocator_api2::alloc::AllocError> {
         if self.len == self.cap {
-            self.try_grow(self.len + 1)?;
+            self.try_grow(self.len() + 1)?;
         }
         unsafe {
-            *self.ptr.add(self.len) = byte;
+            *self.ptr.add(self.len()) = byte;
         }
         self.len += 1;
         Ok(())
     }
 
     pub fn reserve(&mut self, additional: usize) -> Result<(), allocator_api2::alloc::AllocError> {
-        let needed = self.len + additional;
-        if needed > self.cap {
+        let needed = self.len() + additional;
+        if needed > self.cap as usize {
             self.try_grow(needed)?;
         }
         Ok(())
@@ -908,7 +912,7 @@ impl BytesMut {
 
     /// Split at `at`, returning `[0..at)` and leaving `[at..len)` in self.
     pub fn split_to(&mut self, at: usize) -> Bytes {
-        assert!(at <= self.len);
+        assert!(at <= self.len());
         let data = unsafe { slice::from_raw_parts(self.ptr, at) };
         let result = if at <= INLINE_CAP {
             let mut inline = InlineRepr {
@@ -929,16 +933,16 @@ impl BytesMut {
             }
         };
         unsafe {
-            ptr::copy(self.ptr.add(at), self.ptr, self.len - at);
+            ptr::copy(self.ptr.add(at), self.ptr, self.len() - at);
         }
-        self.len -= at;
+        self.len -= at as u32;
         result
     }
 
     /// Split at `at`, returning `[at..len)` and leaving `[0..at)` in self.
     pub fn split_off(&mut self, at: usize) -> Bytes {
-        assert!(at <= self.len);
-        let tail_len = self.len - at;
+        assert!(at <= self.len());
+        let tail_len = self.len() - at;
         let data = unsafe { slice::from_raw_parts(self.ptr.add(at), tail_len) };
         let result = if tail_len <= INLINE_CAP {
             let mut inline = InlineRepr {
@@ -956,7 +960,7 @@ impl BytesMut {
                 Err(_) => panic!("OOM in BytesMut::split_off"),
             }
         };
-        self.len = at;
+        self.len = at as u32;
         result
     }
 
@@ -970,8 +974,8 @@ impl BytesMut {
     /// # Safety
     /// `new_len` must be ≤ `capacity()` and the bytes in `[0..new_len)` must be initialized.
     pub unsafe fn set_len(&mut self, new_len: usize) {
-        debug_assert!(new_len <= self.cap);
-        self.len = new_len;
+        debug_assert!(new_len <= self.cap());
+        self.len = new_len as u32;
     }
 
     /// Access the spare capacity as uninitialized bytes.
@@ -981,8 +985,8 @@ impl BytesMut {
         }
         unsafe {
             slice::from_raw_parts_mut(
-                self.ptr.add(self.len) as *mut MaybeUninit<u8>,
-                self.cap - self.len,
+                self.ptr.add(self.len()) as *mut MaybeUninit<u8>,
+                self.cap() - self.len(),
             )
         }
     }
@@ -990,7 +994,7 @@ impl BytesMut {
     /// Freeze into immutable [`Bytes`]. Zero-cost for >30 bytes.
     #[inline]
     pub fn freeze(self) -> Bytes {
-        let len = self.len;
+        let len = self.len();
         let header = self.header;
         if len == 0 {
             return Bytes::new();
@@ -1045,7 +1049,7 @@ impl BytesMut {
             let (header, data_ptr) = alloc_header_and_data(&self.heap, new_cap)?;
             self.header = header;
             self.ptr = data_ptr;
-            self.cap = new_cap;
+            self.cap = new_cap as u32;
         } else {
             let new_total = HEADER_SIZE + new_cap;
             let align = std::mem::align_of::<Header>();
@@ -1064,7 +1068,7 @@ impl BytesMut {
             unsafe { (*new_header).cap = new_cap as u32 };
             self.header = new_header;
             self.ptr = unsafe { (new_raw as *mut u8).add(HEADER_SIZE) };
-            self.cap = new_cap;
+            self.cap = new_cap as u32;
         }
         Ok(())
     }
@@ -1087,13 +1091,14 @@ impl Drop for BytesMut {
 impl Default for BytesMut {
     fn default() -> Self {
         // Requires a heap — use default heap.
-        Self::new(&Heap::default())
+        let master = HeapMaster::new(64 * 1024 * 1024).expect("failed to create default heap");
+        Self::new(&master)
     }
 }
 
 impl Clone for BytesMut {
     fn clone(&self) -> Self {
-        let mut new = Self::with_capacity(self.len, &self.heap).expect("clone OOM");
+        let mut new = Self::with_capacity(self.len(), &self.heap).expect("clone OOM");
         new.extend_from_slice(self.as_slice()).expect("clone OOM");
         new
     }
@@ -1257,20 +1262,20 @@ impl fmt::Write for BytesMut {
 impl bytes::Buf for BytesMut {
     #[inline]
     fn remaining(&self) -> usize {
-        self.len
+        self.len()
     }
     #[inline]
     fn chunk(&self) -> &[u8] {
         self.as_slice()
     }
     fn advance(&mut self, cnt: usize) {
-        assert!(cnt <= self.len, "advance past end");
-        if cnt > 0 && self.len - cnt > 0 {
+        assert!(cnt <= self.len(), "advance past end");
+        if cnt > 0 && self.len() - cnt > 0 {
             unsafe {
-                ptr::copy(self.ptr.add(cnt), self.ptr, self.len - cnt);
+                ptr::copy(self.ptr.add(cnt), self.ptr, self.len() - cnt);
             }
         }
-        self.len -= cnt;
+        self.len -= cnt as u32;
     }
 }
 
@@ -1286,9 +1291,9 @@ unsafe impl bytes::BufMut for BytesMut {
 
     #[inline]
     unsafe fn advance_mut(&mut self, cnt: usize) {
-        let new_len = self.len + cnt;
-        debug_assert!(new_len <= self.cap, "advance_mut past capacity");
-        self.len = new_len;
+        let new_len = self.len() + cnt;
+        debug_assert!(new_len <= self.cap(), "advance_mut past capacity");
+        self.len = new_len as u32;
     }
 
     #[inline]
@@ -1298,9 +1303,9 @@ unsafe impl bytes::BufMut for BytesMut {
             self.reserve(64).expect("chunk_mut OOM");
         }
         unsafe {
-            let ptr = self.ptr.add(self.len);
+            let ptr = self.ptr.add(self.len());
             let len = self.cap - self.len;
-            bytes::buf::UninitSlice::from_raw_parts_mut(ptr, len)
+            bytes::buf::UninitSlice::from_raw_parts_mut(ptr, len as usize)
         }
     }
 
@@ -1311,8 +1316,8 @@ unsafe impl bytes::BufMut for BytesMut {
     fn put_bytes(&mut self, val: u8, cnt: usize) {
         self.reserve(cnt).expect("put_bytes OOM");
         unsafe {
-            ptr::write_bytes(self.ptr.add(self.len), val, cnt);
-            self.len += cnt;
+            ptr::write_bytes(self.ptr.add(self.len()), val, cnt);
+            self.len += cnt as u32;
         }
     }
 }
@@ -1364,8 +1369,8 @@ mod tests {
     use bytes::{Buf, BufMut};
     use std::fmt::Write;
 
-    fn heap() -> Heap {
-        Heap::new(64 * 1024 * 1024).unwrap()
+    fn heap() -> HeapMaster {
+        HeapMaster::new(64 * 1024 * 1024).unwrap()
     }
 
     // -- Bytes basic --
@@ -1800,7 +1805,7 @@ mod tests {
 
     #[test]
     fn bytes_mut_oom() {
-        let h = Heap::new(32 * 1024 * 1024).unwrap();
+        let h = HeapMaster::new(32 * 1024 * 1024).unwrap();
         let mut bm = BytesMut::new(&h);
         let mut oom = false;
         for _ in 0..10_000 {

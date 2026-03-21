@@ -4,7 +4,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::Heap;
+use crate::{Heap, HeapMaster};
 use allocator_api2::alloc::AllocError;
 
 /// Layout: [refcount: AtomicUsize] [value: T]
@@ -27,7 +27,7 @@ struct ArcInner<T> {
 /// use bisque_alloc::Heap;
 /// use bisque_alloc::collections::Arc;
 ///
-/// let heap = Heap::new(64 * 1024 * 1024).unwrap();
+/// let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
 /// let a = Arc::new(42u64, &heap).unwrap();
 /// let b = a.clone();
 /// assert_eq!(*a, 42);
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn arc_basic() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let a = Arc::new(42u64, &heap).unwrap();
         assert_eq!(*a, 42);
         assert_eq!(Arc::strong_count(&a), 1);
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn arc_clone_and_drop() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let a = Arc::new(String::from("hello"), &heap).unwrap();
         let b = a.clone();
         let c = b.clone();
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn arc_try_unwrap() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let a = Arc::new(vec![1, 2, 3], &heap).unwrap();
         let v = Arc::try_unwrap(a).unwrap();
         assert_eq!(v, vec![1, 2, 3]);
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn arc_try_unwrap_fails_with_multiple_refs() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let a = Arc::new(10u32, &heap).unwrap();
         let _b = a.clone();
         let result = Arc::try_unwrap(a);
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn arc_send_sync() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let a = Arc::new(42u64, &heap).unwrap();
         let b = a.clone();
         let handle = std::thread::spawn(move || {
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn arc_debug() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let a = Arc::new(123i32, &heap).unwrap();
         assert_eq!(format!("{a:?}"), "123");
     }
@@ -247,7 +247,7 @@ mod tests {
         }
 
         DROPPED.store(false, Ordering::Relaxed);
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let a = Arc::new(Sentinel, &heap).unwrap();
         assert!(!DROPPED.load(Ordering::Relaxed));
         drop(a);

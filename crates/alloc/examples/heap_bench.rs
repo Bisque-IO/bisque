@@ -6,7 +6,7 @@ use std::alloc::{GlobalAlloc, Layout, System, alloc, dealloc};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use bisque_alloc::{Heap, HeapVec, MiMalloc};
+use bisque_alloc::{Heap, HeapMaster, HeapVec, MiMalloc};
 use bisque_mimalloc_sys as ffi;
 
 #[global_allocator]
@@ -84,8 +84,8 @@ fn bench_batched<F: FnMut()>(name: &str, dur: Duration, batch: u64, mut f: F) ->
     }
 }
 
-fn new_heap() -> Heap {
-    Heap::new(HEAP_SIZE).unwrap()
+fn new_heap() -> HeapMaster {
+    HeapMaster::new(HEAP_SIZE).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -200,11 +200,12 @@ fn bench_multithread() -> Vec<BenchResult> {
     let mut r = Vec::new();
 
     for &t in &counts {
+        // Pre-create heaps outside the timed section
+        let heaps: Vec<HeapMaster> = (0..t).map(|_| new_heap()).collect();
         let start = Instant::now();
         std::thread::scope(|s| {
-            for _ in 0..t {
+            for h in &heaps {
                 s.spawn(|| {
-                    let h = new_heap();
                     for _ in 0..ops {
                         let p = h.alloc(size, align);
                         black_box(p);
@@ -218,6 +219,7 @@ fn bench_multithread() -> Vec<BenchResult> {
             ops: ops * t as u64,
             elapsed: start.elapsed(),
         });
+        drop(heaps);
 
         let start = Instant::now();
         std::thread::scope(|s| {
@@ -354,7 +356,9 @@ fn bench_multi_heap() -> Vec<BenchResult> {
     let mut r = Vec::new();
 
     for &n in &counts {
-        let heaps: Vec<Heap> = (0..n).map(|_| Heap::new(small_arena).unwrap()).collect();
+        let heaps: Vec<HeapMaster> = (0..n)
+            .map(|_| HeapMaster::new(small_arena).unwrap())
+            .collect();
         let start = Instant::now();
         for h in &heaps {
             for _ in 0..ops_per {
@@ -369,11 +373,13 @@ fn bench_multi_heap() -> Vec<BenchResult> {
             elapsed: start.elapsed(),
         });
 
+        let par_heaps: Vec<HeapMaster> = (0..n)
+            .map(|_| HeapMaster::new(small_arena).unwrap())
+            .collect();
         let start = Instant::now();
         std::thread::scope(|s| {
-            for _ in 0..n {
+            for h in &par_heaps {
                 s.spawn(|| {
-                    let h = Heap::new(small_arena).unwrap();
                     for _ in 0..ops_per {
                         let p = h.alloc(size, 8);
                         black_box(p);
@@ -438,7 +444,7 @@ fn bench_bulk_destroy() -> Vec<BenchResult> {
     let mut r = Vec::new();
 
     // Individual frees: reuse one heap.
-    let heap = Heap::new(small_arena).unwrap();
+    let heap = HeapMaster::new(small_arena).unwrap();
     r.push(bench_batched("alloc 10K + free 10K", DURATION, n, || {
         let mut ptrs = Vec::with_capacity(n as usize);
         for _ in 0..n {
@@ -454,7 +460,7 @@ fn bench_bulk_destroy() -> Vec<BenchResult> {
     let iters = 50u64;
     let start = Instant::now();
     for _ in 0..iters {
-        let h = Heap::new(small_arena).unwrap();
+        let h = HeapMaster::new(small_arena).unwrap();
         for _ in 0..n {
             black_box(h.alloc(size, 8));
         }
@@ -523,12 +529,39 @@ fn main() {
         println!();
     }
 
+    // Force immediate purge and reclaim abandoned segments.
     unsafe {
-        bisque_mimalloc_sys::mi_collect(true);
+        bisque_mimalloc_sys::mi_option_set(
+            bisque_mimalloc_sys::mi_option_e_mi_option_purge_delay as _,
+            0,
+        );
+        // Collect multiple times — first reclaims abandoned segments, subsequent passes purge them.
+        for _ in 0..5 {
+            bisque_mimalloc_sys::mi_collect(true);
+        }
     }
     let (rss, commit) = bisque_alloc::heap::process_memory_info();
-    println!("--- Process Memory (via mi_process_info) ---");
-    println!("  RSS:       {:.2} MiB", rss as f64 / (1024.0 * 1024.0));
-    println!("  Committed: {:.2} MiB", commit as f64 / (1024.0 * 1024.0));
+
+    // Also read actual OS RSS from /proc
+    let os_rss = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+
+    println!("--- Process Memory (after forced purge) ---");
+    println!(
+        "  mi_process_info RSS:  {:.2} MiB",
+        rss as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  mi_process_info committed: {:.2} MiB",
+        commit as f64 / (1024.0 * 1024.0)
+    );
+    println!("  /proc/self VmRSS:     {:.2} MiB", os_rss as f64 / 1024.0);
     println!();
 }

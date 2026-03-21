@@ -3,7 +3,7 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
-use crate::Heap;
+use crate::{Heap, HeapMaster};
 use allocator_api2::alloc::AllocError;
 
 /// A heap-allocated value. Equivalent to `std::boxed::Box<T>` but allocated
@@ -15,7 +15,7 @@ use allocator_api2::alloc::AllocError;
 /// use bisque_alloc::Heap;
 /// use bisque_alloc::collections::Box;
 ///
-/// let heap = Heap::new(64 * 1024 * 1024).unwrap();
+/// let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
 /// let b = Box::new(42u64, &heap).unwrap();
 /// assert_eq!(*b, 42);
 /// ```
@@ -149,14 +149,14 @@ mod tests {
 
     #[test]
     fn box_basic() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let b = Box::new(42u64, &heap).unwrap();
         assert_eq!(*b, 42);
     }
 
     #[test]
     fn box_drop() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let b = Box::new(String::from("hello"), &heap).unwrap();
         assert_eq!(&*b, "hello");
         drop(b); // should free both the String's data and the Box allocation
@@ -164,21 +164,21 @@ mod tests {
 
     #[test]
     fn box_zst() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let b = Box::new((), &heap).unwrap();
         assert_eq!(*b, ());
     }
 
     #[test]
     fn box_debug() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let b = Box::new(123i32, &heap).unwrap();
         assert_eq!(format!("{b:?}"), "123");
     }
 
     #[test]
     fn box_deref_mut() {
-        let heap = Heap::new(64 * 1024 * 1024).unwrap();
+        let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
         let mut b = Box::new(10u32, &heap).unwrap();
         *b += 5;
         assert_eq!(*b, 15);

@@ -1,28 +1,28 @@
-//! `bisque-alloc` — Fixed-size, mmap-backed heap allocation for multi-tenant workloads.
+//! `bisque-alloc` — Memory-limited heap allocation for multi-tenant workloads.
 //!
-//! Each [`Heap`] owns a fixed-size `mmap` region registered as an exclusive
-//! mimalloc arena. Allocations routed through the heap are confined to that
-//! region — when it's full, allocations fail with `AllocError` instead of
-//! growing unbounded.
+//! [`HeapMaster`] owns a mimalloc heap with an optional per-heap memory limit.
+//! [`Heap`] is a cheap, cloneable handle. Keep the master alive as long as any
+//! `Heap` clones exist.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Heap::new(256 MiB)
-//! ├── os_mmap::alloc_pages()        — mmap/VirtualAlloc fixed region
-//! ├── mi_manage_os_memory_ex()      — register as exclusive mimalloc arena
-//! ├── mi_heap_new_ex(allow_destroy) — heap pinned to that arena
+//! HeapMaster::new(256 MiB)
+//! ├── mi_heap_new_ex(allow_destroy) — create mimalloc heap
+//! ├── mi_heap_set_memory_limit()    — per-heap limit (CAS-enforced, zero overshoot)
+//! ├── HeapMaster::heap() → Heap     — cheap cloneable handle
 //! ├── impl allocator_api2::Allocator— hashbrown HashMap/HashSet support
-//! └── Drop: mi_heap_destroy → mi_arena_unload → munmap/VirtualFree
+//! └── Drop: mi_heap_destroy         — bulk-free all pages and segments
 //! ```
 //!
 //! # Usage
 //!
 //! ```rust,no_run
-//! use bisque_alloc::Heap;
+//! use bisque_alloc::{HeapMaster, Heap};
 //! use bisque_alloc::collections;
 //!
-//! let heap = Heap::new(64 * 1024 * 1024).unwrap(); // 64 MiB arena
+//! let master = HeapMaster::new(64 * 1024 * 1024).unwrap();
+//! let heap = master.heap();
 //!
 //! let mut v = collections::Vec::new(&heap);
 //! v.extend_from_slice(&[1, 2, 3]).unwrap();
@@ -43,7 +43,7 @@ pub mod wait_queue;
 
 pub use arc::Arc;
 pub use boxed::Box;
-pub use heap::Heap;
+pub use heap::{Heap, HeapMaster};
 
 /// Alias for [`collections::Vec`] (heap-backed byte buffer).
 pub type HeapVec = collections::Vec;

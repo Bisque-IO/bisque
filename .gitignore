@@ -76,8 +76,6 @@ data/
 ### Mac OS ###
 .DS_Store
 
-
-
 build*
 .vscode
 .cache
@@ -97,14 +95,4 @@ compile_commands.json
 dist
 __pycache__/
 
-ui/kotlin-js-store/
-
-lib/wamr/.github/
-
-lib/wamr/.devcontainer/
-
-lib/zstd/.github/
-
-lib/zlib/.github/
 target/
-/aof_example_dir

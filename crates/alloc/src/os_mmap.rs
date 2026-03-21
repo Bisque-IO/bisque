@@ -6,6 +6,25 @@
 
 use std::ptr;
 
+/// Allocate `size` bytes of committed, read-write virtual memory aligned to `alignment`.
+///
+/// Returns `(aligned_ptr, mmap_ptr, mmap_len)` where `aligned_ptr` is the usable
+/// aligned region, and `mmap_ptr`/`mmap_len` are the original mmap for `free_pages`.
+/// Returns `(null, null, 0)` on failure.
+///
+/// `alignment` must be a power of two and >= page size.
+pub fn alloc_pages_aligned(size: usize, alignment: usize) -> (*mut u8, *mut u8, usize) {
+    debug_assert!(alignment.is_power_of_two() && alignment >= 4096);
+    // Over-allocate to guarantee alignment within the mmap.
+    let mmap_len = size + alignment;
+    let mmap_ptr = alloc_pages(mmap_len);
+    if mmap_ptr.is_null() {
+        return (ptr::null_mut(), ptr::null_mut(), 0);
+    }
+    let aligned = ((mmap_ptr as usize) + alignment - 1) & !(alignment - 1);
+    (aligned as *mut u8, mmap_ptr, mmap_len)
+}
+
 /// Allocate `size` bytes of committed, read-write virtual memory.
 ///
 /// The returned pointer is page-aligned. Returns null on failure.
