@@ -5,7 +5,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use bisque_alloc::Heap;
+use bisque_alloc::{Heap, HeapMaster};
 
 #[global_allocator]
 static GLOBAL: bisque_alloc::MiMalloc = bisque_alloc::MiMalloc;
@@ -57,8 +57,8 @@ fn bench<F: FnMut()>(name: &str, dur: Duration, mut f: F) -> BenchResult {
     }
 }
 
-fn heap() -> Heap {
-    Heap::new(128 * 1024 * 1024).unwrap()
+fn heap() -> HeapMaster {
+    HeapMaster::new(128 * 1024 * 1024).unwrap()
 }
 
 // ---------------------------------------------------------------------------

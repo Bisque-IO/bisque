@@ -108,6 +108,12 @@ terms of the MIT license. A copy of the license can be found in the file
 // the owning thread).
 // #define MI_HUGE_PAGE_ABANDON 1
 
+// MI_HUGE_PAGE_ABANDON is incompatible with MI_HEAP_MEMLIMIT: abandoned huge
+// pages are immediately orphaned and freed by arbitrary threads, making per-heap
+// memory tracking impossible. Disable it when heap memory limits are enabled.
+#if defined(MI_HEAP_MEMLIMIT) && defined(MI_HUGE_PAGE_ABANDON)
+#undef MI_HUGE_PAGE_ABANDON
+#endif
 
 // ------------------------------------------------------
 // Platform specific values

@@ -4,13 +4,13 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{Heap, HeapMaster};
+use crate::Heap;
 use allocator_api2::alloc::AllocError;
 
 /// Layout: [refcount: AtomicUsize] [value: T]
 /// Stored in a single heap allocation.
 #[repr(C)]
-struct ArcInner<T> {
+struct HeapArcInner<T> {
     refcount: AtomicUsize,
     value: T,
 }
@@ -24,8 +24,8 @@ struct ArcInner<T> {
 /// # Examples
 ///
 /// ```rust
-/// use bisque_alloc::Heap;
-/// use bisque_alloc::collections::Arc;
+/// use bisque_alloc::HeapMaster;
+/// use bisque_alloc::Arc;
 ///
 /// let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
 /// let a = Arc::new(42u64, &heap).unwrap();
@@ -34,29 +34,29 @@ struct ArcInner<T> {
 /// assert_eq!(*b, 42);
 /// assert_eq!(Arc::strong_count(&a), 2);
 /// ```
-pub struct Arc<T> {
-    ptr: *mut ArcInner<T>,
+pub struct HeapArc<T> {
+    ptr: *mut HeapArcInner<T>,
     heap: Heap,
 }
 
-unsafe impl<T: Send + Sync> Send for Arc<T> {}
-unsafe impl<T: Send + Sync> Sync for Arc<T> {}
+unsafe impl<T: Send + Sync> Send for HeapArc<T> {}
+unsafe impl<T: Send + Sync> Sync for HeapArc<T> {}
 
-impl<T> Arc<T> {
+impl<T> HeapArc<T> {
     /// Allocate and initialize a reference-counted value on the heap.
     ///
     /// Returns `Err(AllocError)` if the arena is full.
     pub fn new(value: T, heap: &Heap) -> Result<Self, AllocError> {
-        let layout = std::alloc::Layout::new::<ArcInner<T>>();
+        let layout = std::alloc::Layout::new::<HeapArcInner<T>>();
         let raw = heap.alloc(layout.size(), layout.align());
         if raw.is_null() {
             return Err(AllocError);
         }
-        let inner = raw as *mut ArcInner<T>;
+        let inner = raw as *mut HeapArcInner<T>;
         unsafe {
             std::ptr::write(
                 inner,
-                ArcInner {
+                HeapArcInner {
                     refcount: AtomicUsize::new(1),
                     value,
                 },
@@ -102,7 +102,7 @@ impl<T> Arc<T> {
     }
 }
 
-impl<T> Deref for Arc<T> {
+impl<T> Deref for HeapArc<T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -110,7 +110,7 @@ impl<T> Deref for Arc<T> {
     }
 }
 
-impl<T> Clone for Arc<T> {
+impl<T> Clone for HeapArc<T> {
     #[inline]
     fn clone(&self) -> Self {
         let old = unsafe { (*self.ptr).refcount.fetch_add(1, Ordering::Relaxed) };
@@ -122,7 +122,7 @@ impl<T> Clone for Arc<T> {
     }
 }
 
-impl<T> Drop for Arc<T> {
+impl<T> Drop for HeapArc<T> {
     fn drop(&mut self) {
         let inner = unsafe { &*self.ptr };
         if inner.refcount.fetch_sub(1, Ordering::Release) == 1 {
@@ -136,34 +136,34 @@ impl<T> Drop for Arc<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for Arc<T> {
+impl<T: fmt::Debug> fmt::Debug for HeapArc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<T: fmt::Display> fmt::Display for Arc<T> {
+impl<T: fmt::Display> fmt::Display for HeapArc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }
 }
 
-impl<T: PartialEq> PartialEq for Arc<T> {
+impl<T: PartialEq> PartialEq for HeapArc<T> {
     fn eq(&self, other: &Self) -> bool {
         // Pointer equality first (cheap), then value equality.
         std::ptr::eq(self.ptr, other.ptr) || (**self).eq(&**other)
     }
 }
 
-impl<T: Eq> Eq for Arc<T> {}
+impl<T: Eq> Eq for HeapArc<T> {}
 
-impl<T: std::hash::Hash> std::hash::Hash for Arc<T> {
+impl<T: std::hash::Hash> std::hash::Hash for HeapArc<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         (**self).hash(state);
     }
 }
 
-impl<T> AsRef<T> for Arc<T> {
+impl<T> AsRef<T> for HeapArc<T> {
     fn as_ref(&self) -> &T {
         self
     }
@@ -172,52 +172,53 @@ impl<T> AsRef<T> for Arc<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HeapMaster;
 
     #[test]
     fn arc_basic() {
         let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
-        let a = Arc::new(42u64, &heap).unwrap();
+        let a = HeapArc::new(42u64, &heap).unwrap();
         assert_eq!(*a, 42);
-        assert_eq!(Arc::strong_count(&a), 1);
+        assert_eq!(HeapArc::strong_count(&a), 1);
     }
 
     #[test]
     fn arc_clone_and_drop() {
         let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
-        let a = Arc::new(String::from("hello"), &heap).unwrap();
+        let a = HeapArc::new(String::from("hello"), &heap).unwrap();
         let b = a.clone();
         let c = b.clone();
-        assert_eq!(Arc::strong_count(&a), 3);
+        assert_eq!(HeapArc::strong_count(&a), 3);
         assert_eq!(&*a, "hello");
 
         drop(b);
-        assert_eq!(Arc::strong_count(&a), 2);
+        assert_eq!(HeapArc::strong_count(&a), 2);
 
         drop(c);
-        assert_eq!(Arc::strong_count(&a), 1);
+        assert_eq!(HeapArc::strong_count(&a), 1);
     }
 
     #[test]
     fn arc_try_unwrap() {
         let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
-        let a = Arc::new(vec![1, 2, 3], &heap).unwrap();
-        let v = Arc::try_unwrap(a).unwrap();
+        let a = HeapArc::new(vec![1, 2, 3], &heap).unwrap();
+        let v = HeapArc::try_unwrap(a).unwrap();
         assert_eq!(v, vec![1, 2, 3]);
     }
 
     #[test]
     fn arc_try_unwrap_fails_with_multiple_refs() {
         let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
-        let a = Arc::new(10u32, &heap).unwrap();
+        let a = HeapArc::new(10u32, &heap).unwrap();
         let _b = a.clone();
-        let result = Arc::try_unwrap(a);
+        let result = HeapArc::try_unwrap(a);
         assert!(result.is_err());
     }
 
     #[test]
     fn arc_send_sync() {
         let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
-        let a = Arc::new(42u64, &heap).unwrap();
+        let a = HeapArc::new(42u64, &heap).unwrap();
         let b = a.clone();
         let handle = std::thread::spawn(move || {
             assert_eq!(*b, 42);
@@ -229,7 +230,7 @@ mod tests {
     #[test]
     fn arc_debug() {
         let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
-        let a = Arc::new(123i32, &heap).unwrap();
+        let a = HeapArc::new(123i32, &heap).unwrap();
         assert_eq!(format!("{a:?}"), "123");
     }
 
@@ -248,7 +249,7 @@ mod tests {
 
         DROPPED.store(false, Ordering::Relaxed);
         let heap = HeapMaster::new(64 * 1024 * 1024).unwrap();
-        let a = Arc::new(Sentinel, &heap).unwrap();
+        let a = HeapArc::new(Sentinel, &heap).unwrap();
         assert!(!DROPPED.load(Ordering::Relaxed));
         drop(a);
         assert!(DROPPED.load(Ordering::Relaxed));

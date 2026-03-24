@@ -96,3 +96,8 @@ dist
 __pycache__/
 
 target/
+
+
+.sisyphus
+.claude/worktrees
+.claude/projects

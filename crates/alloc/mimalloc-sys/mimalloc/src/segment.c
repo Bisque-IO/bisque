@@ -1223,7 +1223,12 @@ static mi_segment_t* mi_segment_reclaim(mi_segment_t* segment, mi_heap_t* heap, 
   mi_assert_internal(segment->next == NULL);
   _mi_stat_decrease(&tld->stats->segments_abandoned, 1);
 
-  // for all slices
+  // for all slices — track reclaimed pages so we can roll back on failure
+  #if defined(MI_HEAP_MEMLIMIT)
+  mi_page_t* reclaimed_pages[MI_SLICES_PER_SEGMENT];  // pages successfully reclaimed in this loop
+  size_t reclaimed_count = 0;
+  #endif
+
   const mi_slice_t* end;
   mi_slice_t* slice = mi_slices_start_iterate(segment, &end);
   while (slice < end) {
@@ -1255,10 +1260,74 @@ static mi_segment_t* mi_segment_reclaim(mi_segment_t* segment, mi_heap_t* heap, 
       else {
         // otherwise reclaim it into the heap
         if (!_mi_page_reclaim(target_heap, page)) {
-          // heap memory limit reached — re-abandon the segment
-          _mi_arena_segment_mark_abandoned(segment);
+          #if defined(MI_HEAP_MEMLIMIT)
+          // heap memory limit reached — roll back this page and all previously reclaimed pages,
+          // then re-abandon the entire segment.
+
+          // Phase 1: drain delayed frees from all involved heaps while pages are
+          // still valid and in their queues. This processes any blocks that were
+          // pushed to heap->thread_delayed_free for our pages. Note: this may
+          // cause some pages to become all-free and get freed via _mi_page_retire.
+          _mi_heap_delayed_free_all(target_heap);
+          for (size_t ri = 0; ri < reclaimed_count; ri++) {
+            mi_heap_t* rheap = mi_page_heap(reclaimed_pages[ri]);
+            if (rheap != NULL && rheap != target_heap) {
+              _mi_heap_delayed_free_all(rheap);
+            }
+          }
+
+          // Phase 2: set MI_NEVER_DELAYED_FREE on surviving pages to prevent
+          // new delayed frees from being queued during the unclaim.
+          _mi_page_use_delayed_free(page, MI_NEVER_DELAYED_FREE, true);
+          for (size_t ri = 0; ri < reclaimed_count; ri++) {
+            mi_page_t* rpage = reclaimed_pages[ri];
+            // check if the page was freed during delayed free drain
+            // (mi_page_heap is NULL after _mi_page_free)
+            if (mi_page_heap(rpage) != NULL) {
+              _mi_page_use_delayed_free(rpage, MI_NEVER_DELAYED_FREE, false);
+            }
+          }
+
+          // Phase 3: undo this page (was set to heap but not pushed to a queue).
+          mi_page_set_heap(page, NULL);
+          segment->abandoned++;
+          _mi_stat_increase(&tld->stats->pages_abandoned, 1);
+
+          // Phase 4: undo all previously reclaimed pages that are still alive.
+          // _mi_page_unclaim removes the page from its heap queue (adjusting memory_usage),
+          // then _mi_segment_page_abandon re-marks it as abandoned.
+          for (size_t ri = 0; ri < reclaimed_count; ri++) {
+            mi_page_t* rpage = reclaimed_pages[ri];
+            if (mi_page_heap(rpage) != NULL) {
+              _mi_page_unclaim(rpage);
+              _mi_segment_page_abandon(rpage, tld);
+            }
+            // else: page was freed during delayed free drain (segment->used already decremented)
+          }
+          mi_assert_internal(segment->abandoned == segment->used);
+          if (segment->used > 0) {
+            if (segment->abandoned == segment->used) {
+              // all remaining pages are abandoned; if mi_segment_abandon was not
+              // triggered by _mi_segment_page_abandon (e.g. reclaimed_count == 0 or
+              // all reclaimed pages were freed), manually abandon the segment.
+              if (!mi_segment_is_abandoned(segment)) {
+                mi_segment_abandon(segment, tld);
+              }
+            }
+          }
+          else {
+            // all pages in the segment were freed during delayed free drain
+            mi_segment_free(segment, false, tld);
+          }
           return NULL;
+          #else
+          // without MI_HEAP_MEMLIMIT, _mi_page_reclaim cannot fail
+          mi_assert_internal(false);
+          #endif
         }
+        #if defined(MI_HEAP_MEMLIMIT)
+        reclaimed_pages[reclaimed_count++] = page;
+        #endif
         if (requested_block_size == mi_page_block_size(page) && mi_page_has_any_available(page) && heap == target_heap) {
           if (right_page_reclaimed != NULL) { *right_page_reclaimed = true; }
         }

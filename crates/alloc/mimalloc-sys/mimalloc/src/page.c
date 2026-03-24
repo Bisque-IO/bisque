@@ -253,6 +253,20 @@ void _mi_page_free_collect(mi_page_t* page, bool force) {
   Page fresh and retire
 ----------------------------------------------------------- */
 
+// Undo a reclaim: remove the page from its heap queue and return it to abandoned state.
+// Called from mi_segment_reclaim when a later page in the segment fails the memory limit check.
+void _mi_page_unclaim(mi_page_t* page) {
+  mi_heap_t* heap = mi_page_heap(page);
+  mi_assert_internal(heap != NULL);
+  mi_page_queue_t* pq = mi_page_queue(heap, mi_page_block_size(page));
+  if (mi_page_is_in_full(page)) {
+    pq = &heap->pages[MI_BIN_FULL];
+  }
+  mi_page_queue_remove(pq, page);
+  _mi_page_use_delayed_free(page, MI_NEVER_DELAYED_FREE, false);
+  mi_page_set_heap(page, NULL);
+}
+
 // called from segments when reclaiming abandoned pages
 // returns true if the page was successfully reclaimed into the heap.
 bool _mi_page_reclaim(mi_heap_t* heap, mi_page_t* page) {

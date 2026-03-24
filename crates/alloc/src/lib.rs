@@ -31,19 +31,17 @@
 //! m.try_insert("key".into(), 42).unwrap();
 //! ```
 
-pub mod arc;
-pub mod boxed;
 pub mod bytes;
 pub mod collections;
 pub mod heap;
 mod os_mmap;
 pub mod padded;
+pub mod ptr;
 pub mod striped;
 pub mod wait_queue;
 
-pub use arc::Arc;
-pub use boxed::Box;
 pub use heap::{Heap, HeapMaster};
+pub use ptr::{EpochBox, EpochRef, HeapArc, HeapBox, Tlrc, TlrcRef};
 
 /// Alias for [`collections::Vec`] (heap-backed byte buffer).
 pub type HeapVec = collections::Vec;

@@ -83,7 +83,7 @@ pub(crate) struct StripedRefCount {
 impl StripedRefCount {
     fn new() -> Self {
         let num_stripes = std::thread::available_parallelism()
-            .map(|n| (n.get() * 32).next_power_of_two())
+            .map(|n| (n.get() * 8).next_power_of_two())
             .unwrap_or(32);
         let mask = num_stripes - 1;
 

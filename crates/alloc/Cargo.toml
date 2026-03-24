@@ -10,6 +10,8 @@ bisque-mimalloc-sys = { path = "mimalloc-sys" }
 bytes = "1"
 hashbrown = "0.15"
 allocator-api2 = "0.2"
+parking_lot = "0.12"
+seize = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

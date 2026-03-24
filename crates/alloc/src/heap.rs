@@ -1,12 +1,12 @@
 //! Memory-limited mimalloc heap.
 //!
-//! [`HeapMaster`] owns the heap and its memory limit. [`Heap`] is a cheap,
-//! cloneable handle. Drop the master last — once it drops, the striped
-//! refcount enters "closed" mode and the next [`Heap`] drop triggers cleanup.
+//! [`HeapMaster`] owns the heap and its memory limit via [`Tlrc`].
+//! [`Heap`] is a cheap, cloneable handle via [`TlrcRef`].
 //!
-//! Internally reference-counted with a striped refcount for near-zero
-//! contention on clone/drop. The refcount metadata lives *inside* the heap
-//! it manages (self-hosted). On last-ref drop the heap is bulk-freed.
+//! Reference counting uses thread-local counters ([`crate::tlrc`]) for
+//! zero cross-thread contention on clone/drop. The `TlrcInner<HeapData>`
+//! is self-hosted — allocated from the mimalloc heap it manages.
+//! On last-ref drop the heap is bulk-freed via `mi_heap_destroy`.
 //!
 //! # Thread Safety
 //!
@@ -15,11 +15,11 @@
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use allocator_api2::alloc::{AllocError, Allocator};
 
-use crate::padded::CachePadded;
+use crate::ptr::{Tlrc, TlrcRef, tlrc::TlrcInner};
 use bisque_mimalloc_sys as ffi;
 
 // Re-export for use in async contexts.
@@ -31,70 +31,13 @@ pub use allocator_api2::alloc::AllocError as HeapAllocError;
 const TEST_SMALL_ARENA: usize = 64 * 1024 * 1024; // 64 MiB
 
 // =========================================================================
-// Striped refcount (inline, no allocation)
+// HeapData — metadata for a memory-limited mimalloc heap
 // =========================================================================
 
-const NUM_STRIPES: usize = 16;
-const STRIPE_MASK: usize = NUM_STRIPES - 1;
-const CLOSED_MASK: i64 = 1 << 63;
-const VALUE_MASK: i64 = !CLOSED_MASK;
-const BIAS: i64 = 1 << 62;
-
-#[repr(C)]
-struct StripedRefCount {
-    counters: [CachePadded<AtomicI64>; NUM_STRIPES],
-    cleanup_claimed: AtomicU64,
-}
-
-impl StripedRefCount {
-    fn new() -> Self {
-        Self {
-            counters: std::array::from_fn(|_| CachePadded::new(AtomicI64::new(BIAS))),
-            cleanup_claimed: AtomicU64::new(0),
-        }
-    }
-
-    #[inline(always)]
-    fn increment(&self) {
-        self.counters[stripe_index() & STRIPE_MASK].fetch_add(1, Ordering::Release);
-    }
-
-    #[inline(always)]
-    fn decrement_and_check_closed(&self) -> bool {
-        let prev = self.counters[stripe_index() & STRIPE_MASK].fetch_sub(1, Ordering::AcqRel);
-        (prev & CLOSED_MASK) != 0
-    }
-
-    fn close_all(&self) {
-        for c in &self.counters {
-            c.fetch_or(CLOSED_MASK, Ordering::Release);
-        }
-    }
-
-    fn total(&self) -> i64 {
-        self.counters
-            .iter()
-            .map(|c| (c.load(Ordering::Acquire) & VALUE_MASK).wrapping_sub(BIAS))
-            .sum()
-    }
-
-    fn try_claim_cleanup(&self) -> bool {
-        self.cleanup_claimed
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-    }
-}
-
-// =========================================================================
-// HeapInner — metadata for a memory-limited mimalloc heap
-// =========================================================================
-
-/// Allocated via the heap itself. On last-ref drop, the heap is destroyed
-/// via `mi_heap_destroy`, which bulk-frees all pages and segments.
-#[repr(C)]
-struct HeapInner {
-    refcount: StripedRefCount,
-    mi_heap: *mut ffi::mi_heap_t,
+/// The actual heap data, stored inside a `TlrcInner<HeapData>`.
+/// Allocated from the mimalloc heap itself (self-hosted).
+pub(crate) struct HeapData {
+    pub(crate) mi_heap: *mut ffi::mi_heap_t,
     memory_limit: usize,
     /// True when at least one allocation has failed (OOM). Enables
     /// freed-byte tracking on dealloc so waiters can be notified.
@@ -108,23 +51,30 @@ struct HeapInner {
     max_waiters: usize,
 }
 
-unsafe impl Send for HeapInner {}
-unsafe impl Sync for HeapInner {}
+unsafe impl Send for HeapData {}
+unsafe impl Sync for HeapData {}
 
-/// Destroy the heap. Called exactly once when refcount reaches zero.
-/// `mi_heap_destroy` bulk-frees all pages, segments, and the heap struct itself.
-unsafe fn destroy_heap(ptr: *const HeapInner) {
+/// Custom destroy for TlrcInner<HeapData>.
+///
+/// TlrcInner<HeapData> is Box-allocated (global allocator), but HeapData's
+/// internal fields (WaitQueue slots) were allocated from the mi_heap.
+/// Sequence:
+///   1. Save mi_heap pointer
+///   2. drop_in_place — drops HeapData fields (WaitQueue Drop accesses slots)
+///   3. mi_heap_destroy — bulk-frees all mi_heap pages (including WaitQueue slots)
+///   4. dealloc — frees the TlrcInner memory (global allocator)
+unsafe fn destroy_heap(ptr: *mut TlrcInner<HeapData>) {
     unsafe {
-        let mi_heap = (*ptr).mi_heap;
-        // mi_heap_destroy frees all pages/segments and the heap struct.
-        // HeapInner was allocated from this heap, so it's freed too.
+        let data_ref = &*ptr;
+        let mi_heap = data_ref.data.mi_heap;
+        // Drop all fields first (WaitQueue needs its slots alive)
+        std::ptr::drop_in_place(ptr);
+        // Bulk-free all mi_heap allocations (WaitQueue slots, user data, etc.)
         ffi::mi_heap_destroy(mi_heap);
+        // Free the TlrcInner itself (global allocator)
+        std::alloc::dealloc(ptr as *mut u8, Layout::new::<TlrcInner<HeapData>>());
     }
 }
-
-// =========================================================================
-// Heap — the public handle
-// =========================================================================
 
 // =========================================================================
 // HeapMaster — owns the heap, not cloneable
@@ -133,9 +83,8 @@ unsafe fn destroy_heap(ptr: *const HeapInner) {
 /// Owns a memory-limited mimalloc heap. Not cloneable.
 ///
 /// Create cheap [`Heap`] handles via [`heap()`](HeapMaster::heap). The master
-/// must outlive all `Heap` clones — dropping it closes the refcount so the
-/// next `Heap` drop triggers cleanup. Keeping it alive avoids the close/check
-/// overhead on every clone drop.
+/// should outlive all `Heap` clones. When it drops, the `Tlrc` signals closing;
+/// the inner is freed when all threads have unregistered.
 ///
 /// # Examples
 ///
@@ -149,11 +98,12 @@ unsafe fn destroy_heap(ptr: *const HeapInner) {
 /// // master must outlive heap and v
 /// ```
 pub struct HeapMaster {
-    ptr: *const HeapInner,
+    /// Cached Heap handle for Deref. Created once at construction.
+    /// Drops BEFORE inner (Rust drops fields in declaration order),
+    /// so the TlrcRef's reference is released before Tlrc closes.
+    handle: Heap,
+    inner: Tlrc<HeapData>,
 }
-
-unsafe impl Send for HeapMaster {}
-unsafe impl Sync for HeapMaster {}
 
 impl HeapMaster {
     /// Default number of async waiter slots for `alloc_async`.
@@ -187,57 +137,38 @@ impl HeapMaster {
             unsafe { ffi::mi_heap_set_memory_limit(mi_heap, max_bytes) };
         }
 
-        // 3. Allocate HeapInner from the heap itself.
-        let layout = Layout::new::<HeapInner>();
-        let raw = unsafe { ffi::mi_heap_malloc_aligned(mi_heap, layout.size(), layout.align()) };
-        if raw.is_null() {
-            unsafe { ffi::mi_heap_destroy(mi_heap) };
-            return Err(AllocError);
-        }
+        // 3. Allocate TlrcInner<HeapData> from the global allocator (Box).
+        //    This ensures TlrcInner survives mi_heap_destroy, so thread-local
+        //    SlabEntries can safely reference it during TLS teardown.
+        let pressure_wq = unsafe { crate::wait_queue::WaitQueue::new_in(max_waiters, mi_heap) };
+        let inner_box = Box::new(TlrcInner::new(HeapData {
+            mi_heap,
+            memory_limit: max_bytes,
+            pressure: AtomicBool::new(false),
+            freed_since_pressure: AtomicU64::new(0),
+            pressure_wq,
+            max_waiters,
+        }));
+        let inner_ptr = Box::into_raw(inner_box);
 
-        let inner = raw as *mut HeapInner;
-        unsafe {
-            let pressure_wq = crate::wait_queue::WaitQueue::new_in(max_waiters, mi_heap);
-            std::ptr::write(
-                inner,
-                HeapInner {
-                    refcount: StripedRefCount::new(),
-                    mi_heap,
-                    memory_limit: max_bytes,
-                    pressure: AtomicBool::new(false),
-                    freed_since_pressure: AtomicU64::new(0),
-                    pressure_wq,
-                    max_waiters,
-                },
-            );
-            // The master holds one reference.
-            (*inner).refcount.increment();
-        }
-
-        Ok(Self { ptr: inner })
+        let inner = unsafe { Tlrc::from_raw(inner_ptr) };
+        let handle = Heap {
+            inner: inner.tlrc_ref(),
+        };
+        Ok(Self { inner, handle })
     }
 
     /// Create a cheap, cloneable [`Heap`] handle.
     #[inline]
     pub fn heap(&self) -> Heap {
-        let inner = unsafe { &*self.ptr };
-        inner.refcount.increment();
-        Heap { ptr: self.ptr }
+        Heap {
+            inner: self.inner.tlrc_ref(),
+        }
     }
 
     #[inline(always)]
-    fn inner(&self) -> &HeapInner {
-        unsafe { &*self.ptr }
-    }
-
-    fn try_cleanup(&self) {
-        let inner = self.inner();
-        std::sync::atomic::fence(Ordering::SeqCst);
-        let total = inner.refcount.total();
-        debug_assert!(total >= 0, "Heap refcount went negative: {total}");
-        if total == 0 && inner.refcount.try_claim_cleanup() {
-            unsafe { destroy_heap(self.ptr) };
-        }
+    fn data(&self) -> &HeapData {
+        &self.inner
     }
 }
 
@@ -246,20 +177,7 @@ impl std::ops::Deref for HeapMaster {
 
     #[inline(always)]
     fn deref(&self) -> &Heap {
-        // Safety: Heap is repr(transparent) over *const HeapInner,
-        // and &HeapMaster.ptr has the same layout as &Heap.ptr.
-        unsafe { &*(self as *const HeapMaster as *const Heap) }
-    }
-}
-
-impl Drop for HeapMaster {
-    fn drop(&mut self) {
-        let inner = self.inner();
-        // Close all stripes — subsequent Heap drops will see the closed flag.
-        inner.refcount.close_all();
-        // Decrement the master's own reference.
-        inner.refcount.counters[stripe_index() & STRIPE_MASK].fetch_sub(1, Ordering::AcqRel);
-        self.try_cleanup();
+        &self.handle
     }
 }
 
@@ -280,14 +198,10 @@ impl std::fmt::Debug for HeapMaster {
 /// Cheap, cloneable handle to a memory-limited mimalloc heap.
 ///
 /// Created from a [`HeapMaster`] via [`heap()`](HeapMaster::heap) or by
-/// cloning an existing `Heap`. Clone is a single striped atomic increment.
-///
-/// The [`HeapMaster`] that created this handle should not be dropped while
-/// `Heap` clones are still active — doing so enters "closed" mode where
-/// every `Heap` drop must check the total refcount (slower).
-#[repr(transparent)]
+/// cloning an existing `Heap`. Clone uses thread-local reference counting
+/// with zero cross-thread contention.
 pub struct Heap {
-    ptr: *const HeapInner,
+    inner: TlrcRef<HeapData>,
 }
 
 unsafe impl Send for Heap {}
@@ -295,20 +209,20 @@ unsafe impl Sync for Heap {}
 
 impl Heap {
     #[inline(always)]
-    fn inner(&self) -> &HeapInner {
-        unsafe { &*self.ptr }
+    pub(crate) fn data(&self) -> &HeapData {
+        &self.inner
     }
 
     /// Memory limit in bytes (0 = unlimited).
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.inner().memory_limit
+        self.data().memory_limit
     }
 
     /// Current memory usage in bytes (tracked at 64 KiB slice granularity).
     #[inline]
     pub fn memory_usage(&self) -> usize {
-        unsafe { ffi::mi_heap_get_memory_usage(self.inner().mi_heap) }
+        unsafe { ffi::mi_heap_get_memory_usage(self.data().mi_heap) }
     }
 
     /// Allocate `size` bytes with the given alignment. Returns null on OOM.
@@ -317,7 +231,7 @@ impl Heap {
         if size == 0 {
             return align as *mut u8;
         }
-        let heap = self.inner().mi_heap;
+        let heap = self.data().mi_heap;
         if align <= core::mem::size_of::<usize>() {
             unsafe { ffi::mi_heap_malloc(heap, size) as *mut u8 }
         } else {
@@ -331,7 +245,7 @@ impl Heap {
         if size == 0 {
             return align as *mut u8;
         }
-        unsafe { ffi::mi_heap_zalloc_aligned(self.inner().mi_heap, size, align) as *mut u8 }
+        unsafe { ffi::mi_heap_zalloc_aligned(self.data().mi_heap, size, align) as *mut u8 }
     }
 
     /// Reallocate. Returns null on OOM (original pointer is NOT freed).
@@ -342,7 +256,7 @@ impl Heap {
     pub unsafe fn realloc(&self, ptr: *mut u8, new_size: usize, align: usize) -> *mut u8 {
         unsafe {
             ffi::mi_heap_realloc_aligned(
-                self.inner().mi_heap,
+                self.data().mi_heap,
                 ptr as *mut core::ffi::c_void,
                 new_size,
                 align,
@@ -359,7 +273,7 @@ impl Heap {
     /// `ptr` must have been allocated by mimalloc.
     #[inline]
     pub unsafe fn dealloc(&self, ptr: *mut u8) {
-        Self::free_with_pressure(self.inner(), ptr);
+        Self::free_with_pressure(self.data(), ptr);
     }
 
     /// Free a pointer with pressure notification. Used by all drop paths
@@ -369,7 +283,7 @@ impl Heap {
     /// # Safety
     /// `ptr` must have been allocated by mimalloc.
     #[inline]
-    pub(crate) unsafe fn free_with_pressure(inner: &HeapInner, ptr: *mut u8) {
+    pub(crate) unsafe fn free_with_pressure(inner: &HeapData, ptr: *mut u8) {
         if inner.pressure.load(Ordering::Relaxed) {
             let freed = unsafe { ffi::mi_usable_size(ptr as *const core::ffi::c_void) };
             inner
@@ -403,7 +317,7 @@ impl Heap {
         }
 
         // Enter pressure mode — start tracking frees.
-        let inner = self.inner();
+        let inner = self.data();
         inner.pressure.store(true, Ordering::Release);
         inner.freed_since_pressure.store(0, Ordering::Relaxed);
 
@@ -431,7 +345,7 @@ impl Heap {
 
     /// Check if pressure mode should be exited (no more waiters).
     fn try_exit_pressure(&self) {
-        let inner = self.inner();
+        let inner = self.data();
         if !inner.pressure_wq.has_waiters() {
             inner.pressure.store(false, Ordering::Release);
             inner.freed_since_pressure.store(0, Ordering::Relaxed);
@@ -441,18 +355,18 @@ impl Heap {
     /// Returns true if the heap is currently in memory pressure mode.
     #[inline]
     pub fn is_under_pressure(&self) -> bool {
-        self.inner().pressure.load(Ordering::Relaxed)
+        self.data().pressure.load(Ordering::Relaxed)
     }
 
     /// Maximum number of concurrent async waiters for this heap.
     #[inline]
     pub fn max_waiters(&self) -> usize {
-        self.inner().max_waiters
+        self.data().max_waiters
     }
 
     /// Release thread-local caches and deferred free blocks.
     pub fn collect(&self, force: bool) {
-        unsafe { ffi::mi_heap_collect(self.inner().mi_heap, force) }
+        unsafe { ffi::mi_heap_collect(self.data().mi_heap, force) }
     }
 
     /// Walk live blocks. Returns `(committed_bytes, used_block_count)`.
@@ -485,7 +399,7 @@ impl Heap {
         };
         unsafe {
             ffi::mi_heap_visit_blocks(
-                self.inner().mi_heap,
+                self.data().mi_heap,
                 false,
                 Some(visitor),
                 &mut acc as *mut Acc as *mut core::ffi::c_void,
@@ -497,35 +411,17 @@ impl Heap {
     /// Raw `mi_heap_t` pointer. Do not destroy or delete.
     #[inline]
     pub unsafe fn raw(&self) -> *mut ffi::mi_heap_t {
-        self.inner().mi_heap
-    }
-
-    fn try_cleanup(&self) {
-        let inner = self.inner();
-        std::sync::atomic::fence(Ordering::SeqCst);
-        let total = inner.refcount.total();
-        debug_assert!(total >= 0, "Heap refcount went negative: {total}");
-        if total == 0 && inner.refcount.try_claim_cleanup() {
-            unsafe { destroy_heap(self.ptr) };
-        }
+        self.data().mi_heap
     }
 }
+
+// Clone and Drop are handled by TlrcRef<HeapData> inside Heap.
 
 impl Clone for Heap {
     #[inline]
     fn clone(&self) -> Self {
-        self.inner().refcount.increment();
-        Self { ptr: self.ptr }
-    }
-}
-
-impl Drop for Heap {
-    fn drop(&mut self) {
-        let inner = self.inner();
-        if inner.refcount.decrement_and_check_closed() {
-            // Master already dropped — check if we're the last reference.
-            inner.refcount.close_all();
-            self.try_cleanup();
+        Self {
+            inner: self.inner.clone(),
         }
     }
 }
@@ -577,7 +473,7 @@ unsafe impl Allocator for Heap {
         }
         let p = unsafe {
             ffi::mi_heap_realloc_aligned(
-                self.inner().mi_heap,
+                self.data().mi_heap,
                 ptr.as_ptr() as *mut _,
                 new.size(),
                 new.align(),
@@ -605,7 +501,7 @@ unsafe impl Allocator for Heap {
         }
         let p = unsafe {
             ffi::mi_heap_realloc_aligned(
-                self.inner().mi_heap,
+                self.data().mi_heap,
                 ptr.as_ptr() as *mut _,
                 new.size(),
                 new.align(),
@@ -641,24 +537,6 @@ pub fn process_memory_info() -> (usize, usize) {
         )
     }
     (rss, c)
-}
-
-// =========================================================================
-// Thread stripe index
-// =========================================================================
-
-#[inline]
-fn stripe_index() -> usize {
-    use std::hash::{Hash, Hasher};
-    thread_local! {
-        static STRIPE: usize = {
-            let id = std::thread::current().id();
-            let mut hasher = std::hash::DefaultHasher::new();
-            id.hash(&mut hasher);
-            hasher.finish() as usize
-        };
-    }
-    STRIPE.with(|s| *s)
 }
 
 // =========================================================================
@@ -738,6 +616,38 @@ mod tests {
             let _ = heap.alloc(512, 8);
         }
         drop(heap);
+    }
+
+    /// Verify mimalloc can handle a large number of concurrent heaps.
+    /// Each heap allocates, uses, and frees memory independently.
+    #[test]
+    fn heap_100k_heaps() {
+        const NUM_HEAPS: usize = 100_000;
+        const LIMIT: usize = 0; // unlimited — we only care about heap count, not memory
+
+        // Create and destroy heaps in batches to avoid holding 100K heaps simultaneously
+        // (which would consume too much memory). Batches of 1000 prove that mimalloc's
+        // internal heap tracking can handle high churn.
+        let mut total_created = 0usize;
+        while total_created < NUM_HEAPS {
+            let batch = (NUM_HEAPS - total_created).min(1000);
+            let mut masters: Vec<HeapMaster> = Vec::with_capacity(batch);
+            for _ in 0..batch {
+                let m = HeapMaster::new(LIMIT).unwrap();
+                // Allocate and free one block to exercise the full path.
+                let p = m.alloc(128, 8);
+                assert!(
+                    !p.is_null(),
+                    "alloc failed on heap #{}",
+                    total_created + masters.len()
+                );
+                unsafe { m.dealloc(p) };
+                masters.push(m);
+            }
+            total_created += batch;
+            // All masters drop here, freeing the heaps.
+        }
+        assert_eq!(total_created, NUM_HEAPS);
     }
 
     #[test]

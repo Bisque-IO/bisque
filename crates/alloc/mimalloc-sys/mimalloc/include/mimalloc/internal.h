@@ -257,6 +257,7 @@ void        _mi_deferred_free(mi_heap_t* heap, bool force);
 
 void        _mi_page_free_collect(mi_page_t* page,bool force);
 bool        _mi_page_reclaim(mi_heap_t* heap, mi_page_t* page);   // callback from segments; returns false if heap memory limit reached
+void        _mi_page_unclaim(mi_page_t* page);                    // undo a reclaim: remove from heap queue and return to abandoned state
 
 size_t      _mi_page_stats_bin(const mi_page_t* page); // for stats
 size_t      _mi_bin_size(size_t bin);                  // for stats

@@ -237,9 +237,7 @@ static void mi_page_queue_remove(mi_page_queue_t* queue, mi_page_t* page) {
   }
   heap->page_count--;
   #if defined(MI_HEAP_MEMLIMIT)
-  if (heap->memory_limit > 0) {
-    mi_atomic_subi(&heap->memory_usage, (intptr_t)((size_t)page->slice_count * MI_SEGMENT_SLICE_SIZE));
-  }
+  mi_atomic_subi(&heap->memory_usage, (intptr_t)((size_t)page->slice_count * MI_SEGMENT_SLICE_SIZE));
   #endif
   page->next = NULL;
   page->prev = NULL;
@@ -261,18 +259,23 @@ static bool mi_page_queue_push(mi_heap_t* heap, mi_page_queue_t* queue, mi_page_
                         (mi_page_is_in_full(page) && mi_page_queue_is_full(queue)));
 
   #if defined(MI_HEAP_MEMLIMIT)
-  // Atomically reserve the exact page memory using a CAS loop.
-  // This guarantees memory_usage never exceeds memory_limit at any point in time.
-  if mi_unlikely(heap->memory_limit > 0) {
+  // Always track usage so memory_usage stays accurate even before a limit is set.
+  {
     const intptr_t page_mem = (intptr_t)((size_t)page->slice_count * MI_SEGMENT_SLICE_SIZE);
-    intptr_t current = mi_atomic_load_relaxed(&heap->memory_usage);
-    intptr_t desired;
-    do {
-      if (current + page_mem > (intptr_t)heap->memory_limit) {
-        return false;  // would exceed limit
-      }
-      desired = current + page_mem;
-    } while (!mi_atomic_cas_weak((_Atomic(intptr_t)*)&heap->memory_usage, &current, desired, mi_memory_order(acq_rel), mi_memory_order(acquire)));
+    if mi_unlikely(heap->memory_limit > 0) {
+      // Atomically reserve the exact page memory using a CAS loop.
+      intptr_t current = mi_atomic_load_relaxed(&heap->memory_usage);
+      intptr_t desired;
+      do {
+        if (current + page_mem > (intptr_t)heap->memory_limit) {
+          return false;  // would exceed limit
+        }
+        desired = current + page_mem;
+      } while (!mi_atomic_cas_weak((_Atomic(intptr_t)*)&heap->memory_usage, &current, desired, mi_memory_order(acq_rel), mi_memory_order(acquire)));
+    }
+    else {
+      mi_atomic_addi(&heap->memory_usage, page_mem);
+    }
   }
   #endif
 

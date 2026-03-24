@@ -82,6 +82,7 @@ impl WakerSlot {
 
     /// Reset slot from NOTIFIED back to REGISTERED for re-waiting.
     #[inline]
+    #[allow(dead_code)]
     fn reset_for_reuse(&self) {
         self.state.store(SLOT_REGISTERED, Ordering::Release);
     }

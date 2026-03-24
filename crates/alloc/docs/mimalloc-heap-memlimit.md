@@ -400,6 +400,29 @@ releases everything.
 
 ---
 
+## Tracking Trace
+
+page-heap association:
+
+| Path | Increments `memory_usage` | Decrements `memory_usage` | Status |
+|---|---|---|---|
+| `mi_page_queue_push` | CAS or atomic add | — | ✓ |
+| `mi_page_queue_remove` | — | atomic sub | ✓ |
+| `_mi_page_reclaim` → push | ✓ via push | — | ✓ |
+| `_mi_page_abandon` → remove | — | ✓ via remove | ✓ |
+| `_mi_page_free` → remove | — | ✓ via remove | ✓ |
+| `_mi_page_force_abandon` → abandon/free | — | ✓ via remove | ✓ |
+| `_mi_page_unclaim` → remove | — | ✓ via remove | ✓ |
+| `mi_page_fresh_alloc` → push | ✓ via push | release on fail | ✓ |
+| `_mi_heap_page_destroy` (bypasses remove) | — | explicit sub | ✓ |
+| `mi_heap_reset_pages` | — | zeroes to 0 | ✓ |
+| `mi_heap_absorb` → `_mi_page_queue_append` | transfers from→heap | zeroed by reset_pages | ✓ |
+| `mi_heap_delete` with limit breach | — | abandon path | ✓ |
+| `mi_segment_reclaim` rollback | — | 4-phase rollback | ✓ |
+| Intra-heap moves (full↔regular) | no change needed | no change needed | ✓ |
+| Huge pages (`MI_HUGE_PAGE_ABANDON` disabled) | ✓ via push | ✓ via remove | ✓ |
+| `mi_heap_set_memory_limit` after allocs | usage already accurate | — | ✓ |
+
 ## Usage Example (C)
 
 ```c

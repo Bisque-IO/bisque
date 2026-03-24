@@ -294,6 +294,9 @@ static void mi_heap_reset_pages(mi_heap_t* heap) {
   _mi_memcpy_aligned(&heap->pages, &_mi_heap_empty.pages, sizeof(heap->pages));
   heap->thread_delayed_free = NULL;
   heap->page_count = 0;
+  #if defined(MI_HEAP_MEMLIMIT)
+  mi_atomic_store_relaxed(&heap->memory_usage, 0);
+  #endif
 }
 
 // called from `mi_heap_destroy` and `mi_heap_delete` to free the internal heap resources.
@@ -382,6 +385,9 @@ static bool _mi_heap_page_destroy(mi_heap_t* heap, mi_page_queue_t* pq, mi_page_
 
   // and free the page
   // mi_page_free(page,false);
+  #if defined(MI_HEAP_MEMLIMIT)
+  mi_atomic_subi(&heap->memory_usage, (intptr_t)((size_t)page->slice_count * MI_SEGMENT_SLICE_SIZE));
+  #endif
   page->next = NULL;
   page->prev = NULL;
   _mi_segment_page_free(page,false /* no force? */, &heap->tld->segments);
@@ -471,17 +477,6 @@ static void mi_heap_absorb(mi_heap_t* heap, mi_heap_t* from) {
     from->page_count -= pcount;
   }
   mi_assert_internal(from->page_count == 0);
-
-  #if defined(MI_HEAP_MEMLIMIT)
-  // Transfer memory accounting from the absorbed heap
-  if (from->memory_limit > 0 || heap->memory_limit > 0) {
-    const intptr_t from_usage = mi_atomic_load_relaxed(&from->memory_usage);
-    if (from_usage > 0) {
-      mi_atomic_addi(&heap->memory_usage, from_usage);
-      mi_atomic_subi(&from->memory_usage, from_usage);
-    }
-  }
-  #endif
 
   // and do outstanding delayed frees in the `from` heap
   // note: be careful here as the `heap` field in all those pages no longer point to `from`,

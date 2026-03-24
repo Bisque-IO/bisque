@@ -11,24 +11,24 @@
 Benchmark: Clone/Drop
 ==============================================================================
 
-┌─────────┬────────────┬───────────┬─────────┬────────────┐
-│ Threads ┆ StripedArc ┆ std::Arc  ┆ Speedup ┆ Winner     │
-│         ┆ (ops/sec)  ┆ (ops/sec) ┆         ┆            │
-╞═════════╪════════════╪═══════════╪═════════╪════════════╡
-│ 1       ┆ 211.88M    ┆ 195.72M   ┆ 1.08x   ┆ StripedArc │
-├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ 2       ┆ 427.87M    ┆ 87.63M    ┆ 4.88x   ┆ StripedArc │
-├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ 4       ┆ 820.53M    ┆ 87.52M    ┆ 9.38x   ┆ StripedArc │
-├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ 8       ┆ 1.52B      ┆ 66.89M    ┆ 22.77x  ┆ StripedArc │
-├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ 10      ┆ 1.80B      ┆ 65.79M    ┆ 27.42x  ┆ StripedArc │
-├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ 12      ┆ 1.69B      ┆ 50.03M    ┆ 33.78x  ┆ StripedArc │
-├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ 14      ┆ 2.32B      ┆ 41.20M    ┆ 56.27x  ┆ StripedArc │
-└─────────┴────────────┴───────────┴─────────┴────────────┘
+┌─────────┬────────────┬───────────┬───────────┬───────────┬──────────┐
+│ Threads ┆ StripedArc ┆ TlrcArc   ┆ EpochPtr  ┆ std::Arc  ┆ Winner   │
+│         ┆ (ops/sec)  ┆ (ops/sec) ┆ (ops/sec) ┆ (ops/sec) ┆          │
+╞═════════╪════════════╪═══════════╪═══════════╪═══════════╪══════════╡
+│ 1       ┆ 205.88M    ┆ 609.52M   ┆ 8.87B     ┆ 188.98M   ┆ EpochPtr │
+├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
+│ 2       ┆ 377.58M    ┆ 1.18B     ┆ 7.77B     ┆ 96.52M    ┆ EpochPtr │
+├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
+│ 4       ┆ 470.43M    ┆ 1.58B     ┆ 21.51B    ┆ 85.06M    ┆ EpochPtr │
+├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
+│ 8       ┆ 1.18B      ┆ 3.37B     ┆ 13.95B    ┆ 62.68M    ┆ EpochPtr │
+├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
+│ 10      ┆ 239.79M    ┆ 2.74B     ┆ 16.57B    ┆ 61.33M    ┆ EpochPtr │
+├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
+│ 12      ┆ 482.75M    ┆ 4.42B     ┆ 14.50B    ┆ 53.52M    ┆ EpochPtr │
+├╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
+│ 14      ┆ 560.68M    ┆ 3.11B     ┆ 9.66B     ┆ 40.55M    ┆ EpochPtr │
+└─────────┴────────────┴───────────┴───────────┴───────────┴──────────┘
 */
 
 use comfy_table::{
@@ -39,6 +39,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bisque_alloc::EpochBox;
+use bisque_alloc::Tlrc;
+use bisque_alloc::ptr::epoch;
 use bisque_alloc::striped::StripedArc;
 
 #[cfg(target_os = "linux")]
@@ -137,9 +140,10 @@ fn benchmark_clone_drop_striped_arc(num_threads: usize, iterations_per_thread: u
         handles.push(thread::spawn(move || {
             set_cpu_affinity(_i as usize);
             for _ in 0..iterations_per_thread {
-                let _arc = arc_clone.clone();
-                // Force drop to happen
-                drop(_arc);
+                let c = arc_clone.clone();
+                // Read the underlying data to capture cache effects
+                std::hint::black_box(&c.value);
+                drop(c);
             }
         }));
     }
@@ -196,9 +200,10 @@ fn benchmark_clone_drop_std_arc(num_threads: usize, iterations_per_thread: usize
         handles.push(thread::spawn(move || {
             set_cpu_affinity(_i as usize);
             for _ in 0..iterations_per_thread {
-                let _arc = arc_clone.clone();
-                // Force drop to happen
-                drop(_arc);
+                let c = arc_clone.clone();
+                // Read the underlying data to capture cache effects
+                std::hint::black_box(&c.value);
+                drop(c);
             }
         }));
     }
@@ -222,6 +227,127 @@ fn benchmark_clone_drop_std_arc(num_threads: usize, iterations_per_thread: usize
     record_result(BenchmarkResult {
         benchmark_name: "Clone/Drop".to_string(),
         implementation: "std::Arc".to_string(),
+        threads: num_threads,
+        ops_per_sec,
+        duration_ms: duration.as_secs_f64() * 1000.0,
+        total_ops: total_ops as f64,
+    });
+}
+
+fn benchmark_clone_drop_tlrc_arc(num_threads: usize, iterations_per_thread: usize) {
+    println!("\n=== TlrcArc Clone/Drop ===");
+    println!(
+        "Threads: {}, Iterations per thread: {}",
+        num_threads, iterations_per_thread
+    );
+    println!(
+        "Total operations: {}",
+        humanize_number((num_threads * iterations_per_thread) as f64)
+    );
+
+    let owner = Tlrc::new(TestData::default());
+
+    // Warmup
+    for _ in 0..1000 {
+        let _ = owner.tlrc_ref();
+    }
+
+    let mut handles = vec![];
+    let start = Instant::now();
+
+    for _i in 0..num_threads {
+        let arc_clone = owner.tlrc_ref();
+        handles.push(thread::spawn(move || {
+            set_cpu_affinity(_i as usize);
+            for _ in 0..iterations_per_thread {
+                let c = arc_clone.clone();
+                // Read the underlying data to capture cache effects
+                std::hint::black_box(&c.value);
+                drop(c);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let duration = start.elapsed();
+    let total_ops = num_threads * iterations_per_thread * 2; // clone + drop
+    let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
+
+    println!("Duration: {:?}", duration);
+    println!("Throughput: {}", humanize_number(ops_per_sec) + " ops/sec");
+    println!(
+        "Per thread: {}",
+        humanize_number((iterations_per_thread * 2) as f64 / duration.as_secs_f64())
+            + " ops/thread/sec"
+    );
+
+    record_result(BenchmarkResult {
+        benchmark_name: "Clone/Drop".to_string(),
+        implementation: "TlrcArc".to_string(),
+        threads: num_threads,
+        ops_per_sec,
+        duration_ms: duration.as_secs_f64() * 1000.0,
+        total_ops: total_ops as f64,
+    });
+}
+
+fn benchmark_clone_drop_epoch_ptr(num_threads: usize, iterations_per_thread: usize) {
+    println!("\n=== EpochPtr Clone/Drop ===");
+    println!(
+        "Threads: {}, Iterations per thread: {}",
+        num_threads, iterations_per_thread
+    );
+    println!(
+        "Total operations: {}",
+        humanize_number((num_threads * iterations_per_thread) as f64)
+    );
+
+    let owner = EpochBox::new(TestData::default());
+
+    // Warmup
+    for _ in 0..1000 {
+        let _ = owner.epoch_ref();
+    }
+
+    let mut handles = vec![];
+    let start = Instant::now();
+
+    for _i in 0..num_threads {
+        let r = owner.epoch_ref();
+        handles.push(thread::spawn(move || {
+            set_cpu_affinity(_i as usize);
+            let guard = epoch::collector().enter();
+            for _ in 0..iterations_per_thread {
+                let h = r; // Copy — zero cost
+                // Read the underlying data through the epoch guard
+                std::hint::black_box(&h.load(&guard).value);
+                drop(h);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let duration = start.elapsed();
+    let total_ops = num_threads * iterations_per_thread * 2; // clone + drop
+    let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
+
+    println!("Duration: {:?}", duration);
+    println!("Throughput: {}", humanize_number(ops_per_sec) + " ops/sec");
+    println!(
+        "Per thread: {}",
+        humanize_number((iterations_per_thread * 2) as f64 / duration.as_secs_f64())
+            + " ops/thread/sec"
+    );
+
+    record_result(BenchmarkResult {
+        benchmark_name: "Clone/Drop".to_string(),
+        implementation: "EpochPtr".to_string(),
         threads: num_threads,
         ops_per_sec,
         duration_ms: duration.as_secs_f64() * 1000.0,
@@ -717,6 +843,8 @@ fn main() {
 
         println!("\n--- {} threads ---", num_threads);
         benchmark_clone_drop_striped_arc(num_threads, iters);
+        benchmark_clone_drop_tlrc_arc(num_threads, iters);
+        benchmark_clone_drop_epoch_ptr(num_threads, iters);
         benchmark_clone_drop_std_arc(num_threads, iters);
     }
 
@@ -768,7 +896,7 @@ fn main() {
     // SUMMARY
     // =========================================================================
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!("║  BENCHMARK COMPLETE                                          ║");
+    println!("║  BENCHMARK COMPLETE                                           ║");
     println!("╚═══════════════════════════════════════════════════════════════╝");
     println!("\nKey observations to look for:");
     println!("  • StripedArc should outperform std::Arc under high contention");
@@ -817,139 +945,126 @@ fn print_benchmark_table(benchmark_name: &str, results: &[&BenchmarkResult]) {
         return;
     }
 
-    println!("\n{}", "=".repeat(78));
+    println!("\n{}", "=".repeat(90));
     println!("Benchmark: {}", benchmark_name);
-    println!("{}", "=".repeat(78));
+    println!("{}", "=".repeat(90));
     println!();
+
+    let impls = ["StripedArc", "TlrcArc", "EpochPtr", "std::Arc"];
 
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            "Threads",
-            "StripedArc\n(ops/sec)",
-            "std::Arc\n(ops/sec)",
-            "Speedup",
-            "Winner",
-        ]);
+        .set_content_arrangement(ContentArrangement::Dynamic);
 
-    // Group by thread count
+    let mut header: Vec<String> = vec!["Threads".into()];
+    for name in &impls {
+        header.push(format!("{}\n(ops/sec)", name));
+    }
+    header.push("Winner".into());
+    table.set_header(header);
+
     let thread_counts: std::collections::BTreeSet<_> = results.iter().map(|r| r.threads).collect();
 
     for thread_count in &thread_counts {
-        let striped_result = results
+        let ops: Vec<f64> = impls
             .iter()
-            .find(|r| r.threads == *thread_count && r.implementation == "StripedArc");
-        let std_result = results
-            .iter()
-            .find(|r| r.threads == *thread_count && r.implementation == "std::Arc");
+            .map(|name| {
+                results
+                    .iter()
+                    .find(|r| r.threads == *thread_count && r.implementation == *name)
+                    .map(|r| r.ops_per_sec)
+                    .unwrap_or(0.0)
+            })
+            .collect();
 
-        match (striped_result, std_result) {
-            (Some(sa), Some(arc)) => {
-                let sa_ops = humanize_number(sa.ops_per_sec);
-                let arc_ops = humanize_number(arc.ops_per_sec);
-                let speedup = if arc.ops_per_sec > 0.0 {
-                    format!("{:.2}x", sa.ops_per_sec / arc.ops_per_sec)
-                } else {
-                    "-".to_string()
-                };
-                let winner = if sa.ops_per_sec > arc.ops_per_sec {
-                    "StripedArc".to_string()
-                } else if arc.ops_per_sec > sa.ops_per_sec {
-                    "std::Arc".to_string()
-                } else {
-                    "Tie".to_string()
-                };
+        let best = ops.iter().cloned().fold(0.0f64, f64::max);
+        let winner = if best == 0.0 {
+            "-".to_string()
+        } else {
+            impls
+                .iter()
+                .zip(&ops)
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(name, _)| name.to_string())
+                .unwrap_or("-".into())
+        };
 
-                table.add_row(vec![
-                    thread_count.to_string(),
-                    sa_ops,
-                    arc_ops,
-                    speedup,
-                    winner,
-                ]);
+        let fmt = |v: f64| {
+            if v > 0.0 {
+                humanize_number(v)
+            } else {
+                "-".to_string()
             }
-            (Some(sa), None) => {
-                table.add_row(vec![
-                    thread_count.to_string(),
-                    humanize_number(sa.ops_per_sec),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                ]);
-            }
-            (None, Some(arc)) => {
-                table.add_row(vec![
-                    thread_count.to_string(),
-                    "-".to_string(),
-                    humanize_number(arc.ops_per_sec),
-                    "-".to_string(),
-                    "-".to_string(),
-                ]);
-            }
-            _ => {}
+        };
+
+        let mut row: Vec<String> = vec![thread_count.to_string()];
+        for &v in &ops {
+            row.push(fmt(v));
         }
+        row.push(winner);
+        table.add_row(row);
     }
 
     println!("{}", table);
 }
 
 fn print_comparison_table(results: &[&BenchmarkResult]) {
-    println!("\n{}", "=".repeat(78));
+    println!("\n{}", "=".repeat(90));
     println!("Overall Performance Summary");
-    println!("{}", "=".repeat(78));
+    println!("{}", "=".repeat(90));
     println!();
+
+    let impls = ["StripedArc", "TlrcArc", "EpochPtr", "std::Arc"];
 
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["Benchmark", "StripedArc", "std::Arc", "Best\nThreads"]);
+        .set_content_arrangement(ContentArrangement::Dynamic);
+
+    let mut header: Vec<String> = vec!["Benchmark".into()];
+    for name in &impls {
+        header.push(name.to_string());
+    }
+    header.push("Winner".into());
+    table.set_header(header);
 
     let benchmarks = ["Clone/Drop", "Read-Heavy", "Burst"];
 
     for benchmark in benchmarks {
-        let sa_results: Vec<_> = results
-            .iter()
-            .filter(|r| r.benchmark_name == benchmark && r.implementation == "StripedArc")
-            .collect();
-        let arc_results: Vec<_> = results
-            .iter()
-            .filter(|r| r.benchmark_name == benchmark && r.implementation == "std::Arc")
-            .collect();
+        let best_of = |impl_name: &str| -> Option<f64> {
+            results
+                .iter()
+                .filter(|r| r.benchmark_name == benchmark && r.implementation == impl_name)
+                .map(|r| r.ops_per_sec)
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+        };
 
-        let best_sa = sa_results
-            .iter()
-            .max_by(|a, b| a.ops_per_sec.partial_cmp(&b.ops_per_sec).unwrap());
-        let best_arc = arc_results
-            .iter()
-            .max_by(|a, b| a.ops_per_sec.partial_cmp(&b.ops_per_sec).unwrap());
+        let vals: Vec<(&str, Option<f64>)> = impls.iter().map(|n| (*n, best_of(n))).collect();
 
-        match (best_sa, best_arc) {
-            (Some(sa), Some(arc)) => {
-                let winner = if sa.ops_per_sec > arc.ops_per_sec {
-                    "StripedArc".to_string()
-                } else {
-                    "std::Arc".to_string()
-                };
+        if vals.iter().any(|(_, v)| v.is_some()) {
+            let winner = vals
+                .iter()
+                .max_by(|a, b| a.1.unwrap_or(0.0).partial_cmp(&b.1.unwrap_or(0.0)).unwrap())
+                .map(|(name, _)| name.to_string())
+                .unwrap_or("-".into());
 
-                table.add_row(vec![
-                    benchmark.to_string(),
-                    humanize_number(sa.ops_per_sec),
-                    humanize_number(arc.ops_per_sec),
-                    winner,
-                ]);
+            let fmt = |v: Option<f64>| v.map(humanize_number).unwrap_or("-".into());
+
+            let mut row: Vec<String> = vec![benchmark.to_string()];
+            for (_, v) in &vals {
+                row.push(fmt(*v));
             }
-            _ => {}
+            row.push(winner);
+            table.add_row(row);
         }
     }
 
     println!("{}", table);
 
-    println!("\n📊 Key Insights:");
-    println!("   • Speedup > 1.0x: StripedArc wins");
-    println!("   • Speedup < 1.0x: std::Arc wins");
-    println!("   • Look for trends as thread count increases");
-    println!("   • StripedArc should improve relative performance with more threads");
+    println!("\nKey Insights:");
+    println!("   - TlrcArc: per-thread counters, zero contention, shared ownership");
+    println!("   - EpochPtr: zero-cost clone/drop (no atomics), single owner only");
+    println!("   - StripedArc: distributes refcount across cache lines, direct Deref");
+    println!("   - std::Arc: single contended refcount, direct Deref");
 }
