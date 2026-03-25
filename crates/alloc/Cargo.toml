@@ -6,10 +6,14 @@ description = "Per-group heap memory allocation for bisque multi-tenant workload
 license = "MIT"
 
 [dependencies]
+arc-swap = "1"
 bisque-mimalloc-sys = { path = "mimalloc-sys" }
 bytes = "1"
+congee = "0.4"
+crossbeam-epoch = "0.9"
 hashbrown = "0.15"
 allocator-api2 = "0.2"
+num-traits = "0.2"
 parking_lot = "0.12"
 seize = "0.5"
 
@@ -19,6 +23,35 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Memory"] }
 
+[[example]]
+name = "rart-bench"
+path = "examples/rart/bench.rs"
+
+[[example]]
+name = "rart-pub-bench"
+path = "examples/rart/pub_bench.rs"
+
+[[example]]
+name = "rart-alloc-cost"
+path = "examples/rart/alloc_count.rs"
+
+[[example]]
+name = "rart-cow-arc"
+path = "examples/rart/cow_arc_bench.rs"
+
 [dev-dependencies]
 comfy-table = { version = "7.2" }
+congee = "0.4"
+dashmap = "6"
+papaya = "0.2"
+rand = "0.9"
+scc = "3.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+[[example]]
+name = "rart-cow-snap"
+path = "examples/rart/cow_nosnapshot.rs"
+
+[[example]]
+name = "rart-art-cmp"
+path = "examples/rart/art_cmp.rs"

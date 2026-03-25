@@ -31,20 +31,34 @@
 //! m.try_insert("key".into(), 42).unwrap();
 //! ```
 
+pub mod arc;
+pub mod boxed;
 pub mod bytes;
 pub mod collections;
+pub mod epoch;
 pub mod heap;
-mod os_mmap;
 pub mod padded;
-pub mod ptr;
+pub mod string;
 pub mod striped;
+pub mod tlrc;
+pub mod vec;
 pub mod wait_queue;
 
+pub use arc::HeapArc;
+pub use boxed::HeapBox;
+pub use bytes::{Bytes, BytesMut};
+pub use collections::{HashMap, HashSet, art::Art, art::Guard};
+pub use epoch::{EpochBox, EpochRef};
 pub use heap::{Heap, HeapMaster};
-pub use ptr::{EpochBox, EpochRef, HeapArc, HeapBox, Tlrc, TlrcRef};
+pub use padded::CachePadded;
+pub use string::String;
+pub use tlrc::{Tlrc, TlrcRef};
+pub use vec::Vec;
 
-/// Alias for [`collections::Vec`] (heap-backed byte buffer).
-pub type HeapVec = collections::Vec;
+pub type HeapBytes = bytes::Bytes;
+pub type HeapBytesMut = bytes::BytesMut;
+pub type HeapString = string::String;
+pub type HeapVec = vec::Vec;
 
 /// Re-export the mimalloc global allocator for use as `#[global_allocator]`.
 pub use bisque_mimalloc_sys::MiMalloc;

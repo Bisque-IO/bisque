@@ -9,11 +9,21 @@ use allocator_api2::alloc::AllocError;
 
 /// Layout: [refcount: AtomicUsize] [value: T]
 /// Stored in a single heap allocation.
+///
+/// The high bit of `refcount` (bit 63) is the **slab flag**: if set, this
+/// allocation lives inside a slab page and must NOT be individually freed
+/// via `heap.dealloc()`. The slab page is freed when the heap is destroyed.
+/// The actual reference count is in the lower 63 bits.
 #[repr(C)]
-struct HeapArcInner<T> {
-    refcount: AtomicUsize,
-    value: T,
+pub(crate) struct HeapArcInner<T> {
+    pub(crate) refcount: AtomicUsize,
+    pub(crate) value: T,
 }
+
+/// Bit mask for the slab-allocated flag in the refcount field.
+const SLAB_FLAG: usize = 1 << (usize::BITS - 1); // bit 63
+/// Mask to extract the actual refcount (lower 63 bits).
+const REFCOUNT_MASK: usize = !SLAB_FLAG;
 
 /// A thread-safe, atomically reference-counted pointer allocated from a [`Heap`].
 ///
@@ -68,10 +78,24 @@ impl<T> HeapArc<T> {
         })
     }
 
+    /// Construct a `HeapArc` from a raw `HeapArcInner` pointer and a `Heap`.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must point to a valid, initialized `HeapArcInner<T>` with
+    ///   refcount already set (typically to 1).
+    /// - `heap` must be able to deallocate `ptr` when the refcount drops to 0.
+    /// - The caller must not use `ptr` after this call except through the
+    ///   returned `HeapArc`.
+    #[inline]
+    pub unsafe fn from_raw_parts(ptr: *mut HeapArcInner<T>, heap: Heap) -> Self {
+        Self { ptr, heap }
+    }
+
     /// Returns the number of strong references to this value.
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
-        unsafe { (*this.ptr).refcount.load(Ordering::Acquire) }
+        unsafe { (*this.ptr).refcount.load(Ordering::Acquire) & REFCOUNT_MASK }
     }
 
     /// Returns a reference to the underlying heap.
@@ -80,13 +104,34 @@ impl<T> HeapArc<T> {
         &this.heap
     }
 
+    /// Returns a mutable reference to the inner value if this is the only
+    /// reference (strong count == 1). Returns `None` otherwise.
+    ///
+    /// This is the `HeapArc` equivalent of [`std::sync::Arc::get_mut`].
+    #[inline]
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        let rc = unsafe { (*this.ptr).refcount.load(Ordering::Acquire) };
+        if rc & REFCOUNT_MASK == 1 {
+            // We are the sole owner — safe to hand out &mut.
+            // Acquire fence above synchronizes with the Release in other drops.
+            Some(unsafe { &mut (*this.ptr).value })
+        } else {
+            None
+        }
+    }
+
     /// Try to unwrap the `Arc`, returning the inner value if this is the
     /// only reference. Returns `Err(self)` if there are other references.
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         let inner = unsafe { &*this.ptr };
+        let current = inner.refcount.load(Ordering::Acquire);
+        let is_slab = current & SLAB_FLAG != 0;
+        // CAS: compare against current value (which includes the slab flag),
+        // swap to 0 (or SLAB_FLAG to preserve the flag for debugging).
+        let expected = if is_slab { SLAB_FLAG | 1 } else { 1 };
         if inner
             .refcount
-            .compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(expected, 0, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
             // We are the sole owner. Read out the value and free.
@@ -94,7 +139,10 @@ impl<T> HeapArc<T> {
             let raw = this.ptr as *mut u8;
             let heap = this.heap.clone();
             std::mem::forget(this); // prevent Drop from running
-            unsafe { heap.dealloc(raw) };
+            if !is_slab {
+                unsafe { heap.dealloc(raw) };
+            }
+            // Slab-allocated: don't dealloc — the slab page is freed with the heap.
             Ok(value)
         } else {
             Err(this)
@@ -114,7 +162,7 @@ impl<T> Clone for HeapArc<T> {
     #[inline]
     fn clone(&self) -> Self {
         let old = unsafe { (*self.ptr).refcount.fetch_add(1, Ordering::Relaxed) };
-        debug_assert!(old > 0, "Arc::clone on a zero refcount");
+        debug_assert!(old & REFCOUNT_MASK > 0, "Arc::clone on a zero refcount");
         Self {
             ptr: self.ptr,
             heap: self.heap.clone(),
@@ -125,12 +173,20 @@ impl<T> Clone for HeapArc<T> {
 impl<T> Drop for HeapArc<T> {
     fn drop(&mut self) {
         let inner = unsafe { &*self.ptr };
-        if inner.refcount.fetch_sub(1, Ordering::Release) == 1 {
+        let prev = inner.refcount.fetch_sub(1, Ordering::Release);
+        // The actual refcount is in the lower 63 bits. Check if it was 1
+        // (i.e., this was the last reference), regardless of the slab flag.
+        if prev & REFCOUNT_MASK == 1 {
             // Last reference — acquire fence to synchronize with other drops.
             std::sync::atomic::fence(Ordering::Acquire);
+            let is_slab = prev & SLAB_FLAG != 0;
             unsafe {
                 std::ptr::drop_in_place(&mut (*self.ptr).value);
-                self.heap.dealloc(self.ptr as *mut u8);
+                if !is_slab {
+                    self.heap.dealloc(self.ptr as *mut u8);
+                }
+                // Slab-allocated: value is dropped but memory stays in the
+                // slab page, freed when the Heap/HeapMaster is destroyed.
             }
         }
     }

@@ -17,7 +17,6 @@ use crate::{Heap, HeapMaster};
 const TAG_INLINE: u8 = 0;
 const TAG_HEAP: u8 = 1;
 const TAG_STATIC: u8 = 2;
-
 /// Maximum bytes storable inline (no heap allocation).
 const INLINE_CAP: usize = 30;
 
@@ -96,6 +95,54 @@ impl Clone for Repr {
             ptr::copy_nonoverlapping(self.raw.as_ptr(), dst.raw.as_mut_ptr(), 32);
             dst
         }
+    }
+}
+
+// =========================================================================
+// MutRepr — 32-byte union for BytesMut (inline + heap + stash)
+// =========================================================================
+
+/// Inline variant for BytesMut. Stores up to 22 bytes + a Heap handle.
+/// The Heap handle is always available for promotion to heap mode.
+///
+/// Layout: `[heap:8][data:22][len:1][tag:1]` — tag at byte 31, matching all reprs.
+const MUT_INLINE_CAP: usize = 22;
+
+#[repr(C)]
+struct MutInlineRepr {
+    heap: Heap,                 // 8  (offset 0, 8-aligned)
+    data: [u8; MUT_INLINE_CAP], // 22 (offset 8)
+    len: u8,                    // 1  (offset 30)
+    tag: u8,                    // 1  (offset 31) = 32
+}
+
+/// Heap variant for BytesMut. Uses u32 len/cap (max 4 GiB) to fit in 32 bytes.
+/// The `Heap` handle is stored in the `Header` on the heap allocation, not here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MutOwnedRepr {
+    ptr: *mut u8,        // 8
+    len: u32,            // 4
+    cap: u32,            // 4
+    header: *mut Header, // 8
+    _pad: [u8; 7],       // 7
+    tag: u8,             // 1 = 32
+}
+
+#[repr(C)]
+union MutRepr {
+    inline: std::mem::ManuallyDrop<MutInlineRepr>,
+    owned: MutOwnedRepr,
+    raw: [u8; 32],
+}
+
+const _: () = assert!(std::mem::size_of::<MutRepr>() == 32);
+const _: () = assert!(std::mem::size_of::<MutInlineRepr>() == 32);
+
+impl MutRepr {
+    #[inline]
+    fn tag(&self) -> u8 {
+        unsafe { self.raw[31] }
     }
 }
 
@@ -454,15 +501,19 @@ impl Bytes {
         h.ref_cnt.store(1, Ordering::Release);
         let ptr = unsafe { self.repr.owned.ptr as *mut u8 };
         let len = unsafe { self.repr.owned.len };
-        let heap = h.heap.clone();
         let cap = h.cap as usize;
         std::mem::forget(self);
         Ok(BytesMut {
-            ptr,
-            len: len as u32,
-            cap: cap as u32,
-            header,
-            heap,
+            repr: MutRepr {
+                owned: MutOwnedRepr {
+                    ptr,
+                    len: len as u32,
+                    cap: cap as u32,
+                    header,
+                    _pad: [0; 7],
+                    tag: TAG_HEAP,
+                },
+            },
         })
     }
 
@@ -741,12 +792,13 @@ impl fmt::Debug for Bytes {
 // =========================================================================
 
 /// Mutable byte buffer allocated from a [`Heap`]. 32 bytes on the stack.
+///
+/// Two modes, selected by a tag byte at position 31:
+/// - **Inline** (tag 0): ≤22 bytes stored directly in the struct, zero heap
+///   allocation. The `Heap` handle is always present for future promotion.
+/// - **Heap** (tag 1): heap-backed via `Header` (refcounted, arena-backed).
 pub struct BytesMut {
-    ptr: *mut u8,
-    len: u32,
-    cap: u32,
-    header: *mut Header,
-    heap: Heap,
+    repr: MutRepr,
 }
 
 unsafe impl Send for BytesMut {}
@@ -755,11 +807,14 @@ unsafe impl Sync for BytesMut {}
 impl BytesMut {
     pub fn new(heap: &Heap) -> Self {
         Self {
-            ptr: ptr::null_mut(),
-            len: 0,
-            cap: 0,
-            header: ptr::null_mut(),
-            heap: heap.clone(),
+            repr: MutRepr {
+                inline: std::mem::ManuallyDrop::new(MutInlineRepr {
+                    heap: heap.clone(),
+                    data: [0; MUT_INLINE_CAP],
+                    len: 0,
+                    tag: TAG_INLINE,
+                }),
+            },
         }
     }
 
@@ -767,76 +822,124 @@ impl BytesMut {
         cap: usize,
         heap: &Heap,
     ) -> Result<Self, allocator_api2::alloc::AllocError> {
-        if cap == 0 {
+        if cap <= MUT_INLINE_CAP {
             return Ok(Self::new(heap));
         }
         let (header, data_ptr) = alloc_header_and_data(heap, cap)?;
         Ok(Self {
-            ptr: data_ptr,
-            len: 0,
-            cap: cap as u32,
-            header,
-            heap: heap.clone(),
+            repr: MutRepr {
+                owned: MutOwnedRepr {
+                    ptr: data_ptr,
+                    len: 0,
+                    cap: cap as u32,
+                    header,
+                    _pad: [0; 7],
+                    tag: TAG_HEAP,
+                },
+            },
         })
     }
 
     /// Create a zeroed buffer of `len` bytes.
     pub fn zeroed(len: usize, heap: &Heap) -> Result<Self, allocator_api2::alloc::AllocError> {
-        let mut bm = Self::with_capacity(len, heap)?;
-        if len > 0 {
+        if len <= MUT_INLINE_CAP {
+            // Inline: data is already zeroed from MutInlineRepr initialization.
+            let mut bm = Self::new(heap);
             unsafe {
-                ptr::write_bytes(bm.ptr, 0, len);
+                (*bm.repr.inline).len = len as u8;
             }
-            bm.len = len as u32;
+            return Ok(bm);
+        }
+        let mut bm = Self::with_capacity(len, heap)?;
+        unsafe {
+            ptr::write_bytes(bm.repr.owned.ptr, 0, len);
+            bm.repr.owned.len = len as u32;
         }
         Ok(bm)
     }
 
+    // -- Accessors (inline/heap dispatch) ------------------------------------
+
     #[inline]
     pub fn len(&self) -> usize {
-        self.len as usize
+        match self.repr.tag() {
+            TAG_INLINE => unsafe { (*self.repr.inline).len as usize },
+            _ => unsafe { self.repr.owned.len as usize }, // TAG_HEAP
+        }
     }
+
     #[inline]
     pub fn cap(&self) -> usize {
-        self.cap as usize
+        self.capacity()
     }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
+
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.cap as usize
+        match self.repr.tag() {
+            TAG_INLINE => MUT_INLINE_CAP,
+            _ => unsafe { self.repr.owned.cap as usize }, // TAG_HEAP
+        }
     }
 
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        if self.len == 0 {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(self.ptr, self.len as usize) }
+        match self.repr.tag() {
+            TAG_INLINE => unsafe {
+                let len = (*self.repr.inline).len as usize;
+                &(*self.repr.inline).data[..len]
+            },
+            _ => {
+                let len = unsafe { self.repr.owned.len as usize };
+                if len == 0 {
+                    &[]
+                } else {
+                    unsafe { slice::from_raw_parts(self.repr.owned.ptr, len) }
+                }
+            }
         }
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        if self.len == 0 {
-            &mut []
-        } else {
-            unsafe { slice::from_raw_parts_mut(self.ptr, self.len as usize) }
+        match self.repr.tag() {
+            TAG_INLINE => unsafe {
+                let len = (*self.repr.inline).len as usize;
+                &mut (*self.repr.inline).data[..len]
+            },
+            _ => {
+                let len = unsafe { self.repr.owned.len as usize };
+                if len == 0 {
+                    &mut []
+                } else {
+                    unsafe { slice::from_raw_parts_mut(self.repr.owned.ptr, len) }
+                }
+            }
         }
     }
 
     #[inline]
     pub fn clear(&mut self) {
-        self.len = 0;
+        match self.repr.tag() {
+            TAG_INLINE => unsafe { (*self.repr.inline).len = 0 },
+            _ => unsafe { self.repr.owned.len = 0 },
+        }
     }
 
     pub fn truncate(&mut self, len: usize) {
         if len < self.len() {
-            self.len = len as u32;
+            match self.repr.tag() {
+                TAG_INLINE => unsafe { (*self.repr.inline).len = len as u8 },
+                _ => unsafe { self.repr.owned.len = len as u32 },
+            }
         }
     }
+
+    // -- Mutation (may promote inline → heap) --------------------------------
 
     /// Resize the buffer. If growing, fills new bytes with `value`.
     pub fn resize(
@@ -844,13 +947,23 @@ impl BytesMut {
         new_len: usize,
         value: u8,
     ) -> Result<(), allocator_api2::alloc::AllocError> {
-        if new_len > self.len() {
-            self.reserve(new_len - self.len())?;
-            unsafe {
-                ptr::write_bytes(self.ptr.add(self.len()), value, new_len - self.len());
+        let old_len = self.len();
+        if new_len > old_len {
+            self.reserve(new_len - old_len)?;
+            match self.repr.tag() {
+                TAG_INLINE => unsafe {
+                    let p = (*self.repr.inline).data.as_mut_ptr().add(old_len);
+                    ptr::write_bytes(p, value, new_len - old_len);
+                    (*self.repr.inline).len = new_len as u8;
+                },
+                _ => unsafe {
+                    ptr::write_bytes(self.repr.owned.ptr.add(old_len), value, new_len - old_len);
+                    self.repr.owned.len = new_len as u32;
+                },
             }
+        } else {
+            self.truncate(new_len);
         }
-        self.len = new_len as u32;
         Ok(())
     }
 
@@ -858,62 +971,153 @@ impl BytesMut {
         &mut self,
         data: &[u8],
     ) -> Result<(), allocator_api2::alloc::AllocError> {
-        let needed = self.len() + data.len();
-        if needed > self.cap as usize {
-            self.try_grow(needed)?;
+        if data.is_empty() {
+            return Ok(());
         }
-        unsafe {
-            ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(self.len()), data.len());
+        let old_len = self.len();
+        let needed = old_len + data.len();
+
+        match self.repr.tag() {
+            TAG_INLINE => {
+                if needed <= MUT_INLINE_CAP {
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            (*self.repr.inline).data.as_mut_ptr().add(old_len),
+                            data.len(),
+                        );
+                        (*self.repr.inline).len = needed as u8;
+                    }
+                    return Ok(());
+                }
+                self.promote_to_heap(needed)?;
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        self.repr.owned.ptr.add(old_len),
+                        data.len(),
+                    );
+                    self.repr.owned.len = needed as u32;
+                }
+            }
+            _ => {
+                if needed > unsafe { self.repr.owned.cap } as usize {
+                    self.try_grow(needed)?;
+                }
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        self.repr.owned.ptr.add(old_len),
+                        data.len(),
+                    );
+                    self.repr.owned.len = needed as u32;
+                }
+            }
         }
-        self.len += data.len() as u32;
         Ok(())
     }
 
     #[inline]
     pub fn push(&mut self, byte: u8) -> Result<(), allocator_api2::alloc::AllocError> {
-        if self.len == self.cap {
-            self.try_grow(self.len() + 1)?;
+        match self.repr.tag() {
+            TAG_INLINE => unsafe {
+                let len = (*self.repr.inline).len as usize;
+                if len < MUT_INLINE_CAP {
+                    (*self.repr.inline).data[len] = byte;
+                    (*self.repr.inline).len += 1;
+                    return Ok(());
+                }
+                self.promote_to_heap(len + 1)?;
+                *self.repr.owned.ptr.add(len) = byte;
+                self.repr.owned.len = (len + 1) as u32;
+            },
+            _ => unsafe {
+                if self.repr.owned.len == self.repr.owned.cap {
+                    self.try_grow(self.repr.owned.len as usize + 1)?;
+                }
+                let len = self.repr.owned.len as usize;
+                *self.repr.owned.ptr.add(len) = byte;
+                self.repr.owned.len += 1;
+            },
         }
-        unsafe {
-            *self.ptr.add(self.len()) = byte;
-        }
-        self.len += 1;
         Ok(())
     }
 
     pub fn reserve(&mut self, additional: usize) -> Result<(), allocator_api2::alloc::AllocError> {
         let needed = self.len() + additional;
-        if needed > self.cap as usize {
-            self.try_grow(needed)?;
+        match self.repr.tag() {
+            TAG_INLINE => {
+                if needed > MUT_INLINE_CAP {
+                    self.promote_to_heap(needed)?;
+                }
+            }
+            _ => {
+                if needed > unsafe { self.repr.owned.cap } as usize {
+                    self.try_grow(needed)?;
+                }
+            }
         }
         Ok(())
     }
 
     /// Split off all data, leaving self empty. Returns a new `BytesMut` with the data.
     pub fn split(&mut self) -> Self {
-        let len = self.len;
+        let len = self.len();
         if len == 0 {
-            return Self::new(&self.heap);
+            let heap = self.heap_ref();
+            return Self::new(&heap);
         }
-        // Take ownership of the allocation, give self a new empty one.
-        let result = Self {
-            ptr: self.ptr,
-            len,
-            cap: self.cap,
-            header: self.header,
-            heap: self.heap.clone(),
-        };
-        self.ptr = ptr::null_mut();
-        self.len = 0;
-        self.cap = 0;
-        self.header = ptr::null_mut();
-        result
+        match self.repr.tag() {
+            TAG_INLINE => {
+                // Clone heap for the new empty self, then copy data to result.
+                let heap = self.heap_ref();
+                let mut result = Self::new(&heap);
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        (*self.repr.inline).data.as_ptr(),
+                        (*result.repr.inline).data.as_mut_ptr(),
+                        len,
+                    );
+                    (*result.repr.inline).len = len as u8;
+                    (*self.repr.inline).len = 0;
+                }
+                result
+            }
+            _ => {
+                // Heap mode: take ownership of the allocation.
+                let heap = self.heap_ref();
+                let result = unsafe {
+                    Self {
+                        repr: MutRepr {
+                            owned: MutOwnedRepr {
+                                ptr: self.repr.owned.ptr,
+                                len: self.repr.owned.len,
+                                cap: self.repr.owned.cap,
+                                header: self.repr.owned.header,
+                                _pad: [0; 7],
+                                tag: TAG_HEAP,
+                            },
+                        },
+                    }
+                };
+                // Reset self to empty inline with heap handle.
+                self.repr = MutRepr {
+                    inline: std::mem::ManuallyDrop::new(MutInlineRepr {
+                        heap,
+                        data: [0; MUT_INLINE_CAP],
+                        len: 0,
+                        tag: TAG_INLINE,
+                    }),
+                };
+                result
+            }
+        }
     }
 
     /// Split at `at`, returning `[0..at)` and leaving `[at..len)` in self.
     pub fn split_to(&mut self, at: usize) -> Bytes {
         assert!(at <= self.len());
-        let data = unsafe { slice::from_raw_parts(self.ptr, at) };
+        let data = &self.as_slice()[..at];
         let result = if at <= INLINE_CAP {
             let mut inline = InlineRepr {
                 data: [0; INLINE_CAP],
@@ -925,17 +1129,30 @@ impl BytesMut {
                 repr: Repr { inline },
             }
         } else {
-            // Copy to new allocation as frozen Bytes
-            let h = &self.heap;
-            match Bytes::copy_from_slice(data, h) {
+            let heap = self.heap_ref();
+            match Bytes::copy_from_slice(data, &heap) {
                 Ok(b) => b,
                 Err(_) => panic!("OOM in BytesMut::split_to"),
             }
         };
-        unsafe {
-            ptr::copy(self.ptr.add(at), self.ptr, self.len() - at);
+        // Shift remaining data left.
+        match self.repr.tag() {
+            TAG_INLINE => unsafe {
+                let len = (*self.repr.inline).len as usize;
+                let remaining = len - at;
+                ptr::copy(
+                    (*self.repr.inline).data.as_ptr().add(at),
+                    (*self.repr.inline).data.as_mut_ptr(),
+                    remaining,
+                );
+                (*self.repr.inline).len = remaining as u8;
+            },
+            _ => unsafe {
+                let len = self.repr.owned.len as usize;
+                ptr::copy(self.repr.owned.ptr.add(at), self.repr.owned.ptr, len - at);
+                self.repr.owned.len -= at as u32;
+            },
         }
-        self.len -= at as u32;
         result
     }
 
@@ -943,24 +1160,25 @@ impl BytesMut {
     pub fn split_off(&mut self, at: usize) -> Bytes {
         assert!(at <= self.len());
         let tail_len = self.len() - at;
-        let data = unsafe { slice::from_raw_parts(self.ptr.add(at), tail_len) };
+        let tail_data = &self.as_slice()[at..];
         let result = if tail_len <= INLINE_CAP {
             let mut inline = InlineRepr {
                 data: [0; INLINE_CAP],
                 len: tail_len as u8,
                 tag: TAG_INLINE,
             };
-            inline.data[..tail_len].copy_from_slice(data);
+            inline.data[..tail_len].copy_from_slice(tail_data);
             Bytes {
                 repr: Repr { inline },
             }
         } else {
-            match Bytes::copy_from_slice(data, &self.heap) {
+            let heap = self.heap_ref();
+            match Bytes::copy_from_slice(tail_data, &heap) {
                 Ok(b) => b,
                 Err(_) => panic!("OOM in BytesMut::split_off"),
             }
         };
-        self.len = at as u32;
+        self.truncate(at);
         result
     }
 
@@ -974,64 +1192,116 @@ impl BytesMut {
     /// # Safety
     /// `new_len` must be ≤ `capacity()` and the bytes in `[0..new_len)` must be initialized.
     pub unsafe fn set_len(&mut self, new_len: usize) {
-        debug_assert!(new_len <= self.cap());
-        self.len = new_len as u32;
+        debug_assert!(new_len <= self.capacity());
+        match self.repr.tag() {
+            TAG_INLINE => {
+                debug_assert!(new_len <= MUT_INLINE_CAP);
+                (*self.repr.inline).len = new_len as u8;
+            }
+            _ => {
+                self.repr.owned.len = new_len as u32;
+            }
+        }
     }
 
     /// Access the spare capacity as uninitialized bytes.
     pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        if self.cap == 0 || self.header.is_null() {
-            return &mut [];
-        }
-        unsafe {
-            slice::from_raw_parts_mut(
-                self.ptr.add(self.len()) as *mut MaybeUninit<u8>,
-                self.cap() - self.len(),
-            )
+        match self.repr.tag() {
+            TAG_INLINE => unsafe {
+                let len = (*self.repr.inline).len as usize;
+                let spare = MUT_INLINE_CAP - len;
+                if spare == 0 {
+                    return &mut [];
+                }
+                slice::from_raw_parts_mut(
+                    (*self.repr.inline).data.as_mut_ptr().add(len) as *mut MaybeUninit<u8>,
+                    spare,
+                )
+            },
+            _ => unsafe {
+                let len = self.repr.owned.len as usize;
+                let cap = self.repr.owned.cap as usize;
+                if cap == 0 || cap == len {
+                    return &mut [];
+                }
+                slice::from_raw_parts_mut(
+                    self.repr.owned.ptr.add(len) as *mut MaybeUninit<u8>,
+                    cap - len,
+                )
+            },
         }
     }
 
-    /// Freeze into immutable [`Bytes`]. Zero-cost for >30 bytes.
+    /// Freeze into immutable [`Bytes`]. Zero-cost for heap buffers >30 bytes.
     #[inline]
     pub fn freeze(self) -> Bytes {
         let len = self.len();
-        let header = self.header;
         if len == 0 {
             return Bytes::new();
         }
-        if len <= INLINE_CAP {
-            let mut inline = InlineRepr {
-                data: [0; INLINE_CAP],
-                len: len as u8,
-                tag: TAG_INLINE,
-            };
-            unsafe {
-                ptr::copy_nonoverlapping(self.ptr, inline.data.as_mut_ptr(), len);
+        match self.repr.tag() {
+            TAG_INLINE => {
+                // Copy inline data into a Bytes inline repr (30-byte capacity).
+                let mut inline = InlineRepr {
+                    data: [0; INLINE_CAP],
+                    len: len as u8,
+                    tag: TAG_INLINE,
+                };
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        (*self.repr.inline).data.as_ptr(),
+                        inline.data.as_mut_ptr(),
+                        len,
+                    );
+                }
+                // self drops here, releasing the heap handle in MutInlineRepr.
+                Bytes {
+                    repr: Repr { inline },
+                }
             }
-            if !header.is_null() {
-                unsafe { self.heap.dealloc(header as *mut u8) };
+            _ => {
+                let header = unsafe { self.repr.owned.header };
+                if len <= INLINE_CAP {
+                    let mut inline = InlineRepr {
+                        data: [0; INLINE_CAP],
+                        len: len as u8,
+                        tag: TAG_INLINE,
+                    };
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            self.repr.owned.ptr,
+                            inline.data.as_mut_ptr(),
+                            len,
+                        );
+                    }
+                    if !header.is_null() {
+                        let heap = unsafe { ptr::read(&(*header).heap) };
+                        unsafe { heap.dealloc(header as *mut u8) };
+                        drop(heap);
+                    }
+                    std::mem::forget(self);
+                    return Bytes {
+                        repr: Repr { inline },
+                    };
+                }
+                if !header.is_null() {
+                    unsafe { (*header).ref_cnt.fetch_or(FROZEN_BIT, Ordering::Release) };
+                }
+                let bytes = Bytes {
+                    repr: Repr {
+                        owned: OwnedRepr {
+                            ptr: unsafe { self.repr.owned.ptr },
+                            len,
+                            header,
+                            _pad: [0; 7],
+                            tag: TAG_HEAP,
+                        },
+                    },
+                };
+                std::mem::forget(self);
+                bytes
             }
-            std::mem::forget(self);
-            return Bytes {
-                repr: Repr { inline },
-            };
         }
-        if !header.is_null() {
-            unsafe { (*header).ref_cnt.fetch_or(FROZEN_BIT, Ordering::Release) };
-        }
-        let bytes = Bytes {
-            repr: Repr {
-                owned: OwnedRepr {
-                    ptr: self.ptr,
-                    len,
-                    header,
-                    _pad: [0; 7],
-                    tag: TAG_HEAP,
-                },
-            },
-        };
-        std::mem::forget(self);
-        bytes
     }
 
     /// Convert into `bytes::Bytes` for ecosystem interop.
@@ -1043,32 +1313,76 @@ impl BytesMut {
         ::bytes::Bytes::from_owner(frozen)
     }
 
-    fn try_grow(&mut self, min_cap: usize) -> Result<(), allocator_api2::alloc::AllocError> {
+    // -- Internal helpers ----------------------------------------------------
+
+    /// Get a cloned `Heap` handle, regardless of current mode.
+    #[inline]
+    fn heap_ref(&self) -> Heap {
+        match self.repr.tag() {
+            TAG_INLINE => unsafe { (*self.repr.inline).heap.clone() },
+            _ => unsafe { (*self.repr.owned.header).heap.clone() }, // TAG_HEAP
+        }
+    }
+
+    /// Promote inline → heap mode with at least `min_cap` capacity.
+    /// Copies existing inline data to the new heap allocation.
+    fn promote_to_heap(&mut self, min_cap: usize) -> Result<(), allocator_api2::alloc::AllocError> {
+        debug_assert_eq!(self.repr.tag(), TAG_INLINE);
         let new_cap = min_cap.next_power_of_two().max(64);
-        if self.header.is_null() {
-            let (header, data_ptr) = alloc_header_and_data(&self.heap, new_cap)?;
-            self.header = header;
-            self.ptr = data_ptr;
-            self.cap = new_cap as u32;
-        } else {
-            let new_total = HEADER_SIZE + new_cap;
-            let align = std::mem::align_of::<Header>();
-            let new_raw = unsafe {
-                ffi::mi_heap_realloc_aligned(
-                    self.heap.raw(),
-                    self.header as *mut core::ffi::c_void,
-                    new_total,
-                    align,
-                )
-            };
-            if new_raw.is_null() {
-                return Err(allocator_api2::alloc::AllocError);
+        let old_len = unsafe { (*self.repr.inline).len as usize };
+
+        // Read heap from inline repr before overwriting.
+        let heap = unsafe { ptr::read(&(*self.repr.inline).heap) };
+
+        let (header, data_ptr) = alloc_header_and_data(&heap, new_cap)?;
+        // Copy existing inline data to the heap allocation.
+        if old_len > 0 {
+            unsafe {
+                ptr::copy_nonoverlapping((*self.repr.inline).data.as_ptr(), data_ptr, old_len);
             }
-            let new_header = new_raw as *mut Header;
-            unsafe { (*new_header).cap = new_cap as u32 };
-            self.header = new_header;
-            self.ptr = unsafe { (new_raw as *mut u8).add(HEADER_SIZE) };
-            self.cap = new_cap as u32;
+        }
+        // Drop the heap handle we extracted (Header now owns a clone).
+        drop(heap);
+
+        self.repr = MutRepr {
+            owned: MutOwnedRepr {
+                ptr: data_ptr,
+                len: old_len as u32,
+                cap: new_cap as u32,
+                header,
+                _pad: [0; 7],
+                tag: TAG_HEAP,
+            },
+        };
+        Ok(())
+    }
+
+    /// Grow a heap-mode buffer to at least `min_cap`.
+    fn try_grow(&mut self, min_cap: usize) -> Result<(), allocator_api2::alloc::AllocError> {
+        debug_assert_eq!(self.repr.tag(), TAG_HEAP);
+        let new_cap = min_cap.next_power_of_two().max(64);
+        let header = unsafe { self.repr.owned.header };
+        let heap = unsafe { &(*header).heap };
+
+        let new_total = HEADER_SIZE + new_cap;
+        let align = std::mem::align_of::<Header>();
+        let new_raw = unsafe {
+            ffi::mi_heap_realloc_aligned(
+                heap.raw(),
+                header as *mut core::ffi::c_void,
+                new_total,
+                align,
+            )
+        };
+        if new_raw.is_null() {
+            return Err(allocator_api2::alloc::AllocError);
+        }
+        let new_header = new_raw as *mut Header;
+        unsafe { (*new_header).cap = new_cap as u32 };
+        unsafe {
+            self.repr.owned.header = new_header;
+            self.repr.owned.ptr = (new_raw as *mut u8).add(HEADER_SIZE);
+            self.repr.owned.cap = new_cap as u32;
         }
         Ok(())
     }
@@ -1078,19 +1392,30 @@ impl BytesMut {
 
 impl Drop for BytesMut {
     fn drop(&mut self) {
-        if self.header.is_null() {
-            return;
+        match self.repr.tag() {
+            TAG_HEAP => {
+                let header = unsafe { self.repr.owned.header };
+                if header.is_null() {
+                    return;
+                }
+                let h = unsafe { &*header };
+                let heap = unsafe { ptr::read(&h.heap) };
+                unsafe { heap.dealloc(header as *mut u8) };
+                drop(heap);
+            }
+            TAG_INLINE => {
+                // Drop the inline heap handle via ManuallyDrop.
+                unsafe {
+                    std::mem::ManuallyDrop::drop(&mut self.repr.inline);
+                }
+            }
+            _ => {}
         }
-        let h = unsafe { &*self.header };
-        let heap = unsafe { ptr::read(&h.heap) };
-        unsafe { heap.dealloc(self.header as *mut u8) };
-        drop(heap);
     }
 }
 
 impl Default for BytesMut {
     fn default() -> Self {
-        // Requires a heap — use default heap.
         let master = HeapMaster::new(64 * 1024 * 1024).expect("failed to create default heap");
         Self::new(&master)
     }
@@ -1098,9 +1423,29 @@ impl Default for BytesMut {
 
 impl Clone for BytesMut {
     fn clone(&self) -> Self {
-        let mut new = Self::with_capacity(self.len(), &self.heap).expect("clone OOM");
-        new.extend_from_slice(self.as_slice()).expect("clone OOM");
-        new
+        match self.repr.tag() {
+            TAG_INLINE => {
+                let heap = unsafe { (*self.repr.inline).heap.clone() };
+                let len = unsafe { (*self.repr.inline).len as usize };
+                let mut new = Self::new(&heap);
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        (*self.repr.inline).data.as_ptr(),
+                        (*new.repr.inline).data.as_mut_ptr(),
+                        len,
+                    );
+                    (*new.repr.inline).len = len as u8;
+                }
+                new
+            }
+            _ => {
+                let heap = unsafe { (*self.repr.owned.header).heap.clone() };
+                let len = self.len();
+                let mut new = Self::with_capacity(len, &heap).expect("clone OOM");
+                new.extend_from_slice(self.as_slice()).expect("clone OOM");
+                new
+            }
+        }
     }
 }
 
@@ -1270,12 +1615,25 @@ impl bytes::Buf for BytesMut {
     }
     fn advance(&mut self, cnt: usize) {
         assert!(cnt <= self.len(), "advance past end");
-        if cnt > 0 && self.len() - cnt > 0 {
-            unsafe {
-                ptr::copy(self.ptr.add(cnt), self.ptr, self.len() - cnt);
-            }
+        let new_len = self.len() - cnt;
+        match self.repr.tag() {
+            TAG_INLINE => unsafe {
+                if cnt > 0 && new_len > 0 {
+                    ptr::copy(
+                        (*self.repr.inline).data.as_ptr().add(cnt),
+                        (*self.repr.inline).data.as_mut_ptr(),
+                        new_len,
+                    );
+                }
+                (*self.repr.inline).len = new_len as u8;
+            },
+            _ => unsafe {
+                if cnt > 0 && new_len > 0 {
+                    ptr::copy(self.repr.owned.ptr.add(cnt), self.repr.owned.ptr, new_len);
+                }
+                self.repr.owned.len = new_len as u32;
+            },
         }
-        self.len -= cnt as u32;
     }
 }
 
@@ -1283,29 +1641,38 @@ impl bytes::Buf for BytesMut {
 unsafe impl bytes::BufMut for BytesMut {
     #[inline]
     fn remaining_mut(&self) -> usize {
-        // Return usize::MAX to match bytes crate behavior (grow on demand).
-        // Actual capacity limit is enforced by our try_grow returning AllocError,
-        // which will panic in the default put_* impls.
         usize::MAX
     }
 
     #[inline]
     unsafe fn advance_mut(&mut self, cnt: usize) {
         let new_len = self.len() + cnt;
-        debug_assert!(new_len <= self.cap(), "advance_mut past capacity");
-        self.len = new_len as u32;
+        debug_assert!(new_len <= self.capacity(), "advance_mut past capacity");
+        match self.repr.tag() {
+            TAG_INLINE => (*self.repr.inline).len = new_len as u8,
+            _ => self.repr.owned.len = new_len as u32,
+        }
     }
 
     #[inline]
     fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
-        // Ensure we have at least some capacity.
-        if self.cap == self.len {
+        if self.len() >= self.capacity() {
             self.reserve(64).expect("chunk_mut OOM");
         }
-        unsafe {
-            let ptr = self.ptr.add(self.len());
-            let len = self.cap - self.len;
-            bytes::buf::UninitSlice::from_raw_parts_mut(ptr, len as usize)
+        match self.repr.tag() {
+            TAG_INLINE => unsafe {
+                let len = (*self.repr.inline).len as usize;
+                let spare = MUT_INLINE_CAP - len;
+                bytes::buf::UninitSlice::from_raw_parts_mut(
+                    (*self.repr.inline).data.as_mut_ptr().add(len),
+                    spare,
+                )
+            },
+            _ => unsafe {
+                let ptr = self.repr.owned.ptr.add(self.repr.owned.len as usize);
+                let spare = self.repr.owned.cap - self.repr.owned.len;
+                bytes::buf::UninitSlice::from_raw_parts_mut(ptr, spare as usize)
+            },
         }
     }
 
@@ -1315,9 +1682,20 @@ unsafe impl bytes::BufMut for BytesMut {
 
     fn put_bytes(&mut self, val: u8, cnt: usize) {
         self.reserve(cnt).expect("put_bytes OOM");
-        unsafe {
-            ptr::write_bytes(self.ptr.add(self.len()), val, cnt);
-            self.len += cnt as u32;
+        match self.repr.tag() {
+            TAG_INLINE => unsafe {
+                let len = (*self.repr.inline).len as usize;
+                ptr::write_bytes((*self.repr.inline).data.as_mut_ptr().add(len), val, cnt);
+                (*self.repr.inline).len += cnt as u8;
+            },
+            _ => unsafe {
+                ptr::write_bytes(
+                    self.repr.owned.ptr.add(self.repr.owned.len as usize),
+                    val,
+                    cnt,
+                );
+                self.repr.owned.len += cnt as u32;
+            },
         }
     }
 }
@@ -1325,8 +1703,16 @@ unsafe impl bytes::BufMut for BytesMut {
 impl fmt::Debug for BytesMut {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BytesMut")
-            .field("len", &self.len)
-            .field("cap", &self.cap)
+            .field("len", &self.len())
+            .field("cap", &self.capacity())
+            .field(
+                "mode",
+                &match self.repr.tag() {
+                    TAG_INLINE => "inline",
+                    TAG_HEAP => "heap",
+                    _ => "?",
+                },
+            )
             .finish()
     }
 }
@@ -1553,6 +1939,15 @@ mod tests {
 
     // -- BytesMut basic --
 
+    #[test]
+    fn bm_size() {
+        assert_eq!(
+            std::mem::size_of::<BytesMut>(),
+            32,
+            "BytesMut should be 32 bytes"
+        );
+        assert_eq!(std::mem::size_of::<Bytes>(), 32, "Bytes should be 32 bytes");
+    }
     #[test]
     fn bm_empty() {
         let bm = BytesMut::new(&heap());

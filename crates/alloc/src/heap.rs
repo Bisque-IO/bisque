@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use allocator_api2::alloc::{AllocError, Allocator};
 
-use crate::ptr::{Tlrc, TlrcRef, tlrc::TlrcInner};
+use crate::{Tlrc, TlrcRef, tlrc::TlrcInner};
 use bisque_mimalloc_sys as ffi;
 
 // Re-export for use in async contexts.
@@ -49,6 +49,10 @@ pub(crate) struct HeapData {
     pressure_wq: crate::wait_queue::WaitQueue,
     /// Max concurrent async waiters (configurable at construction).
     max_waiters: usize,
+    /// Per-heap epoch collector for concurrent data structures (Art, etc.).
+    /// Dropped during `destroy_heap`'s `drop_in_place` — BEFORE `mi_heap_destroy`.
+    /// This ensures all deferred deallocations complete while the heap is still valid.
+    pub(crate) collector: seize::Collector,
 }
 
 unsafe impl Send for HeapData {}
@@ -57,16 +61,26 @@ unsafe impl Sync for HeapData {}
 /// Custom destroy for TlrcInner<HeapData>.
 ///
 /// TlrcInner<HeapData> is Box-allocated (global allocator), but HeapData's
-/// internal fields (WaitQueue slots) were allocated from the mi_heap.
+/// internal fields (WaitQueue slots, collector deferred work) were allocated
+/// from the mi_heap.
 /// Sequence:
 ///   1. Save mi_heap pointer
-///   2. drop_in_place — drops HeapData fields (WaitQueue Drop accesses slots)
-///   3. mi_heap_destroy — bulk-frees all mi_heap pages (including WaitQueue slots)
-///   4. dealloc — frees the TlrcInner memory (global allocator)
+///   2. Flush the epoch collector — runs all pending deferred deallocations
+///      while the mi_heap is still alive
+///   3. drop_in_place — drops HeapData fields (WaitQueue, Collector, etc.)
+///   4. mi_heap_destroy — bulk-frees all mi_heap pages
+///   5. dealloc — frees the TlrcInner memory (global allocator)
 unsafe fn destroy_heap(ptr: *mut TlrcInner<HeapData>) {
     unsafe {
         let data_ref = &*ptr;
         let mi_heap = data_ref.data.mi_heap;
+        // Flush the epoch collector to ensure all deferred deallocations
+        // (from Art/congee node retirements) run while the heap is alive.
+        {
+            use seize::Guard as _;
+            let guard = data_ref.data.collector.enter();
+            guard.flush();
+        }
         // Drop all fields first (WaitQueue needs its slots alive)
         std::ptr::drop_in_place(ptr);
         // Bulk-free all mi_heap allocations (WaitQueue slots, user data, etc.)
@@ -148,6 +162,7 @@ impl HeapMaster {
             freed_since_pressure: AtomicU64::new(0),
             pressure_wq,
             max_waiters,
+            collector: seize::Collector::new(),
         }));
         let inner_ptr = Box::into_raw(inner_box);
 
@@ -208,9 +223,23 @@ unsafe impl Send for Heap {}
 unsafe impl Sync for Heap {}
 
 impl Heap {
+    /// Create a new memory-limited heap.
+    ///
+    /// `max_bytes` sets the per-heap memory limit (0 = unlimited).
+    /// Tracked at 64 KiB slice granularity.
+    pub fn new(max_bytes: usize) -> Result<HeapMaster, AllocError> {
+        HeapMaster::new(max_bytes)
+    }
+
     #[inline(always)]
     pub(crate) fn data(&self) -> &HeapData {
         &self.inner
+    }
+
+    /// Per-heap epoch collector for concurrent data structures.
+    #[inline]
+    pub fn collector(&self) -> &seize::Collector {
+        &self.data().collector
     }
 
     /// Memory limit in bytes (0 = unlimited).
@@ -522,7 +551,7 @@ unsafe impl Allocator for Heap {
 // =========================================================================
 
 /// Legacy alias. Prefer [`crate::collections::Vec`].
-pub type HeapVec = crate::collections::Vec;
+pub type HeapVec = crate::Vec;
 
 // =========================================================================
 // Process info

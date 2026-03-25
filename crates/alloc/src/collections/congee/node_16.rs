@@ -1,0 +1,163 @@
+use super::{
+    base_node::{BaseNode, Node, NodeIter, NodeType},
+    node_ptr::NodePtr,
+};
+
+/// Node16: keys and children stored in sorted arrays.
+///
+/// Layout optimized: `keys` is placed immediately after `base` so both
+/// the version lock (offset 0) and key bytes (offset 24) reside on the
+/// same 64-byte cache line. This saves one cache miss per `get_child`.
+#[repr(C)]
+#[repr(align(8))]
+pub(crate) struct Node16 {
+    base: BaseNode,
+    children: [NodePtr; 16],
+    keys: [u8; 16],
+}
+
+const _: () = assert!(std::mem::size_of::<Node16>() == 168);
+const _: () = assert!(std::mem::align_of::<Node16>() == 8);
+
+impl Node16 {
+    #[inline]
+    fn get_insert_pos(&self, key: u8) -> usize {
+        let count = self.base.meta.count as usize;
+        // Linear scan for insertion position (sorted order)
+        for i in 0..count {
+            if self.keys[i] >= key {
+                return i;
+            }
+        }
+        count
+    }
+
+    /// Find the position of `key` in the sorted keys array.
+    ///
+    /// Uses SSE2 SIMD on x86_64 (single `_mm_cmpeq_epi8` + `_mm_movemask_epi8`
+    /// to search all 16 keys in parallel). Falls back to linear scan on other
+    /// architectures.
+    #[inline]
+    fn get_child_pos(&self, key: u8) -> Option<usize> {
+        self.keys
+            .iter()
+            .take(self.base.meta.count as usize)
+            .position(|k| *k == key)
+    }
+}
+
+pub(crate) struct Node16Iter<'a> {
+    node: &'a Node16,
+    start_pos: usize,
+    end_pos: usize,
+}
+
+impl Iterator for Node16Iter<'_> {
+    type Item = (u8, NodePtr);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start_pos > self.end_pos {
+            return None;
+        }
+        let key = self.node.keys[self.start_pos];
+        let child = self.node.children[self.start_pos];
+        self.start_pos += 1;
+        Some((key, child))
+    }
+}
+
+impl Node for Node16 {
+    #[inline]
+    fn get_type() -> NodeType {
+        NodeType::N16
+    }
+
+    #[inline]
+    fn get_children(&self, start: u8, end: u8) -> NodeIter {
+        if self.base.meta.count == 0 {
+            return NodeIter::N16(Node16Iter {
+                node: self,
+                start_pos: 1,
+                end_pos: 0,
+            });
+        }
+        let start_pos = self.get_child_pos(start).unwrap_or(0);
+        let end_pos = self
+            .get_child_pos(end)
+            .unwrap_or(self.base.meta.count as usize - 1);
+
+        debug_assert!(end_pos < 16);
+
+        NodeIter::N16(Node16Iter {
+            node: self,
+            start_pos,
+            end_pos,
+        })
+    }
+
+    #[inline]
+    fn remove(&mut self, k: u8) {
+        let pos = self
+            .get_child_pos(k)
+            .expect("trying to delete a non-existing key");
+
+        self.keys
+            .copy_within(pos + 1..self.base.meta.count as usize, pos);
+        self.children
+            .copy_within(pos + 1..self.base.meta.count as usize, pos);
+
+        self.base.meta.count -= 1;
+        debug_assert!(self.get_child(k).is_none());
+    }
+
+    #[inline]
+    fn copy_to<N: Node>(&self, dst: &mut N) {
+        for i in 0..self.base.meta.count {
+            dst.insert(self.keys[i as usize], self.children[i as usize]);
+        }
+    }
+
+    #[inline]
+    fn base(&self) -> &BaseNode {
+        &self.base
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.base.meta.count == 16
+    }
+
+    #[inline]
+    fn insert(&mut self, key: u8, node: NodePtr) {
+        let pos = self.get_insert_pos(key);
+
+        if pos < self.base.meta.count as usize {
+            self.keys
+                .copy_within(pos..self.base.meta.count as usize, pos + 1);
+            self.children
+                .copy_within(pos..self.base.meta.count as usize, pos + 1);
+        }
+
+        self.keys[pos] = key;
+        self.children[pos] = node;
+        self.base.meta.count += 1;
+
+        assert!(self.base.meta.count <= 16);
+    }
+
+    #[inline]
+    fn change(&mut self, key: u8, val: NodePtr) -> NodePtr {
+        let pos = self.get_child_pos(key).unwrap();
+        let old = self.children[pos];
+        self.children[pos] = val;
+        old
+    }
+
+    #[inline]
+    fn get_child(&self, key: u8) -> Option<NodePtr> {
+        let pos = self.get_child_pos(key)?;
+        let child = unsafe { self.children.get_unchecked(pos) };
+        Some(*child)
+    }
+}

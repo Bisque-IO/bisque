@@ -1094,12 +1094,20 @@ name = "bisque-alloc"
 version = "0.1.0"
 dependencies = [
  "allocator-api2",
+ "arc-swap",
  "bisque-mimalloc-sys",
  "bytes",
  "comfy-table",
+ "congee",
+ "crossbeam-epoch",
+ "dashmap",
  "hashbrown 0.15.5",
  "libc",
+ "num-traits",
+ "papaya",
  "parking_lot",
+ "rand 0.9.2",
+ "scc",
  "seize",
  "tokio",
  "windows-sys 0.59.0",
@@ -3127,7 +3135,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 [[package]]
 name = "fsst"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow-array",
  "rand 0.9.2",
@@ -3919,7 +3927,7 @@ dependencies = [
 [[package]]
 name = "lance"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3985,7 +3993,7 @@ dependencies = [
 [[package]]
 name = "lance-arrow"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4006,7 +4014,7 @@ dependencies = [
 [[package]]
 name = "lance-bitpacking"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrayref",
  "paste",
@@ -4016,7 +4024,7 @@ dependencies = [
 [[package]]
 name = "lance-core"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4054,7 +4062,7 @@ dependencies = [
 [[package]]
 name = "lance-datafusion"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4085,7 +4093,7 @@ dependencies = [
 [[package]]
 name = "lance-datagen"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4104,7 +4112,7 @@ dependencies = [
 [[package]]
 name = "lance-encoding"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4142,7 +4150,7 @@ dependencies = [
 [[package]]
 name = "lance-file"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4175,7 +4183,7 @@ dependencies = [
 [[package]]
 name = "lance-index"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4240,7 +4248,7 @@ dependencies = [
 [[package]]
 name = "lance-io"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4282,7 +4290,7 @@ dependencies = [
 [[package]]
 name = "lance-linalg"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4299,7 +4307,7 @@ dependencies = [
 [[package]]
 name = "lance-namespace"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4326,7 +4334,7 @@ dependencies = [
 [[package]]
 name = "lance-table"
 version = "4.1.0-beta.3"
-source = "git+https://github.com/lance-format/lance?branch=main#30cad43c48b5307ddc21bb31a37dcbae65454dd2"
+source = "git+https://github.com/lance-format/lance?branch=main#d3803a9b885c12a55fc2fba74859ea6d165c6d19"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4499,9 +4507,9 @@ dependencies = [
 
 [[package]]
 name = "libredox"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1744e39d1d6a9948f4f388969627434e31128196de472883b39f148769bfe30a"
+checksum = "7ddbf48fd451246b1f8c2610bd3b4ac0cc6e149d89832867093ab69a17194f08"
 dependencies = [
  "bitflags",
  "libc",
@@ -7500,9 +7508,9 @@ checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
 name = "unicode-segmentation"
-version = "1.12.0"
+version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
+checksum = "da36089a805484bcccfffe0739803392c8298778a2d2f09febf76fac5ad9025b"
 
 [[package]]
 name = "unicode-width"

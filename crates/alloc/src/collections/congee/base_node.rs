@@ -1,0 +1,430 @@
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use seize::Guard;
+
+use super::{
+    Allocator,
+    error::ArtError,
+    lock::{ReadGuard, TypedReadGuard},
+    node_4::{Node4, Node4Iter},
+    node_16::{Node16, Node16Iter},
+    node_48::{Node48, Node48Iter},
+    node_256::{Node256, Node256Iter},
+    node_ptr::{AllocatedNode, NodePtr},
+};
+
+pub(crate) const MAX_KEY_LEN: usize = 8;
+
+/// Prefix has to be 8 bytes for better alignment.
+const MAX_PREFIX_LEN: usize = 8;
+pub(crate) type Prefix = [u8; MAX_PREFIX_LEN];
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NodeType {
+    N4 = 0,
+    N16 = 1,
+    N48 = 2,
+    N256 = 3,
+}
+
+impl NodeType {
+    pub(crate) fn node_layout(&self) -> std::alloc::Layout {
+        match *self {
+            NodeType::N4 => std::alloc::Layout::from_size_align(
+                std::mem::size_of::<Node4>(),
+                std::mem::align_of::<Node4>(),
+            )
+            .unwrap(),
+            NodeType::N16 => std::alloc::Layout::from_size_align(
+                std::mem::size_of::<Node16>(),
+                std::mem::align_of::<Node16>(),
+            )
+            .unwrap(),
+            NodeType::N48 => std::alloc::Layout::from_size_align(
+                std::mem::size_of::<Node48>(),
+                std::mem::align_of::<Node48>(),
+            )
+            .unwrap(),
+            NodeType::N256 => std::alloc::Layout::from_size_align(
+                std::mem::size_of::<Node256>(),
+                std::mem::align_of::<Node256>(),
+            )
+            .unwrap(),
+        }
+    }
+}
+
+pub(crate) trait Node {
+    fn base(&self) -> &BaseNode;
+    fn is_full(&self) -> bool;
+    fn insert(&mut self, key: u8, node: NodePtr);
+    fn change(&mut self, key: u8, val: NodePtr) -> NodePtr;
+    fn get_child(&self, key: u8) -> Option<NodePtr>;
+    fn get_children(&self, start: u8, end: u8) -> NodeIter<'_>;
+    fn remove(&mut self, k: u8);
+    fn copy_to<N: Node>(&self, dst: &mut N);
+    fn get_type() -> NodeType;
+}
+
+pub(crate) enum NodeIter<'a> {
+    N4(Node4Iter<'a>),
+    N16(Node16Iter<'a>),
+    N48(Node48Iter<'a>),
+    N256(Node256Iter<'a>),
+}
+
+impl Iterator for NodeIter<'_> {
+    type Item = (u8, NodePtr);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            NodeIter::N4(iter) => iter.next(),
+            NodeIter::N16(iter) => iter.next(),
+            NodeIter::N48(iter) => iter.next(),
+            NodeIter::N256(iter) => iter.next(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct BaseNode {
+    // 2b type | 60b version | 1b lock | 1b obsolete
+    pub(crate) type_version_lock_obsolete: AtomicUsize,
+    pub(crate) meta: NodeMeta,
+}
+
+#[derive(Debug)]
+pub(crate) struct NodeMeta {
+    prefix_cnt: u32,
+    pub(crate) count: u16,
+    node_type: NodeType,
+    prefix: Prefix,
+}
+
+mod layout_assertion {
+    use super::*;
+    const _: () = assert!(std::mem::size_of::<NodeMeta>() == 16);
+    const _: () = assert!(std::mem::align_of::<NodeMeta>() == 4);
+    const _: () = assert!(std::mem::size_of::<BaseNode>() == 24);
+    const _: () = assert!(std::mem::align_of::<BaseNode>() == 8);
+}
+
+macro_rules! gen_method {
+    ($method_name:ident, ($($arg_n:ident : $args:ty),*), $return:ty) => {
+        impl BaseNode {
+            pub(crate) fn $method_name(&self, $($arg_n : $args),*) -> $return {
+                match self.get_type() {
+                    NodeType::N4 => {
+                        let node = self.as_n4();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N16 => {
+                        let node = self.as_n16();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N48 => {
+                        let node = self.as_n48();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N256 => {
+                        let node = self.as_n256();
+                        node.$method_name($($arg_n),*)
+                    },
+                }
+            }
+        }
+    };
+}
+
+macro_rules! gen_method_mut {
+    ($method_name:ident, ($($arg_n:ident : $args:ty),*), $return:ty) => {
+        impl BaseNode {
+            pub(crate) fn $method_name(&mut self, $($arg_n : $args),*) -> $return {
+                match self.get_type() {
+                    NodeType::N4 => {
+                        let node = self.as_n4_mut();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N16 => {
+                        let node = self.as_n16_mut();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N48 => {
+                        let node = self.as_n48_mut();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N256 => {
+                        let node = self.as_n256_mut();
+                        node.$method_name($($arg_n),*)
+                    },
+                }
+            }
+        }
+    };
+}
+
+gen_method!(get_child, (k: u8), Option<NodePtr>);
+gen_method!(get_children, (start: u8, end: u8), NodeIter<'_>);
+
+gen_method_mut!(change, (key: u8, val: NodePtr), NodePtr);
+gen_method_mut!(remove, (key: u8), ());
+
+impl BaseNode {
+    pub(crate) fn new(n_type: NodeType, prefix: &[u8]) -> Self {
+        let mut prefix_v: [u8; MAX_KEY_LEN] = [0; MAX_KEY_LEN];
+
+        assert!(prefix.len() <= MAX_KEY_LEN);
+        for (i, v) in prefix.iter().enumerate() {
+            prefix_v[i] = *v;
+        }
+
+        let meta = NodeMeta {
+            prefix_cnt: prefix.len() as u32,
+            count: 0,
+            prefix: prefix_v,
+            node_type: n_type,
+        };
+
+        BaseNode {
+            type_version_lock_obsolete: AtomicUsize::new(0),
+            meta,
+        }
+    }
+
+    pub(crate) fn make_node<N: Node>(
+        prefix: &[u8],
+        allocator: &impl Allocator,
+    ) -> Result<AllocatedNode<N>, ArtError> {
+        let layout = N::get_type().node_layout();
+        let ptr = allocator
+            .allocate_zeroed(layout)
+            .map_err(|_e| ArtError::Oom)?;
+        let base_ptr = ptr.as_ptr() as *mut BaseNode;
+        let node = BaseNode::new(N::get_type(), prefix);
+        unsafe {
+            std::ptr::write(base_ptr, node);
+
+            if matches!(N::get_type(), NodeType::N48) {
+                let mem = base_ptr as *mut Node48;
+                (*mem).init_empty();
+            }
+
+            Ok(AllocatedNode::new(
+                NonNull::new(base_ptr as *mut N).unwrap(),
+            ))
+        }
+    }
+
+    /// Here we must get a clone of allocator because the drop_node might be called in epoch guard
+    pub(crate) unsafe fn drop_node<A: Allocator>(node: NonNull<BaseNode>, allocator: A) {
+        let layout = unsafe { node.as_ref() }.get_type().node_layout();
+        let ptr = std::ptr::NonNull::new(node.as_ptr() as *mut u8).unwrap();
+        unsafe {
+            allocator.deallocate(ptr, layout);
+        }
+    }
+
+    pub(crate) fn get_type(&self) -> NodeType {
+        self.meta.node_type
+    }
+
+    pub(crate) fn as_n4(&self) -> &Node4 {
+        debug_assert!(matches!(self.get_type(), NodeType::N4));
+        unsafe { &*(self as *const BaseNode as *const Node4) }
+    }
+
+    pub(crate) fn as_n16(&self) -> &Node16 {
+        debug_assert!(matches!(self.get_type(), NodeType::N16));
+        unsafe { &*(self as *const BaseNode as *const Node16) }
+    }
+
+    pub(crate) fn as_n48(&self) -> &Node48 {
+        debug_assert!(matches!(self.get_type(), NodeType::N48));
+        unsafe { &*(self as *const BaseNode as *const Node48) }
+    }
+
+    pub(crate) fn as_n256(&self) -> &Node256 {
+        debug_assert!(matches!(self.get_type(), NodeType::N256));
+        unsafe { &*(self as *const BaseNode as *const Node256) }
+    }
+
+    pub(crate) fn as_n4_mut(&mut self) -> &mut Node4 {
+        debug_assert!(matches!(self.get_type(), NodeType::N4));
+        unsafe { &mut *(self as *mut BaseNode as *mut Node4) }
+    }
+
+    pub(crate) fn as_n16_mut(&mut self) -> &mut Node16 {
+        debug_assert!(matches!(self.get_type(), NodeType::N16));
+        unsafe { &mut *(self as *mut BaseNode as *mut Node16) }
+    }
+
+    pub(crate) fn as_n48_mut(&mut self) -> &mut Node48 {
+        debug_assert!(matches!(self.get_type(), NodeType::N48));
+        unsafe { &mut *(self as *mut BaseNode as *mut Node48) }
+    }
+
+    pub(crate) fn as_n256_mut(&mut self) -> &mut Node256 {
+        debug_assert!(matches!(self.get_type(), NodeType::N256));
+        unsafe { &mut *(self as *mut BaseNode as *mut Node256) }
+    }
+
+    fn read_lock_inner<'a>(node: NonNull<BaseNode>) -> Result<ReadGuard<'a>, ArtError> {
+        let version = unsafe { node.as_ref() }
+            .type_version_lock_obsolete
+            .load(Ordering::Acquire);
+
+        if Self::is_locked(version) || Self::is_obsolete(version) {
+            return Err(ArtError::Locked);
+        }
+
+        Ok(ReadGuard::new(version, node))
+    }
+
+    pub(crate) fn read_lock<'a>(node: NonNull<BaseNode>) -> Result<ReadGuard<'a>, ArtError> {
+        Self::read_lock_inner(node)
+    }
+
+    pub(crate) fn read_lock_root<'a>(node: NonNull<Node256>) -> Result<ReadGuard<'a>, ArtError> {
+        Self::read_lock_inner(unsafe {
+            std::mem::transmute::<NonNull<Node256>, NonNull<BaseNode>>(node)
+        })
+    }
+
+    fn is_locked(version: usize) -> bool {
+        (version & 0b10) == 0b10
+    }
+
+    pub(crate) fn value_count(&self) -> usize {
+        self.meta.count as usize
+    }
+
+    fn is_obsolete(version: usize) -> bool {
+        (version & 1) == 1
+    }
+
+    pub(crate) fn prefix(&self) -> &[u8] {
+        unsafe {
+            self.meta
+                .prefix
+                .get_unchecked(..self.meta.prefix_cnt as usize)
+        }
+    }
+
+    pub(crate) fn insert_grow<CurT: Node, BiggerT: Node, A: Allocator + Send + Clone + 'static>(
+        n: TypedReadGuard<CurT>,
+        parent: (u8, Option<ReadGuard>),
+        val: (u8, NodePtr),
+        allocator: &A,
+        guard: &impl Guard,
+    ) -> Result<(), ArtError> {
+        if !n.as_ref().is_full() {
+            if let Some(p) = parent.1 {
+                p.unlock()?;
+            }
+
+            let mut write_n = n.upgrade().map_err(|v| v.1)?;
+
+            write_n.as_mut().insert(val.0, val.1);
+            return Ok(());
+        }
+
+        let p = parent
+            .1
+            .expect("parent node must present when current node is full");
+
+        let mut write_p = p.upgrade().map_err(|v| v.1)?;
+
+        let mut write_n = n.upgrade().map_err(|v| v.1)?;
+
+        let mut n_big =
+            BaseNode::make_node::<BiggerT>(write_n.as_ref().base().prefix(), allocator)?;
+        write_n.as_ref().copy_to(n_big.as_mut());
+        n_big.as_mut().insert(val.0, val.1);
+
+        write_p.as_mut().change(parent.0, n_big.into_note_ptr());
+
+        write_n.mark_obsolete();
+        let node_ptr = NonNull::new(write_n.as_mut() as *mut CurT as *mut BaseNode).unwrap();
+        std::mem::forget(write_n);
+
+        /// Retirement context for deferred node deallocation via seize.
+        /// Allocated from the Heap (via the Allocator) so memory accounting
+        /// is accurate. Freed during epoch reclamation.
+        struct RetireCtx<A: Allocator + Clone + Send + 'static> {
+            node_ptr: NonNull<BaseNode>,
+            allocator: A,
+        }
+
+        unsafe fn reclaim<A: Allocator + Clone + Send + 'static>(
+            ptr: *mut RetireCtx<A>,
+            _collector: &seize::Collector,
+        ) {
+            unsafe {
+                let ctx = std::ptr::read(ptr);
+                // Deallocate the RetireCtx memory first (ptr is now dangling but ctx is on stack)
+                let alloc = ctx.allocator;
+                let layout = std::alloc::Layout::new::<RetireCtx<A>>();
+                alloc.deallocate(NonNull::new_unchecked(ptr as *mut u8), layout);
+                // Now drop the retired node (alloc consumed by drop_node)
+                BaseNode::drop_node(ctx.node_ptr, alloc);
+            }
+        }
+
+        let layout = std::alloc::Layout::new::<RetireCtx<A>>();
+        let raw = allocator.allocate(layout).map_err(|_| ArtError::Oom)?;
+        let ctx = raw.as_ptr() as *mut RetireCtx<A>;
+        unsafe {
+            std::ptr::write(
+                ctx,
+                RetireCtx {
+                    node_ptr,
+                    allocator: allocator.clone(),
+                },
+            );
+            guard.defer_retire(ctx, reclaim::<A>);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_and_unlock<'a, A: Allocator + Send + Clone + 'static>(
+        node: ReadGuard<'a>,
+        parent: (u8, Option<ReadGuard>),
+        val: (u8, NodePtr),
+        allocator: &'a A,
+        guard: &impl Guard,
+    ) -> Result<(), ArtError> {
+        match node.as_ref().get_type() {
+            NodeType::N4 => Self::insert_grow::<Node4, Node16, A>(
+                node.into_typed(),
+                parent,
+                val,
+                allocator,
+                guard,
+            ),
+            NodeType::N16 => Self::insert_grow::<Node16, Node48, A>(
+                node.into_typed(),
+                parent,
+                val,
+                allocator,
+                guard,
+            ),
+            NodeType::N48 => Self::insert_grow::<Node48, Node256, A>(
+                node.into_typed(),
+                parent,
+                val,
+                allocator,
+                guard,
+            ),
+            NodeType::N256 => Self::insert_grow::<Node256, Node256, A>(
+                node.into_typed(),
+                parent,
+                val,
+                allocator,
+                guard,
+            ),
+        }
+    }
+}
