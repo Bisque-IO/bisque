@@ -326,6 +326,92 @@ fn bench_build_freeze_large() -> Vec<BenchResult> {
 }
 
 // ---------------------------------------------------------------------------
+// 9c. Raw alloc+free (isolate mimalloc overhead)
+// ---------------------------------------------------------------------------
+
+fn bench_raw_alloc_free() -> Vec<BenchResult> {
+    let h = heap();
+    let mut r = Vec::new();
+
+    // Just alloc + free via our Heap, no header/Bytes overhead
+    r.push(bench(
+        "bisque raw mi_heap_malloc+free (256B)",
+        DURATION,
+        || {
+            let ptr = h.alloc(256, 8);
+            unsafe { h.dealloc(ptr) };
+            black_box(ptr);
+        },
+    ));
+
+    // Equivalent via global allocator
+    r.push(bench("global mi_malloc+free (256B)", DURATION, || {
+        let ptr = unsafe { bisque_mimalloc_sys::mi_malloc(256) };
+        unsafe { bisque_mimalloc_sys::mi_free(ptr) };
+        black_box(ptr);
+    }));
+
+    // copy_from_slice 256B (full Bytes alloc+copy+drop path)
+    r.push(bench(
+        "bisque Bytes::copy_from_slice (256B)",
+        DURATION,
+        || {
+            let b = bisque_alloc::bytes::Bytes::copy_from_slice(&[0xBB; 256], &h).unwrap();
+            black_box(&b);
+        },
+    ));
+
+    r.push(bench(
+        "bytes  Bytes::copy_from_slice (256B)",
+        DURATION,
+        || {
+            let b = bytes::Bytes::copy_from_slice(&[0xBB; 256]);
+            black_box(&b);
+        },
+    ));
+
+    // BytesMut with_capacity+drop (no extend, no freeze)
+    r.push(bench(
+        "bisque BytesMut::with_capacity+drop (256B)",
+        DURATION,
+        || {
+            let bm = bisque_alloc::bytes::BytesMut::with_capacity(256, &h).unwrap();
+            black_box(&bm[..]);
+        },
+    ));
+    r.push(bench(
+        "bytes  BytesMut::with_capacity+drop (256B)",
+        DURATION,
+        || {
+            let bm = bytes::BytesMut::with_capacity(256);
+            black_box(&bm[..]);
+        },
+    ));
+
+    // BytesMut with_capacity+extend+drop (no freeze)
+    r.push(bench(
+        "bisque BytesMut cap+extend+drop (256B)",
+        DURATION,
+        || {
+            let mut bm = bisque_alloc::bytes::BytesMut::with_capacity(256, &h).unwrap();
+            bm.extend_from_slice(&[0xBB; 256]).unwrap();
+            black_box(&bm[..]);
+        },
+    ));
+    r.push(bench(
+        "bytes  BytesMut cap+extend+drop (256B)",
+        DURATION,
+        || {
+            let mut bm = bytes::BytesMut::with_capacity(256);
+            bm.extend_from_slice(&[0xBB; 256]);
+            black_box(&bm[..]);
+        },
+    ));
+
+    r
+}
+
+// ---------------------------------------------------------------------------
 // 10. BytesMut grow (repeated extend simulating message building)
 // ---------------------------------------------------------------------------
 

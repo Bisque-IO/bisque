@@ -103,10 +103,10 @@ impl Node for Node256 {
         self.base.meta.count += 1;
     }
 
-    fn change(&mut self, key: u8, val: NodePtr) -> NodePtr {
+    fn change(&mut self, key: u8, val: NodePtr) -> Option<NodePtr> {
         let old = self.children[key as usize];
         self.children[key as usize] = val;
-        old
+        Some(old)
     }
 
     fn remove(&mut self, k: u8) {
@@ -116,8 +116,13 @@ impl Node for Node256 {
 
     fn get_child(&self, key: u8) -> Option<NodePtr> {
         if self.get_mask(key as usize) {
-            let child = unsafe { self.children.get_unchecked(key as usize) };
-            Some(*child)
+            // read_volatile prevents the compiler from splitting this 8-byte
+            // read into smaller accesses. On x86_64, aligned 8-byte reads are
+            // hardware-atomic; this ensures the compiler respects that.
+            let child = unsafe {
+                std::ptr::read_volatile(self.children.as_ptr().add(key as usize))
+            };
+            Some(child)
         } else {
             None
         }

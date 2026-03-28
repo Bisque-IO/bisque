@@ -21,9 +21,9 @@ pub(crate) struct HeapArcInner<T> {
 }
 
 /// Bit mask for the slab-allocated flag in the refcount field.
-const SLAB_FLAG: usize = 1 << (usize::BITS - 1); // bit 63
+pub(crate) const SLAB_FLAG: usize = 1 << (usize::BITS - 1); // bit 63
 /// Mask to extract the actual refcount (lower 63 bits).
-const REFCOUNT_MASK: usize = !SLAB_FLAG;
+pub(crate) const REFCOUNT_MASK: usize = !SLAB_FLAG;
 
 /// A thread-safe, atomically reference-counted pointer allocated from a [`Heap`].
 ///
@@ -45,7 +45,7 @@ const REFCOUNT_MASK: usize = !SLAB_FLAG;
 /// assert_eq!(Arc::strong_count(&a), 2);
 /// ```
 pub struct HeapArc<T> {
-    ptr: *mut HeapArcInner<T>,
+    pub(crate) ptr: *mut HeapArcInner<T>,
     heap: Heap,
 }
 

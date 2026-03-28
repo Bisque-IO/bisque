@@ -85,6 +85,7 @@ impl String {
     }
 
     /// Copies a `&str` into a new `String` allocated from the given heap.
+    #[inline]
     pub fn from_str(s: &str, heap: &Heap) -> Result<Self, AllocError> {
         let mut buf = BytesMut::with_capacity(s.len(), heap)?;
         buf.extend_from_slice(s.as_bytes())?;
@@ -187,6 +188,7 @@ impl String {
     /// Removes the last character from the string and returns it.
     ///
     /// Returns `None` if the string is empty.
+    #[inline]
     pub fn pop(&mut self) -> Option<char> {
         let ch = self.chars().next_back()?;
         let new_len = self.len() - ch.len_utf8();
@@ -200,6 +202,7 @@ impl String {
     /// # Panics
     ///
     /// Panics if `idx` is not on a character boundary or is out of bounds.
+    #[inline]
     pub fn remove(&mut self, idx: usize) -> char {
         let ch = match self[idx..].chars().next() {
             Some(ch) => ch,
@@ -879,6 +882,10 @@ mod tests {
         HeapMaster::new(1024 * 1024).unwrap().heap()
     }
 
+    // =================================================================
+    // Constructors
+    // =================================================================
+
     #[test]
     fn new_is_empty() {
         let s = String::new(&heap());
@@ -895,12 +902,211 @@ mod tests {
     }
 
     #[test]
+    fn from_str_empty() {
+        let s = String::from_str("", &heap()).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn with_capacity() {
+        let s = String::with_capacity(100, &heap()).unwrap();
+        assert!(s.capacity() >= 100);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn with_capacity_zero() {
+        let s = String::with_capacity(0, &heap()).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn from_utf8_valid() {
+        let h = heap();
+        let mut buf = BytesMut::with_capacity(5, &h).unwrap();
+        buf.extend_from_slice(b"hello").unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn from_utf8_valid_multibyte() {
+        let h = heap();
+        let mut buf = BytesMut::with_capacity(16, &h).unwrap();
+        buf.extend_from_slice("café".as_bytes()).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(&*s, "café");
+    }
+
+    #[test]
+    fn from_utf8_empty() {
+        let h = heap();
+        let buf = BytesMut::new(&h);
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn from_utf8_invalid() {
+        let h = heap();
+        let mut buf = BytesMut::with_capacity(4, &h).unwrap();
+        buf.extend_from_slice(&[0xff, 0xfe]).unwrap();
+        assert!(String::from_utf8(buf).is_err());
+    }
+
+    #[test]
+    fn from_utf8_unchecked_roundtrip() {
+        let h = heap();
+        let mut buf = BytesMut::with_capacity(5, &h).unwrap();
+        buf.extend_from_slice(b"hello").unwrap();
+        let s = unsafe { String::from_utf8_unchecked(buf) };
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn from_utf8_lossy_clean() {
+        let h = heap();
+        let s = String::from_utf8_lossy(b"hello", &h).unwrap();
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn from_utf8_lossy_with_replacement() {
+        let h = heap();
+        let s = String::from_utf8_lossy(b"hello \xff world", &h).unwrap();
+        assert!(s.contains('\u{FFFD}'));
+        assert!(s.contains("hello"));
+        assert!(s.contains("world"));
+    }
+
+    #[test]
+    fn from_utf8_lossy_empty() {
+        let h = heap();
+        let s = String::from_utf8_lossy(b"", &h).unwrap();
+        assert!(s.is_empty());
+    }
+
+    // =================================================================
+    // Capacity & length
+    // =================================================================
+
+    #[test]
+    fn reserve_grows_capacity() {
+        let mut s = String::new(&heap());
+        s.reserve(100).unwrap();
+        assert!(s.capacity() >= 100);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn reserve_zero_is_noop() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        let cap_before = s.capacity();
+        s.reserve(0).unwrap();
+        assert!(s.capacity() >= cap_before);
+    }
+
+    #[test]
+    fn clear_empties_string() {
+        let mut s = String::from_str("hello world", &heap()).unwrap();
+        assert!(!s.is_empty());
+        s.clear();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.as_str(), "");
+    }
+
+    #[test]
+    fn clear_empty_is_noop() {
+        let mut s = String::new(&heap());
+        s.clear();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn truncate_basic() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.truncate(3);
+        assert_eq!(&*s, "hel");
+    }
+
+    #[test]
+    fn truncate_to_zero() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.truncate(0);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn truncate_to_same_len_is_noop() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.truncate(5);
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn truncate_beyond_len_is_noop() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.truncate(100);
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a char boundary")]
+    fn truncate_not_char_boundary() {
+        let mut s = String::from_str("café", &heap()).unwrap();
+        s.truncate(4); // 'é' is 2 bytes, byte 4 is mid-character
+    }
+
+    #[test]
+    fn shrink_to_basic() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.shrink_to(3);
+        assert_eq!(&*s, "hel");
+    }
+
+    #[test]
+    fn shrink_to_beyond_len_is_noop() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.shrink_to(100);
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn shrink_to_zero() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.shrink_to(0);
+        assert!(s.is_empty());
+    }
+
+    // =================================================================
+    // Mutation — push / pop
+    // =================================================================
+
+    #[test]
     fn push_and_push_str() {
         let mut s = String::new(&heap());
         s.push_str("hello").unwrap();
         s.push(' ').unwrap();
         s.push_str("world").unwrap();
         assert_eq!(&*s, "hello world");
+    }
+
+    #[test]
+    fn push_str_empty() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.push_str("").unwrap();
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn push_multibyte_char() {
+        let mut s = String::new(&heap());
+        s.push('🦀').unwrap(); // 4-byte emoji
+        s.push('é').unwrap(); // 2-byte
+        s.push('日').unwrap(); // 3-byte
+        assert_eq!(&*s, "🦀é日");
+        assert_eq!(s.len(), 4 + 2 + 3);
     }
 
     #[test]
@@ -918,10 +1124,58 @@ mod tests {
     }
 
     #[test]
+    fn pop_single_char() {
+        let mut s = String::from_str("x", &heap()).unwrap();
+        assert_eq!(s.pop(), Some('x'));
+        assert!(s.is_empty());
+        assert_eq!(s.pop(), None);
+    }
+
+    #[test]
+    fn pop_4byte_char() {
+        let mut s = String::from_str("🦀", &heap()).unwrap();
+        assert_eq!(s.pop(), Some('🦀'));
+        assert!(s.is_empty());
+    }
+
+    // =================================================================
+    // Mutation — remove / insert
+    // =================================================================
+
+    #[test]
     fn remove_char() {
         let mut s = String::from_str("hello", &heap()).unwrap();
         assert_eq!(s.remove(1), 'e');
         assert_eq!(&*s, "hllo");
+    }
+
+    #[test]
+    fn remove_first() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        assert_eq!(s.remove(0), 'h');
+        assert_eq!(&*s, "ello");
+    }
+
+    #[test]
+    fn remove_last() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        assert_eq!(s.remove(4), 'o');
+        assert_eq!(&*s, "hell");
+    }
+
+    #[test]
+    fn remove_multibyte() {
+        let mut s = String::from_str("aéb", &heap()).unwrap();
+        // 'a' = byte 0, 'é' = bytes 1-2, 'b' = byte 3
+        assert_eq!(s.remove(1), 'é');
+        assert_eq!(&*s, "ab");
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot remove")]
+    fn remove_at_end_panics() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.remove(5); // past the end
     }
 
     #[test]
@@ -932,6 +1186,35 @@ mod tests {
     }
 
     #[test]
+    fn insert_at_start() {
+        let mut s = String::from_str("ello", &heap()).unwrap();
+        s.insert(0, 'h').unwrap();
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn insert_at_end() {
+        let mut s = String::from_str("hell", &heap()).unwrap();
+        s.insert(4, 'o').unwrap();
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn insert_multibyte() {
+        let mut s = String::from_str("ab", &heap()).unwrap();
+        s.insert(1, '🦀').unwrap();
+        assert_eq!(&*s, "a🦀b");
+    }
+
+    #[test]
+    #[should_panic]
+    fn insert_not_char_boundary_panics() {
+        let mut s = String::from_str("café", &heap()).unwrap();
+        // 'é' starts at byte 3 (c=0, a=1, f=2, é=3-4), so byte 4 is mid-char
+        let _ = s.insert(4, 'x');
+    }
+
+    #[test]
     fn insert_str() {
         let mut s = String::from_str("hd", &heap()).unwrap();
         s.insert_str(1, "ello worl").unwrap();
@@ -939,18 +1222,36 @@ mod tests {
     }
 
     #[test]
-    fn truncate() {
+    fn insert_str_empty() {
         let mut s = String::from_str("hello", &heap()).unwrap();
-        s.truncate(3);
-        assert_eq!(&*s, "hel");
+        s.insert_str(3, "").unwrap();
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn insert_str_at_start() {
+        let mut s = String::from_str("world", &heap()).unwrap();
+        s.insert_str(0, "hello ").unwrap();
+        assert_eq!(&*s, "hello world");
+    }
+
+    #[test]
+    fn insert_str_at_end() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.insert_str(5, " world").unwrap();
+        assert_eq!(&*s, "hello world");
     }
 
     #[test]
     #[should_panic]
-    fn truncate_not_char_boundary() {
+    fn insert_str_not_char_boundary_panics() {
         let mut s = String::from_str("café", &heap()).unwrap();
-        s.truncate(4); // 'é' is 2 bytes, so byte 4 is mid-character
+        let _ = s.insert_str(4, "x");
     }
+
+    // =================================================================
+    // Mutation — retain / drain / replace_range
+    // =================================================================
 
     #[test]
     fn retain() {
@@ -960,11 +1261,104 @@ mod tests {
     }
 
     #[test]
+    fn retain_all() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.retain(|_| true);
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn retain_none() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.retain(|_| false);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn retain_empty() {
+        let mut s = String::new(&heap());
+        s.retain(|_| panic!("should not be called"));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn retain_multibyte() {
+        let mut s = String::from_str("a🦀bé c", &heap()).unwrap();
+        s.retain(|c| c.is_ascii());
+        assert_eq!(&*s, "ab c");
+    }
+
+    #[test]
     fn drain_range() {
         let mut s = String::from_str("hello world", &heap()).unwrap();
         let drained = s.drain(5..11);
         assert_eq!(drained.as_str(), " world");
         assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn drain_from_start() {
+        let mut s = String::from_str("hello world", &heap()).unwrap();
+        let drained = s.drain(0..6);
+        assert_eq!(drained.as_str(), "hello ");
+        assert_eq!(&*s, "world");
+    }
+
+    #[test]
+    fn drain_empty_range() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        let drained = s.drain(2..2);
+        assert_eq!(drained.as_str(), "");
+        assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn drain_entire_string() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        let drained = s.drain(0..5);
+        assert_eq!(drained.as_str(), "hello");
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn drain_result_iterator() {
+        let mut s = String::from_str("hello world", &heap()).unwrap();
+        let drained = s.drain(0..5);
+        let chars: Vec<char> = drained.collect();
+        assert_eq!(chars, vec!['h', 'e', 'l', 'l', 'o']);
+    }
+
+    #[test]
+    fn drain_result_size_hint() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        let drained = s.drain(0..5);
+        let (lo, hi) = drained.size_hint();
+        assert!(lo >= 1);
+        assert_eq!(hi, Some(5));
+    }
+
+    #[test]
+    fn drain_result_into_string() {
+        let mut s = String::from_str("hello world", &heap()).unwrap();
+        let drained = s.drain(6..11);
+        let std_s = drained.into_string();
+        assert_eq!(std_s, "world");
+    }
+
+    #[test]
+    fn drain_result_display() {
+        let mut s = String::from_str("hello world", &heap()).unwrap();
+        let drained = s.drain(0..5);
+        assert_eq!(format!("{drained}"), "hello");
+    }
+
+    #[test]
+    fn drain_result_partial_iteration_then_as_str() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        let mut drained = s.drain(0..5);
+        assert_eq!(drained.next(), Some('h'));
+        assert_eq!(drained.next(), Some('e'));
+        assert_eq!(drained.as_str(), "llo");
     }
 
     #[test]
@@ -989,11 +1383,90 @@ mod tests {
     }
 
     #[test]
-    fn with_capacity() {
-        let s = String::with_capacity(100, &heap()).unwrap();
-        assert!(s.capacity() >= 100);
-        assert!(s.is_empty());
+    fn replace_range_empty_replacement() {
+        let mut s = String::from_str("hello world", &heap()).unwrap();
+        s.replace_range(5..6, "").unwrap();
+        assert_eq!(&*s, "helloworld");
     }
+
+    #[test]
+    fn replace_range_empty_range() {
+        let mut s = String::from_str("helloworld", &heap()).unwrap();
+        s.replace_range(5..5, " ").unwrap();
+        assert_eq!(&*s, "hello world");
+    }
+
+    #[test]
+    fn replace_range_at_start() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.replace_range(0..1, "H").unwrap();
+        assert_eq!(&*s, "Hello");
+    }
+
+    #[test]
+    fn replace_range_at_end() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.replace_range(4..5, "O").unwrap();
+        assert_eq!(&*s, "hellO");
+    }
+
+    #[test]
+    #[should_panic]
+    fn replace_range_not_char_boundary_start() {
+        let mut s = String::from_str("café", &heap()).unwrap();
+        let _ = s.replace_range(4..5, "x"); // mid-char
+    }
+
+    // =================================================================
+    // Conversions
+    // =================================================================
+
+    #[test]
+    fn into_bytes() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        let b: Bytes = s.into_bytes();
+        assert_eq!(b.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn into_bytes_mut() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        let mut b: BytesMut = s.into_bytes_mut();
+        b.extend_from_slice(b" world").unwrap();
+        assert_eq!(b.as_slice(), b"hello world");
+    }
+
+    #[test]
+    fn as_bytes_roundtrip() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        assert_eq!(s.as_bytes(), b"hello");
+    }
+
+    #[test]
+    fn as_str_and_as_mut_str() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        assert_eq!(s.as_str(), "hello");
+        s.as_mut_str().make_ascii_uppercase();
+        assert_eq!(s.as_str(), "HELLO");
+    }
+
+    #[test]
+    fn from_string_into_bytes_mut() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        let b: BytesMut = BytesMut::from(s);
+        assert_eq!(b.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn from_string_into_bytes_immutable() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        let b: Bytes = Bytes::from(s);
+        assert_eq!(b.as_slice(), b"hello");
+    }
+
+    // =================================================================
+    // Clone
+    // =================================================================
 
     #[test]
     fn clone_is_independent() {
@@ -1005,34 +1478,196 @@ mod tests {
     }
 
     #[test]
-    fn from_utf8_valid() {
+    fn clone_empty() {
+        let s = String::new(&heap());
+        let s2 = s.clone();
+        assert!(s2.is_empty());
+    }
+
+    #[test]
+    fn clone_heap_backed() {
+        // Force heap allocation with a large string (> 22 bytes SBO threshold)
         let h = heap();
-        let mut buf = BytesMut::with_capacity(5, &h).unwrap();
-        buf.extend_from_slice(b"hello").unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert_eq!(&*s, "hello");
+        let long = "this string is definitely longer than twenty-two bytes";
+        let s = String::from_str(long, &h).unwrap();
+        let s2 = s.clone();
+        assert_eq!(&*s, long);
+        assert_eq!(&*s2, long);
+    }
+
+    // =================================================================
+    // Deref / DerefMut
+    // =================================================================
+
+    #[test]
+    fn deref_gives_str_methods() {
+        let s = String::from_str("hello world", &heap()).unwrap();
+        assert!(s.contains("world"));
+        assert!(s.starts_with("hello"));
+        assert!(s.ends_with("world"));
+        assert_eq!(s.find('w'), Some(6));
     }
 
     #[test]
-    fn from_utf8_invalid() {
+    fn deref_mut_allows_in_place_mutation() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s.make_ascii_uppercase();
+        assert_eq!(&*s, "HELLO");
+    }
+
+    // =================================================================
+    // AsRef / AsMut / Borrow / BorrowMut
+    // =================================================================
+
+    #[test]
+    fn as_ref_str() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        let r: &str = s.as_ref();
+        assert_eq!(r, "hello");
+    }
+
+    #[test]
+    fn as_ref_bytes() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        let r: &[u8] = s.as_ref();
+        assert_eq!(r, b"hello");
+    }
+
+    #[test]
+    fn as_mut_str_trait() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        let r: &mut str = s.as_mut();
+        r.make_ascii_uppercase();
+        assert_eq!(&*s, "HELLO");
+    }
+
+    #[test]
+    fn borrow_str() {
+        use std::borrow::Borrow;
+        let s = String::from_str("hello", &heap()).unwrap();
+        let r: &str = s.borrow();
+        assert_eq!(r, "hello");
+    }
+
+    #[test]
+    fn borrow_mut_str() {
+        use std::borrow::BorrowMut;
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        let r: &mut str = s.borrow_mut();
+        r.make_ascii_uppercase();
+        assert_eq!(&*s, "HELLO");
+    }
+
+    #[test]
+    fn borrow_works_with_hashmap() {
+        use std::collections::HashMap;
         let h = heap();
-        let mut buf = BytesMut::with_capacity(4, &h).unwrap();
-        buf.extend_from_slice(&[0xff, 0xfe]).unwrap();
-        assert!(String::from_utf8(buf).is_err());
+        let mut map = HashMap::new();
+        let key = String::from_str("hello", &h).unwrap();
+        map.insert(key, 42);
+        // Look up by &str thanks to Borrow<str>
+        assert_eq!(map.get("hello"), Some(&42));
+    }
+
+    // =================================================================
+    // Index / IndexMut
+    // =================================================================
+
+    #[test]
+    fn index_range() {
+        let s = String::from_str("hello world", &heap()).unwrap();
+        assert_eq!(&s[0..5], "hello");
     }
 
     #[test]
-    fn into_bytes() {
-        let s = String::from_str("hello", &heap()).unwrap();
-        let b: Bytes = s.into_bytes();
-        assert_eq!(b.as_slice(), b"hello");
+    fn index_range_from() {
+        let s = String::from_str("hello world", &heap()).unwrap();
+        assert_eq!(&s[6..], "world");
     }
 
     #[test]
-    fn display_and_debug() {
+    fn index_range_to() {
+        let s = String::from_str("hello world", &heap()).unwrap();
+        assert_eq!(&s[..5], "hello");
+    }
+
+    #[test]
+    fn index_range_inclusive() {
         let s = String::from_str("hello", &heap()).unwrap();
-        assert_eq!(format!("{s}"), "hello");
-        assert_eq!(format!("{s:?}"), "\"hello\"");
+        assert_eq!(&s[0..=4], "hello");
+        assert_eq!(&s[1..=3], "ell");
+    }
+
+    #[test]
+    fn index_range_to_inclusive() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        assert_eq!(&s[..=2], "hel");
+    }
+
+    #[test]
+    fn index_range_full() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        assert_eq!(&s[..], "hello");
+    }
+
+    #[test]
+    fn index_mut_range() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s[0..5].make_ascii_uppercase();
+        assert_eq!(&*s, "HELLO");
+    }
+
+    #[test]
+    fn index_mut_range_from() {
+        let mut s = String::from_str("hello world", &heap()).unwrap();
+        s[6..].make_ascii_uppercase();
+        assert_eq!(&*s, "hello WORLD");
+    }
+
+    #[test]
+    fn index_mut_range_to() {
+        let mut s = String::from_str("hello world", &heap()).unwrap();
+        s[..5].make_ascii_uppercase();
+        assert_eq!(&*s, "HELLO world");
+    }
+
+    #[test]
+    fn index_mut_range_inclusive() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s[1..=3].make_ascii_uppercase();
+        assert_eq!(&*s, "hELLo");
+    }
+
+    #[test]
+    fn index_mut_range_to_inclusive() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s[..=2].make_ascii_uppercase();
+        assert_eq!(&*s, "HELlo");
+    }
+
+    #[test]
+    fn index_mut_range_full() {
+        let mut s = String::from_str("hello", &heap()).unwrap();
+        s[..].make_ascii_uppercase();
+        assert_eq!(&*s, "HELLO");
+    }
+
+    // =================================================================
+    // Comparison traits
+    // =================================================================
+
+    #[test]
+    fn eq_self() {
+        let a = String::from_str("hello", &heap()).unwrap();
+        let b = String::from_str("hello", &heap()).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ne_self() {
+        let a = String::from_str("hello", &heap()).unwrap();
+        let b = String::from_str("world", &heap()).unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -1044,12 +1679,108 @@ mod tests {
     }
 
     #[test]
+    fn eq_with_str_ref() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        let r: &str = "hello";
+        assert!(s == r);
+        assert!(r == s);
+    }
+
+    #[test]
     fn eq_with_std_string() {
         let s = String::from_str("hello", &heap()).unwrap();
         let std_s = std::string::String::from("hello");
         assert_eq!(s, std_s);
         assert_eq!(std_s, s);
     }
+
+    #[test]
+    fn eq_with_cow() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        let cow: Cow<str> = Cow::Borrowed("hello");
+        assert!(s == cow);
+        assert!(cow == s);
+
+        let cow_owned: Cow<str> = Cow::Owned("hello".into());
+        assert!(s == cow_owned);
+        assert!(cow_owned == s);
+    }
+
+    #[test]
+    fn ord_and_hash() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let a = String::from_str("abc", &heap()).unwrap();
+        let b = String::from_str("xyz", &heap()).unwrap();
+        assert!(a < b);
+        assert!(b > a);
+
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        a.hash(&mut h1);
+        "abc".hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn partial_ord_with_str() {
+        let s = String::from_str("banana", &heap()).unwrap();
+        assert!(s > *"apple");
+        assert!(s < *"cherry");
+        assert!(*"apple" < s);
+        assert!(*"cherry" > s);
+    }
+
+    #[test]
+    fn partial_ord_equal() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        assert_eq!(s.partial_cmp(&*"hello"), Some(cmp::Ordering::Equal));
+    }
+
+    // =================================================================
+    // Display / Debug / fmt::Write
+    // =================================================================
+
+    #[test]
+    fn display_and_debug() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        assert_eq!(format!("{s}"), "hello");
+        assert_eq!(format!("{s:?}"), "\"hello\"");
+    }
+
+    #[test]
+    fn display_empty() {
+        let s = String::new(&heap());
+        assert_eq!(format!("{s}"), "");
+    }
+
+    #[test]
+    fn debug_with_escapes() {
+        let s = String::from_str("hello\nworld", &heap()).unwrap();
+        assert_eq!(format!("{s:?}"), "\"hello\\nworld\"");
+    }
+
+    #[test]
+    fn fmt_write() {
+        use std::fmt::Write;
+        let mut s = String::new(&heap());
+        write!(s, "hello {}", 42).unwrap();
+        assert_eq!(&*s, "hello 42");
+    }
+
+    #[test]
+    fn fmt_write_char() {
+        use std::fmt::Write;
+        let mut s = String::new(&heap());
+        s.write_char('🦀').unwrap();
+        s.write_char('!').unwrap();
+        assert_eq!(&*s, "🦀!");
+    }
+
+    // =================================================================
+    // Add / AddAssign
+    // =================================================================
 
     #[test]
     fn add_and_add_assign() {
@@ -1063,10 +1794,29 @@ mod tests {
     }
 
     #[test]
+    fn add_empty() {
+        let s = String::from_str("hello", &heap()).unwrap();
+        let s2 = s + "";
+        assert_eq!(&*s2, "hello");
+    }
+
+    // =================================================================
+    // Extend
+    // =================================================================
+
+    #[test]
     fn extend_chars() {
         let mut s = String::new(&heap());
         s.extend(['h', 'e', 'l', 'l', 'o']);
         assert_eq!(&*s, "hello");
+    }
+
+    #[test]
+    fn extend_char_refs() {
+        let mut s = String::new(&heap());
+        let chars = ['h', 'i'];
+        s.extend(chars.iter());
+        assert_eq!(&*s, "hi");
     }
 
     #[test]
@@ -1077,12 +1827,25 @@ mod tests {
     }
 
     #[test]
-    fn fmt_write() {
-        use std::fmt::Write;
+    fn extend_std_strings() {
         let mut s = String::new(&heap());
-        write!(s, "hello {}", 42).unwrap();
-        assert_eq!(&*s, "hello 42");
+        s.extend(vec![
+            std::string::String::from("hello"),
+            std::string::String::from(" world"),
+        ]);
+        assert_eq!(&*s, "hello world");
     }
+
+    #[test]
+    fn extend_cow_strs() {
+        let mut s = String::new(&heap());
+        s.extend(vec![Cow::Borrowed("hello"), Cow::Owned(" world".into())]);
+        assert_eq!(&*s, "hello world");
+    }
+
+    // =================================================================
+    // IntoIterator
+    // =================================================================
 
     #[test]
     fn into_iterator() {
@@ -1092,15 +1855,54 @@ mod tests {
     }
 
     #[test]
-    fn index_range() {
-        let s = String::from_str("hello world", &heap()).unwrap();
-        assert_eq!(&s[0..5], "hello");
-        assert_eq!(&s[6..], "world");
-        assert_eq!(&s[..5], "hello");
+    fn into_iterator_ref() {
+        let s = String::from_str("hi", &heap()).unwrap();
+        let chars: Vec<char> = (&s).into_iter().collect();
+        assert_eq!(chars, vec!['h', 'i']);
+        // s is still usable
+        assert_eq!(&*s, "hi");
+    }
+
+    // =================================================================
+    // FromUtf8Error
+    // =================================================================
+
+    #[test]
+    fn from_utf8_error_into_bytes() {
+        let h = heap();
+        let mut buf = BytesMut::with_capacity(4, &h).unwrap();
+        buf.extend_from_slice(&[0xff, 0xfe, 0x41]).unwrap();
+        let err = String::from_utf8(buf).unwrap_err();
+        let recovered = err.into_bytes();
+        assert_eq!(recovered.as_slice(), &[0xff, 0xfe, 0x41]);
     }
 
     #[test]
-    fn multibyte_chars() {
+    fn from_utf8_error_utf8_error() {
+        let h = heap();
+        let mut buf = BytesMut::with_capacity(4, &h).unwrap();
+        buf.extend_from_slice(&[0xff, 0xfe]).unwrap();
+        let err = String::from_utf8(buf).unwrap_err();
+        let utf8_err = err.utf8_error();
+        assert_eq!(utf8_err.valid_up_to(), 0);
+    }
+
+    #[test]
+    fn from_utf8_error_display() {
+        let h = heap();
+        let mut buf = BytesMut::with_capacity(4, &h).unwrap();
+        buf.extend_from_slice(&[0xff]).unwrap();
+        let err = String::from_utf8(buf).unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.is_empty());
+    }
+
+    // =================================================================
+    // Multibyte & emoji (4-byte chars)
+    // =================================================================
+
+    #[test]
+    fn multibyte_3byte_chars() {
         let mut s = String::from_str("こんにちは", &heap()).unwrap();
         assert_eq!(s.len(), 15); // 5 × 3 bytes
         assert_eq!(s.pop(), Some('は'));
@@ -1108,25 +1910,80 @@ mod tests {
     }
 
     #[test]
-    fn from_utf8_lossy() {
-        let h = heap();
-        let s = String::from_utf8_lossy(b"hello \xff world", &h).unwrap();
-        assert!(s.contains('\u{FFFD}'));
+    fn emoji_4byte_operations() {
+        let mut s = String::from_str("🦀🐍🐹", &heap()).unwrap();
+        assert_eq!(s.len(), 12); // 3 × 4 bytes
+        assert_eq!(s.remove(0), '🦀');
+        assert_eq!(&*s, "🐍🐹");
+        s.insert(0, '🐧').unwrap();
+        assert_eq!(&*s, "🐧🐍🐹");
     }
 
     #[test]
-    fn ord_and_hash() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    fn mixed_byte_width_retain() {
+        let mut s = String::from_str("a🦀b🐍c", &heap()).unwrap();
+        s.retain(|c| c.len_utf8() == 1); // keep only ASCII
+        assert_eq!(&*s, "abc");
+    }
 
-        let a = String::from_str("abc", &heap()).unwrap();
-        let b = String::from_str("xyz", &heap()).unwrap();
-        assert!(a < b);
+    #[test]
+    fn mixed_byte_width_drain() {
+        let mut s = String::from_str("hello🦀world", &heap()).unwrap();
+        let drained = s.drain(5..9); // drain the 4-byte emoji
+        assert_eq!(drained.as_str(), "🦀");
+        assert_eq!(&*s, "helloworld");
+    }
 
-        let mut h1 = DefaultHasher::new();
-        let mut h2 = DefaultHasher::new();
-        a.hash(&mut h1);
-        "abc".hash(&mut h2);
-        assert_eq!(h1.finish(), h2.finish());
+    #[test]
+    fn replace_range_multibyte() {
+        let mut s = String::from_str("café", &heap()).unwrap();
+        // 'é' is at bytes 3..5
+        s.replace_range(3..5, "e").unwrap();
+        assert_eq!(&*s, "cafe");
+    }
+
+    // =================================================================
+    // SBO boundary (inline → heap promotion)
+    // =================================================================
+
+    #[test]
+    fn sbo_to_heap_transition() {
+        // BytesMut SBO threshold is 22 bytes
+        let mut s = String::new(&heap());
+        // Start inline
+        s.push_str("12345678901234567890").unwrap(); // 20 bytes, inline
+        assert_eq!(s.len(), 20);
+        // Push past SBO
+        s.push_str("abcdefghij").unwrap(); // now 30 bytes, heap
+        assert_eq!(s.len(), 30);
+        assert_eq!(&*s, "12345678901234567890abcdefghij");
+    }
+
+    #[test]
+    fn heap_backed_string_all_operations() {
+        let h = heap();
+        let long = "this string is definitely longer than twenty-two bytes of sbo";
+        let mut s = String::from_str(long, &h).unwrap();
+        assert_eq!(&*s, long);
+
+        // Mutate
+        s.push('!').unwrap();
+        assert!(s.ends_with('!'));
+
+        // Pop
+        assert_eq!(s.pop(), Some('!'));
+
+        // Retain
+        let len_before = s.len();
+        s.retain(|c| c != 'z'); // no z's to remove, length unchanged
+        assert_eq!(s.len(), len_before);
+
+        // Clone
+        let s2 = s.clone();
+        assert_eq!(&*s, &*s2);
+
+        // Into bytes
+        let b = s.into_bytes();
+        assert_eq!(b.as_slice(), long.as_bytes());
     }
 }

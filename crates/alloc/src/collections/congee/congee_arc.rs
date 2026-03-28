@@ -26,7 +26,7 @@ unsafe fn arc_from_usize<V>(v: usize) -> Arc<V> {
 ///
 /// # Safety
 /// `ptr` must have been obtained from [`Arc::into_raw`].
-unsafe fn reclaim_arc<V>(ptr: *mut V, _collector: &seize::Collector) {
+unsafe fn reclaim_arc<V>(ptr: *mut V, _collector: &crate::epoch::Collector) {
     unsafe {
         drop(Arc::from_raw(ptr));
     }
@@ -339,7 +339,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seize::Guard as _;
+    use crate::epoch::Guard as _;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 

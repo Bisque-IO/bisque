@@ -38,6 +38,7 @@ pub mod collections;
 pub mod epoch;
 pub mod heap;
 pub mod padded;
+pub mod slab;
 pub mod string;
 pub mod striped;
 pub mod tlrc;
@@ -47,8 +48,9 @@ pub mod wait_queue;
 pub use arc::HeapArc;
 pub use boxed::HeapBox;
 pub use bytes::{Bytes, BytesMut};
-pub use collections::{HashMap, HashSet, art::Art, art::Guard};
+pub use collections::{HashMap, HashSet, art::Art};
 pub use epoch::{EpochBox, EpochRef};
+pub use epoch::heap::{Collector as HeapCollector, Epoch, EpochGuard as HeapEpochGuard};
 pub use heap::{Heap, HeapMaster};
 pub use padded::CachePadded;
 pub use string::String;
@@ -58,7 +60,7 @@ pub use vec::Vec;
 pub type HeapBytes = bytes::Bytes;
 pub type HeapBytesMut = bytes::BytesMut;
 pub type HeapString = string::String;
-pub type HeapVec = vec::Vec;
+pub type HeapVec = vec::Vec<u8>;
 
 /// Re-export the mimalloc global allocator for use as `#[global_allocator]`.
 pub use bisque_mimalloc_sys::MiMalloc;

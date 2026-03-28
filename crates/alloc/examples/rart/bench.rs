@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use bisque_alloc::collections::art::Art as ArtRaw;
 use bisque_alloc::collections::congee::DefaultAllocator;
+use bisque_alloc::collections::art::Art as MvccArt;
 use bisque_alloc::collections::rart::cow_tree::CowTree;
 use bisque_alloc::collections::rart::keys::array_key::ArrayKey;
 use bisque_alloc::collections::rart::keys::u64_key::U64Key;
@@ -198,6 +199,16 @@ fn main() {
         println!("Memory usage after: {}", master.memory_usage());
     }
 
+    r.push(bench("MvccArt (COW)", n, DUR, || {
+        let tree = MvccArt::<usize, usize>::new(&master);
+        let mut txn = tree.write();
+        for &k in &seq_keys {
+            txn.insert(k as usize, k as usize).unwrap();
+        }
+        txn.commit().unwrap();
+        black_box(&tree);
+    }));
+
     r.push(bench("scc::HashMap", n, DUR, || {
         let map = scc::HashMap::<u64, u64>::new();
         for &k in &seq_keys {
@@ -274,6 +285,16 @@ fn main() {
             black_box(&tree);
         }));
     }
+
+    r.push(bench("MvccArt (COW)", n, DUR, || {
+        let tree = MvccArt::<usize, usize>::new(&master);
+        let mut txn = tree.write();
+        for &k in &rand_keys {
+            txn.insert(k as usize, k as usize).unwrap();
+        }
+        txn.commit().unwrap();
+        black_box(&tree);
+    }));
 
     r.push(bench("scc::HashMap", n, DUR, || {
         let map = scc::HashMap::<u64, u64>::new();
@@ -404,6 +425,22 @@ fn main() {
     }
 
     {
+        let tree = MvccArt::<usize, usize>::new(&master);
+        {
+            let mut txn = tree.write();
+            for &k in &seq_keys {
+                txn.insert(k as usize, k as usize).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        r.push(bench("MvccArt (COW)", n, DUR, || {
+            for &k in &seq_keys {
+                black_box(tree.get(&(k as usize)));
+            }
+        }));
+    }
+
+    {
         let map = scc::HashMap::<u64, u64>::new();
         for &k in &seq_keys {
             let _ = map.insert_sync(k, k);
@@ -509,6 +546,22 @@ fn main() {
             let guard = tree.pin();
             for &k in &lookup {
                 black_box(tree.get(&(k as usize), &guard));
+            }
+        }));
+    }
+
+    {
+        let tree = MvccArt::<usize, usize>::new(&master);
+        {
+            let mut txn = tree.write();
+            for &k in &rand_keys {
+                txn.insert(k as usize, k as usize).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        r.push(bench("MvccArt (COW)", n, DUR, || {
+            for &k in &lookup {
+                black_box(tree.get(&(k as usize)));
             }
         }));
     }
@@ -858,6 +911,67 @@ fn main() {
         let reader_mops = total_reader_ops as f64 / elapsed.as_secs_f64() / 1_000_000.0;
         let writer_mops = total_writer_ops as f64 / elapsed.as_secs_f64() / 1_000_000.0;
         println!("  Art (Heap+OLC, epoch-based):");
+        println!("    Reader throughput: {reader_mops:>8.2} Mops/s ({num_readers} threads)");
+        println!("    Writer throughput: {writer_mops:>8.2} Mops/s (1 thread)");
+        println!("    Wall time:         {:>8.1} ms\n", elapsed.as_millis());
+    }
+
+    // --- MvccArt: MVCC snapshot readers, writer does batched COW ---
+    {
+        let tree = std::sync::Arc::new(MvccArt::<usize, usize>::new(&master));
+        {
+            let mut txn = tree.write();
+            for &k in &seq_keys {
+                txn.insert(k as usize, k as usize).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let iters = 20u64;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let mut handles = Vec::new();
+
+            for _ in 0..num_readers {
+                let tree = tree.clone();
+                let lookup = reader_lookup.clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut found = 0u64;
+                    let snap = tree.snapshot(); // one atomic sequence
+                    for &k in &lookup {
+                        if snap.get(&(k as usize)).is_some() {
+                            found += 1; // zero atomics per read
+                        }
+                    }
+                    found
+                }));
+            }
+
+            {
+                let mut txn = tree.write();
+                for &k in &writer_keys {
+                    txn.insert(k as usize, k as usize).unwrap();
+                }
+                txn.commit().unwrap();
+            }
+
+            for h in handles {
+                black_box(h.join().unwrap());
+            }
+            {
+                let mut txn = tree.write();
+                for &k in &writer_keys {
+                    txn.remove(&(k as usize)).unwrap();
+                }
+                txn.commit().unwrap();
+            }
+        }
+        let elapsed = start.elapsed();
+        let total_reader_ops = iters * num_readers as u64 * reader_lookup.len() as u64;
+        let total_writer_ops = iters * writer_keys.len() as u64;
+        let reader_mops = total_reader_ops as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+        let writer_mops = total_writer_ops as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+        println!("  MvccArt (COW path-copy, MVCC snapshots):");
         println!("    Reader throughput: {reader_mops:>8.2} Mops/s ({num_readers} threads)");
         println!("    Writer throughput: {writer_mops:>8.2} Mops/s (1 thread)");
         println!("    Wall time:         {:>8.1} ms\n", elapsed.as_millis());

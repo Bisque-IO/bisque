@@ -1,7 +1,7 @@
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use seize::Guard;
+use crate::epoch::Guard;
 
 use super::{
     Allocator,
@@ -60,7 +60,7 @@ pub(crate) trait Node {
     fn base(&self) -> &BaseNode;
     fn is_full(&self) -> bool;
     fn insert(&mut self, key: u8, node: NodePtr);
-    fn change(&mut self, key: u8, val: NodePtr) -> NodePtr;
+    fn change(&mut self, key: u8, val: NodePtr) -> Option<NodePtr>;
     fn get_child(&self, key: u8) -> Option<NodePtr>;
     fn get_children(&self, start: u8, end: u8) -> NodeIter<'_>;
     fn remove(&mut self, k: u8);
@@ -169,7 +169,7 @@ macro_rules! gen_method_mut {
 gen_method!(get_child, (k: u8), Option<NodePtr>);
 gen_method!(get_children, (start: u8, end: u8), NodeIter<'_>);
 
-gen_method_mut!(change, (key: u8, val: NodePtr), NodePtr);
+gen_method_mut!(change, (key: u8, val: NodePtr), Option<NodePtr>);
 gen_method_mut!(remove, (key: u8), ());
 
 impl BaseNode {
@@ -298,7 +298,7 @@ impl BaseNode {
     }
 
     pub(crate) fn value_count(&self) -> usize {
-        self.meta.count as usize
+        unsafe { std::ptr::read_volatile(&self.meta.count as *const u16) as usize }
     }
 
     fn is_obsolete(version: usize) -> bool {
@@ -306,11 +306,13 @@ impl BaseNode {
     }
 
     pub(crate) fn prefix(&self) -> &[u8] {
-        unsafe {
-            self.meta
-                .prefix
-                .get_unchecked(..self.meta.prefix_cnt as usize)
-        }
+        // read_volatile on prefix_cnt to prevent compiler from caching a
+        // stale value across the OLC validation window.
+        let cnt = unsafe {
+            std::ptr::read_volatile(&self.meta.prefix_cnt as *const u32) as usize
+        };
+        let cnt = cnt.min(MAX_KEY_LEN);
+        unsafe { self.meta.prefix.get_unchecked(..cnt) }
     }
 
     pub(crate) fn insert_grow<CurT: Node, BiggerT: Node, A: Allocator + Send + Clone + 'static>(
@@ -344,7 +346,17 @@ impl BaseNode {
         write_n.as_ref().copy_to(n_big.as_mut());
         n_big.as_mut().insert(val.0, val.1);
 
-        write_p.as_mut().change(parent.0, n_big.into_note_ptr());
+        // Convert to NodePtr only after change() confirms the key exists.
+        // If change() returns None (key not found — race condition), n_big's
+        // AllocatedNode drops here, freeing the memory instead of leaking.
+        let n_big_ptr = NodePtr::from_node(n_big.as_mut().base());
+        if write_p.as_mut().change(parent.0, n_big_ptr).is_none() {
+            // n_big is dropped here (AllocatedNode::Drop frees memory)
+            return Err(ArtError::VersionNotMatch);
+        }
+        // change() succeeded — the parent now owns n_big. Forget the
+        // AllocatedNode to prevent double-free.
+        std::mem::forget(n_big);
 
         write_n.mark_obsolete();
         let node_ptr = NonNull::new(write_n.as_mut() as *mut CurT as *mut BaseNode).unwrap();
@@ -360,7 +372,7 @@ impl BaseNode {
 
         unsafe fn reclaim<A: Allocator + Clone + Send + 'static>(
             ptr: *mut RetireCtx<A>,
-            _collector: &seize::Collector,
+            _collector: &crate::epoch::Collector,
         ) {
             unsafe {
                 let ctx = std::ptr::read(ptr);

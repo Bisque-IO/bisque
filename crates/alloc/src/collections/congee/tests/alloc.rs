@@ -43,9 +43,9 @@ impl Allocator for SmallAllocator {
         }
     }
 
-    fn collector(&self) -> &seize::Collector {
-        static COLLECTOR: std::sync::LazyLock<seize::Collector> =
-            std::sync::LazyLock::new(seize::Collector::new);
+    fn collector(&self) -> &crate::epoch::Collector {
+        static COLLECTOR: std::sync::LazyLock<crate::epoch::Collector> =
+            std::sync::LazyLock::new(crate::epoch::Collector::new);
         &COLLECTOR
     }
 }

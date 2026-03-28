@@ -9,35 +9,20 @@ license = "MIT"
 arc-swap = "1"
 bisque-mimalloc-sys = { path = "mimalloc-sys" }
 bytes = "1"
-congee = "0.4"
 crossbeam-epoch = "0.9"
+crossbeam-utils = "0.8"
+crossbeam-queue = "0.3"
+crossfire = "3.1"
 hashbrown = "0.15"
 allocator-api2 = "0.2"
 num-traits = "0.2"
 parking_lot = "0.12"
-seize = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Memory"] }
-
-[[example]]
-name = "rart-bench"
-path = "examples/rart/bench.rs"
-
-[[example]]
-name = "rart-pub-bench"
-path = "examples/rart/pub_bench.rs"
-
-[[example]]
-name = "rart-alloc-cost"
-path = "examples/rart/alloc_count.rs"
-
-[[example]]
-name = "rart-cow-arc"
-path = "examples/rart/cow_arc_bench.rs"
 
 [dev-dependencies]
 comfy-table = { version = "7.2" }
@@ -49,9 +34,45 @@ scc = "3.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 
 [[example]]
+name = "simulate-epoch-writing"
+path = "examples/simulate_epoch_writing.rs"
+
+[[example]]
+name = "slab-bench"
+path = "examples/slab_bench.rs"
+
+[[example]]
+name = "rart-bench"
+path = "examples/rart/bench.rs"
+
+[[example]]
+name = "rart-pub-bench"
+path = "examples/rart/pub_bench.rs"
+
+[[example]]
+name = "rart-cow-arc"
+path = "examples/rart/cow_arc_bench.rs"
+
+[[example]]
 name = "rart-cow-snap"
 path = "examples/rart/cow_nosnapshot.rs"
 
 [[example]]
 name = "rart-art-cmp"
 path = "examples/rart/art_cmp.rs"
+
+[[example]]
+name = "sharded-art-bench"
+path = "examples/sharded_art_bench.rs"
+
+[[example]]
+name = "art-bench"
+path = "examples/art_bench.rs"
+
+[[example]]
+name = "counter-bench"
+path = "examples/counter_bench.rs"
+
+[[example]]
+name = "epoch-bench"
+path = "examples/epoch_bench.rs"

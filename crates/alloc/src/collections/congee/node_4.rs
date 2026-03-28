@@ -106,23 +106,29 @@ impl Node for Node4 {
         self.base.meta.count += 1;
     }
 
-    fn change(&mut self, key: u8, val: NodePtr) -> NodePtr {
+    fn change(&mut self, key: u8, val: NodePtr) -> Option<NodePtr> {
         for i in 0..self.base.meta.count {
             if self.keys[i as usize] == key {
                 let old = self.children[i as usize];
                 self.children[i as usize] = val;
-                return old;
+                return Some(old);
             }
         }
-        unreachable!("The key should always exist in the node");
+        None
     }
 
     fn get_child(&self, key: u8) -> Option<NodePtr> {
-        self.keys
-            .iter()
-            .zip(self.children.iter())
-            .take(self.base.meta.count as usize)
-            .find(|(k, _)| **k == key)
-            .map(|(_, c)| *c)
+        let count = unsafe {
+            std::ptr::read_volatile(&self.base.meta.count as *const u16) as usize
+        };
+        let count = count.min(4);
+        for i in 0..count {
+            if self.keys[i] == key {
+                return Some(unsafe {
+                    std::ptr::read_volatile(self.children.as_ptr().add(i))
+                });
+            }
+        }
+        None
     }
 }

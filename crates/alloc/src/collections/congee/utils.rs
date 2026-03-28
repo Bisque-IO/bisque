@@ -226,7 +226,7 @@ pub(crate) mod leak_check {
             }
         }
 
-        fn collector(&self) -> &seize::Collector {
+        fn collector(&self) -> &crate::epoch::Collector {
             self.inner.inner.collector()
         }
     }

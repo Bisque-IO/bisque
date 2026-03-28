@@ -200,7 +200,7 @@ fn bench_multithread() -> Vec<BenchResult> {
     let mut r = Vec::new();
 
     for &t in &counts {
-        // Pre-create heaps outside the timed section
+        // --- Per-thread heaps (each thread has its own HeapMaster) ---
         let heaps: Vec<HeapMaster> = (0..t).map(|_| new_heap()).collect();
         let start = Instant::now();
         std::thread::scope(|s| {
@@ -221,6 +221,29 @@ fn bench_multithread() -> Vec<BenchResult> {
         });
         drop(heaps);
 
+        // --- Shared heap (all threads use clones of one Heap) ---
+        let master = new_heap();
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..t {
+                let h = master.heap();
+                s.spawn(move || {
+                    for _ in 0..ops {
+                        let p = h.alloc(size, align);
+                        black_box(p);
+                        unsafe { h.dealloc(p) };
+                    }
+                });
+            }
+        });
+        r.push(BenchResult {
+            name: format!("heap {t}T shared"),
+            ops: ops * t as u64,
+            elapsed: start.elapsed(),
+        });
+        drop(master);
+
+        // --- mimalloc global allocator ---
         let start = Instant::now();
         std::thread::scope(|s| {
             for _ in 0..t {
@@ -239,6 +262,7 @@ fn bench_multithread() -> Vec<BenchResult> {
             elapsed: start.elapsed(),
         });
 
+        // --- System allocator ---
         let start = Instant::now();
         std::thread::scope(|s| {
             for _ in 0..t {

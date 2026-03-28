@@ -280,13 +280,17 @@ mod tests {
 
         let reader = tree.reader();
         let done = StdArc::new(AtomicBool::new(false));
+        let started = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let mut handles = Vec::new();
         for _ in 0..4 {
             let r = reader.clone();
             let done = done.clone();
+            let started = started.clone();
             handles.push(std::thread::spawn(move || {
                 let mut reads = 0u64;
+                // Signal that we've entered the loop.
+                started.fetch_add(1, Ordering::Release);
                 while !done.load(Ordering::Relaxed) {
                     let guard = r.load();
                     for i in 0..100u64 {
@@ -299,6 +303,10 @@ mod tests {
             }));
         }
 
+        // Wait for all readers to enter their loop before starting writes.
+        while started.load(Ordering::Acquire) < 4 {
+            std::hint::spin_loop();
+        }
         for batch in 0..10 {
             for i in 0..100u64 {
                 let key = 1000 + batch * 100 + i;

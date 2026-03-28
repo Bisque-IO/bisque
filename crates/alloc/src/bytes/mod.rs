@@ -7,9 +7,7 @@
 //!
 //! # Design
 //!
-//! Addresses all shortcomings of the `bytes` crate:
-//!
-//! - **Single allocation**: header (refcount + capacity + heap handle) and data
+//! - **Single allocation**: header (refcount + capacity + heap pointer) and data
 //!   are contiguous in one heap allocation. No separate `Box<Shared>`.
 //! - **No vtable dispatch**: mode is a tag byte, not a function pointer table.
 //!   Clone/drop are inlined match arms, not indirect calls.
@@ -17,14 +15,22 @@
 //!   `Bytes` up to 30 bytes, `BytesMut` up to 22 bytes — zero heap allocation.
 //! - **Static mode** (`Bytes` only): `&'static [u8]` references are stored as
 //!   a pointer — no refcount, no allocation, no-op clone/drop.
-//! - **Frozen bit**: `BytesMut::freeze()` is a bit flip, not a type conversion
-//!   with allocation. `Bytes::try_mut()` reverses it if refcount == 1.
+//! - **Zero-cost freeze**: `BytesMut::freeze()` is a `transmute` for heap buffers
+//!   (both types share identical `HeapRepr` layout). Cold paths (inline, empty,
+//!   heap→inline promotion) are outlined to keep the hot path tiny.
+//! - **Sole-owner fast drop**: `Bytes::Drop` uses a plain `load(Acquire)` instead
+//!   of expensive `lock xadd` when refcount == 1, saving ~5ns per drop.
+//! - **Hot/cold path splitting**: `extend_from_slice`, `freeze`, and `Drop` split
+//!   fast paths (heap mode, enough capacity) from cold paths (inline, growth,
+//!   shared refcount) to minimize instruction cache pressure.
 //! - **Heap attribution**: every heap-backed buffer carries its [`Heap`] handle
 //!   in the allocation header. Memory is freed to the correct arena on drop.
 //!
 //! # Representation
 //!
-//! Both types use a 32-byte stack union with a tag at byte 31:
+//! Both types use a 32-byte stack union with a tag at byte 31. `Bytes` and
+//! `BytesMut` share the same `HeapRepr` for heap mode, enabling zero-cost
+//! `freeze()`/`try_mut()` conversions.
 //!
 //! ```text
 //! ── Bytes ──────────────────────────────────────────────
@@ -35,16 +41,16 @@
 //! └──────────────────────────┴─────┴─────┘
 //!  0                        30    31
 //!
-//! Heap (tag=1):
-//! ┌──────────┬──────────┬──────────┬───────┬─────┐
-//! │ ptr: *u8 │ len: u64 │ hdr: *H  │ pad:7 │ tag │
-//! └──────────┴──────────┴──────────┴───────┴─────┘
-//!  0          8          16         24     31
+//! Heap (tag=1) — shared with BytesMut:
+//! ┌──────────┬──────┬──────┬──────────┬───────┬─────┐
+//! │ ptr: *u8 │len:32│cap:32│ hdr: *H  │ pad:7 │ tag │
+//! └──────────┴──────┴──────┴──────────┴───────┴─────┘
+//!  0          8      12     16         24     31
 //!
 //! Static (tag=2):
-//! ┌──────────┬──────────┬───────────────┬─────┐
-//! │ ptr: *u8 │ len: u64 │   pad: 15     │ tag │
-//! └──────────┴──────────┴───────────────┴─────┘
+//! ┌──────────┬──────┬──────┬───────────────┬─────┐
+//! │ ptr: *u8 │len:32│      │   pad: 15     │ tag │
+//! └──────────┴──────┴──────┴───────────────┴─────┘
 //!
 //! ── BytesMut ───────────────────────────────────────────
 //!
@@ -54,19 +60,17 @@
 //! └──────────────┴──────────────────┴─────┴─────┘
 //!  0              8                 30    31
 //!
-//! Heap (tag=1):
-//! ┌──────────┬──────────┬──────────┬───────┬─────┐
-//! │ ptr: *u8 │len+cap:64│ hdr: *H  │ pad:7 │ tag │
-//! └──────────┴──────────┴──────────┴───────┴─────┘
-//!  0          8          16         24     31
-//!   len: u32 at byte 8, cap: u32 at byte 12
+//! Heap (tag=1) — same HeapRepr as Bytes (freeze = transmute):
+//! ┌──────────┬──────┬──────┬──────────┬───────┬─────┐
+//! │ ptr: *u8 │len:32│cap:32│ hdr: *H  │ pad:7 │ tag │
+//! └──────────┴──────┴──────┴──────────┴───────┴─────┘
 //!
 //! ── Shared heap header ─────────────────────────────────
 //!
 //!   Header (16 bytes, at start of heap allocation):
-//!   ┌────────────┬──────────┬──────────────┐
-//!   │ref_cnt: u32│ cap: u32 │ heap: Heap:8 │
-//!   └────────────┴──────────┴──────────────┘
+//!   ┌────────────┬──────────┬───────────────────┐
+//!   │ref_cnt: u32│ cap: u32 │ heap_data: *const │
+//!   └────────────┴──────────┴───────────────────┘
 //!   data follows immediately at header + 16
 //! ```
 //!

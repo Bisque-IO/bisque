@@ -1,6 +1,6 @@
 use std::{marker::PhantomData, ptr::NonNull, sync::Arc};
 
-use seize::Guard;
+use crate::epoch::Guard;
 
 use super::{
     Allocator, DefaultAllocator,
@@ -15,7 +15,7 @@ use super::{
 };
 
 /// A retirement context that packages a node pointer with its allocator,
-/// allowing deferred reclamation via `seize::Guard::defer_retire`.
+/// allowing deferred reclamation via `crate::epoch::Guard::defer_retire`.
 /// Allocated from the Heap (via the Allocator) for accurate memory accounting.
 struct RetireCtx<A: Allocator + Clone + Send + 'static> {
     node_ptr: NonNull<BaseNode>,
@@ -28,7 +28,7 @@ struct RetireCtx<A: Allocator + Clone + Send + 'static> {
 /// `ptr` must have been allocated via `Allocator::allocate` with the layout of `RetireCtx<A>`.
 unsafe fn reclaim_node_ctx<A: Allocator + Clone + Send + 'static>(
     ptr: *mut RetireCtx<A>,
-    _collector: &seize::Collector,
+    _collector: &crate::epoch::Collector,
 ) {
     unsafe {
         let ctx = std::ptr::read(ptr);
@@ -114,11 +114,10 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> Drop for RawCongee<K_LEN, 
         self.dfs_visitor_slow(&mut visitor).unwrap();
 
         // Flush any pending retirements from this tree's prior operations.
-        // With a shared collector this cannot call reclaim_all (other trees may
-        // still be active), so we enter + flush to give the collector a chance
-        // to process deferred deallocations.
-        let guard = self.allocator.collector().enter();
-        guard.flush();
+        {
+            let guard = self.allocator.collector().enter();
+            guard.flush();
+        }
     }
 }
 
@@ -135,12 +134,12 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> RawCongee<K_LEN, A> {
     }
 
     /// Returns a reference to the epoch-based reclamation collector.
-    pub(crate) fn collector(&self) -> &seize::Collector {
+    pub(crate) fn collector(&self) -> &crate::epoch::Collector {
         self.allocator.collector()
     }
 
     /// Enters an epoch, returning a local guard tied to this tree's collector.
-    pub(crate) fn pin(&self) -> seize::LocalGuard<'_> {
+    pub(crate) fn pin(&self) -> crate::epoch::LocalGuard<'_> {
         self.allocator.collector().enter()
     }
 }
@@ -199,6 +198,10 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> RawCongee<K_LEN, A> {
     }
 
     pub(crate) fn keys(&self) -> Vec<[u8; K_LEN]> {
+        // Hold an epoch guard for the entire traversal. Without this,
+        // retired nodes could be reclaimed between reading a child pointer
+        // and read_locking the child, causing use-after-free.
+        let _guard = self.allocator.collector().enter();
         loop {
             let mut visitor = LeafNodeKeyVisitor::<K_LEN> { keys: Vec::new() };
             if self.dfs_visitor_slow(&mut visitor).is_ok() {
@@ -358,9 +361,13 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> RawCongee<K_LEN, A> {
 
                             let mut write_n = node.upgrade().map_err(|(_n, v)| v)?;
 
-                            write_n
+                            if write_n
                                 .as_mut()
-                                .change(node_key, NodePtr::from_payload(new));
+                                .change(node_key, NodePtr::from_payload(new))
+                                .is_none()
+                            {
+                                return Err(ArtError::VersionNotMatch);
+                            }
                             return Ok(Some(old));
                         }
                         PtrType::SubNode(sub_node) => {
@@ -405,9 +412,13 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> RawCongee<K_LEN, A> {
                         .insert(no_match_key, NodePtr::from_node(write_n.as_mut()));
 
                     // 3) update parentNode to point to the new node, unlock
-                    write_p
+                    if write_p
                         .as_mut()
-                        .change(parent_key, new_middle_node.into_note_ptr());
+                        .change(parent_key, new_middle_node.into_note_ptr())
+                        .is_none()
+                    {
+                        return Err(ArtError::VersionNotMatch);
+                    }
 
                     return Ok(None);
                 }
@@ -473,7 +484,9 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> RawCongee<K_LEN, A> {
             }
             level += 1;
         }
-        debug_assert!(level == node_prefix.len());
+        // NOTE: do NOT assert `level == node_prefix.len()` here.
+        // Under concurrent modification, the prefix data may be stale.
+        // The caller's check_version() will detect this and retry.
         Some(level)
     }
 
@@ -576,9 +589,13 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> RawCongee<K_LEN, A> {
                                 return Ok(Some((tid, Some(tid))));
                             }
                             let mut write_n = node.upgrade().map_err(|(_n, v)| v)?;
-                            write_n
+                            if write_n
                                 .as_mut()
-                                .change(k[level], NodePtr::from_payload(new_v));
+                                .change(k[level], NodePtr::from_payload(new_v))
+                                .is_none()
+                            {
+                                return Err(ArtError::VersionNotMatch);
+                            }
 
                             return Ok(Some((tid, Some(new_v))));
                         }

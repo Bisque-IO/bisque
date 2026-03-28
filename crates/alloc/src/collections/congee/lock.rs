@@ -25,8 +25,8 @@ impl<'a, T: Node> TypedReadGuard<'a, T> {
             .compare_exchange_weak(
                 self.version,
                 new_version,
-                Ordering::Release,
-                Ordering::Relaxed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             ) {
             Ok(_) => Ok(TypedWriteGuard {
                 node: unsafe { &mut *(self.node as *mut T) },
@@ -82,6 +82,14 @@ impl<'a> ReadGuard<'a> {
     }
 
     pub(crate) fn check_version(&self) -> Result<usize, ArtError> {
+        // SeqCst fence: ensures all prior plain reads (get_child, check_prefix,
+        // etc.) are committed before we re-read the version. The OLC pattern
+        // reads shared data, then validates the version hasn't changed. Without
+        // a bidirectional fence, the compiler may reorder prior non-atomic reads
+        // past the version load — an Acquire fence only prevents subsequent ops
+        // from reordering before it, not prior ops from reordering after it.
+        // SeqCst prevents reordering in BOTH directions.
+        std::sync::atomic::fence(Ordering::SeqCst);
         let v = self
             .as_ref()
             .type_version_lock_obsolete
@@ -121,8 +129,8 @@ impl<'a> ReadGuard<'a> {
             .compare_exchange_weak(
                 self.version,
                 new_version,
-                Ordering::Release,
-                Ordering::Relaxed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             ) {
             Ok(_) => Ok(WriteGuard {
                 node: unsafe { &mut *(self.node.as_ptr()) },

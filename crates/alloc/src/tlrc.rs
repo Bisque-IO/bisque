@@ -158,6 +158,21 @@ thread_local! {
 /// interesting decrements. Distinguished from 0 (destroyed/stale).
 const MASTER_DROPPED_SENTINEL: u64 = 1;
 
+/// `tlrc_ptr` sentinel for counters created via the increment cold path
+/// AFTER the master dropped. These counters may have a "stranded peer" —
+/// the old counter (orphaned by Tlrc::drop) retains its positive value.
+/// Cross-thread ref sends create asymmetry: the new counter may never
+/// reach ≤ 0 even after all local refs are dropped. This sentinel tells
+/// the hot-path decrement to trigger a scan on EVERY decrement, not just
+/// when `new_c ≤ 0`, ensuring the final zero-sum is detected.
+const SCAN_EAGERLY_SENTINEL: u64 = 2;
+
+/// Returns true if the `tlrc_ptr` value indicates the master has dropped.
+#[inline(always)]
+fn is_master_dropped(tlrc_ptr: u64) -> bool {
+    tlrc_ptr == MASTER_DROPPED_SENTINEL || tlrc_ptr == SCAN_EAGERLY_SENTINEL
+}
+
 #[repr(C)]
 pub(crate) struct TlrcInner<T> {
     counters: Mutex<Vec<*mut TLCounter>>,
@@ -180,7 +195,14 @@ unsafe impl<T: Send + Sync> Sync for TlrcInner<T> {}
 
 fn alloc_counter(key: usize, initial_count: i64, master_dropped: bool) -> *mut TLCounter {
     let tlrc_ptr = if master_dropped {
-        MASTER_DROPPED_SENTINEL
+        if initial_count > 0 {
+            // Increment cold path after master dropped: the old counter
+            // (orphaned by Tlrc::drop) has stranded positive value.
+            // Mark for eager scanning on decrements.
+            SCAN_EAGERLY_SENTINEL
+        } else {
+            MASTER_DROPPED_SENTINEL
+        }
     } else {
         key as u64
     };
@@ -300,7 +322,7 @@ fn try_destroy<T>(inner_ptr: *const TlrcInner<T>) -> bool {
 /// Epoch reclaim function for the TlrcInner shell.
 /// By the time this runs, all threads have advanced past the retirement
 /// epoch. No one is accessing the shell. Safe to dealloc.
-unsafe fn reclaim_shell<T>(ptr: *mut TlrcInner<T>, _: &seize::Collector) {
+unsafe fn reclaim_shell<T>(ptr: *mut TlrcInner<T>, _: &crate::epoch::Collector) {
     unsafe {
         // Free orphaned counters. By now, all epoch guards have advanced.
         // No TLCounterMap::Drop can be concurrently reading these counters
@@ -371,6 +393,16 @@ impl<T> TlrcRef<T> {
     #[inline]
     pub fn as_ptr(this: &Self) -> *const T {
         &*this.inner().data as *const T
+    }
+
+    /// Create a `TlrcRef` from a raw `TlrcInner` pointer, incrementing the TLRC.
+    ///
+    /// # Safety
+    /// `ptr` must point to a live `TlrcInner<T>`.
+    #[inline]
+    pub(crate) unsafe fn clone_from_raw(ptr: *const TlrcInner<T>) -> Self {
+        tlrc_increment(ptr);
+        Self { ptr }
     }
 }
 
@@ -508,7 +540,7 @@ fn tlrc_increment<T>(inner_ptr: *const TlrcInner<T>) {
             // Check if master already dropped by inspecting existing counters.
             // Acquire: tlrc_ptr is set by Tlrc::drop (Release) on another thread.
             let md = counters.iter().any(|&c| unsafe {
-                (*c).tlrc_ptr.load(Ordering::Acquire) == MASTER_DROPPED_SENTINEL
+                is_master_dropped((*c).tlrc_ptr.load(Ordering::Acquire))
             });
             let ptr = alloc_counter(key, 1, md);
             tl.map.insert(key, ptr);
@@ -531,12 +563,26 @@ fn tlrc_decrement<T>(inner_ptr: *const TlrcInner<T>) {
             let counter = unsafe { &*cptr };
             // Check master_dropped via tlrc_ptr sentinel — NO inner access.
             // This is on the TLCounter (thread-local cache line), not inner.
-            let master_dropped =
-                counter.tlrc_ptr.load(Ordering::Acquire) == MASTER_DROPPED_SENTINEL;
+            let tlrc_ptr_val = counter.tlrc_ptr.load(Ordering::Acquire);
+            let master_dropped = is_master_dropped(tlrc_ptr_val);
             let new_c = do_bracket(counter, -1);
 
-            // Trigger scan if master dropped AND our count is interesting.
-            master_dropped && new_c <= 0
+            // Trigger scan if master dropped AND this is an "interesting" decrement.
+            //
+            // For normal counters (MASTER_DROPPED_SENTINEL): scan when new_c ≤ 0.
+            // For cold-path-increment counters (SCAN_EAGERLY_SENTINEL): scan on
+            // EVERY decrement. These counters have a "stranded peer" — the old
+            // counter (orphaned by Tlrc::drop) retains positive value. Cross-thread
+            // ref sends create asymmetry: the new counter may never reach ≤ 0 even
+            // after all local refs are dropped. Eager scanning ensures the final
+            // zero-sum is detected.
+            //
+            // Cost of eager scanning: O(local_drops × num_counters), but ONLY for
+            // counters created via increment cold path after master drops — a rare
+            // path. Normal counters (created before master drops) use the efficient
+            // new_c ≤ 0 trigger. Once try_destroy succeeds, it zeroes all counters'
+            // tlrc_ptr, so subsequent decrements skip the scan.
+            master_dropped && (new_c <= 0 || tlrc_ptr_val == SCAN_EAGERLY_SENTINEL)
         } else {
             // Cold path: register new counter with -1 (cross-thread debt).
             // Enter epoch guard to ensure inner stays alive.
@@ -552,7 +598,7 @@ fn tlrc_decrement<T>(inner_ptr: *const TlrcInner<T>) {
             // Check if master already dropped via existing counters' tlrc_ptr.
             // Acquire: tlrc_ptr is set by Tlrc::drop (Release) on another thread.
             let md = counters.iter().any(|&c| unsafe {
-                (*c).tlrc_ptr.load(Ordering::Acquire) == MASTER_DROPPED_SENTINEL
+                is_master_dropped((*c).tlrc_ptr.load(Ordering::Acquire))
             });
             let ptr = alloc_counter(key, -1, md);
             tl.map.insert(key, ptr);

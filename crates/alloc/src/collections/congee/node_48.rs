@@ -106,19 +106,25 @@ impl Node for Node48 {
         self.base.meta.count += 1;
     }
 
-    fn change(&mut self, key: u8, val: NodePtr) -> NodePtr {
-        let old = self.children[self.child_idx[key as usize] as usize];
-        self.children[self.child_idx[key as usize] as usize] = val;
-        old
+    fn change(&mut self, key: u8, val: NodePtr) -> Option<NodePtr> {
+        let idx = self.child_idx[key as usize];
+        if idx == EMPTY_MARKER {
+            return None;
+        }
+        let old = self.children[idx as usize];
+        self.children[idx as usize] = val;
+        Some(old)
     }
 
     fn get_child(&self, key: u8) -> Option<NodePtr> {
-        let pos = unsafe { self.child_idx.get_unchecked(key as usize) };
-        if *pos == EMPTY_MARKER {
+        let pos = unsafe { *self.child_idx.get_unchecked(key as usize) };
+        if pos == EMPTY_MARKER {
             None
         } else {
-            let child = unsafe { self.children.get_unchecked(*pos as usize) };
-            Some(*child)
+            let child = unsafe {
+                std::ptr::read_volatile(self.children.as_ptr().add(pos as usize))
+            };
+            Some(child)
         }
     }
 }

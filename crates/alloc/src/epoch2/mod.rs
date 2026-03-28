@@ -1,4 +1,7 @@
-//! Epoch-based shared pointers using `seize` for reclamation.
+//! Epoch-based shared pointers and concurrent memory reclamation.
+//!
+//! This module vendors the [`seize`] crate as submodules and provides
+//! [`EpochBox`] / [`EpochRef`] helpers on top.
 //!
 //! [`EpochBox`] owns an allocation and retires it on drop. [`EpochRef`] is a
 //! zero-cost, `Copy` view — cloning and dropping are no-ops. Safe reads
@@ -35,15 +38,25 @@
 //! ensure the box outlives all refs (or that refs only access through guards
 //! obtained before the box was dropped).
 
+// --- Vendored seize submodules ---
+pub(crate) mod raw;
+pub mod collector;
+pub mod guard;
+pub mod reclaim;
+
+// --- Public re-exports (seize API surface) ---
+pub use collector::Collector;
+pub use guard::{Guard, LocalGuard, OwnedGuard};
+
 use std::marker::PhantomData;
 
 use crate::Heap;
 use allocator_api2::alloc::AllocError;
 
 /// Global epoch-based collector shared by all epoch pointers.
-pub fn collector() -> &'static seize::Collector {
-    static COLLECTOR: std::sync::LazyLock<seize::Collector> =
-        std::sync::LazyLock::new(seize::Collector::new);
+pub fn collector() -> &'static Collector {
+    static COLLECTOR: std::sync::LazyLock<Collector> =
+        std::sync::LazyLock::new(Collector::new);
     &COLLECTOR
 }
 
@@ -57,7 +70,7 @@ struct EpochInner<T> {
 /// An owning epoch-protected pointer. Retires the allocation on drop.
 ///
 /// Like [`Box`](std::boxed::Box), `EpochBox` owns the allocation. Unlike
-/// `Box`, deallocation is deferred through the `seize` collector until all
+/// `Box`, deallocation is deferred through the epoch collector until all
 /// threads have advanced past the retirement epoch.
 ///
 /// Supports both global allocation ([`new`](EpochBox::new)) and heap-backed
@@ -146,7 +159,7 @@ impl<T> EpochBox<T> {
     ///
     /// The returned reference is valid for the lifetime of the guard.
     #[inline]
-    pub fn load<'g>(&self, _guard: &'g seize::LocalGuard<'_>) -> &'g T {
+    pub fn load<'g>(&self, _guard: &'g LocalGuard<'_>) -> &'g T {
         unsafe { &(*self.ptr).data }
     }
 
@@ -164,7 +177,7 @@ impl<T> EpochRef<T> {
     /// While the guard is held, the collector will not reclaim this
     /// pointer even if the owning `EpochBox` has been dropped.
     #[inline]
-    pub fn load<'g>(&self, _guard: &'g seize::LocalGuard<'_>) -> &'g T {
+    pub fn load<'g>(&self, _guard: &'g LocalGuard<'_>) -> &'g T {
         unsafe { &(*self.ptr).data }
     }
 
@@ -186,7 +199,7 @@ impl<T> Drop for EpochBox<T> {
     }
 }
 
-/// Reclaim function for `seize::Collector::retire`.
+/// Reclaim function for `Collector::retire`.
 ///
 /// Handles both global-alloc and heap-backed allocations by checking
 /// the inner `heap` field.
@@ -194,7 +207,7 @@ impl<T> Drop for EpochBox<T> {
 /// # Safety
 /// `ptr` must be a valid pointer to an `EpochInner<T>` allocated by
 /// either `EpochBox::new` or `EpochBox::new_in`.
-unsafe fn reclaim_inner<T>(ptr: *mut EpochInner<T>, _: &seize::Collector) {
+unsafe fn reclaim_inner<T>(ptr: *mut EpochInner<T>, _: &Collector) {
     unsafe {
         // Move everything out before deallocating the memory.
         let EpochInner { heap, data } = std::ptr::read(ptr);

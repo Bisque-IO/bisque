@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use bisque_alloc::EpochBox;
 use bisque_alloc::Tlrc;
-use bisque_alloc::ptr::epoch;
+use bisque_alloc::epoch;
 use bisque_alloc::striped::StripedArc;
 
 #[cfg(target_os = "linux")]

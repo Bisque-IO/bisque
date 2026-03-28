@@ -10,8 +10,8 @@
 //!
 //! # Thread Safety
 //!
-//! mimalloc heaps are thread-local for allocation — `mi_heap_new_ex()` creates
-//! a heap on the calling thread. `mi_free()` can free from any thread.
+//! mimalloc 3.x heaps are thread-safe for allocation from any thread.
+//! `mi_free()` can also free from any thread.
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use allocator_api2::alloc::{AllocError, Allocator};
 
 use crate::{Tlrc, TlrcRef, tlrc::TlrcInner};
-use bisque_mimalloc_sys as ffi;
+use bisque_mimalloc_sys::{self as ffi};
 
 // Re-export for use in async contexts.
 pub use allocator_api2::alloc::AllocError as HeapAllocError;
@@ -36,6 +36,12 @@ const TEST_SMALL_ARENA: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// The actual heap data, stored inside a `TlrcInner<HeapData>`.
 /// Allocated from the mimalloc heap itself (self-hosted).
+///
+/// `pressure_wq` and `collector` are wrapped in `ManuallyDrop` so that
+/// `Drop for HeapData` can enforce the required destruction order:
+///   1. Flush the epoch collector (runs deferred deallocations)
+///   2. Drop collector and WaitQueue (frees their internal allocations)
+///   3. `mi_heap_destroy` (bulk-frees all remaining mi_heap pages)
 pub(crate) struct HeapData {
     pub(crate) mi_heap: *mut ffi::mi_heap_t,
     memory_limit: usize,
@@ -46,47 +52,39 @@ pub(crate) struct HeapData {
     /// pressure mode exits. Only written when `pressure == true`.
     freed_since_pressure: AtomicU64,
     /// Wait queue for tasks blocked on OOM. Slots pre-allocated from the heap.
-    pressure_wq: crate::wait_queue::WaitQueue,
+    pressure_wq: std::mem::ManuallyDrop<crate::wait_queue::WaitQueue>,
     /// Max concurrent async waiters (configurable at construction).
     max_waiters: usize,
     /// Per-heap epoch collector for concurrent data structures (Art, etc.).
-    /// Dropped during `destroy_heap`'s `drop_in_place` — BEFORE `mi_heap_destroy`.
-    /// This ensures all deferred deallocations complete while the heap is still valid.
-    pub(crate) collector: seize::Collector,
+    /// Flushed and dropped BEFORE `mi_heap_destroy` so all deferred
+    /// deallocations complete while the heap is still valid.
+    pub(crate) collector: std::mem::ManuallyDrop<crate::epoch::Collector>,
 }
 
 unsafe impl Send for HeapData {}
 unsafe impl Sync for HeapData {}
 
-/// Custom destroy for TlrcInner<HeapData>.
-///
-/// TlrcInner<HeapData> is Box-allocated (global allocator), but HeapData's
-/// internal fields (WaitQueue slots, collector deferred work) were allocated
-/// from the mi_heap.
-/// Sequence:
-///   1. Save mi_heap pointer
-///   2. Flush the epoch collector — runs all pending deferred deallocations
-///      while the mi_heap is still alive
-///   3. drop_in_place — drops HeapData fields (WaitQueue, Collector, etc.)
-///   4. mi_heap_destroy — bulk-frees all mi_heap pages
-///   5. dealloc — frees the TlrcInner memory (global allocator)
-unsafe fn destroy_heap(ptr: *mut TlrcInner<HeapData>) {
-    unsafe {
-        let data_ref = &*ptr;
-        let mi_heap = data_ref.data.mi_heap;
-        // Flush the epoch collector to ensure all deferred deallocations
-        // (from Art/congee node retirements) run while the heap is alive.
+impl Drop for HeapData {
+    fn drop(&mut self) {
+        let mi_heap = self.mi_heap;
+        // 1. Flush the epoch collector — runs all pending deferred
+        //    deallocations while the mi_heap is still alive.
         {
-            use seize::Guard as _;
-            let guard = data_ref.data.collector.enter();
+            use crate::epoch::Guard as _;
+            let guard = self.collector.enter();
             guard.flush();
         }
-        // Drop all fields first (WaitQueue needs its slots alive)
-        std::ptr::drop_in_place(ptr);
-        // Bulk-free all mi_heap allocations (WaitQueue slots, user data, etc.)
-        ffi::mi_heap_destroy(mi_heap);
-        // Free the TlrcInner itself (global allocator)
-        std::alloc::dealloc(ptr as *mut u8, Layout::new::<TlrcInner<HeapData>>());
+        // 2. Drop collector and WaitQueue. Their internal allocations
+        //    (deferred work, wait slots) are freed via mi_free which is
+        //    safe before mi_heap_destroy.
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.collector);
+            std::mem::ManuallyDrop::drop(&mut self.pressure_wq);
+        }
+        // 3. Bulk-free all remaining mi_heap pages.
+        unsafe {
+            ffi::mi_heap_destroy(mi_heap);
+        }
     }
 }
 
@@ -140,8 +138,8 @@ impl HeapMaster {
     pub fn with_max_waiters(max_bytes: usize, max_waiters: usize) -> Result<Self, AllocError> {
         ffi::ensure_initialized();
 
-        // 1. Create a standard mimalloc heap with allow_destroy=true.
-        let mi_heap = unsafe { ffi::mi_heap_new_ex(0, true, ffi::mi_arena_id_t::default()) };
+        // 1. Create a mimalloc heap (3.x heaps always support destroy).
+        let mi_heap = unsafe { ffi::mi_heap_new() };
         if mi_heap.is_null() {
             return Err(AllocError);
         }
@@ -160,9 +158,9 @@ impl HeapMaster {
             memory_limit: max_bytes,
             pressure: AtomicBool::new(false),
             freed_since_pressure: AtomicU64::new(0),
-            pressure_wq,
+            pressure_wq: std::mem::ManuallyDrop::new(pressure_wq),
             max_waiters,
-            collector: seize::Collector::new(),
+            collector: std::mem::ManuallyDrop::new(crate::epoch::Collector::new()),
         }));
         let inner_ptr = Box::into_raw(inner_box);
 
@@ -236,9 +234,42 @@ impl Heap {
         &self.inner
     }
 
+    /// Raw pointer to the HeapData. Does not participate in reference counting.
+    /// The caller must ensure the HeapData outlives any use of this pointer.
+    #[inline(always)]
+    pub(crate) fn data_ptr(&self) -> *const HeapData {
+        self.data() as *const HeapData
+    }
+
+    /// Free a pointer using a raw `HeapData` pointer, bypassing TLRC.
+    ///
+    /// # Safety
+    /// - `heap_data` must point to a valid, live `HeapData`.
+    /// - `ptr` must have been allocated by mimalloc.
+    #[inline]
+    pub(crate) unsafe fn dealloc_raw(heap_data: *const HeapData, ptr: *mut u8) {
+        Self::free_with_pressure(unsafe { &*heap_data }, ptr);
+    }
+
+    /// Reconstruct a `Heap` handle from a raw `HeapData` pointer.
+    ///
+    /// Performs a TLRC increment. Only use on cold paths (split, clone).
+    ///
+    /// # Safety
+    /// `heap_data` must point into a live `TlrcInner<HeapData>` allocation.
+    #[inline]
+    pub(crate) unsafe fn from_data_ptr(heap_data: *const HeapData) -> Self {
+        // HeapData lives at TlrcInner<HeapData>.data — compute the containing pointer.
+        let data_offset = std::mem::offset_of!(TlrcInner<HeapData>, data);
+        let inner_ptr = (heap_data as *const u8).sub(data_offset) as *const TlrcInner<HeapData>;
+        // Wrap as TlrcRef and clone (TLRC increment).
+        let cloned = TlrcRef::clone_from_raw(inner_ptr);
+        Self { inner: cloned }
+    }
+
     /// Per-heap epoch collector for concurrent data structures.
     #[inline]
-    pub fn collector(&self) -> &seize::Collector {
+    pub fn collector(&self) -> &crate::epoch::Collector {
         &self.data().collector
     }
 
@@ -314,13 +345,19 @@ impl Heap {
     #[inline]
     pub(crate) unsafe fn free_with_pressure(inner: &HeapData, ptr: *mut u8) {
         if inner.pressure.load(Ordering::Relaxed) {
-            let freed = unsafe { ffi::mi_usable_size(ptr as *const core::ffi::c_void) };
-            inner
-                .freed_since_pressure
-                .fetch_add(freed as u64, Ordering::Relaxed);
-            inner.pressure_wq.notify_one();
+            Self::free_with_pressure_slow(inner, ptr);
         }
         unsafe { ffi::mi_free(ptr as *mut core::ffi::c_void) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn free_with_pressure_slow(inner: &HeapData, ptr: *mut u8) {
+        let freed = unsafe { ffi::mi_usable_size(ptr as *const core::ffi::c_void) };
+        inner
+            .freed_since_pressure
+            .fetch_add(freed as u64, Ordering::Relaxed);
+        inner.pressure_wq.notify_one();
     }
 
     /// Async allocation — tries immediately, and if OOM, enters pressure
@@ -551,7 +588,7 @@ unsafe impl Allocator for Heap {
 // =========================================================================
 
 /// Legacy alias. Prefer [`crate::collections::Vec`].
-pub type HeapVec = crate::Vec;
+pub type HeapVec = crate::Vec<u8>;
 
 // =========================================================================
 // Process info
@@ -1112,10 +1149,10 @@ mod tests {
         );
     }
 
-    /// Usage must stay within limit + bounded overshoot.
-    /// Overshoot is at most MI_MEDIUM_PAGE_SIZE (512 KiB) per concurrent allocating thread.
-    // With CAS-based enforcement in page_queue_push, memory_usage never exceeds memory_limit.
-    // Zero overshoot on the limit itself.
+    /// Zero overshoot: memory_usage never exceeds memory_limit.
+    /// The atomic fetch_add check in mi_heap_memlimit_page_over rejects any page
+    /// that would push usage above the limit. For memlimit heaps, page abandonment
+    /// is disabled so full pages stay tracked in the full queue.
     const MEMLIMIT_MAX_OVERSHOOT: usize = 0;
 
     // After free+collect, mimalloc may retain pages for reuse. This is the tolerance
@@ -1164,7 +1201,7 @@ mod tests {
         assert!(heap.memory_usage() <= limit + MEMLIMIT_MAX_OVERSHOOT);
     }
 
-    /// Fill to OOM, free half, allocate more, verify usage stays bounded.
+    /// Fill to OOM, free half, collect to retire empty pages, allocate more.
     #[test]
     fn memlimit_partial_free_realloc() {
         let limit = 8 * 1024 * 1024;
@@ -1179,15 +1216,22 @@ mod tests {
             limit
         );
 
-        // Free half
+        // Free half — pages stay in full queue until collected
         let half = ptrs.len() / 2;
         for p in ptrs.drain(..half) {
             unsafe { heap.dealloc(p) };
         }
+        // Collect to retire now-empty pages and release their tracked usage
+        heap.collect(true);
         let usage_after_free = heap.memory_usage();
-        assert!(usage_after_free < usage_at_full);
+        assert!(
+            usage_after_free < usage_at_full,
+            "usage_after_free={} should be < usage_at_full={}",
+            usage_after_free,
+            usage_at_full
+        );
 
-        // Allocate more — should succeed since we freed space
+        // Allocate more — should succeed by reusing freed block slots in existing pages
         let mut more = Vec::new();
         for _ in 0..half {
             let p = heap.alloc(1024, 8);
@@ -1195,7 +1239,12 @@ mod tests {
                 break;
             }
             more.push(p);
-            assert!(heap.memory_usage() <= limit + MEMLIMIT_MAX_OVERSHOOT);
+            assert!(
+                heap.memory_usage() <= limit,
+                "usage {} exceeded limit {} during re-alloc",
+                heap.memory_usage(),
+                limit
+            );
         }
         assert!(!more.is_empty());
 
@@ -1473,6 +1522,122 @@ mod tests {
         assert!(
             !violation.load(std::sync::atomic::Ordering::Relaxed),
             "mt fuzz: limit exceeded"
+        );
+    }
+
+    /// Shared heap: worker threads allocate, exit (theap deleted), main thread
+    /// continues using the heap. Exercises the theap page-transfer path where
+    /// a dying theap transfers its pages to a sibling instead of abandoning.
+    #[test]
+    fn memlimit_shared_heap_worker_exit() {
+        let limit = 8 * 1024 * 1024;
+        let master = HeapMaster::new(limit).unwrap();
+
+        // Phase 1: workers allocate on the shared heap, then exit.
+        // Their theaps are deleted — pages must transfer to a sibling theap.
+        let ptrs: Vec<*mut u8> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let h = master.heap();
+                handles.push(s.spawn(move || {
+                    let mut local = Vec::new();
+                    for _ in 0..200 {
+                        let p = h.alloc(256, 8);
+                        if !p.is_null() {
+                            unsafe { std::ptr::write_bytes(p, 0xAB, 256) };
+                            local.push(p as usize);
+                        }
+                    }
+                    local
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .map(|addr| addr as *mut u8)
+                .collect()
+        });
+        // All worker threads have exited. Their theaps are deleted.
+        // Pages should have been transferred, not abandoned.
+        assert!(!ptrs.is_empty(), "should have allocated blocks");
+        assert!(
+            master.memory_usage() <= limit,
+            "usage {} > limit {} after worker exit",
+            master.memory_usage(),
+            limit
+        );
+
+        // Phase 2: verify data integrity (pages weren't corrupted by transfer).
+        for &p in &ptrs {
+            let slice = unsafe { std::slice::from_raw_parts(p, 256) };
+            assert!(slice.iter().all(|&b| b == 0xAB), "data corrupted after theap transfer");
+        }
+
+        // Phase 3: main thread can still allocate on the same heap.
+        let p = master.alloc(1024, 8);
+        assert!(!p.is_null(), "alloc failed after worker exit");
+        unsafe { master.dealloc(p) };
+
+        // Phase 4: free worker allocations from main thread (cross-theap free).
+        for &p in &ptrs {
+            unsafe { master.dealloc(p) };
+        }
+        master.collect(true);
+        assert!(
+            master.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+            "usage not zero after cleanup: {}",
+            master.memory_usage()
+        );
+    }
+
+    /// Shared heap: rapid worker spawn/exit cycles. Each cycle spawns N workers
+    /// that allocate on the shared heap, then all exit. Tests repeated theap
+    /// creation and page-transfer under churn.
+    #[test]
+    fn memlimit_shared_heap_worker_churn() {
+        let limit = 8 * 1024 * 1024;
+        let master = HeapMaster::new(limit).unwrap();
+
+        for round in 0..20 {
+            // Spawn workers, allocate, exit
+            let ptrs: Vec<*mut u8> = std::thread::scope(|s| {
+                let mut handles = Vec::new();
+                for _ in 0..4 {
+                    let h = master.heap();
+                    handles.push(s.spawn(move || {
+                        let mut local = Vec::new();
+                        for _ in 0..100 {
+                            let p = h.alloc(512, 8);
+                            if !p.is_null() {
+                                local.push(p as usize);
+                            }
+                        }
+                        local
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .map(|addr| addr as *mut u8)
+                    .collect()
+            });
+            // Workers exited — free their allocations from main thread.
+            for &p in &ptrs {
+                unsafe { master.dealloc(p) };
+            }
+            // Usage must stay bounded across rounds.
+            assert!(
+                master.memory_usage() <= limit,
+                "round {round}: usage {} > limit {}",
+                master.memory_usage(),
+                limit
+            );
+        }
+        master.collect(true);
+        assert!(
+            master.memory_usage() <= MEMLIMIT_COLLECT_TOLERANCE,
+            "usage not zero after churn: {}",
+            master.memory_usage()
         );
     }
 }

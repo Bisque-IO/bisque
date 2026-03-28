@@ -29,7 +29,7 @@ use tree::RawCongee;
 
 /// Types needed to safely access shared data concurrently.
 pub mod epoch {
-    pub use seize::{Guard, LocalGuard, OwnedGuard};
+    pub use crate::epoch::{Guard, LocalGuard, OwnedGuard};
 }
 
 #[derive(Clone)]
@@ -57,8 +57,8 @@ pub trait Allocator {
     /// The pointer must allocated by this allocator.
     unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: std::alloc::Layout);
 
-    /// Returns a reference to the [`seize::Collector`] used for epoch-based reclamation.
-    fn collector(&self) -> &seize::Collector;
+    /// Returns a reference to the [`crate::epoch::Collector`] used for epoch-based reclamation.
+    fn collector(&self) -> &crate::epoch::Collector;
 }
 
 impl Allocator for DefaultAllocator {
@@ -74,9 +74,9 @@ impl Allocator for DefaultAllocator {
         }
     }
 
-    fn collector(&self) -> &seize::Collector {
-        static COLLECTOR: std::sync::LazyLock<seize::Collector> =
-            std::sync::LazyLock::new(seize::Collector::new);
+    fn collector(&self) -> &crate::epoch::Collector {
+        static COLLECTOR: std::sync::LazyLock<crate::epoch::Collector> =
+            std::sync::LazyLock::new(crate::epoch::Collector::new);
         &COLLECTOR
     }
 }

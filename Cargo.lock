@@ -1100,6 +1100,9 @@ dependencies = [
  "comfy-table",
  "congee",
  "crossbeam-epoch",
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "crossfire",
  "dashmap",
  "hashbrown 0.15.5",
  "libc",
@@ -1108,7 +1111,6 @@ dependencies = [
  "parking_lot",
  "rand 0.9.2",
  "scc",
- "seize",
  "tokio",
  "windows-sys 0.59.0",
 ]
