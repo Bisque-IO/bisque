@@ -23,18 +23,12 @@ pub use linux::*;
 #[cfg(all(target_os = "windows", not(miri)))]
 pub use windows::*;
 
-#[cfg(any(
-    not(any(target_os = "windows", target_os = "linux")),
-    miri
-))]
+#[cfg(any(not(any(target_os = "windows", target_os = "linux")), miri))]
 pub use default::*;
 
-#[cfg(any(
-    not(any(target_os = "windows", target_os = "linux")),
-    miri
-))]
+#[cfg(any(not(any(target_os = "windows", target_os = "linux")), miri))]
 mod default {
-    use core::sync::atomic::{fence, Ordering};
+    use core::sync::atomic::{Ordering, fence};
 
     pub fn detect() {}
 
@@ -210,7 +204,7 @@ mod linux {
         use std::cell::UnsafeCell;
         use std::mem::MaybeUninit;
         use std::ptr;
-        use std::sync::{atomic, OnceLock};
+        use std::sync::{OnceLock, atomic};
 
         struct Barrier {
             lock: UnsafeCell<libc::pthread_mutex_t>,

@@ -20,36 +20,89 @@ const MAX_DEPTH: usize = 66;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Lookup a key by value, returning a raw pointer to the value inside the leaf.
+///
+/// For K::LEN <= 8 (u32, u64): uses a fixed [u8; 8] byte cache on the stack.
+/// The compiler sees the exact array size, eliminates bounds checks, and
+/// generates identical code to the hand-tuned usize variant.
+///
+/// For K::LEN > 8 (u128, [u8; 32]): uses `byte_at()` per access.
 pub(super) fn lookup<K: ArtKey, V>(root: usize, key: K) -> Option<*const V> {
-    let mut node = root;
-    let mut depth = 0;
-    while node != NULL_CHILD {
-        if is_leaf(node) {
-            let leaf = unsafe { &*leaf_ptr::<K, V>(node) };
-            return if leaf.key == key {
-                Some(&leaf.value as *const V)
-            } else {
-                None
-            };
-        }
-        let hdr = unsafe { node_header(node) };
-        let plen = hdr.prefix_len as usize;
-        // Pessimistic prefix: only compare up to MAX_PREFIX_LEN stored bytes.
-        // If prefix is longer, we skip the unstored portion and rely on leaf match.
-        let check_len = plen.min(MAX_PREFIX_LEN);
-        for i in 0..check_len {
-            if depth + i >= K::LEN || hdr.prefix[i] != key.byte_at(depth + i) {
-                return None;
+    if K::LEN == 8 {
+        // Optimal path for 8-byte keys (u64, i64, [u8; 8]):
+        // Cache via to_bytes() which applies ArtKey transformations (e.g., sign-bit flip).
+        let key_arr = key.to_bytes();
+        let kb = key_arr.as_ref();
+
+        let mut node = root;
+        let mut depth = 0;
+        while node != NULL_CHILD {
+            if is_leaf(node) {
+                let leaf = unsafe { &*leaf_ptr::<K, V>(node) };
+                return if leaf.key == key { Some(&leaf.value as *const V) } else { None };
             }
+            let hdr = unsafe { node_header(node) };
+            let plen = hdr.prefix_len as usize;
+            let check_len = plen.min(MAX_PREFIX_LEN);
+            for i in 0..check_len {
+                if depth + i >= 8 || hdr.prefix[i] != kb[depth + i] {
+                    return None;
+                }
+            }
+            depth += plen;
+            if depth >= 8 { return None; }
+            node = unsafe { find_child(node, kb[depth]) };
+            depth += 1;
         }
-        depth += plen;
-        if depth >= K::LEN {
-            return None;
+        None
+    } else if K::LEN == 4 {
+        let key_arr = key.to_bytes();
+        let kb = key_arr.as_ref();
+
+        let mut node = root;
+        let mut depth = 0;
+        while node != NULL_CHILD {
+            if is_leaf(node) {
+                let leaf = unsafe { &*leaf_ptr::<K, V>(node) };
+                return if leaf.key == key { Some(&leaf.value as *const V) } else { None };
+            }
+            let hdr = unsafe { node_header(node) };
+            let plen = hdr.prefix_len as usize;
+            let check_len = plen.min(MAX_PREFIX_LEN);
+            for i in 0..check_len {
+                if depth + i >= 4 || hdr.prefix[i] != kb[depth + i] {
+                    return None;
+                }
+            }
+            depth += plen;
+            if depth >= 4 { return None; }
+            node = unsafe { find_child(node, kb[depth]) };
+            depth += 1;
         }
-        node = unsafe { find_child(node, key.byte_at(depth)) };
-        depth += 1;
+        None
+    } else {
+        // General path for large keys: use byte_at() directly.
+        let mut node = root;
+        let mut depth = 0;
+        while node != NULL_CHILD {
+            if is_leaf(node) {
+                let leaf = unsafe { &*leaf_ptr::<K, V>(node) };
+                return if leaf.key == key { Some(&leaf.value as *const V) } else { None };
+            }
+            let hdr = unsafe { node_header(node) };
+            let plen = hdr.prefix_len as usize;
+            let check_len = plen.min(MAX_PREFIX_LEN);
+            for i in 0..check_len {
+                if depth + i >= K::LEN || hdr.prefix[i] != key.byte_at(depth + i) {
+                    return None;
+                }
+            }
+            depth += plen;
+            if depth >= K::LEN { return None; }
+            node = unsafe { find_child(node, key.byte_at(depth)) };
+            depth += 1;
+        }
+        None
     }
-    None
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -76,3 +76,7 @@ path = "examples/counter_bench.rs"
 [[example]]
 name = "epoch-bench"
 path = "examples/epoch_bench.rs"
+
+[[example]]
+name = "spsc-bench"
+path = "examples/spsc_bench.rs"

@@ -33,7 +33,7 @@ use self::node::*;
 // Re-export public types.
 pub use self::epoch::Collector;
 pub use self::iter::{Cursor, CursorRange, Iter, Keys, RangeIter as ArtRangeIter, RevIter, Values};
-pub use self::sharded::{ShardedArt, ShardedSnapshot};
+pub use self::sharded::{ShardedArt, ShardedReadGuard, ShardedSnapshot};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public API
@@ -623,7 +623,7 @@ where
             batch_root: batch_root as usize,
             shard_locks,
             generation: 1,
-            epoch: new_art_epoch(collector, heap),
+            epoch: new_art_epoch(collector),
             heap: heap.clone(),
             _marker: std::marker::PhantomData,
         }

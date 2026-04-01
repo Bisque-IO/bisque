@@ -265,9 +265,9 @@ static void mi_page_queue_remove(mi_page_queue_t* queue, mi_page_t* page) {
   }
   theap->page_count--;
   queue->count--;
-  #if defined(MI_HEAP_MEMLIMIT)
-  mi_heap_memlimit_page_free(theap->heap, (size_t)_mi_page_mem_slices(page) * MI_ARENA_SLICE_SIZE);
-  #endif
+  // Note: memlimit decrement moved to _mi_page_free so that abandoning a page
+  // (which calls mi_page_queue_remove) does not temporarily undercount committed
+  // memory, preventing overshoot during the abandon→reclaim window.
   page->next = NULL;
   page->prev = NULL;
   mi_page_set_in_full(page,false);
@@ -320,8 +320,18 @@ static bool mi_page_queue_push_at_end(mi_theap_t* theap, mi_page_queue_t* queue,
                        (mi_page_is_in_full(page) && mi_page_queue_is_full(queue)));
 
   #if defined(MI_HEAP_MEMLIMIT)
-  if mi_unlikely(mi_heap_memlimit_page_over(theap->heap, (size_t)_mi_page_mem_slices(page) * MI_ARENA_SLICE_SIZE)) {
-    return false;  // would exceed memory limit
+  // Check-only (no increment): pages reclaimed from the abandoned list are
+  // already counted in memory_committed from their original push. We only
+  // check here to reject uncounted pages (e.g., fresh pages that were rejected
+  // by a previous memlimit check and abandoned).
+  {
+    const int64_t limit = mi_atomic_loadi64_relaxed(&theap->heap->memory_limit);
+    if mi_unlikely(limit > 0) {
+      const int64_t usage = mi_atomic_loadi64_relaxed((volatile int64_t*)&theap->heap->memory_committed);
+      if mi_unlikely(usage + (int64_t)((size_t)_mi_page_mem_slices(page) * MI_ARENA_SLICE_SIZE) > limit) {
+        return false;
+      }
+    }
   }
   #endif
 

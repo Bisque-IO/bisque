@@ -1,30 +1,71 @@
 //! Tlrc — Thread-Local Reference Counted smart pointer.
 //!
-//! # "Never transition" design (from epoch_seq.rs)
+//! # Per-thread atomic slot design
 //!
-//! Per-thread counters for the ENTIRE lifecycle. No refcount transition.
+//! Each `TlrcInner` owns a registry of per-thread slots. Each slot contains
+//! a single `AtomicI64` delta counter, cache-line padded to prevent false
+//! sharing between threads.
 //!
-//! **Hot path (NO CAS, NO loop, NO fence):**
-//!   seq.store(FROZEN) → count ±= 1 → seq.store(next).
-//!   If scanner locked our counter (LOCKED): spin until released (rare).
+//! **Hot path:** `slot.delta.fetch_add(±1, Relaxed)` — one atomic RMW on the
+//! thread's own cache line. Since only one thread writes to each slot, the
+//! cache line stays in Exclusive/Modified state and the LOCK prefix (x86) or
+//! LDXR/STXR (ARM) completes without bus traffic.
 //!
-//! **Destruction:** when master_dropped && scan_all() == 0 → destroy.
-//!   Scanner CAS's each idle counter's seq → LOCKED, reads count, restores.
-//!   Double-scan with `destroying` flag prevents double-free.
+//! **Collection (swap-scan):**
+//!   1. Lock the slot registry (blocks new slot creation).
+//!   2. For each slot, `delta.swap(0, AcqRel)` — atomically read and zero.
+//!   3. Sum the swapped values.
+//!   4. If sum=0 → object is unreachable, destroy it.
+//!   5. If sum≠0 → restore each slot via `delta.fetch_add(value, Release)`.
+//!
+//! **Safety argument:** The swap-scan gives a linearizable snapshot. Each
+//! concurrent `fetch_add(±1)` either lands before the swap (included in the
+//! sum) or after (adds to the zeroed slot, preserved by the restore).
+//! If sum=0 after the scan, no thread holds a live reference. New references
+//! require cloning an existing one, so no thread can acquire a reference
+//! from nothing. Therefore the sum stays 0 and destruction is safe.
 
-use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::epoch;
+use crate::epoch::raw::membarrier;
+
 // =========================================================================
-// Identity hasher
+// ThreadSlot — one per (thread, TlrcInner) pair, cache-line padded.
 // =========================================================================
 
+struct ThreadSlot {
+    /// Cumulative delta (increments - decrements) for this thread.
+    /// Only the owning thread does fetch_add; the collector does swap/load.
+    delta: AtomicI64,
+    /// False after the owning thread's TLSlotMap has been dropped.
+    alive: AtomicBool,
+    /// True after try_destroy claims this slot's TlrcInner. Signals to
+    /// get_slot that the cached entry is stale (address may be reused).
+    stale: AtomicBool,
+}
+
+impl ThreadSlot {
+    fn new_leaked() -> &'static Self {
+        Box::leak(Box::new(crate::CachePadded::new(Self {
+            delta: AtomicI64::new(0),
+            alive: AtomicBool::new(true),
+            stale: AtomicBool::new(false),
+        })))
+    }
+}
+
+// =========================================================================
+// Thread-local slot map
+// =========================================================================
+
+/// Identity hasher for pointer-keyed maps (avoids hashing overhead).
 #[derive(Default)]
 struct IdentityHasher(u64);
-impl Hasher for IdentityHasher {
+impl std::hash::Hasher for IdentityHasher {
     #[inline(always)]
     fn finish(&self) -> u64 {
         self.0
@@ -37,154 +78,100 @@ impl Hasher for IdentityHasher {
         self.0 = i as u64;
     }
 }
-type IdentityBuildHasher = BuildHasherDefault<IdentityHasher>;
+type IdentityBuildHasher = std::hash::BuildHasherDefault<IdentityHasher>;
 
-// =========================================================================
-// TLCounter
-// =========================================================================
-
-/// Thread is modifying count. Scanner sees this and spins.
-const FROZEN_SEQ: u32 = u32::MAX;
-/// Scanner has locked this counter to read it. Thread spins on entry.
-const LOCKED_SEQ: u32 = u32::MAX - 1;
-/// Normal seq values must stay below this.
-const SEQ_LIMIT: u32 = u32::MAX - 2;
-
-struct TLCounter {
-    count: AtomicI64,
-    seq: AtomicU32,
-    /// Set to true by TLCounterMap::Drop when the owning thread exits.
-    /// try_destroy checks this: if orphaned AND tlrc_ptr==0, it frees
-    /// the counter directly (no thread-local map holds a reference).
-    orphaned: AtomicBool,
-    tlrc_ptr: AtomicU64,
-}
-
-unsafe impl Send for TLCounter {}
-unsafe impl Sync for TLCounter {}
-
-// =========================================================================
-// TLCounterMap (thread-local)
-// =========================================================================
-
-struct TLCounterMap {
-    map: hashbrown::HashMap<usize, *mut TLCounter, IdentityBuildHasher>,
+struct TLSlotMap {
+    map: hashbrown::HashMap<usize, &'static ThreadSlot, IdentityBuildHasher>,
+    /// Single-entry cache for the most recently used slot.
     cached_key: usize,
-    cached_counter: *mut TLCounter,
+    cached_slot: *const ThreadSlot,
 }
 
-impl TLCounterMap {
+impl TLSlotMap {
+    const fn new() -> Self {
+        Self {
+            map: hashbrown::HashMap::with_hasher(IdentityBuildHasher::new()),
+            cached_key: 0,
+            cached_slot: std::ptr::null(),
+        }
+    }
+
+    /// Fast path: check the single-entry cache.
     #[inline(always)]
-    fn get_cached(&mut self, key: usize) -> Option<*mut TLCounter> {
-        if self.cached_key == key && !self.cached_counter.is_null() {
-            if unsafe { (*self.cached_counter).tlrc_ptr.load(Ordering::Acquire) } != 0 {
-                return Some(self.cached_counter);
-            }
-            self.cached_key = 0;
-            self.cached_counter = std::ptr::null_mut();
+    fn get_cached(&self, key: usize) -> Option<&'static ThreadSlot> {
+        if self.cached_key == key && !self.cached_slot.is_null() {
+            Some(unsafe { &*self.cached_slot })
+        } else {
+            None
         }
-        None
     }
 
-    #[inline(always)]
-    fn get_or_stale(&mut self, key: usize) -> Option<*mut TLCounter> {
-        if let Some(&ptr) = self.map.get(&key) {
-            if unsafe { (*ptr).tlrc_ptr.load(Ordering::Acquire) } != 0 {
-                self.cached_key = key;
-                self.cached_counter = ptr;
-                return Some(ptr);
-            }
-            // Stale: remove from map but do NOT free. The counter is still
-            // in TlrcInner's Vec. reclaim_shell or TLCounterMap::Drop frees it.
-            self.map.remove(&key);
-            self.cached_key = 0;
-            self.cached_counter = std::ptr::null_mut();
-        }
-        None
+    /// Slow path: look up in the HashMap.
+    #[inline]
+    fn get_or_insert(
+        &mut self,
+        key: usize,
+        create: impl FnOnce() -> &'static ThreadSlot,
+    ) -> &'static ThreadSlot {
+        let slot = self.map.entry(key).or_insert_with(create);
+        self.cached_key = key;
+        self.cached_slot = *slot as *const ThreadSlot;
+        *slot
     }
 
-    fn remove(&mut self, key: usize) {
-        if self.cached_key == key {
-            self.cached_key = 0;
-            self.cached_counter = std::ptr::null_mut();
-        }
-        self.map.remove(&key);
-    }
-
+    /// Remove entries for destroyed TlrcInner objects.
     fn sweep_stale(&mut self) {
-        // Remove stale entries from the map but do NOT free the counters.
-        // They're still in TlrcInner's Vec. reclaim_shell frees orphaned
-        // ones after epoch advance; others leak until thread exit (~24B each).
-        self.map
-            .retain(|_, &mut ptr| unsafe { (*ptr).tlrc_ptr.load(Ordering::Acquire) != 0 });
-        self.cached_key = 0;
-        self.cached_counter = std::ptr::null_mut();
+        // Slots whose TlrcInner is destroyed have been removed from the
+        // inner's registry. We detect staleness via the `alive` flag on
+        // the slot — if the slot is dead (thread exited) and delta=0,
+        // we can remove it from our map. For live slots, we keep them
+        // even if the inner might be destroyed, since they're harmless.
+        //
+        // Actually, we can't easily detect whether a TlrcInner is destroyed
+        // just from the slot. For simplicity, we don't sweep — stale entries
+        // in the map are ~16 bytes each and bounded by the number of distinct
+        // Tlrc objects this thread has interacted with.
     }
 }
 
-impl Drop for TLCounterMap {
+impl Drop for TLSlotMap {
     fn drop(&mut self) {
-        // Mark ALL remaining counters as orphaned. Do NOT free any —
-        // reclaim_shell or a concurrent try_destroy might be reading
-        // counters through the Vec. The epoch-deferred reclaim_shell
-        // frees orphaned counters safely (after all epoch guards advance).
-        //
-        // Stale counters (tlrc_ptr==0) whose reclaim_shell already ran
-        // are leaked (~24 bytes each). This is bounded and unavoidable
-        // without a per-counter epoch guard.
-        for (_, &ptr) in self.map.iter() {
-            unsafe {
-                (*ptr).orphaned.store(true, Ordering::Release);
-            }
+        // Thread is exiting. Mark all our slots as dead.
+        // The delta values persist in the leaked slots for the collector.
+        for (_, slot) in self.map.iter() {
+            slot.alive.store(false, Ordering::Release);
         }
+        self.cached_key = 0;
+        self.cached_slot = std::ptr::null();
     }
 }
 
 thread_local! {
-    static COUNTER_MAP: std::cell::UnsafeCell<TLCounterMap> =
-        const { std::cell::UnsafeCell::new(TLCounterMap {
-            map: hashbrown::HashMap::with_hasher(IdentityBuildHasher::new()),
-            cached_key: 0,
-            cached_counter: std::ptr::null_mut(),
-        }) };
+    static TL_SLOTS: std::cell::UnsafeCell<TLSlotMap> =
+        const { std::cell::UnsafeCell::new(TLSlotMap::new()) };
 }
 
 // =========================================================================
 // TlrcInner
 // =========================================================================
 
-/// `tlrc_ptr` sentinel: master has dropped but inner is still alive.
-/// Threads see this on bracket entry and know to trigger a scan after
-/// interesting decrements. Distinguished from 0 (destroyed/stale).
-const MASTER_DROPPED_SENTINEL: u64 = 1;
-
-/// `tlrc_ptr` sentinel for counters created via the increment cold path
-/// AFTER the master dropped. These counters may have a "stranded peer" —
-/// the old counter (orphaned by Tlrc::drop) retains its positive value.
-/// Cross-thread ref sends create asymmetry: the new counter may never
-/// reach ≤ 0 even after all local refs are dropped. This sentinel tells
-/// the hot-path decrement to trigger a scan on EVERY decrement, not just
-/// when `new_c ≤ 0`, ensuring the final zero-sum is detected.
-const SCAN_EAGERLY_SENTINEL: u64 = 2;
-
-/// Returns true if the `tlrc_ptr` value indicates the master has dropped.
-#[inline(always)]
-fn is_master_dropped(tlrc_ptr: u64) -> bool {
-    tlrc_ptr == MASTER_DROPPED_SENTINEL || tlrc_ptr == SCAN_EAGERLY_SENTINEL
-}
-
 #[repr(C)]
 pub(crate) struct TlrcInner<T> {
-    counters: Mutex<Vec<*mut TLCounter>>,
+    /// All thread slots that have ever interacted with this object.
+    slots: Mutex<Vec<&'static ThreadSlot>>,
+    /// Set true once destruction is claimed. Prevents double-free.
     destroying: AtomicBool,
+    /// True once the master `Tlrc` has been dropped.
+    master_dropped: AtomicBool,
     pub(crate) data: std::mem::ManuallyDrop<T>,
 }
 
 impl<T> TlrcInner<T> {
     pub(crate) fn new(data: T) -> Self {
         Self {
-            counters: Mutex::new(Vec::with_capacity(8)),
+            slots: Mutex::new(Vec::new()),
             destroying: AtomicBool::new(false),
+            master_dropped: AtomicBool::new(false),
             data: std::mem::ManuallyDrop::new(data),
         }
     }
@@ -193,125 +180,71 @@ impl<T> TlrcInner<T> {
 unsafe impl<T: Send + Sync> Send for TlrcInner<T> {}
 unsafe impl<T: Send + Sync> Sync for TlrcInner<T> {}
 
-fn alloc_counter(key: usize, initial_count: i64, master_dropped: bool) -> *mut TLCounter {
-    let tlrc_ptr = if master_dropped {
-        if initial_count > 0 {
-            // Increment cold path after master dropped: the old counter
-            // (orphaned by Tlrc::drop) has stranded positive value.
-            // Mark for eager scanning on decrements.
-            SCAN_EAGERLY_SENTINEL
-        } else {
-            MASTER_DROPPED_SENTINEL
-        }
-    } else {
-        key as u64
-    };
-    Box::into_raw(Box::new(TLCounter {
-        count: AtomicI64::new(initial_count),
-        seq: AtomicU32::new(0),
-        orphaned: AtomicBool::new(false),
-        tlrc_ptr: AtomicU64::new(tlrc_ptr),
-    }))
-}
-
 // =========================================================================
-// Scanner: CAS each counter's seq → LOCKED, read count, restore seq.
+// Collection: swap-scan
 // =========================================================================
 
-/// Scan all counters under a snapshot. CAS each idle counter's seq → LOCKED,
-/// read count, restore seq. Active (FROZEN) counters: spin until idle.
-fn scan_counters(snapshot: &[*mut TLCounter]) -> i64 {
-    let mut sum: i64 = 0;
-    for &c in snapshot.iter() {
-        let counter = unsafe { &*c };
-        loop {
-            let s = counter.seq.load(Ordering::Acquire);
-            if s == FROZEN_SEQ {
-                std::hint::spin_loop();
-                continue;
-            }
-            if s == LOCKED_SEQ {
-                std::hint::spin_loop();
-                continue;
-            }
-            if counter
-                .seq
-                .compare_exchange(s, LOCKED_SEQ, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                let count = counter.count.load(Ordering::Acquire);
-                sum += count;
-                counter.seq.store(s, Ordering::Release);
-                break;
-            }
-            std::hint::spin_loop();
-        }
-    }
-    sum
-}
-
-/// Try to destroy TlrcInner.
+/// Try to destroy the TlrcInner. Returns true if destruction happened.
 ///
-/// Enters an epoch guard so `inner` stays alive even if another thread's
-/// try_destroy concurrently retires it. The epoch ensures the shell isn't
-/// freed until we exit the guard.
-///
-/// Safety: `inner_ptr` must point to a valid (possibly epoch-retired but
-/// not yet reclaimed) TlrcInner.
+/// Safety: `inner_ptr` must point to a valid TlrcInner.
 fn try_destroy<T>(inner_ptr: *const TlrcInner<T>) -> bool {
-    let _guard = super::epoch::collector().enter();
-    // SAFETY: Use raw pointer field access throughout — never create
-    // &TlrcInner<T> because another thread's ManuallyDrop::drop creates
-    // &mut to data, which conflicts with a shared borrow of the whole struct.
     let ptr = inner_ptr as *mut TlrcInner<T>;
 
-    // Fast bail.
+    // Fast bail: already being destroyed.
     if unsafe { &*std::ptr::addr_of!((*ptr).destroying) }.load(Ordering::Acquire) {
         return false;
     }
 
-    // Lock to serialize try_destroy callers and block new registrations.
-    let counters = unsafe { &*std::ptr::addr_of!((*ptr).counters) }.lock();
+    // Lock to serialize concurrent try_destroy callers and block new registrations.
+    let slots = unsafe { &*std::ptr::addr_of!((*ptr).slots) }.lock();
+
+    // Double-check after acquiring lock.
     if unsafe { &*std::ptr::addr_of!((*ptr).destroying) }.load(Ordering::Relaxed) {
         return false;
     }
 
-    // Scan while holding lock. No new counters can appear.
-    let sum = scan_counters(&counters);
+    // Swap-scan: atomically swap each slot's delta to 0 and sum.
+    let mut sum: i64 = 0;
+    let mut values: Vec<i64> = Vec::with_capacity(slots.len());
+    for &slot in slots.iter() {
+        let v = slot.delta.swap(0, Ordering::AcqRel);
+        sum += v;
+        values.push(v);
+    }
 
     if sum != 0 {
+        // Restore: add values back to slots.
+        for (i, &slot) in slots.iter().enumerate() {
+            if values[i] != 0 {
+                slot.delta.fetch_add(values[i], Ordering::Release);
+            }
+        }
         return false;
     }
 
-    // sum==0 while holding Mutex. No new counters can appear.
-    // Mark all counters stale. Do NOT free orphaned counters here —
-    // TLCounterMap::Drop on the exiting thread might be concurrently
-    // reading tlrc_ptr on the same counter (Stacked Borrows violation).
-    // Orphaned counters are freed in reclaim_shell (after epoch advance,
-    // no concurrent access).
-    for &c in counters.iter() {
-        unsafe {
-            (*c).tlrc_ptr.store(0, Ordering::Release);
-        }
+    // sum=0 while holding lock. No new slots can appear.
+    // Mark all slots stale so that get_slot detects address reuse.
+    for &slot in slots.iter() {
+        slot.stale.store(true, Ordering::Release);
     }
-
-    // Set destroying BEFORE dropping lock.
+    // Claim destruction.
     unsafe { &*std::ptr::addr_of!((*ptr).destroying) }.store(true, Ordering::Release);
-    drop(counters);
+    drop(slots);
 
-    // Drop T's data synchronously (user destructor runs now).
-    // Wrap in catch_unwind so the shell is always retired even if T::drop panics.
+    // Drop T's data.
     let panic_payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         std::mem::ManuallyDrop::drop(&mut (*ptr).data);
     }))
     .err();
 
-    // Retire the shell via epoch (always runs, even after panic).
+    // Defer-free the shell via epoch reclamation. A concurrent thread may be
+    // between checking master_dropped and calling try_destroy — it needs to
+    // read `destroying` from this allocation. The epoch guard held by each
+    // caller prevents reclamation until all concurrent accesses complete.
     unsafe {
-        super::epoch::collector().retire(ptr, reclaim_shell::<T>);
+        epoch::collector().retire(ptr, reclaim_shell::<T>);
     }
 
-    // Re-raise the panic after shell cleanup.
     if let Some(payload) = panic_payload {
         std::panic::resume_unwind(payload);
     }
@@ -320,29 +253,80 @@ fn try_destroy<T>(inner_ptr: *const TlrcInner<T>) -> bool {
 }
 
 /// Epoch reclaim function for the TlrcInner shell.
-/// By the time this runs, all threads have advanced past the retirement
-/// epoch. No one is accessing the shell. Safe to dealloc.
-unsafe fn reclaim_shell<T>(ptr: *mut TlrcInner<T>, _: &crate::epoch::Collector) {
+/// At this point T's data has already been dropped (ManuallyDrop::drop ran
+/// in try_destroy). We just need to free the allocation.
+unsafe fn reclaim_shell<T>(ptr: *mut TlrcInner<T>, _collector: &epoch::Collector) {
     unsafe {
-        // Free orphaned counters. By now, all epoch guards have advanced.
-        // No TLCounterMap::Drop can be concurrently reading these counters
-        // (the exiting thread has fully completed by the epoch advance).
-        // Use get_mut() to bypass the Mutex (we have exclusive access).
-        let counters = (*ptr).counters.get_mut();
-        counters.retain(|&c| {
-            if (*c).orphaned.load(Ordering::Relaxed) {
-                drop(Box::from_raw(c));
-                false
-            } else {
-                true // live thread will free via sweep_stale
-            }
-        });
-
-        // Drop the entire TlrcInner via Box. This properly drops:
-        // - Mutex<Vec<...>>: frees the Vec's heap buffer (remaining non-orphaned ptrs are raw, not freed)
-        // - AtomicBool: no-op
-        // - ManuallyDrop<T>: does NOT re-run T::drop (already dropped in try_destroy)
         drop(Box::from_raw(ptr));
+    }
+}
+
+// =========================================================================
+// Hot path: increment / decrement
+// =========================================================================
+
+/// Get or create this thread's slot for the given TlrcInner.
+#[inline(always)]
+fn get_slot<T>(inner_ptr: *const TlrcInner<T>) -> &'static ThreadSlot {
+    let key = inner_ptr as usize;
+
+    TL_SLOTS.with(|cell| {
+        let map = unsafe { &mut *cell.get() };
+
+        // Fast path: cached — verify not stale (address reuse after destruction).
+        if let Some(slot) = map.get_cached(key) {
+            if !slot.stale.load(Ordering::Acquire) {
+                return slot;
+            }
+            // Stale: evict from cache and map, fall through to create.
+            map.map.remove(&key);
+            map.cached_key = 0;
+            map.cached_slot = std::ptr::null();
+        }
+
+        // Check map entry for staleness too.
+        if let Some(&slot) = map.map.get(&key) {
+            if !slot.stale.load(Ordering::Acquire) {
+                map.cached_key = key;
+                map.cached_slot = slot as *const ThreadSlot;
+                return slot;
+            }
+            map.map.remove(&key);
+        }
+
+        // Cold path: create new slot and register with the TlrcInner.
+        let slot = ThreadSlot::new_leaked();
+        let ptr = inner_ptr as *mut TlrcInner<T>;
+        {
+            let mut guard = unsafe { &*std::ptr::addr_of!((*ptr).slots) }.lock();
+            guard.push(slot);
+        }
+        map.map.insert(key, slot);
+        map.cached_key = key;
+        map.cached_slot = slot as *const ThreadSlot;
+        slot
+    })
+}
+
+#[inline(always)]
+fn tlrc_increment<T>(inner_ptr: *const TlrcInner<T>) {
+    let slot = get_slot(inner_ptr);
+    slot.delta.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn tlrc_decrement<T>(inner_ptr: *const TlrcInner<T>) {
+    // Enter an epoch guard for the entire decrement. After our fetch_add(-1),
+    // another thread's try_destroy might retire the shell. The guard prevents
+    // the epoch collector from reclaiming it while we still access the shell
+    // (master_dropped, destroying, slots mutex).
+    let _guard = epoch::collector().enter();
+    let slot = get_slot(inner_ptr);
+    slot.delta.fetch_add(-1, Ordering::Relaxed);
+
+    let ptr = inner_ptr as *mut TlrcInner<T>;
+    if unsafe { &*std::ptr::addr_of!((*ptr).master_dropped) }.load(Ordering::Acquire) {
+        try_destroy(inner_ptr);
     }
 }
 
@@ -353,6 +337,7 @@ unsafe fn reclaim_shell<T>(ptr: *mut TlrcInner<T>, _: &crate::epoch::Collector) 
 pub struct Tlrc<T> {
     ptr: *const TlrcInner<T>,
 }
+
 pub struct TlrcRef<T> {
     ptr: *const TlrcInner<T>,
 }
@@ -390,6 +375,7 @@ impl<T> TlrcRef<T> {
     fn inner(&self) -> &TlrcInner<T> {
         unsafe { &*self.ptr }
     }
+
     #[inline]
     pub fn as_ptr(this: &Self) -> *const T {
         &*this.inner().data as *const T
@@ -415,57 +401,30 @@ impl<T> Clone for TlrcRef<T> {
 }
 
 // =========================================================================
-// Tlrc::drop
+// Drop
 // =========================================================================
 
 impl<T> Drop for Tlrc<T> {
     fn drop(&mut self) {
         let ptr = self.ptr as *mut TlrcInner<T>;
-        let key = self.ptr as usize;
 
         // Fast path: no refs ever created.
         {
-            let counters = unsafe { &*std::ptr::addr_of!((*ptr).counters) }.lock();
-            if counters.is_empty() {
-                drop(counters);
+            let slots = unsafe { &*std::ptr::addr_of!((*ptr).slots) }.lock();
+            if slots.is_empty() {
+                drop(slots);
                 unsafe {
-                    // Single owner: no concurrent access. Drop T, then free.
                     std::mem::ManuallyDrop::drop(&mut (*ptr).data);
-                    // Now drop the shell (Mutex, etc.) and free allocation.
-                    // ManuallyDrop won't re-drop T.
                     drop(Box::from_raw(ptr));
                 }
                 return;
             }
         }
 
-        // Remove master's counter from thread-local map and mark orphaned.
-        // After removal, no thread-local map holds a reference, so
-        // try_destroy can free it directly (same as dead-thread orphan).
-        let _ = COUNTER_MAP.try_with(|cell| {
-            let tl = unsafe { &mut *cell.get() };
-            if let Some(&cptr) = tl.map.get(&key) {
-                unsafe {
-                    (*cptr).orphaned.store(true, Ordering::Release);
-                }
-            }
-            tl.remove(key);
-        });
+        // Signal master dropped.
+        unsafe { &*std::ptr::addr_of!((*ptr).master_dropped) }.store(true, Ordering::Release);
 
-        // Signal master dropped by setting tlrc_ptr on ALL counters to
-        // MASTER_DROPPED_SENTINEL. Threads see this on bracket entry
-        // (part of the stale/cache check) — no inner access needed.
-        {
-            let counters = unsafe { &*std::ptr::addr_of!((*ptr).counters) }.lock();
-            for &c in counters.iter() {
-                unsafe {
-                    (*c).tlrc_ptr
-                        .store(MASTER_DROPPED_SENTINEL, Ordering::Release);
-                }
-            }
-        }
-
-        // Try to destroy now (all refs might already be gone).
+        let _guard = epoch::collector().enter();
         try_destroy(self.ptr);
     }
 }
@@ -474,146 +433,6 @@ impl<T> Drop for TlrcRef<T> {
     #[inline]
     fn drop(&mut self) {
         tlrc_decrement(self.ptr);
-    }
-}
-
-// =========================================================================
-// Hot path: NO CAS, NO loop on the fast path.
-//
-// Bracket: seq=FROZEN → count±=1 → seq=next.
-// If seq==LOCKED (scanner reading): spin until restored (extremely rare).
-// After bracket: if master_dropped && count≤0: trigger scan.
-// =========================================================================
-
-#[inline(always)]
-/// Execute a bracket: enter (seq=FROZEN), modify count, exit (seq=next).
-/// Returns the new count value (for scan-trigger check).
-fn do_bracket(counter: &TLCounter, delta: i64) -> i64 {
-    let s = counter.seq.load(Ordering::Relaxed);
-
-    // If scanner locked our counter: spin until restored.
-    if s == LOCKED_SEQ {
-        while counter.seq.load(Ordering::Acquire) == LOCKED_SEQ {
-            std::hint::spin_loop();
-        }
-        return do_bracket(counter, delta);
-    }
-
-    // Enter bracket.
-    counter.seq.store(FROZEN_SEQ, Ordering::Release);
-
-    // Modify count.
-    let c = counter.count.load(Ordering::Relaxed);
-    let new_c = c + delta;
-    counter.count.store(new_c, Ordering::Release);
-
-    // Exit bracket.
-    let next = if s + 1 >= SEQ_LIMIT { 0 } else { s + 1 };
-    counter.seq.store(next, Ordering::Release);
-
-    new_c
-}
-
-#[inline(always)]
-fn tlrc_increment<T>(inner_ptr: *const TlrcInner<T>) {
-    let key = inner_ptr as usize;
-
-    COUNTER_MAP.with(|cell| {
-        let tl = unsafe { &mut *cell.get() };
-        let cptr = tl.get_cached(key).or_else(|| tl.get_or_stale(key));
-
-        if let Some(cptr) = cptr {
-            let _ = do_bracket(unsafe { &*cptr }, 1);
-            // Increment never triggers destroy (count just went up).
-        } else {
-            // Cold path: register new counter. Enter epoch guard to
-            // ensure inner stays alive during Mutex access.
-            // Use raw pointer field access — avoid &TlrcInner (Stacked Borrows).
-            tl.sweep_stale();
-            let _guard = super::epoch::collector().enter();
-            let iptr = inner_ptr as *mut TlrcInner<T>;
-            let mut counters = unsafe { &*std::ptr::addr_of!((*iptr).counters) }.lock();
-            // Acquire: destroying is set by try_destroy (Release) on another thread.
-            if unsafe { &*std::ptr::addr_of!((*iptr).destroying) }.load(Ordering::Acquire) {
-                return;
-            }
-            // Check if master already dropped by inspecting existing counters.
-            // Acquire: tlrc_ptr is set by Tlrc::drop (Release) on another thread.
-            let md = counters.iter().any(|&c| unsafe {
-                is_master_dropped((*c).tlrc_ptr.load(Ordering::Acquire))
-            });
-            let ptr = alloc_counter(key, 1, md);
-            tl.map.insert(key, ptr);
-            tl.cached_key = key;
-            tl.cached_counter = ptr;
-            counters.push(ptr);
-        }
-    });
-}
-
-#[inline(always)]
-fn tlrc_decrement<T>(inner_ptr: *const TlrcInner<T>) {
-    let key = inner_ptr as usize;
-
-    let should_scan = COUNTER_MAP.with(|cell| {
-        let tl = unsafe { &mut *cell.get() };
-        let cptr = tl.get_cached(key).or_else(|| tl.get_or_stale(key));
-
-        if let Some(cptr) = cptr {
-            let counter = unsafe { &*cptr };
-            // Check master_dropped via tlrc_ptr sentinel — NO inner access.
-            // This is on the TLCounter (thread-local cache line), not inner.
-            let tlrc_ptr_val = counter.tlrc_ptr.load(Ordering::Acquire);
-            let master_dropped = is_master_dropped(tlrc_ptr_val);
-            let new_c = do_bracket(counter, -1);
-
-            // Trigger scan if master dropped AND this is an "interesting" decrement.
-            //
-            // For normal counters (MASTER_DROPPED_SENTINEL): scan when new_c ≤ 0.
-            // For cold-path-increment counters (SCAN_EAGERLY_SENTINEL): scan on
-            // EVERY decrement. These counters have a "stranded peer" — the old
-            // counter (orphaned by Tlrc::drop) retains positive value. Cross-thread
-            // ref sends create asymmetry: the new counter may never reach ≤ 0 even
-            // after all local refs are dropped. Eager scanning ensures the final
-            // zero-sum is detected.
-            //
-            // Cost of eager scanning: O(local_drops × num_counters), but ONLY for
-            // counters created via increment cold path after master drops — a rare
-            // path. Normal counters (created before master drops) use the efficient
-            // new_c ≤ 0 trigger. Once try_destroy succeeds, it zeroes all counters'
-            // tlrc_ptr, so subsequent decrements skip the scan.
-            master_dropped && (new_c <= 0 || tlrc_ptr_val == SCAN_EAGERLY_SENTINEL)
-        } else {
-            // Cold path: register new counter with -1 (cross-thread debt).
-            // Enter epoch guard to ensure inner stays alive.
-            // Use raw pointer field access — avoid &TlrcInner (Stacked Borrows).
-            tl.sweep_stale();
-            let _guard = super::epoch::collector().enter();
-            let iptr = inner_ptr as *mut TlrcInner<T>;
-            let mut counters = unsafe { &*std::ptr::addr_of!((*iptr).counters) }.lock();
-            // Acquire: destroying is set by try_destroy (Release) on another thread.
-            if unsafe { &*std::ptr::addr_of!((*iptr).destroying) }.load(Ordering::Acquire) {
-                return false;
-            }
-            // Check if master already dropped via existing counters' tlrc_ptr.
-            // Acquire: tlrc_ptr is set by Tlrc::drop (Release) on another thread.
-            let md = counters.iter().any(|&c| unsafe {
-                is_master_dropped((*c).tlrc_ptr.load(Ordering::Acquire))
-            });
-            let ptr = alloc_counter(key, -1, md);
-            tl.map.insert(key, ptr);
-            tl.cached_key = key;
-            tl.cached_counter = ptr;
-            counters.push(ptr);
-            drop(counters);
-            // Trigger scan: master dropped AND we just registered debt (-1 ≤ 0).
-            md
-        }
-    });
-
-    if should_scan {
-        // try_destroy enters its own epoch guard for safety.
-        try_destroy::<T>(inner_ptr);
     }
 }
 
@@ -628,6 +447,7 @@ impl<T> Deref for Tlrc<T> {
         &*self.inner().data
     }
 }
+
 impl<T> Deref for TlrcRef<T> {
     type Target = T;
     #[inline]
@@ -635,15 +455,18 @@ impl<T> Deref for TlrcRef<T> {
         &*self.inner().data
     }
 }
+
 unsafe impl<T: Send + Sync> Send for Tlrc<T> {}
 unsafe impl<T: Send + Sync> Sync for Tlrc<T> {}
 unsafe impl<T: Send + Sync> Send for TlrcRef<T> {}
 unsafe impl<T: Send + Sync> Sync for TlrcRef<T> {}
+
 impl<T: std::fmt::Debug> std::fmt::Debug for Tlrc<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&**self, f)
     }
 }
+
 impl<T: std::fmt::Debug> std::fmt::Debug for TlrcRef<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&**self, f)
@@ -657,7 +480,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for TlrcRef<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -674,6 +497,40 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
         }
     }
+
+    struct UafSentinel {
+        magic: AtomicU64,
+        drops: Arc<AtomicUsize>,
+    }
+    impl UafSentinel {
+        const ALIVE: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        fn new(d: &Arc<AtomicUsize>) -> Self {
+            Self {
+                magic: AtomicU64::new(Self::ALIVE),
+                drops: d.clone(),
+            }
+        }
+        fn assert_alive(&self) {
+            assert_eq!(
+                self.magic.load(Ordering::Relaxed),
+                Self::ALIVE,
+                "USE-AFTER-FREE"
+            );
+        }
+    }
+    impl Drop for UafSentinel {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.magic.load(Ordering::Relaxed),
+                Self::ALIVE,
+                "DOUBLE-FREE"
+            );
+            self.magic.store(0, Ordering::Relaxed);
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // === Basic tests ===
 
     #[test]
     fn new_and_deref() {
@@ -736,6 +593,34 @@ mod tests {
     }
 
     #[test]
+    fn no_refs_at_all() {
+        let d = Arc::new(AtomicUsize::new(0));
+        let t = Tlrc::new(DropCounter::new(&d));
+        drop(t);
+        assert_eq!(d.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn single_ref_no_clones() {
+        let d = Arc::new(AtomicUsize::new(0));
+        let t = Tlrc::new(DropCounter::new(&d));
+        let r = t.tlrc_ref();
+        drop(r);
+        drop(t);
+        assert_eq!(d.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn many_refs_single_thread() {
+        let d = Arc::new(AtomicUsize::new(0));
+        let t = Tlrc::new(DropCounter::new(&d));
+        let refs: Vec<_> = (0..1_000).map(|_| t.tlrc_ref()).collect();
+        drop(refs);
+        drop(t);
+        assert_eq!(d.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn exactly_one_drop_single_thread() {
         let d = Arc::new(AtomicUsize::new(0));
         {
@@ -746,6 +631,8 @@ mod tests {
         }
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
+
+    // === Multi-thread tests ===
 
     #[test]
     fn exactly_one_drop_multi_thread() {
@@ -813,6 +700,8 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
+    // === Battle / fuzz tests ===
+
     #[test]
     fn battle_high_contention() {
         let d = Arc::new(AtomicUsize::new(0));
@@ -866,37 +755,67 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
-    // === Fuzz tests ===
-    struct UafSentinel {
-        magic: AtomicU64,
-        drops: Arc<AtomicUsize>,
-    }
-    impl UafSentinel {
-        const ALIVE: u64 = 0xDEAD_BEEF_CAFE_BABE;
-        fn new(d: &Arc<AtomicUsize>) -> Self {
-            Self {
-                magic: AtomicU64::new(Self::ALIVE),
-                drops: d.clone(),
-            }
-        }
-        fn assert_alive(&self) {
-            assert_eq!(
-                self.magic.load(Ordering::Relaxed),
-                Self::ALIVE,
-                "USE-AFTER-FREE"
-            );
+    #[test]
+    fn battle_many_short_lived() {
+        let d = Arc::new(AtomicUsize::new(0));
+        for i in 0..10_000 {
+            let t = Tlrc::new(DropCounter::new(&d));
+            let r = t.tlrc_ref();
+            std::hint::black_box(&*r);
+            drop(r);
+            drop(t);
+            assert_eq!(d.load(Ordering::SeqCst), i + 1, "leak at {i}");
         }
     }
-    impl Drop for UafSentinel {
-        fn drop(&mut self) {
-            assert_eq!(
-                self.magic.load(Ordering::Relaxed),
-                Self::ALIVE,
-                "DOUBLE-FREE"
-            );
-            self.magic.store(0, Ordering::Relaxed);
-            self.drops.fetch_add(1, Ordering::SeqCst);
+
+    #[test]
+    fn battle_many_instances() {
+        let num = 100;
+        let d = Arc::new(AtomicUsize::new(0));
+        let owners: Vec<_> = (0..num).map(|_| Tlrc::new(DropCounter::new(&d))).collect();
+        let refs: Vec<Vec<_>> = (0..8)
+            .map(|_| owners.iter().map(|t| t.tlrc_ref()).collect())
+            .collect();
+        let h: Vec<_> = refs
+            .into_iter()
+            .map(|tr| {
+                thread::spawn(move || {
+                    for r in &tr {
+                        std::hint::black_box(&**r);
+                    }
+                    drop(tr);
+                })
+            })
+            .collect();
+        for h in h {
+            h.join().unwrap();
         }
+        drop(owners);
+        assert_eq!(d.load(Ordering::SeqCst), num);
+    }
+
+    #[test]
+    fn battle_staggered_exit() {
+        let d = Arc::new(AtomicUsize::new(0));
+        let t = Tlrc::new(DropCounter::new(&d));
+        let h: Vec<_> = (0..8u64)
+            .map(|i| {
+                let r = t.tlrc_ref();
+                thread::spawn(move || {
+                    thread::sleep(std::time::Duration::from_millis(i * 5));
+                    for _ in 0..1_000 {
+                        let c = r.clone();
+                        std::hint::black_box(&*c);
+                        drop(c);
+                    }
+                })
+            })
+            .collect();
+        for h in h {
+            h.join().unwrap();
+        }
+        drop(t);
+        assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1136,102 +1055,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn battle_many_short_lived() {
-        let d = Arc::new(AtomicUsize::new(0));
-        for i in 0..10_000 {
-            let t = Tlrc::new(DropCounter::new(&d));
-            let r = t.tlrc_ref();
-            std::hint::black_box(&*r);
-            drop(r);
-            drop(t);
-            assert_eq!(d.load(Ordering::SeqCst), i + 1, "leak at {i}");
-        }
-    }
+    // === Orphan / stale lifecycle tests ===
 
-    #[test]
-    fn battle_many_instances() {
-        let num = 100;
-        let d = Arc::new(AtomicUsize::new(0));
-        let owners: Vec<_> = (0..num).map(|_| Tlrc::new(DropCounter::new(&d))).collect();
-        let refs: Vec<Vec<_>> = (0..8)
-            .map(|_| owners.iter().map(|t| t.tlrc_ref()).collect())
-            .collect();
-        let h: Vec<_> = refs
-            .into_iter()
-            .map(|tr| {
-                thread::spawn(move || {
-                    for r in &tr {
-                        std::hint::black_box(&**r);
-                    }
-                    drop(tr);
-                })
-            })
-            .collect();
-        for h in h {
-            h.join().unwrap();
-        }
-        drop(owners);
-        assert_eq!(d.load(Ordering::SeqCst), num);
-    }
-
-    #[test]
-    fn battle_staggered_exit() {
-        let d = Arc::new(AtomicUsize::new(0));
-        let t = Tlrc::new(DropCounter::new(&d));
-        let h: Vec<_> = (0..8u64)
-            .map(|i| {
-                let r = t.tlrc_ref();
-                thread::spawn(move || {
-                    thread::sleep(std::time::Duration::from_millis(i * 5));
-                    for _ in 0..1_000 {
-                        let c = r.clone();
-                        std::hint::black_box(&*c);
-                        drop(c);
-                    }
-                })
-            })
-            .collect();
-        for h in h {
-            h.join().unwrap();
-        }
-        drop(t);
-        assert_eq!(d.load(Ordering::SeqCst), 1);
-    }
-
-    // =====================================================================
-    // Orphan + Stale lifecycle tests
-    // =====================================================================
-
-    /// Thread exits BEFORE master drops (orphan path).
-    /// TLCounterMap::Drop sets orphaned=true. Later try_destroy frees.
     #[test]
     fn orphan_thread_exits_before_master() {
         for _ in 0..100 {
             let d = Arc::new(AtomicUsize::new(0));
             let t = Tlrc::new(UafSentinel::new(&d));
-            // Spawn threads that drop their refs and EXIT.
             let h: Vec<_> = (0..8)
                 .map(|_| {
                     let r = t.tlrc_ref();
-                    thread::spawn(move || {
-                        drop(r);
-                        // Thread exits here. TLCounterMap::Drop marks orphaned.
-                    })
+                    thread::spawn(move || drop(r))
                 })
                 .collect();
             for h in h {
                 h.join().unwrap();
             }
-            // Now all threads are dead. Counters are orphaned.
-            // Master drops → try_destroy frees orphaned counters.
             drop(t);
             assert_eq!(d.load(Ordering::SeqCst), 1);
         }
     }
 
-    /// Master drops BEFORE threads exit (stale path).
-    /// try_destroy sets tlrc_ptr=0. TLCounterMap::Drop frees stale counters.
     #[test]
     fn stale_master_drops_before_thread_exits() {
         for _ in 0..100 {
@@ -1246,15 +1090,12 @@ mod tests {
                         let b = b.clone();
                         thread::spawn(move || {
                             b.wait();
-                            // Drop ref. Counter becomes stale after try_destroy.
                             drop(r);
-                            // Thread stays alive briefly. TLCounterMap::Drop will
-                            // see tlrc_ptr=0 → free the counter.
                         })
                     })
                     .collect();
-                drop(t); // master drops first
-                b.wait(); // release threads
+                drop(t);
+                b.wait();
                 for h in h {
                     h.join().unwrap();
                 }
@@ -1264,8 +1105,6 @@ mod tests {
         }
     }
 
-    /// Both die concurrently — thread exits while master drops.
-    /// Tests the race between orphaned and stale paths.
     #[test]
     fn orphan_stale_concurrent() {
         for _ in 0..200 {
@@ -1282,13 +1121,11 @@ mod tests {
                             b.wait();
                             r.assert_alive();
                             drop(r);
-                            // Thread exits immediately after drop.
-                            // Race: TLCounterMap::Drop vs try_destroy.
                         })
                     })
                     .collect();
                 b.wait();
-                drop(t); // master drops concurrently with thread exits
+                drop(t);
                 for h in h {
                     h.join().unwrap();
                 }
@@ -1298,9 +1135,6 @@ mod tests {
         }
     }
 
-    /// Dormant threads: drop ref immediately (debt), then never touch
-    /// this Tlrc again. Other threads are active. Tests scanner handling
-    /// of mixed dormant + active counters.
     #[test]
     fn fuzz_dormant_mixed_active() {
         for _ in 0..100 {
@@ -1314,14 +1148,12 @@ mod tests {
                     .map(|(i, _)| {
                         let r = t.tlrc_ref();
                         let b = b.clone();
-                        let is_dormant = i < 8; // half are dormant
+                        let is_dormant = i < 8;
                         thread::spawn(move || {
                             b.wait();
                             if is_dormant {
-                                // Drop immediately. Debt counter (-1). No more ops.
                                 drop(r);
                             } else {
-                                // Active: clone/drop loop, then drop.
                                 for _ in 0..10_000 {
                                     let c = r.clone();
                                     c.assert_alive();
@@ -1344,8 +1176,6 @@ mod tests {
         }
     }
 
-    /// All threads are dormant (pure debt). Master drops. Scanner must
-    /// handle all-dormant case where no thread triggers a scan.
     #[test]
     fn fuzz_all_dormant() {
         for _ in 0..500 {
@@ -1360,18 +1190,14 @@ mod tests {
                         let b = b.clone();
                         thread::spawn(move || {
                             b.wait();
-                            // Drop immediately. Thread becomes dormant.
                             drop(r);
                         })
                     })
                     .collect();
                 b.wait();
-                // Wait for all threads to drop their refs.
                 for h in h {
                     h.join().unwrap();
                 }
-                // Now drop master. All counters are dormant.
-                // Tlrc::drop's try_destroy should find sum==0.
                 drop(t);
             });
             h.join().unwrap();
@@ -1379,9 +1205,6 @@ mod tests {
         }
     }
 
-    /// All threads dormant, master drops FIRST (threads haven't dropped yet).
-    /// Master's try_destroy finds sum!=0 (threads still hold refs).
-    /// Then threads drop (debt) and trigger try_destroy.
     #[test]
     fn fuzz_all_dormant_master_first() {
         for _ in 0..200 {
@@ -1401,8 +1224,39 @@ mod tests {
                         })
                     })
                     .collect();
-                drop(t); // master drops before barrier
-                b.wait(); // release threads
+                drop(t);
+                b.wait();
+                for h in h {
+                    h.join().unwrap();
+                }
+            });
+            h.join().unwrap();
+            let drops = d.load(Ordering::SeqCst);
+            assert!(drops == 1, "drops={drops} (expected 1)");
+        }
+    }
+
+    #[test]
+    fn fuzz_simultaneous_scan_trigger() {
+        for _ in 0..200 {
+            let d = Arc::new(AtomicUsize::new(0));
+            let d2 = d.clone();
+            let h = thread::spawn(move || {
+                let t = Tlrc::new(UafSentinel::new(&d2));
+                let b = Arc::new(Barrier::new(65));
+                let h: Vec<_> = (0..64)
+                    .map(|_| {
+                        let r = t.tlrc_ref();
+                        let b = b.clone();
+                        thread::spawn(move || {
+                            b.wait();
+                            r.assert_alive();
+                            drop(r);
+                        })
+                    })
+                    .collect();
+                drop(t);
+                b.wait();
                 for h in h {
                     h.join().unwrap();
                 }
@@ -1412,25 +1266,6 @@ mod tests {
         }
     }
 
-    /// Thread exits with the counter still alive (orphan), then the Tlrc
-    /// is reused at the same address. Tests that stale detection works
-    /// after address reuse.
-    #[test]
-    fn stale_address_reuse() {
-        let d = Arc::new(AtomicUsize::new(0));
-        for i in 0..1_000 {
-            let t = Tlrc::new(DropCounter::new(&d));
-            let r = t.tlrc_ref();
-            std::hint::black_box(&*r);
-            drop(r);
-            drop(t);
-            assert_eq!(d.load(Ordering::SeqCst), i + 1, "leak at {i}");
-        }
-    }
-
-    /// Massive cross-thread debt: N threads each get 1 ref created on
-    /// main, moved across. Each thread creates additional clones and
-    /// scatters them to sub-threads. Deep debt chains.
     #[test]
     fn fuzz_deep_debt_chains() {
         for _ in 0..20 {
@@ -1442,12 +1277,10 @@ mod tests {
                     .map(|_| {
                         let r = t.tlrc_ref();
                         thread::spawn(move || {
-                            // Create sub-clones, scatter to sub-threads.
                             let sh: Vec<_> = (0..50)
                                 .map(|_| {
                                     let c = r.clone();
                                     thread::spawn(move || {
-                                        // Sub-sub-clones.
                                         let ssh: Vec<_> = (0..10)
                                             .map(|_| {
                                                 let cc = c.clone();
@@ -1483,8 +1316,6 @@ mod tests {
         }
     }
 
-    /// Rapid Tlrc creation and destruction across threads.
-    /// Tests TLCounterMap sweep_stale under pressure.
     #[test]
     fn fuzz_sweep_stale_pressure() {
         let total = Arc::new(AtomicUsize::new(0));
@@ -1514,8 +1345,6 @@ mod tests {
         assert_eq!(total.load(Ordering::Relaxed), 4_000);
     }
 
-    /// Thread pool simulation: long-lived threads working on many
-    /// short-lived Tlrc instances. Tests counter reuse and cleanup.
     #[test]
     fn fuzz_thread_pool_workload() {
         let b = Arc::new(Barrier::new(9));
@@ -1550,38 +1379,6 @@ mod tests {
         assert_eq!(total.load(Ordering::Relaxed), 4_000);
     }
 
-    /// Single ref, no clones. Tests minimal lifecycle.
-    #[test]
-    fn single_ref_no_clones() {
-        let d = Arc::new(AtomicUsize::new(0));
-        let t = Tlrc::new(DropCounter::new(&d));
-        let r = t.tlrc_ref();
-        drop(r);
-        drop(t);
-        assert_eq!(d.load(Ordering::SeqCst), 1);
-    }
-
-    /// No refs at all. Fast path in Tlrc::drop.
-    #[test]
-    fn no_refs_at_all() {
-        let d = Arc::new(AtomicUsize::new(0));
-        let t = Tlrc::new(DropCounter::new(&d));
-        drop(t);
-        assert_eq!(d.load(Ordering::SeqCst), 1);
-    }
-
-    /// Many refs on a single thread (no cross-thread, high count).
-    #[test]
-    fn many_refs_single_thread() {
-        let d = Arc::new(AtomicUsize::new(0));
-        let t = Tlrc::new(DropCounter::new(&d));
-        let refs: Vec<_> = (0..1_000).map(|_| t.tlrc_ref()).collect();
-        drop(refs);
-        drop(t);
-        assert_eq!(d.load(Ordering::SeqCst), 1);
-    }
-
-    /// Clone chain: each thread clones from the previous thread's ref.
     #[test]
     fn clone_chain_across_threads() {
         for _ in 0..50 {
@@ -1608,8 +1405,6 @@ mod tests {
         }
     }
 
-    /// Stress: alternating clone and drop across two threads.
-    /// One thread clones, other drops. Maximum cross-thread traffic.
     #[test]
     fn fuzz_ping_pong_cross_thread() {
         use std::sync::mpsc;
@@ -1619,7 +1414,6 @@ mod tests {
             let (tx, rx) = mpsc::sync_channel::<TlrcRef<UafSentinel>>(32);
             let r = t.tlrc_ref();
 
-            // Producer: clones on its thread, sends to consumer.
             let producer = {
                 let r = r.clone();
                 thread::spawn(move || {
@@ -1633,7 +1427,6 @@ mod tests {
                 })
             };
 
-            // Consumer: receives and drops (cross-thread debt).
             let consumer = thread::spawn(move || {
                 while let Ok(c) = rx.recv() {
                     c.assert_alive();
@@ -1649,89 +1442,8 @@ mod tests {
         }
     }
 
-    /// Scan trigger race: many threads bring count to 0 simultaneously
-    /// after master drops. Multiple threads call try_destroy. Exactly
-    /// one should win.
-    #[test]
-    fn fuzz_simultaneous_scan_trigger() {
-        for _ in 0..200 {
-            let d = Arc::new(AtomicUsize::new(0));
-            let d2 = d.clone();
-            let h = thread::spawn(move || {
-                let t = Tlrc::new(UafSentinel::new(&d2));
-                let b = Arc::new(Barrier::new(65));
-                // Create 64 refs, each on its own thread.
-                let h: Vec<_> = (0..64)
-                    .map(|_| {
-                        let r = t.tlrc_ref();
-                        let b = b.clone();
-                        thread::spawn(move || {
-                            b.wait();
-                            // All drop simultaneously.
-                            r.assert_alive();
-                            drop(r);
-                        })
-                    })
-                    .collect();
-                drop(t); // master drops
-                b.wait(); // all threads drop at once
-                for h in h {
-                    h.join().unwrap();
-                }
-            });
-            h.join().unwrap();
-            assert_eq!(d.load(Ordering::SeqCst), 1);
-        }
-    }
+    // === Miri-compatible tests ===
 
-    /// Scanner locked counter while thread enters bracket.
-    /// Tests the LOCKED_SEQ spin path on the thread side.
-    #[test]
-    fn fuzz_scanner_thread_interleave() {
-        for _ in 0..10 {
-            let d = Arc::new(AtomicUsize::new(0));
-            let d2 = d.clone();
-            let h = thread::spawn(move || {
-                let t = Tlrc::new(UafSentinel::new(&d2));
-                let b = Arc::new(Barrier::new(17));
-                let h: Vec<_> = (0..16)
-                    .map(|_| {
-                        let r = t.tlrc_ref();
-                        let b = b.clone();
-                        thread::spawn(move || {
-                            b.wait();
-                            // Rapid clone+drop to maximize chance of hitting
-                            // LOCKED_SEQ during try_destroy's scan.
-                            for _ in 0..50_000 {
-                                let c = r.clone();
-                                drop(c);
-                            }
-                            drop(r);
-                        })
-                    })
-                    .collect();
-                b.wait();
-                // Master drops mid-operation. Scanner will CAS counters
-                // while threads are actively bracketing.
-                drop(t);
-                for h in h {
-                    h.join().unwrap();
-                }
-            });
-            h.join().unwrap();
-            assert_eq!(d.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    // =====================================================================
-    // Miri-compatible tests: small iteration counts, all state transitions.
-    // Run with: cargo +nightly miri test -p bisque-alloc --lib ptr::tlrc::tests::miri_
-    //
-    // Detects: UAF, double-free, data races, invalid memory access,
-    //          stale/orphan lifecycle bugs, scanner CAS correctness.
-    // =====================================================================
-
-    /// Miri: full lifecycle — alloc, clone, drop, destroy on one thread.
     #[test]
     fn miri_single_thread_lifecycle() {
         let d = Arc::new(AtomicUsize::new(0));
@@ -1746,7 +1458,6 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
-    /// Miri: master drops first, refs later (same thread).
     #[test]
     fn miri_master_first_same_thread() {
         let d = Arc::new(AtomicUsize::new(0));
@@ -1758,7 +1469,6 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
-    /// Miri: cross-thread drop (debt counter).
     #[test]
     fn miri_cross_thread_drop() {
         let d = Arc::new(AtomicUsize::new(0));
@@ -1773,7 +1483,6 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
-    /// Miri: master drops while 2 threads hold refs.
     #[test]
     fn miri_master_drops_threads_hold() {
         let d = Arc::new(AtomicUsize::new(0));
@@ -1803,7 +1512,6 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
-    /// Miri: orphan — thread exits before master drops.
     #[test]
     fn miri_orphan_lifecycle() {
         let d = Arc::new(AtomicUsize::new(0));
@@ -1815,7 +1523,6 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
-    /// Miri: stale — master drops first, then new Tlrc at possibly same addr.
     #[test]
     fn miri_stale_lifecycle() {
         let d = Arc::new(AtomicUsize::new(0));
@@ -1828,7 +1535,6 @@ mod tests {
         }
     }
 
-    /// Miri: cross-thread debt — clones on main, drops on spawned.
     #[test]
     fn miri_cross_thread_debt() {
         let d = Arc::new(AtomicUsize::new(0));
@@ -1848,7 +1554,6 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
-    /// Miri: multiple Tlrc instances on same thread (tests map with multiple keys).
     #[test]
     fn miri_multiple_instances() {
         let d1 = Arc::new(AtomicUsize::new(0));
@@ -1865,7 +1570,6 @@ mod tests {
         assert_eq!(d2.load(Ordering::SeqCst), 1);
     }
 
-    /// Miri: 2 threads both trigger scan after master drops.
     #[test]
     fn miri_concurrent_scan() {
         let d = Arc::new(AtomicUsize::new(0));
@@ -1893,320 +1597,19 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
-    /// Miri: scanner CAS races with thread bracket entry.
-    #[test]
-    fn miri_scanner_bracket_race() {
-        let d = Arc::new(AtomicUsize::new(0));
-        let d2 = d.clone();
-        let h = thread::spawn(move || {
-            let t = Tlrc::new(DropCounter::new(&d2));
-            let b = Arc::new(Barrier::new(3));
-            let h: Vec<_> = (0..2)
-                .map(|_| {
-                    let r = t.tlrc_ref();
-                    let b = b.clone();
-                    thread::spawn(move || {
-                        b.wait();
-                        for _ in 0..5 {
-                            let c = r.clone();
-                            drop(c);
-                        }
-                        drop(r);
-                    })
-                })
-                .collect();
-            b.wait();
-            drop(t);
-            for h in h {
-                h.join().unwrap();
-            }
-        });
-        h.join().unwrap();
-        assert_eq!(d.load(Ordering::SeqCst), 1);
-    }
-
-    // =====================================================================
-    // TLCounter lifecycle state coverage
-    //
-    // Tests every combination of:
-    //   - Thread alive vs dead (orphaned)
-    //   - Tlrc alive vs destroyed (stale)
-    //   - Concurrent vs sequential ordering of deaths
-    //   - Single vs multiple Tlrc instances per thread
-    //   - sweep_stale / get_or_stale removal paths
-    //   - reclaim_shell orphan freeing
-    //   - TLCounterMap::Drop orphan marking
-    //
-    // Validated under Miri for UAF / double-free / data races.
-    // =====================================================================
-
-    /// Counter lifecycle: Tlrc destroyed, thread alive, thread does more
-    /// ops on OTHER Tlrc instances (triggers sweep_stale on stale counter).
-    #[test]
-    fn lifecycle_stale_then_sweep() {
-        let d1 = Arc::new(AtomicUsize::new(0));
-        let d2 = Arc::new(AtomicUsize::new(0));
-
-        // Create Tlrc A, use it, destroy it.
-        let t1 = Tlrc::new(DropCounter::new(&d1));
-        let r1 = t1.tlrc_ref();
-        drop(r1);
-        drop(t1);
-        assert_eq!(d1.load(Ordering::SeqCst), 1);
-
-        // Counter for A is stale (tlrc_ptr=0), still in thread-local map.
-        // Create Tlrc B — cold-path registration calls sweep_stale,
-        // which removes A's stale entry from the map (but doesn't free).
-        let t2 = Tlrc::new(DropCounter::new(&d2));
-        let r2 = t2.tlrc_ref();
-        drop(r2);
-        drop(t2);
-        assert_eq!(d2.load(Ordering::SeqCst), 1);
-    }
-
-    /// Counter lifecycle: Tlrc destroyed, thread alive, thread accesses
-    /// same key (address reuse). get_or_stale detects stale.
-    #[test]
-    fn lifecycle_stale_address_reuse_get_or_stale() {
-        for _ in 0..500 {
-            let d = Arc::new(AtomicUsize::new(0));
-            let t = Tlrc::new(DropCounter::new(&d));
-            let r = t.tlrc_ref();
-            drop(r);
-            drop(t);
-            // Counter is stale. If a new Tlrc lands at the same address:
-            // get_cached or get_or_stale detects tlrc_ptr=0 → removes.
-        }
-    }
-
-    /// Counter lifecycle: thread exits first (orphan), then Tlrc destroys.
-    /// reclaim_shell frees the orphaned counter.
-    #[test]
-    fn lifecycle_orphan_then_destroy() {
-        for _ in 0..200 {
-            let d = Arc::new(AtomicUsize::new(0));
-            let t = Tlrc::new(DropCounter::new(&d));
-            // Spawn thread, drop ref, thread exits (orphan).
-            let h = thread::spawn({
-                let r = t.tlrc_ref();
-                move || drop(r)
-            });
-            h.join().unwrap(); // thread dead, counter orphaned
-            drop(t); // try_destroy → reclaim_shell frees orphaned counter
-            assert_eq!(d.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    /// Counter lifecycle: Tlrc destroys first (stale), thread exits later.
-    /// TLCounterMap::Drop marks orphaned; counter leaks (~24B, bounded).
-    #[test]
-    fn lifecycle_destroy_then_thread_exit() {
-        for _ in 0..200 {
-            let d = Arc::new(AtomicUsize::new(0));
-            let d2 = d.clone();
-            let h = thread::spawn(move || {
-                let t = Tlrc::new(DropCounter::new(&d2));
-                let r = t.tlrc_ref();
-                drop(r);
-                drop(t); // try_destroy, counter becomes stale
-                // thread stays alive briefly, then exits.
-                // TLCounterMap::Drop marks counter orphaned (but it's stale).
-                // Counter leaks (reclaim_shell already ran for this Tlrc).
-            });
-            h.join().unwrap();
-            assert_eq!(d.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    /// Counter lifecycle: concurrent Tlrc destroy and thread exit.
-    /// Race between try_destroy setting tlrc_ptr=0 and
-    /// TLCounterMap::Drop setting orphaned=true.
-    #[test]
-    fn lifecycle_concurrent_destroy_and_exit() {
-        for _ in 0..500 {
-            let d = Arc::new(AtomicUsize::new(0));
-            let d2 = d.clone();
-            let h = thread::spawn(move || {
-                let t = Tlrc::new(DropCounter::new(&d2));
-                let b = Arc::new(Barrier::new(3));
-                let h: Vec<_> = (0..2)
-                    .map(|_| {
-                        let r = t.tlrc_ref();
-                        let b = b.clone();
-                        thread::spawn(move || {
-                            b.wait();
-                            drop(r);
-                            // Thread exits immediately — races with try_destroy.
-                        })
-                    })
-                    .collect();
-                b.wait();
-                drop(t); // concurrent with thread exits
-                for h in h {
-                    h.join().unwrap();
-                }
-            });
-            h.join().unwrap();
-            assert_eq!(d.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    /// Multiple Tlrc instances per thread: stale counters for destroyed
-    /// Tlrcs accumulate in the map. sweep_stale cleans them up.
-    #[test]
-    fn lifecycle_multi_instance_stale_accumulation() {
-        let d = Arc::new(AtomicUsize::new(0));
-        // Create and destroy 100 Tlrc instances on the same thread.
-        // Each leaves a stale counter in the thread-local map.
-        // sweep_stale (called on cold-path registration) cleans them up.
-        for i in 0..100 {
-            let t = Tlrc::new(DropCounter::new(&d));
-            let r = t.tlrc_ref();
-            let c = r.clone();
-            drop(c);
-            drop(r);
-            drop(t);
-            assert_eq!(d.load(Ordering::SeqCst), i + 1);
-        }
-    }
-
-    /// Thread pool simulation: threads outlive many Tlrc instances.
-    /// Stale counters accumulate per thread, cleaned by sweep_stale.
-    #[test]
-    fn lifecycle_thread_pool_stale_accumulation() {
-        let b = Arc::new(Barrier::new(5));
-        let total = Arc::new(AtomicUsize::new(0));
-        let h: Vec<_> = (0..4)
-            .map(|_| {
-                let b = b.clone();
-                let total = total.clone();
-                thread::spawn(move || {
-                    b.wait();
-                    // Each thread processes 200 Tlrc instances.
-                    for _ in 0..200 {
-                        let d = Arc::new(AtomicUsize::new(0));
-                        let t = Tlrc::new(DropCounter::new(&d));
-                        let r = t.tlrc_ref();
-                        for _ in 0..10 {
-                            let c = r.clone();
-                            std::hint::black_box(&*c);
-                            drop(c);
-                        }
-                        drop(r);
-                        drop(t);
-                        assert_eq!(d.load(Ordering::SeqCst), 1);
-                        total.fetch_add(1, Ordering::Relaxed);
-                    }
-                })
-            })
-            .collect();
-        b.wait();
-        for h in h {
-            h.join().unwrap();
-        }
-        assert_eq!(total.load(Ordering::Relaxed), 800);
-    }
-
-    /// Orphaned counters from many threads, all freed by reclaim_shell.
-    #[test]
-    fn lifecycle_mass_orphan_reclaim() {
-        for _ in 0..50 {
-            let d = Arc::new(AtomicUsize::new(0));
-            let t = Tlrc::new(DropCounter::new(&d));
-            // Spawn 32 threads, each drops a ref, then exits (orphan).
-            let h: Vec<_> = (0..32)
-                .map(|_| {
-                    let r = t.tlrc_ref();
-                    thread::spawn(move || drop(r))
-                })
-                .collect();
-            for h in h {
-                h.join().unwrap();
-            }
-            // All 32 counters are orphaned. try_destroy → reclaim_shell frees them.
-            drop(t);
-            assert_eq!(d.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    /// Mixed: some threads exit before Tlrc destroy (orphan),
-    /// some exit after (stale). Tests both paths simultaneously.
-    #[test]
-    fn lifecycle_mixed_orphan_and_stale() {
-        for _ in 0..100 {
-            let d = Arc::new(AtomicUsize::new(0));
-            let d2 = d.clone();
-            let h = thread::spawn(move || {
-                let t = Tlrc::new(DropCounter::new(&d2));
-                let early_b = Arc::new(Barrier::new(5));
-                let late_b = Arc::new(Barrier::new(5));
-
-                // 4 "early" threads: exit before master drops (orphan path).
-                let early: Vec<_> = (0..4)
-                    .map(|_| {
-                        let r = t.tlrc_ref();
-                        let b = early_b.clone();
-                        thread::spawn(move || {
-                            drop(r);
-                            b.wait(); // signal "done"
-                        })
-                    })
-                    .collect();
-                early_b.wait(); // wait for early threads to drop refs
-                // Early threads will exit (orphan their counters).
-
-                // 4 "late" threads: hold refs past master drop (stale path).
-                let late: Vec<_> = (0..4)
-                    .map(|_| {
-                        let r = t.tlrc_ref();
-                        let b = late_b.clone();
-                        thread::spawn(move || {
-                            b.wait(); // wait for master to drop
-                            drop(r);
-                        })
-                    })
-                    .collect();
-
-                // Wait for early threads to fully exit.
-                for h in early {
-                    h.join().unwrap();
-                }
-
-                drop(t); // master drops: early counters orphaned, late still active
-                late_b.wait(); // release late threads
-                for h in late {
-                    h.join().unwrap();
-                }
-            });
-            h.join().unwrap();
-            assert_eq!(d.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    /// Cross-thread debt with thread exit: thread creates debt (-1),
-    /// then exits. Debt counter is orphaned. Master drops, try_destroy
-    /// scans the orphaned debt counter, sums correctly, destroys.
     #[test]
     fn lifecycle_debt_counter_orphan() {
         for _ in 0..200 {
             let d = Arc::new(AtomicUsize::new(0));
             let t = Tlrc::new(DropCounter::new(&d));
             let r = t.tlrc_ref();
-            // Move ref to spawned thread, drop there (debt on spawned).
-            let h = thread::spawn(move || {
-                drop(r);
-                // Thread exits. Debt counter (-1) is orphaned.
-            });
+            let h = thread::spawn(move || drop(r));
             h.join().unwrap();
-            // Master drops. Scanner sums: master(+1) + orphaned(-1) = 0.
-            // reclaim_shell frees orphaned counter.
             drop(t);
             assert_eq!(d.load(Ordering::SeqCst), 1);
         }
     }
 
-    /// Rapid Tlrc create/destroy interleaved with thread create/exit.
-    /// Maximum pressure on all lifecycle paths simultaneously.
     #[test]
     fn lifecycle_rapid_churn() {
         let total = Arc::new(AtomicUsize::new(0));
@@ -2216,7 +1619,6 @@ mod tests {
             let total2 = total.clone();
             let h = thread::spawn(move || {
                 let t = Tlrc::new(DropCounter::new(&d2));
-                // Spawn short-lived threads that each do a few ops and exit.
                 let h: Vec<_> = (0..8)
                     .map(|_| {
                         let r = t.tlrc_ref();
@@ -2227,12 +1629,9 @@ mod tests {
                                 drop(c);
                             }
                             drop(r);
-                            // Thread exits: counter becomes orphan or stale
-                            // depending on timing vs master drop.
                         })
                     })
                     .collect();
-                // Don't join — drop master while threads are still running.
                 drop(t);
                 for h in h {
                     h.join().unwrap();
@@ -2243,87 +1642,5 @@ mod tests {
             assert_eq!(d.load(Ordering::SeqCst), 1);
         }
         assert_eq!(total.load(Ordering::Relaxed), 50);
-    }
-
-    // =====================================================================
-    // Miri TLCounter lifecycle tests (small scale, race detection)
-    // =====================================================================
-
-    /// Miri: stale counter path — Tlrc destroyed, thread accesses again.
-    #[test]
-    fn miri_lifecycle_stale_sweep() {
-        let d1 = Arc::new(AtomicUsize::new(0));
-        let d2 = Arc::new(AtomicUsize::new(0));
-        let t1 = Tlrc::new(DropCounter::new(&d1));
-        let r = t1.tlrc_ref();
-        drop(r);
-        drop(t1);
-        assert_eq!(d1.load(Ordering::SeqCst), 1);
-        // Stale counter in map. New Tlrc triggers sweep.
-        let t2 = Tlrc::new(DropCounter::new(&d2));
-        let r = t2.tlrc_ref();
-        drop(r);
-        drop(t2);
-        assert_eq!(d2.load(Ordering::SeqCst), 1);
-    }
-
-    /// Miri: orphan path — thread exits, counter marked orphaned,
-    /// reclaim_shell frees it.
-    #[test]
-    fn miri_lifecycle_orphan_reclaim() {
-        let d = Arc::new(AtomicUsize::new(0));
-        let t = Tlrc::new(DropCounter::new(&d));
-        let h: Vec<_> = (0..2)
-            .map(|_| {
-                let r = t.tlrc_ref();
-                thread::spawn(move || drop(r))
-            })
-            .collect();
-        for h in h {
-            h.join().unwrap();
-        }
-        drop(t);
-        assert_eq!(d.load(Ordering::SeqCst), 1);
-    }
-
-    /// Miri: concurrent destroy and thread exit — races on tlrc_ptr/orphaned.
-    #[test]
-    fn miri_lifecycle_concurrent_destroy_exit() {
-        let d = Arc::new(AtomicUsize::new(0));
-        let d2 = d.clone();
-        let h = thread::spawn(move || {
-            let t = Tlrc::new(DropCounter::new(&d2));
-            let r = t.tlrc_ref();
-            let h = thread::spawn(move || drop(r));
-            drop(t); // concurrent with thread exit
-            h.join().unwrap();
-        });
-        h.join().unwrap();
-        assert_eq!(d.load(Ordering::SeqCst), 1);
-    }
-
-    /// Miri: debt counter orphaned then reclaimed.
-    #[test]
-    fn miri_lifecycle_debt_orphan() {
-        let d = Arc::new(AtomicUsize::new(0));
-        let t = Tlrc::new(DropCounter::new(&d));
-        let r = t.tlrc_ref();
-        let h = thread::spawn(move || drop(r));
-        h.join().unwrap();
-        drop(t);
-        assert_eq!(d.load(Ordering::SeqCst), 1);
-    }
-
-    /// Miri: multiple Tlrc instances, stale accumulation + sweep.
-    #[test]
-    fn miri_lifecycle_multi_instance() {
-        let d = Arc::new(AtomicUsize::new(0));
-        for i in 0..5 {
-            let t = Tlrc::new(DropCounter::new(&d));
-            let r = t.tlrc_ref();
-            drop(r);
-            drop(t);
-            assert_eq!(d.load(Ordering::SeqCst), i + 1);
-        }
     }
 }

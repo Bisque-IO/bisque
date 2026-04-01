@@ -120,6 +120,24 @@ unsafe impl Send for WaitQueue {}
 unsafe impl Sync for WaitQueue {}
 
 impl WaitQueue {
+    /// Raw pointer to the slot array as `*mut u8` (for explicit deallocation on heap reuse).
+    #[inline]
+    pub(crate) fn slots_raw(&self) -> *mut u8 {
+        self.slots as *mut u8
+    }
+
+    /// Create an empty wait queue with no slots. Used as a placeholder
+    /// for slab default initialization. Must be replaced via
+    /// `init_in` before use.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            slots: std::ptr::null_mut(),
+            slot_count: 0,
+            active_count: AtomicUsize::new(0),
+        }
+    }
+
     /// Allocate a wait queue with `slot_count` waiter slots from `mi_heap`.
     ///
     /// # Safety

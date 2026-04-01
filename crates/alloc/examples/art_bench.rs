@@ -45,7 +45,7 @@ fn bench<F: FnMut() -> u64>(name: &str, mut f: F) {
 fn main() {
     let master = HeapMaster::new(HEAP_SIZE).unwrap();
     let heap = master.heap();
-    let c = Collector::new();
+    let c = Collector::new(&heap);
 
     println!("=== Art Operation Benchmark ===\n");
 

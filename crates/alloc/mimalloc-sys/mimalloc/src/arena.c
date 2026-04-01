@@ -974,6 +974,19 @@ void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
   mi_assert_internal(page->next==NULL && page->prev==NULL);
   mi_assert_internal(current_theapx == NULL || _mi_thread_id()==current_theapx->tld->thread_id);
 
+  #if defined(MI_HEAP_MEMLIMIT)
+  // Decrement memory_committed for pages freed directly from the arena
+  // (abandoned pages that became all-free). Pages freed via _mi_page_free
+  // already decremented there, but _mi_page_free calls us after clearing
+  // theap, so we use page->heap (raw) which is still set.
+  {
+    mi_heap_t* const heap = page->heap;
+    if (heap != NULL) {
+      mi_heap_memlimit_page_free(heap, (size_t)_mi_page_mem_slices(page) * MI_ARENA_SLICE_SIZE);
+    }
+  }
+  #endif
+
   if (current_theapx != NULL) {
     mi_theap_stat_decrease(current_theapx, page_bins[_mi_page_stats_bin(page)], 1);
     mi_theap_stat_decrease(current_theapx, pages, 1);

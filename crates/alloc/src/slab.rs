@@ -13,11 +13,13 @@ use parking_lot::Mutex;
 
 const EMPTY: u64 = u64::MAX;
 const CLAIMED: u64 = u64::MAX - 1;
+const RECYCLE: u64 = u64::MAX - 2;
+pub(crate) const DIRTY: u64 = u64::MAX - 3;
 const MAX_SEGMENTS: usize = 64;
 
 struct Entry<T> {
     state: AtomicU64,
-    data: T,
+    data: UnsafeCell<T>,
 }
 
 /// A fixed-size heap-allocated slice of entries.
@@ -31,7 +33,7 @@ impl<T: Default> Segment<T> {
         let entries: Vec<Entry<T>> = (0..cap)
             .map(|_| Entry {
                 state: AtomicU64::new(EMPTY),
-                data: T::default(),
+                data: UnsafeCell::new(T::default()),
             })
             .collect();
         Segment {
@@ -44,14 +46,17 @@ impl<T: Default> Segment<T> {
 // Shared alloc/free logic
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Scan for the lowest free slot below `count`, CAS to claim it.
+/// Scan for the lowest free or recyclable slot below `count`, CAS to claim it.
 #[inline]
 fn scan_free<T>(entries: &[Entry<T>], count: usize) -> Option<usize> {
     for id in 0..count {
-        if entries[id]
-            .state
+        let state = &entries[id].state;
+        if state
             .compare_exchange_weak(EMPTY, CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
+            || state
+                .compare_exchange_weak(RECYCLE, CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
         {
             return Some(id);
         }
@@ -77,7 +82,7 @@ impl<T: Default, const N: usize> FixedSlab<T, N> {
         Self {
             entries: std::array::from_fn(|_| Entry {
                 state: AtomicU64::new(EMPTY),
-                data: T::default(),
+                data: UnsafeCell::new(T::default()),
             }),
             count: AtomicUsize::new(0),
         }
@@ -111,6 +116,29 @@ impl<T: Default, const N: usize> FixedSlab<T, N> {
     pub fn free(&self, id: usize) {
         self.entries[id].state.store(EMPTY, Ordering::Release);
     }
+
+    /// Mark a slot as recyclable. The data stays intact for the next
+    /// `alloc()` caller to reuse.
+    #[inline]
+    pub fn recycle(&self, id: usize) {
+        self.entries[id].state.store(RECYCLE, Ordering::Release);
+    }
+
+    /// Mark a slot as dirty — it has a valid mi_heap but with non-zero
+    /// memory_committed. Must be cleaned via the dirty free list before reuse.
+    #[inline]
+    pub fn mark_dirty(&self, id: usize) {
+        self.entries[id].state.store(DIRTY, Ordering::Release);
+    }
+
+    /// Try to CAS a DIRTY slot to CLAIMED. Returns true on success.
+    #[inline]
+    pub fn try_claim_dirty(&self, id: usize) -> bool {
+        self.entries[id]
+            .state
+            .compare_exchange(DIRTY, CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
 }
 
 impl<T: Default, const N: usize> Default for FixedSlab<T, N> {
@@ -132,7 +160,17 @@ impl<T, const N: usize> FixedSlab<T, N> {
 
     #[inline]
     pub fn get(&self, id: usize) -> &T {
-        &self.entries[id].data
+        unsafe { &*self.entries[id].data.get() }
+    }
+
+    /// Returns a raw mutable pointer to the slot data.
+    ///
+    /// # Safety
+    /// The caller must ensure exclusive access to this slot
+    /// (e.g., between `alloc()` and `free()`).
+    #[inline]
+    pub fn get_mut_ptr(&self, id: usize) -> *mut T {
+        self.entries[id].data.get()
     }
 
     #[inline]
@@ -185,11 +223,13 @@ impl<T: Default> SegmentedSlab<T> {
         let count = self.count.load(Ordering::Acquire).min(scannable);
 
         for id in 0..count {
-            let entry = self.entry(id);
-            if entry
-                .state
+            let state = &self.entry(id).state;
+            if state
                 .compare_exchange_weak(EMPTY, CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
+                || state
+                    .compare_exchange_weak(RECYCLE, CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
             {
                 return Some(id);
             }
@@ -230,6 +270,13 @@ impl<T: Default> SegmentedSlab<T> {
     pub fn free(&self, id: usize) {
         self.entry(id).state.store(EMPTY, Ordering::Release);
     }
+
+    /// Mark a slot as recyclable. The data stays intact for the next
+    /// `alloc()` caller to reuse.
+    #[inline]
+    pub fn recycle(&self, id: usize) {
+        self.entry(id).state.store(RECYCLE, Ordering::Release);
+    }
 }
 
 impl<T> SegmentedSlab<T> {
@@ -240,7 +287,17 @@ impl<T> SegmentedSlab<T> {
 
     #[inline]
     pub fn get(&self, id: usize) -> &T {
-        &self.entry(id).data
+        unsafe { &*self.entry(id).data.get() }
+    }
+
+    /// Returns a raw mutable pointer to the slot data.
+    ///
+    /// # Safety
+    /// The caller must ensure exclusive access to this slot
+    /// (e.g., between `alloc()` and `free()`).
+    #[inline]
+    pub fn get_mut_ptr(&self, id: usize) -> *mut T {
+        self.entry(id).data.get()
     }
 
     #[inline]

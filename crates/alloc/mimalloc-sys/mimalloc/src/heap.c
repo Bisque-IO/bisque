@@ -166,6 +166,7 @@ size_t mi_heap_get_memory_usage(mi_heap_t* heap) {
 size_t mi_heap_memory_slice_size(void) {
   return MI_ARENA_SLICE_SIZE;
 }
+
 #endif
 
 // free the heap resources (assuming the pages are already moved/destroyed)

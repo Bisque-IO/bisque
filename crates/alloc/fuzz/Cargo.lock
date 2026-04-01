@@ -70,6 +70,9 @@ dependencies = [
  "bisque-mimalloc-sys",
  "bytes",
  "crossbeam-epoch",
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "crossfire",
  "hashbrown",
  "libc",
  "num-traits",
@@ -154,10 +157,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f58bbc28f91df819d0aa2a2c00cd19754769c2fad90579b3592b1c9ba7a3115"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "crossfire"
+version = "3.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0042e53977a94d5d10de04ce7eb6016aa212c08e83ea202f7a9f102ff104303"
+dependencies = [
+ "crossbeam-utils",
+ "futures-core",
+ "parking_lot",
+ "smallvec",
+]
 
 [[package]]
 name = "derive_arbitrary"
@@ -193,6 +217,12 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "futures-core"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
 
 [[package]]
 name = "getrandom"

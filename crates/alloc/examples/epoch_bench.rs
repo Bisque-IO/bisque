@@ -27,7 +27,8 @@ fn mops(threads: usize, elapsed: Duration) -> f64 {
     (OPS_PER_THREAD as f64 * threads as f64) / elapsed.as_secs_f64() / 1e6
 }
 
-unsafe fn noop_dealloc(_: &Heap, _: usize) {}
+unsafe fn noop_dealloc(_: *const bisque_alloc::heap::HeapData, _: usize) {}
+unsafe fn noop_dealloc_counted(_: &Heap, _: usize) {}
 
 // ─── Heap Epoch (watermark) ──────────────────────────────────────────────
 
@@ -393,11 +394,11 @@ fn main() {
     let master = HeapMaster::new(256 * 1024 * 1024).unwrap();
     let heap = master.heap();
 
-    let hc = HCollector::new();
-    let he = Arc::new(HEpoch::new(&hc, &heap, noop_dealloc as HDeallocFn));
+    let hc = HCollector::new(&heap);
+    let he = Arc::new(HEpoch::new(&hc, noop_dealloc as HDeallocFn));
 
     let cc = CCollector::new();
-    let ce = Arc::new(CEpoch::new(&cc, &heap, noop_dealloc as CDeallocFn));
+    let ce = Arc::new(CEpoch::new(&cc, &heap, noop_dealloc_counted as CDeallocFn));
 
     let sc = Arc::new(SeizeCollector::new());
 

@@ -276,7 +276,9 @@ void _mi_page_reclaim(mi_theap_t* theap, mi_page_t* page) {
 }
 */
 
-// called from `mi_free` on a reclaim, and fresh_alloc if we get an abandoned page
+// called from `mi_free` on a reclaim, and fresh_alloc if we get an abandoned page.
+// push_at_end does a check-only (no increment) for memlimit, so this can fail
+// for uncounted pages when genuinely over limit.
 #if defined(MI_HEAP_MEMLIMIT)
 bool _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page)
 #else
@@ -335,7 +337,6 @@ static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, si
   if (mi_page_is_abandoned(page)) {
     #if defined(MI_HEAP_MEMLIMIT)
     if (!_mi_theap_page_reclaim(theap, page)) {
-      // memlimit exceeded — re-abandon the page
       _mi_arenas_page_abandon(page, theap);
       return NULL;
     }
@@ -432,6 +433,8 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
   // remove from the page list
   // (no need to do _mi_theap_delayed_free first as all blocks are already free)
   mi_page_queue_remove(pq, page);
+  // Note: memlimit decrement happens in _mi_arenas_page_free (called below),
+  // not here. This ensures both queue-freed and arena-freed pages are decremented.
 
   // and free it
   mi_theap_t* theap = mi_page_theap(page); mi_assert_internal(theap!=NULL);

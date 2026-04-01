@@ -13,16 +13,17 @@
 //! Each scenario runs for a fixed duration. Writers update existing keys
 //! (no net growth). Readers do point lookups against pre-populated data.
 //!
-//! ShardedArt note: `publish()` is not concurrent-safe with writers, so
-//! the benchmark does NOT call publish during the timed window. Readers
-//! see the pre-published snapshot; writers measure raw shard throughput.
+//! ShardedArt note: reads are epoch-pinned (like U64Art). Writers
+//! update existing keys; publish is called periodically to make
+//! writes visible to readers.
 
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use bisque_alloc::collections::art::{Art, Collector, ShardedArt};
+use bisque_alloc::collections::art::fixed::U64Art;
+use bisque_alloc::collections::art::{Collector, ShardedArt};
 use bisque_alloc::{HeapMaster, MiMalloc};
 
 #[global_allocator]
@@ -130,7 +131,8 @@ fn bench_sharded_art(
 ) -> BenchResult {
     let master = HeapMaster::new(HEAP_SIZE).unwrap();
     let heap = master.heap();
-    let tree = Arc::new(ShardedArt::<usize>::new(&heap));
+    let collector = Collector::new(&heap);
+    let tree = Arc::new(ShardedArt::<usize>::new(&collector, &heap));
 
     // Pre-populate and publish so readers see data.
     for &k in existing {
@@ -144,18 +146,23 @@ fn bench_sharded_art(
 
     let mut handles = Vec::new();
 
-    // Reader threads — read from the published snapshot.
-    {
+    // Reader threads — epoch-pinned read guard, zero overhead per lookup.
+    for _ in 0..num_readers {
         let tree = tree.clone();
-        let get_fn: Arc<dyn Fn(u64) -> Option<u64> + Send + Sync> =
-            Arc::new(move |k| tree.get(k as usize).map(|v| v as u64));
-        handles.extend(spawn_readers(
-            &done,
-            &total_reads,
-            lookup,
-            num_readers,
-            get_fn,
-        ));
+        let keys = lookup.to_vec();
+        let done = done.clone();
+        let reads = total_reads.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut count = 0u64;
+            while !done.load(Ordering::Relaxed) {
+                let guard = tree.read();
+                for &k in &keys {
+                    black_box(guard.get(k as usize));
+                    count += 1;
+                }
+            }
+            reads.fetch_add(count, Ordering::Relaxed);
+        }));
     }
 
     // Writer threads — each gets its own per-thread Heap.
@@ -187,12 +194,6 @@ fn bench_sharded_art(
         }));
     }
 
-    // NOTE: publish() is not called during the timed window because COW
-    // garbage collection has a known limitation — ensure_mutable() pushes
-    // shared nodes to garbage that may still be referenced by older snapshots.
-    // Concurrent publish + long-lived readers can cause use-after-free.
-    // TODO: fix garbage collection to use epoch watermarks.
-
     std::thread::sleep(BENCH_DURATION);
     done.store(true, Ordering::Relaxed);
     for h in handles {
@@ -207,12 +208,12 @@ fn bench_sharded_art(
         writer_mops: total_writes.load(Ordering::Relaxed) as f64
             / BENCH_DURATION.as_secs_f64()
             / 1e6,
-        extra: "256-shard, lock-free reads".into(),
+        extra: "256-shard, epoch reads".into(),
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Art benchmark (single-writer MVCC baseline)
+// U64Art benchmark (FixedArt with u64 keys, OLC + epoch)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn bench_art(
@@ -223,14 +224,14 @@ fn bench_art(
 ) -> BenchResult {
     let master = HeapMaster::new(HEAP_SIZE).unwrap();
     let heap = master.heap();
-    let c = Collector::new();
-    let tree = Arc::new(Art::<usize, usize>::new(&c, &heap));
+    let c = Collector::new(&heap);
+    let tree = Arc::new(U64Art::<u64>::new(&c, &heap));
 
     // Pre-populate and publish.
     {
         let mut w = tree.write();
         for &k in existing {
-            w.insert(k as usize, k as usize).unwrap();
+            w.insert(k, k).unwrap();
         }
         w.publish().unwrap();
     }
@@ -252,7 +253,7 @@ fn bench_art(
             while !done.load(Ordering::Relaxed) {
                 let guard = tree.read();
                 for &k in &keys {
-                    black_box(guard.get(&(k as usize)));
+                    black_box(guard.get(&k));
                     count += 1;
                 }
             }
@@ -260,7 +261,7 @@ fn bench_art(
         }));
     }
 
-    // Writer threads — OLC fast path for leaf updates, structure_lock fallback.
+    // Writer threads — OLC fast path for leaf updates, shard-lock fallback.
     let write_keys = Arc::new(existing.to_vec());
     for tid in 0..num_writers {
         let tree = tree.clone();
@@ -277,7 +278,7 @@ fn bench_art(
                         break;
                     }
                     let idx = (offset + count as usize + i) % wkeys.len();
-                    let key = wkeys[idx] as usize;
+                    let key = wkeys[idx];
                     match w.insert(key, key.wrapping_add(1)) {
                         Ok(_) => count += 1,
                         Err(_) => break,
@@ -296,14 +297,14 @@ fn bench_art(
     }
 
     BenchResult {
-        name: "Art (single-Mutex COW)",
+        name: "U64Art (FixedArt OLC)",
         reader_mops: total_reads.load(Ordering::Relaxed) as f64
             / BENCH_DURATION.as_secs_f64()
             / 1e6,
         writer_mops: total_writes.load(Ordering::Relaxed) as f64
             / BENCH_DURATION.as_secs_f64()
             / 1e6,
-        extra: "OLC fast-path, epoch reads".into(),
+        extra: "OLC + shard-lock, epoch reads".into(),
     }
 }
 
@@ -466,14 +467,14 @@ fn bench_papaya(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("=== Concurrent Map Benchmark: Art vs ShardedArt vs DashMap vs papaya ===");
+    println!("=== Concurrent Map Benchmark: U64Art vs ShardedArt vs DashMap vs papaya ===");
     println!("  Pre-populated: {PRE_POPULATE} keys (random u64)");
     println!(
         "  Duration: {:.0}s per scenario",
         BENCH_DURATION.as_secs_f64()
     );
     println!("  Workload: update existing keys (bounded tree size)");
-    println!("  ShardedArt: pre-published snapshot, no publish during bench");
+    println!("  ShardedArt: epoch-pinned reads, 256-shard COW writes");
 
     let existing = generate_keys(PRE_POPULATE, 0xBEEF);
     let lookup = {

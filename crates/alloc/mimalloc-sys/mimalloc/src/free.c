@@ -41,7 +41,7 @@ static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool 
   page->local_free = block;
   if mi_unlikely(--page->used == 0) {
     if (page->retire_expire==0) { // no need to re-retire retired pages (happens when we alloc/free one block repeatedly in an empty page)
-      _mi_page_retire(page); 
+      _mi_page_retire(page);
     }
   }
   else if mi_unlikely(check_full && mi_page_is_in_full(page)) {

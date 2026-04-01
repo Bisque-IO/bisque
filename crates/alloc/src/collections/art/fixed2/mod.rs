@@ -45,24 +45,19 @@ use self::node::*;
 /// # Safety
 /// `ptr` must be a valid ART node pointer (leaf or internal), and if it is
 /// a leaf, the value V must have already been extracted.
-unsafe fn fixed_art_dealloc_raw<const K: usize, V>(heap: &Heap, ptr: usize) {
+unsafe fn fixed_art_dealloc_raw<const K: usize, V>(heap_data: *const crate::heap::HeapData, ptr: usize) {
     if ptr == NULL_CHILD {
         return;
     }
     if is_leaf(ptr) {
-        // V was already moved out — just free the memory.
-        unsafe { dealloc_leaf_raw::<K, V>(heap, ptr) };
+        Heap::dealloc_raw(heap_data, leaf_ptr::<K, V>(ptr) as *mut u8);
     } else {
-        unsafe { dealloc_inner_node(heap, ptr) };
+        Heap::dealloc_raw(heap_data, ptr as *mut u8);
     }
 }
 
-fn new_fixed_epoch<const K: usize, V>(collector: &Collector, heap: &Heap) -> Epoch {
-    Epoch::new(
-        collector,
-        heap,
-        fixed_art_dealloc_raw::<K, V> as DeallocFn,
-    )
+fn new_fixed_epoch<const K: usize, V>(collector: &Collector) -> Epoch {
+    Epoch::new(collector, fixed_art_dealloc_raw::<K, V> as DeallocFn)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -250,7 +245,7 @@ impl<const K: usize, V> FixedArt<K, V> {
             batch_root: batch_root as usize,
             shard_locks,
             generation: 1,
-            epoch: new_fixed_epoch::<K, V>(collector, heap),
+            epoch: new_fixed_epoch::<K, V>(collector),
             heap: heap.clone(),
             _marker: std::marker::PhantomData,
         }
@@ -585,14 +580,14 @@ mod tests {
     use super::*;
     use crate::HeapMaster;
 
-    fn make_heap() -> Heap {
-        HeapMaster::new(64 * 1024 * 1024).unwrap().heap()
+    fn make_heap() -> HeapMaster {
+        HeapMaster::new(64 * 1024 * 1024).unwrap()
     }
 
     #[test]
     fn fixed_8_insert_get() {
         let h = make_heap();
-        let c = Collector::new();
+        let c = Collector::new(&h);
         let t: FixedArt<8, usize> = FixedArt::new(&c, &h);
 
         let k1 = [0, 0, 0, 0, 0, 0, 0, 1u8];
@@ -610,7 +605,7 @@ mod tests {
     #[test]
     fn fixed_16_insert_get() {
         let h = make_heap();
-        let c = Collector::new();
+        let c = Collector::new(&h);
         let t: FixedArt<16, usize> = FixedArt::new(&c, &h);
 
         let k1 = [1u8; 16];
@@ -628,7 +623,7 @@ mod tests {
     #[test]
     fn fixed_replace() {
         let h = make_heap();
-        let c = Collector::new();
+        let c = Collector::new(&h);
         let t: FixedArt<8, usize> = FixedArt::new(&c, &h);
 
         let k = [0, 0, 0, 0, 0, 0, 0, 1u8];
@@ -640,7 +635,7 @@ mod tests {
     #[test]
     fn fixed_remove() {
         let h = make_heap();
-        let c = Collector::new();
+        let c = Collector::new(&h);
         let t: FixedArt<8, usize> = FixedArt::new(&c, &h);
 
         let k = [0, 0, 0, 0, 0, 0, 0, 1u8];
@@ -652,7 +647,7 @@ mod tests {
     #[test]
     fn fixed_many_keys() {
         let h = make_heap();
-        let c = Collector::new();
+        let c = Collector::new(&h);
         let t: FixedArt<8, usize> = FixedArt::new(&c, &h);
 
         for i in 0..1000u64 {
@@ -669,7 +664,7 @@ mod tests {
     #[test]
     fn fixed_write_guard_batch() {
         let h = make_heap();
-        let c = Collector::new();
+        let c = Collector::new(&h);
         let t: FixedArt<8, usize> = FixedArt::new(&c, &h);
 
         {
@@ -691,7 +686,7 @@ mod tests {
     #[test]
     fn fixed_32_large_key() {
         let h = make_heap();
-        let c = Collector::new();
+        let c = Collector::new(&h);
         let t: FixedArt<32, usize> = FixedArt::new(&c, &h);
 
         let mut k1 = [0u8; 32];
@@ -714,7 +709,7 @@ mod tests {
     #[test]
     fn fixed_cursor_min_max() {
         let h = make_heap();
-        let c = Collector::new();
+        let c = Collector::new(&h);
         let t: FixedArt<8, usize> = FixedArt::new(&c, &h);
 
         for i in 1..=100u64 {
@@ -731,7 +726,7 @@ mod tests {
     fn fixed_non_copy_value() {
         // Test with a non-Copy value type (String).
         let h = make_heap();
-        let c = Collector::new();
+        let c = Collector::new(&h);
         let t: FixedArt<8, String> = FixedArt::new(&c, &h);
 
         let k1 = [0, 0, 0, 0, 0, 0, 0, 1u8];

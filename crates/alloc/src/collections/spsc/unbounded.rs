@@ -1,104 +1,141 @@
+//! # Unbounded SPSC Queue
 //!
-//! # Unbounded Spsc
-//!
-//! An unbounded single-producer single-consumer queue implemented as an intrusive
-//! linked list of fixed-capacity Spsc segments. Optimized for the common case of
-//! fitting within a single segment, with automatic expansion when needed.
+//! An unbounded single-producer single-consumer queue with global monotonic
+//! head/tail counters and a linked list of flat segment nodes.
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                    Unbounded Spsc Structure                     │
-//! │                                                                 │
-//! │  Head (Atomic) ──→ Node 0 ──→ Node 1 ──→ Node 2 ──→ ...         │
-//! │       │                 │           │           │               │
-//! │       │              [Spsc]      [Spsc]      [Spsc]             │
-//! │       │            (64 items)  (64 items)  (64 items)           │
-//! │       │                                                         │
-//! │  Tail (Cached) ──→ Current Node for Producer                    │
-//! │                                                                 │
-//! │  Consumer automatically progresses through nodes                │
-//! │  Producer creates new nodes when current tail is full           │
-//! └─────────────────────────────────────────────────────────────────┘
+//! Global positions (monotonic u64):
+//!   head: [63=close bit][62..0=producer position]   (producer writes)
+//!   tail: consumer position                          (consumer writes)
+//!
+//! Node linked list:
+//!   Node 0 ──→ Node 1 ──→ Node 2 ──→ ...
+//!   [data]     [data]     [data]
+//!
+//! Each node: flat array of NODE_CAP items (2^(P+NUM_SEGS_P2))
+//! Position mapping: node_index = pos / NODE_CAP, offset = pos & NODE_MASK
 //! ```
 //!
+//! The producer advances `head` after writing items. The consumer advances
+//! `tail` after reading. Nodes are freed lazily when the consumer crosses
+//! a node boundary. Close is encoded in bit 63 of `head`.
 
-use super::{NoOpSignal, PopError, PushError, SignalSchedule, Spsc};
+use super::{NoOpSignal, PopError, PushError, SignalSchedule};
+use crate::CachePadded;
+use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use std::cell::UnsafeCell;
-use std::marker::PhantomData;
-use std::ptr::null;
+use std::mem::MaybeUninit;
+use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// Intrusive node containing an Spsc segment
-struct Node<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule> {
-    /// The underlying Spsc queue for this segment
-    queue: Spsc<T, P, NUM_SEGS_P2, S>,
+// ═══════════════════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════════════════
 
-    /// Next node in the linked list (atomic for thread-safe access)
-    next: AtomicUsize,
+const CLOSED_BIT: u64 = 1u64 << 63;
+const POS_MASK: u64 = !CLOSED_BIT;
 
-    /// Flag indicating if this node is currently full
-    /// Used for optimization and potential cleanup
-    is_full: AtomicUsize,
+// ═══════════════════════════════════════════════════════════════════════════
+// Node — flat segment with a next pointer
+// ═══════════════════════════════════════════════════════════════════════════
 
-    /// Phantom data to ensure proper variance
-    _phantom: PhantomData<T>,
+struct Node<T> {
+    data: *mut MaybeUninit<T>,
+    next: AtomicUsize, // 0 = no next, else ptr to next Node
 }
 
-impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone>
-    Node<T, P, NUM_SEGS_P2, S>
-{
-    /// Create a new node with an empty Spsc
-    fn new(signal: Arc<S>) -> *mut Self {
-        let node = Box::new(Self {
-            queue: unsafe { Spsc::new_unsafe_with_gate((&*signal).clone()) },
+impl<T> Node<T> {
+    fn alloc(cap: usize) -> *mut Self {
+        let data = alloc_data::<T>(cap);
+        Box::into_raw(Box::new(Self {
+            data,
             next: AtomicUsize::new(0),
-            is_full: AtomicUsize::new(0),
-            _phantom: PhantomData,
-        });
-        Box::into_raw(node)
+        }))
     }
 }
 
-/// Unbounded Spsc implementation
+fn alloc_data<T>(cap: usize) -> *mut MaybeUninit<T> {
+    if core::mem::size_of::<MaybeUninit<T>>() == 0 || cap == 0 {
+        return ptr::null_mut();
+    }
+    unsafe {
+        let layout = Layout::array::<MaybeUninit<T>>(cap).unwrap();
+        let p = alloc_zeroed(layout) as *mut MaybeUninit<T>;
+        if p.is_null() {
+            handle_alloc_error(layout);
+        }
+        p
+    }
+}
+
+unsafe fn free_data<T>(ptr: *mut MaybeUninit<T>, cap: usize) {
+    if ptr.is_null() || core::mem::size_of::<MaybeUninit<T>>() == 0 || cap == 0 {
+        return;
+    }
+    unsafe {
+        let layout = Layout::array::<MaybeUninit<T>>(cap).unwrap();
+        dealloc(ptr as *mut u8, layout);
+    }
+}
+
+/// Free a node and its data segment.
+unsafe fn free_node<T>(node: *mut Node<T>, cap: usize) {
+    unsafe {
+        free_data((*node).data, cap);
+        drop(Box::from_raw(node));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UnboundedSpsc
+// ═══════════════════════════════════════════════════════════════════════════
+
 pub struct UnboundedSpsc<
     T,
     const P: usize = 6,
     const NUM_SEGS_P2: usize = 8,
     S: SignalSchedule + Clone = NoOpSignal,
 > {
-    /// Head of the linked list (atomic for consumer access)
-    head: Arc<AtomicUsize>,
+    // ── Producer state (only producer writes) ────────────────────────────
+    /// Global producer position. Bit 63 = close flag.
+    prod_head: CachePadded<AtomicU64>,
+    /// Producer's current write node.
+    prod_node: UnsafeCell<*mut Node<T>>,
 
-    /// Cached tail pointer for producer (avoids atomic operations in common case)
-    current_tail: UnsafeCell<*mut Node<T, P, NUM_SEGS_P2, S>>,
+    // ── Consumer state (only consumer writes) ────────────────────────────
+    /// Global consumer position.
+    cons_tail: CachePadded<AtomicU64>,
+    /// Consumer's cached copy of prod_head (avoids cache-line bouncing).
+    cons_head_cache: UnsafeCell<u64>,
+    /// Consumer's current read node.
+    cons_node: UnsafeCell<*mut Node<T>>,
 
-    /// Total number of nodes in the linked list
+    // ── Shared ───────────────────────────────────────────────────────────
     node_count: AtomicUsize,
-
-    /// Total capacity across all nodes
-    total_capacity: AtomicUsize,
-
-    /// Signal scheduler for creating new nodes
-    signal: Arc<S>,
+    signal: S,
 }
 
-unsafe impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone> Send
-    for UnboundedSpsc<T, P, NUM_SEGS_P2, S>
+unsafe impl<T: Send, const P: usize, const N: usize, S: SignalSchedule + Clone> Send
+    for UnboundedSpsc<T, P, N, S>
 {
 }
-
-unsafe impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone> Sync
-    for UnboundedSpsc<T, P, NUM_SEGS_P2, S>
+unsafe impl<T: Send, const P: usize, const N: usize, S: SignalSchedule + Clone> Sync
+    for UnboundedSpsc<T, P, N, S>
 {
 }
 
 impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone>
     UnboundedSpsc<T, P, NUM_SEGS_P2, S>
 {
-    /// Create a new unbounded Spsc with default configuration
+    /// Items per node. Power of two.
+    pub const NODE_CAP: usize = (1usize << P) * (1usize << NUM_SEGS_P2);
+    const NODE_MASK: usize = Self::NODE_CAP - 1;
+
+    // ── Construction ─────────────────────────────────────────────────────
+
     pub fn new() -> (
         UnboundedSender<T, P, NUM_SEGS_P2, S>,
         UnboundedReceiver<T, P, NUM_SEGS_P2, S>,
@@ -109,573 +146,457 @@ impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone>
         Self::new_with_signal(S::default())
     }
 
-    /// Create a new unbounded Spsc with a custom signal scheduler
     pub fn new_with_signal(
         signal: S,
     ) -> (
         UnboundedSender<T, P, NUM_SEGS_P2, S>,
         UnboundedReceiver<T, P, NUM_SEGS_P2, S>,
     ) {
-        // Create the first node
-        let first_node = Node::new(Arc::new(signal.clone()));
-
-        let unbounded = Arc::new(Self {
-            head: Arc::new(AtomicUsize::new(first_node as usize)),
-            current_tail: UnsafeCell::new(first_node),
+        let first = Node::alloc(Self::NODE_CAP);
+        let q = Arc::new(Self {
+            prod_head: CachePadded::new(AtomicU64::new(0)),
+            prod_node: UnsafeCell::new(first),
+            cons_tail: CachePadded::new(AtomicU64::new(0)),
+            cons_head_cache: UnsafeCell::new(0),
+            cons_node: UnsafeCell::new(first),
             node_count: AtomicUsize::new(1),
-            total_capacity: AtomicUsize::new(Spsc::<T, P, NUM_SEGS_P2, S>::capacity()),
-            signal: Arc::new(signal),
+            signal,
         });
-
-        let sender = UnboundedSender {
-            unbounded: unbounded.clone(),
-        };
-
-        let receiver = UnboundedReceiver { unbounded };
-
-        (sender, receiver)
+        let tx = UnboundedSender { q: q.clone() };
+        let rx = UnboundedReceiver { q };
+        (tx, rx)
     }
 
-    /// Get the total number of nodes in the linked list
+    /// Create a queue without allocating the first node.
+    /// The first push lazily allocates. Ideal for embedding in static
+    /// registries where most slots are never used.
+    pub(crate) fn new_lazy() -> Self
+    where
+        S: Default,
+    {
+        Self {
+            prod_head: CachePadded::new(AtomicU64::new(0)),
+            prod_node: UnsafeCell::new(ptr::null_mut()),
+            cons_tail: CachePadded::new(AtomicU64::new(0)),
+            cons_head_cache: UnsafeCell::new(0),
+            cons_node: UnsafeCell::new(ptr::null_mut()),
+            node_count: AtomicUsize::new(0),
+            signal: S::default(),
+        }
+    }
+
+    // ── Accessors ────────────────────────────────────────────────────────
+
     pub fn node_count(&self) -> usize {
         self.node_count.load(Ordering::Relaxed)
     }
 
-    /// Get the total capacity across all nodes
     pub fn total_capacity(&self) -> usize {
-        self.total_capacity.load(Ordering::Relaxed)
+        self.node_count.load(Ordering::Relaxed) * Self::NODE_CAP
     }
 
-    /// Get the current length (approximate, as it requires traversing nodes)
     pub fn len(&self) -> usize {
-        let mut len = 0;
-        let mut current = self.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-
-        while !current.is_null() {
-            unsafe {
-                len += (*current).queue.len();
-                current =
-                    (*current).next.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-            }
-        }
-
-        len
+        let h = self.prod_head.load(Ordering::Acquire) & POS_MASK;
+        let t = self.cons_tail.load(Ordering::Acquire);
+        h.saturating_sub(t) as usize
     }
 
-    /// Check if the queue is empty (approximate)
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        let head_node_ptr = self.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-        if head_node_ptr.is_null() {
-            return true;
-        }
-
-        unsafe {
-            // Check if head node has any items
-            !(*head_node_ptr).queue.is_empty()
-        }
+        self.len() == 0
     }
 
-    /// Create a receiver from an Arc<UnboundedSpsc>
-    /// This is useful for MPSC implementations that store the Arc
     pub fn create_receiver(self: &Arc<Self>) -> UnboundedReceiver<T, P, NUM_SEGS_P2, S> {
         UnboundedReceiver {
-            unbounded: Arc::clone(self),
+            q: Arc::clone(self),
         }
     }
 
-    /// Close the queue
-    /// This closes all underlying Spsc nodes
-    pub fn close(&self) {
-        let mut current = self.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
+    // ── Producer internals ───────────────────────────────────────────────
 
-        while !current.is_null() {
-            unsafe {
-                (*current).queue.close();
-                current =
-                    (*current).next.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-            }
+    /// Push a slice of items. Returns number pushed (== src.len() unless closed).
+    /// Items are bitwise-copied; caller must not drop the originals.
+    pub(crate) fn push_n(&self, src: &[T]) -> Result<usize, PushError<()>> {
+        let h = self.prod_head.load(Ordering::Relaxed);
+        if h & CLOSED_BIT != 0 {
+            return Err(PushError::Closed(()));
         }
-    }
+        let mut h_pos = (h & POS_MASK) as usize;
+        let to_push = src.len();
+        let mut pushed = 0usize;
 
-    /// Internal: try to push to the current tail node
-    #[inline(always)]
-    fn try_push_to_current(&self, item: T) -> Result<(), PushError<T>> {
-        unsafe {
-            let current_tail = *self.current_tail.get();
-            if current_tail.is_null() {
-                return Err(PushError::Full(item));
-            }
+        while pushed < to_push {
+            let offset = h_pos & Self::NODE_MASK;
 
-            (*current_tail).queue.try_push(item)
-        }
-    }
-
-    /// Internal: create a new node and link it
-    #[inline(always)]
-    fn create_new_node(&self) -> *mut Node<T, P, NUM_SEGS_P2, S> {
-        let new_node = Node::new(self.signal.clone());
-
-        // Link the new node to the current tail
-        unsafe {
-            let current_tail = *self.current_tail.get();
-            if !current_tail.is_null() {
-                (*current_tail)
-                    .next
-                    .store(new_node as usize, Ordering::Release);
-            }
-        }
-
-        // Update cached tail
-        unsafe {
-            *self.current_tail.get() = new_node;
-        }
-
-        // Update statistics
-        self.node_count.fetch_add(1, Ordering::Relaxed);
-        self.total_capacity
-            .fetch_add(Spsc::<T, P, NUM_SEGS_P2, S>::capacity(), Ordering::Relaxed);
-
-        new_node
-    }
-
-    /// Internal: advance consumer to next node if current is empty and closed
-    #[inline(always)]
-    fn try_advance_consumer(&self) -> bool {
-        unsafe {
-            let current_head_ptr =
-                self.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-            if current_head_ptr.is_null() {
-                return false;
-            }
-
-            let current_head = &*current_head_ptr;
-
-            // If current head is empty and closed, advance to next
-            if current_head.queue.is_empty() && current_head.queue.is_closed() {
-                let next_head =
-                    current_head.next.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-                if !next_head.is_null() {
-                    self.head.store(next_head as usize, Ordering::Release);
-                    return true;
+            // Need a new node? (first push on lazy queue, or crossed boundary)
+            if offset == 0 {
+                let needs_alloc = unsafe { (*self.prod_node.get()).is_null() } || h_pos > 0;
+                if needs_alloc {
+                    let new_node = Node::alloc(Self::NODE_CAP);
+                    unsafe {
+                        let old = *self.prod_node.get();
+                        if !old.is_null() {
+                            // Link old → new. Release ensures prior data writes
+                            // are visible before consumer follows the pointer.
+                            (*old).next.store(new_node as usize, Ordering::Release);
+                        } else {
+                            // First node — set consumer's node too. Safe because no
+                            // consumer can run until we publish head > 0 below.
+                            *self.cons_node.get() = new_node;
+                        }
+                        *self.prod_node.get() = new_node;
+                    }
+                    self.node_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
 
-            false
+            let node = unsafe { *self.prod_node.get() };
+            let can = (Self::NODE_CAP - offset).min(to_push - pushed);
+
+            unsafe {
+                let dst = (*node).data.add(offset) as *mut T;
+                let s = (src.as_ptr()).add(pushed);
+                ptr::copy_nonoverlapping(s, dst, can);
+            }
+
+            h_pos += can;
+            pushed += can;
+        }
+
+        // Publish all writes at once.
+        self.prod_head.store(h_pos as u64, Ordering::Release);
+        self.signal.schedule();
+        Ok(pushed)
+    }
+
+    // ── Consumer internals ───────────────────────────────────────────────
+
+    /// Refresh the consumer's cached head. Returns (h_pos, is_closed).
+    #[inline(always)]
+    fn refresh_head_cache(&self) -> (u64, bool) {
+        let h = self.prod_head.load(Ordering::Acquire);
+        unsafe { *self.cons_head_cache.get() = h }
+        ((h & POS_MASK), h & CLOSED_BIT != 0)
+    }
+
+    /// Returns (available_items, is_closed).
+    #[inline(always)]
+    fn consumer_avail(&self) -> (usize, bool) {
+        let t = self.cons_tail.load(Ordering::Relaxed);
+        let h = unsafe { *self.cons_head_cache.get() };
+        let h_pos = h & POS_MASK;
+        let avail = h_pos.saturating_sub(t) as usize;
+        if avail > 0 {
+            return (avail, false);
+        }
+        // Refresh
+        let (h_pos, closed) = self.refresh_head_cache();
+        let avail = h_pos.saturating_sub(t) as usize;
+        (avail, closed && avail == 0)
+    }
+
+    /// Advance consumer node if tail crossed a boundary.
+    /// Called BEFORE reading from the new position.
+    ///
+    /// # Safety: only the consumer thread may call this.
+    #[inline(always)]
+    unsafe fn maybe_advance_cons_node(&self, tail: u64) {
+        let offset = (tail as usize) & Self::NODE_MASK;
+        if offset == 0 && tail > 0 {
+            let old = *self.cons_node.get();
+            let next = (*old).next.load(Ordering::Acquire) as *mut Node<T>;
+            debug_assert!(!next.is_null(), "consumer advanced past linked nodes");
+            *self.cons_node.get() = next;
+            free_node(old, Self::NODE_CAP);
+            self.node_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Push a single item. Bitwise-copies and forgets the original.
+    pub(crate) fn push_one(&self, item: T) -> Result<(), PushError<T>> {
+        match self.push_n(core::slice::from_ref(&item)) {
+            Ok(_) => {
+                core::mem::forget(item);
+                Ok(())
+            }
+            Err(PushError::Closed(())) => Err(PushError::Closed(item)),
+            Err(PushError::Full(())) => Err(PushError::Full(item)),
+        }
+    }
+
+    /// Pop up to `dst.len()` items. Core consumer path.
+    pub(crate) fn pop_n(&self, dst: &mut [T]) -> Result<usize, PopError> {
+        let (avail, closed) = self.consumer_avail();
+        if avail == 0 {
+            return if closed {
+                Err(PopError::Closed)
+            } else {
+                Err(PopError::Empty)
+            };
+        }
+
+        let mut t = self.cons_tail.load(Ordering::Relaxed);
+        let n = dst.len().min(avail);
+        let mut copied = 0usize;
+
+        while copied < n {
+            unsafe { self.maybe_advance_cons_node(t) };
+
+            let offset = (t as usize) & Self::NODE_MASK;
+            let node = unsafe { *self.cons_node.get() };
+            let can = (Self::NODE_CAP - offset).min(n - copied);
+
+            unsafe {
+                let s = (*node).data.add(offset) as *const T;
+                let d = dst.as_mut_ptr().add(copied);
+                ptr::copy_nonoverlapping(s, d, can);
+            }
+
+            t += can as u64;
+            copied += can;
+        }
+
+        self.cons_tail.store(t, Ordering::Release);
+        Ok(copied)
+    }
+
+    /// Zero-copy consume: invoke `f` with slices of items in-place.
+    pub(crate) fn consume_in_place_inner<F>(&self, max: usize, mut f: F) -> usize
+    where
+        F: FnMut(&[T]) -> usize,
+    {
+        if max == 0 {
+            return 0;
+        }
+        let (avail, _closed) = self.consumer_avail();
+        if avail == 0 {
+            return 0;
+        }
+
+        let mut t = self.cons_tail.load(Ordering::Relaxed);
+        let total = max.min(avail);
+        let mut consumed = 0usize;
+
+        while consumed < total {
+            unsafe { self.maybe_advance_cons_node(t) };
+
+            let offset = (t as usize) & Self::NODE_MASK;
+            let node = unsafe { *self.cons_node.get() };
+            let can = (Self::NODE_CAP - offset).min(total - consumed);
+
+            let ate = unsafe {
+                let base = (*node).data.add(offset) as *const T;
+                let slice = core::slice::from_raw_parts(base, can);
+                f(slice)
+            };
+
+            let ate = ate.min(can);
+            t += ate as u64;
+            consumed += ate;
+
+            if ate < can {
+                break; // callback consumed fewer than offered
+            }
+        }
+
+        self.cons_tail.store(t, Ordering::Release);
+        consumed
+    }
+
+    /// Close the channel by setting bit 63 in head.
+    pub(crate) fn close(&self) {
+        self.prod_head.fetch_or(CLOSED_BIT, Ordering::Release);
+        self.signal.schedule();
+    }
+}
+
+impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone> Drop
+    for UnboundedSpsc<T, P, NUM_SEGS_P2, S>
+{
+    fn drop(&mut self) {
+        // Free the entire node list starting from the consumer's current node.
+        let mut ptr = unsafe { *self.cons_node.get() };
+        while !ptr.is_null() {
+            unsafe {
+                let next = (*ptr).next.load(Ordering::Relaxed);
+                free_node(ptr, Self::NODE_CAP);
+                ptr = if next != 0 {
+                    next as *mut Node<T>
+                } else {
+                    ptr::null_mut()
+                };
+            }
         }
     }
 }
 
-/// Sender half of the unbounded Spsc
+// ═══════════════════════════════════════════════════════════════════════════
+// Sender
+// ═══════════════════════════════════════════════════════════════════════════
+
 pub struct UnboundedSender<
     T,
     const P: usize = 6,
     const NUM_SEGS_P2: usize = 8,
     S: SignalSchedule + Clone = NoOpSignal,
 > {
-    unbounded: Arc<UnboundedSpsc<T, P, NUM_SEGS_P2, S>>,
+    q: Arc<UnboundedSpsc<T, P, NUM_SEGS_P2, S>>,
 }
 
-impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone> Clone
-    for UnboundedSender<T, P, NUM_SEGS_P2, S>
+impl<T, const P: usize, const N: usize, S: SignalSchedule + Clone> Clone
+    for UnboundedSender<T, P, N, S>
 {
     fn clone(&self) -> Self {
-        Self {
-            unbounded: self.unbounded.clone(),
-        }
+        Self { q: self.q.clone() }
     }
 }
 
 impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone>
     UnboundedSender<T, P, NUM_SEGS_P2, S>
 {
-    /// Get a clone of the Arc<UnboundedSpsc>
-    /// This is useful for MPSC implementations that need to store the Arc
     pub fn unbounded_arc(&self) -> Arc<UnboundedSpsc<T, P, NUM_SEGS_P2, S>> {
-        Arc::clone(&self.unbounded)
+        Arc::clone(&self.q)
     }
 
-    /// Try to push an item to the queue
     pub fn try_push(&self, item: T) -> Result<(), PushError<T>> {
-        // Try the current tail first (fast path)
-        match self.unbounded.try_push_to_current(item) {
-            Ok(()) => return Ok(()),
-            Err(PushError::Full(item)) => {
-                // Current tail is full, create a new node
-                let _new_node = self.unbounded.create_new_node();
-
-                // Try again with the new tail
-                match self.unbounded.try_push_to_current(item) {
-                    Ok(()) => Ok(()),
-                    Err(PushError::Full(item)) => Err(PushError::Full(item)),
-                    Err(PushError::Closed(item)) => Err(PushError::Closed(item)),
-                }
+        match self.q.push_n(core::slice::from_ref(&item)) {
+            Ok(_) => {
+                core::mem::forget(item);
+                Ok(())
             }
-            Err(PushError::Closed(item)) => Err(PushError::Closed(item)),
+            Err(PushError::Closed(())) => Err(PushError::Closed(item)),
+            Err(PushError::Full(())) => Err(PushError::Full(item)),
         }
     }
 
-    /// Try to push multiple items to the queue using bulk operations
-    ///
-    /// This method uses the underlying Spsc's bulk try_push_n for efficient batch operations.
-    /// Items are moved out of the Vec using unsafe pointer operations to avoid Clone/Copy bounds.
-    ///
-    /// The Vec is drained as items are successfully pushed. On return, the Vec contains only
-    /// items that were not pushed (if any).
     pub fn try_push_n(&self, items: &mut Vec<T>) -> Result<usize, PushError<()>> {
         if items.is_empty() {
             return Ok(0);
         }
-
-        let original_len = items.len();
-        let mut total_pushed = 0;
-
-        unsafe {
-            let src_ptr = items.as_ptr();
-
-            while total_pushed < original_len {
-                let current_tail = *self.unbounded.current_tail.get();
-                if current_tail.is_null() {
-                    // Remove the items we successfully pushed from the Vec
-                    // by shifting remaining items to the front
-                    if total_pushed > 0 {
-                        let remaining = original_len - total_pushed;
-                        std::ptr::copy(src_ptr.add(total_pushed), items.as_mut_ptr(), remaining);
-                        items.set_len(remaining);
-                    }
-                    return Err(PushError::Closed(()));
-                }
-
-                // Create a slice from the remaining items
-                let remaining_slice = std::slice::from_raw_parts(
-                    src_ptr.add(total_pushed),
-                    original_len - total_pushed,
-                );
-
-                // Try to push the remaining items using bulk operation
-                match (*current_tail).queue.try_push_n(remaining_slice) {
-                    Ok(n) => {
-                        total_pushed += n;
-
-                        // If we pushed all remaining items, we're done
-                        if total_pushed == original_len {
-                            items.set_len(0); // All items moved out
-                            return Ok(total_pushed);
-                        }
-
-                        // If n > 0, we had a partial push - current node is full
-                        // If n == 0, the queue returned Ok(0) meaning it's full
-                        // Either way, create a new node to continue
-                        let _new_node = self.unbounded.create_new_node();
-                    }
-                    Err(PushError::Full(())) => {
-                        // Queue is full but not closed, create a new node
-                        let _new_node = self.unbounded.create_new_node();
-
-                        // After creating a new node, loop will retry with the new node
-                    }
-                    Err(PushError::Closed(())) => {
-                        // Remove the items we successfully pushed from the Vec
-                        if total_pushed > 0 {
-                            let remaining = original_len - total_pushed;
-                            std::ptr::copy(
-                                src_ptr.add(total_pushed),
-                                items.as_mut_ptr(),
-                                remaining,
-                            );
-                            items.set_len(remaining);
-                        }
-                        return Err(PushError::Closed(()));
-                    }
-                }
-            }
-
-            // All items pushed successfully
-            items.set_len(0);
-            Ok(total_pushed)
-        }
+        let n = self.q.push_n(items.as_slice())?;
+        // Items were bitwise-copied into the queue. Clear without dropping.
+        unsafe { items.set_len(0) };
+        Ok(n)
     }
 
-    /// Get the number of nodes in the unbounded queue
     pub fn node_count(&self) -> usize {
-        self.unbounded.node_count()
+        self.q.node_count()
     }
 
-    /// Get the total capacity across all nodes
     pub fn total_capacity(&self) -> usize {
-        self.unbounded.total_capacity()
+        self.q.total_capacity()
     }
 
-    /// Get the current length (approximate)
     pub fn len(&self) -> usize {
-        self.unbounded.len()
+        self.q.len()
     }
 
-    /// Check if the queue is empty (approximate)
     pub fn is_empty(&self) -> bool {
-        self.unbounded.is_empty()
+        self.q.is_empty()
     }
 
-    /// Close the channel for sending
     pub fn close_channel(&self) {
-        unsafe {
-            let current_tail = *self.unbounded.current_tail.get();
-            if !current_tail.is_null() {
-                (*current_tail).queue.close();
-            }
-        }
+        self.q.close();
     }
 }
 
-impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone> Drop
-    for UnboundedSender<T, P, NUM_SEGS_P2, S>
+impl<T, const P: usize, const N: usize, S: SignalSchedule + Clone> Drop
+    for UnboundedSender<T, P, N, S>
 {
     fn drop(&mut self) {
-        // Close the channel when the sender is dropped
         self.close_channel();
     }
 }
 
-/// Receiver half of the unbounded Spsc
+// ═══════════════════════════════════════════════════════════════════════════
+// Receiver
+// ═══════════════════════════════════════════════════════════════════════════
+
 pub struct UnboundedReceiver<
     T,
     const P: usize = 6,
     const NUM_SEGS_P2: usize = 8,
     S: SignalSchedule + Clone = NoOpSignal,
 > {
-    unbounded: Arc<UnboundedSpsc<T, P, NUM_SEGS_P2, S>>,
+    q: Arc<UnboundedSpsc<T, P, NUM_SEGS_P2, S>>,
 }
 
-impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone> Clone
-    for UnboundedReceiver<T, P, NUM_SEGS_P2, S>
+impl<T, const P: usize, const N: usize, S: SignalSchedule + Clone> Clone
+    for UnboundedReceiver<T, P, N, S>
 {
     fn clone(&self) -> Self {
-        Self {
-            unbounded: self.unbounded.clone(),
-        }
+        Self { q: self.q.clone() }
     }
 }
 
 impl<T, const P: usize, const NUM_SEGS_P2: usize, S: SignalSchedule + Clone>
     UnboundedReceiver<T, P, NUM_SEGS_P2, S>
 {
-    /// Try to pop an item from the queue
-    pub fn try_pop(&self) -> Option<T> {
-        loop {
-            // Try to pop from the current head
-            let head_node =
-                self.unbounded.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-            if head_node.is_null() {
-                return None;
-            }
-
-            unsafe {
-                let item = (*head_node).queue.try_pop();
-                if item.is_some() {
-                    return item;
-                }
-
-                // If current head is empty, check if we should advance to next node
-                if (*head_node).queue.is_empty() {
-                    let next_head = (*head_node).next.load(Ordering::Acquire)
-                        as *mut Node<T, P, NUM_SEGS_P2, S>;
-                    if !next_head.is_null() {
-                        self.unbounded
-                            .head
-                            .store(next_head as usize, Ordering::Release);
-                        continue; // Try to pop from the new head
-                    } else {
-                        // No more nodes, check if the current node is closed
-                        if (*head_node).queue.is_closed() {
-                            return None;
-                        } else {
-                            // Current node not closed, items might arrive later
-                            return None;
-                        }
-                    }
-                }
-
-                // Current head has items but we couldn't pop (shouldn't happen)
-                return None;
-            }
+    /// Try to pop a single item.
+    ///
+    /// - `Ok(item)` — dequeued
+    /// - `Err(PopError::Empty)` — empty, items may arrive later
+    /// - `Err(PopError::Closed)` — channel closed and fully drained
+    pub fn try_pop(&self) -> Result<T, PopError> {
+        let mut tmp: T = unsafe { core::mem::zeroed() };
+        match self.q.pop_n(core::slice::from_mut(&mut tmp)) {
+            Ok(1) => Ok(tmp),
+            Ok(_) => unreachable!(),
+            Err(e) => Err(e),
         }
     }
 
-    /// Try to pop multiple items from the queue
-    pub fn try_pop_n(&self, items: &mut [T]) -> Result<usize, PopError> {
-        let mut filled = 0;
-        let mut remaining_space = items;
-
-        while !remaining_space.is_empty() {
-            let head_node =
-                self.unbounded.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-            if head_node.is_null() {
-                break;
-            }
-
-            unsafe {
-                match (*head_node).queue.try_pop_n(remaining_space) {
-                    Ok(n) => {
-                        filled += n;
-                        remaining_space = &mut remaining_space[n..];
-
-                        // If we filled the current buffer or the head is exhausted, break
-                        if remaining_space.is_empty()
-                            || ((*head_node).queue.is_empty() && (*head_node).queue.is_closed())
-                        {
-                            break;
-                        }
-                    }
-                    Err(PopError::Empty) => {
-                        // Current head is empty, check if we should advance
-                        if (*head_node).queue.is_empty() {
-                            let next_head = (*head_node).next.load(Ordering::Acquire)
-                                as *mut Node<T, P, NUM_SEGS_P2, S>;
-                            if !next_head.is_null() {
-                                self.unbounded
-                                    .head
-                                    .store(next_head as usize, Ordering::Release);
-                                continue; // Try to pop from the new head
-                            } else {
-                                // No more nodes, check if current node is closed
-                                if (*head_node).queue.is_closed() {
-                                    break; // No more items coming
-                                } else {
-                                    break; // Items might arrive later
-                                }
-                            }
-                        } else {
-                            break; // Current head not empty but no items available
-                        }
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
-        if filled == 0 {
-            Err(PopError::Empty)
-        } else {
-            Ok(filled)
-        }
+    /// Try to pop multiple items into `dst`.
+    pub fn try_pop_n(&self, dst: &mut [T]) -> Result<usize, PopError> {
+        self.q.pop_n(dst)
     }
 
-    /// Consume items in place using a callback
-    pub fn consume_in_place<F>(&self, max: usize, mut f: F) -> usize
+    /// Zero-copy consumption via callback.
+    pub fn consume_in_place<F>(&self, max: usize, f: F) -> usize
     where
         F: FnMut(&[T]) -> usize,
     {
-        let mut consumed_total = 0;
-        let mut remaining = max;
-
-        while consumed_total < max {
-            let head_node =
-                self.unbounded.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-            if head_node.is_null() {
-                break;
-            }
-
-            unsafe {
-                let to_consume = std::cmp::min(remaining, (*head_node).queue.len());
-                if to_consume == 0 {
-                    // Check if we should advance to next node
-                    if (*head_node).queue.is_empty() {
-                        let next_head = (*head_node).next.load(Ordering::Acquire)
-                            as *mut Node<T, P, NUM_SEGS_P2, S>;
-                        if !next_head.is_null() {
-                            self.unbounded
-                                .head
-                                .store(next_head as usize, Ordering::Release);
-                            continue;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                // Consume from current node
-                let consumed = (*head_node)
-                    .queue
-                    .consume_in_place(to_consume, |chunk| f(chunk));
-
-                consumed_total += consumed;
-                remaining -= consumed;
-
-                if consumed < to_consume {
-                    break; // Consumer function didn't consume all requested items
-                }
-            }
-        }
-
-        consumed_total
+        self.q.consume_in_place_inner(max, f)
     }
 
-    /// Check if the queue is empty
     pub fn is_empty(&self) -> bool {
-        self.unbounded.is_empty()
+        self.q.is_empty()
     }
 
-    /// Get the current length (approximate)
     pub fn len(&self) -> usize {
-        self.unbounded.len()
+        self.q.len()
     }
 
-    /// Check if the channel is closed
+    /// Best-effort closed check. Prefer `try_pop()` returning
+    /// `Err(PopError::Closed)` as the authoritative signal.
     pub fn is_closed(&self) -> bool {
-        let head_node =
-            self.unbounded.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-        if head_node.is_null() {
-            return true;
-        }
-
-        unsafe { (*head_node).queue.is_closed() }
+        self.q.prod_head.load(Ordering::Acquire) & CLOSED_BIT != 0
     }
 
-    /// Get the number of nodes in the unbounded queue
     pub fn node_count(&self) -> usize {
-        self.unbounded.node_count()
+        self.q.node_count()
     }
 
-    /// Get the total capacity across all nodes
     pub fn total_capacity(&self) -> usize {
-        self.unbounded.total_capacity()
+        self.q.total_capacity()
     }
 
-    /// Mark the current head node as executing (for signal scheduling)
     pub fn mark(&self) {
-        let head_node =
-            self.unbounded.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-        if !head_node.is_null() {
-            unsafe {
-                (*head_node).queue.mark();
-            }
-        }
+        self.q.signal.mark();
     }
 
-    /// Unmark the current head node (for signal scheduling)
     pub fn unmark(&self) {
-        let head_node =
-            self.unbounded.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-        if !head_node.is_null() {
-            unsafe {
-                (*head_node).queue.unmark();
-            }
-        }
+        self.q.signal.unmark();
     }
 
-    /// Unmark and reschedule the current head node (for signal scheduling)
     pub fn unmark_and_schedule(&self) {
-        let head_node =
-            self.unbounded.head.load(Ordering::Acquire) as *mut Node<T, P, NUM_SEGS_P2, S>;
-        if !head_node.is_null() {
-            unsafe {
-                (*head_node).queue.unmark_and_schedule();
-            }
-        }
+        self.q.signal.unmark_and_schedule();
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
@@ -686,126 +607,114 @@ mod tests {
 
     #[test]
     fn test_basic_unbounded_spsc() {
-        type TestQ = UnboundedSpsc<u64>;
-        let (sender, receiver) = TestQ::new();
+        type Q = UnboundedSpsc<u64>;
+        let (tx, rx) = Q::new();
 
-        // Test basic push/pop
-        assert!(sender.try_push(42).is_ok());
-        assert_eq!(receiver.try_pop(), Some(42));
-        assert_eq!(receiver.try_pop(), None);
+        assert!(tx.try_push(42).is_ok());
+        assert_eq!(rx.try_pop(), Ok(42));
+        assert!(rx.try_pop().is_err());
     }
 
     #[test]
     fn test_unbounded_growth() {
-        type TestQ = UnboundedSpsc<u64, 2, 2>; // Small capacity: 4 items per node
-        let (sender, receiver) = TestQ::new();
+        // P=2, NUM_SEGS_P2=2 → NODE_CAP = 4*4 = 16
+        type Q = UnboundedSpsc<u64, 2, 2>;
+        let (tx, rx) = Q::new();
 
-        // Fill the first node (4 items)
-        for i in 0..4 {
-            assert!(sender.try_push(i).is_ok());
+        for i in 0..16 {
+            assert!(tx.try_push(i).is_ok());
         }
+        // Still in first node
+        assert_eq!(tx.node_count(), 1);
 
-        // Next push should create a new node
-        assert!(sender.try_push(4).is_ok());
+        // 17th item triggers second node
+        assert!(tx.try_push(16).is_ok());
+        assert_eq!(tx.node_count(), 2);
 
-        // Verify we can pop all items
-        for i in 0..5 {
-            assert_eq!(receiver.try_pop(), Some(i));
+        for i in 0..17 {
+            assert_eq!(rx.try_pop(), Ok(i));
         }
-        assert_eq!(receiver.try_pop(), None);
+        assert!(rx.try_pop().is_err());
     }
 
     #[test]
     fn test_multiple_nodes_traversal() {
-        type TestQ = UnboundedSpsc<u64, 1, 1>; // 2 items per segment, 2 segments = 3 capacity per node
-        let (sender, receiver) = TestQ::new();
+        // P=1, NUM_SEGS_P2=1 → NODE_CAP = 2*2 = 4
+        type Q = UnboundedSpsc<u64, 1, 1>;
+        let (tx, rx) = Q::new();
 
-        // Fill multiple nodes (need more than 3 items to create multiple nodes)
         for i in 0..10 {
-            assert!(sender.try_push(i).is_ok());
+            assert!(tx.try_push(i).is_ok());
         }
+        assert!(tx.node_count() > 1);
 
-        // Verify node count increased
-        assert!(sender.node_count() > 1);
-        assert_eq!(sender.total_capacity(), sender.node_count() * 3); // (2*2)-1 = 3 items per node
-
-        // Pop all items
         for i in 0..10 {
-            assert_eq!(receiver.try_pop(), Some(i));
+            assert_eq!(rx.try_pop(), Ok(i));
         }
     }
 
     #[test]
     fn test_try_push_n_unbounded() {
-        type TestQ = UnboundedSpsc<u64, 2, 2>; // 4 items per node
-        let (sender, receiver) = TestQ::new();
+        type Q = UnboundedSpsc<u64, 2, 2>;
+        let (tx, rx) = Q::new();
 
         let mut items: Vec<u64> = (0..10).collect();
-        let pushed = sender.try_push_n(&mut items).unwrap();
+        let pushed = tx.try_push_n(&mut items).unwrap();
         assert_eq!(pushed, 10);
+        assert!(items.is_empty());
 
-        // Verify all items were pushed
         for i in 0..10 {
-            assert_eq!(receiver.try_pop(), Some(i));
+            assert_eq!(rx.try_pop(), Ok(i));
         }
     }
 
     #[test]
     fn test_consumer_advancement() {
-        type TestQ = UnboundedSpsc<u64, 2, 2>; // 4 items per segment, 4 segments = 15 capacity per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 16
+        type Q = UnboundedSpsc<u64, 2, 2>;
+        let (tx, rx) = Q::new();
 
-        // Fill first node completely (15 items)
-        for i in 0..15 {
-            assert!(sender.try_push(i).is_ok());
+        for i in 0..17 {
+            assert!(tx.try_push(i).is_ok());
+        }
+        assert_eq!(tx.node_count(), 2);
+
+        for i in 0..17 {
+            assert_eq!(rx.try_pop(), Ok(i));
         }
 
-        // Add one more item to trigger creation of second node
-        assert!(sender.try_push(15).is_ok());
-
-        // Verify we now have 2 nodes
-        assert_eq!(sender.node_count(), 2);
-
-        // Pop all items from first node
-        for i in 0..16 {
-            assert_eq!(receiver.try_pop(), Some(i));
+        // After draining past boundary, old node freed
+        // (node freed lazily on next pop crossing boundary)
+        for i in 17..20 {
+            assert!(tx.try_push(i).is_ok());
         }
-
-        // Add items to second node
-        for i in 16..19 {
-            assert!(sender.try_push(i).is_ok());
-        }
-
-        // Should be able to pop from second node
-        for i in 16..19 {
-            assert_eq!(receiver.try_pop(), Some(i));
+        for i in 17..20 {
+            assert_eq!(rx.try_pop(), Ok(i));
         }
     }
 
     #[test]
     fn test_concurrent_operations() {
-        type TestQ = UnboundedSpsc<u64>;
-        let (sender, receiver) = TestQ::new();
+        type Q = UnboundedSpsc<u64>;
+        let (tx, rx) = Q::new();
 
-        // Producer thread
         let producer = {
-            let sender = sender.clone();
+            let tx = tx.clone();
             thread::spawn(move || {
                 for i in 0..1000 {
-                    while sender.try_push(i).is_err() {
+                    while tx.try_push(i).is_err() {
                         thread::sleep(Duration::from_micros(1));
                     }
                 }
             })
         };
 
-        // Consumer thread
         let consumer = {
-            let receiver = receiver.clone();
+            let rx = rx.clone();
             thread::spawn(move || {
                 let mut received = Vec::new();
                 while received.len() < 1000 {
-                    if let Some(item) = receiver.try_pop() {
+                    if let Ok(item) = rx.try_pop() {
                         received.push(item);
                     }
                     thread::sleep(Duration::from_micros(1));
@@ -816,47 +725,41 @@ mod tests {
 
         producer.join().unwrap();
         let received = consumer.join().unwrap();
-
-        // Verify all items were received
         assert_eq!(received.len(), 1000);
-        for i in 0..1000 {
-            assert!(received.contains(&i));
+        for (i, &v) in received.iter().enumerate() {
+            assert_eq!(v, i as u64);
         }
     }
 
     #[test]
     fn test_statistics_tracking() {
-        type TestQ = UnboundedSpsc<u64, 2, 2>; // 4 items per segment, 4 segments = 15 capacity per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 16
+        type Q = UnboundedSpsc<u64, 2, 2>;
+        let (tx, _rx) = Q::new();
 
-        assert_eq!(sender.node_count(), 1);
-        assert_eq!(sender.total_capacity(), 15); // (4*4)-1 = 15
+        assert_eq!(tx.node_count(), 1);
+        assert_eq!(tx.total_capacity(), 16);
 
-        // Fill first node and add one more item
-        for i in 0..16 {
-            assert!(sender.try_push(i).is_ok());
+        for i in 0..17 {
+            assert!(tx.try_push(i).is_ok());
         }
-
-        assert_eq!(sender.node_count(), 2);
-        assert_eq!(sender.total_capacity(), 30); // 2 * 15
+        assert_eq!(tx.node_count(), 2);
+        assert_eq!(tx.total_capacity(), 32);
     }
 
     #[test]
     fn test_consume_in_place_unbounded() {
-        type TestQ = UnboundedSpsc<u64, 2, 2>; // 4 items per node
-        let (sender, receiver) = TestQ::new();
+        type Q = UnboundedSpsc<u64, 2, 2>;
+        let (tx, rx) = Q::new();
 
-        // Add items to multiple nodes
         for i in 0..10 {
-            assert!(sender.try_push(i).is_ok());
+            assert!(tx.try_push(i).is_ok());
         }
 
-        // Consume using callback
-        let sum = Arc::new(Mutex::new(0));
-        let sum_clone = sum.clone();
-
-        let consumed = receiver.consume_in_place(10, |chunk| {
-            let mut total = sum_clone.lock().unwrap();
+        let sum = Arc::new(Mutex::new(0u64));
+        let s = sum.clone();
+        let consumed = rx.consume_in_place(10, |chunk| {
+            let mut total = s.lock().unwrap();
             for &item in chunk {
                 *total += item;
             }
@@ -869,338 +772,253 @@ mod tests {
 
     #[test]
     fn test_memory_dropping_different_nodes() {
-        type TestQ = UnboundedSpsc<u64, 2, 2>; // 15 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 16
+        type Q = UnboundedSpsc<u64, 2, 2>;
+        let (tx, rx) = Q::new();
 
-        // Fill multiple nodes
         for i in 0..50 {
-            assert!(sender.try_push(i).is_ok());
+            assert!(tx.try_push(i).is_ok());
+        }
+        assert!(tx.node_count() > 1);
+        let initial = tx.node_count();
+
+        // Drain past first node boundary
+        for i in 0..20 {
+            assert_eq!(rx.try_pop(), Ok(i));
         }
 
-        // Verify we have multiple nodes
-        assert!(sender.node_count() > 1);
-        let initial_node_count = sender.node_count();
-
-        // Consumer consumes from first node completely
-        for i in 0..15 {
-            assert_eq!(receiver.try_pop(), Some(i));
-        }
-
-        // At this point, consumer should be at node 1, sender should be at node 3 or later
-        // Consumer finishes node 1
-        assert_eq!(receiver.try_pop(), Some(15));
-
-        // Verify that we can still push to later nodes
+        // Push more
         for i in 50..60 {
-            assert!(sender.try_push(i).is_ok());
+            assert!(tx.try_push(i).is_ok());
         }
 
-        // Consumer should be able to continue from where it left off
-        for i in 16..20 {
-            assert_eq!(receiver.try_pop(), Some(i));
+        // Continue consuming
+        for i in 20..25 {
+            assert_eq!(rx.try_pop(), Ok(i));
         }
 
-        // Memory should still be properly managed
-        assert!(sender.node_count() >= initial_node_count);
+        // Nodes should have been freed
+        assert!(tx.node_count() < initial);
     }
 
     #[test]
     fn test_producer_consumer_position_divergence() {
-        type TestQ = UnboundedSpsc<u64, 1, 1>; // 3 items per node - small for easy testing
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 4
+        type Q = UnboundedSpsc<u64, 1, 1>;
+        let (tx, rx) = Q::new();
 
-        // Fill many nodes
         for i in 0..30 {
-            assert!(sender.try_push(i).is_ok());
+            assert!(tx.try_push(i).is_ok());
         }
 
-        // Consumer lags behind significantly
-        // Consumer at node 0 (items 0-2)
-        assert_eq!(receiver.try_pop(), Some(0));
-        assert_eq!(receiver.try_pop(), Some(1));
-        assert_eq!(receiver.try_pop(), Some(2));
+        for i in 0..9 {
+            assert_eq!(rx.try_pop(), Ok(i));
+        }
 
-        // Producer continues to node 9 (items 27-29)
         for i in 30..33 {
-            assert!(sender.try_push(i).is_ok());
+            assert!(tx.try_push(i).is_ok());
         }
 
-        // Consumer moves to node 1 (items 3-5)
-        assert_eq!(receiver.try_pop(), Some(3));
-        assert_eq!(receiver.try_pop(), Some(4));
-        assert_eq!(receiver.try_pop(), Some(5));
-
-        // Consumer moves to node 2 (items 6-8)
-        assert_eq!(receiver.try_pop(), Some(6));
-        assert_eq!(receiver.try_pop(), Some(7));
-        assert_eq!(receiver.try_pop(), Some(8));
-
-        // At this point:
-        // - Consumer is at node 2, about to read item 9
-        // - Producer is at node 10+ (items 30+)
-        // - Nodes 0, 1 should be eligible for cleanup (but we don't implement cleanup yet)
-
-        // Continue consuming to verify the system still works
         for i in 9..12 {
-            assert_eq!(receiver.try_pop(), Some(i));
+            assert_eq!(rx.try_pop(), Ok(i));
         }
     }
 
     #[test]
     fn test_channel_close_with_divergent_positions() {
-        type TestQ = UnboundedSpsc<u64, 2, 2>; // 15 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 16
+        type Q = UnboundedSpsc<u64, 2, 2>;
+        let (tx, rx) = Q::new();
 
-        // Fill multiple nodes
         for i in 0..40 {
-            assert!(sender.try_push(i).is_ok());
+            assert!(tx.try_push(i).is_ok());
         }
-
-        // Consumer gets ahead and consumes several nodes
         for i in 0..20 {
-            assert_eq!(receiver.try_pop(), Some(i));
+            assert_eq!(rx.try_pop(), Ok(i));
         }
 
-        // Consumer is now at node 1, producer is at node 2 or 3
-        // Close the channel while they're at different positions
-        sender.close_channel();
+        tx.close_channel();
 
-        // Consumer should still be able to consume remaining items
         for i in 20..40 {
-            assert_eq!(receiver.try_pop(), Some(i));
+            assert_eq!(rx.try_pop(), Ok(i));
         }
 
-        // After consuming all items, should get None
-        assert_eq!(receiver.try_pop(), None);
-        assert!(receiver.is_closed());
+        assert_eq!(rx.try_pop(), Err(PopError::Closed));
+        assert!(rx.is_closed());
     }
 
     #[test]
     fn test_large_node_count_stress() {
-        type TestQ = UnboundedSpsc<u64, 1, 1>; // 3 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 4
+        type Q = UnboundedSpsc<u64, 1, 1>;
+        let (tx, rx) = Q::new();
 
-        // Create many nodes
-        let num_items = 1000;
+        let num_items = 1000u64;
         for i in 0..num_items {
-            assert!(sender.try_push(i).is_ok());
+            assert!(tx.try_push(i).is_ok());
         }
+        assert!(tx.node_count() > 100);
 
-        // Verify we have many nodes
-        assert!(sender.node_count() > 100);
-
-        // Consume all items
         for i in 0..num_items {
-            assert_eq!(receiver.try_pop(), Some(i));
+            assert_eq!(rx.try_pop(), Ok(i));
         }
-
-        // Should be empty now
-        assert_eq!(receiver.try_pop(), None);
+        assert!(rx.try_pop().is_err());
     }
 
     #[test]
     fn test_memory_pressure_with_rapid_producer_consumer() {
-        type TestQ = UnboundedSpsc<u64, 1, 1>; // 3 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 4
+        type Q = UnboundedSpsc<u64, 1, 1>;
+        let (tx, rx) = Q::new();
 
-        // Rapid production and consumption
-        let mut produced_items = Vec::new();
-        let mut consumed_items = Vec::new();
-
-        // Producer creates items rapidly
-        for i in 0..200 {
-            assert!(sender.try_push(i).is_ok());
-            produced_items.push(i);
+        for i in 0..200u64 {
+            assert!(tx.try_push(i).is_ok());
         }
 
-        // Consumer catches up and consumes many items
+        let mut consumed = Vec::new();
         for _ in 0..150 {
-            if let Some(item) = receiver.try_pop() {
-                consumed_items.push(item);
+            if let Ok(item) = rx.try_pop() {
+                consumed.push(item);
             }
         }
-
-        // Verify consumption is working correctly
-        assert_eq!(consumed_items.len(), 150);
-        for (i, &item) in consumed_items.iter().enumerate() {
-            assert_eq!(item, i as u64);
+        assert_eq!(consumed.len(), 150);
+        for (i, &v) in consumed.iter().enumerate() {
+            assert_eq!(v, i as u64);
         }
 
-        // Continue producing
-        for i in 200..250 {
-            assert!(sender.try_push(i).is_ok());
-            produced_items.push(i);
+        for i in 200..250u64 {
+            assert!(tx.try_push(i).is_ok());
         }
 
-        // Continue consuming
         for _ in 0..100 {
-            if let Some(item) = receiver.try_pop() {
-                consumed_items.push(item);
+            if let Ok(item) = rx.try_pop() {
+                consumed.push(item);
             }
         }
-
-        // Verify the pattern continues correctly
-        assert_eq!(consumed_items.len(), 250);
-        for (i, &item) in consumed_items.iter().enumerate() {
-            assert_eq!(item, i as u64);
+        assert_eq!(consumed.len(), 250);
+        for (i, &v) in consumed.iter().enumerate() {
+            assert_eq!(v, i as u64);
         }
     }
 
     #[test]
     fn test_consumer_abandoning_nodes() {
-        type TestQ = UnboundedSpsc<u64, 1, 1>; // 3 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 4
+        type Q = UnboundedSpsc<u64, 1, 1>;
+        let (tx, rx) = Q::new();
 
-        // Fill many nodes
-        for i in 0..50 {
-            assert!(sender.try_push(i).is_ok());
+        for i in 0..50u64 {
+            assert!(tx.try_push(i).is_ok());
         }
-
-        // Consumer partially consumes some nodes then stops
         for i in 0..10 {
-            assert_eq!(receiver.try_pop(), Some(i));
+            assert_eq!(rx.try_pop(), Ok(i));
         }
 
-        // Drop the receiver - this should not affect the sender
-        drop(receiver);
+        drop(rx);
 
-        // Sender should still be able to push more items
-        for i in 50..60 {
-            assert!(sender.try_push(i).is_ok());
-        }
-
-        // Create a new receiver and verify it can consume from the beginning
-        let (_sender2, receiver2) = TestQ::new();
-
-        // This new receiver should start from the beginning (or be independent)
-        // Since we dropped the first receiver, the behavior depends on implementation
-        // For now, just verify the sender still works
-        for i in 60..70 {
-            assert!(sender.try_push(i).is_ok());
+        // Sender can still push
+        for i in 50..60u64 {
+            assert!(tx.try_push(i).is_ok());
         }
     }
 
     #[test]
     fn test_interleaved_producer_consumer_stress() {
-        type TestQ = UnboundedSpsc<u64, 1, 1>; // 3 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 4
+        type Q = UnboundedSpsc<u64, 1, 1>;
+        let (tx, rx) = Q::new();
+        let mut expected = 0u64;
 
-        let mut expected_consumed = 0;
-
-        // Interleaved push and pop operations
-        for round in 0..20 {
-            // Push a few items
+        for round in 0..20u64 {
             for i in 0..5 {
-                let item = round * 5 + i;
-                assert!(sender.try_push(item).is_ok());
+                assert!(tx.try_push(round * 5 + i).is_ok());
             }
-
-            // Pop a few items
             for _ in 0..3 {
-                if let Some(item) = receiver.try_pop() {
-                    assert_eq!(item, expected_consumed);
-                    expected_consumed += 1;
+                if let Ok(item) = rx.try_pop() {
+                    assert_eq!(item, expected);
+                    expected += 1;
                 }
             }
         }
 
-        // Consume remaining items
-        while let Some(item) = receiver.try_pop() {
-            assert_eq!(item, expected_consumed);
-            expected_consumed += 1;
+        while let Ok(item) = rx.try_pop() {
+            assert_eq!(item, expected);
+            expected += 1;
         }
-
-        // Verify we consumed all expected items
-        assert_eq!(expected_consumed, 100); // 20 rounds * 5 items per round
+        assert_eq!(expected, 100);
     }
 
     #[test]
     fn test_node_count_accuracy() {
-        type TestQ = UnboundedSpsc<u64, 2, 2>; // 15 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 16
+        type Q = UnboundedSpsc<u64, 2, 2>;
+        let (tx, rx) = Q::new();
 
-        // Initially should have 1 node
-        assert_eq!(sender.node_count(), 1);
+        assert_eq!(tx.node_count(), 1);
 
-        // Fill first node (15 items)
-        for i in 0..15 {
-            assert_eq!(sender.node_count(), 1);
-            assert!(sender.try_push(i).is_ok());
+        // Fill first node
+        for i in 0..16u64 {
+            assert_eq!(tx.node_count(), 1);
+            assert!(tx.try_push(i).is_ok());
         }
+        assert_eq!(tx.node_count(), 1);
 
-        // Adding one more should create second node
-        assert!(sender.try_push(15).is_ok());
-        assert_eq!(sender.node_count(), 2);
+        // 17th → second node
+        assert!(tx.try_push(16).is_ok());
+        assert_eq!(tx.node_count(), 2);
 
-        // Add more items to fill second node (items 16-30 = 15 items)
-        for i in 16..30 {
-            assert!(sender.try_push(i).is_ok());
+        // Fill second node (items 17..32)
+        for i in 17..32u64 {
+            assert!(tx.try_push(i).is_ok());
         }
-        // Should still have 2 nodes (second node can hold 15 items)
-        assert_eq!(sender.node_count(), 2);
+        assert_eq!(tx.node_count(), 2);
 
-        // Add one more to create third node
-        assert!(sender.try_push(30).is_ok());
-        assert_eq!(sender.node_count(), 3);
+        // 33rd → third node
+        assert!(tx.try_push(32).is_ok());
+        assert_eq!(tx.node_count(), 3);
 
-        // Consume some items but not entire nodes
-        for i in 0..10 {
-            assert_eq!(receiver.try_pop(), Some(i));
+        // Consume 10 items (still in first node)
+        for i in 0..10u64 {
+            assert_eq!(rx.try_pop(), Ok(i));
         }
-
-        // Node count should remain the same
-        assert_eq!(sender.node_count(), 3);
-
-        // Consume entire first node
-        for i in 10..15 {
-            assert_eq!(receiver.try_pop(), Some(i));
-        }
-
-        // Node count should still be the same (we don't implement cleanup yet)
-        assert_eq!(sender.node_count(), 3);
+        assert_eq!(tx.node_count(), 3);
     }
 
     #[test]
     fn test_try_push_n_with_node_creation() {
-        type TestQ = UnboundedSpsc<u64, 1, 1>; // 3 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 4
+        type Q = UnboundedSpsc<u64, 1, 1>;
+        let (tx, rx) = Q::new();
 
-        // Fill first node completely
-        let mut first_batch: Vec<u64> = (0..3).collect();
-        let pushed = sender.try_push_n(&mut first_batch).unwrap();
-        assert_eq!(pushed, 3);
-        assert_eq!(sender.node_count(), 1);
+        let mut batch: Vec<u64> = (0..4).collect();
+        let pushed = tx.try_push_n(&mut batch).unwrap();
+        assert_eq!(pushed, 4);
+        assert_eq!(tx.node_count(), 1);
 
-        // Try to push more than fits in current node
-        let mut second_batch: Vec<u64> = (3..10).collect(); // 7 items
-        let pushed = sender.try_push_n(&mut second_batch).unwrap();
+        let mut batch2: Vec<u64> = (4..11).collect();
+        let pushed = tx.try_push_n(&mut batch2).unwrap();
         assert_eq!(pushed, 7);
+        assert!(tx.node_count() > 1);
 
-        // Should have created additional nodes
-        assert!(sender.node_count() > 1);
-
-        // Verify all items were pushed
-        for i in 0..10 {
-            assert_eq!(receiver.try_pop(), Some(i));
+        for i in 0..11u64 {
+            assert_eq!(rx.try_pop(), Ok(i));
         }
     }
 
     #[test]
     fn test_consume_in_place_across_nodes() {
-        type TestQ = UnboundedSpsc<u64, 1, 1>; // 3 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 4
+        type Q = UnboundedSpsc<u64, 1, 1>;
+        let (tx, rx) = Q::new();
 
-        // Fill multiple nodes
-        for i in 0..10 {
-            assert!(sender.try_push(i).is_ok());
+        for i in 0..10u64 {
+            assert!(tx.try_push(i).is_ok());
         }
 
-        // Consume across node boundaries using consume_in_place
-        let sum = Arc::new(Mutex::new(0));
-        let sum_clone = sum.clone();
-
-        let consumed = receiver.consume_in_place(10, |chunk| {
-            let mut total = sum_clone.lock().unwrap();
+        let sum = Arc::new(Mutex::new(0u64));
+        let s = sum.clone();
+        let consumed = rx.consume_in_place(10, |chunk| {
+            let mut total = s.lock().unwrap();
             for &item in chunk {
                 *total += item;
             }
@@ -1209,29 +1027,63 @@ mod tests {
 
         assert_eq!(consumed, 10);
         assert_eq!(*sum.lock().unwrap(), (0..10).sum::<u64>());
-
-        // Queue should be empty now
-        assert_eq!(receiver.try_pop(), None);
+        assert!(rx.try_pop().is_err());
     }
 
     #[test]
     fn test_try_push_n_performance() {
-        type TestQ = UnboundedSpsc<u64, 2, 2>; // 15 items per node
-        let (sender, receiver) = TestQ::new();
+        // NODE_CAP = 16
+        type Q = UnboundedSpsc<u64, 2, 2>;
+        let (tx, rx) = Q::new();
 
-        // Test large batch push that spans multiple nodes
-        let mut large_batch: Vec<u64> = (0..100).collect();
-        let pushed = sender.try_push_n(&mut large_batch).unwrap();
+        let mut batch: Vec<u64> = (0..100).collect();
+        let pushed = tx.try_push_n(&mut batch).unwrap();
         assert_eq!(pushed, 100);
 
-        // Verify all items were pushed efficiently
-        for i in 0..100 {
-            assert_eq!(receiver.try_pop(), Some(i));
+        for i in 0..100u64 {
+            assert_eq!(rx.try_pop(), Ok(i));
+        }
+        assert!(tx.node_count() >= 1);
+    }
+
+    #[test]
+    fn test_close_returns_closed_error() {
+        type Q = UnboundedSpsc<u64>;
+        let (tx, rx) = Q::new();
+
+        tx.try_push(1).unwrap();
+        tx.try_push(2).unwrap();
+        drop(tx); // close
+
+        assert_eq!(rx.try_pop(), Ok(1));
+        assert_eq!(rx.try_pop(), Ok(2));
+        assert_eq!(rx.try_pop(), Err(PopError::Closed));
+    }
+
+    #[test]
+    fn test_push_after_close() {
+        type Q = UnboundedSpsc<u64>;
+        let (tx, _rx) = Q::new();
+
+        tx.close_channel();
+        assert!(matches!(tx.try_push(42), Err(PushError::Closed(42))));
+    }
+
+    #[test]
+    fn test_pop_n_across_nodes() {
+        // NODE_CAP = 4
+        type Q = UnboundedSpsc<u64, 1, 1>;
+        let (tx, rx) = Q::new();
+
+        for i in 0..10u64 {
+            tx.try_push(i).unwrap();
         }
 
-        // Verify node count increased appropriately
-        // 100 items / 15 items per node = ~7 nodes
-        assert!(sender.node_count() >= 6);
-        assert!(sender.node_count() <= 8);
+        let mut buf = [0u64; 10];
+        let n = rx.try_pop_n(&mut buf).unwrap();
+        assert_eq!(n, 10);
+        for i in 0..10 {
+            assert_eq!(buf[i], i as u64);
+        }
     }
 }
