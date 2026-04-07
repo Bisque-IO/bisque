@@ -1420,6 +1420,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bincode 2.0.1",
+ "bisque-alloc",
  "bytes",
  "chrono",
  "congee",

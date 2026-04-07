@@ -36,12 +36,11 @@ impl Encode for TestData {
         &self,
         writer: &mut W,
     ) -> Result<(), bisque_raft::codec::CodecError> {
-        (self.0.len() as u32).encode(writer)?;
         writer.write_all(&self.0)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
-        4 + self.0.len()
+        self.0.len()
     }
 }
 
@@ -51,6 +50,10 @@ impl Decode for TestData {
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf)?;
         Ok(Self(buf))
+    }
+
+    fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, bisque_raft::codec::CodecError> {
+        Ok(Self(data.to_vec()))
     }
 }
 
@@ -64,10 +67,13 @@ type C = ManiacRaftTypeConfig<TestData, ()>;
 type Rt = <C as RaftTypeConfig>::AsyncRuntime;
 type Os = <Rt as AsyncRuntime>::Oneshot;
 
-fn make_entry(index: u64, term: u64) -> openraft::impls::Entry<C> {
-    openraft::impls::Entry::<C> {
+fn make_entry(index: u64, term: u32) -> openraft::alias::DefaultEntryOf<C> {
+    openraft::Entry {
         log_id: LogId {
-            leader_id: openraft::impls::leader_id_adv::LeaderId { term, node_id: 1 },
+            leader_id: openraft::impls::leader_id_adv::LeaderId {
+                term,
+                node_id: 1u32,
+            },
             index,
         },
         payload: EntryPayload::Normal(TestData(index.to_le_bytes().to_vec())),

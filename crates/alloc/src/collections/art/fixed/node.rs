@@ -277,11 +277,7 @@ pub(crate) struct Node256 {
 // Node allocation / deallocation
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub(crate) unsafe fn alloc_leaf<K: ArtKey, V>(
-    heap: &Heap,
-    key: K,
-    value: V,
-) -> usize {
+pub(crate) unsafe fn alloc_leaf<K: ArtKey, V>(heap: &Heap, key: K, value: V) -> usize {
     let layout = std::alloc::Layout::new::<LeafNode<K, V>>();
     let ptr = heap.alloc(layout.size(), layout.align());
     if ptr.is_null() {

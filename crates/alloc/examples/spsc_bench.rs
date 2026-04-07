@@ -24,7 +24,10 @@ impl BenchResult {
     fn print(&self) {
         let ns = self.elapsed.as_nanos() as f64 / self.ops as f64;
         let mops = self.ops as f64 / self.elapsed.as_secs_f64() / 1_000_000.0;
-        println!("  {:<52} {:>10.2} Mops/s  {:>8.1} ns/op", self.name, mops, ns);
+        println!(
+            "  {:<52} {:>10.2} Mops/s  {:>8.1} ns/op",
+            self.name, mops, ns
+        );
     }
 }
 
@@ -35,8 +38,10 @@ impl BenchResult {
 /// Single-threaded ping-pong: push 1, pop 1.
 fn bench_bounded_pingpong(duration: Duration) -> BenchResult {
     type Q = Spsc<u64, 6, 8, NoOpSignal>;
-    let (tx, rx): (Sender<u64, 6, 8, NoOpSignal>, Receiver<u64, 6, 8, NoOpSignal>) =
-        Q::new_with_gate(NoOpSignal);
+    let (tx, rx): (
+        Sender<u64, 6, 8, NoOpSignal>,
+        Receiver<u64, 6, 8, NoOpSignal>,
+    ) = Q::new_with_gate(NoOpSignal);
 
     let start = Instant::now();
     let mut ops = 0u64;
@@ -57,8 +62,10 @@ fn bench_bounded_pingpong(duration: Duration) -> BenchResult {
 /// Single-threaded burst: push N, then pop N.
 fn bench_bounded_burst(duration: Duration, burst: usize) -> BenchResult {
     type Q = Spsc<u64, 6, 8, NoOpSignal>;
-    let (tx, rx): (Sender<u64, 6, 8, NoOpSignal>, Receiver<u64, 6, 8, NoOpSignal>) =
-        Q::new_with_gate(NoOpSignal);
+    let (tx, rx): (
+        Sender<u64, 6, 8, NoOpSignal>,
+        Receiver<u64, 6, 8, NoOpSignal>,
+    ) = Q::new_with_gate(NoOpSignal);
 
     let start = Instant::now();
     let mut ops = 0u64;
@@ -81,8 +88,10 @@ fn bench_bounded_burst(duration: Duration, burst: usize) -> BenchResult {
 /// Two-thread throughput: producer and consumer work concurrently, one item at a time.
 fn bench_bounded_concurrent_1x1(duration: Duration) -> BenchResult {
     type Q = Spsc<u64, 10, 6, NoOpSignal>;
-    let (tx, rx): (Sender<u64, 10, 6, NoOpSignal>, Receiver<u64, 10, 6, NoOpSignal>) =
-        Q::new_with_gate(NoOpSignal);
+    let (tx, rx): (
+        Sender<u64, 10, 6, NoOpSignal>,
+        Receiver<u64, 10, 6, NoOpSignal>,
+    ) = Q::new_with_gate(NoOpSignal);
 
     let dur = duration;
     let consumer = thread::spawn(move || {
@@ -118,8 +127,10 @@ fn bench_bounded_concurrent_1x1(duration: Duration) -> BenchResult {
 /// Two-thread throughput: producer bursts N items via push_n, consumer drains via pop_n.
 fn bench_bounded_concurrent_bulk(duration: Duration, batch: usize) -> BenchResult {
     type Q = Spsc<u64, 10, 6, NoOpSignal>;
-    let (tx, rx): (Sender<u64, 10, 6, NoOpSignal>, Receiver<u64, 10, 6, NoOpSignal>) =
-        Q::new_with_gate(NoOpSignal);
+    let (tx, rx): (
+        Sender<u64, 10, 6, NoOpSignal>,
+        Receiver<u64, 10, 6, NoOpSignal>,
+    ) = Q::new_with_gate(NoOpSignal);
 
     let dur = duration;
     let b = batch;
@@ -164,8 +175,10 @@ fn bench_bounded_concurrent_bulk(duration: Duration, batch: usize) -> BenchResul
 /// Bulk push_n / pop_n throughput (single-threaded).
 fn bench_bounded_bulk(duration: Duration, batch: usize) -> BenchResult {
     type Q = Spsc<u64, 10, 6, NoOpSignal>;
-    let (tx, rx): (Sender<u64, 10, 6, NoOpSignal>, Receiver<u64, 10, 6, NoOpSignal>) =
-        Q::new_with_gate(NoOpSignal);
+    let (tx, rx): (
+        Sender<u64, 10, 6, NoOpSignal>,
+        Receiver<u64, 10, 6, NoOpSignal>,
+    ) = Q::new_with_gate(NoOpSignal);
 
     let mut src: Vec<u64> = (0..batch as u64).collect();
     let mut dst = vec![0u64; batch];
@@ -190,8 +203,10 @@ fn bench_bounded_bulk(duration: Duration, batch: usize) -> BenchResult {
 /// consume_in_place throughput (single-threaded).
 fn bench_bounded_consume_in_place(duration: Duration, batch: usize) -> BenchResult {
     type Q = Spsc<u64, 10, 6, NoOpSignal>;
-    let (tx, rx): (Sender<u64, 10, 6, NoOpSignal>, Receiver<u64, 10, 6, NoOpSignal>) =
-        Q::new_with_gate(NoOpSignal);
+    let (tx, rx): (
+        Sender<u64, 10, 6, NoOpSignal>,
+        Receiver<u64, 10, 6, NoOpSignal>,
+    ) = Q::new_with_gate(NoOpSignal);
 
     let mut src: Vec<u64> = (0..batch as u64).collect();
 
@@ -422,8 +437,10 @@ fn bench_unbounded_producer_ahead(duration: Duration) -> BenchResult {
 fn main() {
     let dur = Duration::from_millis(500);
 
-    println!("\n=== Bounded Spsc<u64, 6, 8> (capacity={}) ===",
-        Spsc::<u64, 6, 8, NoOpSignal>::capacity());
+    println!(
+        "\n=== Bounded Spsc<u64, 6, 8> (capacity={}) ===",
+        Spsc::<u64, 6, 8, NoOpSignal>::capacity()
+    );
     bench_bounded_pingpong(dur).print();
     bench_bounded_burst(dur, 64).print();
     bench_bounded_burst(dur, 1024).print();
@@ -435,8 +452,10 @@ fn main() {
     bench_bounded_concurrent_bulk(dur, 64).print();
     bench_bounded_concurrent_bulk(dur, 1024).print();
 
-    println!("\n=== Unbounded UnboundedSpsc<u64> (node cap={}) ===",
-        UnboundedSpsc::<u64>::NODE_CAP);
+    println!(
+        "\n=== Unbounded UnboundedSpsc<u64> (node cap={}) ===",
+        UnboundedSpsc::<u64>::NODE_CAP
+    );
     bench_unbounded_pingpong(dur).print();
     bench_unbounded_burst(dur, 64).print();
     bench_unbounded_burst(dur, 1024).print();

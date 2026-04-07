@@ -154,8 +154,7 @@ pub(crate) unsafe fn cow_insert_inner<K: ArtKey, V>(
             let np = unsafe { &mut *new_parent };
             let stored_mismatch = mismatch.min(MAX_PREFIX_LEN);
             np.header.prefix_len = mismatch as u32;
-            np.header.prefix[..stored_mismatch]
-                .copy_from_slice(&hdr.prefix[..stored_mismatch]);
+            np.header.prefix[..stored_mismatch].copy_from_slice(&hdr.prefix[..stored_mismatch]);
 
             let hdr_mut = unsafe { node_header_mut(node) };
             let old_byte = if mismatch < MAX_PREFIX_LEN {
@@ -168,7 +167,9 @@ pub(crate) unsafe fn cow_insert_inner<K: ArtKey, V>(
             let stored_remaining = remaining.min(MAX_PREFIX_LEN);
             if mismatch + 1 < MAX_PREFIX_LEN {
                 let src_start = mismatch + 1;
-                let copyable = MAX_PREFIX_LEN.saturating_sub(src_start).min(stored_remaining);
+                let copyable = MAX_PREFIX_LEN
+                    .saturating_sub(src_start)
+                    .min(stored_remaining);
                 for i in 0..copyable {
                     hdr_mut.prefix[i] = hdr_mut.prefix[src_start + i];
                 }
@@ -270,7 +271,15 @@ pub(crate) unsafe fn cow_insert_inner<K: ArtKey, V>(
     }
 
     let (new_child, old_val) = unsafe {
-        cow_insert_inner::<K, V>(child, key, value, child_depth + 1, generation, heap, garbage)?
+        cow_insert_inner::<K, V>(
+            child,
+            key,
+            value,
+            child_depth + 1,
+            generation,
+            heap,
+            garbage,
+        )?
     };
     if new_child != child {
         unsafe { replace_child_mut(node, byte, new_child) };
@@ -382,8 +391,7 @@ pub(crate) unsafe fn cow_remove_inner<K: ArtKey, V>(
                 garbage.push(node).expect("garbage pre-reserved");
                 return Ok((only_child, Some(val)));
             }
-            let child_node =
-                unsafe { ensure_mutable::<K>(only_child, generation, heap, garbage)? };
+            let child_node = unsafe { ensure_mutable::<K>(only_child, generation, heap, garbage)? };
             let child_hdr = unsafe { node_header_mut(child_node) };
             let mut new_prefix = [0u8; MAX_PREFIX_LEN];
             let np_len = plen + 1 + child_hdr.prefix_len as usize;

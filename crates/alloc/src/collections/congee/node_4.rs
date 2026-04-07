@@ -118,15 +118,12 @@ impl Node for Node4 {
     }
 
     fn get_child(&self, key: u8) -> Option<NodePtr> {
-        let count = unsafe {
-            std::ptr::read_volatile(&self.base.meta.count as *const u16) as usize
-        };
+        let count =
+            unsafe { std::ptr::read_volatile(&self.base.meta.count as *const u16) as usize };
         let count = count.min(4);
         for i in 0..count {
             if self.keys[i] == key {
-                return Some(unsafe {
-                    std::ptr::read_volatile(self.children.as_ptr().add(i))
-                });
+                return Some(unsafe { std::ptr::read_volatile(self.children.as_ptr().add(i)) });
             }
         }
         None

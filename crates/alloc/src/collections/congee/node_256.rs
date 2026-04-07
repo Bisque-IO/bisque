@@ -119,9 +119,8 @@ impl Node for Node256 {
             // read_volatile prevents the compiler from splitting this 8-byte
             // read into smaller accesses. On x86_64, aligned 8-byte reads are
             // hardware-atomic; this ensures the compiler respects that.
-            let child = unsafe {
-                std::ptr::read_volatile(self.children.as_ptr().add(key as usize))
-            };
+            let child =
+                unsafe { std::ptr::read_volatile(self.children.as_ptr().add(key as usize)) };
             Some(child)
         } else {
             None

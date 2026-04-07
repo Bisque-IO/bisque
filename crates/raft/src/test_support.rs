@@ -50,23 +50,11 @@ impl Decode for TestBytes {
         Ok(Self(Bytes::from(buf)))
     }
 
-    /// Zero-copy decode from a `Bytes` buffer (e.g. mmap-backed).
-    /// Reads the 4-byte length prefix and slices the data without copying.
+    /// Zero-copy decode from a `Bytes` buffer (e.g. mmap-backed storage).
+    /// The storage writes `BorrowPayload::payload_bytes()` (raw bytes, no prefix)
+    /// so this path receives raw data — no length prefix to strip.
     fn decode_from_bytes(data: Bytes) -> Result<Self, CodecError> {
-        if data.len() < 4 {
-            return Err(CodecError::BufferTooSmall {
-                needed: 4,
-                have: data.len(),
-            });
-        }
-        let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-        if data.len() < 4 + len {
-            return Err(CodecError::BufferTooSmall {
-                needed: 4 + len,
-                have: data.len(),
-            });
-        }
-        Ok(Self(data.slice(4..4 + len)))
+        Ok(Self(data))
     }
 }
 
@@ -93,6 +81,38 @@ impl<'de> serde::Deserialize<'de> for TestBytes {
 
 /// Type config alias for tests using TestBytes
 pub type TestConfig = crate::BisqueRaftTypeConfig<TestBytes, ()>;
+
+/// Concrete entry type for tests (matches TestConfig's Entry associated type)
+pub type TestEntry = openraft::impls::Entry<
+    crate::type_config::BisqueCommittedLeaderId,
+    TestBytes,
+    crate::type_config::BisqueNodeId,
+    openraft::impls::BasicNode,
+>;
+
+/// Concrete entry-payload type for tests
+pub type TestEntryPayload =
+    openraft::EntryPayload<TestBytes, crate::type_config::BisqueNodeId, openraft::impls::BasicNode>;
+
+/// Concrete LogId for tests
+pub type TestLogId = openraft::LogId<crate::type_config::BisqueCommittedLeaderId>;
+
+/// Concrete Vote for tests
+pub type TestVote = openraft::impls::Vote<crate::type_config::BisqueLeaderId>;
+
+/// Concrete StoredMembership for tests
+pub type TestStoredMembership = openraft::StoredMembership<
+    crate::type_config::BisqueCommittedLeaderId,
+    crate::type_config::BisqueNodeId,
+    openraft::impls::BasicNode,
+>;
+
+/// Concrete SnapshotMeta for tests
+pub type TestSnapshotMeta = openraft::storage::SnapshotMeta<
+    crate::type_config::BisqueCommittedLeaderId,
+    crate::type_config::BisqueNodeId,
+    openraft::impls::BasicNode,
+>;
 
 /// Run an async future inside a Tokio runtime
 ///

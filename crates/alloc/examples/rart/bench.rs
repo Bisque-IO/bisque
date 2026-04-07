@@ -10,8 +10,8 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use bisque_alloc::collections::art::Art as ArtRaw;
-use bisque_alloc::collections::congee::DefaultAllocator;
 use bisque_alloc::collections::art::Art as MvccArt;
+use bisque_alloc::collections::congee::DefaultAllocator;
 use bisque_alloc::collections::rart::cow_tree::CowTree;
 use bisque_alloc::collections::rart::keys::array_key::ArrayKey;
 use bisque_alloc::collections::rart::keys::u64_key::U64Key;

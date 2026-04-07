@@ -76,14 +76,20 @@ struct RetiredBag {
 }
 
 impl PartialEq for RetiredBag {
-    fn eq(&self, other: &Self) -> bool { self.epoch == other.epoch }
+    fn eq(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
+    }
 }
 impl Eq for RetiredBag {}
 impl PartialOrd for RetiredBag {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for RetiredBag {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.epoch.cmp(&other.epoch) }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.epoch.cmp(&other.epoch)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -158,7 +164,9 @@ impl EpochCounters {
         let mut total = 0u32;
         for i in 0..thread_count {
             let v = slot[i].load(Ordering::Relaxed);
-            if v > 0 { total += v as u32; }
+            if v > 0 {
+                total += v as u32;
+            }
         }
         total
     }
@@ -251,11 +259,15 @@ fn alloc_thread_slot() -> usize {
     idx
 }
 
-struct ThreadHandle { idx: usize }
+struct ThreadHandle {
+    idx: usize,
+}
 
 impl Drop for ThreadHandle {
     fn drop(&mut self) {
-        THREADS.slots[self.idx].state.store(UNPINNED, Ordering::Release);
+        THREADS.slots[self.idx]
+            .state
+            .store(UNPINNED, Ordering::Release);
     }
 }
 
@@ -317,13 +329,18 @@ impl Collector {
             }
         }
         let id = reg.count.fetch_add(1, Ordering::AcqRel);
-        assert!(id < MAX_COLLECTORS, "too many collectors (max {MAX_COLLECTORS})");
+        assert!(
+            id < MAX_COLLECTORS,
+            "too many collectors (max {MAX_COLLECTORS})"
+        );
         reg.slots[id].state.store(CLAIMED, Ordering::Release);
         Self { id }
     }
 
     #[inline]
-    pub fn id(&self) -> usize { self.id }
+    pub fn id(&self) -> usize {
+        self.id
+    }
 
     /// Reclaim using per-epoch counters from the Epoch's ring.
     fn try_reclaim(&self, counters: &EpochCounters) {
@@ -383,7 +400,9 @@ impl Collector {
 impl Drop for Collector {
     fn drop(&mut self) {
         self.force_reclaim_all();
-        COLLECTORS.slots[self.id].state.store(UNPINNED, Ordering::Release);
+        COLLECTORS.slots[self.id]
+            .state
+            .store(UNPINNED, Ordering::Release);
     }
 }
 
@@ -465,18 +484,24 @@ impl Epoch {
     }
 
     pub fn retire(&self, ptrs: crate::Vec<usize>) {
-        if ptrs.is_empty() { return; }
+        if ptrs.is_empty() {
+            return;
+        }
         self.retire_inner(RetiredPtrs::Many(ptrs));
     }
 
     #[inline]
     pub fn retire_one(&self, ptr: usize) {
-        if ptr == 0 { return; }
+        if ptr == 0 {
+            return;
+        }
         self.retire_inner(RetiredPtrs::One(ptr));
     }
 
     pub fn retire_drain(&self, garbage: &mut crate::Vec<usize>) {
-        if garbage.is_empty() { return; }
+        if garbage.is_empty() {
+            return;
+        }
         let ptrs = std::mem::replace(garbage, crate::Vec::new(&self.heap));
         self.retire(ptrs);
     }
@@ -500,7 +525,9 @@ impl Epoch {
     }
 
     fn collector_ref(&self) -> std::mem::ManuallyDrop<Collector> {
-        std::mem::ManuallyDrop::new(Collector { id: self.collector_id })
+        std::mem::ManuallyDrop::new(Collector {
+            id: self.collector_id,
+        })
     }
 
     #[cfg(test)]
@@ -509,7 +536,8 @@ impl Epoch {
         let mut total = 0;
         for i in 0..thread_count {
             let garbage = THREADS.slots[i].collectors[self.collector_id]
-                .garbage.lock();
+                .garbage
+                .lock();
             for Reverse(bag) in garbage.iter() {
                 total += bag.ptrs.len();
             }
@@ -538,10 +566,14 @@ impl<'a> EpochGuard<'a> {
 impl Drop for EpochGuard<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.epoch_handle.counters.decrement(self.pinned_epoch, self.thread_idx);
+        self.epoch_handle
+            .counters
+            .decrement(self.pinned_epoch, self.thread_idx);
         let creg = &COLLECTORS.slots[self.epoch_handle.collector_id];
         if creg.needs_reclaim.load(Ordering::Relaxed) {
-            self.epoch_handle.collector_ref().try_reclaim(&self.epoch_handle.counters);
+            self.epoch_handle
+                .collector_ref()
+                .try_reclaim(&self.epoch_handle.counters);
         }
     }
 }

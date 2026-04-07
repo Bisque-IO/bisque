@@ -39,9 +39,9 @@
 //! obtained before the box was dropped).
 
 // --- Vendored seize submodules ---
-pub(crate) mod raw;
 pub mod collector;
 pub mod guard;
+pub(crate) mod raw;
 pub mod reclaim;
 
 // --- Public re-exports (seize API surface) ---
@@ -55,8 +55,7 @@ use allocator_api2::alloc::AllocError;
 
 /// Global epoch-based collector shared by all epoch pointers.
 pub fn collector() -> &'static Collector {
-    static COLLECTOR: std::sync::LazyLock<Collector> =
-        std::sync::LazyLock::new(Collector::new);
+    static COLLECTOR: std::sync::LazyLock<Collector> = std::sync::LazyLock::new(Collector::new);
     &COLLECTOR
 }
 

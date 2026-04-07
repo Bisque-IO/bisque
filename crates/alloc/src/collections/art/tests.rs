@@ -639,7 +639,9 @@ mod tests {
         retire_one(&te, &h, leaf);
 
         // Advance flushes seize batches — retired node should be reclaimed.
-        for _ in 0..10 { te.advance(); }
+        for _ in 0..10 {
+            te.advance();
+        }
         // No crash = reclaimed successfully (seize freed the node).
     }
 
@@ -655,11 +657,15 @@ mod tests {
         retire_one(&te, &h, leaf);
 
         // Advance while pinned — seize won't reclaim (guard is active).
-        for _ in 0..10 { te.advance(); }
+        for _ in 0..10 {
+            te.advance();
+        }
 
         // Drop the guard — now reclaimable.
         drop(guard);
-        for _ in 0..10 { te.advance(); }
+        for _ in 0..10 {
+            te.advance();
+        }
         // No crash = reclaimed after unpin.
     }
 
@@ -672,16 +678,22 @@ mod tests {
         let leaf1 = unsafe { alloc_leaf(&h, 1, 10) };
         retire_one(&te, &h, leaf1);
 
-        for _ in 0..10 { te.advance(); }
+        for _ in 0..10 {
+            te.advance();
+        }
         let guard2 = te.pin();
 
         let leaf2 = unsafe { alloc_leaf(&h, 2, 20) };
         retire_one(&te, &h, leaf2);
 
-        for _ in 0..10 { te.advance(); }
+        for _ in 0..10 {
+            te.advance();
+        }
 
         drop(guard2);
-        for _ in 0..10 { te.advance(); }
+        for _ in 0..10 {
+            te.advance();
+        }
         // No crash = both generations reclaimed.
     }
 
@@ -759,7 +771,9 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        for _ in 0..20 { te.advance(); }
+        for _ in 0..20 {
+            te.advance();
+        }
     }
 
     // ─── OLC guard tests ───────────────────────────────────────────────

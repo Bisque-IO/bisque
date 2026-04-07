@@ -11,21 +11,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use bisque_raft::BisqueRaftTypeConfig;
 use bisque_raft::NodeAddressResolver;
+use bisque_raft::codec;
 use bisque_raft::codec::{Decode, Encode};
 use bisque_raft::network::GroupNetworkFactory;
 use bisque_raft::test_support::TestTempDir;
-use bisque_raft::{BisqueRaftTypeConfig, multi::codec};
 use bisque_raft::{
     BisqueRpcServer, BisqueRpcServerConfig, BisqueTcpTransport, BisqueTcpTransportConfig,
     DefaultNodeRegistry, MmapStorageConfig, MultiRaftManager, MultiplexedLogStorage,
 };
 use futures::FutureExt;
+use openraft::OptionalSend;
 use openraft::async_runtime::watch::WatchReceiver;
 use openraft::network::RaftNetworkFactory;
 use openraft::network::v2::RaftNetworkV2;
 use openraft::storage::RaftStateMachine;
-use openraft::{LogId, OptionalSend};
 
 fn pick_unused_local_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephem");
@@ -76,6 +77,10 @@ impl codec::Decode for TestData {
         reader.read_exact(&mut buf)?;
         Ok(Self(buf))
     }
+
+    fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, codec::CodecError> {
+        Ok(Self(data.to_vec()))
+    }
 }
 
 impl codec::BorrowPayload for TestData {
@@ -85,6 +90,10 @@ impl codec::BorrowPayload for TestData {
 }
 
 type TestConfig = BisqueRaftTypeConfig<TestData, ()>;
+type TestLogId = openraft::alias::LogIdOf<TestConfig>;
+type TestStoredMembership = openraft::alias::StoredMembershipOf<TestConfig>;
+type TestSnapshotMeta = openraft::alias::SnapshotMetaOf<TestConfig>;
+type TestSnapshot = openraft::alias::SnapshotOf<TestConfig>;
 
 #[derive(Clone)]
 struct TestStateMachine {
@@ -108,14 +117,8 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<
-        (
-            Option<LogId<TestConfig>>,
-            openraft::StoredMembership<TestConfig>,
-        ),
-        std::io::Error,
-    > {
-        Ok((None, openraft::StoredMembership::default()))
+    ) -> Result<(Option<TestLogId>, TestStoredMembership), std::io::Error> {
+        Ok((None, TestStoredMembership::default()))
     }
 
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), std::io::Error>
@@ -149,27 +152,23 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        _meta: &openraft::storage::SnapshotMeta<TestConfig>,
+        _meta: &TestSnapshotMeta,
         snapshot: std::io::Cursor<Vec<u8>>,
     ) -> Result<(), std::io::Error> {
         let _ = snapshot.into_inner();
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<openraft::storage::Snapshot<TestConfig>>, std::io::Error> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<TestSnapshot>, std::io::Error> {
         Ok(None)
     }
 }
 
 impl openraft::RaftSnapshotBuilder<TestConfig> for TestStateMachine {
-    async fn build_snapshot(
-        &mut self,
-    ) -> Result<openraft::storage::Snapshot<TestConfig>, std::io::Error> {
+    async fn build_snapshot(&mut self) -> Result<TestSnapshot, std::io::Error> {
         let meta = openraft::storage::SnapshotMeta {
             last_log_id: None,
-            last_membership: openraft::StoredMembership::default(),
+            last_membership: TestStoredMembership::default(),
             snapshot_id: "multi-raft-smoke".to_string(),
         };
         Ok(openraft::storage::Snapshot {
@@ -209,7 +208,7 @@ fn test_two_node_two_group_cluster() {
         let addr2 = pick_unused_local_addr();
 
         // Shared node registry
-        let node_registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let node_registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         node_registry.register(1, addr1);
         node_registry.register(2, addr2);
 
@@ -246,10 +245,10 @@ fn test_two_node_two_group_cluster() {
         let transport2 =
             BisqueTcpTransport::<TestConfig>::new(transport_cfg.clone(), node_registry.clone());
 
-        let manager1 = Arc::new(MultiRaftManager::<TestConfig, _, _>::new(
+        let manager1 = Arc::new(MultiRaftManager::<TestConfig, _, _, TestStateMachine>::new(
             transport1, storage1,
         ));
-        let manager2 = Arc::new(MultiRaftManager::<TestConfig, _, _>::new(
+        let manager2 = Arc::new(MultiRaftManager::<TestConfig, _, _, TestStateMachine>::new(
             transport2, storage2,
         ));
 
@@ -299,8 +298,8 @@ fn test_two_node_two_group_cluster() {
 
         // Membership
         let mut members = BTreeMap::new();
-        members.insert(1u64, openraft::impls::BasicNode::default());
-        members.insert(2u64, openraft::impls::BasicNode::default());
+        members.insert(1u32, openraft::impls::BasicNode::default());
+        members.insert(2u32, openraft::impls::BasicNode::default());
 
         // Add two groups on both nodes, keeping state machines so we can assert isolation.
         let sm_1_1 = TestStateMachine::new();

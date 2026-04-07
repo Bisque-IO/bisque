@@ -4,6 +4,7 @@
 
 pub mod codec;
 pub mod config;
+pub mod heap_group;
 pub mod manager;
 pub mod manifest;
 pub mod network;
@@ -21,6 +22,10 @@ pub mod test_support;
 #[cfg(test)]
 mod network_tests;
 
+pub use heap_group::{
+    GlobalHeapStats, GlobalHeaps, GlobalSubsystem, GlobalSubsystemStats, GroupContext, GroupStats,
+    HeapGroup, HeapGroupConfig, Subsystem, SubsystemStats,
+};
 pub use manager::{AddGroupError, MultiRaftManager};
 pub use network::{MultiRaftNetwork, MultiRaftNetworkFactory, MultiplexedTransport};
 pub use openraft::TokioRuntime;

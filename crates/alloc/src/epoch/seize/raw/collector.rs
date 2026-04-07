@@ -4,8 +4,8 @@ use super::utils::CachePadded;
 
 use std::cell::{Cell, UnsafeCell};
 use std::ptr;
-use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 
 /// Fast and efficient concurrent memory reclamation.
 ///
@@ -178,7 +178,12 @@ impl Collector {
             // Safety: `LocalBatch::DROP` means we have unique access to the collector.
             // Additionally, the caller guarantees that the pointer is valid for the
             // provided reclaimer.
-            unsafe { reclaim(ptr, crate::epoch::seize::collector::Collector::from_raw(self)) }
+            unsafe {
+                reclaim(
+                    ptr,
+                    crate::epoch::seize::collector::Collector::from_raw(self),
+                )
+            }
             return;
         }
 
@@ -465,7 +470,12 @@ impl Collector {
     unsafe fn free_batch(&self, batch: *mut Batch) {
         // Safety: We have a unique reference to the batch.
         for entry in unsafe { (*batch).entries.iter_mut() } {
-            unsafe { (entry.reclaim)(entry.ptr.cast(), crate::epoch::seize::collector::Collector::from_raw(self)) };
+            unsafe {
+                (entry.reclaim)(
+                    entry.ptr.cast(),
+                    crate::epoch::seize::collector::Collector::from_raw(self),
+                )
+            };
         }
 
         unsafe { LocalBatch::free(batch) };

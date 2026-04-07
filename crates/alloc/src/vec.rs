@@ -233,6 +233,128 @@ impl<T> Vec<T> {
         self.as_mut_slice().iter_mut()
     }
 
+    /// Remove and return the element at `idx`, shifting all elements after it
+    /// to the left. Panics if `idx >= len`.
+    pub fn remove(&mut self, idx: usize) -> T {
+        assert!(idx < self.len, "remove index out of bounds");
+        unsafe {
+            let base = self.ptr.as_ptr();
+            let val = ptr::read(base.add(idx));
+            let remaining = self.len - idx - 1;
+            if remaining > 0 {
+                ptr::copy(base.add(idx + 1), base.add(idx), remaining);
+            }
+            self.len -= 1;
+            val
+        }
+    }
+
+    /// Insert `val` at `idx`, shifting all elements at and after `idx` to the
+    /// right. Returns `Err(AllocError)` if the heap is full.
+    /// Panics if `idx > len`.
+    pub fn insert(&mut self, idx: usize, val: T) -> Result<(), AllocError> {
+        assert!(idx <= self.len, "insert index out of bounds");
+        if self.len == self.cap {
+            if is_zst::<T>() {
+                return Err(AllocError);
+            }
+            self.try_grow(self.len + 1)?;
+        }
+        unsafe {
+            let base = self.ptr.as_ptr();
+            let remaining = self.len - idx;
+            if remaining > 0 {
+                ptr::copy(base.add(idx), base.add(idx + 1), remaining);
+            }
+            ptr::write(base.add(idx), val);
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Sort the vector in-place using an unstable sort.
+    /// Requires `T: Ord`.
+    #[inline]
+    pub fn sort_unstable(&mut self)
+    where
+        T: Ord,
+    {
+        self.as_mut_slice().sort_unstable();
+    }
+
+    /// Sort the vector in-place using an unstable sort with a custom comparator.
+    #[inline]
+    pub fn sort_unstable_by<F>(&mut self, compare: F)
+    where
+        F: FnMut(&T, &T) -> std::cmp::Ordering,
+    {
+        self.as_mut_slice().sort_unstable_by(compare);
+    }
+
+    /// Sort the vector in-place using an unstable sort with a key extraction function.
+    #[inline]
+    pub fn sort_unstable_by_key<K, F>(&mut self, f: F)
+    where
+        F: FnMut(&T) -> K,
+        K: Ord,
+    {
+        self.as_mut_slice().sort_unstable_by_key(f);
+    }
+
+    /// Extend the vector from an iterator of owned values.
+    /// Returns `Err(AllocError)` if the heap is full during any push.
+    pub fn extend_from_iter<I: IntoIterator<Item = T>>(
+        &mut self,
+        iter: I,
+    ) -> Result<(), AllocError> {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        if lower > 0 {
+            self.reserve(lower)?;
+        }
+        for val in iter {
+            self.push(val)?;
+        }
+        Ok(())
+    }
+
+    /// Drain elements in the given range, returning them as an iterator.
+    /// The removed elements are yielded by the `Drain` iterator; when the
+    /// iterator is dropped, any remaining elements are dropped and the
+    /// vector's tail is shifted into the gap.
+    ///
+    /// Panics if the range is out of bounds.
+    pub fn drain<R: std::ops::RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, T> {
+        use std::ops::Bound;
+        let start = match range.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n + 1,
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&n) => n + 1,
+            Bound::Excluded(&n) => n,
+            Bound::Unbounded => self.len,
+        };
+        assert!(start <= end, "drain: start ({start}) > end ({end})");
+        assert!(end <= self.len, "drain: end ({end}) > len ({})", self.len);
+
+        let drain_len = end - start;
+        let tail_len = self.len - end;
+
+        // Temporarily set len to `start` so the drained region is "outside" the
+        // live portion. Drain::drop will fix up the tail.
+        self.len = start;
+
+        Drain {
+            vec: self as *mut Vec<T>,
+            iter: unsafe { slice::from_raw_parts(self.ptr.as_ptr().add(start), drain_len) },
+            idx: 0,
+            tail_start: end,
+            tail_len,
+        }
+    }
+
     // -- internal grow ------------------------------------------------------
 
     fn try_grow(&mut self, min_cap: usize) -> Result<(), AllocError> {
@@ -250,8 +372,11 @@ impl<T> Vec<T> {
             self.ptr = unsafe { NonNull::new_unchecked(p.cast::<T>()) };
         } else {
             let p = unsafe {
-                self.heap
-                    .realloc(self.ptr.as_ptr().cast::<u8>(), layout.size(), layout.align())
+                self.heap.realloc(
+                    self.ptr.as_ptr().cast::<u8>(),
+                    layout.size(),
+                    layout.align(),
+                )
             };
             if p.is_null() {
                 return Err(AllocError);
@@ -281,11 +406,7 @@ impl<T: Copy> Vec<T> {
         }
         if !is_zst::<T>() {
             unsafe {
-                ptr::copy_nonoverlapping(
-                    src.as_ptr(),
-                    self.ptr.as_ptr().add(self.len),
-                    src.len(),
-                );
+                ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr().add(self.len), src.len());
             }
         }
         self.len += src.len();
@@ -370,6 +491,34 @@ impl<T, I: std::slice::SliceIndex<[T]>> IndexMut<I> for Vec<T> {
     }
 }
 
+// -- PartialEq / Eq ---------------------------------------------------------
+
+impl<T: PartialEq> PartialEq for Vec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: PartialEq> PartialEq<[T]> for Vec<T> {
+    fn eq(&self, other: &[T]) -> bool {
+        self.as_slice() == other
+    }
+}
+
+impl<T: PartialEq> PartialEq<&[T]> for Vec<T> {
+    fn eq(&self, other: &&[T]) -> bool {
+        self.as_slice() == *other
+    }
+}
+
+impl<T: PartialEq, const N: usize> PartialEq<&[T; N]> for Vec<T> {
+    fn eq(&self, other: &&[T; N]) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Eq> Eq for Vec<T> {}
+
 // -- Debug ------------------------------------------------------------------
 
 impl<T: std::fmt::Debug> std::fmt::Debug for Vec<T> {
@@ -448,6 +597,73 @@ impl<'a, T> IntoIterator for &'a mut Vec<T> {
 }
 
 // ===========================================================================
+// Drain<T>
+// ===========================================================================
+
+/// Draining iterator for [`Vec<T>`].
+///
+/// Created by [`Vec::drain`]. When dropped, shifts the tail of the vector
+/// into the gap left by the drained elements.
+pub struct Drain<'a, T> {
+    vec: *mut Vec<T>,
+    /// Slice of elements to drain (pointer remains valid because vec.len was
+    /// shrunk to exclude this region).
+    iter: &'a [T],
+    idx: usize,
+    /// Index in the original vec where the tail begins.
+    tail_start: usize,
+    /// Number of elements in the tail.
+    tail_len: usize,
+}
+
+impl<T> Iterator for Drain<'_, T> {
+    type Item = T;
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        if self.idx >= self.iter.len() {
+            return None;
+        }
+        let val = unsafe { ptr::read(self.iter.as_ptr().add(self.idx)) };
+        self.idx += 1;
+        Some(val)
+    }
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.iter.len() - self.idx;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T> ExactSizeIterator for Drain<'_, T> {}
+
+impl<T> Drop for Drain<'_, T> {
+    fn drop(&mut self) {
+        // Drop any remaining elements that were not consumed.
+        if mem::needs_drop::<T>() {
+            while self.idx < self.iter.len() {
+                unsafe {
+                    ptr::drop_in_place(self.iter.as_ptr().add(self.idx) as *mut T);
+                }
+                self.idx += 1;
+            }
+        }
+        // Shift the tail into the gap.
+        let vec = unsafe { &mut *self.vec };
+        if self.tail_len > 0 {
+            let start = vec.len; // == drain start (set before Drain was created)
+            unsafe {
+                ptr::copy(
+                    vec.ptr.as_ptr().add(self.tail_start),
+                    vec.ptr.as_ptr().add(start),
+                    self.tail_len,
+                );
+            }
+            vec.len = start + self.tail_len;
+        }
+    }
+}
+
+// ===========================================================================
 // SmallVec<T, N>
 // ===========================================================================
 
@@ -512,7 +728,11 @@ impl<T, const N: usize> SmallVec<T, N> {
         match &self.data {
             SmallVecData::Inline { .. } => N,
             SmallVecData::Heap { cap, .. } => {
-                if *cap == 0 { N } else { *cap }
+                if *cap == 0 {
+                    N
+                } else {
+                    *cap
+                }
             }
         }
     }
@@ -615,8 +835,7 @@ impl<T, const N: usize> SmallVec<T, N> {
         let old_len = self.len;
         self.len = len;
         unsafe {
-            let tail =
-                slice::from_raw_parts_mut(self.as_mut_ptr().add(len), old_len - len);
+            let tail = slice::from_raw_parts_mut(self.as_mut_ptr().add(len), old_len - len);
             ptr::drop_in_place(tail);
         }
     }
@@ -648,9 +867,7 @@ impl<T, const N: usize> SmallVec<T, N> {
                 // Cannot spill to heap.
                 return Err(AllocError);
             }
-            SmallVecData::Heap {
-                ptr, cap, heap, ..
-            } => {
+            SmallVecData::Heap { ptr, cap, heap, .. } => {
                 if *cap == 0 {
                     // First spill from inline (with_heap path, but cap==0 means
                     // we haven't allocated yet, and len must be 0).
@@ -662,11 +879,7 @@ impl<T, const N: usize> SmallVec<T, N> {
                     *cap = new_cap;
                 } else {
                     let p = unsafe {
-                        heap.realloc(
-                            ptr.as_ptr().cast::<u8>(),
-                            layout.size(),
-                            layout.align(),
-                        )
+                        heap.realloc(ptr.as_ptr().cast::<u8>(), layout.size(), layout.align())
                     };
                     if p.is_null() {
                         return Err(AllocError);
@@ -700,11 +913,7 @@ impl<T: Copy, const N: usize> SmallVec<T, N> {
         }
         if !is_zst::<T>() {
             unsafe {
-                ptr::copy_nonoverlapping(
-                    src.as_ptr(),
-                    self.as_mut_ptr().add(self.len),
-                    src.len(),
-                );
+                ptr::copy_nonoverlapping(src.as_ptr(), self.as_mut_ptr().add(self.len), src.len());
             }
         }
         self.len += src.len();

@@ -368,7 +368,9 @@ unsafe fn grow_node(old: usize, heap: &Heap, generation: u64) -> usize {
         NodeKind::N4 => {
             let n = unsafe { &*(old as *const Node4) };
             let new = unsafe { alloc_node16(heap, generation) };
-            if new.is_null() { return NULL_CHILD; }
+            if new.is_null() {
+                return NULL_CHILD;
+            }
             let new_n = unsafe { &mut *new };
             new_n.header.prefix_len = hdr.prefix_len;
             new_n.header.prefix = hdr.prefix;
@@ -380,7 +382,9 @@ unsafe fn grow_node(old: usize, heap: &Heap, generation: u64) -> usize {
         NodeKind::N16 => {
             let n = unsafe { &*(old as *const Node16) };
             let new = unsafe { alloc_node48(heap, generation) };
-            if new.is_null() { return NULL_CHILD; }
+            if new.is_null() {
+                return NULL_CHILD;
+            }
             unsafe { init_node48(new) };
             let new_n = unsafe { &mut *new };
             new_n.header.prefix_len = hdr.prefix_len;
@@ -395,7 +399,9 @@ unsafe fn grow_node(old: usize, heap: &Heap, generation: u64) -> usize {
         NodeKind::N48 => {
             let n = unsafe { &*(old as *const Node48) };
             let new = unsafe { alloc_node256(heap, generation) };
-            if new.is_null() { return NULL_CHILD; }
+            if new.is_null() {
+                return NULL_CHILD;
+            }
             let new_n = unsafe { &mut *new };
             new_n.header.prefix_len = hdr.prefix_len;
             new_n.header.prefix = hdr.prefix;
@@ -418,7 +424,9 @@ unsafe fn shrink_node(old: usize, heap: &Heap, generation: u64) -> usize {
         NodeKind::N256 => {
             let n = unsafe { &*(old as *const Node256) };
             let new = unsafe { alloc_node48(heap, generation) };
-            if new.is_null() { return NULL_CHILD; }
+            if new.is_null() {
+                return NULL_CHILD;
+            }
             unsafe { init_node48(new) };
             let new_n = unsafe { &mut *new };
             new_n.header.prefix_len = hdr.prefix_len;
@@ -437,7 +445,9 @@ unsafe fn shrink_node(old: usize, heap: &Heap, generation: u64) -> usize {
         NodeKind::N48 => {
             let n = unsafe { &*(old as *const Node48) };
             let new = unsafe { alloc_node16(heap, generation) };
-            if new.is_null() { return NULL_CHILD; }
+            if new.is_null() {
+                return NULL_CHILD;
+            }
             let new_n = unsafe { &mut *new };
             new_n.header.prefix_len = hdr.prefix_len;
             new_n.header.prefix = hdr.prefix;
@@ -455,7 +465,9 @@ unsafe fn shrink_node(old: usize, heap: &Heap, generation: u64) -> usize {
         NodeKind::N16 => {
             let n = unsafe { &*(old as *const Node16) };
             let new = unsafe { alloc_node4(heap, generation) };
-            if new.is_null() { return NULL_CHILD; }
+            if new.is_null() {
+                return NULL_CHILD;
+            }
             let new_n = unsafe { &mut *new };
             new_n.header.prefix_len = hdr.prefix_len;
             new_n.header.prefix = hdr.prefix;
@@ -473,9 +485,18 @@ unsafe fn copy_node(src: usize, heap: &Heap, generation: u64) -> usize {
     let hdr = unsafe { node_header(src) };
     let (size, align) = match hdr.kind {
         NodeKind::N4 => (std::mem::size_of::<Node4>(), std::mem::align_of::<Node4>()),
-        NodeKind::N16 => (std::mem::size_of::<Node16>(), std::mem::align_of::<Node16>()),
-        NodeKind::N48 => (std::mem::size_of::<Node48>(), std::mem::align_of::<Node48>()),
-        NodeKind::N256 => (std::mem::size_of::<Node256>(), std::mem::align_of::<Node256>()),
+        NodeKind::N16 => (
+            std::mem::size_of::<Node16>(),
+            std::mem::align_of::<Node16>(),
+        ),
+        NodeKind::N48 => (
+            std::mem::size_of::<Node48>(),
+            std::mem::align_of::<Node48>(),
+        ),
+        NodeKind::N256 => (
+            std::mem::size_of::<Node256>(),
+            std::mem::align_of::<Node256>(),
+        ),
     };
     let ptr = heap.alloc(size, align);
     if ptr.is_null() {
@@ -489,7 +510,9 @@ unsafe fn copy_node(src: usize, heap: &Heap, generation: u64) -> usize {
 }
 
 unsafe fn dealloc_node(heap: &Heap, p: usize) {
-    if p == NULL_CHILD { return; }
+    if p == NULL_CHILD {
+        return;
+    }
     if is_leaf(p) {
         unsafe { heap.dealloc(leaf_ptr(p)) };
     } else {
@@ -498,7 +521,9 @@ unsafe fn dealloc_node(heap: &Heap, p: usize) {
 }
 
 unsafe fn free_subtree(heap: &Heap, p: usize) {
-    if p == NULL_CHILD { return; }
+    if p == NULL_CHILD {
+        return;
+    }
     if is_leaf(p) {
         unsafe { dealloc_node(heap, p) };
         return;
@@ -597,11 +622,17 @@ unsafe fn ensure_mutable(
     heap: &Heap,
     garbage: &mut Vec<usize>,
 ) -> Result<usize, AllocError> {
-    if node == NULL_CHILD { return Ok(NULL_CHILD); }
+    if node == NULL_CHILD {
+        return Ok(NULL_CHILD);
+    }
     let hdr = unsafe { node_header(node) };
-    if hdr.generation == generation { return Ok(node); }
+    if hdr.generation == generation {
+        return Ok(node);
+    }
     let new = unsafe { copy_node(node, heap, generation) };
-    if new == NULL_CHILD { return Err(AllocError); }
+    if new == NULL_CHILD {
+        return Err(AllocError);
+    }
     garbage.push(node);
     Ok(new)
 }
@@ -616,7 +647,9 @@ unsafe fn cow_insert<const K: usize, V: Copy>(
 ) -> Result<(usize, Option<V>), AllocError> {
     if root == NULL_CHILD {
         let leaf = unsafe { alloc_leaf(heap, key, value) };
-        if leaf == NULL_CHILD { return Err(AllocError); }
+        if leaf == NULL_CHILD {
+            return Err(AllocError);
+        }
         return Ok((leaf, None));
     }
 
@@ -625,7 +658,9 @@ unsafe fn cow_insert<const K: usize, V: Copy>(
         if old_key == key {
             let old_val = leaf_value::<V>(root, K);
             let new_leaf = unsafe { alloc_leaf(heap, key, value) };
-            if new_leaf == NULL_CHILD { return Err(AllocError); }
+            if new_leaf == NULL_CHILD {
+                return Err(AllocError);
+            }
             garbage.push(root);
             return Ok((new_leaf, Some(old_val)));
         }
@@ -634,7 +669,9 @@ unsafe fn cow_insert<const K: usize, V: Copy>(
             common += 1;
         }
         let new_leaf = unsafe { alloc_leaf(heap, key, value) };
-        if new_leaf == NULL_CHILD { return Err(AllocError); }
+        if new_leaf == NULL_CHILD {
+            return Err(AllocError);
+        }
         let new_node = unsafe { alloc_node4(heap, generation) };
         if new_node.is_null() {
             garbage.push(new_leaf);
@@ -680,7 +717,9 @@ unsafe fn cow_insert_inner<const K: usize, V: Copy>(
         }
         if mismatch < plen {
             let new_parent = unsafe { alloc_node4(heap, generation) };
-            if new_parent.is_null() { return Err(AllocError); }
+            if new_parent.is_null() {
+                return Err(AllocError);
+            }
             let np = unsafe { &mut *new_parent };
             let mp = mismatch.min(MAX_PREFIX);
             np.header.prefix_len = mismatch as u32;
@@ -695,7 +734,9 @@ unsafe fn cow_insert_inner<const K: usize, V: Copy>(
             hdr_mut.prefix_len = remaining as u32;
 
             let new_leaf = unsafe { alloc_leaf(heap, key, value) };
-            if new_leaf == NULL_CHILD { return Err(AllocError); }
+            if new_leaf == NULL_CHILD {
+                return Err(AllocError);
+            }
             unsafe {
                 add_child_mut(new_parent as usize, old_byte, node);
                 add_child_mut(new_parent as usize, key[depth + mismatch], new_leaf);
@@ -705,14 +746,18 @@ unsafe fn cow_insert_inner<const K: usize, V: Copy>(
     }
 
     let child_depth = depth + plen;
-    if child_depth >= K { return Ok((node, None)); }
+    if child_depth >= K {
+        return Ok((node, None));
+    }
 
     let byte = key[child_depth];
     let child = unsafe { find_child(node, byte) };
 
     if child == NULL_CHILD {
         let new_leaf = unsafe { alloc_leaf(heap, key, value) };
-        if new_leaf == NULL_CHILD { return Err(AllocError); }
+        if new_leaf == NULL_CHILD {
+            return Err(AllocError);
+        }
         if unsafe { is_full(node) } {
             let grown = unsafe { grow_node(node, heap, generation) };
             if grown == NULL_CHILD {
@@ -732,7 +777,9 @@ unsafe fn cow_insert_inner<const K: usize, V: Copy>(
         if old_key == key {
             let old_val = leaf_value::<V>(child, K);
             let new_leaf = unsafe { alloc_leaf(heap, key, value) };
-            if new_leaf == NULL_CHILD { return Err(AllocError); }
+            if new_leaf == NULL_CHILD {
+                return Err(AllocError);
+            }
             unsafe { replace_child_mut(node, byte, new_leaf) };
             garbage.push(child);
             return Ok((node, Some(old_val)));
@@ -743,7 +790,9 @@ unsafe fn cow_insert_inner<const K: usize, V: Copy>(
             common += 1;
         }
         let new_node = unsafe { alloc_node4(heap, generation) };
-        if new_node.is_null() { return Err(AllocError); }
+        if new_node.is_null() {
+            return Err(AllocError);
+        }
         let n4 = unsafe { &mut *new_node };
         let cp = common.min(MAX_PREFIX);
         n4.header.prefix_len = common as u32;
@@ -751,7 +800,9 @@ unsafe fn cow_insert_inner<const K: usize, V: Copy>(
         let split_depth = next_depth + common;
         if split_depth < K {
             let new_leaf = unsafe { alloc_leaf(heap, key, value) };
-            if new_leaf == NULL_CHILD { return Err(AllocError); }
+            if new_leaf == NULL_CHILD {
+                return Err(AllocError);
+            }
             unsafe {
                 add_child_mut(new_node as usize, old_key[split_depth], child);
                 add_child_mut(new_node as usize, key[split_depth], new_leaf);
@@ -762,7 +813,15 @@ unsafe fn cow_insert_inner<const K: usize, V: Copy>(
     }
 
     let (new_child, old_val) = unsafe {
-        cow_insert_inner::<K, V>(child, key, value, child_depth + 1, generation, heap, garbage)?
+        cow_insert_inner::<K, V>(
+            child,
+            key,
+            value,
+            child_depth + 1,
+            generation,
+            heap,
+            garbage,
+        )?
     };
     if new_child != child {
         unsafe { replace_child_mut(node, byte, new_child) };
@@ -777,7 +836,9 @@ unsafe fn cow_remove<const K: usize, V: Copy>(
     heap: &Heap,
     garbage: &mut Vec<usize>,
 ) -> Result<(usize, Option<V>), AllocError> {
-    if root == NULL_CHILD { return Ok((root, None)); }
+    if root == NULL_CHILD {
+        return Ok((root, None));
+    }
     if is_leaf(root) {
         if leaf_key::<K>(root) == key {
             let val = leaf_value::<V>(root, K);
@@ -809,15 +870,21 @@ unsafe fn cow_remove_inner<const K: usize, V: Copy>(
     }
 
     let child_depth = depth + plen;
-    if child_depth >= K { return Ok((node, None)); }
+    if child_depth >= K {
+        return Ok((node, None));
+    }
 
     let byte = key[child_depth];
     let child = unsafe { find_child(node, byte) };
 
-    if child == NULL_CHILD { return Ok((node, None)); }
+    if child == NULL_CHILD {
+        return Ok((node, None));
+    }
 
     if is_leaf(child) {
-        if leaf_key::<K>(child) != key { return Ok((node, None)); }
+        if leaf_key::<K>(child) != key {
+            return Ok((node, None));
+        }
         let val = leaf_value::<V>(child, K);
         garbage.push(child);
         unsafe { remove_child_mut(node, byte) };
@@ -843,8 +910,7 @@ unsafe fn cow_remove_inner<const K: usize, V: Copy>(
             if plen + 1 < MAX_PREFIX && cp > 0 {
                 let dst_start = plen + 1;
                 let copy = cp.min(MAX_PREFIX - dst_start);
-                new_prefix[dst_start..dst_start + copy]
-                    .copy_from_slice(&child_hdr.prefix[..copy]);
+                new_prefix[dst_start..dst_start + copy].copy_from_slice(&child_hdr.prefix[..copy]);
             }
             child_hdr.prefix_len = np_len as u32;
             child_hdr.prefix[..copy_len].copy_from_slice(&new_prefix[..copy_len]);
@@ -953,7 +1019,10 @@ impl<const K: usize, V: Copy> FixedArt<K, V> {
     #[inline]
     pub fn snapshot(&self) -> Snapshot<K, V> {
         let arc = self.current.read().clone();
-        Snapshot { inner: arc, _marker: std::marker::PhantomData }
+        Snapshot {
+            inner: arc,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     #[inline]
@@ -966,7 +1035,12 @@ impl<const K: usize, V: Copy> FixedArt<K, V> {
         let guard = self.current.read();
         let root = guard.root;
         let next_gen = self.generation.fetch_add(1, Ordering::Relaxed);
-        WriteTxn { art: self, root, generation: next_gen, garbage: Vec::new() }
+        WriteTxn {
+            art: self,
+            root,
+            generation: next_gen,
+            garbage: Vec::new(),
+        }
     }
 
     pub fn insert(&self, key: &[u8; K], val: V) -> Result<Option<V>, AllocError> {
@@ -999,8 +1073,12 @@ impl<'a, const K: usize, V: Copy> WriteTxn<'a, K, V> {
     pub fn insert(&mut self, key: &[u8; K], val: V) -> Result<Option<V>, AllocError> {
         let (new_root, old) = unsafe {
             cow_insert::<K, V>(
-                self.root, key, val, self.generation,
-                &self.art.heap, &mut self.garbage,
+                self.root,
+                key,
+                val,
+                self.generation,
+                &self.art.heap,
+                &mut self.garbage,
             )?
         };
         self.root = new_root;
@@ -1010,8 +1088,11 @@ impl<'a, const K: usize, V: Copy> WriteTxn<'a, K, V> {
     pub fn remove(&mut self, key: &[u8; K]) -> Result<Option<V>, AllocError> {
         let (new_root, old) = unsafe {
             cow_remove::<K, V>(
-                self.root, key, self.generation,
-                &self.art.heap, &mut self.garbage,
+                self.root,
+                key,
+                self.generation,
+                &self.art.heap,
+                &mut self.garbage,
             )?
         };
         self.root = new_root;

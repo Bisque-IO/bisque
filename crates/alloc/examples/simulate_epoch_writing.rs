@@ -32,8 +32,12 @@ struct GarbageBag {
 struct Guarded<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Guarded<T> {}
 impl<T> Guarded<T> {
-    fn new(v: T) -> Self { Self(UnsafeCell::new(v)) }
-    unsafe fn get(&self) -> &mut T { unsafe { &mut *self.0.get() } }
+    fn new(v: T) -> Self {
+        Self(UnsafeCell::new(v))
+    }
+    unsafe fn get(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -56,30 +60,64 @@ impl MutexModel {
             pin_slots: (0..n).map(|_| AtomicU64::new(UNPINNED)).collect(),
         }
     }
-    #[inline] fn pin(&self, tid: usize) -> u64 {
+    #[inline]
+    fn pin(&self, tid: usize) -> u64 {
         let e = self.epoch.load(Ordering::Acquire);
-        self.pin_slots[tid].store(e.min(self.pin_slots[tid].load(Ordering::Relaxed)), Ordering::Release);
+        self.pin_slots[tid].store(
+            e.min(self.pin_slots[tid].load(Ordering::Relaxed)),
+            Ordering::Release,
+        );
         e
     }
-    #[inline] fn unpin(&self, tid: usize) { self.pin_slots[tid].store(UNPINNED, Ordering::Release); }
+    #[inline]
+    fn unpin(&self, tid: usize) {
+        self.pin_slots[tid].store(UNPINNED, Ordering::Release);
+    }
     fn retire(&self, tid: usize, bag: GarbageBag) {
         self.garbage[tid].lock().push_back(bag);
-        if !self.needs_reclaim.swap(true, Ordering::AcqRel) { self.epoch.fetch_add(1, Ordering::Release); }
+        if !self.needs_reclaim.swap(true, Ordering::AcqRel) {
+            self.epoch.fetch_add(1, Ordering::Release);
+        }
     }
     fn try_reclaim(&self, n: usize) {
-        if !self.needs_reclaim.load(Ordering::Relaxed) { return; }
-        if self.needs_reclaim.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed).is_err() { return; }
+        if !self.needs_reclaim.load(Ordering::Relaxed) {
+            return;
+        }
+        if self
+            .needs_reclaim
+            .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         let mut wm = UNPINNED;
-        for i in 0..n { let v = self.pin_slots[i].load(Ordering::Acquire); if v < wm { wm = v; } }
+        for i in 0..n {
+            let v = self.pin_slots[i].load(Ordering::Acquire);
+            if v < wm {
+                wm = v;
+            }
+        }
         let safe = if wm == UNPINNED { u64::MAX } else { wm };
         let mut rem = false;
         for i in 0..n {
             if let Some(mut g) = self.garbage[i].try_lock() {
-                while let Some(b) = g.front() { if b.epoch < safe { black_box(g.pop_front().unwrap().count); } else { break; } }
-                if !g.is_empty() { rem = true; }
-            } else { rem = true; }
+                while let Some(b) = g.front() {
+                    if b.epoch < safe {
+                        black_box(g.pop_front().unwrap().count);
+                    } else {
+                        break;
+                    }
+                }
+                if !g.is_empty() {
+                    rem = true;
+                }
+            } else {
+                rem = true;
+            }
         }
-        if rem { self.needs_reclaim.store(true, Ordering::Release); }
+        if rem {
+            self.needs_reclaim.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -111,37 +149,78 @@ impl CrossfireModel {
         Self {
             epoch: AtomicU64::new(1),
             needs_reclaim: AtomicBool::new(false),
-            senders, receivers,
+            senders,
+            receivers,
             holdback: (0..n).map(|_| Guarded::new(VecDeque::new())).collect(),
             pin_slots: (0..n).map(|_| AtomicU64::new(UNPINNED)).collect(),
         }
     }
-    #[inline] fn pin(&self, tid: usize) -> u64 {
+    #[inline]
+    fn pin(&self, tid: usize) -> u64 {
         let e = self.epoch.load(Ordering::Acquire);
-        self.pin_slots[tid].store(e.min(self.pin_slots[tid].load(Ordering::Relaxed)), Ordering::Release);
+        self.pin_slots[tid].store(
+            e.min(self.pin_slots[tid].load(Ordering::Relaxed)),
+            Ordering::Release,
+        );
         e
     }
-    #[inline] fn unpin(&self, tid: usize) { self.pin_slots[tid].store(UNPINNED, Ordering::Release); }
+    #[inline]
+    fn unpin(&self, tid: usize) {
+        self.pin_slots[tid].store(UNPINNED, Ordering::Release);
+    }
     fn retire(&self, tid: usize, bag: GarbageBag) {
         let tx = unsafe { self.senders[tid].get() };
         let _ = tx.try_send(bag);
-        if !self.needs_reclaim.swap(true, Ordering::AcqRel) { self.epoch.fetch_add(1, Ordering::Release); }
+        if !self.needs_reclaim.swap(true, Ordering::AcqRel) {
+            self.epoch.fetch_add(1, Ordering::Release);
+        }
     }
     fn try_reclaim(&self, n: usize) {
-        if !self.needs_reclaim.load(Ordering::Relaxed) { return; }
-        if self.needs_reclaim.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed).is_err() { return; }
+        if !self.needs_reclaim.load(Ordering::Relaxed) {
+            return;
+        }
+        if self
+            .needs_reclaim
+            .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         let mut wm = UNPINNED;
-        for i in 0..n { let v = self.pin_slots[i].load(Ordering::Acquire); if v < wm { wm = v; } }
+        for i in 0..n {
+            let v = self.pin_slots[i].load(Ordering::Acquire);
+            if v < wm {
+                wm = v;
+            }
+        }
         let safe = if wm == UNPINNED { u64::MAX } else { wm };
         let mut rem = false;
         for i in 0..n {
             let hb = unsafe { self.holdback[i].get() };
             let rx = unsafe { self.receivers[i].get() };
-            while let Some(b) = hb.front() { if b.epoch < safe { black_box(hb.pop_front().unwrap().count); } else { break; } }
-            while let Ok(bag) = rx.try_recv() { if bag.epoch < safe { black_box(bag.count); } else { hb.push_back(bag); rem = true; break; } }
-            if !hb.is_empty() { rem = true; }
+            while let Some(b) = hb.front() {
+                if b.epoch < safe {
+                    black_box(hb.pop_front().unwrap().count);
+                } else {
+                    break;
+                }
+            }
+            while let Ok(bag) = rx.try_recv() {
+                if bag.epoch < safe {
+                    black_box(bag.count);
+                } else {
+                    hb.push_back(bag);
+                    rem = true;
+                    break;
+                }
+            }
+            if !hb.is_empty() {
+                rem = true;
+            }
         }
-        if rem { self.needs_reclaim.store(true, Ordering::Release); }
+        if rem {
+            self.needs_reclaim.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -149,8 +228,13 @@ impl CrossfireModel {
 // Harness
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn mops(ops: u64, elapsed: Duration) -> f64 { ops as f64 / elapsed.as_secs_f64() / 1e6 }
-struct R { w: f64, r: f64 }
+fn mops(ops: u64, elapsed: Duration) -> f64 {
+    ops as f64 / elapsed.as_secs_f64() / 1e6
+}
+struct R {
+    w: f64,
+    r: f64,
+}
 
 macro_rules! bench_model {
     ($model_ty:ty, $nw:expr, $nr:expr) => {{
@@ -163,14 +247,25 @@ macro_rules! bench_model {
         let start = Instant::now();
         std::thread::scope(|s| {
             for tid in 0..$nw {
-                let m = &m; let bar = &bar; let wops = &wops; let done = &done;
+                let m = &m;
+                let bar = &bar;
+                let wops = &wops;
+                let done = &done;
                 s.spawn(move || {
                     bar.wait();
                     for c in 0..OPS_PER_THREAD {
                         let _ = m.pin(tid);
-                        m.retire(tid, GarbageBag { epoch: m.epoch.load(Ordering::Relaxed), count: BATCH_SIZE });
+                        m.retire(
+                            tid,
+                            GarbageBag {
+                                epoch: m.epoch.load(Ordering::Relaxed),
+                                count: BATCH_SIZE,
+                            },
+                        );
                         m.unpin(tid);
-                        if c % 100 == 0 { std::hint::spin_loop(); }
+                        if c % 100 == 0 {
+                            std::hint::spin_loop();
+                        }
                     }
                     done.store(true, Ordering::Relaxed);
                     wops.fetch_add(OPS_PER_THREAD, Ordering::Relaxed);
@@ -178,7 +273,10 @@ macro_rules! bench_model {
             }
             for tid in 0..$nr {
                 let rtid = $nw + tid;
-                let m = &m; let bar = &bar; let rops = &rops; let done = &done;
+                let m = &m;
+                let bar = &bar;
+                let rops = &rops;
+                let done = &done;
                 s.spawn(move || {
                     bar.wait();
                     let mut c = 0u64;
@@ -188,36 +286,53 @@ macro_rules! bench_model {
                         m.unpin(rtid);
                         m.try_reclaim(n);
                         c += 1;
-                        if c >= READER_OPS && done.load(Ordering::Relaxed) { break; }
+                        if c >= READER_OPS && done.load(Ordering::Relaxed) {
+                            break;
+                        }
                     }
                     rops.fetch_add(c, Ordering::Relaxed);
                 });
             }
         });
         let el = start.elapsed();
-        R { w: mops(wops.load(Ordering::Relaxed) * BATCH_SIZE as u64, el), r: mops(rops.load(Ordering::Relaxed), el) }
+        R {
+            w: mops(wops.load(Ordering::Relaxed) * BATCH_SIZE as u64, el),
+            r: mops(rops.load(Ordering::Relaxed), el),
+        }
     }};
 }
 
 fn main() {
     println!("=== Epoch Write Model: Mutex vs crossfire SPSC ===");
-    println!("  Batch: {} | W pubs: {} | R pins: {}\n", BATCH_SIZE, OPS_PER_THREAD, READER_OPS);
+    println!(
+        "  Batch: {} | W pubs: {} | R pins: {}\n",
+        BATCH_SIZE, OPS_PER_THREAD, READER_OPS
+    );
 
     let cfgs: &[(usize, usize)] = &[
-        (1, 0), (1, 1), (1, 4), (1, 8),
-        (2, 2), (2, 4),
-        (4, 1), (4, 4),
+        (1, 0),
+        (1, 1),
+        (1, 4),
+        (1, 8),
+        (2, 2),
+        (2, 4),
+        (4, 1),
+        (4, 4),
     ];
 
-    println!("  {:>3}W {:>2}R {:>12} {:>12} {:>12} {:>12}",
-        "", "", "Mutex W", "SPSC W", "Mutex R", "SPSC R");
+    println!(
+        "  {:>3}W {:>2}R {:>12} {:>12} {:>12} {:>12}",
+        "", "", "Mutex W", "SPSC W", "Mutex R", "SPSC R"
+    );
     println!("  {}", "─".repeat(60));
 
     for &(w, r) in cfgs {
         let mx = bench_model!(MutexModel, w, r);
         let cf = bench_model!(CrossfireModel, w, r);
-        println!("  {:>3}W {:>2}R {:>10.0} M {:>10.0} M {:>10.0} M {:>10.0} M",
-            w, r, mx.w, cf.w, mx.r, cf.r);
+        println!(
+            "  {:>3}W {:>2}R {:>10.0} M {:>10.0} M {:>10.0} M {:>10.0} M",
+            w, r, mx.w, cf.w, mx.r, cf.r
+        );
     }
 
     println!("\n=== Done ===");

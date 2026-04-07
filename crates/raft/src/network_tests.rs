@@ -41,7 +41,7 @@ async fn ephemeral_listener() -> (TcpListener, std::net::SocketAddr) {
     (listener, addr)
 }
 
-fn test_vote() -> openraft::impls::Vote<C> {
+fn test_vote() -> crate::test_support::TestVote {
     openraft::impls::Vote {
         leader_id: openraft::impls::leader_id_adv::LeaderId {
             term: 1,
@@ -165,7 +165,7 @@ async fn test_read_frame_into_reuses_buffer_capacity() {
             rpc: openraft::raft::AppendEntriesRequest {
                 vote: test_vote(),
                 prev_log_id: None,
-                entries: vec![openraft::impls::Entry::<C> {
+                entries: vec![crate::test_support::TestEntry {
                     log_id: openraft::LogId {
                         leader_id: openraft::impls::leader_id_adv::LeaderId {
                             term: 1,
@@ -407,7 +407,7 @@ async fn test_rolling_buffer_large_frame() {
         rpc: openraft::raft::AppendEntriesRequest {
             vote: test_vote(),
             prev_log_id: None,
-            entries: vec![openraft::impls::Entry::<C> {
+            entries: vec![crate::test_support::TestEntry {
                 log_id: openraft::LogId {
                     leader_id: openraft::impls::leader_id_adv::LeaderId {
                         term: 1,
@@ -1608,8 +1608,8 @@ fn test_install_snapshot_request_codec_roundtrip() {
                 last_membership: openraft::StoredMembership::new(
                     None,
                     openraft::Membership::new_with_defaults(
-                        vec![vec![1u64].into_iter().collect()],
-                        Vec::<u64>::new(),
+                        vec![vec![1u32].into_iter().collect()],
+                        Vec::<u32>::new(),
                     ),
                 ),
                 snapshot_id: "snap-1".to_string(),
@@ -1660,8 +1660,8 @@ fn test_install_snapshot_final_chunk_codec() {
                 last_membership: openraft::StoredMembership::new(
                     None,
                     openraft::Membership::new_with_defaults(
-                        vec![vec![1u64].into_iter().collect()],
-                        Vec::<u64>::new(),
+                        vec![vec![1u32].into_iter().collect()],
+                        Vec::<u32>::new(),
                     ),
                 ),
                 snapshot_id: "snap-final".to_string(),

@@ -247,8 +247,7 @@ impl<T: Default> SegmentedSlab<T> {
                     return None;
                 }
                 unsafe {
-                    (*self.segments.get())[next] =
-                        Box::into_raw(Box::new(Segment::new(self.cap)));
+                    (*self.segments.get())[next] = Box::into_raw(Box::new(Segment::new(self.cap)));
                 }
                 self.segment_count.store(next + 1, Ordering::Release);
             }
@@ -613,9 +612,9 @@ mod tests {
             slab.alloc().unwrap();
         }
         // Free one from each segment.
-        slab.free(1);  // segment 0
-        slab.free(5);  // segment 1
-        slab.free(9);  // segment 2
+        slab.free(1); // segment 0
+        slab.free(5); // segment 1
+        slab.free(9); // segment 2
 
         // Should reuse lowest first.
         assert_eq!(slab.alloc(), Some(1));

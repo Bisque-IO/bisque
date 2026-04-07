@@ -121,9 +121,8 @@ impl Node for Node48 {
         if pos == EMPTY_MARKER {
             None
         } else {
-            let child = unsafe {
-                std::ptr::read_volatile(self.children.as_ptr().add(pos as usize))
-            };
+            let child =
+                unsafe { std::ptr::read_volatile(self.children.as_ptr().add(pos as usize)) };
             Some(child)
         }
     }

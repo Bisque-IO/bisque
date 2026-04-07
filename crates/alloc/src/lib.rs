@@ -48,9 +48,13 @@ pub mod wait_queue;
 pub use arc::HeapArc;
 pub use boxed::HeapBox;
 pub use bytes::{Bytes, BytesMut};
+pub use collections::art::fixed::{
+    ArtKey, FixedArt, FixedReadGuard, FixedWriteGuard, U32Art, U64Art, U128Art,
+    sharded::{ShardedFixedArt, ShardedU32Art, ShardedU64Art, ShardedU128Art},
+};
 pub use collections::{HashMap, HashSet, art::Art};
-pub use epoch::{EpochBox, EpochRef};
 pub use epoch::heap::{Collector as HeapCollector, Epoch, EpochGuard as HeapEpochGuard};
+pub use epoch::{EpochBox, EpochRef};
 pub use heap::{Heap, HeapMaster};
 pub use padded::CachePadded;
 pub use string::String;

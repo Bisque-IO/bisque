@@ -8,8 +8,8 @@
 //! zero heap allocations. Each stack frame is 10 bytes (node pointer + byte
 //! position). Total cursor size is fixed at MAX_DEPTH frames.
 
-use super::node::*;
 use super::ArtKey;
+use super::node::*;
 
 /// Max tree depth. Fixed at 66 — supports keys up to 64 bytes.
 /// Uses const instead of K::LEN+2 to avoid nightly generic_const_exprs.
@@ -38,7 +38,11 @@ pub(super) fn lookup<K: ArtKey, V>(root: usize, key: K) -> Option<*const V> {
         while node != NULL_CHILD {
             if is_leaf(node) {
                 let leaf = unsafe { &*leaf_ptr::<K, V>(node) };
-                return if leaf.key == key { Some(&leaf.value as *const V) } else { None };
+                return if leaf.key == key {
+                    Some(&leaf.value as *const V)
+                } else {
+                    None
+                };
             }
             let hdr = unsafe { node_header(node) };
             let plen = hdr.prefix_len as usize;
@@ -49,7 +53,9 @@ pub(super) fn lookup<K: ArtKey, V>(root: usize, key: K) -> Option<*const V> {
                 }
             }
             depth += plen;
-            if depth >= 8 { return None; }
+            if depth >= 8 {
+                return None;
+            }
             node = unsafe { find_child(node, kb[depth]) };
             depth += 1;
         }
@@ -63,7 +69,11 @@ pub(super) fn lookup<K: ArtKey, V>(root: usize, key: K) -> Option<*const V> {
         while node != NULL_CHILD {
             if is_leaf(node) {
                 let leaf = unsafe { &*leaf_ptr::<K, V>(node) };
-                return if leaf.key == key { Some(&leaf.value as *const V) } else { None };
+                return if leaf.key == key {
+                    Some(&leaf.value as *const V)
+                } else {
+                    None
+                };
             }
             let hdr = unsafe { node_header(node) };
             let plen = hdr.prefix_len as usize;
@@ -74,7 +84,9 @@ pub(super) fn lookup<K: ArtKey, V>(root: usize, key: K) -> Option<*const V> {
                 }
             }
             depth += plen;
-            if depth >= 4 { return None; }
+            if depth >= 4 {
+                return None;
+            }
             node = unsafe { find_child(node, kb[depth]) };
             depth += 1;
         }
@@ -86,7 +98,11 @@ pub(super) fn lookup<K: ArtKey, V>(root: usize, key: K) -> Option<*const V> {
         while node != NULL_CHILD {
             if is_leaf(node) {
                 let leaf = unsafe { &*leaf_ptr::<K, V>(node) };
-                return if leaf.key == key { Some(&leaf.value as *const V) } else { None };
+                return if leaf.key == key {
+                    Some(&leaf.value as *const V)
+                } else {
+                    None
+                };
             }
             let hdr = unsafe { node_header(node) };
             let plen = hdr.prefix_len as usize;
@@ -97,7 +113,9 @@ pub(super) fn lookup<K: ArtKey, V>(root: usize, key: K) -> Option<*const V> {
                 }
             }
             depth += plen;
-            if depth >= K::LEN { return None; }
+            if depth >= K::LEN {
+                return None;
+            }
             node = unsafe { find_child(node, key.byte_at(depth)) };
             depth += 1;
         }
@@ -719,11 +737,7 @@ impl<'a, K: ArtKey, V> Iterator for Iter<'a, K, V> {
         }
         // Safety: the epoch guard (held by the ReadGuard that created this Iter)
         // ensures the leaf memory is alive for lifetime 'a.
-        unsafe {
-            self.cursor
-                .key_value_raw::<V>()
-                .map(|(k, ptr)| (k, &*ptr))
-        }
+        unsafe { self.cursor.key_value_raw::<V>().map(|(k, ptr)| (k, &*ptr)) }
     }
 }
 
@@ -800,11 +814,7 @@ impl<'a, K: ArtKey, V> Iterator for RevIter<'a, K, V> {
         } else {
             self.cursor.prev();
         }
-        unsafe {
-            self.cursor
-                .key_value_raw::<V>()
-                .map(|(k, ptr)| (k, &*ptr))
-        }
+        unsafe { self.cursor.key_value_raw::<V>().map(|(k, ptr)| (k, &*ptr)) }
     }
 }
 
@@ -834,11 +844,7 @@ impl<'a, K: ArtKey, V> Iterator for CursorRange<'a, K, V> {
         } else {
             self.cursor.next();
         }
-        let kv = unsafe {
-            self.cursor
-                .key_value_raw::<V>()
-                .map(|(k, ptr)| (k, &*ptr))
-        };
+        let kv = unsafe { self.cursor.key_value_raw::<V>().map(|(k, ptr)| (k, &*ptr)) };
         match kv {
             Some((k, _)) if k > self.end => None,
             other => other,
@@ -850,10 +856,7 @@ impl<'a, K: ArtKey, V> Iterator for CursorRange<'a, K, V> {
 // Legacy compat
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub(super) fn sorted_children(
-    node: usize,
-    buf: &mut [(u8, usize); 256],
-) -> &[(u8, usize)] {
+pub(super) fn sorted_children(node: usize, buf: &mut [(u8, usize); 256]) -> &[(u8, usize)] {
     let hdr = unsafe { node_header(node) };
     let count = hdr.num_children as usize;
     match hdr.kind {

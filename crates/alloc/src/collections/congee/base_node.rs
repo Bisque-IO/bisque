@@ -308,9 +308,7 @@ impl BaseNode {
     pub(crate) fn prefix(&self) -> &[u8] {
         // read_volatile on prefix_cnt to prevent compiler from caching a
         // stale value across the OLC validation window.
-        let cnt = unsafe {
-            std::ptr::read_volatile(&self.meta.prefix_cnt as *const u32) as usize
-        };
+        let cnt = unsafe { std::ptr::read_volatile(&self.meta.prefix_cnt as *const u32) as usize };
         let cnt = cnt.min(MAX_KEY_LEN);
         unsafe { self.meta.prefix.get_unchecked(..cnt) }
     }

@@ -26,7 +26,7 @@ use parking_lot::Mutex;
 use crate::Heap;
 
 use self::cow::*;
-use self::epoch::{EpochGuard, Epoch, new_art_epoch};
+use self::epoch::{Epoch, EpochGuard, new_art_epoch};
 use self::iter::{RangeIter, lookup, lookup_from, range_scan};
 use self::node::*;
 
@@ -261,7 +261,11 @@ where
 
     /// Read-modify-write: apply `f` to the existing value if present.
     /// Returns `Some((old, new))` if the key existed, `None` if absent.
-    pub fn compute_if_present<F>(&mut self, key: &K, f: F) -> Result<Option<(V, Option<V>)>, AllocError>
+    pub fn compute_if_present<F>(
+        &mut self,
+        key: &K,
+        f: F,
+    ) -> Result<Option<(V, Option<V>)>, AllocError>
     where
         F: FnOnce(V) -> Option<V>,
     {
@@ -273,7 +277,8 @@ where
                 let old = V::from(v);
                 match f(old) {
                     Some(new_v) => {
-                        self.art.shard_put_into(k, usize::from(new_v), &mut self.garbage)?;
+                        self.art
+                            .shard_put_into(k, usize::from(new_v), &mut self.garbage)?;
                         Ok(Some((old, Some(new_v))))
                     }
                     None => {
@@ -295,12 +300,18 @@ where
             return Ok(V::from(existing));
         }
         let value = f();
-        self.art.shard_put_into(k, usize::from(value), &mut self.garbage)?;
+        self.art
+            .shard_put_into(k, usize::from(value), &mut self.garbage)?;
         Ok(value)
     }
 
     /// Compare-and-exchange: replace `old` with `new` if the current value matches.
-    pub fn compare_exchange(&mut self, key: &K, old: V, new: Option<V>) -> Result<Option<V>, Option<V>>
+    pub fn compare_exchange(
+        &mut self,
+        key: &K,
+        old: V,
+        new: Option<V>,
+    ) -> Result<Option<V>, Option<V>>
     where
         V: PartialEq,
     {
@@ -613,8 +624,7 @@ where
         let batch_root = unsafe { alloc_node256(heap, 1) };
         assert!(!batch_root.is_null(), "failed to allocate batch root");
 
-        let shard_locks: Vec<Mutex<()>> =
-            (0..256).map(|_| Mutex::new(())).collect();
+        let shard_locks: Vec<Mutex<()>> = (0..256).map(|_| Mutex::new(())).collect();
         let shard_locks: Box<[Mutex<()>; 256]> =
             shard_locks.into_boxed_slice().try_into().ok().unwrap();
 

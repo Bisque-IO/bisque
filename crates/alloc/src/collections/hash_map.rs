@@ -148,6 +148,31 @@ where
     {
         self.inner.retain(f);
     }
+
+    /// Get an Entry handle for in-place mutation.
+    ///
+    /// Reserves capacity for one additional element first, so that
+    /// `entry.or_insert(...)` is infallible once you have the entry.
+    pub fn try_entry(
+        &mut self,
+        key: K,
+    ) -> Result<hashbrown::hash_map::Entry<'_, K, V, S, Heap>, AllocError> {
+        self.inner.try_reserve(1).map_err(|_| AllocError)?;
+        Ok(self.inner.entry(key))
+    }
+
+    /// Drain all entries, returning them as an iterator.
+    /// The map is empty after this call.
+    #[inline]
+    pub fn drain(&mut self) -> hashbrown::hash_map::Drain<'_, K, V, Heap> {
+        self.inner.drain()
+    }
+
+    /// Iterate over values mutably.
+    #[inline]
+    pub fn values_mut(&mut self) -> hashbrown::hash_map::ValuesMut<'_, K, V> {
+        self.inner.values_mut()
+    }
 }
 
 impl<K: std::fmt::Debug, V: std::fmt::Debug, S> std::fmt::Debug for HashMap<K, V, S> {
@@ -161,5 +186,13 @@ impl<'a, K, V, S> IntoIterator for &'a HashMap<K, V, S> {
     type IntoIter = hashbrown::hash_map::Iter<'a, K, V>;
     fn into_iter(self) -> Self::IntoIter {
         self.inner.iter()
+    }
+}
+
+impl<K, V, S> IntoIterator for HashMap<K, V, S> {
+    type Item = (K, V);
+    type IntoIter = hashbrown::hash_map::IntoIter<K, V, Heap>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
     }
 }

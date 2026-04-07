@@ -201,6 +201,7 @@ zstd = "0.13"
 # maniac-allocator = { path = "crates/maniac-allocator", version = "0.1.0", default-features = false }
 # maniac-sys = { path = "crates/maniac-sys", version = "0.1.0" }
 # maniac-usockets = { path = "crates/maniac-usockets", version = "0.1.0", default-features = false }
+bisque-alloc = { path = "crates/alloc", version = "0.1.0" }
 bisque-client = { path = "crates/client", version = "0.1.0" }
 bisque-lance = { path = "crates/lance", version = "0.1.0" }
 bisque-mq = { path = "crates/mq", version = "0.1.0" }

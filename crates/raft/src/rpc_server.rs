@@ -50,8 +50,8 @@ struct SnapshotAccumulator<C: RaftTypeConfig> {
     vote: C::Vote,
     /// Snapshot metadata
     meta: openraft::alias::SnapshotMetaOf<C>,
-    /// Accumulated data chunks
-    data: Vec<u8>,
+    /// Accumulated data chunks (heap-tracked for observability).
+    data: bisque_alloc::Vec<u8>,
     /// Expected next offset
     next_offset: u64,
     /// Last activity timestamp for timeout
@@ -59,11 +59,15 @@ struct SnapshotAccumulator<C: RaftTypeConfig> {
 }
 
 impl<C: RaftTypeConfig> SnapshotAccumulator<C> {
-    fn new(vote: C::Vote, meta: openraft::alias::SnapshotMetaOf<C>) -> Self {
+    fn new(
+        vote: C::Vote,
+        meta: openraft::alias::SnapshotMetaOf<C>,
+        heap: &bisque_alloc::heap::Heap,
+    ) -> Self {
         Self {
             vote,
             meta,
-            data: Vec::new(),
+            data: bisque_alloc::Vec::new(heap),
             next_offset: 0,
             last_activity: Instant::now(),
         }
@@ -80,10 +84,21 @@ impl<C: RaftTypeConfig> SnapshotAccumulator<C> {
             );
             return false;
         }
-        self.data.extend_from_slice(chunk);
+        if self.data.extend_from_slice(chunk).is_err() {
+            tracing::warn!("Snapshot chunk allocation failed (heap full)");
+            return false;
+        }
         self.next_offset = offset + chunk.len() as u64;
         self.last_activity = Instant::now();
         true
+    }
+
+    /// Convert accumulated data to a std Vec for OpenRaft consumption.
+    /// This copies the data since OpenRaft expects `Cursor<Vec<u8>>`.
+    fn into_std_vec(&mut self) -> Vec<u8> {
+        let heap = *self.data.heap();
+        let taken = std::mem::replace(&mut self.data, bisque_alloc::Vec::new(&heap));
+        taken.to_std_vec()
     }
 
     /// Check if this accumulator has timed out
@@ -100,15 +115,31 @@ struct SnapshotTransferManager<C: RaftTypeConfig> {
     transfer_timeout: Duration,
     /// Counter for periodic cleanup (every N calls)
     cleanup_counter: AtomicU64,
+    /// Unlimited heap master for snapshot transfer tracking (observability).
+    /// Must outlive all SnapshotAccumulator instances.
+    _snapshot_master: bisque_alloc::HeapMaster,
+    /// Cached heap handle (Copy, derived from _snapshot_master).
+    snapshot_heap: bisque_alloc::heap::Heap,
 }
 
 impl<C: RaftTypeConfig> SnapshotTransferManager<C> {
     fn new(transfer_timeout: Duration) -> Self {
+        // Unlimited heap for snapshot transfer tracking (observability, no hard limit).
+        let snapshot_master =
+            bisque_alloc::HeapMaster::new(0).expect("failed to allocate snapshot transfer heap");
+        let snapshot_heap = snapshot_master.heap();
         Self {
             transfers: DashMap::new(),
             transfer_timeout,
             cleanup_counter: AtomicU64::new(0),
+            _snapshot_master: snapshot_master,
+            snapshot_heap,
         }
+    }
+
+    /// Current memory usage of in-flight snapshot transfers.
+    pub fn memory_usage(&self) -> usize {
+        self.snapshot_heap.memory_usage()
     }
 
     /// Periodically clean up expired transfers (every 64 calls)
@@ -132,9 +163,10 @@ impl<C: RaftTypeConfig> SnapshotTransferManager<C> {
             snapshot_id: snapshot_id.clone(),
         };
 
+        let heap = self.snapshot_heap;
         self.transfers
             .entry(key)
-            .or_insert_with(|| SnapshotAccumulator::new(vote, meta))
+            .or_insert_with(|| SnapshotAccumulator::new(vote, meta, &heap))
     }
 
     /// Remove a completed or aborted transfer
@@ -921,7 +953,7 @@ where
                                 // Final chunk - install the complete snapshot
                                 let vote = acc.vote.clone();
                                 let meta = acc.meta.clone();
-                                let data = std::mem::take(&mut acc.data);
+                                let data = acc.into_std_vec();
                                 drop(acc);
 
                                 // Remove the accumulator since we're done
@@ -1097,6 +1129,12 @@ mod tests {
         }
     }
 
+    fn test_heap() -> (bisque_alloc::HeapMaster, bisque_alloc::heap::Heap) {
+        let master = bisque_alloc::HeapMaster::new(0).unwrap();
+        let heap = master.heap();
+        (master, heap)
+    }
+
     fn test_snapshot_meta() -> openraft::alias::SnapshotMetaOf<C> {
         openraft::storage::SnapshotMeta {
             last_log_id: None,
@@ -1113,7 +1151,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_accumulator_append_chunk() {
-        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta());
+        let (_master, heap) = test_heap();
+        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta(), &heap);
 
         // Append first chunk
         assert!(acc.append_chunk(0, b"chunk1"));
@@ -1132,7 +1171,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_accumulator_expiry() {
-        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta());
+        let (_master, heap) = test_heap();
+        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta(), &heap);
 
         // Should not be expired immediately
         assert!(!acc.is_expired(Duration::from_secs(60)));
@@ -1232,7 +1272,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_accumulator_empty_chunk() {
-        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta());
+        let (_master, heap) = test_heap();
+        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta(), &heap);
 
         // Appending empty chunk should advance offset by 0
         assert!(acc.append_chunk(0, b""));
@@ -1247,7 +1288,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_accumulator_large_chunk() {
-        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta());
+        let (_master, heap) = test_heap();
+        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta(), &heap);
 
         let large_chunk = vec![0xAB; 1024 * 1024]; // 1MB
         assert!(acc.append_chunk(0, &large_chunk));
@@ -1257,7 +1299,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_accumulator_multi_chunk_sequence() {
-        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta());
+        let (_master, heap) = test_heap();
+        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta(), &heap);
 
         assert!(acc.append_chunk(0, b"aaa"));
         assert!(acc.append_chunk(3, b"bbb"));
@@ -1268,7 +1311,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_accumulator_offset_mismatch_first() {
-        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta());
+        let (_master, heap) = test_heap();
+        let mut acc = SnapshotAccumulator::<C>::new(test_vote(), test_snapshot_meta(), &heap);
 
         // First chunk must be at offset 0
         assert!(acc.append_chunk(0, b"ok"));

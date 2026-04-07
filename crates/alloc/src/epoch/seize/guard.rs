@@ -2,8 +2,8 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use super::raw::{self, Reservation, Thread};
 use super::collector::Collector;
+use super::raw::{self, Reservation, Thread};
 
 /// A guard that enables protected loads of concurrent objects.
 ///

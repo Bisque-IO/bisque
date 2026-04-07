@@ -14,7 +14,7 @@ use allocator_api2::alloc::AllocError;
 use crate::Heap;
 
 use super::cow::*;
-use super::epoch::{new_art_epoch, Collector, Epoch, EpochGuard};
+use super::epoch::{Collector, Epoch, EpochGuard, new_art_epoch};
 use super::iter::{lookup, lookup_from};
 use super::node::*;
 
@@ -154,9 +154,7 @@ where
                     }
                 } else {
                     unsafe {
-                        cow_remove_inner(
-                            child, &key_arr, key, 1, generation, heap, &mut garbage,
-                        )?
+                        cow_remove_inner(child, &key_arr, key, 1, generation, heap, &mut garbage)?
                     }
                 };
                 unsafe { Self::n256_child_write(batch_root, idx, new_child) };
@@ -202,8 +200,7 @@ where
                         }
                         let n4 = unsafe { &mut *new_node };
                         n4.header.prefix_len = prefix_len as u32;
-                        n4.header.prefix[..prefix_len]
-                            .copy_from_slice(&key_arr[1..1 + prefix_len]);
+                        n4.header.prefix[..prefix_len].copy_from_slice(&key_arr[1..1 + prefix_len]);
                         if common < KEY_BYTES {
                             unsafe {
                                 add_child_mut(new_node as usize, old_key_arr[common], child);
@@ -218,7 +215,14 @@ where
                 } else {
                     let (new_child, old_val) = unsafe {
                         cow_insert_inner(
-                            child, &key_arr, key, val, 1, generation, heap, &mut garbage,
+                            child,
+                            &key_arr,
+                            key,
+                            val,
+                            1,
+                            generation,
+                            heap,
+                            &mut garbage,
                         )?
                     };
                     if new_child != child {

@@ -13,6 +13,7 @@
 mod cow;
 mod iter;
 pub(crate) mod node;
+pub mod sharded;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -18,7 +18,7 @@ pub unsafe fn art_dealloc(heap_data: *const HeapData, ptr: usize) {
 
 /// Dealloc an ART node using raw HeapData pointer (no Heap clone needed).
 unsafe fn dealloc_node_raw(heap_data: *const HeapData, p: usize) {
-    use super::node::{is_leaf, leaf_ptr, NULL_CHILD};
+    use super::node::{NULL_CHILD, is_leaf, leaf_ptr};
     if p == NULL_CHILD {
         return;
     }

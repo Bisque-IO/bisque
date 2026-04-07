@@ -1195,11 +1195,11 @@ mod tests {
     #[test]
     fn test_node_registry_multiple_nodes() {
         let registry = DefaultNodeRegistry::<u32>::new();
-        for i in 1..=100u64 {
+        for i in 1..=100u32 {
             let addr: SocketAddr = format!("127.0.0.1:{}", 5000 + i).parse().unwrap();
             registry.register(i, addr);
         }
-        for i in 1..=100u64 {
+        for i in 1..=100u32 {
             let expected: SocketAddr = format!("127.0.0.1:{}", 5000 + i).parse().unwrap();
             assert_eq!(registry.resolve(&i), Some(expected));
         }
@@ -1242,10 +1242,10 @@ mod tests {
         use crate::test_support::TestConfig;
 
         run_async(async {
-            let vote = openraft::impls::Vote::<TestConfig> {
+            let vote = openraft::impls::Vote {
                 leader_id: openraft::impls::leader_id_adv::LeaderId {
-                    term: 1,
-                    node_id: 1,
+                    term: 1u32,
+                    node_id: 1u32,
                 },
                 committed: false,
             };
@@ -1330,10 +1330,10 @@ mod tests {
         use crate::codec::RpcMessage;
         use crate::test_support::TestConfig;
 
-        let vote = openraft::impls::Vote::<TestConfig> {
+        let vote = openraft::impls::Vote {
             leader_id: openraft::impls::leader_id_adv::LeaderId {
-                term: 1,
-                node_id: 1,
+                term: 1u32,
+                node_id: 1u32,
             },
             committed: false,
         };

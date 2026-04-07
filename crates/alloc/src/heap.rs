@@ -251,7 +251,6 @@ impl HeapMaster {
     ) -> Self {
         let slot = HEAPS.get_mut_ptr(id);
 
-
         // Set the new limit before snapshotting so the limit is active
         // for all subsequent page push/free tracking.
         if max_bytes > 0 {

@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use bisque_alloc::slab::{FixedSlab, SegmentedSlab};
 use bisque_alloc::MiMalloc;
+use bisque_alloc::slab::{FixedSlab, SegmentedSlab};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -39,7 +39,9 @@ fn fmt_mops(ops: u64, elapsed: Duration) -> String {
 struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self { Self(seed) }
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -295,7 +297,12 @@ fn main() {
         let total = FIXED_ALLOC_HOLD / t * t;
         let d1 = conc_alloc_fixed(t);
         let d2 = conc_alloc_segmented(t);
-        println!("  {:>8}  {:>14.2} M  {:>14.2} M", t, mops(total as u64, d1), mops(total as u64, d2));
+        println!(
+            "  {:>8}  {:>14.2} M  {:>14.2} M",
+            t,
+            mops(total as u64, d1),
+            mops(total as u64, d2)
+        );
     }
     println!();
 
@@ -305,7 +312,12 @@ fn main() {
         let d1 = conc_alloc_free_fixed(t);
         let d2 = conc_alloc_free_segmented(t);
         let total = OPS_PER_THREAD * t as u64;
-        println!("  {:>8}  {:>14.2} M  {:>14.2} M", t, mops(total, d1), mops(total, d2));
+        println!(
+            "  {:>8}  {:>14.2} M  {:>14.2} M",
+            t,
+            mops(total, d1),
+            mops(total, d2)
+        );
     }
     println!();
 
@@ -315,7 +327,12 @@ fn main() {
         let d1 = conc_get_fixed(t);
         let d2 = conc_get_segmented(t);
         let total = OPS_PER_THREAD * t as u64;
-        println!("  {:>8}  {:>14.2} M  {:>14.2} M", t, mops(total, d1), mops(total, d2));
+        println!(
+            "  {:>8}  {:>14.2} M  {:>14.2} M",
+            t,
+            mops(total, d1),
+            mops(total, d2)
+        );
     }
 
     println!("\n=== Done ===");

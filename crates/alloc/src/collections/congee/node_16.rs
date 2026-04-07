@@ -39,9 +39,8 @@ impl Node16 {
     /// architectures.
     #[inline]
     fn get_child_pos(&self, key: u8) -> Option<usize> {
-        let count = unsafe {
-            std::ptr::read_volatile(&self.base.meta.count as *const u16) as usize
-        };
+        let count =
+            unsafe { std::ptr::read_volatile(&self.base.meta.count as *const u16) as usize };
         let count = count.min(16);
         self.keys.iter().take(count).position(|k| *k == key)
     }
@@ -158,9 +157,7 @@ impl Node for Node16 {
     #[inline]
     fn get_child(&self, key: u8) -> Option<NodePtr> {
         let pos = self.get_child_pos(key)?;
-        let child = unsafe {
-            std::ptr::read_volatile(self.children.as_ptr().add(pos))
-        };
+        let child = unsafe { std::ptr::read_volatile(self.children.as_ptr().add(pos)) };
         Some(child)
     }
 }

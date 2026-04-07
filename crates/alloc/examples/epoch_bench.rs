@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bisque_alloc::epoch::counted::{
-    Collector as CCollector, Epoch as CEpoch, DeallocFn as CDeallocFn,
+    Collector as CCollector, DeallocFn as CDeallocFn, Epoch as CEpoch,
 };
 use bisque_alloc::epoch::heap::{
-    Collector as HCollector, Epoch as HEpoch, DeallocFn as HDeallocFn,
+    Collector as HCollector, DeallocFn as HDeallocFn, Epoch as HEpoch,
 };
 use bisque_alloc::epoch::{Collector as SeizeCollector, Guard};
 use bisque_alloc::{Heap, HeapMaster, MiMalloc};
@@ -81,7 +81,9 @@ fn heap_mixed(n: usize, e: &Arc<HEpoch>) -> Duration {
         let e = e.clone();
         s.spawn(move || {
             for i in 0..OPS_PER_THREAD {
-                if i % 1000 == 0 { e.advance(); }
+                if i % 1000 == 0 {
+                    e.advance();
+                }
                 std::hint::spin_loop();
             }
         });
@@ -140,7 +142,9 @@ fn counted_mixed(n: usize, e: &Arc<CEpoch>) -> Duration {
         let e = e.clone();
         s.spawn(move || {
             for i in 0..OPS_PER_THREAD {
-                if i % 1000 == 0 { e.advance(); }
+                if i % 1000 == 0 {
+                    e.advance();
+                }
                 std::hint::spin_loop();
             }
         });
@@ -231,7 +235,9 @@ fn heap_multi_writer(num_readers: usize, num_writers: usize, e: &Arc<HEpoch>) ->
             let e = e.clone();
             s.spawn(move || {
                 for i in 0..OPS_PER_THREAD {
-                    if i % 1000 == 0 { e.advance(); }
+                    if i % 1000 == 0 {
+                        e.advance();
+                    }
                     std::hint::spin_loop();
                 }
             });
@@ -257,7 +263,9 @@ fn counted_multi_writer(num_readers: usize, num_writers: usize, e: &Arc<CEpoch>)
             let e = e.clone();
             s.spawn(move || {
                 for i in 0..OPS_PER_THREAD {
-                    if i % 1000 == 0 { e.advance(); }
+                    if i % 1000 == 0 {
+                        e.advance();
+                    }
                     std::hint::spin_loop();
                 }
             });
@@ -403,7 +411,10 @@ fn main() {
     let sc = Arc::new(SeizeCollector::new());
 
     let hdr = |label: &str| {
-        println!("  {:>8}  {:>14}  {:>14}  {:>14}  {:>14}", label, "Heap", "Counted", "Seize", "Crossbeam");
+        println!(
+            "  {:>8}  {:>14}  {:>14}  {:>14}  {:>14}",
+            label, "Heap", "Counted", "Seize", "Crossbeam"
+        );
     };
 
     println!("=== Epoch Benchmark: Heap vs Counted vs Seize vs Crossbeam ===");
@@ -416,8 +427,14 @@ fn main() {
         let c = counted_pin_unpin(t, &ce);
         let s = seize_pin_unpin(t, &sc);
         let x = crossbeam_pin_unpin(t);
-        println!("  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
-            t, mops(t, h), mops(t, c), mops(t, s), mops(t, x));
+        println!(
+            "  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
+            t,
+            mops(t, h),
+            mops(t, c),
+            mops(t, s),
+            mops(t, x)
+        );
     }
     println!();
 
@@ -428,8 +445,14 @@ fn main() {
         let c = counted_pin_only(t, &ce);
         let s = seize_pin_only(t, &sc);
         let x = crossbeam_pin_only(t);
-        println!("  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
-            t, mops(t, h), mops(t, c), mops(t, s), mops(t, x));
+        println!(
+            "  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
+            t,
+            mops(t, h),
+            mops(t, c),
+            mops(t, s),
+            mops(t, x)
+        );
     }
     println!();
 
@@ -440,8 +463,14 @@ fn main() {
         let c = counted_mixed(t, &ce);
         let s = seize_mixed(t, &sc);
         let x = crossbeam_mixed(t);
-        println!("  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
-            t, mops(t, h), mops(t, c), mops(t, s), mops(t, x));
+        println!(
+            "  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
+            t,
+            mops(t, h),
+            mops(t, c),
+            mops(t, s),
+            mops(t, x)
+        );
     }
 
     let writers = &[1, 2, 4, 8];
@@ -454,9 +483,14 @@ fn main() {
         let c = counted_multi_writer(readers, w, &ce);
         let s = seize_multi_writer(readers, w, &sc);
         let x = crossbeam_multi_writer(readers, w);
-        println!("  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
-            w, mops_total(readers, w, h), mops_total(readers, w, c),
-            mops_total(readers, w, s), mops_total(readers, w, x));
+        println!(
+            "  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
+            w,
+            mops_total(readers, w, h),
+            mops_total(readers, w, c),
+            mops_total(readers, w, s),
+            mops_total(readers, w, x)
+        );
     }
 
     let readers = 16;
@@ -468,9 +502,14 @@ fn main() {
         let c = counted_multi_writer(readers, w, &ce);
         let s = seize_multi_writer(readers, w, &sc);
         let x = crossbeam_multi_writer(readers, w);
-        println!("  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
-            w, mops_total(readers, w, h), mops_total(readers, w, c),
-            mops_total(readers, w, s), mops_total(readers, w, x));
+        println!(
+            "  {:>8}  {:>12.2} M  {:>12.2} M  {:>12.2} M  {:>12.2} M",
+            w,
+            mops_total(readers, w, h),
+            mops_total(readers, w, c),
+            mops_total(readers, w, s),
+            mops_total(readers, w, x)
+        );
     }
 
     println!("\n=== Done ===");

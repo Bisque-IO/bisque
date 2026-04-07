@@ -24,10 +24,7 @@ struct RetireBatch {
 
 unsafe impl Send for RetireBatch {}
 
-unsafe fn reclaim_batch(
-    batch_ptr: *mut RetireBatch,
-    _: &crate::epoch::collector::Collector,
-) {
+unsafe fn reclaim_batch(batch_ptr: *mut RetireBatch, _: &crate::epoch::collector::Collector) {
     let batch = unsafe { Box::from_raw(batch_ptr) };
     let heap_data = batch.heap.data() as *const HeapData;
     for &ptr in batch.ptrs.iter() {
@@ -48,9 +45,7 @@ impl Collector {
     pub fn new(heap: &Heap) -> Self {
         // Touch the global seize collector to ensure it's initialized.
         let _ = crate::epoch::collector();
-        Self {
-            heap: heap.clone(),
-        }
+        Self { heap: heap.clone() }
     }
 
     #[inline]

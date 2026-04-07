@@ -1,5 +1,5 @@
-use super::raw::{self, membarrier, Thread};
 use super::guard::{LocalGuard, OwnedGuard};
+use super::raw::{self, Thread, membarrier};
 
 use std::fmt;
 use std::sync::OnceLock;
@@ -236,7 +236,6 @@ impl Collector {
     pub unsafe fn reclaim_all(&self) {
         unsafe { self.raw.reclaim_all() };
     }
-
 
     // Create a reference to `Collector` from an underlying `raw::Collector`.
     pub(crate) fn from_raw(raw: &raw::Collector) -> &Collector {
