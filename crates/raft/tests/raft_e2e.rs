@@ -24,7 +24,7 @@ use futures::FutureExt;
 use openraft::async_runtime::watch::WatchReceiver;
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::storage::RaftStateMachine;
-use openraft::{LogId, OptionalSend, Raft, StoredMembership};
+use openraft::{OptionalSend, Raft};
 use parking_lot::RwLock;
 use std::path::PathBuf;
 
@@ -81,6 +81,11 @@ impl codec::Decode for TestData {
         reader.read_exact(&mut buf)?;
         Ok(Self(buf))
     }
+
+    fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, codec::CodecError> {
+        // Storage path: BorrowPayload writes raw bytes (no length prefix).
+        Ok(Self(data.to_vec()))
+    }
 }
 
 impl codec::BorrowPayload for TestData {
@@ -90,6 +95,10 @@ impl codec::BorrowPayload for TestData {
 }
 
 type TestConfig = BisqueRaftTypeConfig<TestData, ()>;
+type TestLogId = openraft::alias::LogIdOf<TestConfig>;
+type TestStoredMembership = openraft::alias::StoredMembershipOf<TestConfig>;
+type TestSnapshotMeta = openraft::alias::SnapshotMetaOf<TestConfig>;
+type TestSnapshot = openraft::alias::SnapshotOf<TestConfig>;
 
 // ---------------------------------------------------------------------------
 // Enhanced TestStateMachine with snapshot support
@@ -98,9 +107,9 @@ type TestConfig = BisqueRaftTypeConfig<TestData, ()>;
 #[derive(Clone)]
 struct TestStateMachine {
     applied_normal: Arc<AtomicU64>,
-    last_applied: Arc<RwLock<Option<LogId<TestConfig>>>>,
-    last_membership: Arc<RwLock<StoredMembership<TestConfig>>>,
-    current_snapshot: Arc<RwLock<Option<openraft::storage::Snapshot<TestConfig>>>>,
+    last_applied: Arc<RwLock<Option<TestLogId>>>,
+    last_membership: Arc<RwLock<TestStoredMembership>>,
+    current_snapshot: Arc<RwLock<Option<TestSnapshot>>>,
 }
 
 impl TestStateMachine {
@@ -108,7 +117,7 @@ impl TestStateMachine {
         Self {
             applied_normal: Arc::new(AtomicU64::new(0)),
             last_applied: Arc::new(RwLock::new(None)),
-            last_membership: Arc::new(RwLock::new(StoredMembership::default())),
+            last_membership: Arc::new(RwLock::new(TestStoredMembership::default())),
             current_snapshot: Arc::new(RwLock::new(None)),
         }
     }
@@ -123,7 +132,7 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<TestConfig>>, StoredMembership<TestConfig>), std::io::Error> {
+    ) -> Result<(Option<TestLogId>, TestStoredMembership), std::io::Error> {
         let la = self.last_applied.read().clone();
         let lm = self.last_membership.read().clone();
         Ok((la, lm))
@@ -146,7 +155,7 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
                 }
                 openraft::EntryPayload::Membership(m) => {
                     *self.last_membership.write() =
-                        StoredMembership::new(Some(entry.log_id), m.clone());
+                        TestStoredMembership::new(Some(entry.log_id), m.clone());
                 }
                 _ => {}
             }
@@ -170,7 +179,7 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        meta: &openraft::storage::SnapshotMeta<TestConfig>,
+        meta: &TestSnapshotMeta,
         snapshot: std::io::Cursor<Vec<u8>>,
     ) -> Result<(), std::io::Error> {
         let data = snapshot.into_inner();
@@ -187,9 +196,7 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<openraft::storage::Snapshot<TestConfig>>, std::io::Error> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<TestSnapshot>, std::io::Error> {
         let snap = self.current_snapshot.read();
         Ok(snap.as_ref().map(|s| openraft::storage::Snapshot {
             meta: s.meta.clone(),
@@ -199,9 +206,7 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 }
 
 impl openraft::RaftSnapshotBuilder<TestConfig> for TestStateMachine {
-    async fn build_snapshot(
-        &mut self,
-    ) -> Result<openraft::storage::Snapshot<TestConfig>, std::io::Error> {
+    async fn build_snapshot(&mut self) -> Result<TestSnapshot, std::io::Error> {
         let count = self.applied_normal.load(Ordering::SeqCst);
         let data = count.to_le_bytes().to_vec();
         let meta = openraft::storage::SnapshotMeta {
@@ -225,14 +230,22 @@ impl openraft::RaftSnapshotBuilder<TestConfig> for TestStateMachine {
 // E2eCluster harness
 // ---------------------------------------------------------------------------
 
-type Manager =
-    MultiRaftManager<TestConfig, BisqueTcpTransport<TestConfig>, MultiplexedLogStorage<TestConfig>>;
+type Manager = MultiRaftManager<
+    TestConfig,
+    BisqueTcpTransport<TestConfig>,
+    MultiplexedLogStorage<TestConfig>,
+    TestStateMachine,
+>;
 
-type Server =
-    BisqueRpcServer<TestConfig, BisqueTcpTransport<TestConfig>, MultiplexedLogStorage<TestConfig>>;
+type Server = BisqueRpcServer<
+    TestConfig,
+    BisqueTcpTransport<TestConfig>,
+    MultiplexedLogStorage<TestConfig>,
+    TestStateMachine,
+>;
 
 struct E2eNode {
-    node_id: u64,
+    node_id: u32,
     #[allow(dead_code)]
     addr: SocketAddr,
     manager: Arc<Manager>,
@@ -243,14 +256,14 @@ struct E2eNode {
 }
 
 struct StoppedNode {
-    node_id: u64,
+    node_id: u32,
     data_dir: PathBuf,
     _dir_handle: Option<TestTempDir>,
 }
 
 struct E2eCluster {
     nodes: Vec<E2eNode>,
-    node_registry: Arc<DefaultNodeRegistry<u64>>,
+    node_registry: Arc<DefaultNodeRegistry<u32>>,
     transport_cfg: BisqueTcpTransportConfig,
     raft_cfg: Arc<openraft::Config>,
     stopped_nodes: Vec<StoppedNode>,
@@ -272,7 +285,7 @@ impl E2eCluster {
     }
 
     async fn new_with_config(num_nodes: usize, raft_cfg: Arc<openraft::Config>) -> Self {
-        let node_registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let node_registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         let transport_cfg = BisqueTcpTransportConfig {
             connect_timeout: Duration::from_secs(2),
             request_timeout: Duration::from_secs(5),
@@ -284,7 +297,7 @@ impl E2eCluster {
         let mut nodes = Vec::with_capacity(num_nodes);
 
         for i in 0..num_nodes {
-            let node_id = (i + 1) as u64;
+            let node_id = (i + 1) as u32;
             let node = Self::create_node(
                 node_id,
                 &node_registry,
@@ -307,8 +320,8 @@ impl E2eCluster {
     }
 
     async fn create_node(
-        node_id: u64,
-        registry: &Arc<DefaultNodeRegistry<u64>>,
+        node_id: u32,
+        registry: &Arc<DefaultNodeRegistry<u32>>,
         transport_cfg: &BisqueTcpTransportConfig,
         existing_dir: Option<(PathBuf, Option<TestTempDir>)>,
     ) -> E2eNode {
@@ -375,7 +388,7 @@ impl E2eCluster {
         }
     }
 
-    fn membership(&self) -> BTreeMap<u64, openraft::impls::BasicNode> {
+    fn membership(&self) -> BTreeMap<u32, openraft::impls::BasicNode> {
         let mut members = BTreeMap::new();
         for node in &self.nodes {
             members.insert(node.node_id, openraft::impls::BasicNode::default());
@@ -409,21 +422,21 @@ impl E2eCluster {
         state_machines
     }
 
-    fn get_node(&self, node_id: u64) -> &E2eNode {
+    fn get_node(&self, node_id: u32) -> &E2eNode {
         self.nodes
             .iter()
             .find(|n| n.node_id == node_id)
             .unwrap_or_else(|| panic!("node {} not found", node_id))
     }
 
-    fn get_raft(&self, group_id: u64, node_id: u64) -> Raft<TestConfig> {
+    fn get_raft(&self, group_id: u64, node_id: u32) -> Raft<TestConfig, TestStateMachine> {
         self.get_node(node_id)
             .manager
             .get_group(group_id)
             .unwrap_or_else(|| panic!("group {} not on node {}", group_id, node_id))
     }
 
-    async fn wait_for_any_leader(&self, group_id: u64, timeout_secs: u64) -> u64 {
+    async fn wait_for_any_leader(&self, group_id: u64, timeout_secs: u64) -> u32 {
         tokio::time::timeout(Duration::from_secs(timeout_secs), async {
             loop {
                 for node in &self.nodes {
@@ -447,7 +460,7 @@ impl E2eCluster {
         &self,
         group_id: u64,
         min_index: u64,
-        node_ids: &[u64],
+        node_ids: &[u32],
         timeout_secs: u64,
     ) {
         tokio::time::timeout(Duration::from_secs(timeout_secs), async {
@@ -472,7 +485,7 @@ impl E2eCluster {
         .expect("wait_for_replication timeout");
     }
 
-    async fn stop_node(&mut self, node_id: u64) {
+    async fn stop_node(&mut self, node_id: u32) {
         let idx = self
             .nodes
             .iter()
@@ -514,7 +527,7 @@ impl E2eCluster {
         });
     }
 
-    async fn restart_node(&mut self, node_id: u64, group_ids: &[u64]) -> Vec<TestStateMachine> {
+    async fn restart_node(&mut self, node_id: u32, group_ids: &[u64]) -> Vec<TestStateMachine> {
         let stopped_idx = self
             .stopped_nodes
             .iter()
@@ -547,7 +560,7 @@ impl E2eCluster {
         sms
     }
 
-    async fn add_new_node(&mut self, node_id: u64, group_ids: &[u64]) -> Vec<TestStateMachine> {
+    async fn add_new_node(&mut self, node_id: u32, group_ids: &[u64]) -> Vec<TestStateMachine> {
         let new_node =
             Self::create_node(node_id, &self.node_registry, &self.transport_cfg, None).await;
 
@@ -568,9 +581,12 @@ impl E2eCluster {
         sms
     }
 
-    fn shutdown(&self) {
-        for node in &self.nodes {
-            node.server.shutdown();
+    async fn shutdown(self) {
+        for node in self.nodes {
+            node.manager.shutdown_all().await;
+            node.server.shutdown_and_drain(Duration::from_secs(5)).await;
+            node.manager.storage().stop();
+            let _ = node.serve_handle.await;
         }
     }
 }
@@ -602,7 +618,7 @@ async fn wait_for_applied(sms: &[TestStateMachine], min_count: u64, timeout_secs
 // Helper: write N entries to a group through its leader
 // ---------------------------------------------------------------------------
 
-async fn write_entries(cluster: &E2eCluster, group_id: u64, leader_id: u64, count: u64) {
+async fn write_entries(cluster: &E2eCluster, group_id: u64, leader_id: u32, count: u64) {
     let raft = cluster.get_raft(group_id, leader_id);
     for i in 0..count {
         raft.client_write(TestData(format!("entry-{}", i).into_bytes()))
@@ -633,7 +649,7 @@ fn test_3node_basic_write_and_replication() {
         // Wait for all 3 state machines to apply 10 normal entries
         wait_for_applied(&sms, 10, 10).await;
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -670,7 +686,7 @@ fn test_write_to_follower_returns_forward_error() {
             Err(e) => panic!("unexpected error type: {:?}", e),
         }
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -702,7 +718,7 @@ fn test_multi_group_isolation_3node() {
             assert_eq!(sm.applied(), 5, "group 1 should still have 5 applied");
         }
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -720,7 +736,7 @@ fn test_leader_shutdown_triggers_reelection() {
 
         // Write 5 entries
         write_entries(&cluster, 1, old_leader, 5).await;
-        let all_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let all_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 5, &all_ids, 10).await;
 
         // Kill the leader
@@ -734,10 +750,10 @@ fn test_leader_shutdown_triggers_reelection() {
         write_entries(&cluster, 1, new_leader, 5).await;
 
         // Wait for replication on surviving nodes
-        let survivor_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let survivor_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 10, &survivor_ids, 10).await;
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -751,7 +767,7 @@ fn test_follower_restart_catches_up() {
 
         // Write 5 entries, fully replicated
         write_entries(&cluster, 1, leader, 5).await;
-        let all_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let all_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 5, &all_ids, 10).await;
 
         // Stop a follower
@@ -765,7 +781,7 @@ fn test_follower_restart_catches_up() {
 
         // Write 10 more entries while follower is down
         write_entries(&cluster, 1, leader, 10).await;
-        let survivor_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let survivor_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 15, &survivor_ids, 10).await;
 
         // Restart the follower
@@ -781,7 +797,7 @@ fn test_follower_restart_catches_up() {
             new_sms[0].applied()
         );
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -795,7 +811,7 @@ fn test_leader_restart_rejoins_as_follower() {
 
         // Write 5 entries
         write_entries(&cluster, 1, old_leader, 5).await;
-        let all_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let all_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 5, &all_ids, 10).await;
 
         // Stop the leader
@@ -807,7 +823,7 @@ fn test_leader_restart_rejoins_as_follower() {
 
         // Write 5 more
         write_entries(&cluster, 1, new_leader, 5).await;
-        let survivor_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let survivor_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 10, &survivor_ids, 10).await;
 
         // Restart old leader
@@ -822,7 +838,7 @@ fn test_leader_restart_rejoins_as_follower() {
             new_sms[0].applied()
         );
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -840,7 +856,7 @@ fn test_add_learner_and_promote_to_voter() {
 
         // Write 5 entries
         write_entries(&cluster, 1, leader, 5).await;
-        let all_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let all_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 5, &all_ids, 10).await;
 
         // Add a 4th node
@@ -854,7 +870,7 @@ fn test_add_learner_and_promote_to_voter() {
             .expect("add_learner failed");
 
         // Promote to voter
-        let new_members: BTreeSet<u64> = [1, 2, 3, 4].into();
+        let new_members: BTreeSet<u32> = [1, 2, 3, 4].into();
         leader_raft
             .change_membership(new_members, false)
             .await
@@ -866,7 +882,7 @@ fn test_add_learner_and_promote_to_voter() {
         // Wait for node 4 to apply all 10 normal entries
         wait_for_applied(&node4_sms, 10, 10).await;
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -880,7 +896,7 @@ fn test_remove_voter_from_cluster() {
 
         // Write 5 entries
         write_entries(&cluster, 1, leader, 5).await;
-        let all_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let all_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 5, &all_ids, 10).await;
 
         // Remove node 3 from voters (retain as learner)
@@ -899,7 +915,7 @@ fn test_remove_voter_from_cluster() {
             .node_id;
 
         let leader_raft = cluster.get_raft(1, leader);
-        let remaining: BTreeSet<u64> = [leader, other_id].into();
+        let remaining: BTreeSet<u32> = [leader, other_id].into();
         leader_raft
             .change_membership(remaining, true)
             .await
@@ -913,7 +929,7 @@ fn test_remove_voter_from_cluster() {
             .wait_for_replication(1, 10, &[leader, other_id], 10)
             .await;
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -931,7 +947,7 @@ fn test_snapshot_trigger_and_verify() {
 
         // Write 10 entries
         write_entries(&cluster, 1, leader, 10).await;
-        let all_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let all_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 10, &all_ids, 10).await;
 
         // Trigger snapshot
@@ -951,7 +967,7 @@ fn test_snapshot_trigger_and_verify() {
         .await
         .expect("snapshot should appear in metrics");
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -979,7 +995,7 @@ fn test_snapshot_install_on_lagging_follower() {
 
         // Write 5 entries, fully replicated
         write_entries(&cluster, 1, leader, 5).await;
-        let all_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let all_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 5, &all_ids, 10).await;
 
         // Stop a follower
@@ -993,7 +1009,7 @@ fn test_snapshot_install_on_lagging_follower() {
 
         // Write 15 more entries while follower is down (20 total)
         write_entries(&cluster, 1, leader, 15).await;
-        let survivor_ids: Vec<u64> = cluster.nodes.iter().map(|n| n.node_id).collect();
+        let survivor_ids: Vec<u32> = cluster.nodes.iter().map(|n| n.node_id).collect();
         cluster.wait_for_replication(1, 20, &survivor_ids, 10).await;
 
         // Trigger snapshot on leader
@@ -1036,6 +1052,6 @@ fn test_snapshot_install_on_lagging_follower() {
             new_sms[0].applied()
         );
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }

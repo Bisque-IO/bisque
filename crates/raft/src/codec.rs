@@ -44,17 +44,36 @@ pub trait Encode {
 
     /// Encode to a new Vec<u8>
     fn encode_to_vec(&self) -> Result<Vec<u8>, CodecError> {
-        let mut buf = Vec::with_capacity(self.encoded_size());
+        let expected = self.encoded_size();
+        let mut buf = Vec::with_capacity(expected);
         self.encode(&mut buf)?;
+        debug_assert_eq!(
+            buf.len(),
+            expected,
+            "Encode/encoded_size mismatch: encoded_size() returned {} but encode() wrote {} bytes. \
+             This usually means Encode writes data without a length prefix that Decode expects.",
+            expected,
+            buf.len(),
+        );
         Ok(buf)
     }
 
     /// Encode into an existing Vec<u8>, clearing it first and reserving capacity.
     /// This avoids allocation when the buffer already has sufficient capacity.
     fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), CodecError> {
+        let expected = self.encoded_size();
         buf.clear();
-        buf.reserve(self.encoded_size());
-        self.encode(buf)
+        buf.reserve(expected);
+        self.encode(buf)?;
+        debug_assert_eq!(
+            buf.len(),
+            expected,
+            "Encode/encoded_size mismatch: encoded_size() returned {} but encode() wrote {} bytes. \
+             This usually means Encode writes data without a length prefix that Decode expects.",
+            expected,
+            buf.len(),
+        );
+        Ok(())
     }
 }
 
@@ -66,7 +85,16 @@ pub trait Decode: Sized {
     /// Decode from a byte slice
     fn decode_from_slice(data: &[u8]) -> Result<Self, CodecError> {
         let mut cursor = Cursor::new(data);
-        Self::decode(&mut cursor)
+        let result = Self::decode(&mut cursor)?;
+        let consumed = cursor.position() as usize;
+        debug_assert_eq!(
+            consumed,
+            data.len(),
+            "Decode consumed only {consumed}/{} bytes — likely an Encode/Decode framing mismatch \
+             (e.g. missing length prefix in Encode that Decode expects).",
+            data.len(),
+        );
+        Ok(result)
     }
 
     /// Decode from a `Bytes` buffer. Override this for zero-copy decoding from
@@ -1400,6 +1428,9 @@ mod tests {
     use super::*;
 
     type C = crate::test_support::TestConfig;
+    type TestEntry = crate::test_support::TestEntry;
+    type TestEntryPayload = crate::test_support::TestEntryPayload;
+    type TestLogId = crate::test_support::TestLogId;
 
     fn make_leader_id(term: u32, node_id: u32) -> ConcreteLeaderId {
         ConcreteLeaderId { term, node_id }
@@ -1523,13 +1554,13 @@ mod tests {
             vote: make_vote(5, 10, true),
             prev_log_id: Some(make_log_id(4, 10, 99)),
             entries: vec![
-                openraft::impls::Entry::<C> {
+                TestEntry {
                     log_id: make_log_id(5, 10, 100),
                     payload: openraft::EntryPayload::Normal(crate::test_support::TestBytes(
                         vec![1, 2, 3].into(),
                     )),
                 },
-                openraft::impls::Entry::<C> {
+                TestEntry {
                     log_id: make_log_id(5, 10, 101),
                     payload: openraft::EntryPayload::Blank,
                 },
@@ -1655,12 +1686,12 @@ mod tests {
             Vec::<u32>::new(),
         );
 
-        let val = openraft::impls::Entry::<C> {
+        let val = TestEntry {
             log_id: make_log_id(5, 10, 100),
             payload: openraft::EntryPayload::Membership(membership),
         };
         let encoded = val.encode_to_vec().unwrap();
-        let decoded = openraft::impls::Entry::<C>::decode_from_slice(&encoded).unwrap();
+        let decoded = TestEntry::decode_from_slice(&encoded).unwrap();
         assert_eq!(val.log_id, decoded.log_id);
     }
 
@@ -1741,7 +1772,7 @@ mod tests {
     #[test]
     fn test_invalid_entry_payload_discriminant() {
         let data = vec![0xFFu8]; // Invalid EntryPayloadType
-        assert!(openraft::EntryPayload::<C>::decode_from_slice(&data).is_err());
+        assert!(TestEntryPayload::decode_from_slice(&data).is_err());
     }
 
     #[test]
@@ -1826,8 +1857,8 @@ mod tests {
         use crate::test_support::TestBytes;
 
         let vote = make_vote(5, 2, true);
-        let entries: Vec<openraft::impls::Entry<C>> = (1..=100)
-            .map(|i| openraft::impls::Entry::<C> {
+        let entries: Vec<TestEntry> = (1..=100)
+            .map(|i| TestEntry {
                 log_id: make_log_id(5, 2, i),
                 payload: openraft::EntryPayload::Normal(TestBytes::from_vec(vec![i as u8; 50])),
             })

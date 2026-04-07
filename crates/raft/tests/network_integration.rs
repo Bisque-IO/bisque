@@ -24,11 +24,11 @@ use bisque_raft::{
 };
 use bytes::{Buf, BytesMut};
 use futures::FutureExt;
+use openraft::OptionalSend;
 use openraft::async_runtime::watch::WatchReceiver;
 use openraft::network::RaftNetworkFactory;
 use openraft::network::v2::RaftNetworkV2;
 use openraft::storage::RaftStateMachine;
-use openraft::{LogId, OptionalSend};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ---------------------------------------------------------------------------
@@ -84,6 +84,10 @@ impl codec::Decode for TestData {
         reader.read_exact(&mut buf)?;
         Ok(Self(buf))
     }
+
+    fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, codec::CodecError> {
+        Ok(Self(data.to_vec()))
+    }
 }
 
 impl codec::BorrowPayload for TestData {
@@ -93,6 +97,10 @@ impl codec::BorrowPayload for TestData {
 }
 
 type TestConfig = BisqueRaftTypeConfig<TestData, ()>;
+type TestLogId = openraft::alias::LogIdOf<TestConfig>;
+type TestStoredMembership = openraft::alias::StoredMembershipOf<TestConfig>;
+type TestSnapshotMeta = openraft::alias::SnapshotMetaOf<TestConfig>;
+type TestSnapshot = openraft::alias::SnapshotOf<TestConfig>;
 
 #[derive(Clone)]
 struct TestStateMachine {
@@ -116,14 +124,8 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<
-        (
-            Option<LogId<TestConfig>>,
-            openraft::StoredMembership<TestConfig>,
-        ),
-        std::io::Error,
-    > {
-        Ok((None, openraft::StoredMembership::default()))
+    ) -> Result<(Option<TestLogId>, TestStoredMembership), std::io::Error> {
+        Ok((None, TestStoredMembership::default()))
     }
 
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), std::io::Error>
@@ -157,27 +159,23 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        _meta: &openraft::storage::SnapshotMeta<TestConfig>,
+        _meta: &TestSnapshotMeta,
         snapshot: std::io::Cursor<Vec<u8>>,
     ) -> Result<(), std::io::Error> {
         let _ = snapshot.into_inner();
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<openraft::storage::Snapshot<TestConfig>>, std::io::Error> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<TestSnapshot>, std::io::Error> {
         Ok(None)
     }
 }
 
 impl openraft::RaftSnapshotBuilder<TestConfig> for TestStateMachine {
-    async fn build_snapshot(
-        &mut self,
-    ) -> Result<openraft::storage::Snapshot<TestConfig>, std::io::Error> {
+    async fn build_snapshot(&mut self) -> Result<TestSnapshot, std::io::Error> {
         let meta = openraft::storage::SnapshotMeta {
             last_log_id: None,
-            last_membership: openraft::StoredMembership::default(),
+            last_membership: TestStoredMembership::default(),
             snapshot_id: "integration-test".to_string(),
         };
         Ok(openraft::storage::Snapshot {
@@ -320,6 +318,7 @@ struct ClusterNode {
             TestConfig,
             BisqueTcpTransport<TestConfig>,
             MultiplexedLogStorage<TestConfig>,
+            TestStateMachine,
         >,
     >,
     server: Arc<
@@ -327,24 +326,26 @@ struct ClusterNode {
             TestConfig,
             BisqueTcpTransport<TestConfig>,
             MultiplexedLogStorage<TestConfig>,
+            TestStateMachine,
         >,
     >,
+    serve_handle: tokio::task::JoinHandle<()>,
     _dir: TestTempDir,
 }
 
 struct TestCluster {
     nodes: Vec<ClusterNode>,
     #[allow(dead_code)]
-    node_registry: Arc<DefaultNodeRegistry<u64>>,
+    node_registry: Arc<DefaultNodeRegistry<u32>>,
 }
 
 impl TestCluster {
     async fn new(num_nodes: usize, transport_cfg: BisqueTcpTransportConfig) -> Self {
-        let node_registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let node_registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         let mut nodes = Vec::with_capacity(num_nodes);
 
         for node_id_idx in 0..num_nodes {
-            let node_id = (node_id_idx + 1) as u64;
+            let node_id = (node_id_idx + 1) as u32;
             let addr = pick_unused_local_addr();
             node_registry.register(node_id, addr);
 
@@ -360,7 +361,7 @@ impl TestCluster {
             let transport =
                 BisqueTcpTransport::<TestConfig>::new(transport_cfg.clone(), node_registry.clone());
 
-            let manager = Arc::new(MultiRaftManager::<TestConfig, _, _>::new(
+            let manager = Arc::new(MultiRaftManager::<TestConfig, _, _, TestStateMachine>::new(
                 transport, storage,
             ));
 
@@ -373,7 +374,7 @@ impl TestCluster {
             ));
 
             // Start serving in background
-            tokio::spawn({
+            let serve_handle = tokio::spawn({
                 let s = server.clone();
                 async move {
                     let _ = s.serve().await;
@@ -384,6 +385,7 @@ impl TestCluster {
                 addr,
                 manager,
                 server,
+                serve_handle,
                 _dir: dir,
             });
         }
@@ -397,10 +399,10 @@ impl TestCluster {
         }
     }
 
-    fn membership(&self) -> BTreeMap<u64, openraft::impls::BasicNode> {
+    fn membership(&self) -> BTreeMap<u32, openraft::impls::BasicNode> {
         let mut members = BTreeMap::new();
         for (i, _node) in self.nodes.iter().enumerate() {
-            members.insert((i + 1) as u64, openraft::impls::BasicNode::default());
+            members.insert((i + 1) as u32, openraft::impls::BasicNode::default());
         }
         members
     }
@@ -419,7 +421,7 @@ impl TestCluster {
                 .nodes
                 .iter()
                 .position(|n| std::ptr::eq(n, node))
-                .unwrap() as u64
+                .unwrap() as u32
                 + 1;
             let mut sms = Vec::with_capacity(group_ids.len());
             for &gid in group_ids {
@@ -445,7 +447,7 @@ impl TestCluster {
         state_machines
     }
 
-    async fn wait_for_leader(&self, group_id: u64, expected_leader: u64, timeout_secs: u64) {
+    async fn wait_for_leader(&self, group_id: u64, expected_leader: u32, timeout_secs: u64) {
         let raft = self.nodes[(expected_leader - 1) as usize]
             .manager
             .get_group(group_id)
@@ -463,9 +465,12 @@ impl TestCluster {
         .expect("leader wait timeout");
     }
 
-    fn shutdown(&self) {
-        for node in &self.nodes {
-            node.server.shutdown();
+    async fn shutdown(self) {
+        for node in self.nodes {
+            node.manager.shutdown_all().await;
+            node.server.shutdown_and_drain(Duration::from_secs(5)).await;
+            node.manager.storage().stop();
+            let _ = node.serve_handle.await;
         }
     }
 }
@@ -545,23 +550,23 @@ fn test_codec_roundtrip_stress() {
         let rpc = openraft::raft::AppendEntriesRequest::<TestConfig> {
             vote: openraft::impls::Vote {
                 leader_id: openraft::impls::leader_id_adv::LeaderId {
-                    term: i as u64,
-                    node_id: 1,
+                    term: i as u32,
+                    node_id: 1u32,
                 },
                 committed: true,
             },
             prev_log_id: Some(openraft::LogId {
                 leader_id: openraft::impls::leader_id_adv::LeaderId {
-                    term: i as u64,
-                    node_id: 1,
+                    term: i as u32,
+                    node_id: 1u32,
                 },
                 index: i as u64,
             }),
-            entries: vec![openraft::impls::Entry::<TestConfig> {
+            entries: vec![openraft::Entry {
                 log_id: openraft::LogId {
                     leader_id: openraft::impls::leader_id_adv::LeaderId {
-                        term: i as u64,
-                        node_id: 1,
+                        term: i as u32,
+                        node_id: 1u32,
                     },
                     index: i as u64 + 1,
                 },
@@ -778,7 +783,7 @@ fn test_multiplexed_transport_concurrent_requests() {
         let _server = spawn_pipelined_rpc_server(addr, request_count.clone());
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         registry.register(2, addr);
 
         let transport = Arc::new(BisqueTcpTransport::<TestConfig>::new(
@@ -857,7 +862,7 @@ fn test_vote_rpc_stress() {
         let _server = spawn_pipelined_rpc_server(addr, request_count.clone());
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         registry.register(2, addr);
 
         let transport = Arc::new(BisqueTcpTransport::<TestConfig>::new(
@@ -886,7 +891,7 @@ fn test_vote_rpc_stress() {
                         2,
                         (i % 50) + 1,
                         openraft::raft::VoteRequest {
-                            vote: openraft::impls::Vote::new(i, 1),
+                            vote: openraft::impls::Vote::new(i as u32, 1u32),
                             last_log_id: None,
                         },
                     )
@@ -928,7 +933,7 @@ fn test_transport_concurrent_stress() {
         let _server = spawn_pipelined_rpc_server(addr, server_request_count.clone());
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         registry.register(2, addr);
 
         let transport = Arc::new(BisqueTcpTransport::<TestConfig>::new(
@@ -1073,7 +1078,7 @@ fn test_cluster_write_throughput() {
             sms[1][0].applied()
         );
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -1157,7 +1162,7 @@ fn test_cluster_concurrent_write_throughput() {
         .await
         .expect("replication timeout");
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -1247,7 +1252,7 @@ fn test_multi_group_concurrent_writes() {
             );
         }
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -1325,7 +1330,7 @@ fn test_large_payload_stress() {
         .await
         .expect("replication timeout");
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -1389,7 +1394,7 @@ fn test_e2e_rpc_latency() {
             num_writes, summary
         );
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -1486,7 +1491,7 @@ fn test_mixed_workload_stress() {
 
         assert!(writes > 0, "should have completed some writes");
 
-        cluster.shutdown();
+        cluster.shutdown().await;
     });
 }
 
@@ -1504,7 +1509,7 @@ fn test_group_pinned_basic_rpc() {
         let _server = spawn_pipelined_rpc_server(addr, request_count.clone());
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         registry.register(2, addr);
 
         let transport = Arc::new(BisqueTcpTransport::<TestConfig>::new(
@@ -1559,7 +1564,7 @@ fn test_group_pinned_concurrent_throughput() {
         let _server = spawn_pipelined_rpc_server(addr, request_count.clone());
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         registry.register(2, addr);
 
         let transport = Arc::new(BisqueTcpTransport::<TestConfig>::new(
@@ -1634,7 +1639,7 @@ fn test_group_pinned_multi_group_isolation() {
         let _server = spawn_pipelined_rpc_server(addr, request_count.clone());
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         registry.register(2, addr);
 
         let transport = Arc::new(BisqueTcpTransport::<TestConfig>::new(
@@ -1698,7 +1703,7 @@ fn test_group_pinned_connection_refresh() {
         let _server = spawn_pipelined_rpc_server(addr, request_count.clone());
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         registry.register(2, addr);
 
         // Very short TTL to force frequent refreshes
@@ -1770,7 +1775,7 @@ fn test_group_pinned_connection_refresh() {
 fn test_group_pinned_error_recovery() {
     run_async(async {
         let addr = pick_unused_local_addr();
-        let registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         registry.register(2, addr);
 
         let transport = Arc::new(BisqueTcpTransport::<TestConfig>::new(

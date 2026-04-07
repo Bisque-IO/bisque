@@ -26,11 +26,11 @@ use bisque_raft::{
     NodeAddressResolver,
 };
 use futures::FutureExt;
+use openraft::OptionalSend;
 use openraft::async_runtime::watch::WatchReceiver;
 use openraft::entry::RaftEntry;
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
-use openraft::{LogId, OptionalSend};
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -85,6 +85,10 @@ impl codec::Decode for TestData {
         reader.read_exact(&mut buf)?;
         Ok(Self(buf))
     }
+
+    fn decode_from_bytes(data: bytes::Bytes) -> Result<Self, codec::CodecError> {
+        Ok(Self(data.to_vec()))
+    }
 }
 
 impl codec::BorrowPayload for TestData {
@@ -94,6 +98,10 @@ impl codec::BorrowPayload for TestData {
 }
 
 type TestConfig = BisqueRaftTypeConfig<TestData, ()>;
+type TestLogId = openraft::alias::LogIdOf<TestConfig>;
+type TestStoredMembership = openraft::alias::StoredMembershipOf<TestConfig>;
+type TestSnapshotMeta = openraft::alias::SnapshotMetaOf<TestConfig>;
+type TestSnapshot = openraft::alias::SnapshotOf<TestConfig>;
 
 #[derive(Clone)]
 struct TestStateMachine {
@@ -113,14 +121,8 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<
-        (
-            Option<LogId<TestConfig>>,
-            openraft::StoredMembership<TestConfig>,
-        ),
-        std::io::Error,
-    > {
-        Ok((None, openraft::StoredMembership::default()))
+    ) -> Result<(Option<TestLogId>, TestStoredMembership), std::io::Error> {
+        Ok((None, TestStoredMembership::default()))
     }
 
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), std::io::Error>
@@ -154,27 +156,23 @@ impl RaftStateMachine<TestConfig> for TestStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        _meta: &openraft::storage::SnapshotMeta<TestConfig>,
+        _meta: &TestSnapshotMeta,
         _snapshot: std::io::Cursor<Vec<u8>>,
     ) -> Result<(), std::io::Error> {
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<openraft::storage::Snapshot<TestConfig>>, std::io::Error> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<TestSnapshot>, std::io::Error> {
         Ok(None)
     }
 }
 
 impl openraft::RaftSnapshotBuilder<TestConfig> for TestStateMachine {
-    async fn build_snapshot(
-        &mut self,
-    ) -> Result<openraft::storage::Snapshot<TestConfig>, std::io::Error> {
+    async fn build_snapshot(&mut self) -> Result<TestSnapshot, std::io::Error> {
         Ok(openraft::storage::Snapshot {
             meta: openraft::storage::SnapshotMeta {
                 last_log_id: None,
-                last_membership: openraft::StoredMembership::default(),
+                last_membership: TestStoredMembership::default(),
                 snapshot_id: "bench".to_string(),
             },
             snapshot: std::io::Cursor::new(Vec::new()),
@@ -247,12 +245,12 @@ impl fmt::Display for LatencySummary {
 
 struct SingleNodeHarness {
     transport: Arc<BisqueTcpTransport<TestConfig>>,
-    #[allow(dead_code)]
     manager: Arc<
         MultiRaftManager<
             TestConfig,
             BisqueTcpTransport<TestConfig>,
             MultiplexedLogStorage<TestConfig>,
+            TestStateMachine,
         >,
     >,
     server: Arc<
@@ -260,8 +258,10 @@ struct SingleNodeHarness {
             TestConfig,
             BisqueTcpTransport<TestConfig>,
             MultiplexedLogStorage<TestConfig>,
+            TestStateMachine,
         >,
     >,
+    serve_handle: tokio::task::JoinHandle<()>,
     _dir: TestTempDir,
 }
 
@@ -272,7 +272,7 @@ impl SingleNodeHarness {
 
     async fn with_transport_config(transport_config: BisqueTcpTransportConfig) -> Self {
         let addr = pick_unused_local_addr();
-        let node_registry = Arc::new(DefaultNodeRegistry::<u64>::new());
+        let node_registry = Arc::new(DefaultNodeRegistry::<u32>::new());
         node_registry.register(1, addr);
 
         let dir = TestTempDir::new();
@@ -296,7 +296,7 @@ impl SingleNodeHarness {
             node_registry,
         );
 
-        let manager = Arc::new(MultiRaftManager::<TestConfig, _, _>::new(
+        let manager = Arc::new(MultiRaftManager::<TestConfig, _, _, TestStateMachine>::new(
             server_transport,
             storage,
         ));
@@ -309,7 +309,7 @@ impl SingleNodeHarness {
             manager.clone(),
         ));
 
-        tokio::spawn({
+        let serve_handle = tokio::spawn({
             let s = server.clone();
             async move {
                 let _ = s.serve().await;
@@ -322,6 +322,7 @@ impl SingleNodeHarness {
             transport,
             manager,
             server,
+            serve_handle,
             _dir: dir,
         }
     }
@@ -339,7 +340,7 @@ impl SingleNodeHarness {
         );
 
         let mut members = BTreeMap::new();
-        members.insert(1u64, openraft::impls::BasicNode::default());
+        members.insert(1u32, openraft::impls::BasicNode::default());
 
         for &gid in group_ids {
             self.manager
@@ -372,8 +373,11 @@ impl SingleNodeHarness {
         }
     }
 
-    fn shutdown(&self) {
-        self.server.shutdown();
+    async fn shutdown(self) {
+        self.manager.shutdown_all().await;
+        self.server.shutdown_and_drain(Duration::from_secs(5)).await;
+        self.manager.storage().stop();
+        let _ = self.serve_handle.await;
     }
 }
 
@@ -386,7 +390,7 @@ fn make_append_request(
     payload_size: usize,
 ) -> openraft::raft::AppendEntriesRequest<TestConfig> {
     let vote = openraft::impls::Vote::new(1, 1);
-    let entry_vec: Vec<openraft::impls::Entry<TestConfig>> = (0..entries)
+    let entry_vec: Vec<openraft::alias::DefaultEntryOf<TestConfig>> = (0..entries)
         .map(|i| {
             let log_id = openraft::LogId::new(
                 openraft::impls::leader_id_adv::LeaderId::new(1, 1),
@@ -413,9 +417,9 @@ fn make_empty_append_request() -> openraft::raft::AppendEntriesRequest<TestConfi
     }
 }
 
-fn make_vote_request(term: u64) -> openraft::raft::VoteRequest<TestConfig> {
+fn make_vote_request(term: u32) -> openraft::raft::VoteRequest<TestConfig> {
     openraft::raft::VoteRequest {
-        vote: openraft::impls::Vote::new(term, 1),
+        vote: openraft::impls::Vote::new(term, 1u32),
         last_log_id: None,
     }
 }
@@ -490,7 +494,7 @@ fn bench_heartbeat_throughput() {
             errs,
         );
 
-        harness.shutdown();
+        harness.shutdown().await;
     });
 }
 
@@ -549,7 +553,7 @@ fn bench_append_entries_payload_sizes() {
             );
         }
 
-        harness.shutdown();
+        harness.shutdown().await;
     });
 }
 
@@ -607,7 +611,7 @@ fn bench_multi_group_fanout() {
             total,
         );
 
-        harness.shutdown();
+        harness.shutdown().await;
     });
 }
 
@@ -638,7 +642,7 @@ fn bench_vote_throughput() {
             handles.push(tokio::spawn(async move {
                 for i in 0..n {
                     if transport
-                        .send_vote(1, 1, make_vote_request(base + i))
+                        .send_vote(1, 1, make_vote_request((base + i) as u32))
                         .await
                         .is_ok()
                     {
@@ -666,7 +670,7 @@ fn bench_vote_throughput() {
             total,
         );
 
-        harness.shutdown();
+        harness.shutdown().await;
     });
 }
 
@@ -725,7 +729,7 @@ fn bench_append_latency() {
         println!("[append_latency] concurrency={}", CONCURRENCY);
         println!("  {}", summary);
 
-        harness.shutdown();
+        harness.shutdown().await;
     });
 }
 
@@ -753,7 +757,7 @@ fn bench_connection_refresh_throughput() {
 
         let (baseline_done, baseline_errs, baseline_elapsed) =
             run_throughput_workload(&baseline_harness.transport, total, 1).await;
-        baseline_harness.shutdown();
+        baseline_harness.shutdown().await;
 
         let baseline_rps = baseline_done as f64 / baseline_elapsed.as_secs_f64();
         println!(
@@ -776,7 +780,7 @@ fn bench_connection_refresh_throughput() {
 
         let (refresh_done, refresh_errs, refresh_elapsed) =
             run_throughput_workload(&refresh_harness.transport, total, 1).await;
-        refresh_harness.shutdown();
+        refresh_harness.shutdown().await;
 
         let refresh_rps = refresh_done as f64 / refresh_elapsed.as_secs_f64();
         println!(
